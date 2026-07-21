@@ -1,12 +1,12 @@
-# DPD-ILC EHT Wi-Fi 仿真工程
+# DPD-ILC HE/EHT Wi-Fi 仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：生成 EHT Wi-Fi 复基带训练波形，经 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以 GMP 拟合可复用的 DPD，并输出 SNR、EVM 和 ACLR。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `GenWifi` 实例生成 HE 或 EHT Wi-Fi 复基带训练波形，经 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以 GMP 拟合可复用的 DPD，并输出 SNR、EVM 和 ACLR。
 
 ## 工程结构
 
 ```text
 main.py                 命令行主程序
-inc/waveGen.py          EHT 波形与 MCS 0–13 调制
+inc/waveGen.py          GenWifi 类、HE/EHT 波形与 MCS 调制
 inc/PaModel.py          Wiener 和 GMP 非线性 PA
 inc/DpdIlc.py           频域 ILC 与 GMP DPD 拟合
 inc/IlcVariants.py      其他 ILC 更新律
@@ -23,14 +23,14 @@ tests/TestProject.py    自包含验证脚本
 
 ```mermaid
 flowchart TD
-    start["main.py：解析命令行参数"] --> ehtConfig["创建 EHTConfig"]
-    ehtConfig --> waveGen["GenerateEhtWaveform"]
-    waveGen --> reference["EHT 参考波形 s 与帧元数据"]
+    start["main.py：解析命令行参数"] --> wifiGenerator["创建 GenWifi 实例"]
+    wifiGenerator --> waveGen["GenWifi.Generate"]
+    waveGen --> reference["HE/EHT 参考波形 s 与帧元数据"]
 
-    start --> paFactory["CreatePaModel"]
-    paFactory --> paModel["WienerPA 或 GMPPA"]
+    start --> paModel["创建 PaModel 实例"]
+    paModel --> paImplementation["WienerPA 或 GMPPA"]
     reference --> baseline["生成未校正 PA 基线输出"]
-    paModel --> baseline
+    paImplementation --> baseline
 
     start --> mode{"运行模式"}
     mode -->|单方案| frequencyIlc["RunFrequencyDomainIlc"]
@@ -45,30 +45,32 @@ flowchart TD
     learnedInput --> deployFit["拟合 MP / GMP / Volterra / LUT / NN"]
     deployFit --> deployedDpd["可复用 DPD 模型"]
 
-    waveGen --> validation["生成独立验证 EHT 帧"]
+    waveGen --> validation["生成独立验证 HE/EHT 帧"]
     validation --> deployedDpd
     deployedDpd --> predistortedInput["DPD 输出"]
-    predistortedInput --> paModel
-    paModel --> correctedOutput["PA 校正输出"]
+    predistortedInput --> paImplementation
+    paImplementation --> correctedOutput["PA 校正输出"]
 
-    baseline --> analysis["AnalyzeSignal"]
-    frequencyIlc --> analysis
-    variantResults --> analysis
-    correctedOutput --> analysis
-    analysis --> metrics["SNR / EVM / ACLR"]
+    reference --> analysis["创建 Analysis 实例"]
+    baseline --> analysisMethod["Analysis.Analyze / AnalyzeStages"]
+    frequencyIlc --> analysisMethod
+    variantResults --> analysisMethod
+    correctedOutput --> analysisMethod
+    analysis --> analysisMethod
+    analysisMethod --> metrics["SNR / EVM / ACLR"]
     metrics --> console["控制台表格"]
     metrics --> files["CSV / JSON / 收敛历史"]
 ```
 
 **图示说明：**
 
-1. `main.py` 首先读取带宽、MCS、PA 类型、驱动电平和 ILC 参数，分别创建 EHT 波形配置与 PA 模型。
-2. `GenerateEhtWaveform` 输出参考复基带波形 `s` 及字段边界、FFT、数据子载波等元数据；同一波形直接通过 PA 后形成未校正基线。
+1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，构造 `GenWifi(...)`、`PaModel(modelName=...)` 和 `Analysis(referenceSignal, waveform)` 实例。
+2. 调用 `GenWifi.Generate()` 后得到参考复基带波形 `s` 及字段边界、FFT、数据子载波等元数据；同一波形直接通过 PA 后形成未校正基线。
 3. 单方案模式执行正则化频域 ILC，寻找使 PA 输出逼近参考波形的理想输入 `u*`；全方案模式则调用统一基准测试，逐一运行所有 ILC 更新律。
 4. 收敛后的 `u*` 可直接用于重复波形测试，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN，从而形成可用于其他帧的部署模型。
-5. 所有输出最终进入 `AnalyzeSignal`，统一计算 SNR、EVM 和 ACLR，并写入控制台、CSV、JSON 及迭代收敛文件。
+5. 所有输出最终传给同一个 `Analysis` 实例，由 `Analyze` 或 `AnalyzeStages` 统一计算 SNR、EVM 和 ACLR，再通过实例方法 `Print`、`Save` 和 `SaveConvergence` 输出结果。
 
-图中从“生成独立验证 EHT 帧”开始的支路专门验证部署模型的泛化能力；它使用不同随机种子的载荷，不与 ILC 训练帧重复。
+图中从“生成独立验证 HE/EHT 帧”开始的支路专门验证部署模型的泛化能力；它使用相同格式配置和不同随机种子的载荷，不与 ILC 训练帧重复。
 
 ## `inc` 模块与函数结构图
 
@@ -78,55 +80,63 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    mcsInfo["MCSInfo 与 mcsTable"] --> generate["GenerateEhtWaveform"]
-    config["EHTConfig"] --> validate["EHTConfig.Validate"]
-    validate --> generate
+    caller["调用方"] --> config["构造 GenWifi 实例"]
+    config --> validate["GenWifi.Validate"]
+    config --> mcs["GenWifi.GetMcsInfo"]
+    config --> generate["GenWifi.Generate"]
+    mcs --> ehtTable["ehtMcsTable：MCS 0–13"]
+    mcs --> heTable["heMcsTable：MCS 0–11"]
+    generate --> privateGenerate["_GenerateWifiWaveform"]
 
-    generate --> active["_ActiveTones"]
-    generate --> pilots["_PilotTones"]
+    privateGenerate --> active["_ActiveTones"]
+    privateGenerate --> pilots["_PilotTones"]
     active --> pilots
-    generate --> training["_TrainingField"]
-    generate --> qam["QamModulate"]
-    generate --> pilotSequence["_PilotSequence"]
-    generate --> ofdm["_OfdmSymbol"]
+    privateGenerate --> training["_TrainingField"]
+    privateGenerate --> qam["QamModulate"]
+    privateGenerate --> pilotSequence["_PilotSequence"]
+    privateGenerate --> ofdm["_OfdmSymbol"]
 
     qam --> gray["_GrayToBinary"]
     training --> pilotSequence
     training --> ofdm
     pilotSequence --> ofdm
-    ofdm --> packet["拼接 EHT 前导和数据字段"]
-    packet --> waveform["EHTWaveform"]
+    ofdm --> packet["按配置拼接 HE 或 EHT 字段"]
+    packet --> waveform["WifiWaveform"]
 ```
 
 **图示说明：**
 
-- `EHTConfig.Validate` 在分配大数组前检查带宽、MCS、GI、符号数和过采样倍率；`MCSInfo` 与 `mcsTable` 提供调制阶数和编码率。
+- 调用方必须先构造 `GenWifi`，再调用实例方法；`GenWifi.Validate` 在分配大数组前检查帧格式、带宽、格式对应的 MCS 范围、GI、符号数和过采样倍率。
+- `GenWifi.GetMcsInfo` 根据 `frameFormat` 选择 `ehtMcsTable` 或 `heMcsTable`，其中 EHT 支持 MCS 0–13，HE 支持 MCS 0–11。
 - `_ActiveTones` 与 `_PilotTones` 决定不同带宽下的数据、导频和空子载波位置；`QamModulate` 完成 Gray 编码星座映射。
 - `_TrainingField` 生成前导训练字段，`_OfdmSymbol` 负责频域装载、IFFT 和循环前缀拼接。
-- `GenerateEhtWaveform` 是模块主入口，最终返回 `EHTWaveform`；其中既有时域样本，也有后续 EVM 解调所需的字段切片和参考星座。
+- `GenWifi.Generate` 是面向调用方的波形入口，并由私有函数 `_GenerateWifiWaveform` 完成组帧，最终返回 `WifiWaveform`；其中既有时域样本，也有后续 EVM 解调所需的格式、字段切片和参考星座。
 
 ### `inc/PaModel.py`
 
 ```mermaid
 flowchart TD
-    factory["CreatePaModel"] --> wiener["WienerPA"]
-    factory --> gmp["GMPPA"]
+    caller["调用方"] --> pa["构造 PaModel 实例"]
+    pa --> select{"modelName"}
+    select -->|wiener| wiener["WienerPA"]
+    select -->|gmp| gmp["GMPPA"]
+    pa --> paProcess["PaModel.Process"]
+    pa --> paGain["PaModel.SmallSignalGain"]
+    paProcess --> wienerProcess["WienerPA.Process"]
+    paProcess --> gmpProcess["GMPPA.Process"]
+    paGain --> wienerGain["WienerPA.SmallSignalGain"]
+    paGain --> gmpGain["GMPPA.SmallSignalGain"]
 
     wienerConfig["WienerConfig.Validate"] --> wiener
-    wiener --> wienerProcess["WienerPA.Process"]
-    wiener --> wienerGain["WienerPA.SmallSignalGain"]
     wienerProcess --> asComplex["_AsComplexVector"]
 
     gmpConfig["GMPConfig.Validate"] --> gmp
     defaults["_DefaultGmpCoefficients"] --> gmp
-    gmp --> gmpProcess["GMPPA.Process"]
-    gmp --> gmpGain["GMPPA.SmallSignalGain"]
     gmpProcess --> asComplex
     gmpProcess --> delay["_DelaySignal"]
 
-    iq["IQImbalancePA"] --> wrappedProcess["IQImbalancePA.Process"]
-    wrappedProcess --> wienerProcess
-    wrappedProcess --> gmpProcess
+    iq["IQImbalancePA"] --> pa
+    iq --> wrappedProcess["IQImbalancePA.Process"]
     iq --> iqGain["IQImbalancePA.SmallSignalGain"]
 
     awgn["AddAwgn"] --> asComplex
@@ -134,7 +144,8 @@ flowchart TD
 
 **图示说明：**
 
-- `CreatePaModel` 根据字符串选择默认 `WienerPA` 或 `GMPPA`；两种模型均由对应配置类先完成参数校验。
+- 调用方先创建 `PaModel(modelName="wiener" 或 "gmp")`；统一类根据名称持有 `WienerPA` 或 `GMPPA` 实现，并可接收对应的配置对象。
+- `PaModel.Process` 与 `PaModel.SmallSignalGain` 将调用委托给当前实现，因此主程序和 ILC 无须包含模型类型分支。
 - `WienerPA.Process` 依次执行线性记忆滤波、Rapp AM-AM 压缩和 AM-PM 相位旋转。
 - `GMPPA.Process` 使用 `_DelaySignal` 构造主项、滞后包络项和超前包络项；未提供系数时由 `_DefaultGmpCoefficients` 创建稳定的默认模型。
 - `IQImbalancePA` 在已有 PA 输出上增加共轭镜像，用于测试增广 ILC；`AddAwgn` 模拟反馈接收链噪声。
@@ -236,12 +247,15 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    analyze["AnalyzeSignal"] --> snr["CalculateSnr"]
-    analyze --> evm["CalculateEvm"]
-    analyze --> aclr["CalculateAclr"]
+    caller["调用方"] --> context["构造 Analysis(referenceSignal, waveform)"]
+    context --> stages["Analysis.AnalyzeStages"]
+    stages --> analyze["Analysis.Analyze"]
+    analyze --> snr["Analysis.CalculateSnr"]
+    analyze --> evm["Analysis.CalculateEvm"]
+    analyze --> aclr["Analysis.CalculateAclr"]
 
     snr --> gain["_BestComplexGain"]
-    evm --> demod["DemodulateEhtData"]
+    evm --> demod["Analysis.DemodulateWifiData"]
     evm --> gain
     aclr --> psd["_AveragePeriodogram"]
 
@@ -249,30 +263,30 @@ flowchart TD
     evm --> metrics
     aclr --> metrics
     metrics --> toDict["SignalMetrics.ToDict"]
-    metrics --> print["PrintMetrics"]
-    metrics --> save["SaveMetrics"]
-    convergence["ILCIteration 列表"] --> saveConvergence["SaveConvergence"]
+    metrics --> print["Analysis.Print"]
+    metrics --> save["Analysis.Save"]
+    convergence["ILCIteration 列表"] --> saveConvergence["Analysis.SaveConvergence"]
 ```
 
 **图示说明：**
 
-- `AnalyzeSignal` 是统一分析入口，并行组织 SNR、EVM 和 ACLR 三条计算路径。
-- SNR 在移除最佳复增益后计算残差功率；EVM 先由 `DemodulateEhtData` 去循环前缀并 FFT，再与发送星座比较。
+- `Analysis` 构造时保存参考信号和 `WifiWaveform` 元数据；后续每个待测输出只需传给 `Analyze`，多个命名阶段可一次传给 `AnalyzeStages`。
+- SNR 在移除最佳复增益后计算残差功率；EVM 先由 `Analysis.DemodulateWifiData` 根据 `WifiWaveform` 的数据字段位置去循环前缀并 FFT，再与发送星座比较。
 - ACLR 通过 `_AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
-- 三类指标封装为 `SignalMetrics`，可由 `PrintMetrics` 输出到终端，也可由 `SaveMetrics` 写入 JSON/CSV。
-- `SaveConvergence` 独立保存每轮 ILC 的误差 RMS、NMSE 和输入峰值。
+- 三类指标封装为 `SignalMetrics`，由同一实例的 `Print` 输出到终端，或由 `Save` 写入 JSON/CSV。
+- `Analysis.SaveConvergence` 独立保存每轮 ILC 的误差 RMS、NMSE 和输入峰值。
 
 ### `inc/Benchmark.py`
 
 ```mermaid
 flowchart TD
     config["BenchmarkConfig"] --> run["RunAllIlcBenchmark"]
-    run --> waveform["GenerateEhtWaveform：训练帧和验证帧"]
-    run --> pa["CreatePaModel / IQImbalancePA"]
+    run --> waveform["两个 GenWifi 实例：训练帧和验证帧"]
+    run --> pa["PaModel / IQImbalancePA 实例"]
     run --> ilc["全部 ILC 更新律"]
     run --> deploy["全部 ILC 标签部署模型"]
 
-    ilc --> evaluate["AnalyzeSignal"]
+    ilc --> evaluate["Analysis.Analyze"]
     deploy --> deploymentEval["_EvaluateDeployment"]
     deploymentEval --> limit["_LimitAmplitude"]
     deploymentEval --> evaluate
@@ -298,9 +312,9 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    init["inc/__init__.py"] --> waveApi["EHTConfig / GenerateEhtWaveform"]
-    init --> paApi["WienerPA / GMPPA / CreatePaModel"]
-    init --> analysisApi["AnalyzeSignal"]
+    init["inc/__init__.py"] --> waveApi["GenWifi / WifiWaveform / MCS 表"]
+    init --> paApi["PaModel / WienerPA / GMPPA"]
+    init --> analysisApi["Analysis / SignalMetrics"]
     init --> ilcApi["ILCConfig / RunFrequencyDomainIlc"]
     init --> benchmarkApi["BenchmarkConfig / RunAllIlcBenchmark"]
 ```
@@ -311,20 +325,53 @@ flowchart LR
 - 外部调用者可以从 `inc` 直接导入波形生成、PA、分析、频域 ILC 和全方案基准测试入口，不需要了解各实现文件的位置。
 - 未在此处导出的下划线私有函数只供模块内部复用，避免将实现细节暴露为稳定接口。
 
-## EHT 支持范围
+## HE/EHT 支持范围
 
 - 带宽：20、40、80、160 MHz。
-- MCS：0–13，即 BPSK、QPSK、16/64/256/1024/4096-QAM 及对应码率。
-- 帧字段：L-STF、L-LTF、L-SIG、RL-SIG、U-SIG、EHT-SIG、EHT-STF、EHT-LTF、EHT-Data。
-- EHT 数据子载波间隔为 78.125 kHz；全带宽 RU 分别采用 242、484、996 和 2×996 tones。
+- EHT MCS：0–13，即 BPSK、QPSK、16/64/256/1024/4096-QAM 及对应码率。
+- HE MCS：0–11，即 BPSK、QPSK、16/64/256/1024-QAM 及对应码率。
+- EHT 字段：L-STF、L-LTF、L-SIG、RL-SIG、U-SIG、EHT-SIG、EHT-STF、EHT-LTF、EHT-Data。
+- HE-SU 字段：L-STF、L-LTF、L-SIG、RL-SIG、HE-SIG-A、HE-STF、HE-LTF、HE-Data。
+- HE/EHT 数据子载波间隔为 78.125 kHz；全带宽 RU 分别采用 242、484、996 和 2×996 tones。
 - 数据 GI 支持 0.8、1.6、3.2 μs。
 
 波形用于 PA/DPD 激励与指标评估，载荷采用随机 post-FEC 比特。它不包含可用于协议一致性测试的完整 LDPC 编解码、MAC/A-MPDU 组帧或 SIG 字段逐比特编码。
 
 ## 快速运行
 
+代码调用统一使用实例接口：
+
+```python
+from inc.Analysis import Analysis
+from inc.PaModel import PaModel
+from inc.waveGen import GenWifi
+
+wifiGenerator = GenWifi(
+    frameFormat="HE",
+    bandwidthMhz=80,
+    mcs=11,
+    numDataSymbols=20,
+)
+waveform = wifiGenerator.Generate()
+referenceSignal = 0.24 * waveform.samples
+
+paModel = PaModel(modelName="wiener")
+paOutput = paModel.Process(referenceSignal)
+
+resultAnalysis = Analysis(referenceSignal, waveform)
+metrics = resultAnalysis.Analyze(paOutput)
+```
+
+命令行默认生成 EHT 帧：
+
 ```powershell
 python main.py
+```
+
+生成 HE-SU 帧：
+
+```powershell
+python main.py --format HE --bandwidth 80 --mcs 11
 ```
 
 指定 160 MHz、MCS 13 和 GMP PA：
@@ -371,7 +418,7 @@ python main.py --benchmark-all-ilc --bandwidth 20 --mcs 7 --pa wiener --symbols 
 Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi-Fi
 波形构造不可接受的完整 Jacobian 矩阵。增广方案以 IQ 镜像为代表场景；
 其共轭误差路径与扩展到 MIMO/crosstalk 时采用相同的增广矩阵思想。
-标签部署模型全部在不同随机种子的 EHT 帧上验证，而非在训练帧上评分。
+标签部署模型全部在相同 HE/EHT 格式、不同随机种子的帧上验证，而非在训练帧上评分。
 
 默认在 `results/` 生成：
 
@@ -383,7 +430,7 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 ## 指标定义
 
 - SNR：数据字段上去除最佳复增益后的重构信噪比。
-- EVM：对 EHT-Data 去循环前缀、FFT 后，在数据子载波上相对理想 QAM 星座计算 RMS EVM，同时输出 dB 与百分比。
+- EVM：对当前格式的 `HE-Data` 或 `EHT-Data` 去循环前缀、FFT 后，在数据子载波上相对理想 QAM 星座计算 RMS EVM，同时输出 dB 与百分比。
 - ACLR：主信道功率与上下相邻同带宽信道功率之比，输出上下邻道和较差值。为完整覆盖两个邻道，命令行采样倍率限制为 4 或 8。
 
 ## 验证
@@ -392,4 +439,4 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 python tests/TestProject.py
 ```
 
-验证内容包括全部 MCS 映射、四种带宽的 EHT 参数、理想链路 EVM，以及两类 PA 的 ILC 改善。
+验证内容包括 HE/EHT 字段结构、两套 MCS 映射、四种带宽、三种 GI、理想链路 EVM，以及两类 PA 的 ILC 改善。

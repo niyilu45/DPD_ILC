@@ -1,20 +1,22 @@
 """DPD-ILC simulation package."""
 
-from .waveGen import EHTConfig, EHTWaveform, GenerateEhtWaveform, mcsTable
-from .PaModel import GMPPA, WienerPA, CreatePaModel
-from .Analysis import AnalyzeSignal
+from .waveGen import GenWifi, MCSInfo, WifiWaveform, ehtMcsTable, heMcsTable
+from .PaModel import GMPPA, PaModel, WienerPA
+from .Analysis import Analysis, SignalMetrics
 from .DpdIlc import GMPPredistorter, ILCConfig, RunFrequencyDomainIlc
 from .Benchmark import BenchmarkConfig, RunAllIlcBenchmark
 
 __all__ = [
-    "EHTConfig",
-    "EHTWaveform",
-    "mcsTable",
-    "GenerateEhtWaveform",
+    "GenWifi",
+    "MCSInfo",
+    "WifiWaveform",
+    "ehtMcsTable",
+    "heMcsTable",
     "GMPPA",
+    "PaModel",
     "WienerPA",
-    "CreatePaModel",
-    "AnalyzeSignal",
+    "Analysis",
+    "SignalMetrics",
     "ILCConfig",
     "GMPPredistorter",
     "RunFrequencyDomainIlc",

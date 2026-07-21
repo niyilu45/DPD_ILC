@@ -8,7 +8,7 @@ from typing import Dict, List, Mapping
 
 import numpy as np
 
-from .Analysis import AnalyzeSignal, SignalMetrics
+from .Analysis import Analysis, SignalMetrics
 from .DeploymentModels import (
     FitLutPredistorter,
     FitNeuralPredistorter,
@@ -28,14 +28,15 @@ from .IlcVariants import (
     RunParameterDomainIlc,
     RunScalarPIlc,
 )
-from .PaModel import CreatePaModel, IQImbalancePA
-from .waveGen import EHTConfig, GenerateEhtWaveform
+from .PaModel import IQImbalancePA, PaModel
+from .waveGen import GenWifi
 
 
 @dataclass(frozen=True)
 class BenchmarkConfig:
     """Configure a compact but representative all-method comparison."""
 
+    frameFormat: str = "EHT"
     bandwidthMhz: int = 20
     mcs: int = 7
     numDataSymbols: int = 10
@@ -143,16 +144,16 @@ def _EvaluateDeployment(
     predistorter,
     validationSignal: np.ndarray,
     paModel,
-    validationWaveform,
+    resultAnalysis: Analysis,
     maxAmplitude: float,
 ) -> SignalMetrics:
-    """Evaluate one fitted DPD on a held-out EHT packet."""
+    """Evaluate one fitted DPD on a held-out Wi-Fi packet."""
 
     predistortedInput = _LimitAmplitude(
         predistorter.Process(validationSignal), maxAmplitude
     )
     paOutput = paModel.Process(predistortedInput)
-    return AnalyzeSignal(validationSignal, paOutput, validationWaveform)
+    return resultAnalysis.Analyze(paOutput)
 
 
 def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[BenchmarkRow]:
@@ -167,35 +168,35 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
 
     outputDirectory = Path(config.outputDirectory)
     outputDirectory.mkdir(parents=True, exist_ok=True)
-    trainingWaveform = GenerateEhtWaveform(
-        EHTConfig(
-            bandwidthMhz=config.bandwidthMhz,
-            mcs=config.mcs,
-            numDataSymbols=config.numDataSymbols,
-            guardIntervalUs=config.guardIntervalUs,
-            oversampling=config.oversampling,
-            seed=config.seed,
-        )
+    trainingGenerator = GenWifi(
+        frameFormat=config.frameFormat,
+        bandwidthMhz=config.bandwidthMhz,
+        mcs=config.mcs,
+        numDataSymbols=config.numDataSymbols,
+        guardIntervalUs=config.guardIntervalUs,
+        oversampling=config.oversampling,
+        seed=config.seed,
     )
-    validationWaveform = GenerateEhtWaveform(
-        EHTConfig(
-            bandwidthMhz=config.bandwidthMhz,
-            mcs=config.mcs,
-            numDataSymbols=config.numDataSymbols,
-            guardIntervalUs=config.guardIntervalUs,
-            oversampling=config.oversampling,
-            seed=config.seed + 97,
-        )
+    validationGenerator = GenWifi(
+        frameFormat=config.frameFormat,
+        bandwidthMhz=config.bandwidthMhz,
+        mcs=config.mcs,
+        numDataSymbols=config.numDataSymbols,
+        guardIntervalUs=config.guardIntervalUs,
+        oversampling=config.oversampling,
+        seed=config.seed + 97,
     )
+    trainingWaveform = trainingGenerator.Generate()
+    validationWaveform = validationGenerator.Generate()
     trainingSignal = config.driveRms * trainingWaveform.samples
     validationSignal = config.driveRms * validationWaveform.samples
-    paModel = CreatePaModel(config.paModelName)
+    paModel = PaModel(modelName=config.paModelName)
+    trainingAnalysis = Analysis(trainingSignal, trainingWaveform)
+    validationAnalysis = Analysis(validationSignal, validationWaveform)
     maxAmplitude = max(2.0, 1.6 * np.max(np.abs(trainingSignal)))
 
     baselineOutput = paModel.Process(trainingSignal)
-    baselineMetrics = AnalyzeSignal(
-        trainingSignal, baselineOutput, trainingWaveform
-    )
+    baselineMetrics = trainingAnalysis.Analyze(baselineOutput)
     rows: List[BenchmarkRow] = []
     _AddRow(
         rows,
@@ -272,9 +273,7 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             methodResult = methodFunction(
                 trainingSignal, paModel, methodConfig
             )
-        methodMetrics = AnalyzeSignal(
-            trainingSignal, methodResult.outputSignal, trainingWaveform
-        )
+        methodMetrics = trainingAnalysis.Analyze(methodResult.outputSignal)
         _AddRow(
             rows,
             methodName,
@@ -302,8 +301,8 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             randomSeed=config.seed + 7,
         ),
     )
-    constrainedMetrics = AnalyzeSignal(
-        trainingSignal, constrainedResult.outputSignal, trainingWaveform
+    constrainedMetrics = trainingAnalysis.Analyze(
+        constrainedResult.outputSignal
     )
     _AddRow(
         rows,
@@ -341,8 +340,8 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             randomSeed=config.seed + 8,
         ),
     )
-    noiseAwareMetrics = AnalyzeSignal(
-        trainingSignal, noiseAwareResult.outputSignal, trainingWaveform
+    noiseAwareMetrics = trainingAnalysis.Analyze(
+        noiseAwareResult.outputSignal
     )
     _AddRow(
         rows,
@@ -356,11 +355,9 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
 
     # Augmented ILC is evaluated in the IQ-image scenario for which its
     # conjugate branch is designed.
-    iqPaModel = IQImbalancePA(CreatePaModel(config.paModelName))
+    iqPaModel = IQImbalancePA(PaModel(modelName=config.paModelName))
     iqBaselineOutput = iqPaModel.Process(trainingSignal)
-    iqBaselineMetrics = AnalyzeSignal(
-        trainingSignal, iqBaselineOutput, trainingWaveform
-    )
+    iqBaselineMetrics = trainingAnalysis.Analyze(iqBaselineOutput)
     _AddRow(
         rows,
         "IQ-imbalance baseline",
@@ -379,8 +376,8 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             randomSeed=config.seed + 9,
         ),
     )
-    augmentedMetrics = AnalyzeSignal(
-        trainingSignal, augmentedResult.outputSignal, trainingWaveform
+    augmentedMetrics = trainingAnalysis.Analyze(
+        augmentedResult.outputSignal
     )
     _AddRow(
         rows,
@@ -395,14 +392,14 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
     # Fit every deployable model to the same converged ILC labels, then test
     # on a held-out EHT payload to measure generalization rather than recall.
     validationBaselineOutput = paModel.Process(validationSignal)
-    validationBaselineMetrics = AnalyzeSignal(
-        validationSignal, validationBaselineOutput, validationWaveform
+    validationBaselineMetrics = validationAnalysis.Analyze(
+        validationBaselineOutput
     )
     _AddRow(
         rows,
         "Validation baseline",
         "baseline",
-        "held-out EHT packet",
+        "held-out Wi-Fi packet",
         validationBaselineMetrics,
         validationBaselineMetrics,
     )
@@ -459,18 +456,19 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             predistorter,
             validationSignal,
             paModel,
-            validationWaveform,
+            validationAnalysis,
             maxAmplitude,
         )
         _AddRow(
             rows,
             methodName,
             "ILC label deployment",
-            "held-out EHT packet",
+            "held-out Wi-Fi packet",
             methodMetrics,
             validationBaselineMetrics,
         )
     metadata: Mapping[str, object] = {
+        "frameFormat": config.frameFormat.upper(),
         "bandwidthMhz": config.bandwidthMhz,
         "mcs": config.mcs,
         "numDataSymbols": config.numDataSymbols,

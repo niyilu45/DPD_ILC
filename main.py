@@ -1,25 +1,32 @@
-"""Command-line entry point for the EHT DPD-ILC simulation project."""
+"""Command-line entry point for the HE/EHT DPD-ILC simulation project."""
 
 import argparse
 from pathlib import Path
 
 import numpy as np
 
-from inc.Analysis import AnalyzeSignal, PrintMetrics, SaveConvergence, SaveMetrics
+from inc.Analysis import Analysis
 from inc.Benchmark import BenchmarkConfig, RunAllIlcBenchmark
 from inc.DpdIlc import FitGmpPredistorter, ILCConfig, RunFrequencyDomainIlc
-from inc.PaModel import CreatePaModel
-from inc.waveGen import EHTConfig, GenerateEhtWaveform
+from inc.PaModel import PaModel
+from inc.waveGen import GenWifi
 
 
 def Main() -> int:
-    """Generate an EHT packet, run PA/ILC/DPD stages, and save all metrics."""
+    """Generate a Wi-Fi packet, run PA/ILC/DPD stages, and save all metrics."""
 
     argumentParser = argparse.ArgumentParser(
         description=(
-            "Simulate EHT Wi-Fi excitation, a nonlinear PA, frequency-domain "
+            "Simulate HE/EHT Wi-Fi excitation, a nonlinear PA, frequency-domain "
             "ILC, and a fitted GMP predistorter."
         )
+    )
+    argumentParser.add_argument(
+        "--format",
+        dest="frameFormat",
+        choices=("EHT", "HE"),
+        default="EHT",
+        help="Wi-Fi PHY frame format (default: EHT)",
     )
     argumentParser.add_argument(
         "--bandwidth",
@@ -27,14 +34,14 @@ def Main() -> int:
         type=int,
         choices=(20, 40, 80, 160),
         default=80,
-        help="EHT channel bandwidth in MHz (default: 80)",
+        help="Wi-Fi channel bandwidth in MHz (default: 80)",
     )
     argumentParser.add_argument(
         "--mcs",
         type=int,
         choices=tuple(range(14)),
         default=11,
-        help="EHT MCS index from 0 through 13 (default: 11)",
+        help="MCS index: HE 0-11 or EHT 0-13 (default: 11)",
     )
     argumentParser.add_argument(
         "--pa",
@@ -48,7 +55,7 @@ def Main() -> int:
         dest="numDataSymbols",
         type=int,
         default=20,
-        help="Number of EHT data OFDM symbols (default: 20)",
+        help="Number of Wi-Fi data OFDM symbols (default: 20)",
     )
     argumentParser.add_argument(
         "--guard-interval",
@@ -56,7 +63,7 @@ def Main() -> int:
         type=float,
         choices=(0.8, 1.6, 3.2),
         default=0.8,
-        help="EHT data guard interval in microseconds (default: 0.8)",
+        help="Data guard interval in microseconds (default: 0.8)",
     )
     argumentParser.add_argument(
         "--oversampling",
@@ -117,7 +124,7 @@ def Main() -> int:
         "--seed",
         type=int,
         default=7,
-        help="Random seed for EHT data and training fields (default: 7)",
+        help="Random seed for Wi-Fi data and training fields (default: 7)",
     )
     argumentParser.add_argument(
         "--output-dir",
@@ -144,11 +151,14 @@ def Main() -> int:
         argumentParser.error("--drive must be positive")
     if arguments.numDataSymbols < 1:
         argumentParser.error("--symbols must be positive")
+    if arguments.frameFormat == "HE" and arguments.mcs > 11:
+        argumentParser.error("HE supports MCS values from 0 through 11")
 
     if arguments.benchmarkAllIlc:
         benchmarkDirectory = arguments.outputDirectory / "all_ilc_benchmark"
         RunAllIlcBenchmark(
             BenchmarkConfig(
+                frameFormat=arguments.frameFormat,
                 bandwidthMhz=arguments.bandwidthMhz,
                 mcs=arguments.mcs,
                 numDataSymbols=arguments.numDataSymbols,
@@ -164,7 +174,8 @@ def Main() -> int:
         print(f"\nAll-ILC results: {benchmarkDirectory.resolve()}")
         return 0
 
-    ehtConfig = EHTConfig(
+    wifiGenerator = GenWifi(
+        frameFormat=arguments.frameFormat,
         bandwidthMhz=arguments.bandwidthMhz,
         mcs=arguments.mcs,
         numDataSymbols=arguments.numDataSymbols,
@@ -172,9 +183,10 @@ def Main() -> int:
         oversampling=arguments.oversampling,
         seed=arguments.seed,
     )
-    waveform = GenerateEhtWaveform(ehtConfig)
+    waveform = wifiGenerator.Generate()
     referenceSignal = arguments.driveRms * waveform.samples
-    paModel = CreatePaModel(arguments.paModelName)
+    paModel = PaModel(modelName=arguments.paModelName)
+    resultAnalysis = Analysis(referenceSignal, waveform)
 
     # The first pass establishes the unlinearized baseline at the requested
     # operating point. The same PA instance is reused for every comparison.
@@ -197,7 +209,7 @@ def Main() -> int:
     )
 
     # ILC labels are waveform-specific. Ridge-regression fitting converts them
-    # into a causal GMP that can be evaluated on subsequent EHT packets.
+    # into a causal GMP that can be evaluated on subsequent Wi-Fi packets.
     gmpPredistorter = FitGmpPredistorter(
         referenceSignal,
         ilcResult.learnedInput,
@@ -215,26 +227,23 @@ def Main() -> int:
         )
     deployedDpdOutput = paModel.Process(deployedDpdInput)
 
-    stageMetrics = {
-        "PA baseline": AnalyzeSignal(
-            referenceSignal, baselineOutput, waveform
-        ),
-        "Waveform ILC": AnalyzeSignal(
-            referenceSignal, ilcResult.outputSignal, waveform
-        ),
-        "Fitted GMP DPD": AnalyzeSignal(
-            referenceSignal, deployedDpdOutput, waveform
-        ),
-    }
+    resultAnalysis.AnalyzeStages(
+        {
+            "PA baseline": baselineOutput,
+            "Waveform ILC": ilcResult.outputSignal,
+            "Fitted GMP DPD": deployedDpdOutput,
+        }
+    )
     print(
-        f"\nEHT {arguments.bandwidthMhz} MHz | MCS {arguments.mcs} "
+        f"\n{waveform.frameFormat} {arguments.bandwidthMhz} MHz | MCS {arguments.mcs} "
         f"({waveform.mcsInfo.modulation}, rate {waveform.mcsInfo.codeRate:.3f}) "
         f"| PA {arguments.paModelName}\n"
     )
-    PrintMetrics(stageMetrics)
+    resultAnalysis.Print()
 
     runMetadata = {
         "format": waveform.formatName,
+        "frameFormat": waveform.frameFormat,
         "bandwidthMhz": arguments.bandwidthMhz,
         "sampleRateHz": waveform.sampleRateHz,
         "oversampling": arguments.oversampling,
@@ -252,10 +261,10 @@ def Main() -> int:
         "feedbackAverages": arguments.feedbackAverages,
         "seed": arguments.seed,
     }
-    jsonPath, csvPath = SaveMetrics(
-        stageMetrics, arguments.outputDirectory, runMetadata
+    jsonPath, csvPath = resultAnalysis.Save(
+        arguments.outputDirectory, runMetadata
     )
-    convergencePath = SaveConvergence(
+    convergencePath = resultAnalysis.SaveConvergence(
         ilcResult.history, arguments.outputDirectory
     )
 

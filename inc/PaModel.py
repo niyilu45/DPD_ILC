@@ -1,6 +1,8 @@
 """Power-amplifier behavioral models used by the DPD-ILC simulation.
 
-Two nonlinear model families are provided:
+Callers construct ``PaModel`` with ``modelName="wiener"`` or
+``modelName="gmp"`` and then call ``Process``. Two nonlinear model families
+are provided internally:
 
 * ``WienerPA`` applies a linear memory filter followed by a smooth Rapp
   AM-AM characteristic and a saturating AM-PM characteristic.
@@ -213,6 +215,47 @@ class GMPPA:
         )
 
 
+class PaModel:
+    """Configure and operate one Wiener or GMP nonlinear PA model.
+
+    The facade gives every caller the same object-oriented construction and
+    processing interface while retaining the dedicated model implementations.
+
+    Example:
+        ``paModel = PaModel(modelName="wiener")``
+        ``outputSignal = paModel.Process(inputSignal)``
+    """
+
+    def __init__(
+        self,
+        modelName: str = "wiener",
+        wienerConfig: Optional[WienerConfig] = None,
+        gmpConfig: Optional[GMPConfig] = None,
+    ) -> None:
+        normalizedName = modelName.strip().lower()
+        if normalizedName == "wiener":
+            self.model = WienerPA(
+                WienerConfig() if wienerConfig is None else wienerConfig
+            )
+        elif normalizedName == "gmp":
+            self.model = GMPPA(
+                GMPConfig() if gmpConfig is None else gmpConfig
+            )
+        else:
+            raise ValueError("modelName must be either 'wiener' or 'gmp'")
+        self.modelName = normalizedName
+
+    def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Pass a complex waveform through the configured PA model."""
+
+        return self.model.Process(inputSignal)
+
+    def SmallSignalGain(self) -> complex:
+        """Return the configured model's DC small-signal complex gain."""
+
+        return self.model.SmallSignalGain()
+
+
 class IQImbalancePA:
     """Wrap any PA with a widely-linear output IQ-imbalance model."""
 
@@ -342,14 +385,3 @@ def AddAwgn(
         + 1j * randomGenerator.standard_normal(complexInput.size)
     )
     return complexInput + complexNoise
-
-
-def CreatePaModel(modelName: str):
-    """Construct a default Wiener or GMP PA model by name."""
-
-    normalizedName = modelName.strip().lower()
-    if normalizedName == "wiener":
-        return WienerPA()
-    if normalizedName == "gmp":
-        return GMPPA()
-    raise ValueError("modelName must be either 'wiener' or 'gmp'")

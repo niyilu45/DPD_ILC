@@ -7,7 +7,7 @@ The waveform ILC follows the regularized update from the theory document:
 ``L[k] = mu * conj(H[k]) / (abs(H[k])**2 + lambda)``
 
 After convergence, a generalized memory polynomial is fitted to map the
-original EHT waveform onto the learned PA input. This converts waveform-
+original Wi-Fi waveform onto the learned PA input. This converts waveform-
 specific ILC labels into a reusable deployable predistorter.
 """
 
