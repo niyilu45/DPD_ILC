@@ -2,6 +2,13 @@
 
 本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `GenWifi` 实例生成 HE 或 EHT Wi-Fi 复基带训练波形，经 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以 GMP 拟合可复用的 DPD，并输出 SNR、EVM、ACLR 以及多方法功率-EVM 对比曲线。
 
+## 理论文档
+
+- [Wi-Fi 帧生成物理原理与推导](doc/WaveGen.md)：复基带、OFDM 正交性、QAM 归一化、MCS、循环前缀、HE/EHT 字段和 PAPR。
+- [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、Rapp AM-AM、AM-PM、GMP、频谱再生、IQ 失衡和反馈噪声。
+- [结果计算物理原理与推导](doc/Analysis.md)：最小二乘复增益、SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
+- [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
+
 安装依赖：
 
 ```powershell
