@@ -1,6 +1,14 @@
 # DPD-ILC HE/EHT Wi-Fi 仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `GenWifi` 实例生成 HE 或 EHT Wi-Fi 复基带训练波形，经 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以 GMP 拟合可复用的 DPD，并输出 SNR、EVM 和 ACLR。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `GenWifi` 实例生成 HE 或 EHT Wi-Fi 复基带训练波形，经 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以 GMP 拟合可复用的 DPD，并输出 SNR、EVM、ACLR 以及多方法功率-EVM 对比曲线。
+
+安装依赖：
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+工程使用 NumPy 完成信号处理，使用 Matplotlib 生成 PNG 曲线图。
 
 ## 工程结构
 
@@ -11,7 +19,7 @@ inc/PaModel.py          Wiener 和 GMP 非线性 PA
 inc/DpdIlc.py           频域 ILC 与 GMP DPD 拟合
 inc/IlcVariants.py      其他 ILC 更新律
 inc/DeploymentModels.py Volterra、LUT 和 NN 部署模型
-inc/Analysis.py         SNR、EVM、ACLR 及 CSV/JSON 输出
+inc/Analysis.py         SNR、EVM、ACLR、功率-EVM 曲线及结果输出
 inc/Benchmark.py        全 ILC 方案统一基准测试
 inc/__init__.py         公共接口汇总
 tests/TestProject.py    自包含验证脚本
@@ -58,8 +66,10 @@ flowchart TD
     correctedOutput --> analysisMethod
     analysis --> analysisMethod
     analysisMethod --> metrics["SNR / EVM / ACLR"]
+    analysisMethod --> powerCurve["多方法功率-EVM 扫描"]
     metrics --> console["控制台表格"]
     metrics --> files["CSV / JSON / 收敛历史"]
+    powerCurve --> curveFiles["PNG / CSV / JSON"]
 ```
 
 **图示说明：**
@@ -68,7 +78,8 @@ flowchart TD
 2. 调用 `GenWifi.Generate()` 后得到参考复基带波形 `s` 及字段边界、FFT、数据子载波等元数据；同一波形直接通过 PA 后形成未校正基线。
 3. 单方案模式执行正则化频域 ILC，寻找使 PA 输出逼近参考波形的理想输入 `u*`；全方案模式则调用统一基准测试，逐一运行所有 ILC 更新律。
 4. 收敛后的 `u*` 可直接用于重复波形测试，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN，从而形成可用于其他帧的部署模型。
-5. 所有输出最终传给同一个 `Analysis` 实例，由 `Analyze` 或 `AnalyzeStages` 统一计算 SNR、EVM 和 ACLR，再通过实例方法 `Print`、`Save` 和 `SaveConvergence` 输出结果。
+5. 所有输出最终传给同一个 `Analysis` 实例，由 `Analyze` 或 `AnalyzeStages` 统一计算 SNR、EVM 和 ACLR；`AnalyzePowerEvmCurve` 在多个 RMS 驱动点调用各方法，并把全部曲线绘制在同一张图上。
+6. `Print`、`Save`、`SaveConvergence` 和 `SavePowerEvmCurve` 分别输出控制台表格、指标文件、收敛历史以及功率-EVM PNG/CSV/JSON。
 
 图中从“生成独立验证 HE/EHT 帧”开始的支路专门验证部署模型的泛化能力；它使用相同格式配置和不同随机种子的载荷，不与 ILC 训练帧重复。
 
@@ -266,6 +277,10 @@ flowchart TD
     metrics --> print["Analysis.Print"]
     metrics --> save["Analysis.Save"]
     convergence["ILCIteration 列表"] --> saveConvergence["Analysis.SaveConvergence"]
+    context --> powerSweep["Analysis.AnalyzePowerEvmCurve"]
+    powerSweep --> curve["PowerEvmCurve"]
+    curve --> curveSave["Analysis.SavePowerEvmCurve"]
+    curveSave --> curveFiles["PNG / CSV / JSON"]
 ```
 
 **图示说明：**
@@ -275,6 +290,7 @@ flowchart TD
 - ACLR 通过 `_AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
 - 三类指标封装为 `SignalMetrics`，由同一实例的 `Print` 输出到终端，或由 `Save` 写入 JSON/CSV。
 - `Analysis.SaveConvergence` 独立保存每轮 ILC 的误差 RMS、NMSE 和输入峰值。
+- `AnalyzePowerEvmCurve` 接收一组严格递增的 RMS 驱动点和多个方法求值器，在每个功率点使用相同参考信号计算 EVM；`SavePowerEvmCurve` 将所有方法绘制到同一张 PNG 图，并同步保存原始 CSV/JSON 数据。
 
 ### `inc/Benchmark.py`
 
@@ -285,6 +301,7 @@ flowchart TD
     run --> pa["PaModel / IQImbalancePA 实例"]
     run --> ilc["全部 ILC 更新律"]
     run --> deploy["全部 ILC 标签部署模型"]
+    run --> powerSweep["全部方法功率-EVM 扫描"]
 
     ilc --> evaluate["Analysis.Analyze"]
     deploy --> deploymentEval["_EvaluateDeployment"]
@@ -296,6 +313,7 @@ flowchart TD
     ilc --> history["_SaveHistory"]
     row --> save["SaveBenchmarkResults"]
     row --> print["PrintBenchmarkResults"]
+    powerSweep --> curve["all_ilc_power_evm_curve.*"]
 ```
 
 **图示说明：**
@@ -305,6 +323,7 @@ flowchart TD
 - `_EvaluateDeployment` 对每个部署模型执行“DPD → 峰值限制 → PA → 指标分析”。
 - `_AddRow` 将指标及相对基线改善量写入 `BenchmarkRow`，`_SaveHistory` 为各更新律保留独立收敛曲线数据。
 - `SaveBenchmarkResults` 与 `PrintBenchmarkResults` 分别负责机器可读文件和控制台汇总表。
+- 基准模式默认在同一张图中比较标称 PA、全部 ILC 更新律、IQ 场景以及 MP/GMP/Volterra/LUT/NN 部署模型；每个 ILC 更新律在各功率点重新学习，部署模型则复用标称驱动点训练得到的固定系数。
 
 ### `inc/__init__.py`
 
@@ -335,11 +354,219 @@ flowchart LR
 - HE/EHT 数据子载波间隔为 78.125 kHz；全带宽 RU 分别采用 242、484、996 和 2×996 tones。
 - 数据 GI 支持 0.8、1.6、3.2 μs。
 
+完整 MCS 映射如下：
+
+| MCS | 调制方式 | 码率 | 支持格式 |
+| ---: | --- | ---: | --- |
+| 0 | BPSK | 1/2 | HE、EHT |
+| 1 | QPSK | 1/2 | HE、EHT |
+| 2 | QPSK | 3/4 | HE、EHT |
+| 3 | 16-QAM | 1/2 | HE、EHT |
+| 4 | 16-QAM | 3/4 | HE、EHT |
+| 5 | 64-QAM | 2/3 | HE、EHT |
+| 6 | 64-QAM | 3/4 | HE、EHT |
+| 7 | 64-QAM | 5/6 | HE、EHT |
+| 8 | 256-QAM | 3/4 | HE、EHT |
+| 9 | 256-QAM | 5/6 | HE、EHT |
+| 10 | 1024-QAM | 3/4 | HE、EHT |
+| 11 | 1024-QAM | 5/6 | HE、EHT |
+| 12 | 4096-QAM | 3/4 | 仅 EHT |
+| 13 | 4096-QAM | 5/6 | 仅 EHT |
+
 波形用于 PA/DPD 激励与指标评估，载荷采用随机 post-FEC 比特。它不包含可用于协议一致性测试的完整 LDPC 编解码、MAC/A-MPDU 组帧或 SIG 字段逐比特编码。
 
-## 快速运行
+## 参数参考
 
-代码调用统一使用实例接口：
+### 命令行参数
+
+以下参数均由 `main.py` 支持；未指定参数时使用表中的默认值。
+
+| 参数 | 可选值或类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `-h`, `--help` | 开关 | — | 显示完整命令行帮助。 |
+| `--format` | `EHT`、`HE` | `EHT` | Wi-Fi PHY 帧格式；HE 生成 HE-SU，EHT 生成单用户非 OFDMA EHT-MU 激励帧。 |
+| `--bandwidth` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
+| `--mcs` | EHT：`0–13`；HE：`0–11` | `11` | 调制编码方案索引；HE 不接受 MCS 12、13。 |
+| `--pa` | `wiener`、`gmp` | `wiener` | 非线性 PA 模型。 |
+| `--symbols` | 正整数 | `20` | 数据 OFDM 符号数。 |
+| `--guard-interval` | `0.8`、`1.6`、`3.2` | `0.8` | 数据 GI，单位 μs。 |
+| `--oversampling` | `4`、`8` | `4` | 过采样倍率；至少 4 倍时可完整计算上下邻道 ACLR。 |
+| `--drive` | 正浮点数 | `0.24` | 相对单位饱和幅度的 PA 输入 RMS 驱动电平。 |
+| `--power-start` | 正浮点数 | `0.08` | 功率-EVM 扫描的起始 RMS 驱动。 |
+| `--power-stop` | 大于 `--power-start` 的浮点数 | `0.40` | 功率-EVM 扫描的结束 RMS 驱动。 |
+| `--power-points` | 不小于 2 的整数 | `7` | 在起止 RMS 之间按对数间隔生成的扫描点数。 |
+| `--skip-power-evm-curve` | 开关 | 关闭 | 跳过功率-EVM 扫描及 PNG/CSV/JSON 输出。 |
+| `--iterations` | 正整数 | `8` | ILC 迭代次数。 |
+| `--learning-rate` | `0 < μ < 2` | `0.15` | ILC 学习增益。 |
+| `--regularization` | 正浮点数 | `1e-3` | 逆响应计算的正则化系数。 |
+| `--max-amplitude` | 正浮点数 | `2.0` | ILC 学习输入和部署 DPD 输入的峰值限制。 |
+| `--feedback-snr` | 浮点数或省略 | `None` | 反馈链 SNR，单位 dB；省略时使用无噪反馈。 |
+| `--feedback-averages` | 正整数 | `1` | 每轮 ILC 重复采集并平均的反馈次数。 |
+| `--seed` | 整数 | `7` | Wi-Fi 数据、训练字段及相关随机过程的种子。 |
+| `--output-dir` | 路径 | `results` | JSON、CSV、收敛历史和可选波形文件的输出目录。 |
+| `--save-waveforms` | 开关 | 关闭 | 额外保存 `waveforms.npz`。 |
+| `--benchmark-all-ilc` | 开关 | 关闭 | 运行全部 ILC 更新律及全部 ILC 标签部署模型。 |
+
+### `GenWifi` 参数
+
+调用方先构造 `GenWifi(...)`，再调用 `Generate()`。
+
+| 参数 | 类型或可选值 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `frameFormat` | `"EHT"`、`"HE"`，不区分大小写 | `"EHT"` | 选择 EHT 或 HE-SU 字段结构。 |
+| `bandwidthMhz` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
+| `mcs` | EHT：`0–13`；HE：`0–11` | `11` | MCS 索引。 |
+| `numDataSymbols` | 正整数 | `20` | 数据 OFDM 符号数。 |
+| `guardIntervalUs` | `0.8`、`1.6`、`3.2` | `0.8` | 数据 GI，单位 μs。 |
+| `oversampling` | 正整数 | `4` | Python 接口允许任意正整数；进行 ACLR 分析时采样率必须不低于 3 倍带宽，建议使用 4 或 8。 |
+| `seed` | 整数 | `7` | 载荷、导频和训练字段随机种子。 |
+
+`Generate()` 返回 `WifiWaveform`，其中包含 `samples`、采样率、带宽、FFT/CP 长度、数据和导频子载波、参考星座、字段切片、MCS 信息及帧格式。
+
+### `PaModel` 参数
+
+| 参数 | 类型或可选值 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `modelName` | `"wiener"`、`"gmp"`，不区分大小写 | `"wiener"` | 选择内部 PA 实现。 |
+| `wienerConfig` | `WienerConfig` 或 `None` | `None` | Wiener 模式的配置；`None` 使用默认配置。 |
+| `gmpConfig` | `GMPConfig` 或 `None` | `None` | GMP 模式的配置；`None` 使用默认配置。 |
+
+`WienerConfig` 支持：
+
+| 参数 | 默认值 | 约束或含义 |
+| --- | --- | --- |
+| `linearTaps` | `(1+0j, 0.055-0.025j, -0.018+0.012j)` | 非空复数 FIR 系数元组。 |
+| `linearGain` | `1.0` | 正数；线性增益。 |
+| `saturationAmplitude` | `1.0` | 正数；Rapp 饱和幅度。 |
+| `rappSmoothness` | `3.0` | 正数；Rapp 平滑度。 |
+| `ampmCoefficient` | `0.18` | AM-PM 相位旋转强度。 |
+
+`GMPConfig` 支持：
+
+| 参数 | 默认值 | 约束或含义 |
+| --- | --- | --- |
+| `nonlinearOrders` | `(1, 3, 5, 7)` | 非空正奇数阶元组。 |
+| `memoryDepth` | `3` | 正整数；主分支记忆深度。 |
+| `crossMemoryDepth` | `2` | 非负整数；交叉包络记忆深度。 |
+| `mainCoefficients` | `None` | 主项系数字典，键为 `(order, memoryIndex)`；`None` 使用内置稳定系数。 |
+| `laggingCoefficients` | `None` | 滞后交叉项字典，键为 `(order, memoryIndex, crossIndex)`。 |
+| `leadingCoefficients` | `None` | 超前交叉项字典，键为 `(order, memoryIndex, crossIndex)`。 |
+
+`PaModel.Process(inputSignal)` 返回 PA 复基带输出；`SmallSignalGain()` 返回当前模型的 DC 小信号复增益。
+
+PA 辅助接口还包括：
+
+| 接口 | 参数 | 默认值或说明 |
+| --- | --- | --- |
+| `WienerPA(config)` | `config` | 默认使用 `WienerConfig()`；通常建议通过 `PaModel` 构造。 |
+| `GMPPA(config)` | `config` | 默认使用 `GMPConfig()`；通常建议通过 `PaModel` 构造。 |
+| `IQImbalancePA(paModel, directCoefficient, imageCoefficient)` | `paModel`、直通系数、镜像系数 | `directCoefficient=1+0j`，`imageCoefficient=0.045·exp(j·0.35)`。 |
+| `AddAwgn(inputSignal, snrDb, randomGenerator)` | 输入、反馈 SNR、NumPy 随机数生成器 | `snrDb=None` 时原样复制输入，否则加入复高斯白噪声。 |
+
+### `Analysis` 参数与方法
+
+构造函数 `Analysis(referenceSignal, waveform)` 要求参考信号为非空有限复数组，且长度与 `WifiWaveform.samples` 相同。
+
+| 方法 | 参数 | 返回值或作用 |
+| --- | --- | --- |
+| `Analyze(measuredSignal)` | 与参考信号等长的 PA/DPD 输出 | 返回一个 `SignalMetrics`。 |
+| `AnalyzeStages(stageSignals)` | `{阶段名称: 输出数组}` 映射 | 批量计算并保存各阶段指标。 |
+| `CalculateSnr(measuredSignal)` | 待测输出 | 返回数据字段 SNR，单位 dB。 |
+| `CalculateEvm(measuredSignal)` | 待测输出 | 返回 `(evmDb, evmPercent)`。 |
+| `CalculateAclr(measuredSignal)` | 待测输出 | 返回 `(aclrLowerDb, aclrUpperDb, aclrWorstDb)`。 |
+| `DemodulateWifiData(measuredSignal)` | 待测输出 | 返回 HE/EHT 数据子载波星座。 |
+| `Print(stageMetrics=None)` | 可选指标映射 | 打印指标表；省略时使用最近一次 `AnalyzeStages` 的结果。 |
+| `Save(outputDirectory, runMetadata, stageMetrics=None)` | 输出路径、元数据、可选指标映射 | 写入 `metrics.json` 和 `metrics.csv`。 |
+| `SaveConvergence(ilcHistory, outputDirectory)` | ILC 历史、输出路径 | 写入 `ilc_convergence.csv`。 |
+| `AnalyzePowerEvmCurve(driveRmsValues, methodEvaluators)` | 递增驱动点、`{方法名: 求值器}` 映射 | 计算并保存一个 `PowerEvmCurve`；求值器接收当前参考信号和 RMS 驱动。 |
+| `SavePowerEvmCurve(outputDirectory, powerEvmCurve=None, fileStem="power_evm_curve")` | 输出路径、可选曲线、文件名前缀 | 将所有方法绘制在同一张图上，并写入 PNG、CSV 和 JSON。 |
+
+`SignalMetrics` 字段包括 `snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。`PowerEvmCurve` 保存 `driveRmsValues`、`inputPowerDb` 以及各方法的 EVM dB/百分比数组。
+
+### `ILCConfig` 与算法参数
+
+| 参数 | 默认值 | 约束或含义 |
+| --- | --- | --- |
+| `numIterations` | `8` | 正整数；迭代次数。 |
+| `learningRate` | `0.15` | `0 < μ < 2`；更新增益。 |
+| `regularization` | `1e-3` | 正数；逆响应或正规方程正则化。 |
+| `maxAmplitude` | `2.0` | 正数；学习输入峰值限制。 |
+| `feedbackSnrDb` | `None` | 反馈 SNR；`None` 表示无噪声。 |
+| `feedbackAverages` | `1` | 正整数；反馈平均次数。 |
+| `projectionBandwidthFactor` | `1.6` | 大于 1；频域 ILC 更新投影带宽相对信道带宽的倍率。 |
+| `responseFloorDb` | `-45.0` | 频率响应估计的低激励置信度门限。 |
+| `randomSeed` | `19` | 反馈噪声及算法随机过程种子。 |
+
+所有 ILC 入口都接收 `referenceSignal`、`paModel` 和 `ILCConfig`。附加参数如下：
+
+| 算法入口 | 附加参数及默认值 |
+| --- | --- |
+| `RunFrequencyDomainIlc` | `sampleRateHz`、`channelBandwidthHz`。 |
+| `RunScalarPIlc` | 无。 |
+| `RunComplexGainIlc` | 无。 |
+| `RunFirIlc` | `firLength=17`。 |
+| `RunDirectionalGaussNewtonIlc` | `finiteDifferenceRms=1e-3`。 |
+| `RunParameterDomainIlc` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`。 |
+| `RunAugmentedIqIlc` | 无。 |
+
+部署模型拟合入口支持：
+
+| 拟合入口 | 可配置参数及默认值 |
+| --- | --- |
+| `FitGmpPredistorter` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`、`crossMemoryDepth=2`、`ridgeFactor=1e-6`、`chunkSize=8192`。 |
+| `FitVolterraPredistorter` | `memoryDepth=3`、`ridgeFactor=1e-6`。 |
+| `FitLutPredistorter` | `binCount=64`、`ridgeFactor=1e-8`。 |
+| `FitNeuralPredistorter` | `memoryDepth=4`、`hiddenUnitCount=32`、`ridgeFactor=1e-5`、`randomSeed=71`。 |
+
+### `BenchmarkConfig` 参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `frameFormat` | `"EHT"` | `"EHT"` 或 `"HE"`。 |
+| `bandwidthMhz` | `20` | 20、40、80 或 160 MHz。 |
+| `mcs` | `7` | EHT 0–13，HE 0–11。 |
+| `numDataSymbols` | `10` | 数据 OFDM 符号数。 |
+| `oversampling` | `4` | 过采样倍率。 |
+| `guardIntervalUs` | `0.8` | 0.8、1.6 或 3.2 μs。 |
+| `driveRms` | `0.24` | PA 输入 RMS 驱动电平。 |
+| `numIterations` | `10` | 每种 ILC 的迭代预算。 |
+| `paModelName` | `"wiener"` | `"wiener"` 或 `"gmp"`。 |
+| `seed` | `101` | 训练帧随机种子；验证帧自动使用 `seed + 97`。 |
+| `powerStartRms` | `0.08` | 全方法功率-EVM 扫描起点。 |
+| `powerStopRms` | `0.40` | 全方法功率-EVM 扫描终点。 |
+| `powerPointCount` | `5` | 基准模式的扫描点数。 |
+| `generatePowerEvmCurve` | `True` | 是否生成全方法功率-EVM PNG/CSV/JSON。 |
+| `outputDirectory` | `results/all_ilc_benchmark` | 全方案 CSV、JSON 和各算法收敛历史目录。 |
+
+## 典型使用方式
+
+### 示例一：使用默认参数快速运行
+
+默认生成 EHT 80 MHz、MCS 11 波形，使用 Wiener PA 和 8 次频域 ILC，并输出 7 点三方法功率-EVM 曲线：
+
+```powershell
+python main.py
+```
+
+### 示例二：HE-SU + Wiener PA
+
+```powershell
+python main.py --format HE --bandwidth 80 --mcs 11 --pa wiener --symbols 20 --iterations 8
+```
+
+### 示例三：EHT 160 MHz + 4096-QAM + GMP PA
+
+```powershell
+python main.py --format EHT --bandwidth 160 --mcs 13 --pa gmp --symbols 20 --oversampling 4
+```
+
+### 示例四：指定功率范围、带噪反馈并保存波形
+
+```powershell
+python main.py --power-start 0.06 --power-stop 0.45 --power-points 9 --feedback-snr 45 --feedback-averages 4 --save-waveforms --output-dir results/noisy_feedback
+```
+
+### 示例五：使用 Python 实例接口完成 PA 和指标分析
 
 ```python
 from inc.Analysis import Analysis
@@ -360,47 +587,119 @@ paOutput = paModel.Process(referenceSignal)
 
 resultAnalysis = Analysis(referenceSignal, waveform)
 metrics = resultAnalysis.Analyze(paOutput)
+print(metrics.ToDict())
 ```
 
-命令行默认生成 EHT 帧：
+### 示例六：自定义 Wiener PA
 
-```powershell
-python main.py
+```python
+from inc.PaModel import PaModel, WienerConfig
+from inc.waveGen import GenWifi
+
+wifiGenerator = GenWifi(
+    frameFormat="EHT",
+    bandwidthMhz=20,
+    mcs=7,
+    numDataSymbols=10,
+)
+waveform = wifiGenerator.Generate()
+referenceSignal = 0.24 * waveform.samples
+
+wienerConfig = WienerConfig(
+    linearTaps=(1.0 + 0.0j, 0.04 - 0.02j),
+    linearGain=1.05,
+    saturationAmplitude=0.9,
+    rappSmoothness=2.5,
+    ampmCoefficient=0.12,
+)
+paModel = PaModel(modelName="wiener", wienerConfig=wienerConfig)
+paOutput = paModel.Process(referenceSignal)
 ```
 
-生成 HE-SU 帧：
+### 示例七：程序化运行频域 ILC 并批量分析
 
-```powershell
-python main.py --format HE --bandwidth 80 --mcs 11
+```python
+from inc.Analysis import Analysis
+from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
+from inc.PaModel import PaModel
+from inc.waveGen import GenWifi
+
+wifiGenerator = GenWifi(
+    frameFormat="EHT",
+    bandwidthMhz=20,
+    mcs=9,
+    numDataSymbols=10,
+    oversampling=4,
+    seed=21,
+)
+waveform = wifiGenerator.Generate()
+referenceSignal = 0.24 * waveform.samples
+paModel = PaModel(modelName="gmp")
+baselineOutput = paModel.Process(referenceSignal)
+
+ilcConfig = ILCConfig(
+    numIterations=10,
+    learningRate=0.15,
+    regularization=1e-3,
+    maxAmplitude=2.0,
+)
+ilcResult = RunFrequencyDomainIlc(
+    referenceSignal,
+    paModel,
+    waveform.sampleRateHz,
+    waveform.bandwidthHz,
+    ilcConfig,
+)
+
+resultAnalysis = Analysis(referenceSignal, waveform)
+resultAnalysis.AnalyzeStages(
+    {
+        "PA baseline": baselineOutput,
+        "Frequency-domain ILC": ilcResult.outputSignal,
+    }
+)
+resultAnalysis.Print()
 ```
 
-指定 160 MHz、MCS 13 和 GMP PA：
-
-```powershell
-python main.py --bandwidth 160 --mcs 13 --pa gmp --symbols 20
-```
-
-加入 45 dB 反馈噪声，并对每轮反馈平均 4 次：
-
-```powershell
-python main.py --feedback-snr 45 --feedback-averages 4
-```
-
-查看完整参数：
-
-```powershell
-python main.py --help
-```
-
-运行文档中的全部 ILC 更新律和 ILC 标签部署模型：
+### 示例八：运行全部 ILC 与部署模型
 
 ```powershell
 python main.py --benchmark-all-ilc --bandwidth 20 --mcs 7 --pa wiener --symbols 10 --iterations 10
 ```
 
-结果保存在 `results/all_ilc_benchmark/`，其中 `all_ilc_metrics.csv` 和
+也可通过 Python 配置：
+
+```python
+from pathlib import Path
+
+from inc.Benchmark import BenchmarkConfig, RunAllIlcBenchmark
+
+benchmarkConfig = BenchmarkConfig(
+    frameFormat="HE",
+    bandwidthMhz=20,
+    mcs=7,
+    numDataSymbols=10,
+    numIterations=10,
+    paModelName="wiener",
+    powerStartRms=0.08,
+    powerStopRms=0.40,
+    powerPointCount=5,
+    outputDirectory=Path("results/he_all_ilc"),
+)
+benchmarkRows = RunAllIlcBenchmark(benchmarkConfig)
+```
+
+查看命令行参数的实时帮助：
+
+```powershell
+python main.py --help
+```
+
+上述命令行示例的结果保存在 `results/all_ilc_benchmark/`，其中 `all_ilc_metrics.csv` 和
 `all_ilc_metrics.json` 包含每种方案的 SNR、EVM、ACLR 及相对基线改善量；
-每种迭代更新律还会生成独立的 `convergence_*.csv`。
+每种迭代更新律还会生成独立的 `convergence_*.csv`。全部方法的功率-EVM 对比输出为
+`all_ilc_power_evm_curve.png`、`all_ilc_power_evm_curve.csv` 和
+`all_ilc_power_evm_curve.json`。
 
 全方案测试包括：
 
@@ -426,12 +725,16 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 - `metrics.csv`：便于 Excel 或脚本统计的指标表；
 - `ilc_convergence.csv`：每轮 ILC 的 NMSE、误差 RMS 和输入峰值；
 - `waveforms.npz`：仅在指定 `--save-waveforms` 时输出。
+- `power_evm_curve.png`：PA 基线、频域 ILC、拟合 GMP DPD 的同图功率-EVM 曲线；
+- `power_evm_curve.csv`：每个 RMS/功率点的各方法 EVM dB 和百分比；
+- `power_evm_curve.json`：与曲线对应的结构化数据。
 
 ## 指标定义
 
 - SNR：数据字段上去除最佳复增益后的重构信噪比。
 - EVM：对当前格式的 `HE-Data` 或 `EHT-Data` 去循环前缀、FFT 后，在数据子载波上相对理想 QAM 星座计算 RMS EVM，同时输出 dB 与百分比。
 - ACLR：主信道功率与上下相邻同带宽信道功率之比，输出上下邻道和较差值。为完整覆盖两个邻道，命令行采样倍率限制为 4 或 8。
+- 功率-EVM：横轴为 `20·log10(driveRms)`，即相对单位饱和幅度的 RMS 输入功率 dB；纵轴为 RMS EVM dB，数值越低表示性能越好。普通模式比较 PA 基线、每个功率点重新学习的频域 ILC、以及复用标称功率训练系数的 GMP DPD。
 
 ## 验证
 
@@ -439,4 +742,4 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 python tests/TestProject.py
 ```
 
-验证内容包括 HE/EHT 字段结构、两套 MCS 映射、四种带宽、三种 GI、理想链路 EVM，以及两类 PA 的 ILC 改善。
+验证内容包括 HE/EHT 字段结构、两套 MCS 映射、四种带宽、三种 GI、理想链路 EVM、两类 PA 的 ILC 改善，以及多方法功率-EVM 数据与 PNG/CSV/JSON 输出。

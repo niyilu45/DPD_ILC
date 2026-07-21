@@ -46,6 +46,10 @@ class BenchmarkConfig:
     numIterations: int = 10
     paModelName: str = "wiener"
     seed: int = 101
+    powerStartRms: float = 0.08
+    powerStopRms: float = 0.40
+    powerPointCount: int = 5
+    generatePowerEvmCurve: bool = True
     outputDirectory: Path = Path("results/all_ilc_benchmark")
 
 
@@ -156,6 +160,31 @@ def _EvaluateDeployment(
     return resultAnalysis.Analyze(paOutput)
 
 
+def _RunIlcCurvePoint(
+    referenceSignal: np.ndarray,
+    driveRms: float,
+    paModel,
+    waveform,
+    methodName: str,
+    methodFunction,
+    methodConfig: ILCConfig,
+) -> np.ndarray:
+    """Run one selected ILC method at one power-EVM sweep point."""
+
+    del driveRms
+    if methodName == "Frequency-domain ILC":
+        return RunFrequencyDomainIlc(
+            referenceSignal,
+            paModel,
+            waveform.sampleRateHz,
+            waveform.bandwidthHz,
+            methodConfig,
+        ).outputSignal
+    return methodFunction(
+        referenceSignal, paModel, methodConfig
+    ).outputSignal
+
+
 def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[BenchmarkRow]:
     """Run every update law and every ILC-label deployment model.
 
@@ -197,6 +226,11 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
 
     baselineOutput = paModel.Process(trainingSignal)
     baselineMetrics = trainingAnalysis.Analyze(baselineOutput)
+    powerEvaluators = {
+        "PA baseline": lambda pointReference, _: paModel.Process(
+            pointReference
+        )
+    }
     rows: List[BenchmarkRow] = []
     _AddRow(
         rows,
@@ -283,6 +317,21 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             baselineMetrics,
         )
         _SaveHistory(methodName, methodResult, outputDirectory)
+        powerEvaluators[methodName] = (
+            lambda pointReference,
+            pointDrive,
+            selectedName=methodName,
+            selectedFunction=methodFunction,
+            selectedConfig=methodConfig: _RunIlcCurvePoint(
+                pointReference,
+                pointDrive,
+                paModel,
+                trainingWaveform,
+                selectedName,
+                selectedFunction,
+                selectedConfig,
+            )
+        )
 
     if frequencyResult is None:
         raise RuntimeError("frequency-domain ILC result was not generated")
@@ -313,6 +362,20 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
         baselineMetrics,
     )
     _SaveHistory("Constrained CFR-ILC", constrainedResult, outputDirectory)
+    powerEvaluators["Constrained CFR-ILC"] = (
+        lambda pointReference, _: RunFrequencyDomainIlc(
+            pointReference,
+            paModel,
+            trainingWaveform.sampleRateHz,
+            trainingWaveform.bandwidthHz,
+            ILCConfig(
+                numIterations=config.numIterations,
+                learningRate=0.12,
+                maxAmplitude=1.05 * np.max(np.abs(pointReference)),
+                randomSeed=config.seed + 7,
+            ),
+        ).outputSignal
+    )
 
     # Noise-aware learning uses a higher regularization and four averaged
     # feedback captures at 32 dB feedback SNR.
@@ -352,6 +415,23 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
         noisyBaselineMetrics,
     )
     _SaveHistory("Noise-aware ILC", noiseAwareResult, outputDirectory)
+    powerEvaluators["Noise-aware ILC"] = (
+        lambda pointReference, _: RunFrequencyDomainIlc(
+            pointReference,
+            paModel,
+            trainingWaveform.sampleRateHz,
+            trainingWaveform.bandwidthHz,
+            ILCConfig(
+                numIterations=config.numIterations,
+                learningRate=0.10,
+                regularization=1e-2,
+                maxAmplitude=maxAmplitude,
+                feedbackSnrDb=32.0,
+                feedbackAverages=4,
+                randomSeed=config.seed + 8,
+            ),
+        ).outputSignal
+    )
 
     # Augmented ILC is evaluated in the IQ-image scenario for which its
     # conjugate branch is designed.
@@ -388,6 +468,21 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
         iqBaselineMetrics,
     )
     _SaveHistory("Augmented IQ ILC", augmentedResult, outputDirectory)
+    powerEvaluators["IQ-imbalance baseline"] = (
+        lambda pointReference, _: iqPaModel.Process(pointReference)
+    )
+    powerEvaluators["Augmented IQ ILC"] = (
+        lambda pointReference, _: RunAugmentedIqIlc(
+            pointReference,
+            iqPaModel,
+            ILCConfig(
+                numIterations=config.numIterations,
+                learningRate=0.18,
+                maxAmplitude=maxAmplitude,
+                randomSeed=config.seed + 9,
+            ),
+        ).outputSignal
+    )
 
     # Fit every deployable model to the same converged ILC labels, then test
     # on a held-out EHT payload to measure generalization rather than recall.
@@ -467,6 +562,16 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             methodMetrics,
             validationBaselineMetrics,
         )
+        powerEvaluators[methodName] = (
+            lambda pointReference,
+            _,
+            selectedPredistorter=predistorter: paModel.Process(
+                _LimitAmplitude(
+                    selectedPredistorter.Process(pointReference),
+                    maxAmplitude,
+                )
+            )
+        )
     metadata: Mapping[str, object] = {
         "frameFormat": config.frameFormat.upper(),
         "bandwidthMhz": config.bandwidthMhz,
@@ -479,9 +584,32 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
         "paModel": config.paModelName,
         "trainingSeed": config.seed,
         "validationSeed": config.seed + 97,
+        "powerStartRms": config.powerStartRms,
+        "powerStopRms": config.powerStopRms,
+        "powerPointCount": config.powerPointCount,
+        "generatePowerEvmCurve": config.generatePowerEvmCurve,
     }
     SaveBenchmarkResults(rows, outputDirectory, metadata)
+    powerCurvePaths = None
+    if config.generatePowerEvmCurve:
+        powerDriveValues = np.geomspace(
+            config.powerStartRms,
+            config.powerStopRms,
+            config.powerPointCount,
+        )
+        trainingAnalysis.AnalyzePowerEvmCurve(
+            powerDriveValues, powerEvaluators
+        )
+        powerCurvePaths = trainingAnalysis.SavePowerEvmCurve(
+            outputDirectory,
+            fileStem="all_ilc_power_evm_curve",
+        )
     PrintBenchmarkResults(rows)
+    if powerCurvePaths is not None:
+        powerCsvPath, powerJsonPath, powerFigurePath = powerCurvePaths
+        print(f"\nPower-EVM CSV:  {powerCsvPath.resolve()}")
+        print(f"Power-EVM JSON: {powerJsonPath.resolve()}")
+        print(f"Power-EVM plot: {powerFigurePath.resolve()}")
     return rows
 
 

@@ -80,6 +80,33 @@ def Main() -> int:
         help="RMS PA input drive relative to unit saturation (default: 0.24)",
     )
     argumentParser.add_argument(
+        "--power-start",
+        dest="powerStartRms",
+        type=float,
+        default=0.08,
+        help="First RMS drive in the power-EVM sweep (default: 0.08)",
+    )
+    argumentParser.add_argument(
+        "--power-stop",
+        dest="powerStopRms",
+        type=float,
+        default=0.40,
+        help="Last RMS drive in the power-EVM sweep (default: 0.40)",
+    )
+    argumentParser.add_argument(
+        "--power-points",
+        dest="powerPointCount",
+        type=int,
+        default=7,
+        help="Number of logarithmically spaced power-EVM points (default: 7)",
+    )
+    argumentParser.add_argument(
+        "--skip-power-evm-curve",
+        dest="skipPowerEvmCurve",
+        action="store_true",
+        help="Skip the PNG/CSV/JSON multi-method power-EVM sweep",
+    )
+    argumentParser.add_argument(
         "--iterations",
         dest="numIterations",
         type=int,
@@ -153,6 +180,12 @@ def Main() -> int:
         argumentParser.error("--symbols must be positive")
     if arguments.frameFormat == "HE" and arguments.mcs > 11:
         argumentParser.error("HE supports MCS values from 0 through 11")
+    if arguments.powerStartRms <= 0.0:
+        argumentParser.error("--power-start must be positive")
+    if arguments.powerStopRms <= arguments.powerStartRms:
+        argumentParser.error("--power-stop must exceed --power-start")
+    if arguments.powerPointCount < 2:
+        argumentParser.error("--power-points must be at least 2")
 
     if arguments.benchmarkAllIlc:
         benchmarkDirectory = arguments.outputDirectory / "all_ilc_benchmark"
@@ -168,6 +201,10 @@ def Main() -> int:
                 numIterations=arguments.numIterations,
                 paModelName=arguments.paModelName,
                 seed=arguments.seed,
+                powerStartRms=arguments.powerStartRms,
+                powerStopRms=arguments.powerStopRms,
+                powerPointCount=arguments.powerPointCount,
+                generatePowerEvmCurve=not arguments.skipPowerEvmCurve,
                 outputDirectory=benchmarkDirectory,
             )
         )
@@ -254,6 +291,10 @@ def Main() -> int:
         "guardIntervalUs": arguments.guardIntervalUs,
         "paModel": arguments.paModelName,
         "driveRms": arguments.driveRms,
+        "powerStartRms": arguments.powerStartRms,
+        "powerStopRms": arguments.powerStopRms,
+        "powerPointCount": arguments.powerPointCount,
+        "generatePowerEvmCurve": not arguments.skipPowerEvmCurve,
         "ilcIterations": arguments.numIterations,
         "learningRate": arguments.learningRate,
         "regularization": arguments.regularization,
@@ -267,6 +308,37 @@ def Main() -> int:
     convergencePath = resultAnalysis.SaveConvergence(
         ilcResult.history, arguments.outputDirectory
     )
+
+    powerCurvePaths = None
+    if not arguments.skipPowerEvmCurve:
+        powerDriveValues = np.geomspace(
+            arguments.powerStartRms,
+            arguments.powerStopRms,
+            arguments.powerPointCount,
+        )
+        resultAnalysis.AnalyzePowerEvmCurve(
+            powerDriveValues,
+            {
+                "PA baseline": lambda pointReference, _: paModel.Process(
+                    pointReference
+                ),
+                "Frequency-domain ILC": lambda pointReference, _: (
+                    RunFrequencyDomainIlc(
+                        pointReference,
+                        paModel,
+                        waveform.sampleRateHz,
+                        waveform.bandwidthHz,
+                        ilcConfig,
+                    ).outputSignal
+                ),
+                "Fitted GMP DPD": lambda pointReference, _: paModel.Process(
+                    gmpPredistorter.Process(pointReference)
+                ),
+            },
+        )
+        powerCurvePaths = resultAnalysis.SavePowerEvmCurve(
+            arguments.outputDirectory
+        )
 
     if arguments.saveWaveforms:
         waveformPath = arguments.outputDirectory / "waveforms.npz"
@@ -284,6 +356,11 @@ def Main() -> int:
     print(f"Metrics JSON: {jsonPath.resolve()}")
     print(f"Metrics CSV:  {csvPath.resolve()}")
     print(f"ILC history:  {convergencePath.resolve()}")
+    if powerCurvePaths is not None:
+        powerCsvPath, powerJsonPath, powerFigurePath = powerCurvePaths
+        print(f"Power-EVM CSV:  {powerCsvPath.resolve()}")
+        print(f"Power-EVM JSON: {powerJsonPath.resolve()}")
+        print(f"Power-EVM plot: {powerFigurePath.resolve()}")
     return 0
 
 

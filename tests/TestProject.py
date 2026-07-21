@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 
 import numpy as np
 
@@ -133,6 +134,41 @@ def CheckIdealMetrics() -> None:
         assert metrics.evmPercent < 1e-10
 
 
+def CheckPowerEvmCurve() -> None:
+    """Verify multi-method power-EVM analysis and all saved file formats."""
+
+    wifiGenerator = GenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=7,
+        numDataSymbols=2,
+        oversampling=4,
+        seed=43,
+    )
+    waveform = wifiGenerator.Generate()
+    nominalReference = 0.24 * waveform.samples
+    paModel = PaModel(modelName="wiener")
+    resultAnalysis = Analysis(nominalReference, waveform)
+    curve = resultAnalysis.AnalyzePowerEvmCurve(
+        (0.10, 0.20, 0.30),
+        {
+            "Ideal": lambda pointReference, _: pointReference,
+            "PA baseline": lambda pointReference, _: paModel.Process(
+                pointReference
+            ),
+        },
+    )
+    assert curve.inputPowerDb.size == 3
+    assert set(curve.evmDbByMethod) == {"Ideal", "PA baseline"}
+    assert np.all(curve.evmDbByMethod["Ideal"] < -250.0)
+
+    with TemporaryDirectory() as temporaryDirectory:
+        outputPaths = resultAnalysis.SavePowerEvmCurve(
+            Path(temporaryDirectory)
+        )
+        assert all(outputPath.is_file() for outputPath in outputPaths)
+
+
 def CheckGuardIntervals() -> None:
     """Verify compatible 2x/4x long-training durations for every GI."""
 
@@ -197,6 +233,7 @@ def RunTests() -> None:
     CheckWifiBandwidths()
     CheckFormatSpecificMcsValidation()
     CheckIdealMetrics()
+    CheckPowerEvmCurve()
     CheckGuardIntervals()
     CheckIlcImprovement()
     print("All DPD-ILC project checks passed.")

@@ -4,7 +4,7 @@ import csv
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -26,6 +26,35 @@ class SignalMetrics:
         """Convert metrics to a JSON/CSV-ready dictionary."""
 
         return {key: float(value) for key, value in asdict(self).items()}
+
+
+@dataclass
+class PowerEvmCurve:
+    """Store a multi-method EVM sweep over PA input RMS drive levels."""
+
+    driveRmsValues: np.ndarray
+    inputPowerDb: np.ndarray
+    evmDbByMethod: Dict[str, np.ndarray]
+    evmPercentByMethod: Dict[str, np.ndarray]
+
+    def ToDict(self) -> Dict[str, object]:
+        """Convert all curve samples to a JSON-ready dictionary."""
+
+        return {
+            "driveRmsValues": self.driveRmsValues.astype(float).tolist(),
+            "inputPowerDb": self.inputPowerDb.astype(float).tolist(),
+            "methods": {
+                methodName: {
+                    "evmDb": self.evmDbByMethod[methodName]
+                    .astype(float)
+                    .tolist(),
+                    "evmPercent": self.evmPercentByMethod[methodName]
+                    .astype(float)
+                    .tolist(),
+                }
+                for methodName in self.evmDbByMethod
+            },
+        }
 
 
 def _BestComplexGain(
@@ -107,6 +136,7 @@ class Analysis:
         self.referenceSignal = complexReference
         self.waveform = waveform
         self.stageMetrics: Dict[str, SignalMetrics] = {}
+        self.powerEvmCurve: Optional[PowerEvmCurve] = None
 
     def _PrepareMeasuredSignal(self, measuredSignal: np.ndarray) -> np.ndarray:
         """Validate and normalize one measured signal for metric processing."""
@@ -256,6 +286,159 @@ class Analysis:
             for stageName, stageSignal in stageSignals.items()
         }
         return dict(self.stageMetrics)
+
+    def AnalyzePowerEvmCurve(
+        self,
+        driveRmsValues: Sequence[float],
+        methodEvaluators: Mapping[
+            str, Callable[[np.ndarray, float], np.ndarray]
+        ],
+    ) -> PowerEvmCurve:
+        """Evaluate multiple methods over one common RMS input-power sweep.
+
+        Every evaluator receives the reference waveform scaled to the current
+        RMS drive and the numeric drive value. An ILC evaluator may relearn at
+        every point, while a deployed DPD evaluator may reuse fixed nominal-
+        power coefficients. All methods are scored with identical references.
+        """
+
+        driveArray = np.asarray(driveRmsValues, dtype=float).reshape(-1)
+        if driveArray.size < 2:
+            raise ValueError("driveRmsValues must contain at least two points")
+        if not np.all(np.isfinite(driveArray)) or np.any(driveArray <= 0.0):
+            raise ValueError("driveRmsValues must contain finite positive values")
+        if np.any(np.diff(driveArray) <= 0.0):
+            raise ValueError("driveRmsValues must be strictly increasing")
+        if not methodEvaluators:
+            raise ValueError("methodEvaluators cannot be empty")
+
+        evmDbByMethod: Dict[str, np.ndarray] = {}
+        evmPercentByMethod: Dict[str, np.ndarray] = {}
+        for methodName, methodEvaluator in methodEvaluators.items():
+            methodEvmDb = []
+            methodEvmPercent = []
+            for driveRms in driveArray:
+                pointReference = float(driveRms) * self.waveform.samples
+                measuredSignal = methodEvaluator(
+                    pointReference, float(driveRms)
+                )
+                pointAnalysis = Analysis(pointReference, self.waveform)
+                pointMetrics = pointAnalysis.Analyze(measuredSignal)
+                methodEvmDb.append(pointMetrics.evmDb)
+                methodEvmPercent.append(pointMetrics.evmPercent)
+            evmDbByMethod[methodName] = np.asarray(methodEvmDb, dtype=float)
+            evmPercentByMethod[methodName] = np.asarray(
+                methodEvmPercent, dtype=float
+            )
+
+        self.powerEvmCurve = PowerEvmCurve(
+            driveRmsValues=driveArray,
+            inputPowerDb=20.0 * np.log10(driveArray),
+            evmDbByMethod=evmDbByMethod,
+            evmPercentByMethod=evmPercentByMethod,
+        )
+        return self.powerEvmCurve
+
+    def SavePowerEvmCurve(
+        self,
+        outputDirectory: Path,
+        powerEvmCurve: Optional[PowerEvmCurve] = None,
+        fileStem: str = "power_evm_curve",
+    ) -> Tuple[Path, Path, Path]:
+        """Save a multi-method power-EVM curve as CSV, JSON, and PNG."""
+
+        selectedCurve = (
+            self.powerEvmCurve if powerEvmCurve is None else powerEvmCurve
+        )
+        if selectedCurve is None:
+            raise ValueError("no power-EVM curve is available to save")
+        if not fileStem or any(
+            character in fileStem for character in '<>:"/\\|?*'
+        ):
+            raise ValueError("fileStem must be a valid simple file name")
+
+        outputPath = Path(outputDirectory)
+        outputPath.mkdir(parents=True, exist_ok=True)
+        csvPath = outputPath / f"{fileStem}.csv"
+        jsonPath = outputPath / f"{fileStem}.json"
+        figurePath = outputPath / f"{fileStem}.png"
+        methodNames = list(selectedCurve.evmDbByMethod)
+
+        fieldNames = ["driveRms", "inputPowerDb"]
+        for methodName in methodNames:
+            fieldNames.extend(
+                [f"{methodName} evmDb", f"{methodName} evmPercent"]
+            )
+        with csvPath.open("w", newline="", encoding="utf-8-sig") as csvFile:
+            csvWriter = csv.DictWriter(csvFile, fieldnames=fieldNames)
+            csvWriter.writeheader()
+            for pointIndex, driveRms in enumerate(
+                selectedCurve.driveRmsValues
+            ):
+                rowData = {
+                    "driveRms": float(driveRms),
+                    "inputPowerDb": float(
+                        selectedCurve.inputPowerDb[pointIndex]
+                    ),
+                }
+                for methodName in methodNames:
+                    rowData[f"{methodName} evmDb"] = float(
+                        selectedCurve.evmDbByMethod[methodName][pointIndex]
+                    )
+                    rowData[f"{methodName} evmPercent"] = float(
+                        selectedCurve.evmPercentByMethod[methodName][pointIndex]
+                    )
+                csvWriter.writerow(rowData)
+
+        with jsonPath.open("w", encoding="utf-8") as jsonFile:
+            json.dump(
+                selectedCurve.ToDict(),
+                jsonFile,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "matplotlib is required to save the power-EVM figure"
+            ) from error
+
+        figure, axes = plt.subplots(figsize=(10.5, 6.2))
+        markerStyles = ("o", "s", "^", "D", "v", "P", "X", "<", ">")
+        lineStyles = ("-", "--", "-.", ":")
+        for methodIndex, methodName in enumerate(methodNames):
+            axes.plot(
+                selectedCurve.inputPowerDb,
+                selectedCurve.evmDbByMethod[methodName],
+                label=methodName,
+                marker=markerStyles[methodIndex % len(markerStyles)],
+                linestyle=lineStyles[
+                    (methodIndex // len(markerStyles)) % len(lineStyles)
+                ],
+                linewidth=1.8,
+                markersize=5.0,
+            )
+        axes.set_xlabel("Input RMS power relative to unit saturation (dB)")
+        axes.set_ylabel("RMS EVM (dB, lower is better)")
+        axes.set_title("Power-EVM comparison")
+        axes.grid(True, which="both", linestyle=":", linewidth=0.7)
+        if len(methodNames) <= 6:
+            axes.legend(loc="best")
+        else:
+            axes.legend(
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0),
+                borderaxespad=0.0,
+            )
+        figure.tight_layout()
+        figure.savefig(figurePath, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+        return csvPath, jsonPath, figurePath
 
     def Print(
         self,
