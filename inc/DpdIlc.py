@@ -12,7 +12,7 @@ specific ILC labels into a reusable deployable predistorter.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -32,6 +32,7 @@ class ILCConfig:
     projectionBandwidthFactor: float = 1.6
     responseFloorDb: float = -45.0
     randomSeed: int = 19
+    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None
 
     def Validate(self) -> None:
         """Validate convergence, regularization, and feedback parameters.
@@ -55,6 +56,10 @@ class ILCConfig:
             raise ValueError("feedbackAverages must be positive")
         if self.projectionBandwidthFactor <= 1.0:
             raise ValueError("projectionBandwidthFactor must exceed 1")
+        if self.evmMseEvaluator is not None and not callable(
+            self.evmMseEvaluator
+        ):
+            raise TypeError("evmMseEvaluator must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -62,8 +67,15 @@ class ILCIteration:
     """Store one iteration of ILC convergence diagnostics."""
 
     iteration: int
+    mse: float
     errorRms: float
     nmseDb: float
+    linearCompensatedMse: float
+    linearCompensatedNmseDb: float
+    evmAlignedMse: Optional[float]
+    evmDb: Optional[float]
+    complexGainMagnitudeDb: float
+    complexGainPhaseDegrees: float
     inputPeak: float
 
 
@@ -74,6 +86,99 @@ class ILCResult:
     learnedInput: np.ndarray
     outputSignal: np.ndarray
     history: List[ILCIteration]
+
+
+def CalculateIterationMetrics(
+    iteration: int,
+    targetSignal: np.ndarray,
+    measuredOutput: np.ndarray,
+    inputPeak: float,
+    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None,
+) -> ILCIteration:
+    """Calculate raw, linear-compensated, and EVM-aligned MSE metrics.
+
+    The raw MSE preserves absolute amplitude and phase errors. The
+    linear-compensated MSE removes the least-squares common complex gain and
+    is therefore a useful EVM proxy when Wi-Fi frame metadata is unavailable.
+    An optional evaluator can add the exact normalized data-subcarrier MSE;
+    that value is mathematically equal to squared RMS EVM.
+
+    Args:
+        iteration: One-based ILC iteration index.
+        targetSignal: Ideal time-domain output target.
+        measuredOutput: PA feedback captured for the current input waveform.
+        inputPeak: Peak magnitude of the current PA input waveform.
+        evmMseEvaluator: Optional callable returning normalized EVM-aligned MSE.
+
+    Returns:
+        result: Complete immutable diagnostics for one ILC iteration.
+    """
+
+    complexTarget = np.asarray(targetSignal, dtype=np.complex128).reshape(-1)
+    complexMeasured = np.asarray(
+        measuredOutput, dtype=np.complex128
+    ).reshape(-1)
+    if complexTarget.size == 0 or complexTarget.shape != complexMeasured.shape:
+        raise ValueError("targetSignal and measuredOutput must have equal length")
+    if not np.all(np.isfinite(complexTarget)) or not np.all(
+        np.isfinite(complexMeasured)
+    ):
+        raise ValueError("iteration metric signals must contain finite samples")
+
+    numericFloor = np.finfo(float).tiny
+    targetPower = max(
+        float(np.mean(np.abs(complexTarget) ** 2)), numericFloor
+    )
+    rawError = complexTarget - complexMeasured
+    rawMse = float(np.mean(np.abs(rawError) ** 2))
+
+    # Least-squares projection separates a common gain/phase term from the
+    # waveform-shape residual. Dividing residual power by |g|^2 expresses the
+    # error back in reference-signal units before normalizing by target power.
+    gainDenominator = max(
+        float(np.vdot(complexTarget, complexTarget).real), numericFloor
+    )
+    complexGain = np.vdot(complexTarget, complexMeasured) / gainDenominator
+    fittedTarget = complexGain * complexTarget
+    orthogonalResidual = complexMeasured - fittedTarget
+    gainPower = max(float(np.abs(complexGain) ** 2), numericFloor)
+    linearCompensatedMse = float(
+        np.mean(np.abs(orthogonalResidual) ** 2) / gainPower
+    )
+    linearCompensatedNmse = linearCompensatedMse / targetPower
+
+    evmAlignedMse = None
+    evmDb = None
+    if evmMseEvaluator is not None:
+        evaluatedMse = float(evmMseEvaluator(complexMeasured))
+        if not np.isfinite(evaluatedMse) or evaluatedMse < 0.0:
+            raise ValueError(
+                "evmMseEvaluator must return a finite nonnegative value"
+            )
+        evmAlignedMse = evaluatedMse
+        evmDb = float(
+            10.0 * np.log10(max(evaluatedMse, numericFloor))
+        )
+
+    return ILCIteration(
+        iteration=int(iteration),
+        mse=rawMse,
+        errorRms=float(np.sqrt(rawMse)),
+        nmseDb=float(
+            10.0 * np.log10(max(rawMse, numericFloor) / targetPower)
+        ),
+        linearCompensatedMse=linearCompensatedMse,
+        linearCompensatedNmseDb=float(
+            10.0 * np.log10(max(linearCompensatedNmse, numericFloor))
+        ),
+        evmAlignedMse=evmAlignedMse,
+        evmDb=evmDb,
+        complexGainMagnitudeDb=float(
+            20.0 * np.log10(max(float(np.abs(complexGain)), numericFloor))
+        ),
+        complexGainPhaseDegrees=float(np.degrees(np.angle(complexGain))),
+        inputPeak=float(inputPeak),
+    )
 
 
 def NextPowerOfTwo(value: int) -> int:
@@ -193,7 +298,7 @@ def RunFrequencyDomainIlc(
 
     history: List[ILCIteration] = []
     targetPower = max(
-        np.mean(np.abs(targetSignal) ** 2), np.finfo(float).tiny
+        float(np.mean(np.abs(targetSignal) ** 2)), np.finfo(float).tiny
     )
 
     # Estimate H(f) once at a low-power operating point. A low-level probe
@@ -241,44 +346,33 @@ def RunFrequencyDomainIlc(
             paModel, inputSignal, config, randomGenerator
         )
         errorSignal = targetSignal - measuredOutput
-        errorPower = np.mean(np.abs(errorSignal) ** 2)
         currentInputPeak = float(np.max(np.abs(inputSignal)))
 
-        # Fixed-gain ILC can become nonmonotonic in strong compression. Select
-        # the best waveform using the gain-normalized residual that underlies
-        # reconstruction SNR and EVM. The first candidate is the unmodified
-        # PA input, so this rule cannot select a later, poorer calibration.
-        selectionDenominator = max(
-            np.vdot(targetSignal, targetSignal).real,
-            np.finfo(float).tiny,
+        # Retain all three MSE views before updating the waveform. When exact
+        # Wi-Fi EVM evaluation is available, best-iteration selection follows
+        # the same data-subcarrier objective reported to the user.
+        iterationMetrics = CalculateIterationMetrics(
+            iteration + 1,
+            targetSignal,
+            measuredOutput,
+            currentInputPeak,
+            config.evmMseEvaluator,
         )
-        selectionGain = np.vdot(targetSignal, measuredOutput) / selectionDenominator
-        fittedTarget = selectionGain * targetSignal
-        selectionResidual = measuredOutput - fittedTarget
-        selectionError = np.mean(np.abs(selectionResidual) ** 2) / max(
-            np.mean(np.abs(fittedTarget) ** 2), np.finfo(float).tiny
+        selectionError = (
+            iterationMetrics.evmAlignedMse
+            if iterationMetrics.evmAlignedMse is not None
+            else 10.0 ** (iterationMetrics.linearCompensatedNmseDb / 10.0)
         )
         if selectionError < bestSelectionError:
             bestSelectionError = selectionError
             bestInput = inputSignal.copy()
+        history.append(iterationMetrics)
 
         errorSpectrum = np.fft.fft(errorSignal, fftLength)
         updateSpectrum = projectionMask * learningFilter * errorSpectrum
         updateSignal = np.fft.ifft(updateSpectrum)[: targetSignal.size]
         inputSignal = LimitAmplitude(
             inputSignal + updateSignal, config.maxAmplitude
-        )
-
-        nmseDb = 10.0 * np.log10(
-            max(errorPower, np.finfo(float).tiny) / targetPower
-        )
-        history.append(
-            ILCIteration(
-                iteration=iteration + 1,
-                errorRms=float(np.sqrt(errorPower)),
-                nmseDb=float(nmseDb),
-                inputPeak=currentInputPeak,
-            )
         )
 
     finalOutput = paModel.Process(bestInput)
@@ -391,7 +485,8 @@ def BuildGmpBasisChunk(
         """Cache delayed slices shared by many polynomial terms.
 
         Processing details:
-            Algorithm: Resolve values according to state and ChainMap precedence, keeping caller-owned configuration behavior explicit.
+            Algorithm: Build each requested causal delay once per chunk and
+            reuse the cached slice across every polynomial basis term.
 
         Args:
             sampleDelay: Nonnegative causal delay measured in complex samples.

@@ -9,7 +9,12 @@ from typing import Callable, List
 
 import numpy as np
 
-from .DpdIlc import ILCConfig, ILCIteration, ILCResult
+from .DpdIlc import (
+    CalculateIterationMetrics,
+    ILCConfig,
+    ILCIteration,
+    ILCResult,
+)
 from .PaModel import AddAwgn
 
 
@@ -122,9 +127,6 @@ def RunWaveformUpdate(
         raise ValueError("referenceSignal cannot be empty")
     randomGenerator = np.random.default_rng(config.randomSeed)
     inputSignal = LimitAmplitude(targetSignal, config.maxAmplitude)
-    targetPower = max(
-        np.mean(np.abs(targetSignal) ** 2), np.finfo(float).tiny
-    )
     bestInput = inputSignal.copy()
     bestError = np.inf
     history: List[ILCIteration] = []
@@ -134,25 +136,22 @@ def RunWaveformUpdate(
             paModel, inputSignal, config, randomGenerator
         )
         errorSignal = targetSignal - measuredOutput
-        selectionError = SelectionError(targetSignal, measuredOutput)
+        iterationMetrics = CalculateIterationMetrics(
+            iteration + 1,
+            targetSignal,
+            measuredOutput,
+            float(np.max(np.abs(inputSignal))),
+            config.evmMseEvaluator,
+        )
+        selectionError = (
+            iterationMetrics.evmAlignedMse
+            if iterationMetrics.evmAlignedMse is not None
+            else 10.0 ** (iterationMetrics.linearCompensatedNmseDb / 10.0)
+        )
         if selectionError < bestError:
             bestError = selectionError
             bestInput = inputSignal.copy()
-
-        errorPower = np.mean(np.abs(errorSignal) ** 2)
-        history.append(
-            ILCIteration(
-                iteration=iteration + 1,
-                errorRms=float(np.sqrt(errorPower)),
-                nmseDb=float(
-                    10.0
-                    * np.log10(
-                        max(errorPower, np.finfo(float).tiny) / targetPower
-                    )
-                ),
-                inputPeak=float(np.max(np.abs(inputSignal))),
-            )
-        )
+        history.append(iterationMetrics)
         updateSignal = updateFunction(
             inputSignal, measuredOutput, errorSignal, iteration
         )
@@ -565,10 +564,6 @@ def RunParameterDomainIlc(
     bestError = np.inf
     history: List[ILCIteration] = []
     randomGenerator = np.random.default_rng(config.randomSeed)
-    targetPower = max(
-        np.mean(np.abs(targetSignal) ** 2), np.finfo(float).tiny
-    )
-
     for iteration in range(config.numIterations):
         inputSignal = normalizedBasis @ normalizedCoefficients
         inputSignal = LimitAmplitude(inputSignal, config.maxAmplitude)
@@ -576,25 +571,22 @@ def RunParameterDomainIlc(
             paModel, inputSignal, config, randomGenerator
         )
         errorSignal = targetSignal - measuredOutput
-        selectionError = SelectionError(targetSignal, measuredOutput)
+        iterationMetrics = CalculateIterationMetrics(
+            iteration + 1,
+            targetSignal,
+            measuredOutput,
+            float(np.max(np.abs(inputSignal))),
+            config.evmMseEvaluator,
+        )
+        selectionError = (
+            iterationMetrics.evmAlignedMse
+            if iterationMetrics.evmAlignedMse is not None
+            else 10.0 ** (iterationMetrics.linearCompensatedNmseDb / 10.0)
+        )
         if selectionError < bestError:
             bestError = selectionError
             bestInput = inputSignal.copy()
-
-        errorPower = np.mean(np.abs(errorSignal) ** 2)
-        history.append(
-            ILCIteration(
-                iteration=iteration + 1,
-                errorRms=float(np.sqrt(errorPower)),
-                nmseDb=float(
-                    10.0
-                    * np.log10(
-                        max(errorPower, np.finfo(float).tiny) / targetPower
-                    )
-                ),
-                inputPeak=float(np.max(np.abs(inputSignal))),
-            )
-        )
+        history.append(iterationMetrics)
         coefficientUpdate = inverseNormal @ (
             normalizedBasis.conj().T @ errorSignal
         )

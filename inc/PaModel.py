@@ -9,7 +9,9 @@ are provided internally:
 * ``GMPPA`` implements the generalized memory polynomial main, lagging,
   and leading cross terms described in the project theory document.
 
-Every model accepts and returns a one-dimensional complex baseband array.
+``PaModel`` accepts one complex stream. ``MimoPaModel`` owns one independent
+``PaModel`` per transmit chain, accepts a samples-by-chains matrix, and applies
+independent input drive and output-power calibration on every chain.
 """
 
 from collections import ChainMap
@@ -277,15 +279,6 @@ class GMPPA:
         )
 
 
-paModelDefaultParameters: Mapping[str, object] = MappingProxyType(
-    {
-        "modelName": "wiener",
-        "wienerConfig": None,
-        "gmpConfig": None,
-    }
-)
-
-
 class PaModel:
     """Configure and operate one Wiener or GMP nonlinear PA model.
 
@@ -307,7 +300,9 @@ class PaModel:
         """Initialize the PA facade and select its active model family.
 
         Processing details:
-            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+            Algorithm: Define immutable PA defaults inside this constructor,
+            then layer direct arguments and the caller-owned mapping ahead of
+            them so callers provide only values they intend to override.
 
         Args:
             modelName: Selected PA model family name.
@@ -318,6 +313,13 @@ class PaModel:
         Returns:
             result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
         """
+        self.defaultParameters: Mapping[str, object] = MappingProxyType(
+            {
+                "modelName": "wiener",
+                "wienerConfig": None,
+                "gmpConfig": None,
+            }
+        )
         parameterOverrides: Dict[str, object] = {}
         if modelName is not None:
             parameterOverrides["modelName"] = modelName
@@ -331,7 +333,7 @@ class PaModel:
         self.parameters: ChainMap[str, object] = ChainMap(
             parameterOverrides,
             externalParameters,
-            paModelDefaultParameters,
+            self.defaultParameters,
         )
         self.model = None
         self._activeConfiguration: Optional[
@@ -403,7 +405,7 @@ class PaModel:
         """
 
         unknownParameters = set(self.parameters).difference(
-            paModelDefaultParameters
+            self.defaultParameters
         )
         if unknownParameters:
             unknownNames = ", ".join(
@@ -486,6 +488,430 @@ class PaModel:
 
         self.SynchronizeModel()
         return self.model.SmallSignalGain()
+
+
+class MimoPaModel:
+    """Operate independent nonlinear PA models on all transmit chains.
+
+    Each chain can select its own Wiener/GMP configuration, input drive,
+    relative output power, and optional absolute output RMS target. The class
+    intentionally does not add electrical crosstalk; a coupled MIMO PA can be
+    introduced later without changing the samples-by-chains interface.
+    """
+
+    def __init__(
+        self,
+        parameters: Optional[Mapping[str, object]] = None,
+        **parameterOverrides: object,
+    ) -> None:
+        """Initialize all chain models with internal default parameters.
+
+        Processing details:
+            Algorithm: Define immutable defaults locally, layer caller
+            overrides with ``ChainMap``, validate every per-chain sequence,
+            and construct one independent ``PaModel`` for each transmit chain.
+
+        Args:
+            parameters: Optional caller-owned mapping containing overrides.
+            parameterOverrides: Highest-priority MIMO PA settings.
+
+        Returns:
+            result: None. Validated chain models and power settings are stored.
+        """
+
+        self.defaultParameters: Mapping[str, object] = MappingProxyType(
+            {
+                "numTransmitChains": 1,
+                "paParametersPerChain": None,
+                "inputPowerDbPerChain": None,
+                "outputPowerDbPerChain": None,
+                "targetOutputRmsPerChain": None,
+            }
+        )
+        if parameters is not None and not isinstance(parameters, Mapping):
+            raise TypeError("parameters must be a mapping or None")
+        externalParameters = {} if parameters is None else parameters
+        self.parameters: ChainMap[str, object] = ChainMap(
+            dict(parameterOverrides),
+            externalParameters,
+            self.defaultParameters,
+        )
+        self.paModels = []
+        self._activePaParameterSnapshot = None
+        self.lastOutputRmsPerChain: Tuple[float, ...] = tuple()
+        self.SynchronizeModels()
+
+    @property
+    def NumTransmitChains(self) -> int:
+        """Return the configured number of physical PA chains.
+
+        Processing details:
+            Algorithm: Resolve the validated integer from the parameter layers.
+
+        Returns:
+            result: Positive number of independent transmit chains.
+        """
+
+        return cast(int, self.parameters["numTransmitChains"])
+
+    numTransmitChains = NumTransmitChains
+
+    def GetParameters(self) -> Dict[str, object]:
+        """Return a flattened snapshot of effective MIMO PA parameters.
+
+        Processing details:
+            Algorithm: Resolve and copy every ``ChainMap`` entry so callers
+            cannot mutate the local highest-priority layer through the result.
+
+        Returns:
+            result: Dictionary containing chain count, model, and power values.
+        """
+
+        return dict(self.parameters)
+
+    def UpdateParameters(self, **parameterOverrides: object) -> None:
+        """Apply validated MIMO PA parameter overrides transactionally.
+
+        Processing details:
+            Algorithm: Update the local layer, rebuild chain models when their
+            configurations change, and restore the previous layer on failure.
+
+        Args:
+            parameterOverrides: Supported chain or power settings to update.
+
+        Returns:
+            result: None. Valid settings affect subsequent ``Process`` calls.
+        """
+
+        previousOverrides = dict(self.parameters.maps[0])
+        self.parameters.maps[0].update(parameterOverrides)
+        try:
+            self.SynchronizeModels()
+        except (TypeError, ValueError):
+            self.parameters.maps[0].clear()
+            self.parameters.maps[0].update(previousOverrides)
+            self.SynchronizeModels()
+            raise
+
+    def ResolveNumericSequence(
+        self,
+        parameterName: str,
+        defaultValue: float,
+        allowNoneEntries: bool = False,
+    ) -> Tuple[Optional[float], ...]:
+        """Resolve one scalar-per-chain numeric configuration sequence.
+
+        Processing details:
+            Algorithm: Expand a missing sequence to one default per chain,
+            require exact length, and convert every finite entry to float.
+
+        Args:
+            parameterName: Name of the sequence in the active parameter map.
+            defaultValue: Value used for every chain when the sequence is None.
+            allowNoneEntries: Whether individual entries may disable a target.
+
+        Returns:
+            result: Tuple containing one numeric or optional value per chain.
+        """
+
+        rawSequence = self.parameters[parameterName]
+        if rawSequence is None:
+            if allowNoneEntries:
+                return tuple(
+                    None for _ in range(self.numTransmitChains)
+                )
+            return tuple(
+                float(defaultValue) for _ in range(self.numTransmitChains)
+            )
+        if isinstance(rawSequence, (str, bytes)) or not isinstance(
+            rawSequence, Sequence
+        ):
+            raise TypeError(f"{parameterName} must be a sequence or None")
+        if len(rawSequence) != self.numTransmitChains:
+            raise ValueError(
+                f"{parameterName} must contain one value per transmit chain"
+            )
+        resolvedValues = []
+        for rawValue in rawSequence:
+            if rawValue is None and allowNoneEntries:
+                resolvedValues.append(None)
+                continue
+            if (
+                not isinstance(rawValue, (int, float))
+                or isinstance(rawValue, bool)
+                or not np.isfinite(rawValue)
+            ):
+                raise ValueError(
+                    f"{parameterName} entries must be finite numeric values"
+                )
+            resolvedValues.append(float(rawValue))
+        return tuple(resolvedValues)
+
+    def ResolvePaParametersPerChain(self) -> Tuple[Mapping[str, object], ...]:
+        """Resolve one ordinary ``PaModel`` override mapping per chain.
+
+        Processing details:
+            Algorithm: Expand ``None`` to empty mappings, validate exact chain
+            count and mapping types, then copy entries for stable comparison.
+
+        Returns:
+            result: Tuple of independent per-chain PA parameter dictionaries.
+        """
+
+        rawParameters = self.parameters["paParametersPerChain"]
+        if rawParameters is None:
+            return tuple({} for _ in range(self.numTransmitChains))
+        if isinstance(rawParameters, (str, bytes)) or not isinstance(
+            rawParameters, Sequence
+        ):
+            raise TypeError(
+                "paParametersPerChain must be a sequence of mappings or None"
+            )
+        if len(rawParameters) != self.numTransmitChains:
+            raise ValueError(
+                "paParametersPerChain must contain one mapping per chain"
+            )
+        resolvedParameters = []
+        for chainParameters in rawParameters:
+            if not isinstance(chainParameters, Mapping):
+                raise TypeError(
+                    "each paParametersPerChain entry must be a mapping"
+                )
+            resolvedParameters.append(dict(chainParameters))
+        return tuple(resolvedParameters)
+
+    def ValidateParameters(self) -> None:
+        """Validate chain count, model mappings, and power controls.
+
+        Processing details:
+            Algorithm: Reject unknown keys, validate the positive chain count,
+            resolve all per-chain sequences, and require positive RMS targets.
+
+        Returns:
+            result: None. Invalid settings raise descriptive exceptions.
+        """
+
+        unknownParameters = set(self.parameters).difference(
+            self.defaultParameters
+        )
+        if unknownParameters:
+            unknownNames = ", ".join(
+                sorted(str(parameterName) for parameterName in unknownParameters)
+            )
+            raise TypeError(f"unknown MimoPaModel parameters: {unknownNames}")
+        numTransmitChains = self.parameters["numTransmitChains"]
+        if (
+            not isinstance(numTransmitChains, int)
+            or isinstance(numTransmitChains, bool)
+            or numTransmitChains < 1
+            or numTransmitChains > 16
+        ):
+            raise ValueError("numTransmitChains must be an integer from 1 to 16")
+        self.ResolvePaParametersPerChain()
+        self.ResolveNumericSequence("inputPowerDbPerChain", 0.0)
+        self.ResolveNumericSequence("outputPowerDbPerChain", 0.0)
+        targetOutputRmsValues = self.ResolveNumericSequence(
+            "targetOutputRmsPerChain", 0.0, allowNoneEntries=True
+        )
+        if any(
+            targetValue is not None and targetValue <= 0.0
+            for targetValue in targetOutputRmsValues
+        ):
+            raise ValueError(
+                "targetOutputRmsPerChain entries must be positive or None"
+            )
+
+    def SynchronizeModels(self) -> None:
+        """Rebuild per-chain PA objects after live configuration changes.
+
+        Processing details:
+            Algorithm: Validate all settings, compare copied chain mappings
+            with the last snapshot, and reconstruct only when they differ.
+
+        Returns:
+            result: None. ``paModels`` always matches current configuration.
+        """
+
+        self.ValidateParameters()
+        paParameterSnapshot = self.ResolvePaParametersPerChain()
+        if paParameterSnapshot == self._activePaParameterSnapshot:
+            return
+        self.paModels = [
+            PaModel(parameters=chainParameters)
+            for chainParameters in paParameterSnapshot
+        ]
+        self._activePaParameterSnapshot = paParameterSnapshot
+
+    def SetOutputPowerDb(self, chainIndex: int, outputPowerDb: float) -> None:
+        """Set one chain's relative output-power calibration in decibels.
+
+        Processing details:
+            Algorithm: Copy the resolved per-chain dB tuple, replace one
+            indexed value, and commit it through transactional validation.
+
+        Args:
+            chainIndex: Zero-based transmit-chain index.
+            outputPowerDb: Desired relative output power in decibels.
+
+        Returns:
+            result: None. The selected chain changes on the next processing call.
+        """
+
+        if not isinstance(chainIndex, int) or isinstance(chainIndex, bool):
+            raise TypeError("chainIndex must be an integer")
+        if chainIndex < 0 or chainIndex >= self.numTransmitChains:
+            raise IndexError("chainIndex is outside the configured chain range")
+        resolvedValues = list(
+            self.ResolveNumericSequence("outputPowerDbPerChain", 0.0)
+        )
+        resolvedValues[chainIndex] = float(outputPowerDb)
+        self.UpdateParameters(outputPowerDbPerChain=tuple(resolvedValues))
+
+    def SetTargetOutputRms(
+        self, chainIndex: int, targetOutputRms: Optional[float]
+    ) -> None:
+        """Set or disable one chain's absolute output RMS target.
+
+        Processing details:
+            Algorithm: Copy the optional target sequence, update one entry,
+            and validate positive enabled targets transactionally.
+
+        Args:
+            chainIndex: Zero-based transmit-chain index.
+            targetOutputRms: Positive complex-envelope RMS, or None to disable.
+
+        Returns:
+            result: None. The new target applies to subsequent outputs.
+        """
+
+        if not isinstance(chainIndex, int) or isinstance(chainIndex, bool):
+            raise TypeError("chainIndex must be an integer")
+        if chainIndex < 0 or chainIndex >= self.numTransmitChains:
+            raise IndexError("chainIndex is outside the configured chain range")
+        rawTargets = self.parameters["targetOutputRmsPerChain"]
+        targetValues = (
+            [None] * self.numTransmitChains
+            if rawTargets is None
+            else list(rawTargets)
+        )
+        targetValues[chainIndex] = targetOutputRms
+        self.UpdateParameters(targetOutputRmsPerChain=tuple(targetValues))
+
+    def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Process every transmit column through its independent PA chain.
+
+        Processing details:
+            Algorithm: Apply per-chain input dB drive, nonlinear PA processing,
+            relative output dB calibration, and optional absolute RMS scaling;
+            stack outputs with the original samples-by-chains orientation.
+
+        Args:
+            inputSignal: Complex vector for one chain or matrix shaped samples
+                by the configured number of transmit chains.
+
+        Returns:
+            result: Processed complex array with the same dimensionality.
+        """
+
+        self.SynchronizeModels()
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        inputWasVector = complexInput.ndim == 1
+        if inputWasVector:
+            complexInput = complexInput.reshape(-1, 1)
+        if (
+            complexInput.ndim != 2
+            or complexInput.shape[1] != self.numTransmitChains
+        ):
+            raise ValueError(
+                "inputSignal must have one column per transmit chain"
+            )
+        if complexInput.shape[0] == 0 or not np.all(np.isfinite(complexInput)):
+            raise ValueError("inputSignal must contain finite samples")
+        outputColumns = []
+        outputRmsValues = []
+        for chainIndex in range(self.numTransmitChains):
+            chainOutput = self.ProcessChain(
+                complexInput[:, chainIndex], chainIndex
+            )
+            outputColumns.append(chainOutput)
+            outputRmsValues.append(
+                float(np.sqrt(np.mean(np.abs(chainOutput) ** 2)))
+            )
+        outputMatrix = np.column_stack(outputColumns)
+        self.lastOutputRmsPerChain = tuple(outputRmsValues)
+        if inputWasVector and self.numTransmitChains == 1:
+            return outputMatrix[:, 0]
+        return outputMatrix
+
+    def ProcessChain(
+        self, inputSignal: np.ndarray, chainIndex: int
+    ) -> np.ndarray:
+        """Process a vector through one selected PA and power calibration.
+
+        Processing details:
+            Algorithm: Apply this chain's input drive, nonlinear model,
+            relative output calibration, and optional absolute RMS target.
+            This method is also the independent plant used by per-chain ILC.
+
+        Args:
+            inputSignal: One-dimensional complex samples for one RF chain.
+            chainIndex: Zero-based physical PA index.
+
+        Returns:
+            result: Processed one-dimensional complex samples.
+        """
+
+        self.SynchronizeModels()
+        if not isinstance(chainIndex, int) or isinstance(chainIndex, bool):
+            raise TypeError("chainIndex must be an integer")
+        if chainIndex < 0 or chainIndex >= self.numTransmitChains:
+            raise IndexError("chainIndex is outside the configured chain range")
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        if complexInput.ndim != 1 or complexInput.size == 0:
+            raise ValueError("inputSignal must be a nonempty vector")
+        if not np.all(np.isfinite(complexInput)):
+            raise ValueError("inputSignal must contain finite samples")
+        inputPowerDbValues = self.ResolveNumericSequence(
+            "inputPowerDbPerChain", 0.0
+        )
+        outputPowerDbValues = self.ResolveNumericSequence(
+            "outputPowerDbPerChain", 0.0
+        )
+        targetOutputRmsValues = self.ResolveNumericSequence(
+            "targetOutputRmsPerChain", 0.0, allowNoneEntries=True
+        )
+        inputScale = 10.0 ** (
+            float(inputPowerDbValues[chainIndex]) / 20.0
+        )
+        chainOutput = self.paModels[chainIndex].Process(
+            inputScale * complexInput
+        )
+        outputScale = 10.0 ** (
+            float(outputPowerDbValues[chainIndex]) / 20.0
+        )
+        chainOutput = outputScale * chainOutput
+        targetOutputRms = targetOutputRmsValues[chainIndex]
+        if targetOutputRms is not None:
+            currentRms = np.sqrt(np.mean(np.abs(chainOutput) ** 2))
+            if currentRms <= np.finfo(float).tiny:
+                raise ValueError(
+                    "cannot set target RMS on a zero-power PA output"
+                )
+            chainOutput = float(targetOutputRms) * chainOutput / currentRms
+        return chainOutput
+
+    def GetOutputRmsPerChain(self) -> Tuple[float, ...]:
+        """Return RMS output powers measured during the most recent call.
+
+        Processing details:
+            Algorithm: Return an immutable tuple already calculated from each
+            output column, without reprocessing the waveform.
+
+        Returns:
+            result: One RMS complex-envelope value per transmit chain.
+        """
+
+        return tuple(self.lastOutputRmsPerChain)
 
 
 class IQImbalancePA:

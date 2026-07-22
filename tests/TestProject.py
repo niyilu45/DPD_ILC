@@ -1,7 +1,7 @@
 """Self-contained project checks that preserve the requested naming style."""
 
 import ast
-from collections import ChainMap
+import json
 from pathlib import Path
 import re
 import sys
@@ -14,15 +14,20 @@ projectRoot = Path(__file__).resolve().parents[1]
 if str(projectRoot) not in sys.path:
     sys.path.insert(0, str(projectRoot))
 
-from inc.Analysis import Analysis, analysisDefaultParameters
-from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
-from inc.Draw import Draw, drawDefaultParameters
-from inc.PaModel import PaModel, paModelDefaultParameters
+from inc.Analysis import Analysis
+from inc.DpdIlc import (
+    CalculateIterationMetrics,
+    ILCConfig,
+    RunFrequencyDomainIlc,
+)
+from inc.Draw import Draw
+from inc.MimoDpd import FitMimoGmpPredistorter, RunMimoFrequencyDomainIlc
+from inc.PaModel import MimoPaModel, PaModel
+from inc.SigProcess import SigProcess
 from inc.waveGen import (
     GenWifi,
     NormalizeFrameFormat,
     ehtMcsTable,
-    genWifiDefaultParameters,
     heMcsTable,
     vhtMcsTable,
 )
@@ -135,11 +140,58 @@ def CheckFunctionStyle() -> None:
             )
 
 
-def CheckChainMapConfiguration() -> None:
-    """Verify default fallback, live external edits, and direct overrides.
+def CheckFunctionPrincipleCoverage() -> None:
+    """Verify that every production function has an exact audit entry.
 
     Processing details:
-        Algorithm: Evaluate every documented constraint in deterministic order and stop at the first invalid condition without changing valid state.
+        Algorithm: Build parent links for each production AST, qualify every
+        function by its owning class or module, and require the resulting name
+        to appear verbatim in the function-principle audit document.
+
+    Returns:
+        result: None. Missing documentation mappings fail the project checks.
+    """
+
+    auditPath = projectRoot / "doc" / "FunctionPrinciples.md"
+    auditText = auditPath.read_text(encoding="utf-8")
+    sourceFiles = [projectRoot / "main.py"]
+    sourceFiles.extend(sorted((projectRoot / "inc").glob("*.py")))
+    checkedDefinitionCount = 0
+    for sourceFile in sourceFiles:
+        syntaxTree = ast.parse(sourceFile.read_text(encoding="utf-8"))
+        parentByNode = {}
+        for parentNode in ast.walk(syntaxTree):
+            for childNode in ast.iter_child_nodes(parentNode):
+                parentByNode[childNode] = parentNode
+        for syntaxNode in ast.walk(syntaxTree):
+            if not isinstance(
+                syntaxNode,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                continue
+            ownerName = sourceFile.stem
+            ancestorNode = parentByNode.get(syntaxNode)
+            while ancestorNode is not None:
+                if isinstance(ancestorNode, ast.ClassDef):
+                    ownerName = ancestorNode.name
+                    break
+                ancestorNode = parentByNode.get(ancestorNode)
+            qualifiedName = f"{ownerName}.{syntaxNode.name}"
+            assert f"`{qualifiedName}`" in auditText, (
+                f"missing function-principle mapping: {qualifiedName} "
+                f"at {sourceFile}:{syntaxNode.lineno}"
+            )
+            checkedDefinitionCount += 1
+    assert checkedDefinitionCount >= 197
+
+
+def CheckInternalDefaultConfiguration() -> None:
+    """Verify internal defaults, live external edits, and direct overrides.
+
+    Processing details:
+        Algorithm: Pass only caller-owned override dictionaries to each class,
+        verify that omitted values come from constructor-internal ChainMap
+        defaults, and ensure external edits remain visible.
 
     Returns:
         result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
@@ -151,11 +203,7 @@ def CheckChainMapConfiguration() -> None:
         "numDataSymbols": 1,
         "oversampling": 4,
     }
-    wifiParameters = ChainMap(
-        externalWifiParameters,
-        genWifiDefaultParameters,
-    )
-    wifiGenerator = GenWifi(parameters=wifiParameters)
+    wifiGenerator = GenWifi(parameters=externalWifiParameters)
     assert wifiGenerator.frameFormat == "EHT"
     assert wifiGenerator.seed == 7
 
@@ -172,35 +220,25 @@ def CheckChainMapConfiguration() -> None:
     except ValueError:
         pass
     else:
-        raise AssertionError("invalid ChainMap overrides must be rejected")
+        raise AssertionError("invalid parameter overrides must be rejected")
     assert wifiGenerator.mcs == 0
 
     externalPaParameters = {"modelName": "wiener"}
-    paParameters = ChainMap(
-        externalPaParameters,
-        paModelDefaultParameters,
-    )
-    paModel = PaModel(parameters=paParameters)
+    paModel = PaModel(parameters=externalPaParameters)
     assert paModel.modelName == "wiener"
     externalPaParameters["modelName"] = "gmp"
     paModel.Process(np.array([0.1 + 0.0j], dtype=np.complex128))
     assert paModel.modelName == "gmp"
     assert paModel.model.__class__.__name__ == "GMPPA"
 
-    analysisParameters = ChainMap(
-        {"maxSegmentLength": 1024},
-        analysisDefaultParameters,
-    )
+    analysisParameters = {"maxSegmentLength": 1024}
     analysisWaveform = GenWifi(
-        parameters=ChainMap(
-            {
-                "bandwidthMhz": 20,
-                "mcs": 0,
-                "numDataSymbols": 2,
-                "oversampling": 4,
-            },
-            genWifiDefaultParameters,
-        )
+        parameters={
+            "bandwidthMhz": 20,
+            "mcs": 0,
+            "numDataSymbols": 2,
+            "oversampling": 4,
+        }
     ).Generate()
     resultAnalysis = Analysis(
         analysisWaveform.samples,
@@ -210,18 +248,14 @@ def CheckChainMapConfiguration() -> None:
     assert resultAnalysis.GetParameters()["powerEvmFileStem"] == (
         "power_evm_curve"
     )
-    analysisParameters.maps[0]["powerEvmFileStem"] = "external_curve"
+    analysisParameters["powerEvmFileStem"] = "external_curve"
     assert resultAnalysis.GetParameters()["powerEvmFileStem"] == (
         "external_curve"
     )
     resultAnalysis.CalculateAclr(analysisWaveform.samples)
 
     externalDrawParameters = {"figureDpi": 100}
-    drawParameters = ChainMap(
-        externalDrawParameters,
-        drawDefaultParameters,
-    )
-    resultDraw = Draw(parameters=drawParameters)
+    resultDraw = Draw(parameters=externalDrawParameters)
     assert resultDraw.GetParameters()["powerEvmFileStem"] == (
         "power_evm_curve"
     )
@@ -229,6 +263,14 @@ def CheckChainMapConfiguration() -> None:
     assert resultDraw.GetParameters()["powerEvmFileStem"] == (
         "external_figure"
     )
+
+    # Production call sites must not reconstruct internal default layers.
+    for relativePath in ("main.py", "inc/Benchmark.py"):
+        callSiteSource = (projectRoot / relativePath).read_text(
+            encoding="utf-8"
+        )
+        assert "ChainMap" not in callSiteSource
+        assert "DefaultParameters" not in callSiteSource
 
 
 def CheckWifiFormats() -> None:
@@ -347,6 +389,144 @@ def CheckWifiBandwidths() -> None:
             assert waveform.pilotSubcarriers.size == pilotToneCount
 
 
+def CheckMimoSpatialStructure() -> None:
+    """Verify VHT/HE/EHT streams, mapping, CSD, and LTF dimensions.
+
+    Processing details:
+        Algorithm: Generate representative multi-stream packets for every
+        PHY, require an orthonormal antenna mapping, confirm independent data
+        dimensions, and invert mapping/CSD through the analysis demodulator.
+
+    Returns:
+        result: None. Assertions identify MIMO structure regressions.
+    """
+
+    formatCases = (
+        ("VHT", 2, 2, 2),
+        ("HE", 4, 3, 4),
+        ("EHT", 4, 4, 4),
+    )
+    for frameFormat, transmitCount, streamCount, ltfCount in formatCases:
+        waveform = GenWifi(
+            frameFormat=frameFormat,
+            bandwidthMhz=20,
+            mcs=3,
+            numDataSymbols=2,
+            oversampling=4,
+            numTransmitAntennas=transmitCount,
+            numSpatialStreams=streamCount,
+            spatialMapping="dft",
+            seed=101,
+        ).Generate()
+        assert waveform.samples.shape[1] == transmitCount
+        assert waveform.referenceDataSymbols.shape[2] == streamCount
+        assert waveform.ltfSymbolCount == ltfCount
+        assert waveform.cyclicShiftsSeconds.size == transmitCount
+        assert np.allclose(
+            waveform.spatialMappingMatrix.conj().T
+            @ waveform.spatialMappingMatrix,
+            np.eye(streamCount),
+            atol=1e-12,
+        )
+        resultAnalysis = Analysis(waveform.samples, waveform)
+        recoveredSymbols = resultAnalysis.DemodulatePreparedWifiData(
+            waveform.samples
+        )
+        assert np.allclose(
+            recoveredSymbols,
+            waveform.referenceDataSymbols,
+            atol=1e-11,
+        )
+        idealMetrics = resultAnalysis.Analyze(waveform.samples)
+        mimoMetrics = resultAnalysis.GetLastMimoMetrics()
+        assert idealMetrics.evmDb < -250.0
+        assert mimoMetrics is not None
+        assert len(mimoMetrics.evmDbPerSpatialStream) == streamCount
+
+    # Standard-generation stream limits are enforced independently from the
+    # number of physical antennas available to the caller.
+    for frameFormat in ("VHT", "HE", "EHT"):
+        GenWifi(
+            frameFormat=frameFormat,
+            numTransmitAntennas=8,
+            numSpatialStreams=8,
+        )
+        try:
+            GenWifi(
+                frameFormat=frameFormat,
+                numTransmitAntennas=9,
+                numSpatialStreams=9,
+            )
+        except ValueError as error:
+            assert "1 through 8" in str(error)
+        else:
+            raise AssertionError(
+                f"{frameFormat} must reject more than eight streams"
+            )
+
+
+def CheckMimoPaAndDpd() -> None:
+    """Verify independent PA power control and matrix DPD processing.
+
+    Processing details:
+        Algorithm: Drive equal chain inputs through equal PA models, verify
+        relative dB and absolute RMS controls, then exercise one short ILC and
+        fitted-GMP pass while preserving samples-by-chains shapes.
+
+    Returns:
+        result: None. Assertions cover power calibration and MIMO DPD APIs.
+    """
+
+    sampleIndices = np.arange(2048, dtype=float)
+    testVector = 0.08 * np.exp(1j * 2.0 * np.pi * sampleIndices / 37.0)
+    testMatrix = np.column_stack((testVector, testVector))
+    mimoPaModel = MimoPaModel(
+        numTransmitChains=2,
+        outputPowerDbPerChain=(0.0, -6.0),
+    )
+    relativeOutput = mimoPaModel.Process(testMatrix)
+    relativeRms = mimoPaModel.GetOutputRmsPerChain()
+    assert relativeOutput.shape == testMatrix.shape
+    assert np.isclose(
+        relativeRms[1] / relativeRms[0],
+        10.0 ** (-6.0 / 20.0),
+        rtol=1e-12,
+    )
+    mimoPaModel.SetTargetOutputRms(0, 0.12)
+    mimoPaModel.SetTargetOutputRms(1, 0.21)
+    mimoPaModel.Process(testMatrix)
+    assert np.allclose(
+        mimoPaModel.GetOutputRmsPerChain(), (0.12, 0.21), atol=1e-12
+    )
+
+    waveform = GenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=2,
+        numDataSymbols=2,
+        oversampling=4,
+        numTransmitAntennas=2,
+        numSpatialStreams=2,
+    ).Generate()
+    referenceSignal = 0.18 * waveform.samples
+    # Disable absolute normalization for a meaningful repeatable ILC plant.
+    mimoPaModel.UpdateParameters(targetOutputRmsPerChain=(None, None))
+    ilcResult = RunMimoFrequencyDomainIlc(
+        referenceSignal,
+        mimoPaModel,
+        waveform.sampleRateHz,
+        waveform.bandwidthHz,
+        ILCConfig(numIterations=1),
+    )
+    assert ilcResult.learnedInput.shape == referenceSignal.shape
+    assert ilcResult.outputSignal.shape == referenceSignal.shape
+    assert len(ilcResult.chainResults) == 2
+    predistorter = FitMimoGmpPredistorter(
+        referenceSignal, ilcResult.learnedInput
+    )
+    assert predistorter.Process(referenceSignal).shape == referenceSignal.shape
+
+
 def CheckFormatSpecificMcsValidation() -> None:
     """Verify each PHY rejects MCS and GI values introduced by later PHYs.
 
@@ -402,6 +582,117 @@ def CheckIdealMetrics() -> None:
         assert metrics.snrDb > 250.0
         assert metrics.evmDb < -250.0
         assert metrics.evmPercent < 1e-10
+
+
+def CheckSignalProcessingCompensation() -> None:
+    """Verify joint timing, frequency, and complex-gain compensation.
+
+    Processing details:
+        Algorithm: Synthesize a measurement with known integer and fractional
+        delay, carrier offset, sample-rate offset, and complex gain; require
+        ``SigProcess`` to recover each value and ``Analysis`` to consume the
+        same utility path before calculating metrics.
+
+    Returns:
+        result: None. Assertions bound estimator error and residual EVM.
+    """
+
+    waveform = GenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=9,
+        numDataSymbols=6,
+        oversampling=4,
+        seed=77,
+    ).Generate()
+    referenceSignal = 0.20 * waveform.samples
+    signalProcessingParameters = {
+        "maxIntegerDelaySamples": 64,
+        "maxSamplingFrequencyOffsetPpm": 100.0,
+        "timingWindowLength": 1024,
+        "interpolationHalfLength": 16,
+    }
+    signalProcessor = SigProcess(
+        referenceSignal,
+        waveform.sampleRateHz,
+        parameters=signalProcessingParameters,
+    )
+    expectedIntegerDelay = 7
+    expectedFractionalDelay = 0.28
+    expectedCarrierOffsetHz = 25000.0
+    expectedSamplingOffsetPpm = 40.0
+    expectedComplexGain = 0.73 * np.exp(1j * 0.42)
+    measuredIndices = np.arange(referenceSignal.size + 32, dtype=float)
+    referencePositions = (
+        measuredIndices
+        - expectedIntegerDelay
+        - expectedFractionalDelay
+    ) / (1.0 + expectedSamplingOffsetPpm / 1.0e6)
+    measuredSignal = signalProcessor.InterpolateSignal(
+        referenceSignal, referencePositions
+    )
+    measuredSignal *= expectedComplexGain * np.exp(
+        1j
+        * 2.0
+        * np.pi
+        * expectedCarrierOffsetHz
+        * measuredIndices
+        / waveform.sampleRateHz
+    )
+
+    processingResult = signalProcessor.Process(
+        measuredSignal,
+        estimationSlice=waveform.fieldSlices[waveform.dataFieldName],
+    )
+    assert processingResult.integerDelaySamples == expectedIntegerDelay
+    assert abs(
+        processingResult.fractionalDelaySamples
+        - expectedFractionalDelay
+    ) < 0.08
+    assert abs(
+        processingResult.carrierFrequencyOffsetHz
+        - expectedCarrierOffsetHz
+    ) < 500.0
+    assert abs(
+        processingResult.samplingFrequencyOffsetPpm
+        - expectedSamplingOffsetPpm
+    ) < 5.0
+    assert abs(abs(processingResult.complexGain) - abs(expectedComplexGain)) < 0.03
+    residualRatio = np.sqrt(
+        np.sum(
+            np.abs(processingResult.processedSignal - referenceSignal) ** 2
+        )
+        / np.sum(np.abs(referenceSignal) ** 2)
+    )
+    assert residualRatio < 0.03
+
+    resultAnalysis = Analysis(
+        referenceSignal,
+        waveform,
+        parameters={
+            "signalProcessingParameters": signalProcessingParameters
+        },
+    )
+    metrics = resultAnalysis.Analyze(measuredSignal)
+    assert metrics.evmDb < -30.0
+    assert resultAnalysis.GetLastSignalProcessingResult() is not None
+    resultAnalysis.AnalyzeStages({"Impaired": measuredSignal})
+    assert "Impaired" in resultAnalysis.GetStageSignalProcessingResults()
+    with TemporaryDirectory() as temporaryDirectory:
+        jsonPath, csvPath = resultAnalysis.Save(
+            Path(temporaryDirectory),
+            {"test": "signal processing"},
+        )
+        savedPayload = json.loads(jsonPath.read_text(encoding="utf-8"))
+        assert "Impaired" in savedPayload["signalProcessing"]
+        assert "carrierFrequencyOffsetHz" in csvPath.read_text(
+            encoding="utf-8-sig"
+        )
+    analysisSource = (projectRoot / "inc" / "Analysis.py").read_text(
+        encoding="utf-8"
+    )
+    assert "from .SigProcess import" in analysisSource
+    assert "def BestComplexGain" not in analysisSource
 
 
 def CheckPowerEvmCurve() -> None:
@@ -545,6 +836,80 @@ def CheckIlcImprovement() -> None:
         assert ilcMetrics.snrDb > baselineMetrics.snrDb
 
 
+def CheckMseEvmConvergence() -> None:
+    """Verify that reported EVM-aligned MSE exactly represents RMS EVM.
+
+    Processing details:
+        Algorithm: First apply only a common complex gain to prove that raw
+        MSE retains the linear mismatch while compensated metrics reject it.
+        Then run a short ILC, validate every new history field, and verify the
+        CSV and convergence PNG outputs used by normal result presentation.
+
+    Returns:
+        result: None. Assertions enforce metric identities and file content.
+    """
+
+    waveform = GenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=5,
+        numDataSymbols=3,
+        oversampling=4,
+        seed=91,
+    ).Generate()
+    referenceSignal = 0.20 * waveform.samples
+    resultAnalysis = Analysis(referenceSignal, waveform)
+    complexGain = 0.72 * np.exp(1j * 0.37)
+    gainOnlyOutput = complexGain * referenceSignal
+    gainOnlyMetrics = CalculateIterationMetrics(
+        1,
+        referenceSignal,
+        gainOnlyOutput,
+        float(np.max(np.abs(referenceSignal))),
+        resultAnalysis.CalculateEvmAlignedMse,
+    )
+    assert gainOnlyMetrics.mse > 1e-4
+    assert gainOnlyMetrics.linearCompensatedMse < 1e-25
+    assert gainOnlyMetrics.evmAlignedMse is not None
+    assert gainOnlyMetrics.evmAlignedMse < 1e-20
+
+    ilcResult = RunFrequencyDomainIlc(
+        referenceSignal,
+        PaModel(modelName="wiener"),
+        waveform.sampleRateHz,
+        waveform.bandwidthHz,
+        ILCConfig(
+            numIterations=3,
+            learningRate=0.25,
+            maxAmplitude=1.25,
+            evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
+        ),
+    )
+    assert len(ilcResult.history) == 3
+    for iterationRecord in ilcResult.history:
+        assert np.isclose(iterationRecord.mse, iterationRecord.errorRms**2)
+        assert iterationRecord.evmAlignedMse is not None
+        assert iterationRecord.evmDb is not None
+        assert np.isclose(
+            iterationRecord.evmDb,
+            10.0 * np.log10(iterationRecord.evmAlignedMse),
+        )
+
+    with TemporaryDirectory() as temporaryDirectory:
+        outputDirectory = Path(temporaryDirectory)
+        csvPath = resultAnalysis.SaveConvergence(
+            ilcResult.history, outputDirectory
+        )
+        figurePath = Draw().SaveConvergenceCurve(
+            ilcResult.history, outputDirectory
+        )
+        csvText = csvPath.read_text(encoding="utf-8-sig")
+        assert "mse" in csvText
+        assert "linearCompensatedMse" in csvText
+        assert "evmAlignedMse" in csvText
+        assert figurePath.is_file()
+
+
 def RunTests() -> None:
     """Run all project checks and report a compact success message.
 
@@ -558,14 +923,19 @@ def RunTests() -> None:
     CheckMcsTables()
     CheckFrameFormatAliases()
     CheckFunctionStyle()
-    CheckChainMapConfiguration()
+    CheckFunctionPrincipleCoverage()
+    CheckInternalDefaultConfiguration()
     CheckWifiFormats()
     CheckWifiBandwidths()
+    CheckMimoSpatialStructure()
+    CheckMimoPaAndDpd()
     CheckFormatSpecificMcsValidation()
     CheckIdealMetrics()
+    CheckSignalProcessingCompensation()
     CheckPowerEvmCurve()
     CheckGuardIntervals()
     CheckIlcImprovement()
+    CheckMseEvmConvergence()
     print("All DPD-ILC project checks passed.")
 
 

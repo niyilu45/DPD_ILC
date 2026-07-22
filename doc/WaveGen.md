@@ -383,7 +383,7 @@ flowchart LR
     G --> H["VHT-Data<br/>QAM/OFDM 数据"]
 ```
 
-**图 3 说明**：VHT 前三段保持传统设备可检测的兼容性，随后进入 VHT 专用 SIG、训练和数据字段。本工程实现单用户单空间流激励的字段顺序和时长；VHT-LTF 固定采用 3.2 µs 有效段加 0.8 µs GI，而 VHT-Data 可选择 0.4 或 0.8 µs GI。
+**图 3 说明**：VHT 前三段保持传统设备可检测的兼容性，随后进入 VHT 专用 SIG、训练和数据字段。本工程实现单用户 1–8 空间流激励的字段顺序和时长；VHT-LTF 采用 3.2 µs 有效段加 0.8 µs GI，并根据空间流数生成 1/2/4/6/8 个正交训练符号，而 VHT-Data 可选择 0.4 或 0.8 µs GI。
 
 ### 8.3 EHT 激励帧
 
@@ -415,7 +415,7 @@ flowchart LR
 
 `TrainingField` 用 64 点传统 OFDM 基准，在每个 20 MHz 子信道放置 52 个 BPSK 音调；多带宽时按 bonded 20 MHz 分段扩展。传统符号的有效时长约为 3.2 µs，CP 为 0.8 µs，合计 4 µs。
 
-VHT 中，L-STF/L-LTF/L-SIG 分别占 8/8/4 µs，VHT-SIG-A 占 8 µs，VHT-STF、单流 VHT-LTF 和 VHT-SIG-B 各占 4 µs。
+VHT 中，L-STF/L-LTF/L-SIG 分别占 8/8/4 µs，VHT-SIG-A 占 8 µs，VHT-STF 和 VHT-SIG-B 各占 4 µs；每个 VHT-LTF 占 4 µs，字段总时长随空间流所需的 LTF 符号数增长。
 
 代码中的主要 EHT 前导时长为：
 
@@ -446,6 +446,113 @@ T_{\mathrm{LTF}}=12.8+T_{\mathrm{GI}},
 ```
 
 即 13.6 µs 或 16.0 µs。
+
+### 8.7 空间流、物理发射链与 MIMO 映射
+
+空间流不是“把同一个 SISO 波形复制多份”。第 $r$ 条空间流在第 $k$ 个数据子载波上有自己的 QAM 符号 $S_r[k]$，代码也为各流产生独立导频极性。把所有流写成列向量：
+
+```math
+\mathbf s[k]=
+\begin{bmatrix}
+S_1[k]&S_2[k]&\cdots&S_{N_{SS}}[k]
+\end{bmatrix}^{T}.
+```
+
+其中 $N_{SS}$ 是空间流数，$N_{TX}$ 是物理发射链/PA 数，必须满足
+
+```math
+1\le N_{SS}\le N_{TX}.
+```
+
+工程约束 VHT/HE/EHT 的 $N_{SS},N_{TX}\le8$。空间映射矩阵
+
+```math
+\mathbf Q\in\mathbb C^{N_{TX}\times N_{SS}}
+```
+
+满足列正交归一条件
+
+```math
+\mathbf Q^{H}\mathbf Q=\mathbf I_{N_{SS}}.
+```
+
+于是映射后的物理链频域向量为
+
+```math
+\tilde{\mathbf x}[k]=\mathbf Q\mathbf s[k].
+```
+
+`direct` 映射把第 $r$ 条流直接送到第 $r$ 条链；多余链为空。`dft` 映射使用 DFT 矩阵的前 $N_{SS}$ 列，使一条流分散到全部发射链。`custom` 允许调用方提供任意满足上述形状和正交条件的复矩阵。
+
+> **EHT 上限说明**：802.11be 的早期候选特性曾讨论 16 空间流，但最终 EHT 信号配置采用最多 8 空间流。本工程按最终配置限制为 8，不把早期候选方案误标为标准 EHT。
+
+```mermaid
+flowchart LR
+    bits["每流独立比特"] --> qam["每流 QAM / pilots"]
+    qam --> streams["s[k]：NSS 维"]
+    streams --> mapping["Q：NTX × NSS 空间映射"]
+    mapping --> csd["每链 CSD 相位"]
+    csd --> ifft["每链独立 IFFT + CP"]
+    ifft --> pa["每链独立 PA"]
+```
+
+**图 6 说明**：空间流描述并行信息维度，物理链描述实际 DAC/RF/PA 路径。$N_{TX}>N_{SS}$ 时，映射矩阵可以把较少信息流分布到较多天线链；代码始终返回每条物理链的一列时域样本。
+
+### 8.8 循环移位分集（CSD）
+
+若第 $m$ 条物理链使用循环移位 $\tau_m$，频域中等效为子载波相关相位：
+
+```math
+D_m[k]=\exp\left(-j2\pi k\Delta f\tau_m\right).
+```
+
+令
+
+```math
+\mathbf D_{\mathrm{CSD}}[k]
+=\operatorname{diag}\{D_1[k],\ldots,D_{N_{TX}}[k]\},
+```
+
+最终送入各链 IFFT 的频域样本为
+
+```math
+\mathbf x[k]
+=\mathbf D_{\mathrm{CSD}}[k]\mathbf Q\mathbf s[k].
+```
+
+CSD 不改变单个子载波总功率，因为 $|D_m[k]|=1$；它改变不同天线链在频率上的相位关系。代码以 VHT/HE/EHT 发射链序号选择预设纳秒移位，`cyclicShiftEnabled=False` 时令全部 $\tau_m=0$。
+
+### 8.9 多流 LTF 的正交训练结构
+
+接收端若要区分 $N_{SS}$ 个空间维度，需要跨多个 LTF 符号发送正交训练码。代码建立训练矩阵
+
+```math
+\mathbf P\in\mathbb C^{N_{SS}\times N_{LTF}},
+\qquad
+\mathbf P\mathbf P^{H}=N_{LTF}\mathbf I,
+```
+
+并在第 $\ell$ 个 LTF 中用 $P_{r,\ell}$ 加权第 $r$ 条流。这样不同流在 LTF 维度上的内积为零，且每个码元素保持单位幅度。本工程采用 DFT 相位训练矩阵，并使用以下工程级 LTF 数量规则：
+
+| 空间流数 | 1 | 2 | 3–4 | 5–6 | 7–8 |
+|---:|---:|---:|---:|---:|---:|
+| LTF 符号数 | 1 | 2 | 4 | 6 | 8 |
+
+这保证训练维度不少于空间流数。需要强调：这里复现的是空间维度、字段数量和正交训练的物理结构，训练码和 SIG 内容仍是 PA/DPD 激励用途的工程实现，不是标准一致性测试向量。
+
+### 8.10 公共字段和总发射功率归一化
+
+传统兼容字段和公共 SIG 字段不是独立用户数据流。代码把同一公共字段复制到各物理链，施加各链 CSD，并乘 $1/\sqrt{N_{TX}}$，使复制后总传导功率不随链数线性增长。
+
+MIMO 整包归一化按所有物理链总功率定义：
+
+```math
+x_{\mathrm{rms,total}}
+=\sqrt{\frac{1}{N_s}\sum_{n=0}^{N_s-1}
+\sum_{m=1}^{N_{TX}}|x_m[n]|^2}.
+```
+
+归一化后该总 RMS 为 1；主程序乘 `driveRms=d` 后，总传导 RMS 为 $d$。单路 RMS 取决于空间映射、CSD、字段和数据，但可在 `MimoPaModel` 中再次独立调整。
 
 ---
 
@@ -538,6 +645,11 @@ P_{\mathrm{in,dB}}=10\log_{10}(d^2)=20\log_{10}d.
 | `guardIntervalUs` | 改变 CP 和 LTF 模式 | GI 越长，抗长多径能力越强，效率越低 |
 | `oversampling` | 扩大可观察频率范围 | ACLR 至少需要 3x，本工程默认 4x |
 | `seed` | 控制随机激励 | 固定 seed 可保证公平比较 |
+| `numTransmitAntennas` | 改变物理发射链与 PA 列数 | VHT/HE/EHT 最大 8 |
+| `numSpatialStreams` | 改变独立 QAM/导频/训练维度 | 不得大于发射链数 |
+| `spatialMapping` | 选择 direct、DFT 或 custom 正交映射 | 改变各空间流在 PA 之间的分布 |
+| `spatialMappingMatrix` | 提供自定义 $N_{TX}\times N_{SS}$ 复矩阵 | 列必须正交归一 |
+| `cyclicShiftEnabled` | 打开/关闭每链频率相关相位 | 不改变理想单音总功率 |
 
 ---
 
@@ -551,16 +663,18 @@ P_{\mathrm{in,dB}}=10\log_{10}(d^2)=20\log_{10}d.
 | 星座映射 | `QamModulate` | 单位平均功率 BPSK/QAM |
 | 活动/导频音调 | `ActiveTones`、`PilotTones` | 中心化子载波索引 |
 | OFDM 调制 | `OfdmSymbol` | IFFT 有效符号和 CP |
+| 空间映射 | `BuildSpatialMappingMatrix`、`SpatialMapTones` | 每子载波物理链向量 |
+| 循环移位 | `GetCyclicShifts`、`BuildCsdPhaseMatrix` | 各链频率相关相位 |
+| 多流训练 | `GetLtfSymbolCount`、`BuildLtfTrainingMatrix` | 正交 LTF 符号 |
+| MIMO OFDM | `BuildMimoOfdmSymbol` | `samples × transmitChains` 时域符号 |
 | 前导激励 | `TrainingField` | 4 µs 传统速率宽带字段 |
 | 帧拼接 | `GenerateWifiWaveform` | `fieldSlices`、数据起点、完整帧 |
 | RMS 归一化 | `GenerateWifiWaveform` 末尾 | 单位 RMS `samples` |
 
-最典型的调用方式使用 `ChainMap` 将外部覆盖参数叠加在内置默认值之前：
+最典型的调用方式只提供需要修改的普通字典；默认值由 `GenWifi` 构造函数在类内部补齐：
 
 ```python
-from collections import ChainMap
-
-from inc.waveGen import GenWifi, genWifiDefaultParameters
+from inc.waveGen import GenWifi
 
 wifiOverrides = {
     "frameFormat": "11ac",
@@ -569,11 +683,7 @@ wifiOverrides = {
     "numDataSymbols": 20,
     "guardIntervalUs": 0.4,
 }
-wifiParameters = ChainMap(
-    wifiOverrides,
-    genWifiDefaultParameters,
-)
-wifiGenerator = GenWifi(parameters=wifiParameters)
+wifiGenerator = GenWifi(parameters=wifiOverrides)
 wifiWaveform = wifiGenerator.Generate()
 
 # The same instance now switches to the equivalent 802.11ax/HE input name.
@@ -582,7 +692,7 @@ wifiOverrides["guardIntervalUs"] = 0.8
 updatedWaveform = wifiGenerator.Generate()
 ```
 
-`GenWifi` 内部再建立“构造函数直接覆盖 → 外部映射 → 只读默认值”的 ChainMap。`UpdateParameters(...)` 可写入最高优先级层，`GetParameters()` 可取得当前解析结果的字典快照。
+`GenWifi` 在构造函数内部建立“构造函数直接覆盖 → 外部映射 → 类内只读默认值”的 `ChainMap`。调用方不需要导入默认参数表，也不需要显式创建 `ChainMap`。`UpdateParameters(...)` 可写入最高优先级层，`GetParameters()` 可取得当前解析结果的字典快照。
 
 ---
 
@@ -591,9 +701,10 @@ updatedWaveform = wifiGenerator.Generate()
 1. 波形适合 PA、DPD、ILC、EVM 和频谱再生研究，不是标准一致性向量。
 2. 未实现完整 MAC 帧、SERVICE/TAIL/PAD、加扰、LDPC/BCC、交织和译码。
 3. 前导字段强调字段顺序、持续时间和宽带激励，不是标准逐比特/逐采样训练序列。
-4. 当前系统假设单用户、满带宽，不实现多用户 RU 调度和多空间流 MIMO。
-5. 不包含无线多径、载波频偏、采样频偏和相位噪声；如需研究接收机，需要另外加入这些模型。
-6. EVM 分析使用生成时保存的理想 QAM 符号，因此发送和测量波形必须保持采样级对齐。
+4. 当前系统实现单用户、满带宽、最多 8 条空间流的 MIMO 激励；不实现多用户 RU 调度、MAC 调度或 OTA 信道矩阵。
+5. 空间映射和 LTF 具有正确的矩阵维度与正交结构，但训练序列/SIG 不是标准逐比特一致性向量。
+6. 不包含无线多径、相位噪声或天线耦合；时延、CFO、SFO 和复增益由分析端工具补偿，而非波形生成器主动注入。
+7. EVM 分析从时域参考重新解调并撤销 CSD/空间映射，因此发送和测量波形需要保持可同步关系。
 
 ---
 
@@ -602,6 +713,7 @@ updatedWaveform = wifiGenerator.Generate()
 - [IEEE 802.11ac-2013：Very High Throughput 修订标准](https://standards.ieee.org/ieee/802.11ac/4473/)
 - [IEEE 802.11ax-2021：High-Efficiency WLAN 修订标准](https://standards.ieee.org/ieee/802.11ax/7180/)
 - [IEEE 802.11be-2024：Extremely High Throughput 修订标准](https://standards.ieee.org/ieee/802.11be/7516/)
+- [Keysight 802.11be 信号配置简介：EHT 最多 8 空间流](https://helpfiles.keysight.com/csg/n5186/Content/WLAN/802%2011be%20Introduction.htm)
 - [IEEE Standards Board：802.11be-2024 批准信息](https://standards.ieee.org/about/sasb/sba/26sep2024/)
 
 以上标准链接用于说明 VHT/HE/EHT 的标准来源；本文中的具体“工程实现边界”以 `inc/waveGen.py` 为准。

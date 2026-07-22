@@ -1,21 +1,86 @@
 """Command-line entry point for the VHT/HE/EHT DPD-ILC simulation project."""
 
 import argparse
-from collections import ChainMap
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
-from inc.Analysis import Analysis, analysisDefaultParameters
+from inc.Analysis import Analysis
 from inc.Benchmark import BenchmarkConfig, RunAllIlcBenchmark
 from inc.DpdIlc import FitGmpPredistorter, ILCConfig, RunFrequencyDomainIlc
-from inc.Draw import Draw, drawDefaultParameters
-from inc.PaModel import PaModel, paModelDefaultParameters
+from inc.Draw import Draw
+from inc.MimoDpd import FitMimoGmpPredistorter, RunMimoFrequencyDomainIlc
+from inc.PaModel import MimoPaModel, PaModel
 from inc.waveGen import (
     GenWifi,
     NormalizeFrameFormat,
-    genWifiDefaultParameters,
 )
+
+
+def ParseFloatSequence(rawValue: str) -> tuple:
+    """Parse a comma-separated list of finite floating-point values.
+
+    Processing details:
+        Algorithm: Split on commas, reject empty fields, convert each token,
+        and require finite values suitable for per-chain PA settings.
+
+    Args:
+        rawValue: Command-line text such as ``0,-3.0,1.5``.
+
+    Returns:
+        result: Tuple of floats in physical transmit-chain order.
+    """
+
+    try:
+        values = tuple(
+            float(token.strip()) for token in rawValue.split(",")
+        )
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated numeric values"
+        ) from error
+    if not values or any(not np.isfinite(value) for value in values):
+        raise argparse.ArgumentTypeError(
+            "per-chain values must be finite and nonempty"
+        )
+    return values
+
+
+def ParseOptionalFloatSequence(rawValue: str) -> tuple:
+    """Parse positive RMS values while allowing ``none`` per PA chain.
+
+    Processing details:
+        Algorithm: Interpret case-insensitive ``none`` as a disabled target,
+        parse all other comma-separated tokens as positive finite floats.
+
+    Args:
+        rawValue: Text such as ``0.20,none,0.18``.
+
+    Returns:
+        result: Tuple containing positive floats or None entries.
+    """
+
+    values = []
+    for token in rawValue.split(","):
+        normalizedToken = token.strip().lower()
+        if normalizedToken == "none":
+            values.append(None)
+            continue
+        try:
+            numericValue = float(normalizedToken)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                "expected positive RMS values or 'none'"
+            ) from error
+        if not np.isfinite(numericValue) or numericValue <= 0.0:
+            raise argparse.ArgumentTypeError(
+                "enabled output RMS targets must be positive and finite"
+            )
+        values.append(numericValue)
+    if not values:
+        raise argparse.ArgumentTypeError("per-chain RMS list cannot be empty")
+    return tuple(values)
 
 
 def Main() -> int:
@@ -40,7 +105,7 @@ def Main() -> int:
         type=NormalizeFrameFormat,
         choices=("VHT", "HE", "EHT"),
         metavar="FORMAT",
-        default=genWifiDefaultParameters["frameFormat"],
+        default=None,
         help=(
             "Wi-Fi format: VHT/11ac, HE/11ax, or EHT/11be "
             "(default: EHT)"
@@ -51,28 +116,73 @@ def Main() -> int:
         dest="bandwidthMhz",
         type=int,
         choices=(20, 40, 80, 160),
-        default=genWifiDefaultParameters["bandwidthMhz"],
+        default=None,
         help="Wi-Fi channel bandwidth in MHz (default: 80)",
     )
     argumentParser.add_argument(
         "--mcs",
         type=int,
         choices=tuple(range(14)),
-        default=genWifiDefaultParameters["mcs"],
+        default=None,
         help="MCS index: VHT 0-9, HE 0-11, or EHT 0-13 (default: 9)",
     )
     argumentParser.add_argument(
         "--pa",
         dest="paModelName",
         choices=("wiener", "gmp"),
-        default=paModelDefaultParameters["modelName"],
+        default=None,
         help="Nonlinear PA model family (default: wiener)",
+    )
+    argumentParser.add_argument(
+        "--tx-antennas",
+        dest="numTransmitAntennas",
+        type=int,
+        default=None,
+        help="Number of physical transmit chains: VHT/HE/EHT 1-8",
+    )
+    argumentParser.add_argument(
+        "--spatial-streams",
+        dest="numSpatialStreams",
+        type=int,
+        default=None,
+        help="Number of independent spatial streams, no greater than TX chains",
+    )
+    argumentParser.add_argument(
+        "--spatial-mapping",
+        dest="spatialMapping",
+        choices=("direct", "dft"),
+        default=None,
+        help="Stream-to-antenna mapping matrix (default: direct)",
+    )
+    argumentParser.add_argument(
+        "--pa-input-power-db",
+        dest="paInputPowerDbPerChain",
+        type=ParseFloatSequence,
+        default=None,
+        metavar="DB0,DB1,...",
+        help="Independent input-drive adjustment in dB for every PA chain",
+    )
+    argumentParser.add_argument(
+        "--pa-output-power-db",
+        dest="paOutputPowerDbPerChain",
+        type=ParseFloatSequence,
+        default=None,
+        metavar="DB0,DB1,...",
+        help="Independent relative output-power adjustment for every PA chain",
+    )
+    argumentParser.add_argument(
+        "--pa-output-rms",
+        dest="paTargetOutputRmsPerChain",
+        type=ParseOptionalFloatSequence,
+        default=None,
+        metavar="RMS0,RMS1,...",
+        help="Absolute output RMS target per PA; use 'none' to disable a chain target",
     )
     argumentParser.add_argument(
         "--symbols",
         dest="numDataSymbols",
         type=int,
-        default=genWifiDefaultParameters["numDataSymbols"],
+        default=None,
         help="Number of Wi-Fi data OFDM symbols (default: 20)",
     )
     argumentParser.add_argument(
@@ -80,7 +190,7 @@ def Main() -> int:
         dest="guardIntervalUs",
         type=float,
         choices=(0.4, 0.8, 1.6, 3.2),
-        default=genWifiDefaultParameters["guardIntervalUs"],
+        default=None,
         help=(
             "Data guard interval in microseconds: VHT 0.4/0.8, "
             "HE/EHT 0.8/1.6/3.2 (default: 0.8)"
@@ -90,7 +200,7 @@ def Main() -> int:
         "--oversampling",
         type=int,
         choices=(4, 8),
-        default=genWifiDefaultParameters["oversampling"],
+        default=None,
         help="Oversampling factor; ACLR requires at least 4 (default: 4)",
     )
     argumentParser.add_argument(
@@ -171,7 +281,7 @@ def Main() -> int:
     argumentParser.add_argument(
         "--seed",
         type=int,
-        default=genWifiDefaultParameters["seed"],
+        default=None,
         help="Random seed for Wi-Fi data and training fields (default: 7)",
     )
     argumentParser.add_argument(
@@ -197,21 +307,6 @@ def Main() -> int:
 
     if arguments.driveRms <= 0.0:
         argumentParser.error("--drive must be positive")
-    if arguments.numDataSymbols < 1:
-        argumentParser.error("--symbols must be positive")
-    if arguments.frameFormat == "HE" and arguments.mcs > 11:
-        argumentParser.error("HE supports MCS values from 0 through 11")
-    if arguments.frameFormat == "VHT" and arguments.mcs > 9:
-        argumentParser.error("VHT supports MCS values from 0 through 9")
-    if arguments.frameFormat == "VHT" and arguments.guardIntervalUs not in (
-        0.4,
-        0.8,
-    ):
-        argumentParser.error("VHT supports guard intervals 0.4 or 0.8 us")
-    if arguments.frameFormat in ("HE", "EHT") and (
-        arguments.guardIntervalUs == 0.4
-    ):
-        argumentParser.error("HE/EHT do not support a 0.4 us guard interval")
     if arguments.powerStartRms <= 0.0:
         argumentParser.error("--power-start must be positive")
     if arguments.powerStopRms <= arguments.powerStartRms:
@@ -219,20 +314,97 @@ def Main() -> int:
     if arguments.powerPointCount < 2:
         argumentParser.error("--power-points must be at least 2")
 
+    # Only explicitly supplied CLI values are passed to the object. GenWifi
+    # and PaModel add their immutable default layers internally.
+    wifiArgumentNames = (
+        "frameFormat",
+        "bandwidthMhz",
+        "mcs",
+        "numDataSymbols",
+        "guardIntervalUs",
+        "oversampling",
+        "seed",
+        "numTransmitAntennas",
+        "numSpatialStreams",
+        "spatialMapping",
+    )
+    wifiOverrides = {
+        argumentName: getattr(arguments, argumentName)
+        for argumentName in wifiArgumentNames
+        if getattr(arguments, argumentName) is not None
+    }
+    paOverrides = (
+        {}
+        if arguments.paModelName is None
+        else {"modelName": arguments.paModelName}
+    )
+    try:
+        wifiGenerator = GenWifi(parameters=wifiOverrides)
+        useMimoPaFacade = wifiGenerator.numTransmitAntennas > 1 or any(
+            value is not None
+            for value in (
+                arguments.paInputPowerDbPerChain,
+                arguments.paOutputPowerDbPerChain,
+                arguments.paTargetOutputRmsPerChain,
+            )
+        )
+        if not useMimoPaFacade:
+            paModel = PaModel(parameters=paOverrides)
+        else:
+            mimoPaOverrides = {
+                "numTransmitChains": wifiGenerator.numTransmitAntennas,
+                "paParametersPerChain": tuple(
+                    dict(paOverrides)
+                    for _ in range(wifiGenerator.numTransmitAntennas)
+                ),
+            }
+            if arguments.paInputPowerDbPerChain is not None:
+                mimoPaOverrides["inputPowerDbPerChain"] = (
+                    arguments.paInputPowerDbPerChain
+                )
+            if arguments.paOutputPowerDbPerChain is not None:
+                mimoPaOverrides["outputPowerDbPerChain"] = (
+                    arguments.paOutputPowerDbPerChain
+                )
+            if arguments.paTargetOutputRmsPerChain is not None:
+                mimoPaOverrides["targetOutputRmsPerChain"] = (
+                    arguments.paTargetOutputRmsPerChain
+                )
+            paModel = MimoPaModel(parameters=mimoPaOverrides)
+    except (TypeError, ValueError) as error:
+        argumentParser.error(str(error))
+
+    frameFormat = wifiGenerator.frameFormat
+    bandwidthMhz = wifiGenerator.bandwidthMhz
+    mcs = wifiGenerator.mcs
+    numDataSymbols = wifiGenerator.numDataSymbols
+    guardIntervalUs = wifiGenerator.guardIntervalUs
+    oversampling = wifiGenerator.oversampling
+    seed = wifiGenerator.seed
+    paModelName = (
+        paModel.modelName
+        if isinstance(paModel, PaModel)
+        else str(paOverrides.get("modelName", "wiener"))
+    )
+
     if arguments.benchmarkAllIlc:
+        if wifiGenerator.numTransmitAntennas > 1:
+            argumentParser.error(
+                "--benchmark-all-ilc currently requires a SISO waveform"
+            )
         benchmarkDirectory = arguments.outputDirectory / "all_ilc_benchmark"
         RunAllIlcBenchmark(
             BenchmarkConfig(
-                frameFormat=arguments.frameFormat,
-                bandwidthMhz=arguments.bandwidthMhz,
-                mcs=arguments.mcs,
-                numDataSymbols=arguments.numDataSymbols,
-                oversampling=arguments.oversampling,
-                guardIntervalUs=arguments.guardIntervalUs,
+                frameFormat=frameFormat,
+                bandwidthMhz=bandwidthMhz,
+                mcs=mcs,
+                numDataSymbols=numDataSymbols,
+                oversampling=oversampling,
+                guardIntervalUs=guardIntervalUs,
                 driveRms=arguments.driveRms,
                 numIterations=arguments.numIterations,
-                paModelName=arguments.paModelName,
-                seed=arguments.seed,
+                paModelName=paModelName,
+                seed=seed,
                 powerStartRms=arguments.powerStartRms,
                 powerStopRms=arguments.powerStopRms,
                 powerPointCount=arguments.powerPointCount,
@@ -243,33 +415,10 @@ def Main() -> int:
         print(f"\nAll-ILC results: {benchmarkDirectory.resolve()}")
         return 0
 
-    wifiParameters = ChainMap(
-        {
-            "frameFormat": arguments.frameFormat,
-            "bandwidthMhz": arguments.bandwidthMhz,
-            "mcs": arguments.mcs,
-            "numDataSymbols": arguments.numDataSymbols,
-            "guardIntervalUs": arguments.guardIntervalUs,
-            "oversampling": arguments.oversampling,
-            "seed": arguments.seed,
-        },
-        genWifiDefaultParameters,
-    )
-    wifiGenerator = GenWifi(parameters=wifiParameters)
     waveform = wifiGenerator.Generate()
     referenceSignal = arguments.driveRms * waveform.samples
-    paParameters = ChainMap(
-        {"modelName": arguments.paModelName},
-        paModelDefaultParameters,
-    )
-    analysisParameters = ChainMap({}, analysisDefaultParameters)
-    paModel = PaModel(parameters=paParameters)
-    resultAnalysis = Analysis(
-        referenceSignal,
-        waveform,
-        parameters=analysisParameters,
-    )
-    resultDraw = Draw(parameters=ChainMap({}, drawDefaultParameters))
+    resultAnalysis = Analysis(referenceSignal, waveform)
+    resultDraw = Draw()
 
     # The first pass establishes the unlinearized baseline at the requested
     # operating point. The same PA instance is reused for every comparison.
@@ -281,26 +430,50 @@ def Main() -> int:
         maxAmplitude=arguments.maxAmplitude,
         feedbackSnrDb=arguments.feedbackSnrDb,
         feedbackAverages=arguments.feedbackAverages,
-        randomSeed=arguments.seed + 1000,
+        randomSeed=seed + 1000,
+        evmMseEvaluator=(
+            resultAnalysis.CalculateEvmAlignedMse
+            if waveform.numTransmitAntennas == 1
+            else None
+        ),
     )
-    ilcResult = RunFrequencyDomainIlc(
-        referenceSignal,
-        paModel,
-        waveform.sampleRateHz,
-        waveform.bandwidthHz,
-        ilcConfig,
-    )
+    if waveform.numTransmitAntennas == 1:
+        ilcResult = RunFrequencyDomainIlc(
+            referenceSignal,
+            paModel,
+            waveform.sampleRateHz,
+            waveform.bandwidthHz,
+            ilcConfig,
+        )
+    else:
+        ilcResult = RunMimoFrequencyDomainIlc(
+            referenceSignal,
+            paModel,
+            waveform.sampleRateHz,
+            waveform.bandwidthHz,
+            ilcConfig,
+        )
 
     # ILC labels are waveform-specific. Ridge-regression fitting converts them
     # into a causal GMP that can be evaluated on subsequent Wi-Fi packets.
-    gmpPredistorter = FitGmpPredistorter(
-        referenceSignal,
-        ilcResult.learnedInput,
-        nonlinearOrders=(1, 3, 5, 7),
-        memoryDepth=3,
-        crossMemoryDepth=2,
-        ridgeFactor=1e-6,
-    )
+    if waveform.numTransmitAntennas == 1:
+        gmpPredistorter = FitGmpPredistorter(
+            referenceSignal,
+            ilcResult.learnedInput,
+            nonlinearOrders=(1, 3, 5, 7),
+            memoryDepth=3,
+            crossMemoryDepth=2,
+            ridgeFactor=1e-6,
+        )
+    else:
+        gmpPredistorter = FitMimoGmpPredistorter(
+            referenceSignal,
+            ilcResult.learnedInput,
+            nonlinearOrders=(1, 3, 5, 7),
+            memoryDepth=3,
+            crossMemoryDepth=2,
+            ridgeFactor=1e-6,
+        )
     deployedDpdInput = gmpPredistorter.Process(referenceSignal)
     deployedMagnitude = np.abs(deployedDpdInput)
     overLimit = deployedMagnitude > arguments.maxAmplitude
@@ -318,24 +491,91 @@ def Main() -> int:
         }
     )
     print(
-        f"\n{waveform.frameFormat} {arguments.bandwidthMhz} MHz | MCS {arguments.mcs} "
+        f"\n{waveform.frameFormat} {bandwidthMhz} MHz | MCS {mcs} "
         f"({waveform.mcsInfo.modulation}, rate {waveform.mcsInfo.codeRate:.3f}) "
-        f"| PA {arguments.paModelName}\n"
+        f"| {waveform.numSpatialStreams} spatial stream(s) / "
+        f"{waveform.numTransmitAntennas} PA chain(s) | PA {paModelName}\n"
     )
+    if isinstance(paModel, MimoPaModel):
+        outputRmsText = ", ".join(
+            f"PA {chainIndex + 1}={outputRms:.5f} RMS"
+            for chainIndex, outputRms in enumerate(
+                paModel.GetOutputRmsPerChain()
+            )
+        )
+        print(f"Latest independent PA outputs: {outputRmsText}\n")
     resultAnalysis.Print()
+    if waveform.numTransmitAntennas > 1:
+        resultAnalysis.PrintMimo()
+    if waveform.numTransmitAntennas == 1:
+        resultAnalysis.PrintConvergence(
+            ilcResult.history, "Waveform ILC iteration metrics"
+        )
+    else:
+        for chainIndex, chainResult in enumerate(ilcResult.chainResults):
+            resultAnalysis.PrintConvergence(
+                chainResult.history,
+                f"PA {chainIndex + 1} ILC iteration metrics",
+            )
 
     runMetadata = {
         "format": waveform.formatName,
         "frameFormat": waveform.frameFormat,
-        "bandwidthMhz": arguments.bandwidthMhz,
+        "bandwidthMhz": bandwidthMhz,
         "sampleRateHz": waveform.sampleRateHz,
-        "oversampling": arguments.oversampling,
-        "mcs": arguments.mcs,
+        "oversampling": oversampling,
+        "mcs": mcs,
         "modulation": waveform.mcsInfo.modulation,
         "codeRate": waveform.mcsInfo.codeRate,
-        "numDataSymbols": arguments.numDataSymbols,
-        "guardIntervalUs": arguments.guardIntervalUs,
-        "paModel": arguments.paModelName,
+        "numDataSymbols": numDataSymbols,
+        "guardIntervalUs": guardIntervalUs,
+        "numTransmitAntennas": waveform.numTransmitAntennas,
+        "numSpatialStreams": waveform.numSpatialStreams,
+        "spatialMapping": waveform.spatialMapping,
+        "spatialMappingMatrix": [
+            [
+                {"real": float(value.real), "imag": float(value.imag)}
+                for value in row
+            ]
+            for row in waveform.spatialMappingMatrix
+        ],
+        "cyclicShiftsSeconds": waveform.cyclicShiftsSeconds.tolist(),
+        "ltfSymbolCount": waveform.ltfSymbolCount,
+        "paModel": paModelName,
+        "paInputPowerDbPerChain": (
+            None
+            if not isinstance(paModel, MimoPaModel)
+            else list(
+                paModel.ResolveNumericSequence(
+                    "inputPowerDbPerChain", 0.0
+                )
+            )
+        ),
+        "paOutputPowerDbPerChain": (
+            None
+            if not isinstance(paModel, MimoPaModel)
+            else list(
+                paModel.ResolveNumericSequence(
+                    "outputPowerDbPerChain", 0.0
+                )
+            )
+        ),
+        "paTargetOutputRmsPerChain": (
+            None
+            if not isinstance(paModel, MimoPaModel)
+            else list(
+                paModel.ResolveNumericSequence(
+                    "targetOutputRmsPerChain",
+                    0.0,
+                    allowNoneEntries=True,
+                )
+            )
+        ),
+        "paMeasuredOutputRmsPerChain": (
+            None
+            if not isinstance(paModel, MimoPaModel)
+            else list(paModel.GetOutputRmsPerChain())
+        ),
         "driveRms": arguments.driveRms,
         "powerStartRms": arguments.powerStartRms,
         "powerStopRms": arguments.powerStopRms,
@@ -346,41 +586,80 @@ def Main() -> int:
         "regularization": arguments.regularization,
         "feedbackSnrDb": arguments.feedbackSnrDb,
         "feedbackAverages": arguments.feedbackAverages,
-        "seed": arguments.seed,
+        "seed": seed,
     }
     jsonPath, csvPath = resultAnalysis.Save(
         arguments.outputDirectory, runMetadata
     )
-    convergencePath = resultAnalysis.SaveConvergence(
-        ilcResult.history, arguments.outputDirectory
-    )
+    if waveform.numTransmitAntennas == 1:
+        convergencePaths = (
+            resultAnalysis.SaveConvergence(
+                ilcResult.history, arguments.outputDirectory
+            ),
+        )
+        convergenceFigurePaths = (
+            resultDraw.SaveConvergenceCurve(
+                ilcResult.history, arguments.outputDirectory
+            ),
+        )
+    else:
+        convergencePaths = tuple(
+            resultAnalysis.SaveConvergence(
+                chainResult.history,
+                arguments.outputDirectory / f"pa_chain_{chainIndex + 1}",
+            )
+            for chainIndex, chainResult in enumerate(ilcResult.chainResults)
+        )
+        convergenceFigurePaths = tuple(
+            resultDraw.SaveConvergenceCurve(
+                chainResult.history,
+                arguments.outputDirectory / f"pa_chain_{chainIndex + 1}",
+            )
+            for chainIndex, chainResult in enumerate(ilcResult.chainResults)
+        )
 
     powerCurvePaths = None
     if not arguments.skipPowerEvmCurve:
+        # A nominal-reference evaluator cannot score other drive levels. The
+        # point sweep therefore falls back to gain-compensated NMSE for ILC
+        # best-iteration selection; final EVM remains evaluated against each
+        # point's correctly scaled Wi-Fi reference inside Analysis.
+        powerSweepIlcConfig = replace(ilcConfig, evmMseEvaluator=None)
         powerDriveValues = np.geomspace(
             arguments.powerStartRms,
             arguments.powerStopRms,
             arguments.powerPointCount,
         )
+        methodEvaluators = {
+            "PA baseline": lambda pointReference, _: paModel.Process(
+                pointReference
+            ),
+            "Fitted GMP DPD": lambda pointReference, _: paModel.Process(
+                gmpPredistorter.Process(pointReference)
+            ),
+        }
+        if waveform.numTransmitAntennas == 1:
+            methodEvaluators["Frequency-domain ILC"] = (
+                lambda pointReference, _: RunFrequencyDomainIlc(
+                    pointReference,
+                    paModel,
+                    waveform.sampleRateHz,
+                    waveform.bandwidthHz,
+                    powerSweepIlcConfig,
+                ).outputSignal
+            )
+        else:
+            methodEvaluators["Frequency-domain ILC"] = (
+                lambda pointReference, _: RunMimoFrequencyDomainIlc(
+                    pointReference,
+                    paModel,
+                    waveform.sampleRateHz,
+                    waveform.bandwidthHz,
+                    powerSweepIlcConfig,
+                ).outputSignal
+            )
         resultAnalysis.AnalyzePowerEvmCurve(
-            powerDriveValues,
-            {
-                "PA baseline": lambda pointReference, _: paModel.Process(
-                    pointReference
-                ),
-                "Frequency-domain ILC": lambda pointReference, _: (
-                    RunFrequencyDomainIlc(
-                        pointReference,
-                        paModel,
-                        waveform.sampleRateHz,
-                        waveform.bandwidthHz,
-                        ilcConfig,
-                    ).outputSignal
-                ),
-                "Fitted GMP DPD": lambda pointReference, _: paModel.Process(
-                    gmpPredistorter.Process(pointReference)
-                ),
-            },
+            powerDriveValues, methodEvaluators
         )
         powerEvmCurve = resultAnalysis.powerEvmCurve
         powerDataPaths = resultAnalysis.SavePowerEvmCurveData(
@@ -407,7 +686,17 @@ def Main() -> int:
 
     print(f"Metrics JSON: {jsonPath.resolve()}")
     print(f"Metrics CSV:  {csvPath.resolve()}")
-    print(f"ILC history:  {convergencePath.resolve()}")
+    for chainIndex, convergencePath in enumerate(convergencePaths):
+        historyLabel = (
+            "ILC history"
+            if len(convergencePaths) == 1
+            else f"PA {chainIndex + 1} ILC history"
+        )
+        print(f"{historyLabel}: {convergencePath.resolve()}")
+        print(
+            f"{historyLabel} plot: "
+            f"{convergenceFigurePaths[chainIndex].resolve()}"
+        )
     if powerCurvePaths is not None:
         powerCsvPath, powerJsonPath, powerFigurePath = powerCurvePaths
         print(f"Power-EVM CSV:  {powerCsvPath.resolve()}")

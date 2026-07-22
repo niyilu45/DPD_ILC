@@ -2,14 +2,13 @@
 
 import csv
 import json
-from collections import ChainMap
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Mapping
 
 import numpy as np
 
-from .Analysis import Analysis, SignalMetrics, analysisDefaultParameters
+from .Analysis import Analysis, SignalMetrics
 from .DeploymentModels import (
     FitLutPredistorter,
     FitNeuralPredistorter,
@@ -30,8 +29,8 @@ from .IlcVariants import (
     RunParameterDomainIlc,
     RunScalarPIlc,
 )
-from .PaModel import IQImbalancePA, PaModel, paModelDefaultParameters
-from .waveGen import GenWifi, genWifiDefaultParameters
+from .PaModel import IQImbalancePA, PaModel
+from .waveGen import GenWifi
 
 
 @dataclass(frozen=True)
@@ -177,18 +176,77 @@ def SaveHistory(
     with historyPath.open("w", newline="", encoding="utf-8-sig") as csvFile:
         csvWriter = csv.DictWriter(
             csvFile,
-            fieldnames=("iteration", "errorRms", "nmseDb", "inputPeak"),
+            fieldnames=(
+                "iteration",
+                "mse",
+                "errorRms",
+                "nmseDb",
+                "linearCompensatedMse",
+                "linearCompensatedNmseDb",
+                "evmAlignedMse",
+                "evmDb",
+                "complexGainMagnitudeDb",
+                "complexGainPhaseDegrees",
+                "inputPeak",
+            ),
         )
         csvWriter.writeheader()
         for iterationRecord in ilcResult.history:
             csvWriter.writerow(
                 {
                     "iteration": iterationRecord.iteration,
+                    "mse": iterationRecord.mse,
                     "errorRms": iterationRecord.errorRms,
                     "nmseDb": iterationRecord.nmseDb,
+                    "linearCompensatedMse": (
+                        iterationRecord.linearCompensatedMse
+                    ),
+                    "linearCompensatedNmseDb": (
+                        iterationRecord.linearCompensatedNmseDb
+                    ),
+                    "evmAlignedMse": iterationRecord.evmAlignedMse,
+                    "evmDb": iterationRecord.evmDb,
+                    "complexGainMagnitudeDb": (
+                        iterationRecord.complexGainMagnitudeDb
+                    ),
+                    "complexGainPhaseDegrees": (
+                        iterationRecord.complexGainPhaseDegrees
+                    ),
                     "inputPeak": iterationRecord.inputPeak,
                 }
             )
+    Draw(convergenceFileStem=f"convergence_{safeName}").SaveConvergenceCurve(
+        ilcResult.history, outputDirectory
+    )
+
+
+def ReportHistory(
+    methodName: str,
+    ilcResult: ILCResult,
+    resultAnalysis: Analysis,
+    outputDirectory: Path,
+) -> None:
+    """Print and save one method's complete per-iteration MSE history.
+
+    Processing details:
+        Algorithm: Use ``Analysis`` for the console table, then serialize the
+        same immutable records and render their convergence figure without
+        recalculating any metric.
+
+    Args:
+        methodName: Human-readable ILC method label.
+        ilcResult: Completed ILC result containing ordered history records.
+        resultAnalysis: Analysis instance used for consistent presentation.
+        outputDirectory: Destination for CSV and PNG result artifacts.
+
+    Returns:
+        result: None. Console and file outputs are produced as side effects.
+    """
+
+    resultAnalysis.PrintConvergence(
+        ilcResult.history, f"{methodName} iteration metrics"
+    )
+    SaveHistory(methodName, ilcResult, outputDirectory)
 
 
 def EvaluateDeployment(
@@ -249,16 +307,21 @@ def RunIlcCurvePoint(
     """
 
     del driveRms
+    pointAnalysis = Analysis(referenceSignal, waveform)
+    pointConfig = replace(
+        methodConfig,
+        evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
+    )
     if methodName == "Frequency-domain ILC":
         return RunFrequencyDomainIlc(
             referenceSignal,
             paModel,
             waveform.sampleRateHz,
             waveform.bandwidthHz,
-            methodConfig,
+            pointConfig,
         ).outputSignal
     return methodFunction(
-        referenceSignal, paModel, methodConfig
+        referenceSignal, paModel, pointConfig
     ).outputSignal
 
 
@@ -282,38 +345,20 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
         "guardIntervalUs": config.guardIntervalUs,
         "oversampling": config.oversampling,
     }
-    trainingParameters = ChainMap(
-        {"seed": config.seed},
-        sharedWifiParameters,
-        genWifiDefaultParameters,
-    )
-    validationParameters = ChainMap(
-        {"seed": config.seed + 97},
-        sharedWifiParameters,
-        genWifiDefaultParameters,
-    )
+    trainingParameters = dict(sharedWifiParameters)
+    trainingParameters["seed"] = config.seed
+    validationParameters = dict(sharedWifiParameters)
+    validationParameters["seed"] = config.seed + 97
     trainingGenerator = GenWifi(parameters=trainingParameters)
     validationGenerator = GenWifi(parameters=validationParameters)
     trainingWaveform = trainingGenerator.Generate()
     validationWaveform = validationGenerator.Generate()
     trainingSignal = config.driveRms * trainingWaveform.samples
     validationSignal = config.driveRms * validationWaveform.samples
-    paParameters = ChainMap(
-        {"modelName": config.paModelName},
-        paModelDefaultParameters,
-    )
-    analysisParameters = ChainMap({}, analysisDefaultParameters)
+    paParameters = {"modelName": config.paModelName}
     paModel = PaModel(parameters=paParameters)
-    trainingAnalysis = Analysis(
-        trainingSignal,
-        trainingWaveform,
-        parameters=analysisParameters,
-    )
-    validationAnalysis = Analysis(
-        validationSignal,
-        validationWaveform,
-        parameters=analysisParameters,
-    )
+    trainingAnalysis = Analysis(trainingSignal, trainingWaveform)
+    validationAnalysis = Analysis(validationSignal, validationWaveform)
     maxAmplitude = max(2.0, 1.6 * np.max(np.abs(trainingSignal)))
 
     baselineOutput = paModel.Process(trainingSignal)
@@ -340,36 +385,42 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
         learningRate=0.10,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 1,
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     complexConfig = ILCConfig(
         numIterations=config.numIterations,
         learningRate=0.15,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 2,
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     firConfig = ILCConfig(
         numIterations=config.numIterations,
         learningRate=0.15,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 3,
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     frequencyConfig = ILCConfig(
         numIterations=config.numIterations,
         learningRate=0.15,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 4,
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     gaussNewtonConfig = ILCConfig(
         numIterations=config.numIterations,
         learningRate=0.65,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 5,
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     parameterConfig = ILCConfig(
         numIterations=config.numIterations,
         learningRate=0.20,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 6,
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
 
     methodRuns = (
@@ -408,7 +459,9 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             methodMetrics,
             baselineMetrics,
         )
-        SaveHistory(methodName, methodResult, outputDirectory)
+        ReportHistory(
+            methodName, methodResult, trainingAnalysis, outputDirectory
+        )
         powerEvaluators[methodName] = (
             lambda pointReference,
             pointDrive,
@@ -440,6 +493,7 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             learningRate=0.12,
             maxAmplitude=constrainedPeak,
             randomSeed=config.seed + 7,
+            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
         ),
     )
     constrainedMetrics = trainingAnalysis.Analyze(
@@ -453,7 +507,12 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
         constrainedMetrics,
         baselineMetrics,
     )
-    SaveHistory("Constrained CFR-ILC", constrainedResult, outputDirectory)
+    ReportHistory(
+        "Constrained CFR-ILC",
+        constrainedResult,
+        trainingAnalysis,
+        outputDirectory,
+    )
     powerEvaluators["Constrained CFR-ILC"] = (
         lambda pointReference, _: RunFrequencyDomainIlc(
             pointReference,
@@ -493,6 +552,7 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             feedbackSnrDb=32.0,
             feedbackAverages=4,
             randomSeed=config.seed + 8,
+            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
         ),
     )
     noiseAwareMetrics = trainingAnalysis.Analyze(
@@ -506,7 +566,12 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
         noiseAwareMetrics,
         noisyBaselineMetrics,
     )
-    SaveHistory("Noise-aware ILC", noiseAwareResult, outputDirectory)
+    ReportHistory(
+        "Noise-aware ILC",
+        noiseAwareResult,
+        trainingAnalysis,
+        outputDirectory,
+    )
     powerEvaluators["Noise-aware ILC"] = (
         lambda pointReference, _: RunFrequencyDomainIlc(
             pointReference,
@@ -546,6 +611,7 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
             learningRate=0.18,
             maxAmplitude=maxAmplitude,
             randomSeed=config.seed + 9,
+            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
         ),
     )
     augmentedMetrics = trainingAnalysis.Analyze(
@@ -559,7 +625,12 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
         augmentedMetrics,
         iqBaselineMetrics,
     )
-    SaveHistory("Augmented IQ ILC", augmentedResult, outputDirectory)
+    ReportHistory(
+        "Augmented IQ ILC",
+        augmentedResult,
+        trainingAnalysis,
+        outputDirectory,
+    )
     powerEvaluators["IQ-imbalance baseline"] = (
         lambda pointReference, _: iqPaModel.Process(pointReference)
     )

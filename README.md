@@ -1,13 +1,15 @@
 # DPD-ILC VHT/HE/EHT Wi-Fi 仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `GenWifi` 实例生成 802.11ac/VHT、802.11ax/HE 或 802.11be/EHT Wi-Fi 复基带训练波形，经 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以 GMP 拟合可复用的 DPD，并输出 SNR、EVM、ACLR 以及多方法功率-EVM 对比曲线。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `GenWifi` 实例生成 802.11ac/VHT、802.11ax/HE 或 802.11be/EHT Wi-Fi 复基带训练波形，支持 1–8 条空间流及物理发射链，经每路独立的 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以每路 GMP 拟合可复用的 DPD，并输出汇总及逐 PA/逐空间流 SNR、EVM、ACLR，以及多方法功率-EVM 对比曲线。
 
 ## 理论文档
 
 - [Wi-Fi 帧生成物理原理与推导](doc/WaveGen.md)：复基带、OFDM 正交性、QAM 归一化、MCS、循环前缀、VHT/HE/EHT 字段和 PAPR。
 - [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、Rapp AM-AM、AM-PM、GMP、频谱再生、IQ 失衡和反馈噪声。
-- [结果计算物理原理与推导](doc/Analysis.md)：最小二乘复增益、SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
+- [信号同步与补偿物理原理](doc/SigProcess.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样和复增益补偿。
+- [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
 - [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
+- [全工程函数与物理原理覆盖审计](doc/FunctionPrinciples.md)：逐项索引 `main.py` 与 `inc` 中全部函数，区分物理模型、数值实现和工程编排，并链接到对应推导。
 
 安装依赖：
 
@@ -22,10 +24,12 @@ python -m pip install -r requirements.txt
 ```text
 main.py                 命令行主程序
 inc/waveGen.py          GenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
-inc/PaModel.py          Wiener 和 GMP 非线性 PA
+inc/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
 inc/DpdIlc.py           频域 ILC 与 GMP DPD 拟合
+inc/MimoDpd.py          每路独立 MIMO ILC 与多路 GMP DPD
 inc/IlcVariants.py      其他 ILC 更新律
 inc/DeploymentModels.py Volterra、LUT 和 NN 部署模型
+inc/SigProcess.py       时延、载波/采样频偏和复增益估计与补偿
 inc/Analysis.py         SNR、EVM、ACLR、功率-EVM 数据计算及结果输出
 inc/Draw.py             功率-EVM 多方法同图绘制与 PNG 输出
 inc/Benchmark.py        全 ILC 方案统一基准测试
@@ -39,18 +43,20 @@ tests/TestProject.py    自包含验证脚本
 
 ```mermaid
 flowchart TD
-    start["main.py：解析命令行参数"] --> configChain["ChainMap：外部覆盖 + 只读默认值"]
-    configChain --> wifiGenerator["创建 GenWifi 实例"]
+    start["main.py：解析命令行参数"] --> overrideMap["仅收集调用方显式覆盖参数"]
+    overrideMap --> wifiGenerator["创建 GenWifi；类内追加默认参数层"]
     wifiGenerator --> waveGen["GenWifi.Generate"]
-    waveGen --> reference["VHT/HE/EHT 参考波形 s 与帧元数据"]
+    waveGen --> streams["独立空间流：QAM / pilots / LTF"]
+    streams --> spatialMap["空间映射 Q + 每链 CSD"]
+    spatialMap --> reference["samples × TX chains 参考矩阵 S 与帧元数据"]
 
-    configChain --> paModel["创建 PaModel 实例"]
-    paModel --> paImplementation["WienerPA 或 GMPPA"]
+    overrideMap --> paModel["创建 PaModel 或 MimoPaModel；类内追加默认参数层"]
+    paModel --> paImplementation["每路 WienerPA 或 GMPPA + 独立功率设置"]
     reference --> baseline["生成未校正 PA 基线输出"]
     paImplementation --> baseline
 
     start --> mode{"运行模式"}
-    mode -->|单方案| frequencyIlc["RunFrequencyDomainIlc"]
+    mode -->|单方案| frequencyIlc["SISO 或逐 PA RunMimoFrequencyDomainIlc"]
     mode -->|全方案| benchmark["RunAllIlcBenchmark"]
     reference --> frequencyIlc
     paModel --> frequencyIlc
@@ -68,32 +74,42 @@ flowchart TD
     predistortedInput --> paImplementation
     paImplementation --> correctedOutput["PA 校正输出"]
 
-    configChain --> analysis["创建 Analysis 实例"]
+    overrideMap --> analysis["创建 Analysis；类内追加默认参数层"]
     reference --> analysis
-    baseline --> analysisMethod["Analysis.Analyze / AnalyzeStages"]
-    frequencyIlc --> analysisMethod
-    variantResults --> analysisMethod
-    correctedOutput --> analysisMethod
+    reference --> signalProcess["SigProcess：时延 / CFO / SFO / 复增益补偿"]
+    baseline --> signalProcess
+    frequencyIlc --> signalProcess
+    variantResults --> signalProcess
+    correctedOutput --> signalProcess
+    signalProcess --> analysisMethod["Analysis.Analyze / AnalyzeStages"]
     analysis --> analysisMethod
-    analysisMethod --> metrics["SNR / EVM / ACLR"]
+    analysisMethod --> metrics["汇总 SNR / EVM / ACLR"]
+    analysisMethod --> mimoMetrics["逐 PA SNR/ACLR + 逐空间流 EVM"]
     analysisMethod --> powerCurve["多方法功率-EVM 扫描"]
     metrics --> console["控制台表格"]
     metrics --> files["CSV / JSON / 收敛历史"]
+    frequencyIlc --> iterationMse["每轮 Raw / LC / EVM-MSE"]
+    analysis --> iterationMse
+    iterationMse --> console
+    iterationMse --> files
     powerCurve --> curveData["Analysis：CSV / JSON 曲线数据"]
-    configChain --> draw["创建 Draw 实例"]
+    overrideMap --> draw["创建 Draw；类内追加默认参数层"]
     powerCurve --> drawMethod["Draw.SavePowerEvmCurve"]
     draw --> drawMethod
     drawMethod --> curveFigure["PNG 对比图"]
+    iterationMse --> convergenceDraw["Draw.SaveConvergenceCurve"]
+    draw --> convergenceDraw
+    convergenceDraw --> convergenceFigure["每轮 MSE 收敛 PNG"]
 ```
 
 **图示说明：**
 
-1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，将外部值与模块内置默认值组成 `ChainMap`，再构造 `GenWifi(parameters=...)`、`PaModel(parameters=...)`、`Analysis(..., parameters=...)` 和 `Draw(parameters=...)` 实例。
-2. 调用 `GenWifi.Generate()` 后得到参考复基带波形 `s` 及字段边界、FFT、数据子载波等元数据；同一波形直接通过 PA 后形成未校正基线。
-3. 单方案模式执行正则化频域 ILC，寻找使 PA 输出逼近参考波形的理想输入 `u*`；全方案模式则调用统一基准测试，逐一运行所有 ILC 更新律。
+1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `GenWifi`、`PaModel`、`Analysis` 和 `Draw`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
+2. 调用 `GenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
+3. `MimoPaModel` 为每个矩阵列建立独立 PA，可分别设置输入驱动 dB、相对输出功率 dB 或绝对输出 RMS。单方案模式对每个 PA 独立执行正则化频域 ILC，再对各路 ILC 标签分别拟合 GMP；全方案基准当前仅用于 SISO。
 4. 收敛后的 `u*` 可直接用于重复波形测试，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN，从而形成可用于其他帧的部署模型。
-5. 所有输出最终传给同一个 `Analysis` 实例，由 `Analyze` 或 `AnalyzeStages` 统一计算 SNR、EVM 和 ACLR；`AnalyzePowerEvmCurve` 在多个 RMS 驱动点调用各方法，生成不包含绘图逻辑的 `PowerEvmCurve` 数据对象。
-6. `Analysis.Print`、`Analysis.Save`、`Analysis.SaveConvergence` 和 `Analysis.SavePowerEvmCurveData` 分别输出控制台表格、指标文件、收敛历史以及功率-EVM CSV/JSON；独立的 `Draw.SavePowerEvmCurve` 将全部方法绘制在一张 PNG 图中。
+5. 所有输出最终传给同一个 `Analysis` 实例；MIMO 时每条物理链分别调用 `SigProcess` 完成整数/分数时延、载波频偏、采样频偏和复增益补偿。ACLR 对各链 PSD 求和形成汇总值，同时保留每链结果；EVM 在撤销 CSD 和空间映射后按空间流统计。`AnalyzePowerEvmCurve` 在多个 RMS 驱动点调用各方法，生成不包含绘图逻辑的 `PowerEvmCurve` 数据对象。
+6. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
 
 图中从“生成独立验证 VHT/HE/EHT 帧”开始的支路专门验证部署模型的泛化能力；它使用相同格式配置和不同随机种子的载荷，不与 ILC 训练帧重复。
 
@@ -121,13 +137,22 @@ flowchart TD
     privateGenerate --> training["TrainingField"]
     privateGenerate --> qam["QamModulate"]
     privateGenerate --> pilotSequence["PilotSequence"]
-    privateGenerate --> ofdm["OfdmSymbol"]
+    privateGenerate --> mapping["BuildSpatialMappingMatrix"]
+    privateGenerate --> csd["GetCyclicShifts / BuildCsdPhaseMatrix"]
+    privateGenerate --> ltf["GetLtfSymbolCount / BuildLtfTrainingMatrix"]
+    privateGenerate --> mimoOfdm["BuildMimoOfdmSymbol"]
 
     qam --> gray["GrayToBinary"]
     training --> pilotSequence
-    training --> ofdm
-    pilotSequence --> ofdm
-    ofdm --> packet["按配置拼接 VHT、HE 或 EHT 字段"]
+    mapping --> spatialTones["SpatialMapTones"]
+    csd --> spatialTones
+    qam --> spatialTones
+    pilotSequence --> spatialTones
+    spatialTones --> mimoOfdm
+    ltf --> mimoOfdm
+    training --> common["MapCommonFieldToAntennas"]
+    common --> packet["按配置拼接 VHT、HE 或 EHT 字段"]
+    mimoOfdm --> packet
     packet --> waveform["WifiWaveform"]
 ```
 
@@ -136,7 +161,8 @@ flowchart TD
 - 调用方必须先构造 `GenWifi`，再调用实例方法；`NormalizeFrameFormat` 先把 `11ac/11ax/11be` 等效归一化为 `VHT/HE/EHT`，`GenWifi.Validate` 再检查带宽、格式对应的 MCS 范围、GI、符号数和过采样倍率。
 - `GenWifi.GetMcsInfo` 根据规范化后的 `frameFormat` 选择 `vhtMcsTable`、`heMcsTable` 或 `ehtMcsTable`，其中 VHT 支持 MCS 0–9、HE 支持 MCS 0–11、EHT 支持 MCS 0–13。
 - `ActiveTones` 与 `PilotTones` 决定不同带宽下的数据、导频和空子载波位置；`QamModulate` 完成 Gray 编码星座映射。
-- `TrainingField` 生成前导训练字段，`OfdmSymbol` 负责频域装载、IFFT 和循环前缀拼接。
+- `BuildSpatialMappingMatrix` 产生 direct、DFT 或调用方自定义的正交映射；`SpatialMapTones` 为每个子载波执行空间映射并叠加 CSD，`BuildMimoOfdmSymbol` 再完成各发射链 IFFT 和循环前缀。
+- `BuildLtfTrainingMatrix` 产生跨 LTF 符号的正交训练码；LTF 数量随空间流增加。公共字段由 `MapCommonFieldToAntennas` 复制到各链并保留 CSD。
 - `GenWifi.Generate` 是面向调用方的波形入口，并由内部辅助函数 `GenerateWifiWaveform` 完成组帧，最终返回 `WifiWaveform`；其中既有时域样本，也有后续 EVM 解调所需的格式、字段切片和参考星座。
 
 ### `inc/PaModel.py`
@@ -144,6 +170,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     caller["调用方"] --> pa["构造 PaModel 实例"]
+    caller --> mimo["构造 MimoPaModel 实例"]
     pa --> select{"modelName"}
     select -->|wiener| wiener["WienerPA"]
     select -->|gmp| gmp["GMPPA"]
@@ -167,6 +194,12 @@ flowchart TD
     iq --> iqGain["IQImbalancePA.SmallSignalGain"]
 
     awgn["AddAwgn"] --> asComplex
+    mimo --> sync["SynchronizeModels：每链一个 PaModel"]
+    sync --> chain["MimoPaModel.ProcessChain"]
+    mimo --> matrix["MimoPaModel.Process：samples × chains"]
+    matrix --> chain
+    mimo --> relative["input/outputPowerDbPerChain"]
+    mimo --> absolute["targetOutputRmsPerChain"]
 ```
 
 **图示说明：**
@@ -177,6 +210,24 @@ flowchart TD
 - `GMPPA.Process` 使用 `DelaySignal` 构造主项、滞后包络项和超前包络项；未提供系数时由 `DefaultGmpCoefficients` 创建稳定的默认模型。
 - `IQImbalancePA` 在已有 PA 输出上增加共轭镜像，用于测试增广 ILC；`AddAwgn` 模拟反馈接收链噪声。
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
+- `MimoPaModel` 不在链间引入隐含耦合：每一列进入独立 `PaModel`。`ProcessChain` 是单路 ILC 看到的真实 plant；相对 dB 与绝对 RMS 功率设置均在该路径中生效。
+
+### `inc/MimoDpd.py`
+
+```mermaid
+flowchart TD
+    reference["samples × PA chains 参考矩阵"] --> run["RunMimoFrequencyDomainIlc"]
+    pa["MimoPaModel"] --> view["MimoPaChain：选中一路 ProcessChain"]
+    view --> run
+    run --> perChain["每路 RunFrequencyDomainIlc"]
+    perChain --> result["MimoIlcResult：矩阵输入/输出 + 每路历史"]
+    result --> fit["FitMimoGmpPredistorter"]
+    fit --> chainGmp["每路 FitGmpPredistorter"]
+    chainGmp --> model["MimoGmpPredistorter"]
+    model --> process["Process：逐列部署 GMP"]
+```
+
+**图示说明：** `MimoPaChain` 只暴露被选 PA 的一维输入/输出，使现有频域 ILC 数学和验证逻辑可以逐路复用。每一路保留独立随机反馈种子、收敛历史和 GMP 系数，最终再按物理链顺序堆叠为矩阵；工程当前采用独立 DPD，不假设 PA 间电气串扰。
 
 ### `inc/DpdIlc.py`
 
@@ -186,6 +237,10 @@ flowchart TD
     runFrequency --> nextFft["NextPowerOfTwo"]
     runFrequency --> measure["MeasurePaOutput"]
     runFrequency --> limit["LimitAmplitude"]
+    runFrequency --> iterationMetrics["CalculateIterationMetrics"]
+    iterationMetrics --> rawMse["Raw MSE / NMSE"]
+    iterationMetrics --> lcMse["复增益补偿 LC-MSE"]
+    iterationMetrics --> evmMse["可选 EVM 对齐 MSE"]
     measure --> paProcess["PA.Process"]
     measure --> addNoise["AddAwgn"]
     runFrequency --> iteration["ILCIteration 列表"]
@@ -203,7 +258,7 @@ flowchart TD
 **图示说明：**
 
 - 上半部分是波形 ILC：`RunFrequencyDomainIlc` 根据低功率探测结果构造正则化逆频响，反复测量 PA、计算误差、更新输入并执行峰值投影。
-- 每轮状态记录为 `ILCIteration`，完整输出封装为 `ILCResult`，包含最佳学习输入、对应 PA 输出和收敛历史。
+- 每轮状态由 `CalculateIterationMetrics` 记录为 `ILCIteration`，同时保留原始 MSE、公共复增益补偿 MSE、EVM 对齐 MSE、复增益幅相及输入峰值；完整输出封装为 `ILCResult`。
 - 下半部分是标签拟合：`FitGmpPredistorter` 先枚举 GMP 基函数，再分块累计岭回归矩阵，避免宽带长帧占用过多内存。
 - `GMPPredistorter.Process` 使用同一组基函数和拟合系数，将新的 EHT 波形转换为可部署的 DPD 输出。
 
@@ -222,7 +277,7 @@ flowchart TD
     augmented["RunAugmentedIqIlc"] --> core
 
     core --> measure["MeasureOutput"]
-    core --> selection["SelectionError"]
+    core --> selection["CalculateIterationMetrics / EVM 优先选优"]
     core --> limit["LimitAmplitude"]
     core --> result["ILCResult"]
 
@@ -270,6 +325,33 @@ flowchart TD
 - NN 路线把当前及历史 I/Q/包络样本组成时延输入，经标准化和 `tanh` 隐层后拟合复数输出层。
 - 三个 `Fit...` 函数负责训练，三个 `...Predistorter.Process` 方法负责在验证帧或实际输入上推理。
 
+### `inc/SigProcess.py`
+
+```mermaid
+flowchart TD
+    caller["Analysis 或直接调用方"] --> processor["构造 SigProcess；内部合并默认参数"]
+    processor --> process["SigProcess.Process"]
+    reference["已知参考信号"] --> integer["EstimateIntegerDelay"]
+    measured["测量/仿真输出"] --> integer
+    process --> integer
+    integer --> cfo["EstimateCarrierFrequencyOffset"]
+    cfo --> cfoComp["CompensateCarrierFrequencyOffset"]
+    cfoComp --> timing["EstimateTimingOffsets"]
+    timing --> interpolation["InterpolateSignal"]
+    interpolation --> gain["EstimateComplexGain"]
+    gain --> result["SignalProcessingResult"]
+    result --> corrected["processedSignal"]
+    result --> estimates["时延 / CFO / SFO / 复增益估计"]
+```
+
+**图示说明：**
+
+- `SigProcess` 使用已知参考做数据辅助同步；正整数时延表示测量信号晚于参考。
+- CFO 由多个时间窗口的复增益相位斜率估计，避免逐样点 PA 相位扰动产生明显假频偏。
+- 多窗口局部相关峰的截距给出分数时延，随时间的斜率给出采样频偏 ppm。
+- `InterpolateSignal` 使用有限长度 Lanczos-sinc 核把测量记录重采样到参考网格，随后除去最小二乘公共复增益。
+- `SignalProcessingResult` 同时保存校正样点和所有标量估计，`ToDict()` 可用于记录估计结果。
+
 ### `inc/Analysis.py`
 
 ```mermaid
@@ -277,22 +359,33 @@ flowchart TD
     caller["调用方"] --> context["构造 Analysis(referenceSignal, waveform)"]
     context --> stages["Analysis.AnalyzeStages"]
     stages --> analyze["Analysis.Analyze"]
-    analyze --> snr["Analysis.CalculateSnr"]
-    analyze --> evm["Analysis.CalculateEvm"]
-    analyze --> aclr["Analysis.CalculateAclr"]
+    analyze --> prepare["Analysis.PrepareMeasuredSignal"]
+    prepare --> sigProcess["SigProcess.Process"]
+    sigProcess --> prepared["同一份校正信号"]
+    prepared --> snr["Analysis.CalculatePreparedSnr"]
+    prepared --> evm["Analysis.CalculatePreparedEvm"]
+    prepared --> evmMse["CalculatePreparedEvmAlignedMse"]
+    prepared --> aclr["Analysis.CalculatePreparedAclr"]
+    prepared --> chainSnr["CalculatePreparedSnrPerChain"]
+    prepared --> chainAclr["CalculatePreparedAclrPerChain"]
+    prepared --> streamEvm["CalculatePreparedEvmPerSpatialStream"]
 
-    snr --> gain["BestComplexGain"]
-    evm --> demod["Analysis.DemodulateWifiData"]
-    evm --> gain
+    evm --> demod["Analysis.DemodulatePreparedWifiData"]
+    streamEvm --> demod
+    demod --> undo["撤销 CSD 与空间映射 Q"]
     aclr --> psd["AveragePeriodogram"]
 
     snr --> metrics["SignalMetrics"]
     evm --> metrics
     aclr --> metrics
+    chainSnr --> mimoMetrics["MimoSignalMetrics"]
+    chainAclr --> mimoMetrics
+    streamEvm --> mimoMetrics
     metrics --> toDict["SignalMetrics.ToDict"]
     metrics --> print["Analysis.Print"]
     metrics --> save["Analysis.Save"]
     convergence["ILCIteration 列表"] --> saveConvergence["Analysis.SaveConvergence"]
+    convergence --> printConvergence["Analysis.PrintConvergence"]
     context --> powerSweep["Analysis.AnalyzePowerEvmCurve"]
     powerSweep --> curve["PowerEvmCurve"]
     curve --> curveSave["Analysis.SavePowerEvmCurveData"]
@@ -302,17 +395,20 @@ flowchart TD
 **图示说明：**
 
 - `Analysis` 构造时保存参考信号和 `WifiWaveform` 元数据；后续每个待测输出只需传给 `Analyze`，多个命名阶段可一次传给 `AnalyzeStages`。
-- SNR 在移除最佳复增益后计算残差功率；EVM 先由 `Analysis.DemodulateWifiData` 根据 `WifiWaveform` 的数据字段位置去循环前缀并 FFT，再与发送星座比较。
+- 每次 `Analyze` 只调用一次 `SigProcess.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
+- SNR 直接计算校正后数据字段与参考的残差功率；EVM 根据 `WifiWaveform` 的数据字段位置去循环前缀并 FFT，再与采用相同 FFT 路径得到的参考星座比较。
 - ACLR 通过 `AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
 - 三类指标封装为 `SignalMetrics`，由同一实例的 `Print` 输出到终端，或由 `Save` 写入 JSON/CSV。
-- `Analysis.SaveConvergence` 独立保存每轮 ILC 的误差 RMS、NMSE 和输入峰值。
+- `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
+- `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、公共复增益幅相和输入峰值。
+- MIMO 输入按列分别同步；`DemodulatePreparedWifiData` 在 FFT 后撤销每链 CSD 相位和空间映射矩阵。`MimoSignalMetrics` 保存逐 PA SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
 - `AnalyzePowerEvmCurve` 接收一组严格递增的 RMS 驱动点和多个方法求值器，在每个功率点使用相同参考信号计算 EVM；`SavePowerEvmCurveData` 只保存原始 CSV/JSON 数据，不导入或调用任何绘图库。
 
 ### `inc/Draw.py`
 
 ```mermaid
 flowchart TD
-    caller["调用方"] --> draw["构造 Draw(parameters=...)"]
+    caller["调用方：仅传覆盖字典"] --> draw["构造 Draw；内部合并默认参数"]
     draw --> validate["Draw.ValidateParameters"]
     curve["Analysis 生成 PowerEvmCurve"] --> curveValidate["Draw.ValidatePowerEvmCurve"]
     draw --> create["Draw.CreatePowerEvmFigure"]
@@ -321,14 +417,20 @@ flowchart TD
     styles --> figure["Matplotlib Figure"]
     figure --> save["Draw.SavePowerEvmCurve"]
     save --> png["功率-EVM PNG"]
+    history["ILCIteration 列表"] --> historyValidate["ValidateConvergenceHistory"]
+    historyValidate --> historyCreate["CreateConvergenceFigure"]
+    draw --> historyCreate
+    historyCreate --> historySave["SaveConvergenceCurve"]
+    historySave --> historyPng["Raw / LC / EVM-MSE 收敛 PNG"]
 ```
 
 **图示说明：**
 
-- `Draw` 只接收已经算好的 `PowerEvmCurve`，不计算 SNR、EVM 或 ACLR，也不负责 CSV/JSON 数据序列化。
+- `Draw` 只接收已经算好的 `PowerEvmCurve` 或 `ILCIteration` 历史，不计算 SNR、EVM、MSE 或 ACLR，也不负责 CSV/JSON 数据序列化。
 - `ValidatePowerEvmCurve` 在创建图形前检查功率坐标、各方法数据长度和有限性，防止产生缺失或错位曲线。
 - `CreatePowerEvmFigure` 把所有方法绘制在同一坐标系中；方法较多时图例自动移到绘图区外，避免遮挡数据。
-- `SavePowerEvmCurve` 读取 `Draw` 的 `ChainMap` 绘图参数并仅输出 PNG；图形尺寸、DPI、线宽、标记大小、标题和坐标轴文字均可由外部覆盖。
+- `SavePowerEvmCurve` 读取 `Draw` 在类内部解析后的绘图参数并仅输出 PNG；图形尺寸、DPI、线宽、标记大小、标题和坐标轴文字均可由外部覆盖。
+- `SaveConvergenceCurve` 在同一 dB 轴上绘制 Raw NMSE、LC-NMSE 和可用的 EVM-MSE/EVM dB，便于定位原始 MSE 停滞但 EVM 继续改善的原因。
 
 ### `inc/Benchmark.py`
 
@@ -370,10 +472,12 @@ flowchart TD
 ```mermaid
 flowchart LR
     init["inc/__init__.py"] --> waveApi["GenWifi / WifiWaveform / MCS 表"]
-    init --> paApi["PaModel / WienerPA / GMPPA"]
-    init --> analysisApi["Analysis / SignalMetrics"]
-    init --> drawApi["Draw / drawDefaultParameters"]
+    init --> paApi["PaModel / MimoPaModel / WienerPA / GMPPA"]
+    init --> signalApi["SigProcess / SignalProcessingResult"]
+    init --> analysisApi["Analysis / SignalMetrics / MimoSignalMetrics"]
+    init --> drawApi["Draw / PowerEvmCurve 绘图入口"]
     init --> ilcApi["ILCConfig / RunFrequencyDomainIlc"]
+    init --> mimoIlcApi["RunMimoFrequencyDomainIlc / MimoGmpPredistorter"]
     init --> benchmarkApi["BenchmarkConfig / RunAllIlcBenchmark"]
 ```
 
@@ -403,6 +507,8 @@ flowchart LR
 - VHT 数据子载波间隔为 312.5 kHz；20/40/80/160 MHz 分别使用 64/128/256/512 点基础 FFT，数据音调数为 52/108/234/468。
 - HE/EHT 数据子载波间隔为 78.125 kHz；全带宽 RU 分别采用 242、484、996 和 2×996 tones。
 - VHT 数据 GI 支持 0.4、0.8 μs；HE/EHT 支持 0.8、1.6、3.2 μs。
+- VHT/HE/EHT 支持 1–8 条空间流和发射链，且 `numSpatialStreams <= numTransmitAntennas`。
+- 每条空间流具有独立 QAM 与导频；支持 direct、DFT 和 Python API 自定义正交空间映射、每链 CSD 以及随空间维度增加的正交 LTF 训练。
 
 完整 MCS 映射如下：
 
@@ -423,7 +529,7 @@ flowchart LR
 | 12 | 4096-QAM | 3/4 | 仅 EHT |
 | 13 | 4096-QAM | 5/6 | 仅 EHT |
 
-波形用于 PA/DPD 激励与指标评估，载荷采用随机 post-FEC 比特。它不包含可用于协议一致性测试的完整 LDPC 编解码、MAC/A-MPDU 组帧或 SIG 字段逐比特编码。
+波形用于 PA/DPD 激励与指标评估，载荷采用随机 post-FEC 比特。MIMO 的空间维度、正交映射、CSD 和多 LTF 结构可用于多链 PA/DPD 研究；它不包含可用于协议一致性测试的完整 LDPC 编解码、MAC/A-MPDU 组帧、标准 P 矩阵逐元素复刻或 SIG 字段逐比特编码。
 
 ## 参数参考
 
@@ -438,6 +544,12 @@ flowchart LR
 | `--bandwidth` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
 | `--mcs` | VHT：`0–9`；HE：`0–11`；EHT：`0–13` | `9` | 调制编码方案索引；默认值对三种格式都有效。 |
 | `--pa` | `wiener`、`gmp` | `wiener` | 非线性 PA 模型。 |
+| `--tx-antennas` | `1–8` | `1` | VHT/HE/EHT 物理发射链及独立 PA 数量。 |
+| `--spatial-streams` | 正整数且不大于发射链数 | `1` | 独立空间流数，VHT/HE/EHT 最大 8。 |
+| `--spatial-mapping` | `direct`、`dft` | `direct` | 空间流到发射链的正交映射。自定义矩阵通过 Python API 设置。 |
+| `--pa-input-power-db` | 逗号分隔浮点数 | 每路 `0` | 每路进入非线性 PA 前的独立驱动增益 dB，元素数必须等于发射链数。 |
+| `--pa-output-power-db` | 逗号分隔浮点数 | 每路 `0` | 每路 PA 后的独立相对输出功率调整 dB。 |
+| `--pa-output-rms` | 逗号分隔正数或 `none` | 每路 `none` | 每路绝对复包络输出 RMS 目标；启用时优先于相对 dB 的最终幅度。 |
 | `--symbols` | 正整数 | `20` | 数据 OFDM 符号数。 |
 | `--guard-interval` | `0.4`、`0.8`、`1.6`、`3.2` | `0.8` | VHT 使用 0.4/0.8 μs；HE/EHT 使用 0.8/1.6/3.2 μs。 |
 | `--oversampling` | `4`、`8` | `4` | 过采样倍率；至少 4 倍时可完整计算上下邻道 ACLR。 |
@@ -463,7 +575,7 @@ flowchart LR
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `parameters` | `Mapping` 或 `ChainMap` | `None` | 外部参数层；缺少的键回退到 `genWifiDefaultParameters`。 |
+| `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `GenWifi` 构造函数内部的不可变默认参数补齐。 |
 | `frameFormat` | `"VHT"/"11ac"`、`"HE"/"11ax"`、`"EHT"/"11be"`，并接受带 `802.` 前缀的名称 | `"EHT"` | 不区分大小写；生成后规范化为 VHT、HE 或 EHT。 |
 | `bandwidthMhz` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
 | `mcs` | VHT：`0–9`；HE：`0–11`；EHT：`0–13` | `9` | MCS 索引；默认值对三种格式都有效。 |
@@ -471,14 +583,19 @@ flowchart LR
 | `guardIntervalUs` | VHT：`0.4/0.8`；HE/EHT：`0.8/1.6/3.2` | `0.8` | 数据 GI，单位 μs。 |
 | `oversampling` | 正整数 | `4` | Python 接口允许任意正整数；进行 ACLR 分析时采样率必须不低于 3 倍带宽，建议使用 4 或 8。 |
 | `seed` | 整数 | `7` | 载荷、导频和训练字段随机种子。 |
+| `numTransmitAntennas` | `1–8` | `1` | VHT/HE/EHT 物理发射链数量；MIMO 输出矩阵的列数。 |
+| `numSpatialStreams` | `1..numTransmitAntennas` | `1` | 独立 QAM、导频和训练流数量。 |
+| `spatialMapping` | `"direct"`、`"dft"`、`"custom"` | `"direct"` | 每个子载波采用的空间映射方式。 |
+| `spatialMappingMatrix` | 复矩阵或 `None` | `None` | 仅 custom 使用，形状为 `numTransmitAntennas × numSpatialStreams`，列必须正交归一。 |
+| `cyclicShiftEnabled` | `bool` | `True` | 是否对各物理链施加格式相关的循环移位分集相位。 |
 
-`Generate()` 返回 `WifiWaveform`，其中包含 `samples`、采样率、带宽、FFT/CP 长度、数据和导频子载波、参考星座、字段切片、MCS 信息及帧格式。
+`Generate()` 返回 `WifiWaveform`。SISO 的 `samples` 是一维数组，MIMO 是 `samples × numTransmitAntennas` 矩阵；元数据还包含 `numSpatialStreams`、`spatialMappingMatrix`、`cyclicShiftsSeconds`、`ltfSymbolCount` 及三维参考空间流星座。
 
 ### `PaModel` 参数
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `parameters` | `Mapping` 或 `ChainMap` | `None` | 外部参数层；缺少的键回退到 `paModelDefaultParameters`。 |
+| `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `PaModel` 构造函数内部的不可变默认参数补齐。 |
 | `modelName` | `"wiener"`、`"gmp"`，不区分大小写 | `"wiener"` | 选择内部 PA 实现。 |
 | `wienerConfig` | `WienerConfig` 或 `None` | `None` | Wiener 模式的配置；`None` 使用默认配置。 |
 | `gmpConfig` | `GMPConfig` 或 `None` | `None` | GMP 模式的配置；`None` 使用默认配置。 |
@@ -506,6 +623,18 @@ flowchart LR
 
 `PaModel.Process(inputSignal)` 返回 PA 复基带输出；`SmallSignalGain()` 返回当前模型的 DC 小信号复增益。
 
+`MimoPaModel(parameters=None, **parameterOverrides)` 在构造函数内部使用 `ChainMap` 管理以下参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `numTransmitChains` | `1` | 独立 PA 数，范围 1–16。 |
+| `paParametersPerChain` | `None` | 每路一个普通 `PaModel` 覆盖字典；`None` 表示每路使用 `PaModel` 内部默认值。 |
+| `inputPowerDbPerChain` | `None` | 每路输入驱动 dB；`None` 展开为全 0。 |
+| `outputPowerDbPerChain` | `None` | 每路相对输出 dB；`None` 展开为全 0。 |
+| `targetOutputRmsPerChain` | `None` | 每路绝对输出 RMS 或 `None`；整个参数为 `None` 时全部禁用。 |
+
+`Process(matrix)` 逐列处理；`ProcessChain(vector, chainIndex)` 供单路测量或 ILC 使用；`SetOutputPowerDb`、`SetTargetOutputRms` 可在运行时只修改一路；`GetOutputRmsPerChain` 返回最近一次矩阵处理测得的各路 RMS。
+
 PA 辅助接口还包括：
 
 | 接口 | 参数 | 默认值或说明 |
@@ -515,41 +644,83 @@ PA 辅助接口还包括：
 | `IQImbalancePA(paModel, directCoefficient, imageCoefficient)` | `paModel`、直通系数、镜像系数 | `directCoefficient=1+0j`，`imageCoefficient=0.045·exp(j·0.35)`。 |
 | `AddAwgn(inputSignal, snrDb, randomGenerator)` | 输入、反馈 SNR、NumPy 随机数生成器 | `snrDb=None` 时原样复制输入，否则加入复高斯白噪声。 |
 
-### `Analysis` 参数与方法
+### `SigProcess` 参数与方法
 
-构造函数 `Analysis(referenceSignal, waveform, parameters=None, **parameterOverrides)` 要求参考信号为非空有限复数组，且长度与 `WifiWaveform.samples` 相同。
+构造函数 `SigProcess(referenceSignal, sampleRateHz, parameters=None, **parameterOverrides)` 保存已知参考和采样率；全部默认值定义在构造函数内部，调用方只传覆盖字典。
 
 | 配置参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `parameters` | `None` | 外部 `Mapping` 或 `ChainMap` 参数层。 |
-| `maxSegmentLength` | `16384` | Welch PSD 的最大分段长度，必须是不小于 16 的整数。 |
-| `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
-| `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
+| `enableIntegerDelayCompensation` | `True` | 估计并补偿整数样点时延。 |
+| `enableFractionalDelayCompensation` | `True` | 估计并补偿 `[-0.5, 0.5)` 范围内的残余分数时延。 |
+| `enableCarrierFrequencyOffsetCompensation` | `True` | 通过分块复增益相位斜率估计并补偿 CFO。 |
+| `enableSamplingFrequencyOffsetCompensation` | `True` | 通过局部时延随时间的斜率估计并补偿 SFO。 |
+| `enableComplexGainCompensation` | `True` | 估计并除去最小二乘公共复增益。 |
+| `maxIntegerDelaySamples` | `None` | 整数时延搜索半径；`None` 自动选择且最大为 4096 样点。 |
+| `maxCarrierFrequencyOffsetHz` | `None` | CFO 估计绝对值上限；`None` 使用内部安全范围。 |
+| `maxSamplingFrequencyOffsetPpm` | `200.0` | 采样频偏估计绝对值上限。 |
+| `timingWindowCount` | `9` | CFO 和时变时延估计使用的窗口数。 |
+| `timingWindowLength` | `2048` | 每个局部估计窗口的目标样点数。 |
+| `interpolationHalfLength` | `12` | Lanczos-sinc 插值核的单侧支持长度。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
-| `Analyze(measuredSignal)` | 与参考信号等长的 PA/DPD 输出 | 返回一个 `SignalMetrics`。 |
+| `Process(measuredSignal, estimationSlice=None)` | 测量信号、可选增益估计区间 | 返回 `SignalProcessingResult`。 |
+| `EstimateIntegerDelay(measuredSignal)` | 测量信号 | 返回有符号整数时延。 |
+| `EstimateCarrierFrequencyOffset(integerAlignedSignal)` | 粗对齐信号 | 返回 CFO，单位 Hz。 |
+| `EstimateTimingOffsets(signal, integerDelay)` | CFO 校正信号、粗时延 | 返回整数时延、分数时延和 SFO ppm。 |
+| `InterpolateSignal(inputSignal, samplePositions)` | 输入信号、浮点采样位置 | 返回 Lanczos-sinc 重采样信号。 |
+| `EstimateComplexGain(referenceSignal, measuredSignal)` | 等长对齐信号 | 返回最小二乘复增益。 |
+| `GetParameters()` | 无 | 返回当前解析后的参数快照。 |
+| `UpdateParameters(**parameterOverrides)` | 支持的任意配置 | 事务式更新最高优先级参数层。 |
+
+`SignalProcessingResult` 包含 `processedSignal`、`integerDelaySamples`、`fractionalDelaySamples`、`carrierFrequencyOffsetHz`、`samplingFrequencyOffsetPpm` 和 `complexGain`。
+
+### `Analysis` 参数与方法
+
+构造函数 `Analysis(referenceSignal, waveform, parameters=None, **parameterOverrides)` 要求参考信号为非空有限复数组，且形状与 `WifiWaveform.samples` 相同；MIMO 采用 `samples × transmitChains`。传入的待测信号可以在同步前具有不同样点数，但列数必须保持一致。
+
+| 配置参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `parameters` | `None` | 外部 `Mapping` 覆盖层；未提供的键使用 `Analysis` 构造函数内部默认值。 |
+| `maxSegmentLength` | `16384` | Welch PSD 的最大分段长度，必须是不小于 16 的整数。 |
+| `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
+| `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
+| `signalProcessingParameters` | `None` | 传给 `SigProcess` 的普通覆盖字典；`None` 使用其内部默认值。 |
+
+| 方法 | 参数 | 返回值或作用 |
+| --- | --- | --- |
+| `Analyze(measuredSignal)` | PA/DPD 输出或采集信号 | 先调用 `SigProcess`，再返回一个 `SignalMetrics`。 |
 | `AnalyzeStages(stageSignals)` | `{阶段名称: 输出数组}` 映射 | 批量计算并保存各阶段指标。 |
+| `PrepareMeasuredSignal(measuredSignal)` | 原始待测信号 | 返回与参考等长的同步、频偏和复增益校正信号。 |
+| `GetLastSignalProcessingResult()` | 无 | 返回最近一次第一路 `SignalProcessingResult`，尚未分析时返回 `None`。 |
+| `GetLastSignalProcessingResults()` | 无 | 返回最近一次所有物理链的同步结果元组。 |
+| `GetLastMimoMetrics()` | 无 | 返回最近一次逐 PA/逐空间流 `MimoSignalMetrics`。 |
+| `GetStageSignalProcessingResults()` | 无 | 返回 `AnalyzeStages` 保存的各阶段逐链同步估计。 |
+| `GetStageMimoMetrics()` | 无 | 返回各阶段详细 MIMO 指标。 |
 | `CalculateSnr(measuredSignal)` | 待测输出 | 返回数据字段 SNR，单位 dB。 |
+| `CalculateEvmAlignedMse(measuredSignal)` | 待测输出 | 返回与 EVM 接收链完全一致的归一化 MSE；该值等于 RMS EVM 的平方。 |
 | `CalculateEvm(measuredSignal)` | 待测输出 | 返回 `(evmDb, evmPercent)`。 |
 | `CalculateAclr(measuredSignal)` | 待测输出 | 返回 `(aclrLowerDb, aclrUpperDb, aclrWorstDb)`。 |
 | `DemodulateWifiData(measuredSignal)` | 待测输出 | 返回 VHT/HE/EHT 数据子载波星座。 |
 | `Print(stageMetrics=None)` | 可选指标映射 | 打印指标表；省略时使用最近一次 `AnalyzeStages` 的结果。 |
-| `Save(outputDirectory, runMetadata, stageMetrics=None)` | 输出路径、元数据、可选指标映射 | 写入 `metrics.json` 和 `metrics.csv`。 |
-| `SaveConvergence(ilcHistory, outputDirectory)` | ILC 历史、输出路径 | 写入 `ilc_convergence.csv`。 |
+| `PrintMimo(stageMimoMetrics=None)` | 可选详细指标映射 | 打印逐 PA SNR/ACLR 与逐空间流 EVM。 |
+| `PrintConvergence(ilcHistory, historyName="ILC convergence")` | ILC 历史、可选标题 | 逐轮打印 Raw MSE、LC-MSE、EVM-MSE、复增益幅相和输入峰值。 |
+| `Save(outputDirectory, runMetadata, stageMetrics=None)` | 输出路径、元数据、可选指标映射 | 写入 `metrics.json` 和 `metrics.csv`，并附带可用的各阶段同步估计。 |
+| `SaveConvergence(ilcHistory, outputDirectory)` | ILC 历史、输出路径 | 写入包含三级 MSE 和线性项诊断的 `ilc_convergence.csv`。 |
 | `AnalyzePowerEvmCurve(driveRmsValues, methodEvaluators)` | 递增驱动点、`{方法名: 求值器}` 映射 | 计算并保存一个 `PowerEvmCurve`；求值器接收当前参考信号和 RMS 驱动。 |
-| `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取 ChainMap 中的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
+| `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取实例解析后的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
 
 `SignalMetrics` 字段包括 `snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。`PowerEvmCurve` 保存 `driveRmsValues`、`inputPowerDb` 以及各方法的 EVM dB/百分比数组。
 
 ### `Draw` 参数与方法
 
-构造函数 `Draw(parameters=None, **parameterOverrides)` 使用 `ChainMap` 管理绘图配置，并且不持有或重新计算分析指标。
+构造函数 `Draw(parameters=None, **parameterOverrides)` 在内部使用 `ChainMap` 管理绘图配置，并且不持有或重新计算分析指标；调用方只需提供覆盖字典。
 
 | 配置参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `parameters` | `None` | 外部 `Mapping` 或 `ChainMap` 参数层。 |
+| `parameters` | `None` | 外部 `Mapping` 覆盖层；未提供的键使用 `Draw` 构造函数内部默认值。 |
 | `powerEvmFileStem` | `"power_evm_curve"` | PNG 默认文件名前缀。 |
+| `convergenceFileStem` | `"ilc_convergence"` | 每轮 MSE 收敛 PNG 的默认文件名前缀。 |
 | `figureWidthInches` | `10.5` | 图像宽度，单位英寸，必须为正数。 |
 | `figureHeightInches` | `6.2` | 图像高度，单位英寸，必须为正数。 |
 | `figureDpi` | `180` | PNG 分辨率，必须为正整数。 |
@@ -557,8 +728,11 @@ PA 辅助接口还包括：
 | `markerSize` | `5.0` | 数据点标记大小。 |
 | `legendColumnThreshold` | `6` | 方法数超过该值时，将图例移到绘图区右侧。 |
 | `plotTitle` | `"Power-EVM comparison"` | 图标题。 |
+| `convergencePlotTitle` | `"ILC MSE convergence"` | 每轮 MSE 收敛图标题。 |
 | `xAxisLabel` | `"Input RMS power relative to unit saturation (dB)"` | 横轴标题。 |
 | `yAxisLabel` | `"RMS EVM (dB, lower is better)"` | 纵轴标题。 |
+| `convergenceXAxisLabel` | `"ILC iteration"` | 收敛图横轴标题。 |
+| `convergenceYAxisLabel` | `"Normalized error / EVM (dB, lower is better)"` | 收敛图纵轴标题。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
@@ -567,6 +741,9 @@ PA 辅助接口还包括：
 | `ValidatePowerEvmCurve(powerEvmCurve)` | `PowerEvmCurve` | 检查曲线长度、方法名和有限性。 |
 | `CreatePowerEvmFigure(powerEvmCurve)` | `PowerEvmCurve` | 返回包含所有方法的 Matplotlib Figure。 |
 | `SavePowerEvmCurve(powerEvmCurve, outputDirectory, fileStem=None)` | 曲线、输出目录、可选文件名前缀 | 只生成并返回 PNG 路径。 |
+| `ValidateConvergenceHistory(ilcHistory)` | 每轮历史 | 检查轮次顺序以及 Raw/LC/EVM 序列完整性。 |
+| `CreateConvergenceFigure(ilcHistory)` | 每轮历史 | 返回三级 MSE 同轴对比的 Matplotlib Figure。 |
+| `SaveConvergenceCurve(ilcHistory, outputDirectory, fileStem=None)` | 每轮历史、输出目录、可选文件名前缀 | 生成并返回每轮 MSE 收敛 PNG 路径。 |
 
 ### `ILCConfig` 与算法参数
 
@@ -581,6 +758,7 @@ PA 辅助接口还包括：
 | `projectionBandwidthFactor` | `1.6` | 大于 1；频域 ILC 更新投影带宽相对信道带宽的倍率。 |
 | `responseFloorDb` | `-45.0` | 频率响应估计的低激励置信度门限。 |
 | `randomSeed` | `19` | 反馈噪声及算法随机过程种子。 |
+| `evmMseEvaluator` | `None` | 可选回调；返回数据子载波归一化 MSE。提供时每轮记录严格 EVM-MSE，并按该指标保留最佳轮次。 |
 
 所有 ILC 入口都接收 `referenceSignal`、`paModel` 和 `ILCConfig`。附加参数如下：
 
@@ -599,6 +777,8 @@ PA 辅助接口还包括：
 | 拟合入口 | 可配置参数及默认值 |
 | --- | --- |
 | `FitGmpPredistorter` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`、`crossMemoryDepth=2`、`ridgeFactor=1e-6`、`chunkSize=8192`。 |
+| `RunMimoFrequencyDomainIlc` | 接收矩阵与 `MimoPaModel`，其余参数同 `RunFrequencyDomainIlc`；逐 PA 返回独立历史。 |
+| `FitMimoGmpPredistorter` | GMP 参数同 `FitGmpPredistorter`；逐列拟合并返回 `MimoGmpPredistorter`。 |
 | `FitVolterraPredistorter` | `memoryDepth=3`、`ridgeFactor=1e-6`。 |
 | `FitLutPredistorter` | `binCount=64`、`ridgeFactor=1e-8`。 |
 | `FitNeuralPredistorter` | `memoryDepth=4`、`hiddenUnitCount=32`、`ridgeFactor=1e-5`、`randomSeed=71`。 |
@@ -623,27 +803,25 @@ PA 辅助接口还包括：
 | `generatePowerEvmCurve` | `True` | 是否生成全方法功率-EVM PNG/CSV/JSON。 |
 | `outputDirectory` | `results/all_ilc_benchmark` | 全方案 CSV、JSON 和各算法收敛历史目录。 |
 
-## 使用 ChainMap 覆盖默认参数
+## 默认参数由类内部 ChainMap 管理
 
-四个主要面向对象入口都使用 `ChainMap` 管理参数，解析优先级为：
+`GenWifi`、`PaModel`、`MimoPaModel`、`Analysis` 和 `Draw` 都在各自构造函数内部定义不可变默认参数，并在内部建立 `ChainMap`。调用方不导入默认参数表，也不显式构造 `ChainMap`，只传需要修改的普通字典。解析优先级为：
 
 ```text
 构造函数关键字或 UpdateParameters 覆盖
         ↓ 高优先级
-调用方拥有的外部字典 / ChainMap
+调用方拥有的外部覆盖字典
         ↓
-模块内置只读默认参数
+类构造函数内部的只读默认参数
 ```
 
-内置后备层分别为 `genWifiDefaultParameters`、`paModelDefaultParameters`、`analysisDefaultParameters` 和 `drawDefaultParameters`。调用方只需要提供想修改的键；其他键自动读取默认值。外部字典是活动映射，构造实例后继续修改它，下一次 `Generate()`、`Process()`、分析计算或绘图会读取新值。
+调用方省略的键会自动从对应类的内部默认层读取。外部字典仍是活动映射：构造实例后继续修改它，下一次 `Generate()`、`Process()`、分析计算或绘图会读取新值。
 
 ```python
-from collections import ChainMap
-
-from inc.Analysis import Analysis, analysisDefaultParameters
-from inc.Draw import Draw, drawDefaultParameters
-from inc.PaModel import PaModel, paModelDefaultParameters
-from inc.waveGen import GenWifi, genWifiDefaultParameters
+from inc.Analysis import Analysis
+from inc.Draw import Draw
+from inc.PaModel import PaModel
+from inc.waveGen import GenWifi
 
 # Only externally changed values are placed in the first mapping.
 wifiOverrides = {
@@ -651,8 +829,7 @@ wifiOverrides = {
     "mcs": 9,
     "numDataSymbols": 12,
 }
-wifiParameters = ChainMap(wifiOverrides, genWifiDefaultParameters)
-wifiGenerator = GenWifi(parameters=wifiParameters)
+wifiGenerator = GenWifi(parameters=wifiOverrides)
 firstWaveform = wifiGenerator.Generate()
 
 # The existing instance sees this external change on the next Generate call.
@@ -660,29 +837,23 @@ wifiOverrides["mcs"] = 11
 secondWaveform = wifiGenerator.Generate()
 
 paOverrides = {"modelName": "gmp"}
-paParameters = ChainMap(paOverrides, paModelDefaultParameters)
-paModel = PaModel(parameters=paParameters)
+paModel = PaModel(parameters=paOverrides)
 
 analysisOverrides = {
     "maxSegmentLength": 8192,
     "powerEvmFileStem": "eht_mcs11_power_evm",
 }
-analysisParameters = ChainMap(
-    analysisOverrides,
-    analysisDefaultParameters,
-)
 resultAnalysis = Analysis(
     0.24 * secondWaveform.samples,
     secondWaveform,
-    parameters=analysisParameters,
+    parameters=analysisOverrides,
 )
 
 drawOverrides = {
     "powerEvmFileStem": "eht_mcs11_power_evm",
     "figureDpi": 240,
 }
-drawParameters = ChainMap(drawOverrides, drawDefaultParameters)
-resultDraw = Draw(parameters=drawParameters)
+resultDraw = Draw(parameters=drawOverrides)
 ```
 
 也可以通过 `UpdateParameters(...)` 写入实例自己的最高优先级层：
@@ -724,63 +895,111 @@ python main.py --format EHT --bandwidth 160 --mcs 13 --pa gmp --symbols 20 --ove
 python main.py --power-start 0.06 --power-stop 0.45 --power-points 9 --feedback-snr 45 --feedback-averages 4 --save-waveforms --output-dir results/noisy_feedback
 ```
 
-### 示例五：使用 Python 实例接口完成 PA 和指标分析
+### 示例五：EHT 4×4 MIMO，并独立设置每路 PA 输出功率
+
+下面生成 4 条独立空间流，经 DFT 空间映射送入 4 个独立 Wiener PA。相对输出功率依次为 0、−1.5、−3 和 −4.5 dB；每一路独立执行 ILC，结果同时输出汇总指标、逐 PA SNR/ACLR 和逐空间流 EVM。
+
+```powershell
+python main.py --format 11be --bandwidth 80 --mcs 11 --tx-antennas 4 --spatial-streams 4 --spatial-mapping dft --pa-output-power-db 0,-1.5,-3,-4.5 --iterations 8 --output-dir results/eht_4x4
+```
+
+若要直接规定每路绝对复包络 RMS，可改用：
+
+```powershell
+python main.py --format EHT --bandwidth 20 --tx-antennas 4 --spatial-streams 2 --pa-output-rms 0.22,0.20,0.18,0.16 --skip-power-evm-curve
+```
+
+### 示例六：Python API 构造 4×2 MIMO 和独立 PA
 
 ```python
-from collections import ChainMap
+from inc.Analysis import Analysis
+from inc.PaModel import MimoPaModel
+from inc.waveGen import GenWifi
 
-from inc.Analysis import Analysis, analysisDefaultParameters
-from inc.PaModel import PaModel, paModelDefaultParameters
-from inc.waveGen import GenWifi, genWifiDefaultParameters
+wifiGenerator = GenWifi(
+    frameFormat="11ax",
+    bandwidthMhz=40,
+    mcs=9,
+    numTransmitAntennas=4,
+    numSpatialStreams=2,
+    spatialMapping="dft",
+)
+waveform = wifiGenerator.Generate()
+referenceSignal = 0.24 * waveform.samples
 
-wifiParameters = ChainMap(
-    {
+mimoPaModel = MimoPaModel(
+    numTransmitChains=4,
+    paParametersPerChain=(
+        {"modelName": "wiener"},
+        {"modelName": "wiener"},
+        {"modelName": "gmp"},
+        {"modelName": "gmp"},
+    ),
+    outputPowerDbPerChain=(0.0, -1.0, -2.0, -3.0),
+)
+paOutput = mimoPaModel.Process(referenceSignal)
+print(mimoPaModel.GetOutputRmsPerChain())
+
+# Runtime changes affect only the selected physical PA.
+mimoPaModel.SetOutputPowerDb(chainIndex=2, outputPowerDb=-4.0)
+mimoPaModel.SetTargetOutputRms(chainIndex=3, targetOutputRms=0.17)
+
+resultAnalysis = Analysis(referenceSignal, waveform)
+resultAnalysis.AnalyzeStages({"MIMO PA": paOutput})
+resultAnalysis.Print()
+resultAnalysis.PrintMimo()
+```
+
+### 示例七：使用 Python 实例接口完成 PA 和指标分析
+
+```python
+from inc.Analysis import Analysis
+from inc.PaModel import PaModel
+from inc.waveGen import GenWifi
+
+wifiGenerator = GenWifi(
+    parameters={
         "frameFormat": "11ax",
         "bandwidthMhz": 80,
         "mcs": 11,
         "numDataSymbols": 20,
-    },
-    genWifiDefaultParameters,
+    }
 )
-wifiGenerator = GenWifi(parameters=wifiParameters)
 waveform = wifiGenerator.Generate()
 referenceSignal = 0.24 * waveform.samples
 
-paParameters = ChainMap(
-    {"modelName": "wiener"},
-    paModelDefaultParameters,
-)
-paModel = PaModel(parameters=paParameters)
+paModel = PaModel(parameters={"modelName": "wiener"})
 paOutput = paModel.Process(referenceSignal)
 
-analysisParameters = ChainMap({}, analysisDefaultParameters)
 resultAnalysis = Analysis(
     referenceSignal,
     waveform,
-    parameters=analysisParameters,
+    parameters={
+        "signalProcessingParameters": {
+            "maxIntegerDelaySamples": 256,
+            "maxSamplingFrequencyOffsetPpm": 100.0,
+        }
+    },
 )
 metrics = resultAnalysis.Analyze(paOutput)
 print(metrics.ToDict())
+print(resultAnalysis.GetLastSignalProcessingResult().ToDict())
 ```
 
-### 示例六：自定义 Wiener PA
+### 示例八：自定义 Wiener PA
 
 ```python
-from collections import ChainMap
+from inc.PaModel import PaModel, WienerConfig
+from inc.waveGen import GenWifi
 
-from inc.PaModel import PaModel, WienerConfig, paModelDefaultParameters
-from inc.waveGen import GenWifi, genWifiDefaultParameters
-
-wifiParameters = ChainMap(
-    {
+wifiGenerator = GenWifi(
+    parameters={
         "frameFormat": "EHT",
         "bandwidthMhz": 20,
         "mcs": 7,
         "numDataSymbols": 10,
-    },
-    genWifiDefaultParameters,
+    }
 )
-wifiGenerator = GenWifi(parameters=wifiParameters)
 waveform = wifiGenerator.Generate()
 referenceSignal = 0.24 * waveform.samples
 
@@ -791,46 +1010,36 @@ wienerConfig = WienerConfig(
     rappSmoothness=2.5,
     ampmCoefficient=0.12,
 )
-paParameters = ChainMap(
-    {
+paModel = PaModel(
+    parameters={
         "modelName": "wiener",
         "wienerConfig": wienerConfig,
-    },
-    paModelDefaultParameters,
+    }
 )
-paModel = PaModel(parameters=paParameters)
 paOutput = paModel.Process(referenceSignal)
 ```
 
-### 示例七：程序化运行频域 ILC 并批量分析
+### 示例九：程序化运行频域 ILC 并批量分析
 
 ```python
-from collections import ChainMap
-
-from inc.Analysis import Analysis, analysisDefaultParameters
+from inc.Analysis import Analysis
 from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
-from inc.PaModel import PaModel, paModelDefaultParameters
-from inc.waveGen import GenWifi, genWifiDefaultParameters
+from inc.PaModel import PaModel
+from inc.waveGen import GenWifi
 
-wifiParameters = ChainMap(
-    {
+wifiGenerator = GenWifi(
+    parameters={
         "frameFormat": "EHT",
         "bandwidthMhz": 20,
         "mcs": 9,
         "numDataSymbols": 10,
         "oversampling": 4,
         "seed": 21,
-    },
-    genWifiDefaultParameters,
+    }
 )
-wifiGenerator = GenWifi(parameters=wifiParameters)
 waveform = wifiGenerator.Generate()
 referenceSignal = 0.24 * waveform.samples
-paParameters = ChainMap(
-    {"modelName": "gmp"},
-    paModelDefaultParameters,
-)
-paModel = PaModel(parameters=paParameters)
+paModel = PaModel(parameters={"modelName": "gmp"})
 baselineOutput = paModel.Process(referenceSignal)
 
 ilcConfig = ILCConfig(
@@ -847,12 +1056,7 @@ ilcResult = RunFrequencyDomainIlc(
     ilcConfig,
 )
 
-analysisParameters = ChainMap({}, analysisDefaultParameters)
-resultAnalysis = Analysis(
-    referenceSignal,
-    waveform,
-    parameters=analysisParameters,
-)
+resultAnalysis = Analysis(referenceSignal, waveform)
 resultAnalysis.AnalyzeStages(
     {
         "PA baseline": baselineOutput,
@@ -862,15 +1066,14 @@ resultAnalysis.AnalyzeStages(
 resultAnalysis.Print()
 ```
 
-### 示例八：程序化保存功率-EVM 数据并单独绘图
+### 示例十：程序化保存功率-EVM 数据并单独绘图
 
 以下代码接续示例七中的 `resultAnalysis` 和 `paModel`。`Analysis` 负责扫描及保存数值数据，`Draw` 只消费 `PowerEvmCurve` 并生成 PNG：
 
 ```python
-from collections import ChainMap
 from pathlib import Path
 
-from inc.Draw import Draw, drawDefaultParameters
+from inc.Draw import Draw
 
 outputDirectory = Path("results/programmatic_curve")
 powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
@@ -887,22 +1090,20 @@ powerCsvPath, powerJsonPath = resultAnalysis.SavePowerEvmCurveData(
     fileStem="programmatic_power_evm",
 )
 
-drawParameters = ChainMap(
-    {
+resultDraw = Draw(
+    parameters={
         "powerEvmFileStem": "programmatic_power_evm",
         "figureDpi": 240,
         "plotTitle": "Programmatic power-EVM comparison",
-    },
-    drawDefaultParameters,
+    }
 )
-resultDraw = Draw(parameters=drawParameters)
 powerFigurePath = resultDraw.SavePowerEvmCurve(
     powerEvmCurve,
     outputDirectory,
 )
 ```
 
-### 示例九：运行全部 ILC 与部署模型
+### 示例十一：运行全部 ILC 与部署模型
 
 ```powershell
 python main.py --benchmark-all-ilc --bandwidth 20 --mcs 7 --pa wiener --symbols 10 --iterations 10
@@ -964,7 +1165,8 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 
 - `metrics.json`：运行配置及各阶段指标；
 - `metrics.csv`：便于 Excel 或脚本统计的指标表；
-- `ilc_convergence.csv`：每轮 ILC 的 NMSE、误差 RMS 和输入峰值；
+- `ilc_convergence.csv`：每轮 ILC 的 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、公共复增益幅相和输入峰值；
+- `ilc_convergence.png`：在同一 dB 坐标中比较 Raw NMSE、LC-NMSE 与 EVM-MSE/EVM dB；
 - `waveforms.npz`：仅在指定 `--save-waveforms` 时输出。
 - `power_evm_curve.png`：PA 基线、频域 ILC、拟合 GMP DPD 的同图功率-EVM 曲线；
 - `power_evm_curve.csv`：每个 RMS/功率点的各方法 EVM dB 和百分比；
@@ -972,8 +1174,9 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 
 ## 指标定义
 
-- SNR：数据字段上去除最佳复增益后的重构信噪比。
-- EVM：对当前格式的 `VHT-Data`、`HE-Data` 或 `EHT-Data` 去循环前缀、FFT 后，在数据子载波上相对理想 QAM 星座计算 RMS EVM，同时输出 dB 与百分比。
+- SNR：`SigProcess` 完成时延、CFO、SFO 和公共复增益补偿后，数据字段参考功率与残差功率之比。
+- EVM：使用同一份 `SigProcess` 校正信号，对当前格式的 `VHT-Data`、`HE-Data` 或 `EHT-Data` 去循环前缀、FFT 后，在数据子载波上相对同路径参考星座计算 RMS EVM，同时输出 dB 与百分比。
+- 每轮 MSE：Raw MSE 保留绝对增益、相位及整帧误差；LC-MSE 删除最优公共复增益，是一般复基带的 EVM 代理；EVM-MSE 使用完整 Wi-Fi 接收链，并严格满足 `EVM-MSE = EVM_rms²` 与 `EVM(dB) = 10·log10(EVM-MSE)`。详细推导见 [结果计算物理原理与推导](doc/Analysis.md#55-为什么原始-mse-不能总是反映-evm)。
 - ACLR：主信道功率与上下相邻同带宽信道功率之比，输出上下邻道和较差值。为完整覆盖两个邻道，命令行采样倍率限制为 4 或 8。
 - 功率-EVM：横轴为 `20·log10(driveRms)`，即相对单位饱和幅度的 RMS 输入功率 dB；纵轴为 RMS EVM dB，数值越低表示性能越好。普通模式比较 PA 基线、每个功率点重新学习的频域 ILC、以及复用标称功率训练系数的 GMP DPD。
 
@@ -983,4 +1186,4 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 python tests/TestProject.py
 ```
 
-验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、两类 PA 的 ILC 改善，以及多方法功率-EVM 数据与 PNG/CSV/JSON 输出。
+验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、每轮 CSV/PNG、两类 PA 的 ILC 改善，以及多方法功率-EVM 数据与 PNG/CSV/JSON 输出。

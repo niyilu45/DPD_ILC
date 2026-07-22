@@ -3,27 +3,11 @@
 from collections import ChainMap
 from pathlib import Path
 from types import MappingProxyType
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
 from .Analysis import PowerEvmCurve
-
-
-drawDefaultParameters: Mapping[str, object] = MappingProxyType(
-    {
-        "powerEvmFileStem": "power_evm_curve",
-        "figureWidthInches": 10.5,
-        "figureHeightInches": 6.2,
-        "figureDpi": 180,
-        "lineWidth": 1.8,
-        "markerSize": 5.0,
-        "legendColumnThreshold": 6,
-        "plotTitle": "Power-EVM comparison",
-        "xAxisLabel": "Input RMS power relative to unit saturation (dB)",
-        "yAxisLabel": "RMS EVM (dB, lower is better)",
-    }
-)
 
 
 class Draw:
@@ -43,9 +27,9 @@ class Draw:
         """Initialize live plotting parameters with ChainMap precedence.
 
         Processing details:
-            Algorithm: Layer constructor overrides, a caller-owned mapping,
-            and immutable module defaults so later external edits are visible
-            without rebuilding the drawing object.
+            Algorithm: Define immutable plotting defaults inside this
+            constructor, then layer constructor overrides and a caller-owned
+            mapping ahead of them so callers never repeat default values.
 
         Args:
             parameters: Optional external mapping layered ahead of defaults.
@@ -55,13 +39,35 @@ class Draw:
             result: None. The validated settings are retained by the object.
         """
 
+        self.defaultParameters: Mapping[str, object] = MappingProxyType(
+            {
+                "powerEvmFileStem": "power_evm_curve",
+                "convergenceFileStem": "ilc_convergence",
+                "figureWidthInches": 10.5,
+                "figureHeightInches": 6.2,
+                "figureDpi": 180,
+                "lineWidth": 1.8,
+                "markerSize": 5.0,
+                "legendColumnThreshold": 6,
+                "plotTitle": "Power-EVM comparison",
+                "convergencePlotTitle": "ILC MSE convergence",
+                "xAxisLabel": (
+                    "Input RMS power relative to unit saturation (dB)"
+                ),
+                "yAxisLabel": "RMS EVM (dB, lower is better)",
+                "convergenceXAxisLabel": "ILC iteration",
+                "convergenceYAxisLabel": (
+                    "Normalized error / EVM (dB, lower is better)"
+                ),
+            }
+        )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
         externalParameters = {} if parameters is None else parameters
         self.parameters: ChainMap[str, object] = ChainMap(
             dict(parameterOverrides),
             externalParameters,
-            drawDefaultParameters,
+            self.defaultParameters,
         )
         self.ValidateParameters()
 
@@ -115,7 +121,7 @@ class Draw:
         """
 
         unknownParameters = set(self.parameters).difference(
-            drawDefaultParameters
+            self.defaultParameters
         )
         if unknownParameters:
             unknownNames = ", ".join(
@@ -123,15 +129,16 @@ class Draw:
             )
             raise TypeError(f"unknown Draw parameters: {unknownNames}")
 
-        fileStem = self.parameters["powerEvmFileStem"]
-        if not isinstance(fileStem, str):
-            raise TypeError("powerEvmFileStem must be a string")
-        if not fileStem or any(
-            character in fileStem for character in '<>:"/\\|?*'
-        ):
-            raise ValueError(
-                "powerEvmFileStem must be a valid simple file name"
-            )
+        for parameterName in ("powerEvmFileStem", "convergenceFileStem"):
+            fileStem = self.parameters[parameterName]
+            if not isinstance(fileStem, str):
+                raise TypeError(f"{parameterName} must be a string")
+            if not fileStem or any(
+                character in fileStem for character in '<>:"/\\|?*'
+            ):
+                raise ValueError(
+                    f"{parameterName} must be a valid simple file name"
+                )
 
         positiveFloatNames = (
             "figureWidthInches",
@@ -157,7 +164,14 @@ class Draw:
             if parameterValue < 1:
                 raise ValueError(f"{parameterName} must be positive")
 
-        for parameterName in ("plotTitle", "xAxisLabel", "yAxisLabel"):
+        for parameterName in (
+            "plotTitle",
+            "convergencePlotTitle",
+            "xAxisLabel",
+            "yAxisLabel",
+            "convergenceXAxisLabel",
+            "convergenceYAxisLabel",
+        ):
             parameterValue = self.parameters[parameterName]
             if not isinstance(parameterValue, str):
                 raise TypeError(f"{parameterName} must be a string")
@@ -304,6 +318,163 @@ class Draw:
         outputPath.mkdir(parents=True, exist_ok=True)
         figurePath = outputPath / f"{selectedFileStem}.png"
         figure = self.CreatePowerEvmFigure(powerEvmCurve)
+        try:
+            figure.savefig(
+                figurePath,
+                dpi=int(self.parameters["figureDpi"]),
+                bbox_inches="tight",
+            )
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
+        return figurePath
+
+    def ValidateConvergenceHistory(self, ilcHistory: Sequence[object]) -> None:
+        """Validate iteration ordering and every drawable MSE diagnostic.
+
+        Processing details:
+            Algorithm: Require at least one record, strictly increasing
+            iteration indices, finite raw and linear-compensated NMSE values,
+            and either a complete finite EVM series or no EVM series.
+
+        Args:
+            ilcHistory: Ordered objects exposing ``ILCIteration`` fields.
+
+        Returns:
+            result: None. Invalid histories raise a descriptive error.
+        """
+
+        historyRecords = tuple(ilcHistory)
+        if not historyRecords:
+            raise ValueError("ilcHistory cannot be empty")
+        iterations = np.asarray(
+            [record.iteration for record in historyRecords], dtype=int
+        )
+        if np.any(np.diff(iterations) <= 0):
+            raise ValueError("ILC iterations must be strictly increasing")
+        for fieldName in ("nmseDb", "linearCompensatedNmseDb"):
+            fieldValues = np.asarray(
+                [getattr(record, fieldName) for record in historyRecords],
+                dtype=float,
+            )
+            if not np.all(np.isfinite(fieldValues)):
+                raise ValueError(f"{fieldName} values must be finite")
+        evmValues = [record.evmDb for record in historyRecords]
+        if any(value is not None for value in evmValues):
+            if any(value is None for value in evmValues) or not np.all(
+                np.isfinite(np.asarray(evmValues, dtype=float))
+            ):
+                raise ValueError("evmDb must be complete and finite when present")
+
+    def CreateConvergenceFigure(self, ilcHistory: Sequence[object]):
+        """Create a raw-NMSE, compensated-NMSE, and EVM convergence figure.
+
+        Processing details:
+            Algorithm: Plot normalized metrics on one decibel axis so their
+            iteration trends are directly comparable. Exact EVM is included
+            only when an EVM-aligned evaluator populated every record.
+
+        Args:
+            ilcHistory: Ordered per-iteration ILC diagnostic records.
+
+        Returns:
+            result: Matplotlib Figure ready for display or PNG output.
+        """
+
+        self.ValidateParameters()
+        historyRecords = tuple(ilcHistory)
+        self.ValidateConvergenceHistory(historyRecords)
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "matplotlib is required to create the convergence figure"
+            ) from error
+
+        iterations = np.asarray(
+            [record.iteration for record in historyRecords], dtype=int
+        )
+        figure, axes = plt.subplots(
+            figsize=(
+                float(self.parameters["figureWidthInches"]),
+                float(self.parameters["figureHeightInches"]),
+            )
+        )
+        axes.plot(
+            iterations,
+            [record.nmseDb for record in historyRecords],
+            marker="o",
+            linewidth=float(self.parameters["lineWidth"]),
+            markersize=float(self.parameters["markerSize"]),
+            label="Raw time-domain NMSE",
+        )
+        axes.plot(
+            iterations,
+            [record.linearCompensatedNmseDb for record in historyRecords],
+            marker="s",
+            linewidth=float(self.parameters["lineWidth"]),
+            markersize=float(self.parameters["markerSize"]),
+            label="Complex-gain-compensated NMSE",
+        )
+        if all(record.evmDb is not None for record in historyRecords):
+            axes.plot(
+                iterations,
+                [record.evmDb for record in historyRecords],
+                marker="^",
+                linewidth=float(self.parameters["lineWidth"]),
+                markersize=float(self.parameters["markerSize"]),
+                label="EVM-aligned MSE / EVM dB",
+            )
+        axes.set_xlabel(str(self.parameters["convergenceXAxisLabel"]))
+        axes.set_ylabel(str(self.parameters["convergenceYAxisLabel"]))
+        axes.set_title(str(self.parameters["convergencePlotTitle"]))
+        axes.set_xticks(iterations)
+        axes.grid(True, which="both", linestyle=":", linewidth=0.7)
+        axes.legend(loc="best")
+        figure.tight_layout()
+        return figure
+
+    def SaveConvergenceCurve(
+        self,
+        ilcHistory: Sequence[object],
+        outputDirectory: Path,
+        fileStem: Optional[str] = None,
+    ) -> Path:
+        """Render and save all per-iteration MSE views in one PNG file.
+
+        Processing details:
+            Algorithm: Resolve the ChainMap-backed filename, create the output
+            directory, render the validated convergence history, and always
+            close Matplotlib resources after saving.
+
+        Args:
+            ilcHistory: Ordered per-iteration ILC diagnostic records.
+            outputDirectory: Directory in which the PNG image is written.
+            fileStem: Optional filename overriding ``convergenceFileStem``.
+
+        Returns:
+            result: Path to the generated convergence figure.
+        """
+
+        selectedFileStem = (
+            str(self.parameters["convergenceFileStem"])
+            if fileStem is None
+            else fileStem
+        )
+        if not isinstance(selectedFileStem, str):
+            raise TypeError("fileStem must be a string")
+        if not selectedFileStem or any(
+            character in selectedFileStem for character in '<>:"/\\|?*'
+        ):
+            raise ValueError("fileStem must be a valid simple file name")
+        outputPath = Path(outputDirectory)
+        outputPath.mkdir(parents=True, exist_ok=True)
+        figurePath = outputPath / f"{selectedFileStem}.png"
+        figure = self.CreateConvergenceFigure(ilcHistory)
         try:
             figure.savefig(
                 figurePath,

@@ -109,6 +109,30 @@ guardIntervalsByFormat: Mapping[str, Tuple[float, ...]] = MappingProxyType(
     }
 )
 
+# VHT, HE, and the finalized EHT PPDU configuration define up to eight
+# spatial streams. The project remains a single-user, full-band waveform
+# generator; MU user allocation is outside this class.
+maximumSpatialStreamsByFormat: Mapping[str, int] = MappingProxyType(
+    {"VHT": 8, "HE": 8, "EHT": 8}
+)
+
+# Per-transmit-chain cyclic shifts follow the standard WLAN pattern for all
+# eight supported chains. Values are represented in nanoseconds and applied
+# as frequency-dependent phase rotations before every IFFT.
+cyclicShiftNanoseconds = np.asarray(
+    (
+        0.0,
+        -400.0,
+        -200.0,
+        -600.0,
+        -350.0,
+        -650.0,
+        -100.0,
+        -750.0,
+    ),
+    dtype=float,
+)
+
 
 def NormalizeFrameFormat(frameFormat: str) -> str:
     """Convert a standard-generation or PHY-format name to VHT, HE, or EHT.
@@ -135,26 +159,13 @@ def NormalizeFrameFormat(frameFormat: str) -> str:
     return frameFormatAliases[normalizedInput]
 
 
-genWifiDefaultParameters: Mapping[str, object] = MappingProxyType(
-    {
-        "frameFormat": "EHT",
-        "bandwidthMhz": 80,
-        "mcs": 9,
-        "numDataSymbols": 20,
-        "guardIntervalUs": 0.8,
-        "oversampling": 4,
-        "seed": 7,
-    }
-)
-
-
 class GenWifi:
-    """Configure and generate a single-user VHT, HE, or EHT Wi-Fi waveform.
+    """Configure and generate a SISO or MIMO VHT, HE, or EHT waveform.
 
     A ``ChainMap`` resolves explicit keyword overrides first, a caller-owned
-    parameter mapping second, and immutable module defaults last. Changes to
-    the caller-owned mapping remain visible until a higher-priority keyword
-    override shadows the same key.
+    parameter mapping second, and immutable constructor-internal defaults
+    last. Changes to the caller-owned mapping remain visible until a
+    higher-priority keyword override shadows the same key.
 
     Example:
         ``wifiGenerator = GenWifi(frameFormat="11be", bandwidthMhz=80, mcs=11)``
@@ -169,7 +180,9 @@ class GenWifi:
         """Initialize a VHT/HE/EHT waveform generator with ChainMap defaults.
 
         Processing details:
-            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+            Algorithm: Define immutable defaults inside the constructor, then
+            layer direct overrides and the caller-owned mapping ahead of those
+            defaults without requiring callers to import or repeat them.
 
         Args:
             parameters: Optional external mapping layered ahead of the built-in defaults.
@@ -178,13 +191,29 @@ class GenWifi:
         Returns:
             result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
         """
+        self.defaultParameters: Mapping[str, object] = MappingProxyType(
+            {
+                "frameFormat": "EHT",
+                "bandwidthMhz": 80,
+                "mcs": 9,
+                "numDataSymbols": 20,
+                "guardIntervalUs": 0.8,
+                "oversampling": 4,
+                "seed": 7,
+                "numTransmitAntennas": 1,
+                "numSpatialStreams": 1,
+                "spatialMapping": "direct",
+                "spatialMappingMatrix": None,
+                "cyclicShiftEnabled": True,
+            }
+        )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
         externalParameters = {} if parameters is None else parameters
         self.parameters: ChainMap[str, object] = ChainMap(
             dict(parameterOverrides),
             externalParameters,
-            genWifiDefaultParameters,
+            self.defaultParameters,
         )
         self.Validate()
 
@@ -293,6 +322,89 @@ class GenWifi:
 
     seed = Seed
 
+    @property
+    def NumTransmitAntennas(self) -> int:
+        """Return the configured number of physical transmit chains.
+
+        Processing details:
+            Algorithm: Resolve the integer from the active parameter layers;
+            validation guarantees the format-specific antenna bound.
+
+        Returns:
+            result: Number of transmit antennas in the generated waveform.
+        """
+
+        return cast(int, self.parameters["numTransmitAntennas"])
+
+    numTransmitAntennas = NumTransmitAntennas
+
+    @property
+    def NumSpatialStreams(self) -> int:
+        """Return the configured number of independently modulated streams.
+
+        Processing details:
+            Algorithm: Resolve the integer from the active parameter layers;
+            validation guarantees it does not exceed transmit dimensions.
+
+        Returns:
+            result: Number of VHT, HE, or EHT spatial streams.
+        """
+
+        return cast(int, self.parameters["numSpatialStreams"])
+
+    numSpatialStreams = NumSpatialStreams
+
+    @property
+    def SpatialMapping(self) -> str:
+        """Return the normalized spatial-mapping mode name.
+
+        Processing details:
+            Algorithm: Strip whitespace and lowercase the configured mode so
+            downstream matrix construction has one canonical representation.
+
+        Returns:
+            result: ``direct``, ``dft``, or ``custom``.
+        """
+
+        return cast(str, self.parameters["spatialMapping"]).strip().lower()
+
+    spatialMapping = SpatialMapping
+
+    @property
+    def SpatialMappingMatrix(self) -> Optional[np.ndarray]:
+        """Return a copy of the optional caller-supplied mapping matrix.
+
+        Processing details:
+            Algorithm: Preserve ``None`` for automatic mapping; otherwise
+            convert the configured matrix to complex128 and return a copy.
+
+        Returns:
+            result: Optional matrix shaped transmit antennas by streams.
+        """
+
+        rawMatrix = self.parameters["spatialMappingMatrix"]
+        if rawMatrix is None:
+            return None
+        return np.asarray(rawMatrix, dtype=np.complex128).copy()
+
+    spatialMappingMatrix = SpatialMappingMatrix
+
+    @property
+    def CyclicShiftEnabled(self) -> bool:
+        """Return whether per-chain cyclic shift diversity is enabled.
+
+        Processing details:
+            Algorithm: Read the validated Boolean without changing external
+            live-mapping behavior.
+
+        Returns:
+            result: True when frequency-dependent CSD phases are applied.
+        """
+
+        return cast(bool, self.parameters["cyclicShiftEnabled"])
+
+    cyclicShiftEnabled = CyclicShiftEnabled
+
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened snapshot of all resolved parameters.
 
@@ -338,7 +450,7 @@ class GenWifi:
         """
 
         unknownParameters = set(self.parameters).difference(
-            genWifiDefaultParameters
+            self.defaultParameters
         )
         if unknownParameters:
             unknownNames = ", ".join(
@@ -388,6 +500,68 @@ class GenWifi:
             raise ValueError("oversampling must be a positive integer")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise TypeError("seed must be an integer")
+        maximumSpatialStreams = maximumSpatialStreamsByFormat[
+            normalizedFormat
+        ]
+        for parameterName, parameterValue in (
+            ("numTransmitAntennas", self.numTransmitAntennas),
+            ("numSpatialStreams", self.numSpatialStreams),
+        ):
+            if not isinstance(parameterValue, int) or isinstance(
+                parameterValue, bool
+            ):
+                raise TypeError(f"{parameterName} must be an integer")
+            if parameterValue < 1 or parameterValue > maximumSpatialStreams:
+                raise ValueError(
+                    f"{normalizedFormat} {parameterName} must be from 1 "
+                    f"through {maximumSpatialStreams}"
+                )
+        if self.numSpatialStreams > self.numTransmitAntennas:
+            raise ValueError(
+                "numSpatialStreams cannot exceed numTransmitAntennas"
+            )
+        if self.spatialMapping not in ("direct", "dft", "custom"):
+            raise ValueError(
+                "spatialMapping must be 'direct', 'dft', or 'custom'"
+            )
+        rawSpatialMappingMatrix = self.parameters["spatialMappingMatrix"]
+        if self.spatialMapping == "custom":
+            if rawSpatialMappingMatrix is None:
+                raise ValueError(
+                    "custom spatialMapping requires spatialMappingMatrix"
+                )
+            mappingMatrix = np.asarray(
+                rawSpatialMappingMatrix, dtype=np.complex128
+            )
+            expectedShape = (
+                self.numTransmitAntennas,
+                self.numSpatialStreams,
+            )
+            if mappingMatrix.shape != expectedShape:
+                raise ValueError(
+                    "spatialMappingMatrix must have shape "
+                    f"{expectedShape}"
+                )
+            if not np.all(np.isfinite(mappingMatrix)):
+                raise ValueError(
+                    "spatialMappingMatrix contains NaN or infinite values"
+                )
+            gramMatrix = mappingMatrix.conj().T @ mappingMatrix
+            if not np.allclose(
+                gramMatrix,
+                np.eye(self.numSpatialStreams),
+                rtol=1.0e-7,
+                atol=1.0e-9,
+            ):
+                raise ValueError(
+                    "spatialMappingMatrix columns must be orthonormal"
+                )
+        elif rawSpatialMappingMatrix is not None:
+            raise ValueError(
+                "spatialMappingMatrix is only valid for custom mapping"
+            )
+        if not isinstance(self.cyclicShiftEnabled, bool):
+            raise TypeError("cyclicShiftEnabled must be boolean")
 
     def GetMcsInfo(self) -> MCSInfo:
         """Return the MCS record selected by this generator instance.
@@ -439,6 +613,12 @@ class WifiWaveform:
     frameFormat: str
     dataFieldName: str
     formatName: str
+    numTransmitAntennas: int
+    numSpatialStreams: int
+    spatialMapping: str
+    spatialMappingMatrix: np.ndarray
+    cyclicShiftsSeconds: np.ndarray
+    ltfSymbolCount: int
 
 
 def ActiveTones(
@@ -750,6 +930,296 @@ def TrainingField(
     return np.concatenate(outputSymbols)
 
 
+def BuildSpatialMappingMatrix(config: GenWifi) -> np.ndarray:
+    """Build the constant orthonormal spatial mapping matrix.
+
+    Processing details:
+        Algorithm: Use direct stream-to-chain placement, a normalized partial
+        DFT for uniform spatial expansion, or the validated custom matrix.
+
+    Args:
+        config: Validated waveform configuration containing MIMO dimensions.
+
+    Returns:
+        result: Complex matrix shaped transmit antennas by spatial streams.
+    """
+
+    numTransmitAntennas = config.numTransmitAntennas
+    numSpatialStreams = config.numSpatialStreams
+    if config.spatialMapping == "direct":
+        mappingMatrix = np.zeros(
+            (numTransmitAntennas, numSpatialStreams),
+            dtype=np.complex128,
+        )
+        mappingMatrix[:numSpatialStreams, :] = np.eye(numSpatialStreams)
+        return mappingMatrix
+    if config.spatialMapping == "dft":
+        antennaIndices = np.arange(numTransmitAntennas)[:, None]
+        streamIndices = np.arange(numSpatialStreams)[None, :]
+        return np.exp(
+            -1j
+            * 2.0
+            * np.pi
+            * antennaIndices
+            * streamIndices
+            / float(numTransmitAntennas)
+        ) / np.sqrt(float(numTransmitAntennas))
+    customMatrix = config.spatialMappingMatrix
+    if customMatrix is None:
+        raise RuntimeError("validated custom spatial mapping matrix is missing")
+    return customMatrix
+
+
+def GetLtfSymbolCount(frameFormat: str, numSpatialStreams: int) -> int:
+    """Return the training-symbol count required by the spatial dimensions.
+
+    Processing details:
+        Algorithm: Apply the standard 1,2,4,6,8 training-dimension
+        progression through at most eight VHT/HE/EHT spatial streams.
+
+    Args:
+        frameFormat: Canonical VHT, HE, or EHT name.
+        numSpatialStreams: Number of independently trained spatial streams.
+
+    Returns:
+        result: Number of orthogonally coded format-specific LTF symbols.
+    """
+
+    normalizedFormat = NormalizeFrameFormat(frameFormat)
+    if numSpatialStreams <= 1:
+        return 1
+    if numSpatialStreams <= 2:
+        return 2
+    if numSpatialStreams <= 4:
+        return 4
+    if numSpatialStreams <= 6:
+        return 6
+    if numSpatialStreams <= 8:
+        return 8
+    raise ValueError(
+        f"{normalizedFormat} supports at most eight spatial streams"
+    )
+
+
+def BuildLtfTrainingMatrix(
+    numSpatialStreams: int, ltfSymbolCount: int
+) -> np.ndarray:
+    """Create orthogonal phase codes across format-specific LTF symbols.
+
+    Processing details:
+        Algorithm: Select the first spatial-stream rows of a DFT matrix whose
+        columns index LTF symbols. The rows are mutually orthogonal and allow
+        the receiver to separate every trained spatial dimension.
+
+    Args:
+        numSpatialStreams: Number of spatial streams to train.
+        ltfSymbolCount: Number of available LTF OFDM symbols.
+
+    Returns:
+        result: Complex matrix shaped streams by LTF symbols.
+    """
+
+    if ltfSymbolCount < numSpatialStreams:
+        raise ValueError("ltfSymbolCount cannot be smaller than streams")
+    streamIndices = np.arange(numSpatialStreams)[:, None]
+    symbolIndices = np.arange(ltfSymbolCount)[None, :]
+    return np.exp(
+        -1j
+        * 2.0
+        * np.pi
+        * streamIndices
+        * symbolIndices
+        / float(ltfSymbolCount)
+    )
+
+
+def GetCyclicShifts(config: GenWifi) -> np.ndarray:
+    """Return per-chain cyclic shifts in seconds.
+
+    Processing details:
+        Algorithm: Select the configured number of WLAN shift values and
+        replace them with zeros when cyclic shift diversity is disabled.
+
+    Args:
+        config: Validated MIMO waveform configuration.
+
+    Returns:
+        result: Floating-point vector of shifts in seconds.
+    """
+
+    selectedShifts = cyclicShiftNanoseconds[
+        : config.numTransmitAntennas
+    ].copy()
+    if not config.cyclicShiftEnabled:
+        selectedShifts.fill(0.0)
+    return selectedShifts * 1.0e-9
+
+
+def BuildCsdPhaseMatrix(
+    subcarrierIndices: np.ndarray,
+    subcarrierSpacingHz: float,
+    cyclicShiftsSeconds: np.ndarray,
+) -> np.ndarray:
+    """Build frequency-dependent CSD phases for all tones and chains.
+
+    Processing details:
+        Algorithm: Evaluate ``exp(-j*2*pi*k*deltaF*tau)`` for every centered
+        subcarrier index and transmit-chain cyclic shift.
+
+    Args:
+        subcarrierIndices: Centered signed OFDM tone indices.
+        subcarrierSpacingHz: Tone spacing in hertz.
+        cyclicShiftsSeconds: Per-chain cyclic shifts in seconds.
+
+    Returns:
+        result: Matrix shaped tones by transmit antennas.
+    """
+
+    toneFrequencies = (
+        np.asarray(subcarrierIndices, dtype=float).reshape(-1, 1)
+        * float(subcarrierSpacingHz)
+    )
+    shifts = np.asarray(cyclicShiftsSeconds, dtype=float).reshape(1, -1)
+    return np.exp(-1j * 2.0 * np.pi * toneFrequencies * shifts)
+
+
+def SpatialMapTones(
+    streamValues: np.ndarray,
+    subcarrierIndices: np.ndarray,
+    spatialMappingMatrix: np.ndarray,
+    subcarrierSpacingHz: float,
+    cyclicShiftsSeconds: np.ndarray,
+) -> np.ndarray:
+    """Map spatial-stream tone values onto physical transmit chains.
+
+    Processing details:
+        Algorithm: Apply ``x[k] = Q*s[k]`` on every tone and multiply each
+        antenna by its frequency-dependent cyclic-shift phase.
+
+    Args:
+        streamValues: Complex matrix shaped tones by spatial streams.
+        subcarrierIndices: Centered signed tone indices matching the rows.
+        spatialMappingMatrix: Orthonormal matrix shaped antennas by streams.
+        subcarrierSpacingHz: OFDM tone spacing in hertz.
+        cyclicShiftsSeconds: Per-chain CSD shifts in seconds.
+
+    Returns:
+        result: Complex tone matrix shaped tones by transmit antennas.
+    """
+
+    complexStreams = np.asarray(streamValues, dtype=np.complex128)
+    if complexStreams.ndim != 2:
+        raise ValueError("streamValues must be a two-dimensional matrix")
+    if complexStreams.shape[0] != np.asarray(subcarrierIndices).size:
+        raise ValueError("streamValues and subcarrierIndices must align")
+    if complexStreams.shape[1] != spatialMappingMatrix.shape[1]:
+        raise ValueError("streamValues do not match spatial stream count")
+    antennaValues = complexStreams @ spatialMappingMatrix.T
+    csdPhases = BuildCsdPhaseMatrix(
+        subcarrierIndices,
+        subcarrierSpacingHz,
+        cyclicShiftsSeconds,
+    )
+    return antennaValues * csdPhases
+
+
+def BuildMimoOfdmSymbol(
+    fftLength: int,
+    cpLength: int,
+    subcarrierIndices: np.ndarray,
+    streamValues: np.ndarray,
+    spatialMappingMatrix: np.ndarray,
+    subcarrierSpacingHz: float,
+    cyclicShiftsSeconds: np.ndarray,
+) -> np.ndarray:
+    """Generate one CP-OFDM symbol for every transmit antenna.
+
+    Processing details:
+        Algorithm: Spatially map stream values tone by tone, invoke the SISO
+        OFDM modulator independently on every mapped antenna column, and stack
+        time samples along a common first dimension.
+
+    Args:
+        fftLength: Oversampled IFFT length.
+        cpLength: Cyclic-prefix length in samples.
+        subcarrierIndices: Centered signed allocated tones.
+        streamValues: Values shaped tones by spatial streams.
+        spatialMappingMatrix: Orthonormal antennas-by-streams mapping.
+        subcarrierSpacingHz: Tone spacing in hertz.
+        cyclicShiftsSeconds: Per-chain cyclic shifts in seconds.
+
+    Returns:
+        result: Time-domain matrix shaped samples by transmit antennas.
+    """
+
+    antennaValues = SpatialMapTones(
+        streamValues,
+        subcarrierIndices,
+        spatialMappingMatrix,
+        subcarrierSpacingHz,
+        cyclicShiftsSeconds,
+    )
+    antennaSymbols = [
+        OfdmSymbol(
+            fftLength,
+            cpLength,
+            subcarrierIndices,
+            antennaValues[:, antennaIndex],
+        )
+        for antennaIndex in range(spatialMappingMatrix.shape[0])
+    ]
+    return np.column_stack(antennaSymbols)
+
+
+def MapCommonFieldToAntennas(
+    fieldSamples: np.ndarray,
+    sampleRateHz: float,
+    cyclicShiftsSeconds: np.ndarray,
+) -> np.ndarray:
+    """Replicate one non-spatial field across antennas with CSD.
+
+    Processing details:
+        Algorithm: Split the field into its 4-us legacy-rate OFDM symbols,
+        apply each cyclic shift independently as a frequency-domain circular
+        shift per symbol, and preserve total power across antenna copies.
+
+    Args:
+        fieldSamples: One-dimensional common-field complex waveform.
+        sampleRateHz: Complex sample rate in samples per second.
+        cyclicShiftsSeconds: Per-chain cyclic shifts in seconds.
+
+    Returns:
+        result: Common-field matrix shaped samples by transmit antennas.
+    """
+
+    complexField = np.asarray(fieldSamples, dtype=np.complex128).reshape(-1)
+    legacySymbolLength = int(round(4.0e-6 * float(sampleRateHz)))
+    if (
+        legacySymbolLength <= 0
+        or complexField.size % legacySymbolLength != 0
+    ):
+        raise ValueError(
+            "fieldSamples must contain complete 4-us common-field symbols"
+        )
+    fieldSymbols = complexField.reshape(-1, legacySymbolLength)
+    fieldSpectrum = np.fft.fft(fieldSymbols, axis=1)
+    frequencyBins = np.fft.fftfreq(
+        legacySymbolLength, d=1.0 / float(sampleRateHz)
+    )
+    antennaFields = []
+    antennaScale = 1.0 / np.sqrt(float(cyclicShiftsSeconds.size))
+    for shiftSeconds in cyclicShiftsSeconds:
+        shiftedField = np.fft.ifft(
+            fieldSpectrum
+            * np.exp(
+                -1j * 2.0 * np.pi * frequencyBins * shiftSeconds
+            )[None, :],
+            axis=1,
+        ).reshape(-1)
+        antennaFields.append(antennaScale * shiftedField)
+    return np.column_stack(antennaFields)
+
+
 def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
     """Generate one VHT, HE, or EHT packet for a validated generator.
 
@@ -775,6 +1245,12 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
     fftLength = baseFftLength * config.oversampling
     sampleRateHz = bandwidthHz * config.oversampling
     cpLength = int(round(config.guardIntervalUs * 1e-6 * sampleRateHz))
+    subcarrierSpacingHz = sampleRateHz / float(fftLength)
+    spatialMappingMatrix = BuildSpatialMappingMatrix(config)
+    cyclicShiftsSeconds = GetCyclicShifts(config)
+    ltfSymbolCount = GetLtfSymbolCount(
+        normalizedFormat, config.numSpatialStreams
+    )
 
     activeSubcarriers = ActiveTones(
         config.bandwidthMhz, normalizedFormat
@@ -810,11 +1286,20 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
 
         nonlocal sampleCursor
         complexSamples = np.asarray(fieldSamples, dtype=np.complex128)
+        if complexSamples.ndim == 1:
+            complexSamples = complexSamples.reshape(-1, 1)
+        if (
+            complexSamples.ndim != 2
+            or complexSamples.shape[1] != config.numTransmitAntennas
+        ):
+            raise ValueError(
+                "fieldSamples must have one column per transmit antenna"
+            )
         packetFields.append(complexSamples)
         fieldSlices[fieldName] = slice(
-            sampleCursor, sampleCursor + complexSamples.size
+            sampleCursor, sampleCursor + complexSamples.shape[0]
         )
-        sampleCursor += complexSamples.size
+        sampleCursor += complexSamples.shape[0]
 
     legacyFftLength = (
         64 * (config.bandwidthMhz // 20) * config.oversampling
@@ -868,23 +1353,36 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
             randomGenerator,
             fieldNumber,
         )
-        AppendField(fieldName, fieldSamples)
+        AppendField(
+            fieldName,
+            MapCommonFieldToAntennas(
+                fieldSamples,
+                sampleRateHz,
+                cyclicShiftsSeconds,
+            ),
+        )
 
     # VHT-STF, HE-STF, and EHT-STF are 4 us fields. A legacy-rate OFDM
     # construction preserves that duration and a repeatable wideband stimulus.
-    AppendField(
-        shortTrainingFieldName,
-        TrainingField(
+    shortTrainingSamples = TrainingField(
             1,
             legacyFftLength,
             config.oversampling,
             randomGenerator,
             len(preambleSpecification),
+        )
+    AppendField(
+        shortTrainingFieldName,
+        MapCommonFieldToAntennas(
+            shortTrainingSamples,
+            sampleRateHz,
+            cyclicShiftsSeconds,
         ),
     )
 
-    # A single-stream VHT-LTF always uses a 3.2 us useful symbol and a 0.8 us
-    # guard interval. HE/EHT use format-specific 2x or 4x LTF constructions.
+    # Every VHT-LTF uses a 3.2 us useful symbol and a 0.8 us guard interval;
+    # multiple spatial dimensions add orthogonally coded LTF symbols.
+    # HE/EHT use format-specific 2x or 4x LTF constructions.
     if normalizedFormat == "VHT":
         longTrainingFftLength = fftLength
         longTrainingSubcarriers = activeSubcarriers
@@ -904,39 +1402,67 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
     longTrainingValues = PilotSequence(
         longTrainingSubcarriers.size, randomGenerator
     )
+    ltfTrainingMatrix = BuildLtfTrainingMatrix(
+        config.numSpatialStreams, ltfSymbolCount
+    )
+    longTrainingSymbols = []
+    longTrainingSubcarrierSpacingHz = (
+        sampleRateHz / float(longTrainingFftLength)
+    )
+    for ltfSymbolIndex in range(ltfSymbolCount):
+        ltfStreamValues = (
+            longTrainingValues[:, None]
+            * ltfTrainingMatrix[:, ltfSymbolIndex][None, :]
+        )
+        longTrainingSymbols.append(
+            BuildMimoOfdmSymbol(
+                longTrainingFftLength,
+                longTrainingCpLength,
+                longTrainingSubcarriers,
+                ltfStreamValues,
+                spatialMappingMatrix,
+                longTrainingSubcarrierSpacingHz,
+                cyclicShiftsSeconds,
+            )
+        )
     AppendField(
         longTrainingFieldName,
-        OfdmSymbol(
-            longTrainingFftLength,
-            longTrainingCpLength,
-            longTrainingSubcarriers,
-            longTrainingValues,
-        ),
+        np.concatenate(longTrainingSymbols, axis=0),
     )
 
     # VHT-SIG-B follows VHT-LTF and occupies one 4 us OFDM symbol. HE and EHT
     # carry equivalent signaling earlier in their respective preambles.
     if normalizedFormat == "VHT":
-        AppendField(
-            "VHT-SIG-B",
-            TrainingField(
+        vhtSigBSamples = TrainingField(
                 1,
                 legacyFftLength,
                 config.oversampling,
                 randomGenerator,
                 len(preambleSpecification) + 1,
+            )
+        AppendField(
+            "VHT-SIG-B",
+            MapCommonFieldToAntennas(
+                vhtSigBSamples,
+                sampleRateHz,
+                cyclicShiftsSeconds,
             ),
         )
 
     bitsPerSubcarrier = mcsInfo.bitsPerSubcarrier
     totalCodedBits = (
-        config.numDataSymbols * dataSubcarriers.size * bitsPerSubcarrier
+        config.numDataSymbols
+        * dataSubcarriers.size
+        * config.numSpatialStreams
+        * bitsPerSubcarrier
     )
     codedBits = randomGenerator.integers(
         0, 2, totalCodedBits, dtype=np.uint8
     )
     qamSymbols = QamModulate(codedBits, mcsInfo.qamOrder).reshape(
-        config.numDataSymbols, dataSubcarriers.size
+        config.numDataSymbols,
+        dataSubcarriers.size,
+        config.numSpatialStreams,
     )
 
     dataStart = sampleCursor
@@ -944,34 +1470,62 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
     dataTimeSymbols = []
     symbolLength = fftLength + cpLength
     for symbolIndex in range(config.numDataSymbols):
-        pilotValues = PilotSequence(pilotSubcarriers.size, randomGenerator)
-        subcarrierValues = np.r_[qamSymbols[symbolIndex], pilotValues]
+        pilotValues = PilotSequence(
+            pilotSubcarriers.size * config.numSpatialStreams,
+            randomGenerator,
+        ).reshape(pilotSubcarriers.size, config.numSpatialStreams)
+        subcarrierValues = np.concatenate(
+            (qamSymbols[symbolIndex], pilotValues), axis=0
+        )
         mappedSubcarriers = np.r_[dataSubcarriers, pilotSubcarriers]
         dataSymbolStarts.append(dataStart + symbolIndex * symbolLength)
         dataTimeSymbols.append(
-            OfdmSymbol(
+            BuildMimoOfdmSymbol(
                 fftLength,
                 cpLength,
                 mappedSubcarriers,
                 subcarrierValues,
+                spatialMappingMatrix,
+                subcarrierSpacingHz,
+                cyclicShiftsSeconds,
             )
         )
-    dataSamples = np.concatenate(dataTimeSymbols)
+    dataSamples = np.concatenate(dataTimeSymbols, axis=0)
     AppendField(dataFieldName, dataSamples)
     if fieldSlices[dataFieldName].start != dataStart:
         raise RuntimeError("internal Wi-Fi data field offset error")
 
-    packetSamples = np.concatenate(packetFields)
-    packetRms = np.sqrt(np.mean(np.abs(packetSamples) ** 2))
+    packetSamples = np.concatenate(packetFields, axis=0)
+    packetRms = np.sqrt(
+        np.mean(np.sum(np.abs(packetSamples) ** 2, axis=1))
+    )
     normalizationScale = 1.0 / max(packetRms, np.finfo(float).tiny)
     packetSamples *= normalizationScale
 
-    codedBitsPerSymbol = dataSubcarriers.size * bitsPerSubcarrier
+    codedBitsPerSymbol = (
+        dataSubcarriers.size
+        * bitsPerSubcarrier
+        * config.numSpatialStreams
+    )
     informationBitsPerSymbol = int(
         np.floor(codedBitsPerSymbol * mcsInfo.codeRate)
     )
+    outputSamples = (
+        packetSamples[:, 0]
+        if config.numTransmitAntennas == 1
+        else packetSamples
+    )
+    outputQamSymbols = (
+        qamSymbols[:, :, 0]
+        if config.numSpatialStreams == 1
+        else qamSymbols
+    ) * normalizationScale
+    formatName = (
+        f"{formatName}; {config.numSpatialStreams} spatial stream(s), "
+        f"{config.numTransmitAntennas} transmit chain(s)"
+    )
     return WifiWaveform(
-        samples=packetSamples,
+        samples=outputSamples,
         sampleRateHz=sampleRateHz,
         bandwidthHz=bandwidthHz,
         fftLength=fftLength,
@@ -980,7 +1534,7 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
         activeSubcarriers=activeSubcarriers,
         dataSubcarriers=dataSubcarriers,
         pilotSubcarriers=pilotSubcarriers,
-        referenceDataSymbols=qamSymbols,
+        referenceDataSymbols=outputQamSymbols,
         fieldSlices=fieldSlices,
         dataSymbolStarts=np.asarray(dataSymbolStarts, dtype=np.int64),
         symbolLength=symbolLength,
@@ -991,4 +1545,10 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
         frameFormat=normalizedFormat,
         dataFieldName=dataFieldName,
         formatName=formatName,
+        numTransmitAntennas=config.numTransmitAntennas,
+        numSpatialStreams=config.numSpatialStreams,
+        spatialMapping=config.spatialMapping,
+        spatialMappingMatrix=spatialMappingMatrix,
+        cyclicShiftsSeconds=cyclicShiftsSeconds,
+        ltfSymbolCount=ltfSymbolCount,
     )
