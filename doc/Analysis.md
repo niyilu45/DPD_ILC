@@ -93,7 +93,7 @@ J(g)
 }
 ```
 
-这就是 `_BestComplexGain`。
+这就是 `BestComplexGain`。
 
 几何上，$\hat g\mathbf x$ 是 $\mathbf y$ 在参考方向上的正交投影，残差
 
@@ -115,7 +115,7 @@ J(g)
 
 ### 4.1 代码定义
 
-分析器只截取 HE-Data 或 EHT-Data 字段。令
+分析器只截取当前格式对应的 VHT-Data、HE-Data 或 EHT-Data 字段。令
 
 ```math
 \mathbf s=\hat g\mathbf x,
@@ -573,11 +573,10 @@ EVM(dB)
 - `evmDbByMethod`：每种方法的 EVM dB 数组；
 - `evmPercentByMethod`：每种方法的 EVM 百分比数组。
 
-`SavePowerEvmCurve` 同时生成：
+曲线计算与显示采用职责分离：
 
-- CSV：便于表格处理；
-- JSON：保留方法分组结构；
-- PNG：在一张图中比较全部方法。
+- `Analysis.SavePowerEvmCurveData` 生成 CSV 和 JSON，分别用于表格处理和保存方法分组结构；
+- `Draw.SavePowerEvmCurve` 位于 `inc/Draw.py`，只负责把全部方法绘制到同一张 PNG 图中。
 
 ---
 
@@ -585,22 +584,24 @@ EVM(dB)
 
 | 计算步骤 | 方法 |
 |---|---|
-| 输入检查 | `Analysis._PrepareMeasuredSignal` |
-| 最佳复增益 | `_BestComplexGain` |
+| 输入检查 | `Analysis.PrepareMeasuredSignal` |
+| 最佳复增益 | `BestComplexGain` |
 | 数据字段 SNR | `Analysis.CalculateSnr` |
 | OFDM 数据解调 | `Analysis.DemodulateWifiData` |
 | RMS EVM | `Analysis.CalculateEvm` |
-| Welch PSD | `_AveragePeriodogram` |
+| Welch PSD | `AveragePeriodogram` |
 | ACLR | `Analysis.CalculateAclr` |
 | 三指标汇总 | `Analysis.Analyze` |
 | 多阶段批量统计 | `Analysis.AnalyzeStages` |
 | 功率扫描 | `Analysis.AnalyzePowerEvmCurve` |
-| 曲线保存 | `Analysis.SavePowerEvmCurve` |
+| 曲线数据保存 | `Analysis.SavePowerEvmCurveData` |
+| 曲线绘图 | `Draw.SavePowerEvmCurve` |
 
 ```python
 from collections import ChainMap
 
 from inc.Analysis import Analysis, analysisDefaultParameters
+from inc.Draw import Draw, drawDefaultParameters
 
 analysisOverrides = {
     "maxSegmentLength": 8192,
@@ -614,6 +615,12 @@ resultAnalysis = Analysis(
     referenceSignal,
     wifiWaveform,
     parameters=analysisParameters,
+)
+resultDraw = Draw(
+    parameters=ChainMap(
+        {"powerEvmFileStem": "comparison_curve"},
+        drawDefaultParameters,
+    )
 )
 
 metrics = resultAnalysis.Analyze(paOutput)
@@ -631,7 +638,7 @@ stageMetrics = resultAnalysis.AnalyzeStages(
 resultAnalysis.Print(stageMetrics)
 ```
 
-未提供的键从 `analysisDefaultParameters` 读取。外部修改 `analysisOverrides` 后，下一次 ACLR 或曲线保存会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。
+未提供的分析键从 `analysisDefaultParameters` 读取，绘图键从 `drawDefaultParameters` 读取。外部修改对应覆盖字典后，下一次 ACLR、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。
 
 功率–EVM 扫描的评估器接口为：
 
@@ -643,7 +650,8 @@ powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
     driveRmsValues=(0.20, 0.30, 0.45, 0.65, 0.85),
     methodEvaluators={"Baseline": EvaluateMethod},
 )
-resultAnalysis.SavePowerEvmCurve(outputDirectory, powerEvmCurve)
+resultAnalysis.SavePowerEvmCurveData(outputDirectory, powerEvmCurve)
+resultDraw.SavePowerEvmCurve(powerEvmCurve, outputDirectory)
 ```
 
 ---

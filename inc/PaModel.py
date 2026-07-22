@@ -35,7 +35,14 @@ class WienerConfig:
     ampmCoefficient: float = 0.18
 
     def Validate(self) -> None:
-        """Reject nonphysical settings before processing a waveform."""
+        """Reject nonphysical settings before processing a waveform.
+
+        Processing details:
+            Algorithm: Evaluate every documented constraint in deterministic order and stop at the first invalid condition without changing valid state.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
 
         if len(self.linearTaps) == 0:
             raise ValueError("linearTaps must contain at least one coefficient")
@@ -51,6 +58,17 @@ class WienerPA:
     """Model a PA as an FIR memory filter followed by AM-AM and AM-PM curves."""
 
     def __init__(self, config: WienerConfig = WienerConfig()) -> None:
+        """Initialize the Wiener PA from validated memory and nonlinearity settings.
+
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Args:
+            config: Validated configuration object controlling this operation.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
         config.Validate()
         self.config = config
         self.linearTaps = np.asarray(config.linearTaps, dtype=np.complex128)
@@ -67,7 +85,7 @@ class WienerPA:
         ILC algorithm a genuine memory effect to compensate.
         """
 
-        complexInput = _AsComplexVector(inputSignal)
+        complexInput = AsComplexVector(inputSignal)
         filteredSignal = np.convolve(
             complexInput, self.linearTaps, mode="full"
         )[: complexInput.size]
@@ -95,7 +113,14 @@ class WienerPA:
         return outputMagnitude * np.exp(1j * (inputPhase + phaseRotation))
 
     def SmallSignalGain(self) -> complex:
-        """Return the DC small-signal gain of the linear Wiener cascade."""
+        """Return the DC small-signal gain of the linear Wiener cascade.
+
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Returns:
+            result: complex. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         return self.config.linearGain * np.sum(self.linearTaps)
 
@@ -118,7 +143,14 @@ class GMPConfig:
     leadingCoefficients: Optional[Mapping[Tuple[int, int, int], complex]] = None
 
     def Validate(self) -> None:
-        """Validate order and memory dimensions used by the GMP expansion."""
+        """Validate order and memory dimensions used by the GMP expansion.
+
+        Processing details:
+            Algorithm: Evaluate every documented constraint in deterministic order and stop at the first invalid condition without changing valid state.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
 
         if len(self.nonlinearOrders) == 0:
             raise ValueError("nonlinearOrders cannot be empty")
@@ -134,9 +166,20 @@ class GMPPA:
     """Implement a complex-baseband generalized memory polynomial PA."""
 
     def __init__(self, config: GMPConfig = GMPConfig()) -> None:
+        """Initialize GMP coefficients from validated order and memory settings.
+
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Args:
+            config: Validated configuration object controlling this operation.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
         config.Validate()
         self.config = config
-        defaultMain, defaultLagging, defaultLeading = _DefaultGmpCoefficients(
+        defaultMain, defaultLagging, defaultLeading = DefaultGmpCoefficients(
             config.nonlinearOrders,
             config.memoryDepth,
             config.crossMemoryDepth,
@@ -158,14 +201,24 @@ class GMPPA:
         )
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
-        """Evaluate the main, lagging, and leading GMP basis expansions."""
+        """Evaluate the main, lagging, and leading GMP basis expansions.
 
-        complexInput = _AsComplexVector(inputSignal)
+        Processing details:
+            Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
+
+        complexInput = AsComplexVector(inputSignal)
         outputSignal = np.zeros_like(complexInput)
 
         # Main branch: x[n-m] * |x[n-m]|^(p-1).
         for (nonlinearOrder, memoryIndex), coefficient in self.mainCoefficients.items():
-            delayedSignal = _DelaySignal(complexInput, memoryIndex)
+            delayedSignal = DelaySignal(complexInput, memoryIndex)
             outputSignal += (
                 coefficient
                 * delayedSignal
@@ -179,8 +232,8 @@ class GMPPA:
             memoryIndex,
             crossIndex,
         ), coefficient in self.laggingCoefficients.items():
-            carrierSignal = _DelaySignal(complexInput, memoryIndex)
-            envelopeSignal = _DelaySignal(
+            carrierSignal = DelaySignal(complexInput, memoryIndex)
+            envelopeSignal = DelaySignal(
                 complexInput, memoryIndex + crossIndex
             )
             outputSignal += (
@@ -196,10 +249,10 @@ class GMPPA:
             memoryIndex,
             crossIndex,
         ), coefficient in self.leadingCoefficients.items():
-            carrierSignal = _DelaySignal(
+            carrierSignal = DelaySignal(
                 complexInput, memoryIndex + crossIndex
             )
-            envelopeSignal = _DelaySignal(complexInput, memoryIndex)
+            envelopeSignal = DelaySignal(complexInput, memoryIndex)
             outputSignal += (
                 coefficient
                 * carrierSignal
@@ -208,7 +261,14 @@ class GMPPA:
         return outputSignal
 
     def SmallSignalGain(self) -> complex:
-        """Return the DC gain contributed by all first-order main terms."""
+        """Return the DC gain contributed by all first-order main terms.
+
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Returns:
+            result: complex. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         return sum(
             coefficient
@@ -244,6 +304,20 @@ class PaModel:
         gmpConfig: Optional[GMPConfig] = None,
         parameters: Optional[Mapping[str, object]] = None,
     ) -> None:
+        """Initialize the PA facade and select its active model family.
+
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Args:
+            modelName: Selected PA model family name.
+            wienerConfig: Optional Wiener configuration; None selects built-in values.
+            gmpConfig: Optional GMP configuration; None selects built-in values.
+            parameters: Optional external mapping layered ahead of the built-in defaults.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
         parameterOverrides: Dict[str, object] = {}
         if modelName is not None:
             parameterOverrides["modelName"] = modelName
@@ -263,37 +337,70 @@ class PaModel:
         self._activeConfiguration: Optional[
             Tuple[str, Optional[WienerConfig], Optional[GMPConfig]]
         ] = None
-        self._SynchronizeModel()
+        self.SynchronizeModel()
 
     @property
-    def modelName(self) -> str:
-        """Return the normalized model name resolved by the ChainMap."""
+    def ModelName(self) -> str:
+        """Return the normalized model name resolved by the ChainMap.
 
-        normalizedName, _, _ = self._ResolveConfiguration()
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Returns:
+            result: str. The computed value described by the summary, with documented units, shape, and normalization.
+        """
+
+        normalizedName, _, _ = self.ResolveConfiguration()
         return normalizedName
 
+    modelName = ModelName
+
     def GetParameters(self) -> Dict[str, object]:
-        """Return a flattened snapshot of all resolved PA parameters."""
+        """Return a flattened snapshot of all resolved PA parameters.
+
+        Processing details:
+            Algorithm: Resolve values according to state and ChainMap precedence, keeping caller-owned configuration behavior explicit.
+
+        Returns:
+            result: Dict[str, object]. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         return dict(self.parameters)
 
     def UpdateParameters(self, **parameterOverrides: object) -> None:
-        """Apply validated high-priority PA configuration overrides."""
+        """Apply validated high-priority PA configuration overrides.
+
+        Processing details:
+            Algorithm: Resolve values according to state and ChainMap precedence, keeping caller-owned configuration behavior explicit.
+
+        Args:
+            parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
 
         previousOverrides = dict(self.parameters.maps[0])
         self.parameters.maps[0].update(parameterOverrides)
         try:
-            self._SynchronizeModel()
+            self.SynchronizeModel()
         except (TypeError, ValueError):
             self.parameters.maps[0].clear()
             self.parameters.maps[0].update(previousOverrides)
-            self._SynchronizeModel()
+            self.SynchronizeModel()
             raise
 
-    def _ResolveConfiguration(
+    def ResolveConfiguration(
         self,
     ) -> Tuple[str, Optional[WienerConfig], Optional[GMPConfig]]:
-        """Validate and return the currently resolved PA configuration."""
+        """Validate and return the currently resolved PA configuration.
+
+        Processing details:
+            Algorithm: Resolve values according to state and ChainMap precedence, keeping caller-owned configuration behavior explicit.
+
+        Returns:
+            result: Tuple[str, Optional[WienerConfig], Optional[GMPConfig]]. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         unknownParameters = set(self.parameters).difference(
             paModelDefaultParameters
@@ -326,10 +433,17 @@ class PaModel:
             cast(Optional[GMPConfig], rawGmpConfig),
         )
 
-    def _SynchronizeModel(self) -> None:
-        """Rebuild the PA when a live external parameter mapping changes."""
+    def SynchronizeModel(self) -> None:
+        """Rebuild the PA when a live external parameter mapping changes.
 
-        selectedConfiguration = self._ResolveConfiguration()
+        Processing details:
+            Algorithm: Resolve values according to state and ChainMap precedence, keeping caller-owned configuration behavior explicit.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
+
+        selectedConfiguration = self.ResolveConfiguration()
         if selectedConfiguration == self._activeConfiguration:
             return
         normalizedName, wienerConfig, gmpConfig = selectedConfiguration
@@ -345,15 +459,32 @@ class PaModel:
         self._activeConfiguration = selectedConfiguration
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
-        """Pass a complex waveform through the configured PA model."""
+        """Pass a complex waveform through the configured PA model.
 
-        self._SynchronizeModel()
+        Processing details:
+            Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
+
+        self.SynchronizeModel()
         return self.model.Process(inputSignal)
 
     def SmallSignalGain(self) -> complex:
-        """Return the configured model's DC small-signal complex gain."""
+        """Return the configured model's DC small-signal complex gain.
 
-        self._SynchronizeModel()
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Returns:
+            result: complex. The computed value described by the summary, with documented units, shape, and normalization.
+        """
+
+        self.SynchronizeModel()
         return self.model.SmallSignalGain()
 
 
@@ -366,12 +497,35 @@ class IQImbalancePA:
         directCoefficient: complex = 1.0 + 0.0j,
         imageCoefficient: complex = 0.045 * np.exp(1j * 0.35),
     ) -> None:
+        """Initialize an IQ-imbalance wrapper around an existing PA model.
+
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Args:
+            paModel: PA object exposing Process and SmallSignalGain operations.
+            directCoefficient: Complex gain of the desired direct IQ path.
+            imageCoefficient: Complex gain multiplying the conjugate image path.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
         self.paModel = paModel
         self.directCoefficient = complex(directCoefficient)
         self.imageCoefficient = complex(imageCoefficient)
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
-        """Apply the base PA and then add its conjugate image component."""
+        """Apply the base PA and then add its conjugate image component.
+
+        Processing details:
+            Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         paOutput = self.paModel.Process(inputSignal)
         return (
@@ -380,13 +534,30 @@ class IQImbalancePA:
         )
 
     def SmallSignalGain(self) -> complex:
-        """Return the direct-path small-signal gain of the wrapped PA."""
+        """Return the direct-path small-signal gain of the wrapped PA.
+
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Returns:
+            result: complex. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         return self.directCoefficient * self.paModel.SmallSignalGain()
 
 
-def _AsComplexVector(inputSignal: np.ndarray) -> np.ndarray:
-    """Convert input to a finite one-dimensional complex array."""
+def AsComplexVector(inputSignal: np.ndarray) -> np.ndarray:
+    """Convert input to a finite one-dimensional complex array.
+
+    Processing details:
+        Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     complexInput = np.asarray(inputSignal, dtype=np.complex128)
     if complexInput.ndim != 1:
@@ -396,8 +567,19 @@ def _AsComplexVector(inputSignal: np.ndarray) -> np.ndarray:
     return complexInput
 
 
-def _DelaySignal(inputSignal: np.ndarray, sampleDelay: int) -> np.ndarray:
-    """Apply a causal integer delay without changing the array length."""
+def DelaySignal(inputSignal: np.ndarray, sampleDelay: int) -> np.ndarray:
+    """Apply a causal integer delay without changing the array length.
+
+    Processing details:
+        Algorithm: Apply the bounded sample-domain transformation without changing array length or causal indexing conventions.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        sampleDelay: Nonnegative causal delay measured in complex samples.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     if sampleDelay < 0:
         raise ValueError("sampleDelay cannot be negative")
@@ -409,7 +591,7 @@ def _DelaySignal(inputSignal: np.ndarray, sampleDelay: int) -> np.ndarray:
     return delayedSignal
 
 
-def _DefaultGmpCoefficients(
+def DefaultGmpCoefficients(
     nonlinearOrders: Sequence[int],
     memoryDepth: int,
     crossMemoryDepth: int,
@@ -418,7 +600,19 @@ def _DefaultGmpCoefficients(
     Dict[Tuple[int, int, int], complex],
     Dict[Tuple[int, int, int], complex],
 ]:
-    """Create stable default coefficients with compression and memory effects."""
+    """Create stable default coefficients with compression and memory effects.
+
+    Processing details:
+        Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+    Args:
+        nonlinearOrders: Positive odd polynomial orders included in the model.
+        memoryDepth: Number of causal sample delays included in the model.
+        crossMemoryDepth: Number of envelope cross-delays included in the GMP model.
+
+    Returns:
+        result: Tuple[Dict[Tuple[int, int], complex], Dict[Tuple[int, int, int], complex], Dict[Tuple[int, int, int], complex]]. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     # Zero-memory coefficients define the dominant AM-AM/AM-PM behavior.
     orderCoefficient = {
@@ -473,9 +667,21 @@ def AddAwgn(
     snrDb: Optional[float],
     randomGenerator: np.random.Generator,
 ) -> np.ndarray:
-    """Add complex white Gaussian feedback noise at the requested SNR."""
+    """Add complex white Gaussian feedback noise at the requested SNR.
 
-    complexInput = _AsComplexVector(inputSignal)
+    Processing details:
+        Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        snrDb: Requested signal-to-noise ratio in decibels, or None for no noise.
+        randomGenerator: NumPy random generator that makes results reproducible.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
+
+    complexInput = AsComplexVector(inputSignal)
     if snrDb is None:
         return complexInput.copy()
     signalPower = np.mean(np.abs(complexInput) ** 2)

@@ -16,8 +16,19 @@ from .PaModel import AddAwgn
 UpdateFunction = Callable[[np.ndarray, np.ndarray, np.ndarray, int], np.ndarray]
 
 
-def _LimitAmplitude(inputSignal: np.ndarray, maxAmplitude: float) -> np.ndarray:
-    """Apply the pointwise peak constraint used by constrained ILC."""
+def LimitAmplitude(inputSignal: np.ndarray, maxAmplitude: float) -> np.ndarray:
+    """Apply the pointwise peak constraint used by constrained ILC.
+
+    Processing details:
+        Algorithm: Apply the bounded sample-domain transformation without changing array length or causal indexing conventions.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        maxAmplitude: Maximum allowed complex-envelope magnitude.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     limitedSignal = np.asarray(inputSignal, dtype=np.complex128).copy()
     sampleMagnitude = np.abs(limitedSignal)
@@ -27,13 +38,26 @@ def _LimitAmplitude(inputSignal: np.ndarray, maxAmplitude: float) -> np.ndarray:
     return limitedSignal
 
 
-def _MeasureOutput(
+def MeasureOutput(
     paModel,
     inputSignal: np.ndarray,
     config: ILCConfig,
     randomGenerator: np.random.Generator,
 ) -> np.ndarray:
-    """Average noisy PA feedback captures according to the ILC configuration."""
+    """Average noisy PA feedback captures according to the ILC configuration.
+
+    Processing details:
+        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+    Args:
+        paModel: PA object exposing Process and SmallSignalGain operations.
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        config: Validated configuration object controlling this operation.
+        randomGenerator: NumPy random generator that makes results reproducible.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     averagedOutput = np.zeros_like(inputSignal, dtype=np.complex128)
     for _ in range(config.feedbackAverages):
@@ -44,10 +68,21 @@ def _MeasureOutput(
     return averagedOutput / float(config.feedbackAverages)
 
 
-def _SelectionError(
+def SelectionError(
     targetSignal: np.ndarray, measuredOutput: np.ndarray
 ) -> float:
-    """Return a gain-normalized residual compatible with SNR and EVM."""
+    """Return a gain-normalized residual compatible with SNR and EVM.
+
+    Processing details:
+        Algorithm: Apply the bounded sample-domain transformation without changing array length or causal indexing conventions.
+
+    Args:
+        targetSignal: Caller-supplied value consumed according to the function contract.
+        measuredOutput: Caller-supplied value consumed according to the function contract.
+
+    Returns:
+        result: float. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     denominator = max(
         np.vdot(targetSignal, targetSignal).real, np.finfo(float).tiny
@@ -60,20 +95,33 @@ def _SelectionError(
         / max(np.mean(np.abs(fittedTarget) ** 2), np.finfo(float).tiny)
     )
 
-def _RunWaveformUpdate(
+def RunWaveformUpdate(
     referenceSignal: np.ndarray,
     paModel,
     config: ILCConfig,
     updateFunction: UpdateFunction,
 ) -> ILCResult:
-    """Run a generic waveform ILC loop with best-iteration retention."""
+    """Run a generic waveform ILC loop with best-iteration retention.
+
+    Processing details:
+        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        paModel: PA object exposing Process and SmallSignalGain operations.
+        config: Validated configuration object controlling this operation.
+        updateFunction: Caller-supplied value consumed according to the function contract.
+
+    Returns:
+        result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     config.Validate()
     targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
     if targetSignal.size == 0:
         raise ValueError("referenceSignal cannot be empty")
     randomGenerator = np.random.default_rng(config.randomSeed)
-    inputSignal = _LimitAmplitude(targetSignal, config.maxAmplitude)
+    inputSignal = LimitAmplitude(targetSignal, config.maxAmplitude)
     targetPower = max(
         np.mean(np.abs(targetSignal) ** 2), np.finfo(float).tiny
     )
@@ -82,11 +130,11 @@ def _RunWaveformUpdate(
     history: List[ILCIteration] = []
 
     for iteration in range(config.numIterations):
-        measuredOutput = _MeasureOutput(
+        measuredOutput = MeasureOutput(
             paModel, inputSignal, config, randomGenerator
         )
         errorSignal = targetSignal - measuredOutput
-        selectionError = _SelectionError(targetSignal, measuredOutput)
+        selectionError = SelectionError(targetSignal, measuredOutput)
         if selectionError < bestError:
             bestError = selectionError
             bestInput = inputSignal.copy()
@@ -108,7 +156,7 @@ def _RunWaveformUpdate(
         updateSignal = updateFunction(
             inputSignal, measuredOutput, errorSignal, iteration
         )
-        inputSignal = _LimitAmplitude(
+        inputSignal = LimitAmplitude(
             inputSignal + updateSignal, config.maxAmplitude
         )
 
@@ -119,8 +167,19 @@ def _RunWaveformUpdate(
     )
 
 
-def _EstimateComplexGain(referenceSignal: np.ndarray, paModel) -> complex:
-    """Measure the low-power least-squares complex gain of a PA."""
+def EstimateComplexGain(referenceSignal: np.ndarray, paModel) -> complex:
+    """Measure the low-power least-squares complex gain of a PA.
+
+    Processing details:
+        Algorithm: Form the required numerical representation, apply documented regularization or normalization, and return the fitted result.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        paModel: PA object exposing Process and SmallSignalGain operations.
+
+    Returns:
+        result: complex. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     referenceRms = max(
         np.sqrt(np.mean(np.abs(referenceSignal) ** 2)),
@@ -139,7 +198,19 @@ def RunScalarPIlc(
     paModel,
     config: ILCConfig = ILCConfig(),
 ) -> ILCResult:
-    """Run scalar P-type ILC using the nominal target gain of one."""
+    """Run scalar P-type ILC using the nominal target gain of one.
+
+    Processing details:
+        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        paModel: PA object exposing Process and SmallSignalGain operations.
+        config: Validated configuration object controlling this operation.
+
+    Returns:
+        result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     def BuildUpdate(
         inputSignal: np.ndarray,
@@ -147,11 +218,24 @@ def RunScalarPIlc(
         errorSignal: np.ndarray,
         iteration: int,
     ) -> np.ndarray:
-        """Apply the scalar equation u[k+1] = u[k] + mu*e[k]."""
+        """Apply the scalar equation u[k+1] = u[k] + mu*e[k].
+
+        Processing details:
+            Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+            measuredOutput: Caller-supplied value consumed according to the function contract.
+            errorSignal: Caller-supplied value consumed according to the function contract.
+            iteration: Caller-supplied value consumed according to the function contract.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         return config.learningRate * errorSignal
 
-    return _RunWaveformUpdate(referenceSignal, paModel, config, BuildUpdate)
+    return RunWaveformUpdate(referenceSignal, paModel, config, BuildUpdate)
 
 
 def RunComplexGainIlc(
@@ -159,9 +243,21 @@ def RunComplexGainIlc(
     paModel,
     config: ILCConfig = ILCConfig(),
 ) -> ILCResult:
-    """Run regularized complex-gain-normalized ILC."""
+    """Run regularized complex-gain-normalized ILC.
 
-    complexGain = _EstimateComplexGain(referenceSignal, paModel)
+    Processing details:
+        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        paModel: PA object exposing Process and SmallSignalGain operations.
+        config: Validated configuration object controlling this operation.
+
+    Returns:
+        result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
+    """
+
+    complexGain = EstimateComplexGain(referenceSignal, paModel)
     gainScale = max(np.abs(complexGain) ** 2, np.finfo(float).tiny)
     learningGain = (
         config.learningRate
@@ -175,26 +271,62 @@ def RunComplexGainIlc(
         errorSignal: np.ndarray,
         iteration: int,
     ) -> np.ndarray:
-        """Apply the regularized scalar complex inverse to every sample."""
+        """Apply the regularized scalar complex inverse to every sample.
+
+        Processing details:
+            Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+            measuredOutput: Caller-supplied value consumed according to the function contract.
+            errorSignal: Caller-supplied value consumed according to the function contract.
+            iteration: Caller-supplied value consumed according to the function contract.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         return learningGain * errorSignal
 
-    return _RunWaveformUpdate(referenceSignal, paModel, config, BuildUpdate)
+    return RunWaveformUpdate(referenceSignal, paModel, config, BuildUpdate)
 
 
-def _NextPowerOfTwo(value: int) -> int:
-    """Return the smallest radix-two FFT length that contains value samples."""
+def NextPowerOfTwo(value: int) -> int:
+    """Return the smallest radix-two FFT length that contains value samples.
+
+    Processing details:
+        Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+    Args:
+        value: Integer value whose representation or size is being calculated.
+
+    Returns:
+        result: int. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     return 1 << max(0, int(value - 1).bit_length())
 
 
-def _EstimateFrequencyResponse(
+def EstimateFrequencyResponse(
     referenceSignal: np.ndarray,
     paModel,
     fftLength: int,
     responseFloorDb: float,
 ) -> np.ndarray:
-    """Estimate a regularized small-signal PA frequency response."""
+    """Estimate a regularized small-signal PA frequency response.
+
+    Processing details:
+        Algorithm: Form the required numerical representation, apply documented regularization or normalization, and return the fitted result.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        paModel: PA object exposing Process and SmallSignalGain operations.
+        fftLength: Number of time samples and frequency bins in the OFDM transform.
+        responseFloorDb: Caller-supplied value consumed according to the function contract.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     referenceRms = max(
         np.sqrt(np.mean(np.abs(referenceSignal) ** 2)),
@@ -208,7 +340,7 @@ def _EstimateFrequencyResponse(
     powerFloor = max(probePower.max(), np.finfo(float).tiny) * (
         10.0 ** (responseFloorDb / 10.0)
     )
-    complexGain = _EstimateComplexGain(referenceSignal, paModel)
+    complexGain = EstimateComplexGain(referenceSignal, paModel)
     confidence = probePower / (probePower + powerFloor)
     spectralRatio = outputSpectrum * np.conj(probeSpectrum) / (
         probePower + powerFloor
@@ -222,11 +354,24 @@ def RunFirIlc(
     config: ILCConfig = ILCConfig(),
     firLength: int = 17,
 ) -> ILCResult:
-    """Run FIR-filtered ILC using a truncated regularized inverse response."""
+    """Run FIR-filtered ILC using a truncated regularized inverse response.
+
+    Processing details:
+        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        paModel: PA object exposing Process and SmallSignalGain operations.
+        config: Validated configuration object controlling this operation.
+        firLength: Number of taps in the learned FIR update filter.
+
+    Returns:
+        result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
-    fftLength = _NextPowerOfTwo(targetSignal.size)
-    frequencyResponse = _EstimateFrequencyResponse(
+    fftLength = NextPowerOfTwo(targetSignal.size)
+    frequencyResponse = EstimateFrequencyResponse(
         targetSignal, paModel, fftLength, config.responseFloorDb
     )
     responseScale = max(
@@ -256,12 +401,25 @@ def RunFirIlc(
         errorSignal: np.ndarray,
         iteration: int,
     ) -> np.ndarray:
-        """Filter the output error with the finite-length learning filter."""
+        """Filter the output error with the finite-length learning filter.
+
+        Processing details:
+            Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+            measuredOutput: Caller-supplied value consumed according to the function contract.
+            errorSignal: Caller-supplied value consumed according to the function contract.
+            iteration: Caller-supplied value consumed according to the function contract.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         errorSpectrum = np.fft.fft(errorSignal, fftLength)
         return np.fft.ifft(firResponse * errorSpectrum)[: errorSignal.size]
 
-    return _RunWaveformUpdate(targetSignal, paModel, config, BuildUpdate)
+    return RunWaveformUpdate(targetSignal, paModel, config, BuildUpdate)
 
 
 def RunDirectionalGaussNewtonIlc(
@@ -283,7 +441,20 @@ def RunDirectionalGaussNewtonIlc(
         errorSignal: np.ndarray,
         iteration: int,
     ) -> np.ndarray:
-        """Calculate a directional finite-difference Gauss-Newton update."""
+        """Calculate a directional finite-difference Gauss-Newton update.
+
+        Processing details:
+            Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+            measuredOutput: Caller-supplied value consumed according to the function contract.
+            errorSignal: Caller-supplied value consumed according to the function contract.
+            iteration: Caller-supplied value consumed according to the function contract.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         directionRms = max(
             np.sqrt(np.mean(np.abs(errorSignal) ** 2)),
@@ -304,15 +475,27 @@ def RunDirectionalGaussNewtonIlc(
         )
         return config.learningRate * stepGain * errorSignal
 
-    return _RunWaveformUpdate(referenceSignal, paModel, config, BuildUpdate)
+    return RunWaveformUpdate(referenceSignal, paModel, config, BuildUpdate)
 
 
-def _MemoryPolynomialBasis(
+def MemoryPolynomialBasis(
     inputSignal: np.ndarray,
     nonlinearOrders: tuple,
     memoryDepth: int,
 ) -> np.ndarray:
-    """Build the memory-polynomial basis used by parameter-domain ILC."""
+    """Build the memory-polynomial basis used by parameter-domain ILC.
+
+    Processing details:
+        Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        nonlinearOrders: Positive odd polynomial orders included in the model.
+        memoryDepth: Number of causal sample delays included in the model.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     complexInput = np.asarray(inputSignal, dtype=np.complex128).reshape(-1)
     basisColumns = []
@@ -336,11 +519,25 @@ def RunParameterDomainIlc(
     nonlinearOrders: tuple = (1, 3, 5, 7),
     memoryDepth: int = 3,
 ) -> ILCResult:
-    """Update memory-polynomial DPD coefficients directly in each ILC round."""
+    """Update memory-polynomial DPD coefficients directly in each ILC round.
+
+    Processing details:
+        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        paModel: PA object exposing Process and SmallSignalGain operations.
+        config: Validated configuration object controlling this operation.
+        nonlinearOrders: Positive odd polynomial orders included in the model.
+        memoryDepth: Number of causal sample delays included in the model.
+
+    Returns:
+        result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     config.Validate()
     targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
-    basisMatrix = _MemoryPolynomialBasis(
+    basisMatrix = MemoryPolynomialBasis(
         targetSignal, nonlinearOrders, memoryDepth
     )
     featureScale = np.sqrt(np.mean(np.abs(basisMatrix) ** 2, axis=0))
@@ -363,7 +560,7 @@ def RunParameterDomainIlc(
         normalizedBasis.shape[1], dtype=np.complex128
     )
     normalizedCoefficients[0] = featureScale[0]
-    complexGain = _EstimateComplexGain(targetSignal, paModel)
+    complexGain = EstimateComplexGain(targetSignal, paModel)
     bestInput = targetSignal.copy()
     bestError = np.inf
     history: List[ILCIteration] = []
@@ -374,12 +571,12 @@ def RunParameterDomainIlc(
 
     for iteration in range(config.numIterations):
         inputSignal = normalizedBasis @ normalizedCoefficients
-        inputSignal = _LimitAmplitude(inputSignal, config.maxAmplitude)
-        measuredOutput = _MeasureOutput(
+        inputSignal = LimitAmplitude(inputSignal, config.maxAmplitude)
+        measuredOutput = MeasureOutput(
             paModel, inputSignal, config, randomGenerator
         )
         errorSignal = targetSignal - measuredOutput
-        selectionError = _SelectionError(targetSignal, measuredOutput)
+        selectionError = SelectionError(targetSignal, measuredOutput)
         if selectionError < bestError:
             bestError = selectionError
             bestInput = inputSignal.copy()
@@ -417,7 +614,19 @@ def RunAugmentedIqIlc(
     paModel,
     config: ILCConfig = ILCConfig(),
 ) -> ILCResult:
-    """Run widely-linear augmented ILC with error and conjugate-error paths."""
+    """Run widely-linear augmented ILC with error and conjugate-error paths.
+
+    Processing details:
+        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        paModel: PA object exposing Process and SmallSignalGain operations.
+        config: Validated configuration object controlling this operation.
+
+    Returns:
+        result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
     referenceRms = max(
@@ -452,8 +661,21 @@ def RunAugmentedIqIlc(
         errorSignal: np.ndarray,
         iteration: int,
     ) -> np.ndarray:
-        """Apply both direct and conjugate branches of the augmented inverse."""
+        """Apply both direct and conjugate branches of the augmented inverse.
+
+        Processing details:
+            Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+            measuredOutput: Caller-supplied value consumed according to the function contract.
+            errorSignal: Caller-supplied value consumed according to the function contract.
+            iteration: Caller-supplied value consumed according to the function contract.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         return directLearning * errorSignal + imageLearning * np.conj(errorSignal)
 
-    return _RunWaveformUpdate(targetSignal, paModel, config, BuildUpdate)
+    return RunWaveformUpdate(targetSignal, paModel, config, BuildUpdate)

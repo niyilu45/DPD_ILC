@@ -34,7 +34,14 @@ class ILCConfig:
     randomSeed: int = 19
 
     def Validate(self) -> None:
-        """Validate convergence, regularization, and feedback parameters."""
+        """Validate convergence, regularization, and feedback parameters.
+
+        Processing details:
+            Algorithm: Evaluate every documented constraint in deterministic order and stop at the first invalid condition without changing valid state.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
 
         if self.numIterations < 1:
             raise ValueError("numIterations must be positive")
@@ -69,14 +76,35 @@ class ILCResult:
     history: List[ILCIteration]
 
 
-def _NextPowerOfTwo(value: int) -> int:
-    """Return the smallest power of two greater than or equal to value."""
+def NextPowerOfTwo(value: int) -> int:
+    """Return the smallest power of two greater than or equal to value.
+
+    Processing details:
+        Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+    Args:
+        value: Integer value whose representation or size is being calculated.
+
+    Returns:
+        result: int. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     return 1 << max(0, int(value - 1).bit_length())
 
 
-def _LimitAmplitude(inputSignal: np.ndarray, maxAmplitude: float) -> np.ndarray:
-    """Project each complex sample onto the requested peak-amplitude disk."""
+def LimitAmplitude(inputSignal: np.ndarray, maxAmplitude: float) -> np.ndarray:
+    """Project each complex sample onto the requested peak-amplitude disk.
+
+    Processing details:
+        Algorithm: Apply the bounded sample-domain transformation without changing array length or causal indexing conventions.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        maxAmplitude: Maximum allowed complex-envelope magnitude.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     sampleMagnitude = np.abs(inputSignal)
     limitedSignal = inputSignal.copy()
@@ -86,13 +114,26 @@ def _LimitAmplitude(inputSignal: np.ndarray, maxAmplitude: float) -> np.ndarray:
     return limitedSignal
 
 
-def _MeasurePaOutput(
+def MeasurePaOutput(
     paModel,
     inputSignal: np.ndarray,
     config: ILCConfig,
     randomGenerator: np.random.Generator,
 ) -> np.ndarray:
-    """Average repeated noisy feedback captures of the same PA waveform."""
+    """Average repeated noisy feedback captures of the same PA waveform.
+
+    Processing details:
+        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+    Args:
+        paModel: PA object exposing Process and SmallSignalGain operations.
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        config: Validated configuration object controlling this operation.
+        randomGenerator: NumPy random generator that makes results reproducible.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     accumulatedOutput = np.zeros_like(inputSignal, dtype=np.complex128)
     for _ in range(config.feedbackAverages):
@@ -129,8 +170,8 @@ def RunFrequencyDomainIlc(
         raise ValueError("ILC requires at least 2x waveform oversampling")
 
     randomGenerator = np.random.default_rng(config.randomSeed)
-    inputSignal = _LimitAmplitude(targetSignal.copy(), config.maxAmplitude)
-    fftLength = _NextPowerOfTwo(targetSignal.size)
+    inputSignal = LimitAmplitude(targetSignal.copy(), config.maxAmplitude)
+    fftLength = NextPowerOfTwo(targetSignal.size)
     frequencyBins = np.fft.fftfreq(fftLength, d=1.0 / sampleRateHz)
 
     # A raised-cosine-like transition avoids sharp frequency truncation that
@@ -196,7 +237,7 @@ def RunFrequencyDomainIlc(
     bestSelectionError = np.inf
     bestInput = inputSignal.copy()
     for iteration in range(config.numIterations):
-        measuredOutput = _MeasurePaOutput(
+        measuredOutput = MeasurePaOutput(
             paModel, inputSignal, config, randomGenerator
         )
         errorSignal = targetSignal - measuredOutput
@@ -224,7 +265,7 @@ def RunFrequencyDomainIlc(
         errorSpectrum = np.fft.fft(errorSignal, fftLength)
         updateSpectrum = projectionMask * learningFilter * errorSpectrum
         updateSignal = np.fft.ifft(updateSpectrum)[: targetSignal.size]
-        inputSignal = _LimitAmplitude(
+        inputSignal = LimitAmplitude(
             inputSignal + updateSignal, config.maxAmplitude
         )
 
@@ -251,12 +292,24 @@ def RunFrequencyDomainIlc(
 FeatureSpec = Tuple[str, int, int, int]
 
 
-def _BuildFeatureSpecs(
+def BuildFeatureSpecs(
     nonlinearOrders: Sequence[int],
     memoryDepth: int,
     crossMemoryDepth: int,
 ) -> List[FeatureSpec]:
-    """Enumerate GMP main, lagging, and leading basis-function indices."""
+    """Enumerate GMP main, lagging, and leading basis-function indices.
+
+    Processing details:
+        Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+    Args:
+        nonlinearOrders: Positive odd polynomial orders included in the model.
+        memoryDepth: Number of causal sample delays included in the model.
+        crossMemoryDepth: Number of envelope cross-delays included in the GMP model.
+
+    Returns:
+        result: List[FeatureSpec]. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     featureSpecs: List[FeatureSpec] = []
     for nonlinearOrder in nonlinearOrders:
@@ -276,10 +329,23 @@ def _BuildFeatureSpecs(
     return featureSpecs
 
 
-def _DelayedSlice(
+def DelayedSlice(
     inputSignal: np.ndarray, sampleDelay: int, startIndex: int, stopIndex: int
 ) -> np.ndarray:
-    """Return a delayed signal slice while padding unavailable history with zero."""
+    """Return a delayed signal slice while padding unavailable history with zero.
+
+    Processing details:
+        Algorithm: Apply the bounded sample-domain transformation without changing array length or causal indexing conventions.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        sampleDelay: Nonnegative causal delay measured in complex samples.
+        startIndex: Caller-supplied value consumed according to the function contract.
+        stopIndex: Caller-supplied value consumed according to the function contract.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     outputLength = stopIndex - startIndex
     delayedValues = np.zeros(outputLength, dtype=np.complex128)
@@ -294,13 +360,26 @@ def _DelayedSlice(
     return delayedValues
 
 
-def _BuildGmpBasisChunk(
+def BuildGmpBasisChunk(
     inputSignal: np.ndarray,
     featureSpecs: Sequence[FeatureSpec],
     startIndex: int,
     stopIndex: int,
 ) -> np.ndarray:
-    """Build one bounded-memory block of the complex GMP design matrix."""
+    """Build one bounded-memory block of the complex GMP design matrix.
+
+    Processing details:
+        Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        featureSpecs: Caller-supplied value consumed according to the function contract.
+        startIndex: Caller-supplied value consumed according to the function contract.
+        stopIndex: Caller-supplied value consumed according to the function contract.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     chunkLength = stopIndex - startIndex
     basisMatrix = np.empty(
@@ -309,10 +388,20 @@ def _BuildGmpBasisChunk(
     delayCache = {}
 
     def GetDelayed(sampleDelay: int) -> np.ndarray:
-        """Cache delayed slices shared by many polynomial terms."""
+        """Cache delayed slices shared by many polynomial terms.
+
+        Processing details:
+            Algorithm: Resolve values according to state and ChainMap precedence, keeping caller-owned configuration behavior explicit.
+
+        Args:
+            sampleDelay: Nonnegative causal delay measured in complex samples.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         if sampleDelay not in delayCache:
-            delayCache[sampleDelay] = _DelayedSlice(
+            delayCache[sampleDelay] = DelayedSlice(
                 inputSignal, sampleDelay, startIndex, stopIndex
             )
         return delayCache[sampleDelay]
@@ -346,13 +435,24 @@ class GMPPredistorter:
     coefficients: np.ndarray
 
     def Process(self, inputSignal: np.ndarray, chunkSize: int = 16384) -> np.ndarray:
-        """Apply the fitted GMP in chunks to limit temporary memory usage."""
+        """Apply the fitted GMP in chunks to limit temporary memory usage.
+
+        Processing details:
+            Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+            chunkSize: Maximum samples processed per temporary basis-matrix chunk.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         complexInput = np.asarray(inputSignal, dtype=np.complex128).reshape(-1)
         outputSignal = np.zeros_like(complexInput)
         for startIndex in range(0, complexInput.size, chunkSize):
             stopIndex = min(startIndex + chunkSize, complexInput.size)
-            basisChunk = _BuildGmpBasisChunk(
+            basisChunk = BuildGmpBasisChunk(
                 complexInput, self.featureSpecs, startIndex, stopIndex
             )
             outputSignal[startIndex:stopIndex] = basisChunk @ self.coefficients
@@ -385,7 +485,7 @@ def FitGmpPredistorter(
     if ridgeFactor <= 0.0:
         raise ValueError("ridgeFactor must be positive")
 
-    featureSpecs = _BuildFeatureSpecs(
+    featureSpecs = BuildFeatureSpecs(
         nonlinearOrders, memoryDepth, crossMemoryDepth
     )
     featureCount = len(featureSpecs)
@@ -394,7 +494,7 @@ def FitGmpPredistorter(
     # First pass: estimate the RMS scale of every basis column.
     for startIndex in range(0, complexReference.size, chunkSize):
         stopIndex = min(startIndex + chunkSize, complexReference.size)
-        basisChunk = _BuildGmpBasisChunk(
+        basisChunk = BuildGmpBasisChunk(
             complexReference, featureSpecs, startIndex, stopIndex
         )
         featureEnergy += np.sum(np.abs(basisChunk) ** 2, axis=0)
@@ -405,7 +505,7 @@ def FitGmpPredistorter(
     targetProjection = np.zeros(featureCount, dtype=np.complex128)
     for startIndex in range(0, complexReference.size, chunkSize):
         stopIndex = min(startIndex + chunkSize, complexReference.size)
-        basisChunk = _BuildGmpBasisChunk(
+        basisChunk = BuildGmpBasisChunk(
             complexReference, featureSpecs, startIndex, stopIndex
         )
         normalizedBasis = basisChunk / featureScale

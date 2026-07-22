@@ -1,4 +1,4 @@
-"""Command-line entry point for the HE/EHT DPD-ILC simulation project."""
+"""Command-line entry point for the VHT/HE/EHT DPD-ILC simulation project."""
 
 import argparse
 from collections import ChainMap
@@ -9,25 +9,42 @@ import numpy as np
 from inc.Analysis import Analysis, analysisDefaultParameters
 from inc.Benchmark import BenchmarkConfig, RunAllIlcBenchmark
 from inc.DpdIlc import FitGmpPredistorter, ILCConfig, RunFrequencyDomainIlc
+from inc.Draw import Draw, drawDefaultParameters
 from inc.PaModel import PaModel, paModelDefaultParameters
-from inc.waveGen import GenWifi, genWifiDefaultParameters
+from inc.waveGen import (
+    GenWifi,
+    NormalizeFrameFormat,
+    genWifiDefaultParameters,
+)
 
 
 def Main() -> int:
-    """Generate a Wi-Fi packet, run PA/ILC/DPD stages, and save all metrics."""
+    """Generate a Wi-Fi packet, run PA/ILC/DPD stages, and save all metrics.
+
+    Processing details:
+        Algorithm: Coordinate validation, waveform generation, PA/ILC execution, metric calculation, and artifact reporting.
+
+    Returns:
+        result: int. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     argumentParser = argparse.ArgumentParser(
         description=(
-            "Simulate HE/EHT Wi-Fi excitation, a nonlinear PA, frequency-domain "
-            "ILC, and a fitted GMP predistorter."
+            "Simulate VHT/HE/EHT Wi-Fi excitation, a nonlinear PA, "
+            "frequency-domain ILC, and a fitted GMP predistorter."
         )
     )
     argumentParser.add_argument(
         "--format",
         dest="frameFormat",
-        choices=("EHT", "HE"),
+        type=NormalizeFrameFormat,
+        choices=("VHT", "HE", "EHT"),
+        metavar="FORMAT",
         default=genWifiDefaultParameters["frameFormat"],
-        help="Wi-Fi PHY frame format (default: EHT)",
+        help=(
+            "Wi-Fi format: VHT/11ac, HE/11ax, or EHT/11be "
+            "(default: EHT)"
+        ),
     )
     argumentParser.add_argument(
         "--bandwidth",
@@ -42,7 +59,7 @@ def Main() -> int:
         type=int,
         choices=tuple(range(14)),
         default=genWifiDefaultParameters["mcs"],
-        help="MCS index: HE 0-11 or EHT 0-13 (default: 11)",
+        help="MCS index: VHT 0-9, HE 0-11, or EHT 0-13 (default: 9)",
     )
     argumentParser.add_argument(
         "--pa",
@@ -62,9 +79,12 @@ def Main() -> int:
         "--guard-interval",
         dest="guardIntervalUs",
         type=float,
-        choices=(0.8, 1.6, 3.2),
+        choices=(0.4, 0.8, 1.6, 3.2),
         default=genWifiDefaultParameters["guardIntervalUs"],
-        help="Data guard interval in microseconds (default: 0.8)",
+        help=(
+            "Data guard interval in microseconds: VHT 0.4/0.8, "
+            "HE/EHT 0.8/1.6/3.2 (default: 0.8)"
+        ),
     )
     argumentParser.add_argument(
         "--oversampling",
@@ -181,6 +201,17 @@ def Main() -> int:
         argumentParser.error("--symbols must be positive")
     if arguments.frameFormat == "HE" and arguments.mcs > 11:
         argumentParser.error("HE supports MCS values from 0 through 11")
+    if arguments.frameFormat == "VHT" and arguments.mcs > 9:
+        argumentParser.error("VHT supports MCS values from 0 through 9")
+    if arguments.frameFormat == "VHT" and arguments.guardIntervalUs not in (
+        0.4,
+        0.8,
+    ):
+        argumentParser.error("VHT supports guard intervals 0.4 or 0.8 us")
+    if arguments.frameFormat in ("HE", "EHT") and (
+        arguments.guardIntervalUs == 0.4
+    ):
+        argumentParser.error("HE/EHT do not support a 0.4 us guard interval")
     if arguments.powerStartRms <= 0.0:
         argumentParser.error("--power-start must be positive")
     if arguments.powerStopRms <= arguments.powerStartRms:
@@ -238,6 +269,7 @@ def Main() -> int:
         waveform,
         parameters=analysisParameters,
     )
+    resultDraw = Draw(parameters=ChainMap({}, drawDefaultParameters))
 
     # The first pass establishes the unlinearized baseline at the requested
     # operating point. The same PA instance is reused for every comparison.
@@ -350,9 +382,15 @@ def Main() -> int:
                 ),
             },
         )
-        powerCurvePaths = resultAnalysis.SavePowerEvmCurve(
+        powerEvmCurve = resultAnalysis.powerEvmCurve
+        powerDataPaths = resultAnalysis.SavePowerEvmCurveData(
             arguments.outputDirectory
         )
+        powerFigurePath = resultDraw.SavePowerEvmCurve(
+            powerEvmCurve,
+            arguments.outputDirectory,
+        )
+        powerCurvePaths = (*powerDataPaths, powerFigurePath)
 
     if arguments.saveWaveforms:
         waveformPath = arguments.outputDirectory / "waveforms.npz"

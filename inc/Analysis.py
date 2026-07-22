@@ -1,4 +1,4 @@
-"""Object-oriented SNR, EVM, and ACLR analysis for HE/EHT simulations."""
+"""Object-oriented SNR, EVM, and ACLR analysis for VHT/HE/EHT simulations."""
 
 import csv
 import json
@@ -34,7 +34,14 @@ class SignalMetrics:
     aclrWorstDb: float
 
     def ToDict(self) -> Dict[str, float]:
-        """Convert metrics to a JSON/CSV-ready dictionary."""
+        """Convert metrics to a JSON/CSV-ready dictionary.
+
+        Processing details:
+            Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
+
+        Returns:
+            result: Dict[str, float]. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         return {key: float(value) for key, value in asdict(self).items()}
 
@@ -49,7 +56,14 @@ class PowerEvmCurve:
     evmPercentByMethod: Dict[str, np.ndarray]
 
     def ToDict(self) -> Dict[str, object]:
-        """Convert all curve samples to a JSON-ready dictionary."""
+        """Convert all curve samples to a JSON-ready dictionary.
+
+        Processing details:
+            Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
+
+        Returns:
+            result: Dict[str, object]. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         return {
             "driveRmsValues": self.driveRmsValues.astype(float).tolist(),
@@ -68,10 +82,21 @@ class PowerEvmCurve:
         }
 
 
-def _BestComplexGain(
+def BestComplexGain(
     referenceSignal: np.ndarray, measuredSignal: np.ndarray
 ) -> complex:
-    """Find the least-squares complex gain mapping reference onto measurement."""
+    """Find the least-squares complex gain mapping reference onto measurement.
+
+    Processing details:
+        Algorithm: Perform the numerical calculation with explicit power, shape, and normalization handling for comparable results.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        measuredSignal: Measured or simulated complex samples evaluated against the reference.
+
+    Returns:
+        result: complex. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     denominator = max(
         np.vdot(referenceSignal, referenceSignal).real,
@@ -80,12 +105,24 @@ def _BestComplexGain(
     return np.vdot(referenceSignal, measuredSignal) / denominator
 
 
-def _AveragePeriodogram(
+def AveragePeriodogram(
     inputSignal: np.ndarray,
     sampleRateHz: float,
     maxSegmentLength: int = 16384,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Estimate a low-variance PSD using overlapping Hann-windowed segments."""
+    """Estimate a low-variance PSD using overlapping Hann-windowed segments.
+
+    Processing details:
+        Algorithm: Perform the numerical calculation with explicit power, shape, and normalization handling for comparable results.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        sampleRateHz: Complex sample rate in samples per second.
+        maxSegmentLength: Caller-supplied value consumed according to the function contract.
+
+    Returns:
+        result: Tuple[np.ndarray, np.ndarray]. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     complexInput = np.asarray(inputSignal, dtype=np.complex128).reshape(-1)
     if complexInput.size < 16:
@@ -137,6 +174,20 @@ class Analysis:
         parameters: Optional[Mapping[str, object]] = None,
         **parameterOverrides: object,
     ) -> None:
+        """Initialize a reusable signal-analysis context and its live parameter layers.
+
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Args:
+            referenceSignal: Ideal complex baseband samples used as the target or regression input.
+            waveform: Wi-Fi metadata defining field locations, FFT sizes, and subcarriers.
+            parameters: Optional external mapping layered ahead of the built-in defaults.
+            parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
         complexReference = np.asarray(
             referenceSignal, dtype=np.complex128
         ).reshape(-1)
@@ -158,29 +209,53 @@ class Analysis:
             externalParameters,
             analysisDefaultParameters,
         )
-        self._ValidateParameters()
+        self.ValidateParameters()
         self.stageMetrics: Dict[str, SignalMetrics] = {}
         self.powerEvmCurve: Optional[PowerEvmCurve] = None
 
     def GetParameters(self) -> Dict[str, object]:
-        """Return a flattened snapshot of all resolved analysis parameters."""
+        """Return a flattened snapshot of all resolved analysis parameters.
+
+        Processing details:
+            Algorithm: Resolve values according to state and ChainMap precedence, keeping caller-owned configuration behavior explicit.
+
+        Returns:
+            result: Dict[str, object]. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         return dict(self.parameters)
 
     def UpdateParameters(self, **parameterOverrides: object) -> None:
-        """Apply validated high-priority analysis parameter overrides."""
+        """Apply validated high-priority analysis parameter overrides.
+
+        Processing details:
+            Algorithm: Resolve values according to state and ChainMap precedence, keeping caller-owned configuration behavior explicit.
+
+        Args:
+            parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
 
         previousOverrides = dict(self.parameters.maps[0])
         self.parameters.maps[0].update(parameterOverrides)
         try:
-            self._ValidateParameters()
+            self.ValidateParameters()
         except (TypeError, ValueError):
             self.parameters.maps[0].clear()
             self.parameters.maps[0].update(previousOverrides)
             raise
 
-    def _ValidateParameters(self) -> None:
-        """Validate the currently resolved ChainMap analysis settings."""
+    def ValidateParameters(self) -> None:
+        """Validate the currently resolved ChainMap analysis settings.
+
+        Processing details:
+            Algorithm: Evaluate every documented constraint in deterministic order and stop at the first invalid condition without changing valid state.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
 
         unknownParameters = set(self.parameters).difference(
             analysisDefaultParameters
@@ -214,8 +289,18 @@ class Analysis:
         ):
             raise ValueError("powerEvmFileStem must be a valid simple file name")
 
-    def _PrepareMeasuredSignal(self, measuredSignal: np.ndarray) -> np.ndarray:
-        """Validate and normalize one measured signal for metric processing."""
+    def PrepareMeasuredSignal(self, measuredSignal: np.ndarray) -> np.ndarray:
+        """Validate and normalize one measured signal for metric processing.
+
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Args:
+            measuredSignal: Measured or simulated complex samples evaluated against the reference.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         complexMeasured = np.asarray(
             measuredSignal, dtype=np.complex128
@@ -229,13 +314,23 @@ class Analysis:
         return complexMeasured
 
     def CalculateSnr(self, measuredSignal: np.ndarray) -> float:
-        """Calculate data-field SNR after removing one complex gain and phase."""
+        """Calculate data-field SNR after removing one complex gain and phase.
 
-        complexMeasured = self._PrepareMeasuredSignal(measuredSignal)
+        Processing details:
+            Algorithm: Perform the numerical calculation with explicit power, shape, and normalization handling for comparable results.
+
+        Args:
+            measuredSignal: Measured or simulated complex samples evaluated against the reference.
+
+        Returns:
+            result: float. The computed value described by the summary, with documented units, shape, and normalization.
+        """
+
+        complexMeasured = self.PrepareMeasuredSignal(measuredSignal)
         dataSlice = self.waveform.fieldSlices[self.waveform.dataFieldName]
         referenceData = self.referenceSignal[dataSlice]
         measuredData = complexMeasured[dataSlice]
-        complexGain = _BestComplexGain(referenceData, measuredData)
+        complexGain = BestComplexGain(referenceData, measuredData)
         fittedReference = complexGain * referenceData
         errorSignal = measuredData - fittedReference
         signalPower = np.mean(np.abs(fittedReference) ** 2)
@@ -249,9 +344,19 @@ class Analysis:
         )
 
     def DemodulateWifiData(self, measuredSignal: np.ndarray) -> np.ndarray:
-        """Remove cyclic prefixes and FFT-demodulate Wi-Fi data subcarriers."""
+        """Remove cyclic prefixes and FFT-demodulate Wi-Fi data subcarriers.
 
-        complexMeasured = self._PrepareMeasuredSignal(measuredSignal)
+        Processing details:
+            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+
+        Args:
+            measuredSignal: Measured or simulated complex samples evaluated against the reference.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
+
+        complexMeasured = self.PrepareMeasuredSignal(measuredSignal)
         demodulatedSymbols = []
         for symbolStart in self.waveform.dataSymbolStarts:
             usefulStart = int(symbolStart) + self.waveform.cpLength
@@ -275,12 +380,22 @@ class Analysis:
         return np.asarray(demodulatedSymbols)
 
     def CalculateEvm(self, measuredSignal: np.ndarray) -> Tuple[float, float]:
-        """Calculate RMS EVM in dB and percent on Wi-Fi data subcarriers."""
+        """Calculate RMS EVM in dB and percent on Wi-Fi data subcarriers.
+
+        Processing details:
+            Algorithm: Perform the numerical calculation with explicit power, shape, and normalization handling for comparable results.
+
+        Args:
+            measuredSignal: Measured or simulated complex samples evaluated against the reference.
+
+        Returns:
+            result: Tuple[float, float]. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         measuredSymbols = self.DemodulateWifiData(measuredSignal)
         flattenedReference = self.waveform.referenceDataSymbols.reshape(-1)
         flattenedMeasured = measuredSymbols.reshape(-1)
-        complexGain = _BestComplexGain(
+        complexGain = BestComplexGain(
             flattenedReference, flattenedMeasured
         )
         fittedReference = complexGain * flattenedReference
@@ -299,10 +414,20 @@ class Analysis:
     def CalculateAclr(
         self, measuredSignal: np.ndarray
     ) -> Tuple[float, float, float]:
-        """Calculate lower, upper, and worst adjacent-channel leakage ratios."""
+        """Calculate lower, upper, and worst adjacent-channel leakage ratios.
 
-        self._ValidateParameters()
-        complexMeasured = self._PrepareMeasuredSignal(measuredSignal)
+        Processing details:
+            Algorithm: Perform the numerical calculation with explicit power, shape, and normalization handling for comparable results.
+
+        Args:
+            measuredSignal: Measured or simulated complex samples evaluated against the reference.
+
+        Returns:
+            result: Tuple[float, float, float]. The computed value described by the summary, with documented units, shape, and normalization.
+        """
+
+        self.ValidateParameters()
+        complexMeasured = self.PrepareMeasuredSignal(measuredSignal)
         dataSlice = self.waveform.fieldSlices[self.waveform.dataFieldName]
         measuredData = complexMeasured[dataSlice]
         sampleRateHz = self.waveform.sampleRateHz
@@ -315,7 +440,7 @@ class Analysis:
                 "ACLR analysis requires at least "
                 f"{minimumAclrOversampling:g}x oversampling"
             )
-        frequencyBins, powerSpectrum = _AveragePeriodogram(
+        frequencyBins, powerSpectrum = AveragePeriodogram(
             measuredData,
             sampleRateHz,
             int(self.parameters["maxSegmentLength"]),
@@ -344,9 +469,19 @@ class Analysis:
         return float(lowerAclrDb), float(upperAclrDb), float(worstAclrDb)
 
     def Analyze(self, measuredSignal: np.ndarray) -> SignalMetrics:
-        """Calculate SNR, EVM, and ACLR for one PA or DPD output waveform."""
+        """Calculate SNR, EVM, and ACLR for one PA or DPD output waveform.
 
-        complexMeasured = self._PrepareMeasuredSignal(measuredSignal)
+        Processing details:
+            Algorithm: Perform the numerical calculation with explicit power, shape, and normalization handling for comparable results.
+
+        Args:
+            measuredSignal: Measured or simulated complex samples evaluated against the reference.
+
+        Returns:
+            result: SignalMetrics. The computed value described by the summary, with documented units, shape, and normalization.
+        """
+
+        complexMeasured = self.PrepareMeasuredSignal(measuredSignal)
         snrDb = self.CalculateSnr(complexMeasured)
         evmDb, evmPercent = self.CalculateEvm(complexMeasured)
         aclrLowerDb, aclrUpperDb, aclrWorstDb = self.CalculateAclr(
@@ -364,7 +499,17 @@ class Analysis:
     def AnalyzeStages(
         self, stageSignals: Mapping[str, np.ndarray]
     ) -> Dict[str, SignalMetrics]:
-        """Analyze multiple named stages and retain their result table."""
+        """Analyze multiple named stages and retain their result table.
+
+        Processing details:
+            Algorithm: Perform the numerical calculation with explicit power, shape, and normalization handling for comparable results.
+
+        Args:
+            stageSignals: Mapping from result-stage labels to complex output waveforms.
+
+        Returns:
+            result: Dict[str, SignalMetrics]. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         self.stageMetrics = {
             stageName: self.Analyze(stageSignal)
@@ -428,15 +573,27 @@ class Analysis:
         )
         return self.powerEvmCurve
 
-    def SavePowerEvmCurve(
+    def SavePowerEvmCurveData(
         self,
         outputDirectory: Path,
         powerEvmCurve: Optional[PowerEvmCurve] = None,
         fileStem: Optional[str] = None,
-    ) -> Tuple[Path, Path, Path]:
-        """Save a multi-method power-EVM curve as CSV, JSON, and PNG."""
+    ) -> Tuple[Path, Path]:
+        """Save calculated power-EVM samples as CSV and JSON data.
 
-        self._ValidateParameters()
+        Processing details:
+            Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
+
+        Args:
+            outputDirectory: Directory in which result artifacts are written.
+            powerEvmCurve: Optional curve; the most recent stored curve is used when omitted.
+            fileStem: Optional filename stem overriding the configured default.
+
+        Returns:
+            result: Tuple[Path, Path]. Paths to the CSV and JSON data files.
+        """
+
+        self.ValidateParameters()
         selectedCurve = (
             self.powerEvmCurve if powerEvmCurve is None else powerEvmCurve
         )
@@ -456,7 +613,6 @@ class Analysis:
         outputPath.mkdir(parents=True, exist_ok=True)
         csvPath = outputPath / f"{selectedFileStem}.csv"
         jsonPath = outputPath / f"{selectedFileStem}.json"
-        figurePath = outputPath / f"{selectedFileStem}.png"
         methodNames = list(selectedCurve.evmDbByMethod)
 
         fieldNames = ["driveRms", "inputPowerDb"]
@@ -493,53 +649,23 @@ class Analysis:
                 ensure_ascii=False,
             )
 
-        try:
-            import matplotlib
-
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-        except ImportError as error:
-            raise RuntimeError(
-                "matplotlib is required to save the power-EVM figure"
-            ) from error
-
-        figure, axes = plt.subplots(figsize=(10.5, 6.2))
-        markerStyles = ("o", "s", "^", "D", "v", "P", "X", "<", ">")
-        lineStyles = ("-", "--", "-.", ":")
-        for methodIndex, methodName in enumerate(methodNames):
-            axes.plot(
-                selectedCurve.inputPowerDb,
-                selectedCurve.evmDbByMethod[methodName],
-                label=methodName,
-                marker=markerStyles[methodIndex % len(markerStyles)],
-                linestyle=lineStyles[
-                    (methodIndex // len(markerStyles)) % len(lineStyles)
-                ],
-                linewidth=1.8,
-                markersize=5.0,
-            )
-        axes.set_xlabel("Input RMS power relative to unit saturation (dB)")
-        axes.set_ylabel("RMS EVM (dB, lower is better)")
-        axes.set_title("Power-EVM comparison")
-        axes.grid(True, which="both", linestyle=":", linewidth=0.7)
-        if len(methodNames) <= 6:
-            axes.legend(loc="best")
-        else:
-            axes.legend(
-                loc="upper left",
-                bbox_to_anchor=(1.02, 1.0),
-                borderaxespad=0.0,
-            )
-        figure.tight_layout()
-        figure.savefig(figurePath, dpi=180, bbox_inches="tight")
-        plt.close(figure)
-        return csvPath, jsonPath, figurePath
+        return csvPath, jsonPath
 
     def Print(
         self,
         stageMetrics: Optional[Mapping[str, SignalMetrics]] = None,
     ) -> None:
-        """Print an aligned table for all selected result stages."""
+        """Print an aligned table for all selected result stages.
+
+        Processing details:
+            Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
+
+        Args:
+            stageMetrics: Optional named metrics; stored metrics are used when omitted.
+
+        Returns:
+            result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
+        """
 
         selectedMetrics = (
             self.stageMetrics if stageMetrics is None else stageMetrics
@@ -567,7 +693,19 @@ class Analysis:
         runMetadata: Mapping[str, object],
         stageMetrics: Optional[Mapping[str, SignalMetrics]] = None,
     ) -> Tuple[Path, Path]:
-        """Save selected metrics as JSON and CSV result files."""
+        """Save selected metrics as JSON and CSV result files.
+
+        Processing details:
+            Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
+
+        Args:
+            outputDirectory: Directory in which result artifacts are written.
+            runMetadata: Experiment metadata serialized with numerical results.
+            stageMetrics: Optional named metrics; stored metrics are used when omitted.
+
+        Returns:
+            result: Tuple[Path, Path]. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         selectedMetrics = (
             self.stageMetrics if stageMetrics is None else stageMetrics
@@ -602,7 +740,18 @@ class Analysis:
         return jsonPath, csvPath
 
     def SaveConvergence(self, ilcHistory, outputDirectory: Path) -> Path:
-        """Save the per-iteration ILC convergence history as a CSV file."""
+        """Save the per-iteration ILC convergence history as a CSV file.
+
+        Processing details:
+            Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
+
+        Args:
+            ilcHistory: Ordered per-iteration convergence records to serialize.
+            outputDirectory: Directory in which result artifacts are written.
+
+        Returns:
+            result: Path. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         outputPath = Path(outputDirectory)
         outputPath.mkdir(parents=True, exist_ok=True)

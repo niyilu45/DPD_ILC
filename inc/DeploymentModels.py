@@ -12,8 +12,19 @@ from typing import List, Tuple
 import numpy as np
 
 
-def _DelaySignal(inputSignal: np.ndarray, sampleDelay: int) -> np.ndarray:
-    """Return a causal integer-delayed copy with zero initial conditions."""
+def DelaySignal(inputSignal: np.ndarray, sampleDelay: int) -> np.ndarray:
+    """Return a causal integer-delayed copy with zero initial conditions.
+
+    Processing details:
+        Algorithm: Apply the bounded sample-domain transformation without changing array length or causal indexing conventions.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        sampleDelay: Nonnegative causal delay measured in complex samples.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     delayedSignal = np.zeros_like(inputSignal, dtype=np.complex128)
     if sampleDelay == 0:
@@ -26,8 +37,18 @@ def _DelaySignal(inputSignal: np.ndarray, sampleDelay: int) -> np.ndarray:
 VolterraSpec = Tuple[str, int, int, int]
 
 
-def _BuildVolterraSpecs(memoryDepth: int) -> List[VolterraSpec]:
-    """Enumerate first- and third-order complex-baseband Volterra terms."""
+def BuildVolterraSpecs(memoryDepth: int) -> List[VolterraSpec]:
+    """Enumerate first- and third-order complex-baseband Volterra terms.
+
+    Processing details:
+        Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+    Args:
+        memoryDepth: Number of causal sample delays included in the model.
+
+    Returns:
+        result: List[VolterraSpec]. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     featureSpecs: List[VolterraSpec] = []
     for firstDelay in range(memoryDepth):
@@ -46,10 +67,21 @@ def _BuildVolterraSpecs(memoryDepth: int) -> List[VolterraSpec]:
     return featureSpecs
 
 
-def _BuildVolterraBasis(
+def BuildVolterraBasis(
     inputSignal: np.ndarray, featureSpecs: List[VolterraSpec]
 ) -> np.ndarray:
-    """Build a simplified complex Volterra basis containing x*x*conj(x)."""
+    """Build a simplified complex Volterra basis containing x*x*conj(x).
+
+    Processing details:
+        Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        featureSpecs: Caller-supplied value consumed according to the function contract.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     complexInput = np.asarray(inputSignal, dtype=np.complex128).reshape(-1)
     maximumDelay = max(
@@ -57,7 +89,7 @@ def _BuildVolterraBasis(
         for _, firstDelay, secondDelay, conjugateDelay in featureSpecs
     )
     delayCache = {
-        sampleDelay: _DelaySignal(complexInput, sampleDelay)
+        sampleDelay: DelaySignal(complexInput, sampleDelay)
         for sampleDelay in range(maximumDelay + 1)
     }
     basisMatrix = np.empty(
@@ -88,9 +120,19 @@ class VolterraPredistorter:
     coefficients: np.ndarray
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
-        """Evaluate the fitted complex Volterra expansion."""
+        """Evaluate the fitted complex Volterra expansion.
 
-        basisMatrix = _BuildVolterraBasis(inputSignal, self.featureSpecs)
+        Processing details:
+            Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
+
+        basisMatrix = BuildVolterraBasis(inputSignal, self.featureSpecs)
         return basisMatrix @ self.coefficients
 
 
@@ -100,14 +142,27 @@ def FitVolterraPredistorter(
     memoryDepth: int = 3,
     ridgeFactor: float = 1e-6,
 ) -> VolterraPredistorter:
-    """Fit a simplified complex Volterra DPD by normalized ridge regression."""
+    """Fit a simplified complex Volterra DPD by normalized ridge regression.
+
+    Processing details:
+        Algorithm: Form the required numerical representation, apply documented regularization or normalization, and return the fitted result.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        learnedInput: Waveform-specific ILC labels used for deployment fitting.
+        memoryDepth: Number of causal sample delays included in the model.
+        ridgeFactor: Nonnegative diagonal regularization for least-squares fitting.
+
+    Returns:
+        result: VolterraPredistorter. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     complexReference = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
     complexLabels = np.asarray(learnedInput, dtype=np.complex128).reshape(-1)
     if complexReference.size != complexLabels.size:
         raise ValueError("referenceSignal and learnedInput must have equal length")
-    featureSpecs = _BuildVolterraSpecs(memoryDepth)
-    basisMatrix = _BuildVolterraBasis(complexReference, featureSpecs)
+    featureSpecs = BuildVolterraSpecs(memoryDepth)
+    basisMatrix = BuildVolterraBasis(complexReference, featureSpecs)
     featureScale = np.sqrt(np.mean(np.abs(basisMatrix) ** 2, axis=0))
     featureScale = np.maximum(featureScale, 1e-12)
     normalizedBasis = basisMatrix / featureScale
@@ -135,7 +190,17 @@ class LUTPredistorter:
     binCoefficients: np.ndarray
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
-        """Select the amplitude bin and apply its fitted complex gain."""
+        """Select the amplitude bin and apply its fitted complex gain.
+
+        Processing details:
+            Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
 
         complexInput = np.asarray(inputSignal, dtype=np.complex128).reshape(-1)
         binIndices = np.searchsorted(
@@ -151,7 +216,20 @@ def FitLutPredistorter(
     binCount: int = 64,
     ridgeFactor: float = 1e-8,
 ) -> LUTPredistorter:
-    """Fit the regularized complex gain of every input-amplitude bin."""
+    """Fit the regularized complex gain of every input-amplitude bin.
+
+    Processing details:
+        Algorithm: Form the required numerical representation, apply documented regularization or normalization, and return the fitted result.
+
+    Args:
+        referenceSignal: Ideal complex baseband samples used as the target or regression input.
+        learnedInput: Waveform-specific ILC labels used for deployment fitting.
+        binCount: Caller-supplied value consumed according to the function contract.
+        ridgeFactor: Nonnegative diagonal regularization for least-squares fitting.
+
+    Returns:
+        result: LUTPredistorter. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     complexReference = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
     complexLabels = np.asarray(learnedInput, dtype=np.complex128).reshape(-1)
@@ -190,15 +268,26 @@ def FitLutPredistorter(
     return LUTPredistorter(binEdges, binCoefficients)
 
 
-def _BuildNeuralInputs(
+def BuildNeuralInputs(
     inputSignal: np.ndarray, memoryDepth: int
 ) -> np.ndarray:
-    """Build real I/Q/envelope time-delay inputs for a lightweight DPD NN."""
+    """Build real I/Q/envelope time-delay inputs for a lightweight DPD NN.
+
+    Processing details:
+        Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+
+    Args:
+        inputSignal: One-dimensional complex baseband samples supplied to the operation.
+        memoryDepth: Number of causal sample delays included in the model.
+
+    Returns:
+        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+    """
 
     complexInput = np.asarray(inputSignal, dtype=np.complex128).reshape(-1)
     inputColumns = []
     for memoryIndex in range(memoryDepth):
-        delayedSignal = _DelaySignal(complexInput, memoryIndex)
+        delayedSignal = DelaySignal(complexInput, memoryIndex)
         inputColumns.extend(
             (delayedSignal.real, delayedSignal.imag, np.abs(delayedSignal))
         )
@@ -217,9 +306,19 @@ class NeuralPredistorter:
     outputWeights: np.ndarray
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
-        """Evaluate standardized linear skip features and tanh hidden units."""
+        """Evaluate standardized linear skip features and tanh hidden units.
 
-        neuralInputs = _BuildNeuralInputs(inputSignal, self.memoryDepth)
+        Processing details:
+            Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+
+        Args:
+            inputSignal: One-dimensional complex baseband samples supplied to the operation.
+
+        Returns:
+            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        """
+
+        neuralInputs = BuildNeuralInputs(inputSignal, self.memoryDepth)
         standardizedInputs = (
             neuralInputs - self.inputMean
         ) / self.inputScale
@@ -252,7 +351,7 @@ def FitNeuralPredistorter(
     """
 
     complexLabels = np.asarray(learnedInput, dtype=np.complex128).reshape(-1)
-    neuralInputs = _BuildNeuralInputs(referenceSignal, memoryDepth)
+    neuralInputs = BuildNeuralInputs(referenceSignal, memoryDepth)
     if neuralInputs.shape[0] != complexLabels.size:
         raise ValueError("referenceSignal and learnedInput must have equal length")
     inputMean = np.mean(neuralInputs, axis=0)
