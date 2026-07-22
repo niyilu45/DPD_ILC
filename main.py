@@ -1,15 +1,16 @@
 """Command-line entry point for the HE/EHT DPD-ILC simulation project."""
 
 import argparse
+from collections import ChainMap
 from pathlib import Path
 
 import numpy as np
 
-from inc.Analysis import Analysis
+from inc.Analysis import Analysis, analysisDefaultParameters
 from inc.Benchmark import BenchmarkConfig, RunAllIlcBenchmark
 from inc.DpdIlc import FitGmpPredistorter, ILCConfig, RunFrequencyDomainIlc
-from inc.PaModel import PaModel
-from inc.waveGen import GenWifi
+from inc.PaModel import PaModel, paModelDefaultParameters
+from inc.waveGen import GenWifi, genWifiDefaultParameters
 
 
 def Main() -> int:
@@ -25,7 +26,7 @@ def Main() -> int:
         "--format",
         dest="frameFormat",
         choices=("EHT", "HE"),
-        default="EHT",
+        default=genWifiDefaultParameters["frameFormat"],
         help="Wi-Fi PHY frame format (default: EHT)",
     )
     argumentParser.add_argument(
@@ -33,28 +34,28 @@ def Main() -> int:
         dest="bandwidthMhz",
         type=int,
         choices=(20, 40, 80, 160),
-        default=80,
+        default=genWifiDefaultParameters["bandwidthMhz"],
         help="Wi-Fi channel bandwidth in MHz (default: 80)",
     )
     argumentParser.add_argument(
         "--mcs",
         type=int,
         choices=tuple(range(14)),
-        default=11,
+        default=genWifiDefaultParameters["mcs"],
         help="MCS index: HE 0-11 or EHT 0-13 (default: 11)",
     )
     argumentParser.add_argument(
         "--pa",
         dest="paModelName",
         choices=("wiener", "gmp"),
-        default="wiener",
+        default=paModelDefaultParameters["modelName"],
         help="Nonlinear PA model family (default: wiener)",
     )
     argumentParser.add_argument(
         "--symbols",
         dest="numDataSymbols",
         type=int,
-        default=20,
+        default=genWifiDefaultParameters["numDataSymbols"],
         help="Number of Wi-Fi data OFDM symbols (default: 20)",
     )
     argumentParser.add_argument(
@@ -62,14 +63,14 @@ def Main() -> int:
         dest="guardIntervalUs",
         type=float,
         choices=(0.8, 1.6, 3.2),
-        default=0.8,
+        default=genWifiDefaultParameters["guardIntervalUs"],
         help="Data guard interval in microseconds (default: 0.8)",
     )
     argumentParser.add_argument(
         "--oversampling",
         type=int,
         choices=(4, 8),
-        default=4,
+        default=genWifiDefaultParameters["oversampling"],
         help="Oversampling factor; ACLR requires at least 4 (default: 4)",
     )
     argumentParser.add_argument(
@@ -150,7 +151,7 @@ def Main() -> int:
     argumentParser.add_argument(
         "--seed",
         type=int,
-        default=7,
+        default=genWifiDefaultParameters["seed"],
         help="Random seed for Wi-Fi data and training fields (default: 7)",
     )
     argumentParser.add_argument(
@@ -211,19 +212,32 @@ def Main() -> int:
         print(f"\nAll-ILC results: {benchmarkDirectory.resolve()}")
         return 0
 
-    wifiGenerator = GenWifi(
-        frameFormat=arguments.frameFormat,
-        bandwidthMhz=arguments.bandwidthMhz,
-        mcs=arguments.mcs,
-        numDataSymbols=arguments.numDataSymbols,
-        guardIntervalUs=arguments.guardIntervalUs,
-        oversampling=arguments.oversampling,
-        seed=arguments.seed,
+    wifiParameters = ChainMap(
+        {
+            "frameFormat": arguments.frameFormat,
+            "bandwidthMhz": arguments.bandwidthMhz,
+            "mcs": arguments.mcs,
+            "numDataSymbols": arguments.numDataSymbols,
+            "guardIntervalUs": arguments.guardIntervalUs,
+            "oversampling": arguments.oversampling,
+            "seed": arguments.seed,
+        },
+        genWifiDefaultParameters,
     )
+    wifiGenerator = GenWifi(parameters=wifiParameters)
     waveform = wifiGenerator.Generate()
     referenceSignal = arguments.driveRms * waveform.samples
-    paModel = PaModel(modelName=arguments.paModelName)
-    resultAnalysis = Analysis(referenceSignal, waveform)
+    paParameters = ChainMap(
+        {"modelName": arguments.paModelName},
+        paModelDefaultParameters,
+    )
+    analysisParameters = ChainMap({}, analysisDefaultParameters)
+    paModel = PaModel(parameters=paParameters)
+    resultAnalysis = Analysis(
+        referenceSignal,
+        waveform,
+        parameters=analysisParameters,
+    )
 
     # The first pass establishes the unlinearized baseline at the requested
     # operating point. The same PA instance is reused for every comparison.

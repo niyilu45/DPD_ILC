@@ -2,13 +2,24 @@
 
 import csv
 import json
+from collections import ChainMap
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .waveGen import WifiWaveform
+
+
+analysisDefaultParameters: Mapping[str, object] = MappingProxyType(
+    {
+        "maxSegmentLength": 16384,
+        "minimumAclrOversampling": 3.0,
+        "powerEvmFileStem": "power_evm_curve",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -120,7 +131,11 @@ class Analysis:
     """
 
     def __init__(
-        self, referenceSignal: np.ndarray, waveform: WifiWaveform
+        self,
+        referenceSignal: np.ndarray,
+        waveform: WifiWaveform,
+        parameters: Optional[Mapping[str, object]] = None,
+        **parameterOverrides: object,
     ) -> None:
         complexReference = np.asarray(
             referenceSignal, dtype=np.complex128
@@ -135,8 +150,69 @@ class Analysis:
             raise ValueError("referenceSignal contains NaN or infinite values")
         self.referenceSignal = complexReference
         self.waveform = waveform
+        if parameters is not None and not isinstance(parameters, Mapping):
+            raise TypeError("parameters must be a mapping or None")
+        externalParameters = {} if parameters is None else parameters
+        self.parameters: ChainMap[str, object] = ChainMap(
+            dict(parameterOverrides),
+            externalParameters,
+            analysisDefaultParameters,
+        )
+        self._ValidateParameters()
         self.stageMetrics: Dict[str, SignalMetrics] = {}
         self.powerEvmCurve: Optional[PowerEvmCurve] = None
+
+    def GetParameters(self) -> Dict[str, object]:
+        """Return a flattened snapshot of all resolved analysis parameters."""
+
+        return dict(self.parameters)
+
+    def UpdateParameters(self, **parameterOverrides: object) -> None:
+        """Apply validated high-priority analysis parameter overrides."""
+
+        previousOverrides = dict(self.parameters.maps[0])
+        self.parameters.maps[0].update(parameterOverrides)
+        try:
+            self._ValidateParameters()
+        except (TypeError, ValueError):
+            self.parameters.maps[0].clear()
+            self.parameters.maps[0].update(previousOverrides)
+            raise
+
+    def _ValidateParameters(self) -> None:
+        """Validate the currently resolved ChainMap analysis settings."""
+
+        unknownParameters = set(self.parameters).difference(
+            analysisDefaultParameters
+        )
+        if unknownParameters:
+            unknownNames = ", ".join(
+                sorted(str(parameterName) for parameterName in unknownParameters)
+            )
+            raise TypeError(f"unknown Analysis parameters: {unknownNames}")
+        maxSegmentLength = self.parameters["maxSegmentLength"]
+        if (
+            not isinstance(maxSegmentLength, int)
+            or isinstance(maxSegmentLength, bool)
+            or maxSegmentLength < 16
+        ):
+            raise ValueError(
+                "maxSegmentLength must be an integer of at least 16"
+            )
+        minimumAclrOversampling = self.parameters["minimumAclrOversampling"]
+        if not isinstance(minimumAclrOversampling, (int, float)) or isinstance(
+            minimumAclrOversampling, bool
+        ):
+            raise TypeError("minimumAclrOversampling must be numeric")
+        if minimumAclrOversampling < 3.0:
+            raise ValueError("minimumAclrOversampling cannot be less than 3.0")
+        powerEvmFileStem = self.parameters["powerEvmFileStem"]
+        if not isinstance(powerEvmFileStem, str):
+            raise TypeError("powerEvmFileStem must be a string")
+        if not powerEvmFileStem or any(
+            character in powerEvmFileStem for character in '<>:"/\\|?*'
+        ):
+            raise ValueError("powerEvmFileStem must be a valid simple file name")
 
     def _PrepareMeasuredSignal(self, measuredSignal: np.ndarray) -> np.ndarray:
         """Validate and normalize one measured signal for metric processing."""
@@ -225,15 +301,24 @@ class Analysis:
     ) -> Tuple[float, float, float]:
         """Calculate lower, upper, and worst adjacent-channel leakage ratios."""
 
+        self._ValidateParameters()
         complexMeasured = self._PrepareMeasuredSignal(measuredSignal)
         dataSlice = self.waveform.fieldSlices[self.waveform.dataFieldName]
         measuredData = complexMeasured[dataSlice]
         sampleRateHz = self.waveform.sampleRateHz
         channelBandwidthHz = self.waveform.bandwidthHz
-        if sampleRateHz < 3.0 * channelBandwidthHz:
-            raise ValueError("ACLR analysis requires at least 3x oversampling")
+        minimumAclrOversampling = float(
+            self.parameters["minimumAclrOversampling"]
+        )
+        if sampleRateHz < minimumAclrOversampling * channelBandwidthHz:
+            raise ValueError(
+                "ACLR analysis requires at least "
+                f"{minimumAclrOversampling:g}x oversampling"
+            )
         frequencyBins, powerSpectrum = _AveragePeriodogram(
-            measuredData, sampleRateHz
+            measuredData,
+            sampleRateHz,
+            int(self.parameters["maxSegmentLength"]),
         )
         halfBandwidth = channelBandwidthHz / 2.0
         mainMask = np.abs(frequencyBins) < halfBandwidth
@@ -322,7 +407,11 @@ class Analysis:
                 measuredSignal = methodEvaluator(
                     pointReference, float(driveRms)
                 )
-                pointAnalysis = Analysis(pointReference, self.waveform)
+                pointAnalysis = Analysis(
+                    pointReference,
+                    self.waveform,
+                    parameters=self.parameters,
+                )
                 pointMetrics = pointAnalysis.Analyze(measuredSignal)
                 methodEvmDb.append(pointMetrics.evmDb)
                 methodEvmPercent.append(pointMetrics.evmPercent)
@@ -343,25 +432,31 @@ class Analysis:
         self,
         outputDirectory: Path,
         powerEvmCurve: Optional[PowerEvmCurve] = None,
-        fileStem: str = "power_evm_curve",
+        fileStem: Optional[str] = None,
     ) -> Tuple[Path, Path, Path]:
         """Save a multi-method power-EVM curve as CSV, JSON, and PNG."""
 
+        self._ValidateParameters()
         selectedCurve = (
             self.powerEvmCurve if powerEvmCurve is None else powerEvmCurve
         )
         if selectedCurve is None:
             raise ValueError("no power-EVM curve is available to save")
-        if not fileStem or any(
-            character in fileStem for character in '<>:"/\\|?*'
+        selectedFileStem = (
+            str(self.parameters["powerEvmFileStem"])
+            if fileStem is None
+            else fileStem
+        )
+        if not selectedFileStem or any(
+            character in selectedFileStem for character in '<>:"/\\|?*'
         ):
             raise ValueError("fileStem must be a valid simple file name")
 
         outputPath = Path(outputDirectory)
         outputPath.mkdir(parents=True, exist_ok=True)
-        csvPath = outputPath / f"{fileStem}.csv"
-        jsonPath = outputPath / f"{fileStem}.json"
-        figurePath = outputPath / f"{fileStem}.png"
+        csvPath = outputPath / f"{selectedFileStem}.csv"
+        jsonPath = outputPath / f"{selectedFileStem}.json"
+        figurePath = outputPath / f"{selectedFileStem}.png"
         methodNames = list(selectedCurve.evmDbByMethod)
 
         fieldNames = ["driveRms", "inputPowerDb"]

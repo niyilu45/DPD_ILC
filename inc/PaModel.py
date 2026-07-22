@@ -12,8 +12,10 @@ are provided internally:
 Every model accepts and returns a one-dimensional complex baseband array.
 """
 
+from collections import ChainMap
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from types import MappingProxyType
+from typing import Dict, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -215,6 +217,15 @@ class GMPPA:
         )
 
 
+paModelDefaultParameters: Mapping[str, object] = MappingProxyType(
+    {
+        "modelName": "wiener",
+        "wienerConfig": None,
+        "gmpConfig": None,
+    }
+)
+
+
 class PaModel:
     """Configure and operate one Wiener or GMP nonlinear PA model.
 
@@ -228,31 +239,121 @@ class PaModel:
 
     def __init__(
         self,
-        modelName: str = "wiener",
+        modelName: Optional[str] = None,
         wienerConfig: Optional[WienerConfig] = None,
         gmpConfig: Optional[GMPConfig] = None,
+        parameters: Optional[Mapping[str, object]] = None,
     ) -> None:
-        normalizedName = modelName.strip().lower()
+        parameterOverrides: Dict[str, object] = {}
+        if modelName is not None:
+            parameterOverrides["modelName"] = modelName
+        if wienerConfig is not None:
+            parameterOverrides["wienerConfig"] = wienerConfig
+        if gmpConfig is not None:
+            parameterOverrides["gmpConfig"] = gmpConfig
+        if parameters is not None and not isinstance(parameters, Mapping):
+            raise TypeError("parameters must be a mapping or None")
+        externalParameters = {} if parameters is None else parameters
+        self.parameters: ChainMap[str, object] = ChainMap(
+            parameterOverrides,
+            externalParameters,
+            paModelDefaultParameters,
+        )
+        self.model = None
+        self._activeConfiguration: Optional[
+            Tuple[str, Optional[WienerConfig], Optional[GMPConfig]]
+        ] = None
+        self._SynchronizeModel()
+
+    @property
+    def modelName(self) -> str:
+        """Return the normalized model name resolved by the ChainMap."""
+
+        normalizedName, _, _ = self._ResolveConfiguration()
+        return normalizedName
+
+    def GetParameters(self) -> Dict[str, object]:
+        """Return a flattened snapshot of all resolved PA parameters."""
+
+        return dict(self.parameters)
+
+    def UpdateParameters(self, **parameterOverrides: object) -> None:
+        """Apply validated high-priority PA configuration overrides."""
+
+        previousOverrides = dict(self.parameters.maps[0])
+        self.parameters.maps[0].update(parameterOverrides)
+        try:
+            self._SynchronizeModel()
+        except (TypeError, ValueError):
+            self.parameters.maps[0].clear()
+            self.parameters.maps[0].update(previousOverrides)
+            self._SynchronizeModel()
+            raise
+
+    def _ResolveConfiguration(
+        self,
+    ) -> Tuple[str, Optional[WienerConfig], Optional[GMPConfig]]:
+        """Validate and return the currently resolved PA configuration."""
+
+        unknownParameters = set(self.parameters).difference(
+            paModelDefaultParameters
+        )
+        if unknownParameters:
+            unknownNames = ", ".join(
+                sorted(str(parameterName) for parameterName in unknownParameters)
+            )
+            raise TypeError(f"unknown PaModel parameters: {unknownNames}")
+        rawModelName = self.parameters["modelName"]
+        if not isinstance(rawModelName, str):
+            raise TypeError("modelName must be a string")
+        normalizedName = rawModelName.strip().lower()
+        if normalizedName not in ("wiener", "gmp"):
+            raise ValueError("modelName must be either 'wiener' or 'gmp'")
+
+        rawWienerConfig = self.parameters["wienerConfig"]
+        if rawWienerConfig is not None and not isinstance(
+            rawWienerConfig, WienerConfig
+        ):
+            raise TypeError("wienerConfig must be a WienerConfig or None")
+        rawGmpConfig = self.parameters["gmpConfig"]
+        if rawGmpConfig is not None and not isinstance(
+            rawGmpConfig, GMPConfig
+        ):
+            raise TypeError("gmpConfig must be a GMPConfig or None")
+        return (
+            normalizedName,
+            cast(Optional[WienerConfig], rawWienerConfig),
+            cast(Optional[GMPConfig], rawGmpConfig),
+        )
+
+    def _SynchronizeModel(self) -> None:
+        """Rebuild the PA when a live external parameter mapping changes."""
+
+        selectedConfiguration = self._ResolveConfiguration()
+        if selectedConfiguration == self._activeConfiguration:
+            return
+        normalizedName, wienerConfig, gmpConfig = selectedConfiguration
         if normalizedName == "wiener":
-            self.model = WienerPA(
+            selectedModel = WienerPA(
                 WienerConfig() if wienerConfig is None else wienerConfig
             )
-        elif normalizedName == "gmp":
-            self.model = GMPPA(
+        else:
+            selectedModel = GMPPA(
                 GMPConfig() if gmpConfig is None else gmpConfig
             )
-        else:
-            raise ValueError("modelName must be either 'wiener' or 'gmp'")
-        self.modelName = normalizedName
+        self.model = selectedModel
+        self._activeConfiguration = selectedConfiguration
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
         """Pass a complex waveform through the configured PA model."""
 
+        self._SynchronizeModel()
         return self.model.Process(inputSignal)
 
     def SmallSignalGain(self) -> complex:
         """Return the configured model's DC small-signal complex gain."""
 
+        self._SynchronizeModel()
         return self.model.SmallSignalGain()
 
 

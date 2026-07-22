@@ -561,29 +561,42 @@ classDiagram
 **图 7 说明**：`PaModel` 是统一面向对象入口，内部选择 Wiener 或 GMP。`IQImbalancePA` 可以包装任意具有 `Process` 接口的 PA；反馈噪声则由独立的 `AddAwgn` 在测量链上添加。
 
 ```python
-from inc.PaModel import GMPConfig, PaModel, WienerConfig
+from collections import ChainMap
 
-wienerPa = PaModel(
-    modelName="wiener",
-    wienerConfig=WienerConfig(
+from inc.PaModel import (
+    GMPConfig,
+    PaModel,
+    WienerConfig,
+    paModelDefaultParameters,
+)
+
+paOverrides = {
+    "modelName": "wiener",
+    "wienerConfig": WienerConfig(
         saturationAmplitude=1.0,
         rappSmoothness=3.0,
         ampmCoefficient=0.18,
     ),
-)
+}
+paParameters = ChainMap(paOverrides, paModelDefaultParameters)
+paModel = PaModel(parameters=paParameters)
+wienerOutput = paModel.Process(inputSignal)
 
-gmpPa = PaModel(
-    modelName="gmp",
-    gmpConfig=GMPConfig(
-        nonlinearOrders=(1, 3, 5, 7),
-        memoryDepth=3,
-        crossMemoryDepth=2,
-    ),
+paOverrides.update(
+    {
+        "modelName": "gmp",
+        "gmpConfig": GMPConfig(
+            nonlinearOrders=(1, 3, 5, 7),
+            memoryDepth=3,
+            crossMemoryDepth=2,
+        ),
+    }
 )
-
-wienerOutput = wienerPa.Process(inputSignal)
-gmpOutput = gmpPa.Process(inputSignal)
+# Process detects the live mapping change and rebuilds the selected PA.
+gmpOutput = paModel.Process(inputSignal)
 ```
+
+直接构造参数或 `UpdateParameters(...)` 位于最高优先级，外部映射位于中间层，`paModelDefaultParameters` 是只读后备层。`GetParameters()` 返回当前解析结果的字典快照。
 
 ---
 

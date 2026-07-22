@@ -11,8 +11,10 @@ instead of implementing an LDPC encoder and decoder. The generated waveform
 is a Wi-Fi PHY stimulus, not a bit-exact protocol conformance implementation.
 """
 
+from collections import ChainMap
 from dataclasses import dataclass
-from typing import Dict, Mapping, Tuple
+from types import MappingProxyType
+from typing import Dict, Mapping, Optional, Tuple, cast
 
 import numpy as np
 
@@ -61,45 +63,158 @@ _ruToneCount = {20: 242, 40: 484, 80: 996, 160: 1992}
 _pilotToneCount = {20: 8, 40: 16, 80: 16, 160: 32}
 
 
-@dataclass(frozen=True)
+genWifiDefaultParameters: Mapping[str, object] = MappingProxyType(
+    {
+        "frameFormat": "EHT",
+        "bandwidthMhz": 80,
+        "mcs": 11,
+        "numDataSymbols": 20,
+        "guardIntervalUs": 0.8,
+        "oversampling": 4,
+        "seed": 7,
+    }
+)
+
+
 class GenWifi:
     """Configure and generate a single-user HE or EHT Wi-Fi waveform.
+
+    A ``ChainMap`` resolves explicit keyword overrides first, a caller-owned
+    parameter mapping second, and immutable module defaults last. Changes to
+    the caller-owned mapping remain visible until a higher-priority keyword
+    override shadows the same key.
 
     Example:
         ``wifiGenerator = GenWifi(frameFormat="EHT", bandwidthMhz=80, mcs=11)``
         ``waveform = wifiGenerator.Generate()``
     """
 
-    frameFormat: str = "EHT"
-    bandwidthMhz: int = 80
-    mcs: int = 11
-    numDataSymbols: int = 20
-    guardIntervalUs: float = 0.8
-    oversampling: int = 4
-    seed: int = 7
+    def __init__(
+        self,
+        parameters: Optional[Mapping[str, object]] = None,
+        **parameterOverrides: object,
+    ) -> None:
+        if parameters is not None and not isinstance(parameters, Mapping):
+            raise TypeError("parameters must be a mapping or None")
+        externalParameters = {} if parameters is None else parameters
+        self.parameters: ChainMap[str, object] = ChainMap(
+            dict(parameterOverrides),
+            externalParameters,
+            genWifiDefaultParameters,
+        )
+        self.Validate()
+
+    @property
+    def frameFormat(self) -> str:
+        """Return the currently resolved frame format."""
+
+        return cast(str, self.parameters["frameFormat"])
+
+    @property
+    def bandwidthMhz(self) -> int:
+        """Return the currently resolved channel bandwidth."""
+
+        return cast(int, self.parameters["bandwidthMhz"])
+
+    @property
+    def mcs(self) -> int:
+        """Return the currently resolved MCS index."""
+
+        return cast(int, self.parameters["mcs"])
+
+    @property
+    def numDataSymbols(self) -> int:
+        """Return the currently resolved data-symbol count."""
+
+        return cast(int, self.parameters["numDataSymbols"])
+
+    @property
+    def guardIntervalUs(self) -> float:
+        """Return the currently resolved guard interval in microseconds."""
+
+        return cast(float, self.parameters["guardIntervalUs"])
+
+    @property
+    def oversampling(self) -> int:
+        """Return the currently resolved oversampling factor."""
+
+        return cast(int, self.parameters["oversampling"])
+
+    @property
+    def seed(self) -> int:
+        """Return the currently resolved random seed."""
+
+        return cast(int, self.parameters["seed"])
+
+    def GetParameters(self) -> Dict[str, object]:
+        """Return a flattened snapshot of all resolved parameters."""
+
+        return dict(self.parameters)
+
+    def UpdateParameters(self, **parameterOverrides: object) -> None:
+        """Apply validated high-priority overrides to this generator."""
+
+        previousOverrides = dict(self.parameters.maps[0])
+        self.parameters.maps[0].update(parameterOverrides)
+        try:
+            self.Validate()
+        except (TypeError, ValueError):
+            self.parameters.maps[0].clear()
+            self.parameters.maps[0].update(previousOverrides)
+            raise
 
     def Validate(self) -> None:
         """Validate every option before allocating potentially large arrays."""
 
+        unknownParameters = set(self.parameters).difference(
+            genWifiDefaultParameters
+        )
+        if unknownParameters:
+            unknownNames = ", ".join(
+                sorted(str(parameterName) for parameterName in unknownParameters)
+            )
+            raise TypeError(f"unknown GenWifi parameters: {unknownNames}")
+        if not isinstance(self.frameFormat, str):
+            raise TypeError("frameFormat must be a string")
         normalizedFormat = self.frameFormat.strip().upper()
         if normalizedFormat not in ("EHT", "HE"):
             raise ValueError("frameFormat must be either 'EHT' or 'HE'")
+        if not isinstance(self.bandwidthMhz, int) or isinstance(
+            self.bandwidthMhz, bool
+        ):
+            raise TypeError("bandwidthMhz must be an integer")
         if self.bandwidthMhz not in _baseFftLength:
             raise ValueError("bandwidthMhz must be one of 20, 40, 80, 160")
         selectedMcsTable = (
             ehtMcsTable if normalizedFormat == "EHT" else heMcsTable
         )
+        if not isinstance(self.mcs, int) or isinstance(self.mcs, bool):
+            raise TypeError("mcs must be an integer")
         if self.mcs not in selectedMcsTable:
             maximumMcs = 13 if normalizedFormat == "EHT" else 11
             raise ValueError(
                 f"{normalizedFormat} MCS must be an integer from 0 through {maximumMcs}"
             )
+        if not isinstance(self.numDataSymbols, int) or isinstance(
+            self.numDataSymbols, bool
+        ):
+            raise TypeError("numDataSymbols must be an integer")
         if self.numDataSymbols < 1:
             raise ValueError("numDataSymbols must be positive")
+        if not isinstance(self.guardIntervalUs, (int, float)) or isinstance(
+            self.guardIntervalUs, bool
+        ):
+            raise TypeError("guardIntervalUs must be numeric")
         if self.guardIntervalUs not in (0.8, 1.6, 3.2):
             raise ValueError("guardIntervalUs must be 0.8, 1.6, or 3.2")
-        if not isinstance(self.oversampling, int) or self.oversampling < 1:
+        if (
+            not isinstance(self.oversampling, int)
+            or isinstance(self.oversampling, bool)
+            or self.oversampling < 1
+        ):
             raise ValueError("oversampling must be a positive integer")
+        if not isinstance(self.seed, int) or isinstance(self.seed, bool):
+            raise TypeError("seed must be an integer")
 
     def GetMcsInfo(self) -> MCSInfo:
         """Return the MCS record selected by this generator instance."""

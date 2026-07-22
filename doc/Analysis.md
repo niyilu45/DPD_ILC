@@ -598,9 +598,23 @@ EVM(dB)
 | 曲线保存 | `Analysis.SavePowerEvmCurve` |
 
 ```python
-from inc.Analysis import Analysis
+from collections import ChainMap
 
-resultAnalysis = Analysis(referenceSignal, wifiWaveform)
+from inc.Analysis import Analysis, analysisDefaultParameters
+
+analysisOverrides = {
+    "maxSegmentLength": 8192,
+    "powerEvmFileStem": "comparison_curve",
+}
+analysisParameters = ChainMap(
+    analysisOverrides,
+    analysisDefaultParameters,
+)
+resultAnalysis = Analysis(
+    referenceSignal,
+    wifiWaveform,
+    parameters=analysisParameters,
+)
 
 metrics = resultAnalysis.Analyze(paOutput)
 print(metrics.snrDb)
@@ -616,6 +630,8 @@ stageMetrics = resultAnalysis.AnalyzeStages(
 )
 resultAnalysis.Print(stageMetrics)
 ```
+
+未提供的键从 `analysisDefaultParameters` 读取。外部修改 `analysisOverrides` 后，下一次 ACLR 或曲线保存会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。
 
 功率–EVM 扫描的评估器接口为：
 

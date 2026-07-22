@@ -38,11 +38,12 @@ tests/TestProject.py    自包含验证脚本
 
 ```mermaid
 flowchart TD
-    start["main.py：解析命令行参数"] --> wifiGenerator["创建 GenWifi 实例"]
+    start["main.py：解析命令行参数"] --> configChain["ChainMap：外部覆盖 + 只读默认值"]
+    configChain --> wifiGenerator["创建 GenWifi 实例"]
     wifiGenerator --> waveGen["GenWifi.Generate"]
     waveGen --> reference["HE/EHT 参考波形 s 与帧元数据"]
 
-    start --> paModel["创建 PaModel 实例"]
+    configChain --> paModel["创建 PaModel 实例"]
     paModel --> paImplementation["WienerPA 或 GMPPA"]
     reference --> baseline["生成未校正 PA 基线输出"]
     paImplementation --> baseline
@@ -66,7 +67,8 @@ flowchart TD
     predistortedInput --> paImplementation
     paImplementation --> correctedOutput["PA 校正输出"]
 
-    reference --> analysis["创建 Analysis 实例"]
+    configChain --> analysis["创建 Analysis 实例"]
+    reference --> analysis
     baseline --> analysisMethod["Analysis.Analyze / AnalyzeStages"]
     frequencyIlc --> analysisMethod
     variantResults --> analysisMethod
@@ -81,7 +83,7 @@ flowchart TD
 
 **图示说明：**
 
-1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，构造 `GenWifi(...)`、`PaModel(modelName=...)` 和 `Analysis(referenceSignal, waveform)` 实例。
+1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，将外部值与模块内置默认值组成 `ChainMap`，再构造 `GenWifi(parameters=...)`、`PaModel(parameters=...)` 和 `Analysis(..., parameters=...)` 实例。
 2. 调用 `GenWifi.Generate()` 后得到参考复基带波形 `s` 及字段边界、FFT、数据子载波等元数据；同一波形直接通过 PA 后形成未校正基线。
 3. 单方案模式执行正则化频域 ILC，寻找使 PA 输出逼近参考波形的理想输入 `u*`；全方案模式则调用统一基准测试，逐一运行所有 ILC 更新律。
 4. 收敛后的 `u*` 可直接用于重复波形测试，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN，从而形成可用于其他帧的部署模型。
@@ -420,6 +422,7 @@ flowchart LR
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
+| `parameters` | `Mapping` 或 `ChainMap` | `None` | 外部参数层；缺少的键回退到 `genWifiDefaultParameters`。 |
 | `frameFormat` | `"EHT"`、`"HE"`，不区分大小写 | `"EHT"` | 选择 EHT 或 HE-SU 字段结构。 |
 | `bandwidthMhz` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
 | `mcs` | EHT：`0–13`；HE：`0–11` | `11` | MCS 索引。 |
@@ -434,6 +437,7 @@ flowchart LR
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
+| `parameters` | `Mapping` 或 `ChainMap` | `None` | 外部参数层；缺少的键回退到 `paModelDefaultParameters`。 |
 | `modelName` | `"wiener"`、`"gmp"`，不区分大小写 | `"wiener"` | 选择内部 PA 实现。 |
 | `wienerConfig` | `WienerConfig` 或 `None` | `None` | Wiener 模式的配置；`None` 使用默认配置。 |
 | `gmpConfig` | `GMPConfig` 或 `None` | `None` | GMP 模式的配置；`None` 使用默认配置。 |
@@ -472,7 +476,14 @@ PA 辅助接口还包括：
 
 ### `Analysis` 参数与方法
 
-构造函数 `Analysis(referenceSignal, waveform)` 要求参考信号为非空有限复数组，且长度与 `WifiWaveform.samples` 相同。
+构造函数 `Analysis(referenceSignal, waveform, parameters=None, **parameterOverrides)` 要求参考信号为非空有限复数组，且长度与 `WifiWaveform.samples` 相同。
+
+| 配置参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `parameters` | `None` | 外部 `Mapping` 或 `ChainMap` 参数层。 |
+| `maxSegmentLength` | `16384` | Welch PSD 的最大分段长度，必须是不小于 16 的整数。 |
+| `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
+| `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 PNG、CSV、JSON 默认文件名前缀。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
@@ -486,7 +497,7 @@ PA 辅助接口还包括：
 | `Save(outputDirectory, runMetadata, stageMetrics=None)` | 输出路径、元数据、可选指标映射 | 写入 `metrics.json` 和 `metrics.csv`。 |
 | `SaveConvergence(ilcHistory, outputDirectory)` | ILC 历史、输出路径 | 写入 `ilc_convergence.csv`。 |
 | `AnalyzePowerEvmCurve(driveRmsValues, methodEvaluators)` | 递增驱动点、`{方法名: 求值器}` 映射 | 计算并保存一个 `PowerEvmCurve`；求值器接收当前参考信号和 RMS 驱动。 |
-| `SavePowerEvmCurve(outputDirectory, powerEvmCurve=None, fileStem="power_evm_curve")` | 输出路径、可选曲线、文件名前缀 | 将所有方法绘制在同一张图上，并写入 PNG、CSV 和 JSON。 |
+| `SavePowerEvmCurve(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取 ChainMap 中的 `powerEvmFileStem`，并写入 PNG、CSV 和 JSON。 |
 
 `SignalMetrics` 字段包括 `snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。`PowerEvmCurve` 保存 `driveRmsValues`、`inputPowerDb` 以及各方法的 EVM dB/百分比数组。
 
@@ -545,6 +556,70 @@ PA 辅助接口还包括：
 | `generatePowerEvmCurve` | `True` | 是否生成全方法功率-EVM PNG/CSV/JSON。 |
 | `outputDirectory` | `results/all_ilc_benchmark` | 全方案 CSV、JSON 和各算法收敛历史目录。 |
 
+## 使用 ChainMap 覆盖默认参数
+
+三个主要面向对象入口都使用 `ChainMap` 管理参数，解析优先级为：
+
+```text
+构造函数关键字或 UpdateParameters 覆盖
+        ↓ 高优先级
+调用方拥有的外部字典 / ChainMap
+        ↓
+模块内置只读默认参数
+```
+
+内置后备层分别为 `genWifiDefaultParameters`、`paModelDefaultParameters` 和 `analysisDefaultParameters`。调用方只需要提供想修改的键；其他键自动读取默认值。外部字典是活动映射，构造实例后继续修改它，下一次 `Generate()`、`Process()` 或分析计算会读取新值。
+
+```python
+from collections import ChainMap
+
+from inc.Analysis import Analysis, analysisDefaultParameters
+from inc.PaModel import PaModel, paModelDefaultParameters
+from inc.waveGen import GenWifi, genWifiDefaultParameters
+
+# Only externally changed values are placed in the first mapping.
+wifiOverrides = {
+    "bandwidthMhz": 40,
+    "mcs": 9,
+    "numDataSymbols": 12,
+}
+wifiParameters = ChainMap(wifiOverrides, genWifiDefaultParameters)
+wifiGenerator = GenWifi(parameters=wifiParameters)
+firstWaveform = wifiGenerator.Generate()
+
+# The existing instance sees this external change on the next Generate call.
+wifiOverrides["mcs"] = 11
+secondWaveform = wifiGenerator.Generate()
+
+paOverrides = {"modelName": "gmp"}
+paParameters = ChainMap(paOverrides, paModelDefaultParameters)
+paModel = PaModel(parameters=paParameters)
+
+analysisOverrides = {
+    "maxSegmentLength": 8192,
+    "powerEvmFileStem": "eht_mcs11_power_evm",
+}
+analysisParameters = ChainMap(
+    analysisOverrides,
+    analysisDefaultParameters,
+)
+resultAnalysis = Analysis(
+    0.24 * secondWaveform.samples,
+    secondWaveform,
+    parameters=analysisParameters,
+)
+```
+
+也可以通过 `UpdateParameters(...)` 写入实例自己的最高优先级层：
+
+```python
+wifiGenerator.UpdateParameters(seed=101, guardIntervalUs=1.6)
+paModel.UpdateParameters(modelName="wiener")
+resultAnalysis.UpdateParameters(maxSegmentLength=4096)
+```
+
+最高优先级覆盖会遮蔽外部字典中的同名键。`GetParameters()` 返回当前解析结果的普通字典快照，便于记录实验配置；修改该快照不会反向修改实例。
+
 ## 典型使用方式
 
 ### 示例一：使用默认参数快速运行
@@ -576,23 +651,38 @@ python main.py --power-start 0.06 --power-stop 0.45 --power-points 9 --feedback-
 ### 示例五：使用 Python 实例接口完成 PA 和指标分析
 
 ```python
-from inc.Analysis import Analysis
-from inc.PaModel import PaModel
-from inc.waveGen import GenWifi
+from collections import ChainMap
 
-wifiGenerator = GenWifi(
-    frameFormat="HE",
-    bandwidthMhz=80,
-    mcs=11,
-    numDataSymbols=20,
+from inc.Analysis import Analysis, analysisDefaultParameters
+from inc.PaModel import PaModel, paModelDefaultParameters
+from inc.waveGen import GenWifi, genWifiDefaultParameters
+
+wifiParameters = ChainMap(
+    {
+        "frameFormat": "HE",
+        "bandwidthMhz": 80,
+        "mcs": 11,
+        "numDataSymbols": 20,
+    },
+    genWifiDefaultParameters,
 )
+wifiGenerator = GenWifi(parameters=wifiParameters)
 waveform = wifiGenerator.Generate()
 referenceSignal = 0.24 * waveform.samples
 
-paModel = PaModel(modelName="wiener")
+paParameters = ChainMap(
+    {"modelName": "wiener"},
+    paModelDefaultParameters,
+)
+paModel = PaModel(parameters=paParameters)
 paOutput = paModel.Process(referenceSignal)
 
-resultAnalysis = Analysis(referenceSignal, waveform)
+analysisParameters = ChainMap({}, analysisDefaultParameters)
+resultAnalysis = Analysis(
+    referenceSignal,
+    waveform,
+    parameters=analysisParameters,
+)
 metrics = resultAnalysis.Analyze(paOutput)
 print(metrics.ToDict())
 ```
@@ -600,15 +690,21 @@ print(metrics.ToDict())
 ### 示例六：自定义 Wiener PA
 
 ```python
-from inc.PaModel import PaModel, WienerConfig
-from inc.waveGen import GenWifi
+from collections import ChainMap
 
-wifiGenerator = GenWifi(
-    frameFormat="EHT",
-    bandwidthMhz=20,
-    mcs=7,
-    numDataSymbols=10,
+from inc.PaModel import PaModel, WienerConfig, paModelDefaultParameters
+from inc.waveGen import GenWifi, genWifiDefaultParameters
+
+wifiParameters = ChainMap(
+    {
+        "frameFormat": "EHT",
+        "bandwidthMhz": 20,
+        "mcs": 7,
+        "numDataSymbols": 10,
+    },
+    genWifiDefaultParameters,
 )
+wifiGenerator = GenWifi(parameters=wifiParameters)
 waveform = wifiGenerator.Generate()
 referenceSignal = 0.24 * waveform.samples
 
@@ -619,29 +715,46 @@ wienerConfig = WienerConfig(
     rappSmoothness=2.5,
     ampmCoefficient=0.12,
 )
-paModel = PaModel(modelName="wiener", wienerConfig=wienerConfig)
+paParameters = ChainMap(
+    {
+        "modelName": "wiener",
+        "wienerConfig": wienerConfig,
+    },
+    paModelDefaultParameters,
+)
+paModel = PaModel(parameters=paParameters)
 paOutput = paModel.Process(referenceSignal)
 ```
 
 ### 示例七：程序化运行频域 ILC 并批量分析
 
 ```python
-from inc.Analysis import Analysis
-from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
-from inc.PaModel import PaModel
-from inc.waveGen import GenWifi
+from collections import ChainMap
 
-wifiGenerator = GenWifi(
-    frameFormat="EHT",
-    bandwidthMhz=20,
-    mcs=9,
-    numDataSymbols=10,
-    oversampling=4,
-    seed=21,
+from inc.Analysis import Analysis, analysisDefaultParameters
+from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
+from inc.PaModel import PaModel, paModelDefaultParameters
+from inc.waveGen import GenWifi, genWifiDefaultParameters
+
+wifiParameters = ChainMap(
+    {
+        "frameFormat": "EHT",
+        "bandwidthMhz": 20,
+        "mcs": 9,
+        "numDataSymbols": 10,
+        "oversampling": 4,
+        "seed": 21,
+    },
+    genWifiDefaultParameters,
 )
+wifiGenerator = GenWifi(parameters=wifiParameters)
 waveform = wifiGenerator.Generate()
 referenceSignal = 0.24 * waveform.samples
-paModel = PaModel(modelName="gmp")
+paParameters = ChainMap(
+    {"modelName": "gmp"},
+    paModelDefaultParameters,
+)
+paModel = PaModel(parameters=paParameters)
 baselineOutput = paModel.Process(referenceSignal)
 
 ilcConfig = ILCConfig(
@@ -658,7 +771,12 @@ ilcResult = RunFrequencyDomainIlc(
     ilcConfig,
 )
 
-resultAnalysis = Analysis(referenceSignal, waveform)
+analysisParameters = ChainMap({}, analysisDefaultParameters)
+resultAnalysis = Analysis(
+    referenceSignal,
+    waveform,
+    parameters=analysisParameters,
+)
 resultAnalysis.AnalyzeStages(
     {
         "PA baseline": baselineOutput,

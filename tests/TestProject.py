@@ -1,5 +1,6 @@
 """Self-contained project checks that preserve the requested naming style."""
 
+from collections import ChainMap
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -11,10 +12,15 @@ projectRoot = Path(__file__).resolve().parents[1]
 if str(projectRoot) not in sys.path:
     sys.path.insert(0, str(projectRoot))
 
-from inc.Analysis import Analysis
+from inc.Analysis import Analysis, analysisDefaultParameters
 from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
-from inc.PaModel import PaModel
-from inc.waveGen import GenWifi, ehtMcsTable, heMcsTable
+from inc.PaModel import PaModel, paModelDefaultParameters
+from inc.waveGen import (
+    GenWifi,
+    ehtMcsTable,
+    genWifiDefaultParameters,
+    heMcsTable,
+)
 
 
 def CheckMcsTables() -> None:
@@ -26,6 +32,81 @@ def CheckMcsTables() -> None:
     assert ehtMcsTable[13].qamOrder == 4096
     assert ehtMcsTable[13].codeRate == 5.0 / 6.0
     assert heMcsTable[11].qamOrder == 1024
+
+
+def CheckChainMapConfiguration() -> None:
+    """Verify default fallback, live external edits, and direct overrides."""
+
+    externalWifiParameters = {
+        "bandwidthMhz": 20,
+        "mcs": 0,
+        "numDataSymbols": 1,
+        "oversampling": 4,
+    }
+    wifiParameters = ChainMap(
+        externalWifiParameters,
+        genWifiDefaultParameters,
+    )
+    wifiGenerator = GenWifi(parameters=wifiParameters)
+    assert wifiGenerator.frameFormat == "EHT"
+    assert wifiGenerator.seed == 7
+
+    externalWifiParameters["frameFormat"] = "HE"
+    externalWifiParameters["seed"] = 29
+    assert wifiGenerator.Generate().frameFormat == "HE"
+    assert wifiGenerator.seed == 29
+
+    wifiGenerator.UpdateParameters(bandwidthMhz=40)
+    externalWifiParameters["bandwidthMhz"] = 80
+    assert wifiGenerator.bandwidthMhz == 40
+    try:
+        wifiGenerator.UpdateParameters(mcs=99)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid ChainMap overrides must be rejected")
+    assert wifiGenerator.mcs == 0
+
+    externalPaParameters = {"modelName": "wiener"}
+    paParameters = ChainMap(
+        externalPaParameters,
+        paModelDefaultParameters,
+    )
+    paModel = PaModel(parameters=paParameters)
+    assert paModel.modelName == "wiener"
+    externalPaParameters["modelName"] = "gmp"
+    paModel.Process(np.array([0.1 + 0.0j], dtype=np.complex128))
+    assert paModel.modelName == "gmp"
+    assert paModel.model.__class__.__name__ == "GMPPA"
+
+    analysisParameters = ChainMap(
+        {"maxSegmentLength": 1024},
+        analysisDefaultParameters,
+    )
+    analysisWaveform = GenWifi(
+        parameters=ChainMap(
+            {
+                "bandwidthMhz": 20,
+                "mcs": 0,
+                "numDataSymbols": 2,
+                "oversampling": 4,
+            },
+            genWifiDefaultParameters,
+        )
+    ).Generate()
+    resultAnalysis = Analysis(
+        analysisWaveform.samples,
+        analysisWaveform,
+        parameters=analysisParameters,
+    )
+    assert resultAnalysis.GetParameters()["powerEvmFileStem"] == (
+        "power_evm_curve"
+    )
+    analysisParameters.maps[0]["powerEvmFileStem"] = "external_curve"
+    assert resultAnalysis.GetParameters()["powerEvmFileStem"] == (
+        "external_curve"
+    )
+    resultAnalysis.CalculateAclr(analysisWaveform.samples)
 
 
 def CheckWifiFormats() -> None:
@@ -229,6 +310,7 @@ def RunTests() -> None:
     """Run all project checks and report a compact success message."""
 
     CheckMcsTables()
+    CheckChainMapConfiguration()
     CheckWifiFormats()
     CheckWifiBandwidths()
     CheckFormatSpecificMcsValidation()

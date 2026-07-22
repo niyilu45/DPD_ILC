@@ -501,22 +501,32 @@ P_{\mathrm{in,dB}}=10\log_{10}(d^2)=20\log_{10}d.
 | 帧拼接 | `_GenerateWifiWaveform` | `fieldSlices`、数据起点、完整帧 |
 | RMS 归一化 | `_GenerateWifiWaveform` 末尾 | 单位 RMS `samples` |
 
-最典型的调用方式为：
+最典型的调用方式使用 `ChainMap` 将外部覆盖参数叠加在内置默认值之前：
 
 ```python
-from inc.waveGen import GenWifi
+from collections import ChainMap
 
-wifiGenerator = GenWifi(
-    frameFormat="EHT",
-    bandwidthMhz=80,
-    mcs=11,
-    numDataSymbols=20,
-    guardIntervalUs=0.8,
-    oversampling=4,
-    seed=7,
+from inc.waveGen import GenWifi, genWifiDefaultParameters
+
+wifiOverrides = {
+    "frameFormat": "EHT",
+    "bandwidthMhz": 80,
+    "mcs": 11,
+    "numDataSymbols": 20,
+}
+wifiParameters = ChainMap(
+    wifiOverrides,
+    genWifiDefaultParameters,
 )
+wifiGenerator = GenWifi(parameters=wifiParameters)
 wifiWaveform = wifiGenerator.Generate()
+
+# The next packet uses MCS 9 while all unspecified values still use defaults.
+wifiOverrides["mcs"] = 9
+updatedWaveform = wifiGenerator.Generate()
 ```
+
+`GenWifi` 内部再建立“构造函数直接覆盖 → 外部映射 → 只读默认值”的 ChainMap。`UpdateParameters(...)` 可写入最高优先级层，`GetParameters()` 可取得当前解析结果的字典快照。
 
 ---
 

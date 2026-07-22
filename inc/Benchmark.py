@@ -2,13 +2,14 @@
 
 import csv
 import json
+from collections import ChainMap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Mapping
 
 import numpy as np
 
-from .Analysis import Analysis, SignalMetrics
+from .Analysis import Analysis, SignalMetrics, analysisDefaultParameters
 from .DeploymentModels import (
     FitLutPredistorter,
     FitNeuralPredistorter,
@@ -28,8 +29,8 @@ from .IlcVariants import (
     RunParameterDomainIlc,
     RunScalarPIlc,
 )
-from .PaModel import IQImbalancePA, PaModel
-from .waveGen import GenWifi
+from .PaModel import IQImbalancePA, PaModel, paModelDefaultParameters
+from .waveGen import GenWifi, genWifiDefaultParameters
 
 
 @dataclass(frozen=True)
@@ -197,31 +198,46 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
 
     outputDirectory = Path(config.outputDirectory)
     outputDirectory.mkdir(parents=True, exist_ok=True)
-    trainingGenerator = GenWifi(
-        frameFormat=config.frameFormat,
-        bandwidthMhz=config.bandwidthMhz,
-        mcs=config.mcs,
-        numDataSymbols=config.numDataSymbols,
-        guardIntervalUs=config.guardIntervalUs,
-        oversampling=config.oversampling,
-        seed=config.seed,
+    sharedWifiParameters = {
+        "frameFormat": config.frameFormat,
+        "bandwidthMhz": config.bandwidthMhz,
+        "mcs": config.mcs,
+        "numDataSymbols": config.numDataSymbols,
+        "guardIntervalUs": config.guardIntervalUs,
+        "oversampling": config.oversampling,
+    }
+    trainingParameters = ChainMap(
+        {"seed": config.seed},
+        sharedWifiParameters,
+        genWifiDefaultParameters,
     )
-    validationGenerator = GenWifi(
-        frameFormat=config.frameFormat,
-        bandwidthMhz=config.bandwidthMhz,
-        mcs=config.mcs,
-        numDataSymbols=config.numDataSymbols,
-        guardIntervalUs=config.guardIntervalUs,
-        oversampling=config.oversampling,
-        seed=config.seed + 97,
+    validationParameters = ChainMap(
+        {"seed": config.seed + 97},
+        sharedWifiParameters,
+        genWifiDefaultParameters,
     )
+    trainingGenerator = GenWifi(parameters=trainingParameters)
+    validationGenerator = GenWifi(parameters=validationParameters)
     trainingWaveform = trainingGenerator.Generate()
     validationWaveform = validationGenerator.Generate()
     trainingSignal = config.driveRms * trainingWaveform.samples
     validationSignal = config.driveRms * validationWaveform.samples
-    paModel = PaModel(modelName=config.paModelName)
-    trainingAnalysis = Analysis(trainingSignal, trainingWaveform)
-    validationAnalysis = Analysis(validationSignal, validationWaveform)
+    paParameters = ChainMap(
+        {"modelName": config.paModelName},
+        paModelDefaultParameters,
+    )
+    analysisParameters = ChainMap({}, analysisDefaultParameters)
+    paModel = PaModel(parameters=paParameters)
+    trainingAnalysis = Analysis(
+        trainingSignal,
+        trainingWaveform,
+        parameters=analysisParameters,
+    )
+    validationAnalysis = Analysis(
+        validationSignal,
+        validationWaveform,
+        parameters=analysisParameters,
+    )
     maxAmplitude = max(2.0, 1.6 * np.max(np.abs(trainingSignal)))
 
     baselineOutput = paModel.Process(trainingSignal)
@@ -435,7 +451,7 @@ def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[Benc
 
     # Augmented ILC is evaluated in the IQ-image scenario for which its
     # conjugate branch is designed.
-    iqPaModel = IQImbalancePA(PaModel(modelName=config.paModelName))
+    iqPaModel = IQImbalancePA(PaModel(parameters=paParameters))
     iqBaselineOutput = iqPaModel.Process(trainingSignal)
     iqBaselineMetrics = trainingAnalysis.Analyze(iqBaselineOutput)
     _AddRow(
