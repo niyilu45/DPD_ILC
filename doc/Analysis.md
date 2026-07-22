@@ -63,49 +63,49 @@ flowchart LR
 
 设参考向量为 $\mathbf x$，测量向量为 $\mathbf y$。我们希望找到复数 $g$，使 $g\mathbf x$ 尽可能接近 $\mathbf y$：
 
-$$
+```math
 \hat g=\arg\min_g\|\mathbf y-g\mathbf x\|_2^2.
-$$
+```
 
 展开目标函数：
 
-$$
+```math
 \begin{aligned}
 J(g)
 &=(\mathbf y-g\mathbf x)^H(\mathbf y-g\mathbf x)\\
 &=\mathbf y^H\mathbf y-g\mathbf y^H\mathbf x
 -g^*\mathbf x^H\mathbf y+|g|^2\mathbf x^H\mathbf x.
 \end{aligned}
-$$
+```
 
 对 $g^*$ 求导并令其为零：
 
-$$
+```math
 \frac{\partial J}{\partial g^*}
 =-\mathbf x^H\mathbf y+g\mathbf x^H\mathbf x=0.
-$$
+```
 
 得到
 
-$$
+```math
 \boxed{
 \hat g=\frac{\mathbf x^H\mathbf y}{\mathbf x^H\mathbf x}
 }
-$$
+```
 
 这就是 `_BestComplexGain`。
 
 几何上，$\hat g\mathbf x$ 是 $\mathbf y$ 在参考方向上的正交投影，残差
 
-$$
+```math
 \mathbf e=\mathbf y-\hat g\mathbf x
-$$
+```
 
 满足
 
-$$
+```math
 \mathbf x^H\mathbf e=0.
-$$
+```
 
 因此一个统一的线性增益差和固定相位差不会被计作误差。这样比较 PA 与 DPD 时，指标更关注波形形状失真，而不是无关的标量增益。
 
@@ -117,65 +117,65 @@ $$
 
 分析器只截取 HE-Data 或 EHT-Data 字段。令
 
-$$
+```math
 \mathbf s=\hat g\mathbf x,
 \qquad
 \mathbf e=\mathbf y-\hat g\mathbf x.
-$$
+```
 
 信号功率和误差功率为
 
-$$
+```math
 P_s=\frac{1}{N}\sum_{n=0}^{N-1}|s[n]|^2,
-$$
+```
 
-$$
+```math
 P_e=\frac{1}{N}\sum_{n=0}^{N-1}|e[n]|^2.
-$$
+```
 
 于是
 
-$$
+```math
 \boxed{
 \mathrm{SNR}_{\mathrm{dB}}
 =10\log_{10}\frac{P_s}{P_e}
 }
-$$
+```
 
 ### 4.2 为什么功率比使用 $10\log_{10}$
 
 分贝对功率的定义为
 
-$$
+```math
 L_{\mathrm{dB}}=10\log_{10}\frac{P_1}{P_0}.
-$$
+```
 
 若改用 RMS 电压或复幅度比 $A_1/A_0$，在阻抗相同条件下 $P\propto A^2$，因此
 
-$$
+```math
 10\log_{10}\left(\frac{A_1}{A_0}\right)^2
 =20\log_{10}\frac{A_1}{A_0}.
-$$
+```
 
 ### 4.3 这里的残差包含什么
 
 如果
 
-$$
+```math
 y[n]=gx[n]+w[n],
-$$
+```
 
 且 $w[n]$ 是与信号不相关的 AWGN，那么此定义接近通常的 SNR。但 PA 输出更可能是
 
-$$
+```math
 y[n]=gx[n]+d_{\mathrm{NL}}[n]+d_{\mathrm{mem}}[n]+w[n],
-$$
+```
 
 所以误差功率包含：
 
-$$
-P_e\approx P_{\mathrm{NL}}+P_{\mathrm{mem}}+P_n+	ext{交叉项}.
-$$
+```math
+P_e\approx P_{\mathrm{NL}}+P_{\mathrm{mem}}+P_n+\text{交叉项}.
+```
 
 因此它也可以理解为信号与总失真加噪声之比（接近 SINAD 思想）。指标越大越好。
 
@@ -210,9 +210,9 @@ Q
 
 每个数据 OFDM 符号的总长度为
 
-$$
+```math
 N_s=N_{\mathrm{CP}}+N_{\mathrm{FFT}}.
-$$
+```
 
 对第 $q$ 个符号：
 
@@ -223,10 +223,10 @@ $$
 
 公式为
 
-$$
+```math
 R_q[k]=\frac{1}{\sqrt N}
 \sum_{n=0}^{N-1}r_q[n]e^{-j2\pi kn/N}.
-$$
+```
 
 注意这里 NumPy `fft` 本身没有 $1/N$，除以 $\sqrt N$ 正好与发送端 `ifft × sqrt(N)` 配对。
 
@@ -246,42 +246,42 @@ flowchart LR
 
 把所有数据符号和数据子载波展平成向量。理想星座为 $\mathbf S$，测量星座为 $\mathbf R$，先求
 
-$$
+```math
 \hat g=\frac{\mathbf S^H\mathbf R}{\mathbf S^H\mathbf S}.
-$$
+```
 
 误差为
 
-$$
+```math
 \mathbf E=\mathbf R-\hat g\mathbf S.
-$$
+```
 
 RMS EVM 比值为
 
-$$
+```math
 \boxed{
 \mathrm{EVM}_{\mathrm{rms}}
 =\sqrt{\frac{\sum_i|E_i|^2}
 {\sum_i|\hat gS_i|^2}}
 }
-$$
+```
 
 百分比为
 
-$$
+```math
 \boxed{
 \mathrm{EVM}_{\%}=100\times\mathrm{EVM}_{\mathrm{rms}}
 }
-$$
+```
 
 分贝形式为
 
-$$
+```math
 \boxed{
 \mathrm{EVM}_{\mathrm{dB}}
 =20\log_{10}\mathrm{EVM}_{\mathrm{rms}}
 }
-$$
+```
 
 EVM 是幅度比，所以使用 $20\log_{10}$。例如：
 
@@ -310,20 +310,20 @@ EVM 会综合反映：
 
 若误差只有与信号不相关的白噪声，且信号归一化一致，则
 
-$$
+```math
 \mathrm{EVM}_{\mathrm{rms}}^2\approx\frac{P_e}{P_s}.
-$$
+```
 
 于是
 
-$$
+```math
 \begin{aligned}
 \mathrm{EVM}_{\mathrm{dB}}
 &=20\log_{10}\sqrt{\frac{P_e}{P_s}}\\
 &=10\log_{10}\frac{P_e}{P_s}\\
 &\approx-\mathrm{SNR}_{\mathrm{dB}}.
 \end{aligned}
-$$
+```
 
 这个关系只是理想近似。当前 SNR 在时域数据样点上计算，EVM 在频域数据子载波上计算；空音调、导频、非线性带外能量和记忆失真会使两者不再严格互为相反数。
 
@@ -333,10 +333,10 @@ $$
 
 ACLR（Adjacent Channel Leakage Ratio）比较主信道功率和邻道功率：
 
-$$
+```math
 \mathrm{ACLR}=10\log_{10}
 \frac{P_{\mathrm{main}}}{P_{\mathrm{adjacent}}}.
-$$
+```
 
 数值越大越好。例如主信道功率比邻道高 $40$ dB，则 ACLR 为 $40$ dB。
 
@@ -344,17 +344,17 @@ $$
 
 设配置带宽为 $B$，复基带中心位于 0 Hz：
 
-$$
+```math
 \mathcal B_{\mathrm{main}}=\left(-\frac B2,\frac B2\right),
-$$
+```
 
-$$
-\mathcal B_{\mathrm{lower}}=left[-\frac{3B}{2},-\frac B2\right),
-$$
+```math
+\mathcal B_{\mathrm{lower}}=\left[-\frac{3B}{2},-\frac B2\right),
+```
 
-$$
+```math
 \mathcal B_{\mathrm{upper}}=\left(\frac B2,\frac{3B}{2}\right].
-$$
+```
 
 ```text
        下邻道                 主信道                 上邻道
@@ -366,15 +366,15 @@ $$
 
 为观察到 $\pm3B/2$，奈奎斯特频率至少要满足
 
-$$
+```math
 \frac{f_s}{2}\ge\frac{3B}{2},
-$$
+```
 
 所以
 
-$$
+```math
 \boxed{f_s\ge3B}.
-$$
+```
 
 这就是 `CalculateAclr` 要求至少 3x 过采样的原因。工程默认 4x，可以覆盖两个完整邻道并留出余量。
 
@@ -384,17 +384,17 @@ $$
 
 长度为 $L$ 的第 $r$ 段记为 $x_r[n]$，Hann 窗为 $w[n]$。分段周期图为
 
-$$
+```math
 \hat P_r[k]
 =\frac{\left|\sum_{n=0}^{L-1}x_r[n]w[n]e^{-j2\pi kn/L}\right|^2}
 {\sum_{n=0}^{L-1}w^2[n]}.
-$$
+```
 
 对 $R$ 段平均：
 
-$$
+```math
 \hat P[k]=\frac{1}{R}\sum_{r=0}^{R-1}\hat P_r[k].
-$$
+```
 
 代码设置：
 
@@ -410,34 +410,34 @@ Hann 窗降低矩形截断带来的频谱旁瓣泄漏；分段平均降低估计
 
 在离散频率网格上，三个频带功率近似为 PSD 样点求和：
 
-$$
+```math
 P_{\mathrm{main}}=\sum_{k\in\mathcal B_{\mathrm{main}}}\hat P[k],
-$$
+```
 
-$$
+```math
 P_{\mathrm{lower}}=\sum_{k\in\mathcal B_{\mathrm{lower}}}\hat P[k],
 \qquad
 P_{\mathrm{upper}}=\sum_{k\in\mathcal B_{\mathrm{upper}}}\hat P[k].
-$$
+```
 
 因为各频点间隔相同，严格积分中共同的 $\Delta f$ 在功率比里约掉。于是
 
-$$
+```math
 \mathrm{ACLR}_{L}=10\log_{10}\frac{P_{\mathrm{main}}}{P_{\mathrm{lower}}},
-$$
+```
 
-$$
+```math
 \mathrm{ACLR}_{U}=10\log_{10}\frac{P_{\mathrm{main}}}{P_{\mathrm{upper}}}.
-$$
+```
 
 最差值定义为
 
-$$
+```math
 \boxed{
 \mathrm{ACLR}_{\mathrm{worst}}
 =\min(\mathrm{ACLR}_{L},\mathrm{ACLR}_{U})
 }
-$$
+```
 
 因为较小的比值对应较严重的邻道泄漏。
 
@@ -487,17 +487,17 @@ DPD/ILC 在一个标称功率点表现优秀，不代表在低功率和高功率
 
 Wi-Fi 波形已归一化为单位 RMS。第 $i$ 个驱动点使用
 
-$$
+```math
 x_i[n]=d_i x_{\mathrm{unit}}[n].
-$$
+```
 
 若把单位 RMS 对应功率作为 0 dB 参考，则功率比为 $d_i^2$：
 
-$$
+```math
 \boxed{
 P_{\mathrm{in,dB},i}=10\log_{10}(d_i^2)=20\log_{10}d_i
 }
-$$
+```
 
 因此 `driveRmsValues` 必须为正数且严格递增。
 
@@ -505,9 +505,9 @@ $$
 
 对每个功率点和每种方法，分析器都使用同一个点参考：
 
-$$
+```math
 \mathbf x_i=d_i\mathbf x_{\mathrm{unit}}.
-$$
+```
 
 所有方法的输出 $\mathbf y_{i,m}$ 都调用相同的 `CalculateEvm`。这样曲线差异来自方法本身，而不是输入帧、随机种子或指标定义不同。
 
