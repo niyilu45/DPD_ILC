@@ -460,6 +460,66 @@ flowchart TB
 }
 ```
 
+这里最容易产生的疑问是：把 $\mathbf{y}_k$ 的公共复增益去掉之后，测量信号和参考信号的幅度是否仍然一致？答案是肯定的，因为 $\hat{g}_k$ 表示从参考幅度到测量幅度的复比例，即“测量幅度/参考幅度”。所以 $\mathbf{y}_k/\hat{g}_k$ 已经被折算回参考信号的幅度和相位尺度，而不是把两个不同尺度的量直接相减。
+
+把正交分解代入补偿表达式：
+
+```math
+\frac{\mathbf{y}_k}{\hat{g}_k}
+=\frac{\hat{g}_k\mathbf{x}+\mathbf{e}_{\perp,k}}
+       {\hat{g}_k}
+=\mathbf{x}+\frac{\mathbf{e}_{\perp,k}}{\hat{g}_k}.
+```
+
+因此补偿后的误差为：
+
+```math
+\frac{\mathbf{y}_k}{\hat{g}_k}-\mathbf{x}
+=\frac{\mathbf{y}_k-\hat{g}_k\mathbf{x}}
+       {\hat{g}_k}
+=\frac{\mathbf{e}_{\perp,k}}{\hat{g}_k}.
+```
+
+这说明代码不必显式计算 $\mathbf{y}_k/\hat{g}_k$。它可以先计算输出尺度的正交残差 $\mathbf{e}_{\perp,k}=\mathbf{y}_k-\hat{g}_k\mathbf{x}$，再把残差功率除以 $|\hat{g}_k|^2$，两种写法严格等价：
+
+```math
+\frac{1}{N}
+\left\|
+\frac{\mathbf{y}_k}{\hat{g}_k}-\mathbf{x}
+\right\|_2^2
+=
+\frac{\left\|\mathbf{y}_k-\hat{g}_k\mathbf{x}\right\|_2^2}
+     {N|\hat{g}_k|^2}.
+```
+
+如果只计算下面的量，并把它直接称为参考尺度的 LC-MSE，则确实是错误的：
+
+```math
+\frac{1}{N}
+\left\|\mathbf{y}_k-\hat{g}_k\mathbf{x}\right\|_2^2.
+```
+
+原因是该残差仍处于测量输出的幅度尺度；当不同迭代轮次的 $|\hat{g}_k|$ 发生变化时，它不能与参考尺度 MSE 直接比较。本工程的 `CalculateIterationMetrics` 明确除以 $|\hat{g}_k|^2$，因此没有遗漏这一尺度换算。
+
+一个直观例子是只有公共衰减和相移、没有波形失真：
+
+```math
+\mathbf{y}
+=0.7e^{j30^\circ}\mathbf{x},
+\qquad
+\hat{g}=0.7e^{j30^\circ}.
+```
+
+补偿后得到：
+
+```math
+\frac{\mathbf{y}}{\hat{g}}=\mathbf{x},
+\qquad
+\mathrm{MSE}_{\mathrm{LC}}=0.
+```
+
+这里 LC-MSE 为零并不表示 PA 的绝对增益完全正确，而是表示除公共幅度和相位之外没有剩余波形失真。这正是 LC-MSE 的设计目的：Raw MSE 负责保留绝对增益和相位误差，LC-MSE 负责观察去除公共线性项后的波形形状。
+
 再用参考时域平均功率归一化：
 
 ```math
@@ -473,6 +533,8 @@ flowchart TB
 `CalculateIterationMetrics` 对每轮都输出 `linearCompensatedMse` 和 `linearCompensatedNmseDb`。它们删除了公共幅度和相位项，因此通常比原始 MSE 更接近 EVM 趋势；同时输出的 `complexGainMagnitudeDb` 和 `complexGainPhaseDegrees` 用于确认被删除的线性项是否正在漂移。
 
 线性补偿 MSE 仍然只是 EVM 的**代理指标**，原因是它仍在整帧时域统计，尚未删除同步残差、前导、CP、导频、空音调和带外分量。
+
+此外，当 $|\hat{g}_k|$ 接近零时，除以 $|\hat{g}_k|^2$ 会显著放大反馈噪声和数值误差，此时 LC-MSE 不再具有稳定的工程含义。实际使用时应同时检查公共增益、Raw MSE 和 PA 输出功率；如果目标是评价绝对功率或增益压缩，就不能只使用 LC-MSE。如果目标是评价最终 Wi-Fi 调制质量，则应优先使用下一节定义的 EVM 对齐 MSE。
 
 ### 5.8 第二级优化：严格的 EVM 对齐 MSE
 
