@@ -17,11 +17,12 @@ if str(projectRoot) not in sys.path:
 from inc.Analysis import Analysis
 from inc.DpdIlc import (
     CalculateIterationMetrics,
+    FitMimoGmpPredistorter,
     ILCConfig,
     RunFrequencyDomainIlc,
+    RunMimoFrequencyDomainIlc,
 )
 from inc.Draw import Draw
-from inc.MimoDpd import FitMimoGmpPredistorter, RunMimoFrequencyDomainIlc
 from inc.PaModel import MimoPaModel, PaModel
 from inc.SigProcess import SigProcess
 from inc.waveGen import (
@@ -182,7 +183,7 @@ def CheckFunctionPrincipleCoverage() -> None:
                 f"at {sourceFile}:{syntaxNode.lineno}"
             )
             checkedDefinitionCount += 1
-    assert checkedDefinitionCount >= 197
+    assert checkedDefinitionCount >= 194
 
 
 def CheckDocumentationMathCompatibility() -> None:
@@ -334,7 +335,7 @@ def CheckInternalDefaultConfiguration() -> None:
     )
 
     # Production call sites must not reconstruct internal default layers.
-    for relativePath in ("main.py", "inc/Benchmark.py"):
+    for relativePath in ("main.py", "inc/DpdIlc.py"):
         callSiteSource = (projectRoot / relativePath).read_text(
             encoding="utf-8"
         )

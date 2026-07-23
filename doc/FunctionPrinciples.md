@@ -5,7 +5,7 @@
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `inc` 中 194 个函数/方法定义位置，以及 `main.py` 中 3 个入口函数。`IlcVariants.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数。
+本次审计共检查 `inc` 中 191 个函数/方法定义位置，以及 `main.py` 中 3 个入口函数。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；原先分散的 ILC、MIMO ILC、部署模型和 benchmark 已统一到 `DpdIlc.py`。
 
 ## 1. 分类规则
 
@@ -92,7 +92,7 @@ flowchart LR
 | `PaModel.DefaultGmpCoefficients` | E/N | 生成稳定的演示系数，不代表实测器件 | PaModel §11 |
 | `PaModel.AddAwgn` | P/N | 按目标复基带 SNR 设置圆对称复高斯噪声方差 | PaModel §8 |
 
-## 5. `DpdIlc.py`：频域 ILC 和 GMP 部署函数
+## 5. `DpdIlc.py`：全部 ILC、部署模型和基准函数
 
 详细推导统一见 [DPD-ILC.md](./DPD-ILC.md)，MSE 选优见 [Analysis.md §5.5–§5.10](./Analysis.md)。
 
@@ -110,52 +110,51 @@ flowchart LR
 | `GMPPredistorter.Process` | P/N | 计算 $\mathbf u=\boldsymbol\Phi_{GMP}\mathbf c$，分块只改变内存不改变代数 | DPD-ILC §3.7、§3.14 |
 | `DpdIlc.FitGmpPredistorter` | N | 两遍列归一化、分块累加正规矩阵和岭回归 | DPD-ILC §3.7、§3.14 |
 
-## 6. `IlcVariants.py`：各 ILC 更新律
+### 5.1 各 ILC 更新律
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `IlcVariants.LimitAmplitude` | N/P | 与频域 ILC 相同的复圆盘峰值投影 | DPD-ILC §3.11、§3.14 |
-| `IlcVariants.MeasureOutput` | P/N | 重复带噪反馈平均 | DPD-ILC §3.12、§3.14 |
-| `IlcVariants.SelectionError` | N | 去除公共复增益后的归一化正交残差；是无帧元数据时的 EVM 代理 | Analysis §5.6–§5.7 |
-| `IlcVariants.RunWaveformUpdate` | E/N | 统一执行“测量→三级 MSE→最佳轮保留→更新→峰值投影” | Analysis §5.9、DPD-ILC §3 |
-| `IlcVariants.EstimateComplexGain` | P/N | 低功率探测下的最小二乘复增益 | Analysis §3、DPD-ILC §3.14 |
-| `IlcVariants.RunScalarPIlc` 及其 `IlcVariants.BuildUpdate` | P/N | $\Delta u=\mu e$ | DPD-ILC §3.1 |
-| `IlcVariants.RunComplexGainIlc` 及其 `IlcVariants.BuildUpdate` | P/N | $\Delta u=\mu h^*e/(|h|^2+\lambda)$ | DPD-ILC §3.2 |
-| `IlcVariants.NextPowerOfTwo`, `IlcVariants.EstimateFrequencyResponse` | N/P | FFT 长度及低功率逐频点/标量增益置信度融合 | DPD-ILC §3.3、§3.14 |
-| `IlcVariants.RunFirIlc` 及其 `IlcVariants.BuildUpdate` | P/N | 正则化逆频响 IFFT 后截成双边离线 FIR，卷积误差更新 | DPD-ILC §3.3 |
-| `IlcVariants.RunDirectionalGaussNewtonIlc` 及其 `IlcVariants.BuildUpdate` | P/N | 沿误差方向有限差分雅可比的一维正则化步长 | DPD-ILC §3.5、§3.14 |
-| `IlcVariants.MemoryPolynomialBasis`, `IlcVariants.RunParameterDomainIlc` | P/N | MP 基矩阵、归一化正规矩阵和直接系数迭代 | DPD-ILC §3.6–§3.7 |
-| `IlcVariants.RunAugmentedIqIlc` 及其 `IlcVariants.BuildUpdate` | P/N | 从 $[u,u^*]$ 回归得到 2×2 增广逆，联合使用 $e$ 和 $e^*$ | DPD-ILC §3.10 |
+| `DpdIlc.MeasureOutput` | P/N | 重复带噪反馈平均 | DPD-ILC §3.12、§3.14 |
+| `DpdIlc.SelectionError` | N | 去除公共复增益后的归一化正交残差；是无帧元数据时的 EVM 代理 | Analysis §5.6–§5.7 |
+| `DpdIlc.RunWaveformUpdate` | E/N | 统一执行“测量→三级 MSE→最佳轮保留→更新→峰值投影” | Analysis §5.9、DPD-ILC §3 |
+| `DpdIlc.EstimateComplexGain` | P/N | 低功率探测下的最小二乘复增益 | Analysis §3、DPD-ILC §3.14 |
+| `DpdIlc.RunScalarPIlc` 及其 `DpdIlc.BuildUpdate` | P/N | $\Delta u=\mu e$ | DPD-ILC §3.1 |
+| `DpdIlc.RunComplexGainIlc` 及其 `DpdIlc.BuildUpdate` | P/N | $\Delta u=\mu h^*e/(|h|^2+\lambda)$ | DPD-ILC §3.2 |
+| `DpdIlc.NextPowerOfTwo`, `DpdIlc.EstimateFrequencyResponse` | N/P | FFT 长度及低功率逐频点/标量增益置信度融合 | DPD-ILC §3.3、§3.14 |
+| `DpdIlc.RunFirIlc` 及其 `DpdIlc.BuildUpdate` | P/N | 正则化逆频响 IFFT 后截成双边离线 FIR，卷积误差更新 | DPD-ILC §3.3 |
+| `DpdIlc.RunDirectionalGaussNewtonIlc` 及其 `DpdIlc.BuildUpdate` | P/N | 沿误差方向有限差分雅可比的一维正则化步长 | DPD-ILC §3.5、§3.14 |
+| `DpdIlc.MemoryPolynomialBasis`, `DpdIlc.RunParameterDomainIlc` | P/N | MP 基矩阵、归一化正规矩阵和直接系数迭代 | DPD-ILC §3.6–§3.7 |
+| `DpdIlc.RunAugmentedIqIlc` 及其 `DpdIlc.BuildUpdate` | P/N | 从 $[u,u^*]$ 回归得到 2×2 增广逆，联合使用 $e$ 和 $e^*$ | DPD-ILC §3.10 |
 
 上表中的五个 `BuildUpdate` 是不同闭包：虽然名字相同，公式分别由所在行明确给出。
 
-## 7. `DeploymentModels.py`：Volterra、LUT 和神经部署模型
+### 5.2 Volterra、LUT 和神经部署模型
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `DeploymentModels.DelaySignal` | N | 因果整数记忆，负时间补零 | DPD-ILC §3.13 |
-| `DeploymentModels.BuildVolterraSpecs` | N/P | 枚举一阶项和 $s[n-m_1]s[n-m_2]s^*[n-m_3]$ 三阶项 | DPD-ILC §3.7、§3.13 |
-| `DeploymentModels.BuildVolterraBasis` | N/P | 构造简化复 Volterra 设计矩阵 | DPD-ILC §3.13 |
+| `DpdIlc.DelaySignal` | N | 因果整数记忆，负时间补零 | DPD-ILC §3.13 |
+| `DpdIlc.BuildVolterraSpecs` | N/P | 枚举一阶项和 $s[n-m_1]s[n-m_2]s^*[n-m_3]$ 三阶项 | DPD-ILC §3.7、§3.13 |
+| `DpdIlc.BuildVolterraBasis` | N/P | 构造简化复 Volterra 设计矩阵 | DPD-ILC §3.13 |
 | `VolterraPredistorter.Process` | P/N | 计算 $\boldsymbol\Phi_V\mathbf c$ | DPD-ILC §3.13 |
-| `DeploymentModels.FitVolterraPredistorter` | N | 列 RMS 归一化和复岭回归 | DPD-ILC §3.13 |
+| `DpdIlc.FitVolterraPredistorter` | N | 列 RMS 归一化和复岭回归 | DPD-ILC §3.13 |
 | `LUTPredistorter.Process` | P/N | 按输入幅度选 bin 并乘复增益 | DPD-ILC §3.8、§3.13 |
-| `DeploymentModels.FitLutPredistorter` | N | 每 bin 正则化复 LS，空 bin 用最近已填充系数 | DPD-ILC §3.8、§3.13 |
-| `DeploymentModels.BuildNeuralInputs` | N/P | 构造多时延 I/Q/包络实特征 | DPD-ILC §3.9、§3.13 |
+| `DpdIlc.FitLutPredistorter` | N | 每 bin 正则化复 LS，空 bin 用最近已填充系数 | DPD-ILC §3.8、§3.13 |
+| `DpdIlc.BuildNeuralInputs` | N/P | 构造多时延 I/Q/包络实特征 | DPD-ILC §3.9、§3.13 |
 | `NeuralPredistorter.Process` | P/N | 标准化→固定 tanh 隐藏层→复线性输出 | DPD-ILC §3.13 |
-| `DeploymentModels.FitNeuralPredistorter` | N | ELM 随机特征初始化和复输出层岭回归 | DPD-ILC §3.9、§3.13 |
+| `DpdIlc.FitNeuralPredistorter` | N | ELM 随机特征初始化和复输出层岭回归 | DPD-ILC §3.9、§3.13 |
 
-## 8. `MimoDpd.py`：逐 PA 的独立 ILC/DPD
+### 5.3 逐 PA 的独立 MIMO ILC/DPD
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
 | `MimoPaChain.__init__`, `MimoPaChain.Process` | E/P | 把第 $m$ 个独立 PA 暴露为 SISO 植物，不改变该链模型 | PaModel §10.2 |
 | `MimoGmpPredistorter.__init__`, `MimoGmpPredistorter.Process` | E/P | 每个矩阵列使用自己的 GMP DPD | PaModel §10.2、DPD-ILC §3.7 |
-| `MimoDpd.RunMimoFrequencyDomainIlc` | P/E | 在“链间无耦合”假设下逐列运行频域 ILC并使用独立噪声种子 | PaModel §10.1–§10.2 |
-| `MimoDpd.FitMimoGmpPredistorter` | N/E | 对每组 $(x_m,u_m^*)$ 标签独立岭回归 | PaModel §10.2 |
+| `DpdIlc.RunMimoFrequencyDomainIlc` | P/E | 在“链间无耦合”假设下逐列运行频域 ILC并使用独立噪声种子 | PaModel §10.1–§10.2 |
+| `DpdIlc.FitMimoGmpPredistorter` | N/E | 对每组 $(x_m,u_m^*)$ 标签独立岭回归 | PaModel §10.2 |
 
 若存在天线耦合、电源耦合或串扰，上述逐链分解不成立，必须使用 DPD-ILC §3.10 的联合增广 MIMO 模型。
 
-## 9. `SigProcess.py`：同步和补偿函数
+## 6. `SigProcess.py`：同步和补偿函数
 
 详细推导统一见 [SigProcess.md](./SigProcess.md)。
 
@@ -175,7 +174,7 @@ flowchart LR
 | `SigProcess.ResolveEstimationSlice` | E | 把数据字段或调用方切片限制到有效参考范围 | SigProcess §9、Analysis §4.4 |
 | `SigProcess.Process` | E/P | 按整数时延→CFO→分数时延/SFO→重采样→复增益的顺序执行 | SigProcess §2 |
 
-## 10. `Analysis.py`：指标与每轮 MSE 函数
+## 7. `Analysis.py`：指标与每轮 MSE 函数
 
 详细推导统一见 [Analysis.md](./Analysis.md)。
 
@@ -199,7 +198,7 @@ flowchart LR
 | `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同 RMS 驱动点和参考下公平比较各方法 EVM | Analysis §8 |
 | `Analysis.SavePowerEvmCurveData`, `Analysis.Print`, `Analysis.PrintMimo`, `Analysis.Save`, `Analysis.SaveConvergence`, `Analysis.PrintConvergence` | E | 展示/序列化既有结果，不改变物理指标 | Analysis §10–§11 |
 
-## 11. `Draw.py`：图形函数
+## 8. `Draw.py`：图形函数
 
 这些函数全部属于 E 类。它们只改变视觉表示，不参与 MSE、EVM 或功率计算。
 
@@ -213,28 +212,27 @@ flowchart LR
 
 图上的连线只帮助阅读离散采样点，不表示功率点或迭代轮次之间存在连续物理轨迹。
 
-## 12. `Benchmark.py`：公平比较与报告函数
+## 9. `DpdIlc.py`：统一基准编排与报告函数
 
 这些函数主要属于 E 类；其科学原则是控制变量和独立验证，而不是新的 PA 方程。
 
 | 函数/方法 | 类型 | 原理或职责 | 依据 |
 |---|---|---|---|
 | `BenchmarkRow.ToDict` | E | 序列化一个方法的指标和相对改善量 | Analysis §10 |
-| `Benchmark.LimitAmplitude` | N/P | 对部署模型输出施加与 ILC 相同的峰值圆盘约束 | DPD-ILC §3.11 |
-| `Benchmark.AddRow` | E | 相对同场景 baseline 计算 SNR/EVM/ACLR 改善 | Analysis §4–§8 |
-| `Benchmark.SaveHistory`, `Benchmark.ReportHistory` | E | 打印并保存每种 ILC 的同一组三级 MSE 和图 | Analysis §5.10 |
-| `Benchmark.EvaluateDeployment` | E/P | 固定 DPD→峰值投影→PA→统一 Analysis，使用独立验证帧 | DPD-ILC §3.7–§3.13 |
-| `Benchmark.RunIlcCurvePoint` | E | 在当前功率点重新构造正确参考和 EVM-MSE evaluator | Analysis §8 |
-| `Benchmark.RunAllIlcBenchmark` | E | 固定波形、PA、迭代预算和指标定义；训练帧与验证帧种子分离 | DPD-ILC §3.7、Analysis §8 |
-| `Benchmark.SaveBenchmarkResults`, `Benchmark.PrintBenchmarkResults` | E | 输出统一表格/文件，不重新计算指标 | Analysis §10 |
+| `DpdIlc.AddRow` | E | 相对同场景 baseline 计算 SNR/EVM/ACLR 改善 | Analysis §4–§8 |
+| `DpdIlc.SaveHistory`, `DpdIlc.ReportHistory` | E | 打印并保存每种 ILC 的同一组三级 MSE 和图 | Analysis §5.10 |
+| `DpdIlc.EvaluateDeployment` | E/P | 固定 DPD→峰值投影→PA→统一 Analysis，使用独立验证帧 | DPD-ILC §3.7–§3.13 |
+| `DpdIlc.RunIlcCurvePoint` | E | 在当前功率点重新构造正确参考和 EVM-MSE evaluator | Analysis §8 |
+| `DpdIlc.RunAllIlcBenchmark` | E | 固定波形、PA、迭代预算和指标定义；训练帧与验证帧种子分离 | DPD-ILC §3.7、Analysis §8 |
+| `DpdIlc.SaveBenchmarkResults`, `DpdIlc.PrintBenchmarkResults` | E | 输出统一表格/文件，不重新计算指标 | Analysis §10 |
 
-## 13. 审计结论与维护规则
+## 10. 审计结论与维护规则
 
 审计结果如下：
 
 - 所有具有物理或信号处理含义的函数均可追溯到专题文档中的公式和边界；
 - 所有纯配置、查询、序列化、保存和绘图函数均被明确标为 E 类，没有为其虚构物理原理；
-- `DeploymentModels.py` 的简化 Volterra、幅度 LUT 和 ELM 风格神经网络以前只有一般模型说明，本次已在 DPD-ILC §3.13 补充代码精确方程；
+- `DpdIlc.py` 中的简化 Volterra、幅度 LUT 和 ELM 风格神经网络以前只有一般模型说明，本次已在 DPD-ILC §3.13 补充代码精确方程；
 - ILC 的低功率频响融合、方向 Gauss-Newton、峰值/带宽投影、反馈平均和 GMP 分块岭回归以前缺少实现级推导，本次已在 DPD-ILC §3.14 补齐；
 - prepared 指标、每链/每流指标、每轮三级 MSE、绘图和 benchmark 的函数级入口均已在本文建立索引。
 

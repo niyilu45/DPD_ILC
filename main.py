@@ -7,10 +7,16 @@ from pathlib import Path
 import numpy as np
 
 from inc.Analysis import Analysis
-from inc.Benchmark import BenchmarkConfig, RunAllIlcBenchmark
-from inc.DpdIlc import FitGmpPredistorter, ILCConfig, RunFrequencyDomainIlc
+from inc.DpdIlc import (
+    BenchmarkConfig,
+    FitGmpPredistorter,
+    FitMimoGmpPredistorter,
+    ILCConfig,
+    RunAllIlcBenchmark,
+    RunFrequencyDomainIlc,
+    RunMimoFrequencyDomainIlc,
+)
 from inc.Draw import Draw
-from inc.MimoDpd import FitMimoGmpPredistorter, RunMimoFrequencyDomainIlc
 from inc.PaModel import MimoPaModel, PaModel
 from inc.waveGen import (
     GenWifi,

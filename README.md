@@ -25,14 +25,10 @@ python -m pip install -r requirements.txt
 main.py                 命令行主程序
 inc/waveGen.py          GenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
 inc/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
-inc/DpdIlc.py           频域 ILC 与 GMP DPD 拟合
-inc/MimoDpd.py          每路独立 MIMO ILC 与多路 GMP DPD
-inc/IlcVariants.py      其他 ILC 更新律
-inc/DeploymentModels.py Volterra、LUT 和 NN 部署模型
+inc/DpdIlc.py           全部 ILC 更新律、SISO/MIMO、标签部署模型与统一 benchmark
 inc/SigProcess.py       时延、载波/采样频偏和复增益估计与补偿
 inc/Analysis.py         SNR、EVM、ACLR、功率-EVM 数据计算及结果输出
 inc/Draw.py             功率-EVM 多方法同图绘制与 PNG 输出
-inc/Benchmark.py        全 ILC 方案统一基准测试
 inc/__init__.py         公共接口汇总
 tests/TestProject.py    自包含验证脚本
 ```
@@ -212,118 +208,70 @@ flowchart TD
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
 - `MimoPaModel` 不在链间引入隐含耦合：每一列进入独立 `PaModel`。`ProcessChain` 是单路 ILC 看到的真实 plant；相对 dB 与绝对 RMS 功率设置均在该路径中生效。
 
-### `inc/MimoDpd.py`
-
-```mermaid
-flowchart TD
-    reference["samples × PA chains 参考矩阵"] --> run["RunMimoFrequencyDomainIlc"]
-    pa["MimoPaModel"] --> view["MimoPaChain：选中一路 ProcessChain"]
-    view --> run
-    run --> perChain["每路 RunFrequencyDomainIlc"]
-    perChain --> result["MimoIlcResult：矩阵输入/输出 + 每路历史"]
-    result --> fit["FitMimoGmpPredistorter"]
-    fit --> chainGmp["每路 FitGmpPredistorter"]
-    chainGmp --> model["MimoGmpPredistorter"]
-    model --> process["Process：逐列部署 GMP"]
-```
-
-**图示说明：** `MimoPaChain` 只暴露被选 PA 的一维输入/输出，使现有频域 ILC 数学和验证逻辑可以逐路复用。每一路保留独立随机反馈种子、收敛历史和 GMP 系数，最终再按物理链顺序堆叠为矩阵；工程当前采用独立 DPD，不假设 PA 间电气串扰。
-
 ### `inc/DpdIlc.py`
 
 ```mermaid
 flowchart TD
-    config["ILCConfig.Validate"] --> runFrequency["RunFrequencyDomainIlc"]
-    runFrequency --> nextFft["NextPowerOfTwo"]
-    runFrequency --> measure["MeasurePaOutput"]
-    runFrequency --> limit["LimitAmplitude"]
-    runFrequency --> iterationMetrics["CalculateIterationMetrics"]
-    iterationMetrics --> rawMse["Raw MSE / NMSE"]
-    iterationMetrics --> lcMse["复增益补偿 LC-MSE"]
-    iterationMetrics --> evmMse["可选 EVM 对齐 MSE"]
-    measure --> paProcess["PA.Process"]
-    measure --> addNoise["AddAwgn"]
-    runFrequency --> iteration["ILCIteration 列表"]
-    runFrequency --> result["ILCResult"]
+    config["ILCConfig.Validate"] --> frequency["RunFrequencyDomainIlc"]
+    frequency --> fft["NextPowerOfTwo"]
+    frequency --> measure["MeasurePaOutput / AddAwgn"]
+    frequency --> metrics["CalculateIterationMetrics"]
+    frequency --> limit["LimitAmplitude"]
+    metrics --> history["ILCIteration / ILCResult"]
 
-    fitGmp["FitGmpPredistorter"] --> specs["BuildFeatureSpecs"]
-    fitGmp --> basis["BuildGmpBasisChunk"]
-    basis --> delayed["DelayedSlice"]
-    fitGmp --> ridge["归一化岭回归"]
-    ridge --> predistorter["GMPPredistorter"]
-    predistorter --> process["GMPPredistorter.Process"]
-    process --> basis
-```
-
-**图示说明：**
-
-- 上半部分是波形 ILC：`RunFrequencyDomainIlc` 根据低功率探测结果构造正则化逆频响，反复测量 PA、计算误差、更新输入并执行峰值投影。
-- 每轮状态由 `CalculateIterationMetrics` 记录为 `ILCIteration`，同时保留原始 MSE、公共复增益补偿 MSE、EVM 对齐 MSE、复增益幅相及输入峰值；完整输出封装为 `ILCResult`。
-- 下半部分是标签拟合：`FitGmpPredistorter` 先枚举 GMP 基函数，再分块累计岭回归矩阵，避免宽带长帧占用过多内存。
-- `GMPPredistorter.Process` 使用同一组基函数和拟合系数，将新的 EHT 波形转换为可部署的 DPD 输出。
-
-### `inc/IlcVariants.py`
-
-```mermaid
-flowchart TD
-    scalar["RunScalarPIlc"] --> core["RunWaveformUpdate"]
-    complex["RunComplexGainIlc"] --> gain["EstimateComplexGain"]
-    complex --> core
-    fir["RunFirIlc"] --> nextFft["NextPowerOfTwo"]
-    fir --> response["EstimateFrequencyResponse"]
-    response --> gain
-    fir --> core
-    gauss["RunDirectionalGaussNewtonIlc"] --> core
-    augmented["RunAugmentedIqIlc"] --> core
-
-    core --> measure["MeasureOutput"]
-    core --> selection["CalculateIterationMetrics / EVM 优先选优"]
-    core --> limit["LimitAmplitude"]
-    core --> result["ILCResult"]
-
+    scalar["RunScalarPIlc"] --> waveformCore["RunWaveformUpdate"]
+    complexGain["RunComplexGainIlc"] --> estimateGain["EstimateComplexGain"]
+    complexGain --> waveformCore
+    fir["RunFirIlc"] --> response["EstimateFrequencyResponse"]
+    response --> waveformCore
+    gauss["RunDirectionalGaussNewtonIlc"] --> waveformCore
+    augmented["RunAugmentedIqIlc"] --> waveformCore
+    waveformCore --> measureVariant["MeasureOutput"]
+    waveformCore --> metrics
+    waveformCore --> limit
     parameter["RunParameterDomainIlc"] --> mpBasis["MemoryPolynomialBasis"]
-    parameter --> gain
-    parameter --> measure
-    parameter --> selection
-    parameter --> limit
-    parameter --> result
-```
+    parameter --> metrics
 
-**图示说明：**
-
-- 标量 P 型、复增益、FIR、方向 Gauss-Newton 和增广 IQ ILC 共用 `RunWaveformUpdate`，因此具有一致的测量、最佳迭代选择、峰值限制和历史记录逻辑。
-- `RunComplexGainIlc` 使用 `EstimateComplexGain` 补偿平均增益和相位；`RunFirIlc` 进一步估计频率响应并截取有限长度学习滤波器。
-- `RunDirectionalGaussNewtonIlc` 通过 PA 有限差分计算误差方向上的 Jacobian 投影，不构造完整的大型 Jacobian 矩阵。
-- `RunAugmentedIqIlc` 同时使用误差与共轭误差，补偿 IQ 镜像；扩展到 MIMO 时可将同一结构推广为多通道增广矩阵。
-- 参数域 ILC 不经过通用波形更新核心，而是用 `MemoryPolynomialBasis` 直接更新 DPD 系数。
-
-### `inc/DeploymentModels.py`
-
-```mermaid
-flowchart TD
-    fitVolterra["FitVolterraPredistorter"] --> volterraSpecs["BuildVolterraSpecs"]
-    fitVolterra --> volterraBasis["BuildVolterraBasis"]
-    volterraBasis --> delay["DelaySignal"]
+    labels["收敛 ILC 标签 u*"] --> fitGmp["FitGmpPredistorter"]
+    labels --> fitVolterra["FitVolterraPredistorter"]
+    labels --> fitLut["FitLutPredistorter"]
+    labels --> fitNeural["FitNeuralPredistorter"]
+    fitGmp --> gmpModel["GMPPredistorter"]
     fitVolterra --> volterraModel["VolterraPredistorter"]
-    volterraModel --> volterraProcess["VolterraPredistorter.Process"]
-    volterraProcess --> volterraBasis
+    fitLut --> lutModel["LUTPredistorter"]
+    fitNeural --> neuralModel["NeuralPredistorter"]
 
-    fitLut["FitLutPredistorter"] --> lutModel["LUTPredistorter"]
-    lutModel --> lutProcess["LUTPredistorter.Process"]
+    mimoReference["samples × PA chains"] --> mimoRun["RunMimoFrequencyDomainIlc"]
+    mimoPa["MimoPaModel"] --> chainView["MimoPaChain"]
+    chainView --> mimoRun
+    mimoRun --> frequency
+    mimoRun --> mimoResult["MimoIlcResult"]
+    mimoResult --> mimoFit["FitMimoGmpPredistorter"]
+    mimoFit --> mimoModel["MimoGmpPredistorter"]
 
-    fitNn["FitNeuralPredistorter"] --> neuralInputs["BuildNeuralInputs"]
-    neuralInputs --> delay
-    fitNn --> neuralModel["NeuralPredistorter"]
-    neuralModel --> neuralProcess["NeuralPredistorter.Process"]
-    neuralProcess --> neuralInputs
+    benchmarkConfig["BenchmarkConfig"] --> benchmark["RunAllIlcBenchmark"]
+    benchmark --> scalar
+    benchmark --> complexGain
+    benchmark --> fir
+    benchmark --> gauss
+    benchmark --> augmented
+    benchmark --> parameter
+    benchmark --> labels
+    benchmark --> evaluate["EvaluateDeployment / Analysis"]
+    evaluate --> rows["BenchmarkRow / AddRow"]
+    history --> saveHistory["SaveHistory / ReportHistory"]
+    rows --> saveResults["SaveBenchmarkResults / PrintBenchmarkResults"]
+    benchmark --> powerCurve["RunIlcCurvePoint / 功率-EVM"]
 ```
 
 **图示说明：**
 
-- Volterra 路线先枚举一阶和三阶复基带项，再由 `BuildVolterraBasis` 构建设计矩阵并完成岭回归；运行时使用相同基函数求输出。
-- LUT 路线按输入幅度分箱，为每个区间拟合一个复增益；空分箱使用最近的有效系数填充。
-- NN 路线把当前及历史 I/Q/包络样本组成时延输入，经标准化和 `tanh` 隐层后拟合复数输出层。
-- 三个 `Fit...` 函数负责训练，三个 `...Predistorter.Process` 方法负责在验证帧或实际输入上推理。
+- `DpdIlc.py` 是工程中唯一的 ILC 实现文件，集中保存公共配置和收敛记录、全部更新律、SISO/MIMO 执行、ILC 标签部署模型以及全方法 benchmark；其他 `inc` 文件不再定义或转发 ILC 函数。
+- 频域 ILC 和其他波形更新律共享 `ILCConfig`、`CalculateIterationMetrics`、`LimitAmplitude` 与 `ILCResult`，因此 Raw MSE、LC-MSE、EVM-MSE、峰值约束及最佳轮选择保持一致。
+- 标量 P、复增益、FIR、方向 Gauss-Newton 和增广 IQ 路线通过 `RunWaveformUpdate` 复用测量与迭代骨架；参数域 ILC 使用 `MemoryPolynomialBasis` 直接更新可部署系数。
+- GMP、Volterra、LUT 和神经网络拟合都消费收敛标签 `u*`。各 `Fit...` 函数负责训练，相应 `...Predistorter.Process` 方法负责在独立验证帧上推理。
+- MIMO 路线用 `MimoPaChain` 将每个物理 PA 暴露给同一频域 ILC，再按链保存历史并分别拟合 GMP；当前模型假设 PA 之间没有隐藏耦合。
+- `RunAllIlcBenchmark` 在同一文件内编排全部更新律、部署模型和功率-EVM 扫描，最终仍调用独立的 `Analysis.py` 计算指标、调用 `Draw.py` 绘图。
 
 ### `inc/SigProcess.py`
 
@@ -431,39 +379,6 @@ flowchart TD
 - `CreatePowerEvmFigure` 把所有方法绘制在同一坐标系中；方法较多时图例自动移到绘图区外，避免遮挡数据。
 - `SavePowerEvmCurve` 读取 `Draw` 在类内部解析后的绘图参数并仅输出 PNG；图形尺寸、DPI、线宽、标记大小、标题和坐标轴文字均可由外部覆盖。
 - `SaveConvergenceCurve` 在同一 dB 轴上绘制 Raw NMSE、LC-NMSE 和可用的 EVM-MSE/EVM dB，便于定位原始 MSE 停滞但 EVM 继续改善的原因。
-
-### `inc/Benchmark.py`
-
-```mermaid
-flowchart TD
-    config["BenchmarkConfig"] --> run["RunAllIlcBenchmark"]
-    run --> waveform["两个 GenWifi 实例：训练帧和验证帧"]
-    run --> pa["PaModel / IQImbalancePA 实例"]
-    run --> ilc["全部 ILC 更新律"]
-    run --> deploy["全部 ILC 标签部署模型"]
-    run --> powerSweep["全部方法功率-EVM 扫描"]
-
-    ilc --> evaluate["Analysis.Analyze"]
-    deploy --> deploymentEval["EvaluateDeployment"]
-    deploymentEval --> limit["LimitAmplitude"]
-    deploymentEval --> evaluate
-
-    evaluate --> addRow["AddRow"]
-    addRow --> row["BenchmarkRow.ToDict"]
-    ilc --> history["SaveHistory"]
-    row --> save["SaveBenchmarkResults"]
-    row --> print["PrintBenchmarkResults"]
-    powerSweep --> curve["all_ilc_power_evm_curve.*"]
-```
-
-**图示说明：**
-
-- `RunAllIlcBenchmark` 是全方案编排入口：生成训练帧与独立验证帧，创建 PA，并按相同迭代预算运行所有算法。
-- 常规 ILC 在重复训练波形上测试；增广 ILC 使用 IQ 镜像场景；噪声感知 ILC 使用带噪多次反馈；标签模型在独立验证帧上测试。
-- `EvaluateDeployment` 对每个部署模型执行“DPD → 峰值限制 → PA → 指标分析”。
-- `AddRow` 将指标及相对基线改善量写入 `BenchmarkRow`，`SaveHistory` 为各更新律保留独立收敛曲线数据。
-- `SaveBenchmarkResults` 与 `PrintBenchmarkResults` 分别负责机器可读文件和控制台汇总表。
-- 基准模式默认在同一张图中比较标称 PA、全部 ILC 更新律、IQ 场景以及 MP/GMP/Volterra/LUT/NN 部署模型；每个 ILC 更新律在各功率点重新学习，部署模型则复用标称驱动点训练得到的固定系数。
 
 ### `inc/__init__.py`
 
@@ -1114,7 +1029,7 @@ python main.py --benchmark-all-ilc --bandwidth 20 --mcs 7 --pa wiener --symbols 
 ```python
 from pathlib import Path
 
-from inc.Benchmark import BenchmarkConfig, RunAllIlcBenchmark
+from inc.DpdIlc import BenchmarkConfig, RunAllIlcBenchmark
 
 benchmarkConfig = BenchmarkConfig(
     frameFormat="HE",
