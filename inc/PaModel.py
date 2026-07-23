@@ -17,7 +17,7 @@ independent input drive and output-power calibration on every chain.
 from collections import ChainMap
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Dict, Mapping, Optional, Sequence, Tuple, cast
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -919,7 +919,7 @@ class IQImbalancePA:
 
     def __init__(
         self,
-        paModel,
+        paModel: Any,
         directCoefficient: complex = 1.0 + 0.0j,
         imageCoefficient: complex = 0.045 * np.exp(1j * 0.35),
     ) -> None:

@@ -8,11 +8,9 @@ import numpy as np
 
 from inc.Analysis import Analysis
 from inc.DpdIlc import (
-    BenchmarkConfig,
     FitGmpPredistorter,
     FitMimoGmpPredistorter,
     ILCConfig,
-    RunAllIlcBenchmark,
     RunFrequencyDomainIlc,
     RunMimoFrequencyDomainIlc,
 )
@@ -303,12 +301,6 @@ def Main() -> int:
         action="store_true",
         help="Save reference, PA, ILC, and deployed-DPD arrays as compressed NPZ",
     )
-    argumentParser.add_argument(
-        "--benchmark-all-ilc",
-        dest="benchmarkAllIlc",
-        action="store_true",
-        help="Run every ILC update law and every ILC-label deployment model",
-    )
     arguments = argumentParser.parse_args()
 
     if arguments.driveRms <= 0.0:
@@ -392,34 +384,6 @@ def Main() -> int:
         if isinstance(paModel, PaModel)
         else str(paOverrides.get("modelName", "wiener"))
     )
-
-    if arguments.benchmarkAllIlc:
-        if wifiGenerator.numTransmitAntennas > 1:
-            argumentParser.error(
-                "--benchmark-all-ilc currently requires a SISO waveform"
-            )
-        benchmarkDirectory = arguments.outputDirectory / "all_ilc_benchmark"
-        RunAllIlcBenchmark(
-            BenchmarkConfig(
-                frameFormat=frameFormat,
-                bandwidthMhz=bandwidthMhz,
-                mcs=mcs,
-                numDataSymbols=numDataSymbols,
-                oversampling=oversampling,
-                guardIntervalUs=guardIntervalUs,
-                driveRms=arguments.driveRms,
-                numIterations=arguments.numIterations,
-                paModelName=paModelName,
-                seed=seed,
-                powerStartRms=arguments.powerStartRms,
-                powerStopRms=arguments.powerStopRms,
-                powerPointCount=arguments.powerPointCount,
-                generatePowerEvmCurve=not arguments.skipPowerEvmCurve,
-                outputDirectory=benchmarkDirectory,
-            )
-        )
-        print(f"\nAll-ILC results: {benchmarkDirectory.resolve()}")
-        return 0
 
     waveform = wifiGenerator.Generate()
     referenceSignal = arguments.driveRms * waveform.samples

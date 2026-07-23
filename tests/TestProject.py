@@ -10,9 +10,22 @@ from tempfile import TemporaryDirectory
 import numpy as np
 
 
-projectRoot = Path(__file__).resolve().parents[1]
-if str(projectRoot) not in sys.path:
-    sys.path.insert(0, str(projectRoot))
+def GetProjectRoot() -> Path:
+    """Return the repository root without retaining module-level state.
+
+    Processing details:
+        Algorithm: Resolve this test file and select its parent repository
+        directory whenever a test needs an absolute project path.
+
+    Returns:
+        result: Absolute path containing ``main.py``, ``inc``, and ``doc``.
+    """
+
+    return Path(__file__).resolve().parents[1]
+
+
+if str(GetProjectRoot()) not in sys.path:
+    sys.path.insert(0, str(GetProjectRoot()))
 
 from inc.Analysis import Analysis
 from inc.DpdIlc import (
@@ -28,9 +41,6 @@ from inc.SigProcess import SigProcess
 from inc.waveGen import (
     GenWifi,
     NormalizeFrameFormat,
-    ehtMcsTable,
-    heMcsTable,
-    vhtMcsTable,
 )
 
 
@@ -44,9 +54,13 @@ def CheckMcsTables() -> None:
         result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
     """
 
-    assert set(ehtMcsTable.keys()) == set(range(14))
-    assert set(heMcsTable.keys()) == set(range(12))
-    assert set(vhtMcsTable.keys()) == set(range(10))
+    wifiGenerator = GenWifi()
+    ehtMcsTable = wifiGenerator.ResolveMcsTable("EHT")
+    heMcsTable = wifiGenerator.ResolveMcsTable("HE")
+    vhtMcsTable = wifiGenerator.ResolveMcsTable("VHT")
+    assert set(ehtMcsTable) == set(range(14))
+    assert set(heMcsTable) == set(range(12))
+    assert set(vhtMcsTable) == set(range(10))
     assert ehtMcsTable[0].qamOrder == 2
     assert ehtMcsTable[13].qamOrder == 4096
     assert ehtMcsTable[13].codeRate == 5.0 / 6.0
@@ -99,24 +113,29 @@ def CheckFrameFormatAliases() -> None:
 
 
 def CheckFunctionStyle() -> None:
-    """Verify PascalCase functions and detailed English documentation.
+    """Verify names, typed signatures, and detailed English documentation.
 
     Processing details:
         Algorithm: Parse every project Python file with the standard-library
-        AST, allow only Python-required double-underscore method names, and
-        require every function to contain a multi-line documentation string.
+        AST, require ``self`` or ``cls`` for bound methods, require explicit
+        parameter and return annotations, allow Python-required
+        double-underscore names, and validate multi-line documentation.
 
     Returns:
         result: None. Assertion failures identify naming or documentation
         regressions before code is published.
     """
 
-    sourceFiles = [projectRoot / "main.py"]
-    sourceFiles.extend(sorted((projectRoot / "inc").glob("*.py")))
-    sourceFiles.extend(sorted((projectRoot / "tests").glob("*.py")))
+    sourceFiles = [GetProjectRoot() / "main.py"]
+    sourceFiles.extend(sorted((GetProjectRoot() / "inc").glob("*.py")))
+    sourceFiles.extend(sorted((GetProjectRoot() / "tests").glob("*.py")))
     pascalCasePattern = re.compile(r"[A-Z][A-Za-z0-9]*")
     for sourceFile in sourceFiles:
         syntaxTree = ast.parse(sourceFile.read_text(encoding="utf-8"))
+        parentByNode = {}
+        for parentNode in ast.walk(syntaxTree):
+            for childNode in ast.iter_child_nodes(parentNode):
+                parentByNode[childNode] = parentNode
         for syntaxNode in ast.walk(syntaxTree):
             if not isinstance(
                 syntaxNode,
@@ -130,6 +149,61 @@ def CheckFunctionStyle() -> None:
             assert isDoubleUnderscoreMethod or pascalCasePattern.fullmatch(
                 syntaxNode.name
             ), f"function name must be PascalCase: {sourceFile}:{syntaxNode.lineno}"
+
+            positionalArguments = [
+                *syntaxNode.args.posonlyargs,
+                *syntaxNode.args.args,
+            ]
+            parentNode = parentByNode.get(syntaxNode)
+            if isinstance(parentNode, ast.ClassDef):
+                decoratorNames = {
+                    decoratorNode.id
+                    for decoratorNode in syntaxNode.decorator_list
+                    if isinstance(decoratorNode, ast.Name)
+                }
+                if "staticmethod" not in decoratorNames:
+                    expectedFirstArgument = (
+                        "cls" if "classmethod" in decoratorNames else "self"
+                    )
+                    assert positionalArguments, (
+                        f"bound method requires {expectedFirstArgument}: "
+                        f"{sourceFile}:{syntaxNode.lineno}"
+                    )
+                    assert (
+                        positionalArguments[0].arg == expectedFirstArgument
+                    ), (
+                        f"bound method first argument must be "
+                        f"{expectedFirstArgument}: "
+                        f"{sourceFile}:{syntaxNode.lineno}"
+                    )
+
+            annotatedArguments = [
+                *positionalArguments,
+                *syntaxNode.args.kwonlyargs,
+            ]
+            for argumentNode in annotatedArguments:
+                if argumentNode.arg in ("self", "cls"):
+                    continue
+                assert argumentNode.annotation is not None, (
+                    f"missing parameter type annotation for "
+                    f"{argumentNode.arg}: "
+                    f"{sourceFile}:{syntaxNode.lineno}"
+                )
+            if syntaxNode.args.vararg is not None:
+                assert syntaxNode.args.vararg.annotation is not None, (
+                    f"missing variadic parameter type annotation: "
+                    f"{sourceFile}:{syntaxNode.lineno}"
+                )
+            if syntaxNode.args.kwarg is not None:
+                assert syntaxNode.args.kwarg.annotation is not None, (
+                    f"missing keyword parameter type annotation: "
+                    f"{sourceFile}:{syntaxNode.lineno}"
+                )
+            assert syntaxNode.returns is not None, (
+                f"missing return type annotation: "
+                f"{sourceFile}:{syntaxNode.lineno}"
+            )
+
             documentation = ast.get_docstring(syntaxNode, clean=False)
             assert documentation is not None, (
                 f"missing function documentation: "
@@ -139,6 +213,105 @@ def CheckFunctionStyle() -> None:
                 f"function documentation must be detailed and multi-line: "
                 f"{sourceFile}:{syntaxNode.lineno}"
             )
+
+
+def CheckNoGlobalDataVariables() -> None:
+    """Reject module-level data assignments in every project Python file.
+
+    Processing details:
+        Algorithm: Parse ``main.py`` plus every ``inc`` and ``tests`` module,
+        inspect only the module body, and reject ordinary, annotated,
+        augmented, or named assignments while allowing imports, classes,
+        functions, and constructor- or function-local configuration data.
+
+    Returns:
+        result: None. Assertion failures identify any global data variable
+        before it can become shared mutable state or hidden configuration.
+    """
+
+    productionFiles = [GetProjectRoot() / "main.py"]
+    productionFiles.extend(sorted((GetProjectRoot() / "inc").glob("*.py")))
+    productionFiles.extend(
+        sorted((GetProjectRoot() / "tests").glob("*.py"))
+    )
+    forbiddenAssignmentTypes = (
+        ast.Assign,
+        ast.AnnAssign,
+        ast.AugAssign,
+        ast.NamedExpr,
+    )
+    for sourceFile in productionFiles:
+        syntaxTree = ast.parse(sourceFile.read_text(encoding="utf-8"))
+        for syntaxNode in syntaxTree.body:
+            assert not isinstance(
+                syntaxNode, forbiddenAssignmentTypes
+            ), (
+                f"module-level data variable is forbidden: "
+                f"{sourceFile}:{syntaxNode.lineno}"
+            )
+
+
+def CheckBenchmarkSeparation() -> None:
+    """Verify that scenario tests are isolated from production ILC code.
+
+    Processing details:
+        Algorithm: Inspect both source files, reject benchmark configuration,
+        scenario orchestration, or report functions in ``inc/DpdIlc.py``, and
+        require the standalone test module plus its classified documentation
+        to expose every expected scenario and result section.
+
+    Returns:
+        result: None. Assertions identify architectural regressions before
+        benchmark workflows can leak back into production algorithms.
+    """
+
+    ilcSource = (
+        GetProjectRoot() / "inc" / "DpdIlc.py"
+    ).read_text(encoding="utf-8")
+    benchmarkPath = GetProjectRoot() / "tests" / "BenchMark.py"
+    benchmarkSource = benchmarkPath.read_text(encoding="utf-8")
+    benchmarkDocument = (
+        GetProjectRoot() / "doc" / "BenchMark.md"
+    ).read_text(encoding="utf-8")
+    forbiddenProductionNames = (
+        "BenchmarkConfig",
+        "BenchmarkRow",
+        "RunAllIlcBenchmark",
+        "SaveBenchmarkResults",
+        "PrintBenchmarkResults",
+    )
+    for forbiddenName in forbiddenProductionNames:
+        assert forbiddenName not in ilcSource, (
+            f"benchmark workflow leaked into DpdIlc.py: {forbiddenName}"
+        )
+        assert forbiddenName in benchmarkSource, (
+            f"missing benchmark API in tests/BenchMark.py: {forbiddenName}"
+        )
+
+    requiredScenarioLabels = (
+        "nominal repeated waveform",
+        "peak-constrained waveform",
+        "32 dB averaged feedback",
+        "IQ image impairment",
+        "held-out Wi-Fi packet",
+    )
+    for scenarioLabel in requiredScenarioLabels:
+        assert scenarioLabel in benchmarkSource, (
+            f"missing benchmark scenario: {scenarioLabel}"
+        )
+
+    requiredDocumentSections = (
+        "A类：基础对照场景",
+        "B类：标称波形更新律场景",
+        "C类：约束与噪声鲁棒性场景",
+        "D类：IQ失衡增广场景",
+        "E类：ILC标签部署泛化场景",
+        "F类：功率-EVM扫描场景",
+    )
+    for sectionTitle in requiredDocumentSections:
+        assert sectionTitle in benchmarkDocument, (
+            f"missing classified benchmark documentation: {sectionTitle}"
+        )
 
 
 def CheckFunctionPrincipleCoverage() -> None:
@@ -153,10 +326,10 @@ def CheckFunctionPrincipleCoverage() -> None:
         result: None. Missing documentation mappings fail the project checks.
     """
 
-    auditPath = projectRoot / "doc" / "FunctionPrinciples.md"
+    auditPath = GetProjectRoot() / "doc" / "FunctionPrinciples.md"
     auditText = auditPath.read_text(encoding="utf-8")
-    sourceFiles = [projectRoot / "main.py"]
-    sourceFiles.extend(sorted((projectRoot / "inc").glob("*.py")))
+    sourceFiles = [GetProjectRoot() / "main.py"]
+    sourceFiles.extend(sorted((GetProjectRoot() / "inc").glob("*.py")))
     checkedDefinitionCount = 0
     for sourceFile in sourceFiles:
         syntaxTree = ast.parse(sourceFile.read_text(encoding="utf-8"))
@@ -183,7 +356,7 @@ def CheckFunctionPrincipleCoverage() -> None:
                 f"at {sourceFile}:{syntaxNode.lineno}"
             )
             checkedDefinitionCount += 1
-    assert checkedDefinitionCount >= 194
+    assert checkedDefinitionCount >= 186
 
 
 def CheckDocumentationMathCompatibility() -> None:
@@ -192,14 +365,15 @@ def CheckDocumentationMathCompatibility() -> None:
     Processing details:
         Algorithm: Scan every Markdown document for unsupported macros,
         invisible control characters, legacy display delimiters, incomplete
-        math fences, and unbalanced braces inside fenced equations.
+        math fences, broken inline delimiters, fragile inline ellipses, and
+        unbalanced braces inside both inline and fenced equations.
 
     Returns:
         result: None. Assertion failures identify the affected document and
         equation before incompatible formulas can be published.
     """
 
-    documentPaths = sorted((projectRoot / "doc").glob("*.md"))
+    documentPaths = sorted((GetProjectRoot() / "doc").glob("*.md"))
     forbiddenMacros = (r"\operatorname", r"\text", r"\dfrac")
     fenceMarker = chr(96) * 3
     mathFenceMarker = fenceMarker + "math"
@@ -225,6 +399,64 @@ def CheckDocumentationMathCompatibility() -> None:
         for forbiddenMacro in forbiddenMacros:
             assert forbiddenMacro not in markdownText, (
                 f"unsupported math macro {forbiddenMacro}: {documentPath}"
+            )
+
+        insideCodeFence = False
+        for lineNumber, markdownLine in enumerate(
+            markdownText.splitlines(),
+            start=1,
+        ):
+            if markdownLine.startswith(fenceMarker):
+                insideCodeFence = not insideCodeFence
+                continue
+            if insideCodeFence:
+                continue
+
+            inlineDelimiterCount = len(
+                re.findall(r"(?<!\\)\$", markdownLine)
+            )
+            assert inlineDelimiterCount % 2 == 0, (
+                f"broken inline math delimiter in {documentPath}:"
+                f"{lineNumber}"
+            )
+            inlineMathFragments = re.findall(
+                r"(?<!\\)\$([^$\r\n]+)(?<!\\)\$",
+                markdownLine,
+            )
+            for inlineMath in inlineMathFragments:
+                assert r"\ldots" not in inlineMath, (
+                    f"inline sequence must use a math block in "
+                    f"{documentPath}:{lineNumber}"
+                )
+                braceDepth = 0
+                for characterIndex, character in enumerate(inlineMath):
+                    isEscaped = (
+                        characterIndex > 0
+                        and inlineMath[characterIndex - 1] == "\\"
+                    )
+                    if character == "{" and not isEscaped:
+                        braceDepth += 1
+                    elif character == "}" and not isEscaped:
+                        braceDepth -= 1
+                    assert braceDepth >= 0, (
+                        f"unexpected inline closing brace in "
+                        f"{documentPath}:{lineNumber}"
+                    )
+                assert braceDepth == 0, (
+                    f"unbalanced inline braces in "
+                    f"{documentPath}:{lineNumber}"
+                )
+            lineWithoutInlineMath = re.sub(
+                r"(?<!\\)\$[^$\r\n]+(?<!\\)\$",
+                "",
+                markdownLine,
+            )
+            assert re.search(
+                r"\\[A-Za-z]+",
+                lineWithoutInlineMath,
+            ) is None, (
+                f"math macro outside a delimiter in "
+                f"{documentPath}:{lineNumber}"
             )
 
         mathBlocks = re.findall(
@@ -336,7 +568,7 @@ def CheckInternalDefaultConfiguration() -> None:
 
     # Production call sites must not reconstruct internal default layers.
     for relativePath in ("main.py", "inc/DpdIlc.py"):
-        callSiteSource = (projectRoot / relativePath).read_text(
+        callSiteSource = (GetProjectRoot() / relativePath).read_text(
             encoding="utf-8"
         )
         assert "ChainMap" not in callSiteSource
@@ -758,7 +990,9 @@ def CheckSignalProcessingCompensation() -> None:
         assert "carrierFrequencyOffsetHz" in csvPath.read_text(
             encoding="utf-8-sig"
         )
-    analysisSource = (projectRoot / "inc" / "Analysis.py").read_text(
+    analysisSource = (
+        GetProjectRoot() / "inc" / "Analysis.py"
+    ).read_text(
         encoding="utf-8"
     )
     assert "from .SigProcess import" in analysisSource
@@ -811,7 +1045,9 @@ def CheckPowerEvmCurve() -> None:
         assert all(outputPath.is_file() for outputPath in dataPaths)
         assert figurePath.is_file()
 
-    analysisSource = (projectRoot / "inc" / "Analysis.py").read_text(
+    analysisSource = (
+        GetProjectRoot() / "inc" / "Analysis.py"
+    ).read_text(
         encoding="utf-8"
     )
     assert "matplotlib" not in analysisSource
@@ -993,6 +1229,8 @@ def RunTests() -> None:
     CheckMcsTables()
     CheckFrameFormatAliases()
     CheckFunctionStyle()
+    CheckNoGlobalDataVariables()
+    CheckBenchmarkSeparation()
     CheckFunctionPrincipleCoverage()
     CheckDocumentationMathCompatibility()
     CheckInternalDefaultConfiguration()

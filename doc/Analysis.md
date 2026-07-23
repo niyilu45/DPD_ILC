@@ -827,7 +827,7 @@ P_{\mathrm{NL},k}
 =20\log_{10}(\mathrm{EVM}_{\mathrm{rms}}).
 ```
 
-代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子，`ILCIteration.evmAlignedMse` 保存每轮的无量纲平方误差，`ILCIteration.evmDb` 保存它的 dB 值。标准 SISO 主流程和全方法 benchmark 会把这个计算器传入 ILC，因此最佳轮次也按照与最终 EVM 相同的目标选择。
+代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子，`ILCIteration.evmAlignedMse` 保存每轮的无量纲平方误差，`ILCIteration.evmDb` 保存它的 dB 值。标准 SISO 主流程和 `tests/BenchMark.py` 中的分类性能测试会把这个计算器传入ILC，因此最佳轮次也按照与最终EVM相同的目标选择。
 
 ```mermaid
 flowchart LR

@@ -5,7 +5,7 @@
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `inc` 中 191 个函数/方法定义位置，以及 `main.py` 中 3 个入口函数。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；原先分散的 ILC、MIMO ILC、部署模型和 benchmark 已统一到 `DpdIlc.py`。
+本次审计共检查 `inc` 中183个函数/方法定义位置，以及 `main.py` 中3个入口函数。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
 
 ## 1. 分类规则
 
@@ -25,7 +25,7 @@ flowchart LR
     ilc --> sync["SigProcess.md：同步与补偿"]
     pa --> sync
     sync --> analysis["Analysis.md：MSE/SNR/EVM/ACLR"]
-    analysis --> report["打印/保存/绘图/Benchmark"]
+    analysis --> report["打印/保存/绘图"]
     audit["本文：197 个定义位置逐项索引"] -.-> wave
     audit -.-> pa
     audit -.-> ilc
@@ -52,7 +52,7 @@ flowchart LR
 | `waveGen.NormalizeFrameFormat` | E | 把 11ac/11ax/11be 别名规范为 VHT/HE/EHT，不改变波形 | WaveGen §8.1 |
 | `GenWifi.__init__`, `GenWifi.GetParameters`, `GenWifi.UpdateParameters`, `GenWifi.Validate` | E | ChainMap 配置、单位和合法域校验；保证后续公式输入有效 | WaveGen §12–14 |
 | `GenWifi.FrameFormat`, `GenWifi.BandwidthMhz`, `GenWifi.Mcs`, `GenWifi.NumDataSymbols`, `GenWifi.GuardIntervalUs`, `GenWifi.Oversampling`, `GenWifi.Seed`, `GenWifi.NumTransmitAntennas`, `GenWifi.NumSpatialStreams`, `GenWifi.SpatialMapping`, `GenWifi.SpatialMappingMatrix`, `GenWifi.CyclicShiftEnabled` | E | 返回已验证配置，不做额外物理变换 | WaveGen §12 |
-| `GenWifi.GetMcsInfo` | P/E | 返回调制阶数、名义码率和每音调比特数 | WaveGen §5 |
+| `GenWifi.ResolveMcsTable`, `GenWifi.GetMcsInfo` | P/E | 在方法内部构造不可变 MCS 表并返回调制阶数、名义码率和每音调比特数，不保留模块级查表变量 | WaveGen §5 |
 | `GenWifi.Generate`, `waveGen.GenerateWifiWaveform` | P/E | 组装完整 VHT/HE/EHT 复基带帧并保存解调元数据 | WaveGen §2、§8、§10 |
 | `waveGen.ActiveTones`, `waveGen.PilotTones` | P | 依据 FFT 网格选择活动、数据和导频子载波 | WaveGen §4 |
 | `waveGen.GrayToBinary`, `waveGen.QamModulate` | P/N | Gray 标号转自然坐标，构造单位平均功率 BPSK/QAM | WaveGen §6 |
@@ -218,13 +218,13 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 依据 |
 |---|---|---|---|
-| `BenchmarkRow.ToDict` | E | 序列化一个方法的指标和相对改善量 | Analysis §10 |
-| `DpdIlc.AddRow` | E | 相对同场景 baseline 计算 SNR/EVM/ACLR 改善 | Analysis §4–§8 |
-| `DpdIlc.SaveHistory`, `DpdIlc.ReportHistory` | E | 打印并保存每种 ILC 的同一组三级 MSE 和图 | Analysis §5.10 |
-| `DpdIlc.EvaluateDeployment` | E/P | 固定 DPD→峰值投影→PA→统一 Analysis，使用独立验证帧 | DPD-ILC §3.7–§3.13 |
-| `DpdIlc.RunIlcCurvePoint` | E | 在当前功率点重新构造正确参考和 EVM-MSE evaluator | Analysis §8 |
-| `DpdIlc.RunAllIlcBenchmark` | E | 固定波形、PA、迭代预算和指标定义；训练帧与验证帧种子分离 | DPD-ILC §3.7、Analysis §8 |
-| `DpdIlc.SaveBenchmarkResults`, `DpdIlc.PrintBenchmarkResults` | E | 输出统一表格/文件，不重新计算指标 | Analysis §10 |
+| `BenchMark.BenchmarkRow.ToDict` | E | 序列化一个方法的指标和相对改善量 | BenchMark §4 |
+| `BenchMark.AddRow` | E | 相对同场景baseline计算SNR/EVM/ACLR改善 | BenchMark §4–§9 |
+| `BenchMark.SaveHistory`, `BenchMark.ReportHistory` | E | 打印并保存每种ILC的同一组三级MSE和图 | BenchMark §6 |
+| `BenchMark.EvaluateDeployment` | E/P | 固定DPD→峰值投影→PA→统一Analysis，使用独立验证帧 | BenchMark §9 |
+| `BenchMark.RunIlcCurvePoint` | E | 在当前功率点重新构造正确参考和EVM-MSE evaluator | BenchMark §10 |
+| `BenchMark.RunAllIlcBenchmark` | E | 固定波形、PA、迭代预算和指标定义；按类别构造全部场景 | BenchMark §2–§10 |
+| `BenchMark.SaveBenchmarkResults`, `BenchMark.PrintBenchmarkResults` | E | 输出统一表格/文件，不重新计算指标 | BenchMark §3–§4 |
 
 ## 10. 审计结论与维护规则
 
@@ -234,7 +234,7 @@ flowchart LR
 - 所有纯配置、查询、序列化、保存和绘图函数均被明确标为 E 类，没有为其虚构物理原理；
 - `DpdIlc.py` 中的简化 Volterra、幅度 LUT 和 ELM 风格神经网络以前只有一般模型说明，本次已在 DPD-ILC §3.13 补充代码精确方程；
 - ILC 的低功率频响融合、方向 Gauss-Newton、峰值/带宽投影、反馈平均和 GMP 分块岭回归以前缺少实现级推导，本次已在 DPD-ILC §3.14 补齐；
-- prepared 指标、每链/每流指标、每轮三级 MSE、绘图和 benchmark 的函数级入口均已在本文建立索引。
+- prepared指标、每链/每流指标、每轮三级MSE和绘图的生产函数入口均已在本文建立索引；benchmark函数的场景含义、预期和实测结果在 `BenchMark.md` 分类说明。
 
 以后新增 `inc` 函数时，应同时完成以下至少一项：
 

@@ -25,12 +25,14 @@ python -m pip install -r requirements.txt
 main.py                 命令行主程序
 inc/waveGen.py          GenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
 inc/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
-inc/DpdIlc.py           全部 ILC 更新律、SISO/MIMO、标签部署模型与统一 benchmark
+inc/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
 inc/SigProcess.py       时延、载波/采样频偏和复增益估计与补偿
 inc/Analysis.py         SNR、EVM、ACLR、功率-EVM 数据计算及结果输出
 inc/Draw.py             功率-EVM 多方法同图绘制与 PNG 输出
 inc/__init__.py         公共接口汇总
 tests/TestProject.py    自包含验证脚本
+tests/BenchMark.py      分类场景 ILC 性能基准、结果保存和功率-EVM比较
+doc/BenchMark.md        各 benchmark 场景的构造、预期和参考仿真结果
 ```
 
 所有代码注释与文档字符串均为英文；除 Python 协议强制要求的 `__init__` 等双下划线方法外，所有函数（包括内部辅助函数）都使用大驼峰命名。变量和对外对象属性使用小驼峰命名；属性底层访问器使用大驼峰函数名，并通过小驼峰属性别名保持调用接口一致。
@@ -51,16 +53,11 @@ flowchart TD
     reference --> baseline["生成未校正 PA 基线输出"]
     paImplementation --> baseline
 
-    start --> mode{"运行模式"}
-    mode -->|单方案| frequencyIlc["SISO 或逐 PA RunMimoFrequencyDomainIlc"]
-    mode -->|全方案| benchmark["RunAllIlcBenchmark"]
+    start --> frequencyIlc["SISO 或逐 PA RunMimoFrequencyDomainIlc"]
     reference --> frequencyIlc
     paModel --> frequencyIlc
-    reference --> benchmark
-    paModel --> benchmark
 
     frequencyIlc --> learnedInput["ILC 学得的理想 PA 输入 u*"]
-    benchmark --> variantResults["全部 ILC 更新律结果"]
     learnedInput --> deployFit["拟合 MP / GMP / Volterra / LUT / NN"]
     deployFit --> deployedDpd["可复用 DPD 模型"]
 
@@ -75,7 +72,6 @@ flowchart TD
     reference --> signalProcess["SigProcess：时延 / CFO / SFO / 复增益补偿"]
     baseline --> signalProcess
     frequencyIlc --> signalProcess
-    variantResults --> signalProcess
     correctedOutput --> signalProcess
     signalProcess --> analysisMethod["Analysis.Analyze / AnalyzeStages"]
     analysis --> analysisMethod
@@ -122,9 +118,10 @@ flowchart TD
     normalize --> validate["GenWifi.Validate"]
     config --> mcs["GenWifi.GetMcsInfo"]
     config --> generate["GenWifi.Generate"]
-    mcs --> vhtTable["vhtMcsTable：MCS 0–9"]
-    mcs --> ehtTable["ehtMcsTable：MCS 0–13"]
-    mcs --> heTable["heMcsTable：MCS 0–11"]
+    mcs --> resolveMcs["GenWifi.ResolveMcsTable：方法内局部不可变表"]
+    resolveMcs --> vhtTable["VHT：MCS 0–9"]
+    resolveMcs --> ehtTable["EHT：MCS 0–13"]
+    resolveMcs --> heTable["HE：MCS 0–11"]
     generate --> privateGenerate["GenerateWifiWaveform"]
 
     privateGenerate --> active["ActiveTones"]
@@ -155,7 +152,7 @@ flowchart TD
 **图示说明：**
 
 - 调用方必须先构造 `GenWifi`，再调用实例方法；`NormalizeFrameFormat` 先把 `11ac/11ax/11be` 等效归一化为 `VHT/HE/EHT`，`GenWifi.Validate` 再检查带宽、格式对应的 MCS 范围、GI、符号数和过采样倍率。
-- `GenWifi.GetMcsInfo` 根据规范化后的 `frameFormat` 选择 `vhtMcsTable`、`heMcsTable` 或 `ehtMcsTable`，其中 VHT 支持 MCS 0–9、HE 支持 MCS 0–11、EHT 支持 MCS 0–13。
+- `GenWifi.GetMcsInfo` 调用 `GenWifi.ResolveMcsTable`，在方法内部构造局部不可变 MCS 表并根据规范化后的 `frameFormat` 选择范围；VHT 支持 MCS 0–9、HE 支持 MCS 0–11、EHT 支持 MCS 0–13，不使用模块级查表变量。
 - `ActiveTones` 与 `PilotTones` 决定不同带宽下的数据、导频和空子载波位置；`QamModulate` 完成 Gray 编码星座映射。
 - `BuildSpatialMappingMatrix` 产生 direct、DFT 或调用方自定义的正交映射；`SpatialMapTones` 为每个子载波执行空间映射并叠加 CSD，`BuildMimoOfdmSymbol` 再完成各发射链 IFFT 和循环前缀。
 - `BuildLtfTrainingMatrix` 产生跨 LTF 符号的正交训练码；LTF 数量随空间流增加。公共字段由 `MapCommonFieldToAntennas` 复制到各链并保留 CSD。
@@ -249,29 +246,38 @@ flowchart TD
     mimoResult --> mimoFit["FitMimoGmpPredistorter"]
     mimoFit --> mimoModel["MimoGmpPredistorter"]
 
-    benchmarkConfig["BenchmarkConfig"] --> benchmark["RunAllIlcBenchmark"]
-    benchmark --> scalar
-    benchmark --> complexGain
-    benchmark --> fir
-    benchmark --> gauss
-    benchmark --> augmented
-    benchmark --> parameter
-    benchmark --> labels
-    benchmark --> evaluate["EvaluateDeployment / Analysis"]
-    evaluate --> rows["BenchmarkRow / AddRow"]
-    history --> saveHistory["SaveHistory / ReportHistory"]
-    rows --> saveResults["SaveBenchmarkResults / PrintBenchmarkResults"]
-    benchmark --> powerCurve["RunIlcCurvePoint / 功率-EVM"]
 ```
 
 **图示说明：**
 
-- `DpdIlc.py` 是工程中唯一的 ILC 实现文件，集中保存公共配置和收敛记录、全部更新律、SISO/MIMO 执行、ILC 标签部署模型以及全方法 benchmark；其他 `inc` 文件不再定义或转发 ILC 函数。
+- `DpdIlc.py` 是工程中唯一的可复用 ILC 算法文件，集中保存公共配置和收敛记录、全部更新律、SISO/MIMO执行及ILC标签部署模型。
 - 频域 ILC 和其他波形更新律共享 `ILCConfig`、`CalculateIterationMetrics`、`LimitAmplitude` 与 `ILCResult`，因此 Raw MSE、LC-MSE、EVM-MSE、峰值约束及最佳轮选择保持一致。
 - 标量 P、复增益、FIR、方向 Gauss-Newton 和增广 IQ 路线通过 `RunWaveformUpdate` 复用测量与迭代骨架；参数域 ILC 使用 `MemoryPolynomialBasis` 直接更新可部署系数。
 - GMP、Volterra、LUT 和神经网络拟合都消费收敛标签 `u*`。各 `Fit...` 函数负责训练，相应 `...Predistorter.Process` 方法负责在独立验证帧上推理。
 - MIMO 路线用 `MimoPaChain` 将每个物理 PA 暴露给同一频域 ILC，再按链保存历史并分别拟合 GMP；当前模型假设 PA 之间没有隐藏耦合。
-- `RunAllIlcBenchmark` 在同一文件内编排全部更新律、部署模型和功率-EVM 扫描，最终仍调用独立的 `Analysis.py` 计算指标、调用 `Draw.py` 绘图。
+- 测试波形、特殊损伤、方法组合、结果文件和功率扫描全部移到 `tests/BenchMark.py`，因此生产算法不依赖任何 benchmark 流程。
+
+### `tests/BenchMark.py`
+
+```mermaid
+flowchart TD
+    config["BenchmarkConfig.Validate"] --> benchmark["RunAllIlcBenchmark"]
+    benchmark --> nominal["标称重复波形更新律"]
+    benchmark --> constrained["峰值约束场景"]
+    benchmark --> noisy["32 dB反馈噪声场景"]
+    benchmark --> iq["IQ镜像增广场景"]
+    benchmark --> heldout["独立验证帧标签部署"]
+    benchmark --> power["全方法功率-EVM扫描"]
+    nominal --> algorithms["调用 DpdIlc 中的可复用算法"]
+    constrained --> algorithms
+    noisy --> algorithms
+    iq --> algorithms
+    heldout --> algorithms
+    algorithms --> analysis["Analysis：SNR / EVM / ACLR"]
+    analysis --> report["CSV / JSON / 收敛图 / 功率-EVM图"]
+```
+
+**图示说明：**`BenchMark.py` 只负责场景编排和结果呈现，不重新实现任何ILC更新律。场景分类、预期趋势和本机参考结果见[BenchMark场景说明](doc/BenchMark.md)。
 
 ### `inc/SigProcess.py`
 
@@ -386,20 +392,19 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    init["inc/__init__.py"] --> waveApi["GenWifi / WifiWaveform / MCS 表"]
+    init["inc/__init__.py"] --> waveApi["GenWifi / WifiWaveform / MCSInfo"]
     init --> paApi["PaModel / MimoPaModel / WienerPA / GMPPA"]
     init --> signalApi["SigProcess / SignalProcessingResult"]
     init --> analysisApi["Analysis / SignalMetrics / MimoSignalMetrics"]
     init --> drawApi["Draw / PowerEvmCurve 绘图入口"]
     init --> ilcApi["ILCConfig / RunFrequencyDomainIlc"]
     init --> mimoIlcApi["RunMimoFrequencyDomainIlc / MimoGmpPredistorter"]
-    init --> benchmarkApi["BenchmarkConfig / RunAllIlcBenchmark"]
 ```
 
 **图示说明：**
 
 - `inc/__init__.py` 是包的公共门面，不包含算法计算。
-- 外部调用者可以从 `inc` 直接导入波形生成、PA、分析、频域 ILC 和全方案基准测试入口，不需要了解各实现文件的位置。
+- 外部调用者可以从 `inc` 直接导入波形生成、PA、分析和频域ILC入口；基准测试入口位于 `tests.BenchMark`，明确与生产API隔离。
 - 未在此处导出的下划线私有函数只供模块内部复用，避免将实现细节暴露为稳定接口。
 
 ## 802.11ac/ax/be 与 VHT/HE/EHT 支持范围
@@ -482,7 +487,6 @@ flowchart LR
 | `--seed` | 整数 | `7` | Wi-Fi 数据、训练字段及相关随机过程的种子。 |
 | `--output-dir` | 路径 | `results` | JSON、CSV、收敛历史和可选波形文件的输出目录。 |
 | `--save-waveforms` | 开关 | 关闭 | 额外保存 `waveforms.npz`。 |
-| `--benchmark-all-ilc` | 开关 | 关闭 | 运行全部 ILC 更新律及全部 ILC 标签部署模型。 |
 
 ### `GenWifi` 参数
 
@@ -698,7 +702,7 @@ PA 辅助接口还包括：
 | `FitLutPredistorter` | `binCount=64`、`ridgeFactor=1e-8`。 |
 | `FitNeuralPredistorter` | `memoryDepth=4`、`hiddenUnitCount=32`、`ridgeFactor=1e-5`、`randomSeed=71`。 |
 
-### `BenchmarkConfig` 参数
+### `tests/BenchMark.py` 中的 `BenchmarkConfig` 参数
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -706,7 +710,7 @@ PA 辅助接口还包括：
 | `bandwidthMhz` | `20` | 20、40、80 或 160 MHz。 |
 | `mcs` | `7` | VHT 0–9，HE 0–11，EHT 0–13。 |
 | `numDataSymbols` | `10` | 数据 OFDM 符号数。 |
-| `oversampling` | `4` | 过采样倍率。 |
+| `oversampling` | `4` | 过采样倍率；benchmark为计算ACLR要求不小于3。 |
 | `guardIntervalUs` | `0.8` | VHT 为 0.4/0.8；HE/EHT 为 0.8/1.6/3.2 μs。 |
 | `driveRms` | `0.24` | PA 输入 RMS 驱动电平。 |
 | `numIterations` | `10` | 每种 ILC 的迭代预算。 |
@@ -1021,7 +1025,7 @@ powerFigurePath = resultDraw.SavePowerEvmCurve(
 ### 示例十一：运行全部 ILC 与部署模型
 
 ```powershell
-python main.py --benchmark-all-ilc --bandwidth 20 --mcs 7 --pa wiener --symbols 10 --iterations 10
+python tests\BenchMark.py --bandwidth 20 --mcs 7 --pa wiener --symbols 10 --iterations 10
 ```
 
 也可通过 Python 配置：
@@ -1029,7 +1033,7 @@ python main.py --benchmark-all-ilc --bandwidth 20 --mcs 7 --pa wiener --symbols 
 ```python
 from pathlib import Path
 
-from inc.DpdIlc import BenchmarkConfig, RunAllIlcBenchmark
+from tests.BenchMark import BenchmarkConfig, RunAllIlcBenchmark
 
 benchmarkConfig = BenchmarkConfig(
     frameFormat="HE",
@@ -1049,14 +1053,16 @@ benchmarkRows = RunAllIlcBenchmark(benchmarkConfig)
 查看命令行参数的实时帮助：
 
 ```powershell
-python main.py --help
+python tests\BenchMark.py --help
 ```
 
-上述命令行示例的结果保存在 `results/all_ilc_benchmark/`，其中 `all_ilc_metrics.csv` 和
+上述benchmark命令的结果保存在 `results/all_ilc_benchmark/`，其中 `all_ilc_metrics.csv` 和
 `all_ilc_metrics.json` 包含每种方案的 SNR、EVM、ACLR 及相对基线改善量；
 每种迭代更新律还会生成独立的 `convergence_*.csv`。全部方法的功率-EVM 对比输出为
 `all_ilc_power_evm_curve.png`、`all_ilc_power_evm_curve.csv` 和
 `all_ilc_power_evm_curve.json`。
+
+每个测试场景的分类、构造方法、控制变量、结果预期和固定配置仿真结果见[BenchMark场景说明](doc/BenchMark.md)。
 
 全方案测试包括：
 
@@ -1099,6 +1105,12 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 
 ```powershell
 python tests/TestProject.py
+```
+
+分类性能基准使用独立入口：
+
+```powershell
+python tests\BenchMark.py
 ```
 
 验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、每轮 CSV/PNG、两类 PA 的 ILC 改善，以及多方法功率-EVM 数据与 PNG/CSV/JSON 输出。

@@ -1,10 +1,10 @@
 """Unified iterative learning control and deployable DPD implementations.
 
-This module is the single home of all ILC-related code in the project. It
-contains common convergence records, every waveform and parameter update law,
-SISO and MIMO execution, ILC-label deployment models, and the all-method
-benchmark. Keeping these cooperating algorithms together makes their shared
-measurement, projection, and selection rules explicit.
+This module is the single home of reusable ILC-related algorithms in the
+project. It contains common convergence records, every waveform and parameter
+update law, SISO and MIMO execution, and ILC-label deployment models. Scenario
+construction and performance comparison belong to ``tests/BenchMark.py`` so
+production algorithms remain independent of the benchmark harness.
 
 The frequency-domain waveform ILC follows the regularized update:
 
@@ -18,15 +18,11 @@ specific ILC labels into reusable GMP, Volterra, LUT, or neural
 predistorters.
 """
 
-import csv
-import json
 from dataclasses import dataclass, replace
-from pathlib import Path
 from typing import (
+    Any,
     Callable,
-    Dict,
     List,
-    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -34,10 +30,7 @@ from typing import (
 
 import numpy as np
 
-from .Analysis import Analysis, SignalMetrics
-from .Draw import Draw
-from .PaModel import AddAwgn, IQImbalancePA, MimoPaModel, PaModel
-from .waveGen import GenWifi
+from .PaModel import AddAwgn, MimoPaModel
 
 
 @dataclass(frozen=True)
@@ -241,7 +234,7 @@ def LimitAmplitude(inputSignal: np.ndarray, maxAmplitude: float) -> np.ndarray:
 
 
 def MeasurePaOutput(
-    paModel,
+    paModel: Any,
     inputSignal: np.ndarray,
     config: ILCConfig,
     randomGenerator: np.random.Generator,
@@ -272,7 +265,7 @@ def MeasurePaOutput(
 
 def RunFrequencyDomainIlc(
     referenceSignal: np.ndarray,
-    paModel,
+    paModel: Any,
     sampleRateHz: float,
     channelBandwidthHz: float,
     config: ILCConfig = ILCConfig(),
@@ -404,14 +397,11 @@ def RunFrequencyDomainIlc(
     )
 
 
-FeatureSpec = Tuple[str, int, int, int]
-
-
 def BuildFeatureSpecs(
     nonlinearOrders: Sequence[int],
     memoryDepth: int,
     crossMemoryDepth: int,
-) -> List[FeatureSpec]:
+) -> List[Tuple[str, int, int, int]]:
     """Enumerate GMP main, lagging, and leading basis-function indices.
 
     Processing details:
@@ -423,10 +413,10 @@ def BuildFeatureSpecs(
         crossMemoryDepth: Number of envelope cross-delays included in the GMP model.
 
     Returns:
-        result: List[FeatureSpec]. The computed value described by the summary, with documented units, shape, and normalization.
+        result: List[Tuple[str, int, int, int]]. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
-    featureSpecs: List[FeatureSpec] = []
+    featureSpecs: List[Tuple[str, int, int, int]] = []
     for nonlinearOrder in nonlinearOrders:
         for memoryIndex in range(memoryDepth):
             featureSpecs.append(("main", nonlinearOrder, memoryIndex, 0))
@@ -477,7 +467,7 @@ def DelayedSlice(
 
 def BuildGmpBasisChunk(
     inputSignal: np.ndarray,
-    featureSpecs: Sequence[FeatureSpec],
+    featureSpecs: Sequence[Tuple[str, int, int, int]],
     startIndex: int,
     stopIndex: int,
 ) -> np.ndarray:
@@ -547,7 +537,7 @@ def BuildGmpBasisChunk(
 class GMPPredistorter:
     """Store and evaluate a fitted generalized memory polynomial DPD."""
 
-    featureSpecs: List[FeatureSpec]
+    featureSpecs: List[Tuple[str, int, int, int]]
     coefficients: np.ndarray
 
     def Process(self, inputSignal: np.ndarray, chunkSize: int = 16384) -> np.ndarray:
@@ -667,9 +657,9 @@ def DelaySignal(inputSignal: np.ndarray, sampleDelay: int) -> np.ndarray:
         delayedSignal[sampleDelay:] = inputSignal[:-sampleDelay]
     return delayedSignal
 
-VolterraSpec = Tuple[str, int, int, int]
-
-def BuildVolterraSpecs(memoryDepth: int) -> List[VolterraSpec]:
+def BuildVolterraSpecs(
+    memoryDepth: int,
+) -> List[Tuple[str, int, int, int]]:
     """Enumerate first- and third-order complex-baseband Volterra terms.
 
     Processing details:
@@ -679,10 +669,10 @@ def BuildVolterraSpecs(memoryDepth: int) -> List[VolterraSpec]:
         memoryDepth: Number of causal sample delays included in the model.
 
     Returns:
-        result: List[VolterraSpec]. The computed value described by the summary, with documented units, shape, and normalization.
+        result: List[Tuple[str, int, int, int]]. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
-    featureSpecs: List[VolterraSpec] = []
+    featureSpecs: List[Tuple[str, int, int, int]] = []
     for firstDelay in range(memoryDepth):
         featureSpecs.append(("linear", firstDelay, 0, 0))
     for firstDelay in range(memoryDepth):
@@ -699,7 +689,8 @@ def BuildVolterraSpecs(memoryDepth: int) -> List[VolterraSpec]:
     return featureSpecs
 
 def BuildVolterraBasis(
-    inputSignal: np.ndarray, featureSpecs: List[VolterraSpec]
+    inputSignal: np.ndarray,
+    featureSpecs: List[Tuple[str, int, int, int]],
 ) -> np.ndarray:
     """Build a simplified complex Volterra basis containing x*x*conj(x).
 
@@ -746,7 +737,7 @@ def BuildVolterraBasis(
 class VolterraPredistorter:
     """Store a fitted simplified complex third-order Volterra DPD."""
 
-    featureSpecs: List[VolterraSpec]
+    featureSpecs: List[Tuple[str, int, int, int]]
     coefficients: np.ndarray
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
@@ -1021,10 +1012,8 @@ def FitNeuralPredistorter(
 # Additional ILC update laws
 # =============================================================================
 
-UpdateFunction = Callable[[np.ndarray, np.ndarray, np.ndarray, int], np.ndarray]
-
 def MeasureOutput(
-    paModel,
+    paModel: Any,
     inputSignal: np.ndarray,
     config: ILCConfig,
     randomGenerator: np.random.Generator,
@@ -1081,9 +1070,12 @@ def SelectionError(
 
 def RunWaveformUpdate(
     referenceSignal: np.ndarray,
-    paModel,
+    paModel: Any,
     config: ILCConfig,
-    updateFunction: UpdateFunction,
+    updateFunction: Callable[
+        [np.ndarray, np.ndarray, np.ndarray, int],
+        np.ndarray,
+    ],
 ) -> ILCResult:
     """Run a generic waveform ILC loop with best-iteration retention.
 
@@ -1144,7 +1136,9 @@ def RunWaveformUpdate(
         history=history,
     )
 
-def EstimateComplexGain(referenceSignal: np.ndarray, paModel) -> complex:
+def EstimateComplexGain(
+    referenceSignal: np.ndarray, paModel: Any
+) -> complex:
     """Measure the low-power least-squares complex gain of a PA.
 
     Processing details:
@@ -1171,7 +1165,7 @@ def EstimateComplexGain(referenceSignal: np.ndarray, paModel) -> complex:
 
 def RunScalarPIlc(
     referenceSignal: np.ndarray,
-    paModel,
+    paModel: Any,
     config: ILCConfig = ILCConfig(),
 ) -> ILCResult:
     """Run scalar P-type ILC using the nominal target gain of one.
@@ -1215,7 +1209,7 @@ def RunScalarPIlc(
 
 def RunComplexGainIlc(
     referenceSignal: np.ndarray,
-    paModel,
+    paModel: Any,
     config: ILCConfig = ILCConfig(),
 ) -> ILCResult:
     """Run regularized complex-gain-normalized ILC.
@@ -1267,7 +1261,7 @@ def RunComplexGainIlc(
 
 def EstimateFrequencyResponse(
     referenceSignal: np.ndarray,
-    paModel,
+    paModel: Any,
     fftLength: int,
     responseFloorDb: float,
 ) -> np.ndarray:
@@ -1307,7 +1301,7 @@ def EstimateFrequencyResponse(
 
 def RunFirIlc(
     referenceSignal: np.ndarray,
-    paModel,
+    paModel: Any,
     config: ILCConfig = ILCConfig(),
     firLength: int = 17,
 ) -> ILCResult:
@@ -1380,7 +1374,7 @@ def RunFirIlc(
 
 def RunDirectionalGaussNewtonIlc(
     referenceSignal: np.ndarray,
-    paModel,
+    paModel: Any,
     config: ILCConfig = ILCConfig(),
     finiteDifferenceRms: float = 1e-3,
 ) -> ILCResult:
@@ -1468,7 +1462,7 @@ def MemoryPolynomialBasis(
 
 def RunParameterDomainIlc(
     referenceSignal: np.ndarray,
-    paModel,
+    paModel: Any,
     config: ILCConfig = ILCConfig(),
     nonlinearOrders: tuple = (1, 3, 5, 7),
     memoryDepth: int = 3,
@@ -1557,7 +1551,7 @@ def RunParameterDomainIlc(
 
 def RunAugmentedIqIlc(
     referenceSignal: np.ndarray,
-    paModel,
+    paModel: Any,
     config: ILCConfig = ILCConfig(),
 ) -> ILCResult:
     """Run widely-linear augmented ILC with error and conjugate-error paths.
@@ -1848,787 +1842,3 @@ def FitMimoGmpPredistorter(
         for chainIndex in range(complexReference.shape[1])
     )
     return MimoGmpPredistorter(chainPredistorters)
-
-
-# =============================================================================
-# All-method ILC benchmark and reporting
-# =============================================================================
-
-@dataclass(frozen=True)
-class BenchmarkConfig:
-    """Configure a compact but representative all-method comparison."""
-
-    frameFormat: str = "EHT"
-    bandwidthMhz: int = 20
-    mcs: int = 7
-    numDataSymbols: int = 10
-    oversampling: int = 4
-    guardIntervalUs: float = 0.8
-    driveRms: float = 0.24
-    numIterations: int = 10
-    paModelName: str = "wiener"
-    seed: int = 101
-    powerStartRms: float = 0.08
-    powerStopRms: float = 0.40
-    powerPointCount: int = 5
-    generatePowerEvmCurve: bool = True
-    outputDirectory: Path = Path("results/all_ilc_benchmark")
-
-@dataclass(frozen=True)
-class BenchmarkRow:
-    """Store one method result and its improvement over scenario baseline."""
-
-    methodName: str
-    category: str
-    scenario: str
-    metrics: SignalMetrics
-    snrImprovementDb: float
-    evmImprovementDb: float
-    aclrImprovementDb: float
-
-    def ToDict(self) -> Dict[str, object]:
-        """Convert a row to flat JSON/CSV-compatible values.
-
-        Processing details:
-            Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
-
-        Returns:
-            result: Dict[str, object]. The computed value described by the summary, with documented units, shape, and normalization.
-        """
-
-        rowData: Dict[str, object] = {
-            "methodName": self.methodName,
-            "category": self.category,
-            "scenario": self.scenario,
-            "snrImprovementDb": self.snrImprovementDb,
-            "evmImprovementDb": self.evmImprovementDb,
-            "aclrImprovementDb": self.aclrImprovementDb,
-        }
-        rowData.update(self.metrics.ToDict())
-        return rowData
-
-def AddRow(
-    rows: List[BenchmarkRow],
-    methodName: str,
-    category: str,
-    scenario: str,
-    metrics: SignalMetrics,
-    baselineMetrics: SignalMetrics,
-) -> None:
-    """Append metrics and consistently signed improvements to the result table.
-
-    Processing details:
-        Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
-
-    Args:
-        rows: Benchmark rows accumulated or emitted by the reporting operation.
-        methodName: Human-readable algorithm or deployment-model label.
-        category: Caller-supplied value consumed according to the function contract.
-        scenario: Description of the impairment or validation scenario.
-        metrics: Signal-quality metrics calculated for the selected output.
-        baselineMetrics: Reference metrics used to calculate improvements.
-
-    Returns:
-        result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
-    """
-
-    rows.append(
-        BenchmarkRow(
-            methodName=methodName,
-            category=category,
-            scenario=scenario,
-            metrics=metrics,
-            snrImprovementDb=metrics.snrDb - baselineMetrics.snrDb,
-            # More-negative EVM dB is better, so baseline minus result is a
-            # positive improvement.
-            evmImprovementDb=baselineMetrics.evmDb - metrics.evmDb,
-            aclrImprovementDb=metrics.aclrWorstDb
-            - baselineMetrics.aclrWorstDb,
-        )
-    )
-
-def SaveHistory(
-    methodName: str, ilcResult: ILCResult, outputDirectory: Path
-) -> None:
-    """Save a separate convergence CSV without overwriting other methods.
-
-    Processing details:
-        Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
-
-    Args:
-        methodName: Human-readable algorithm or deployment-model label.
-        ilcResult: Caller-supplied value consumed according to the function contract.
-        outputDirectory: Directory in which result artifacts are written.
-
-    Returns:
-        result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
-    """
-
-    safeName = "".join(
-        character.lower() if character.isalnum() else "_"
-        for character in methodName
-    ).strip("_")
-    historyPath = outputDirectory / f"convergence_{safeName}.csv"
-    with historyPath.open("w", newline="", encoding="utf-8-sig") as csvFile:
-        csvWriter = csv.DictWriter(
-            csvFile,
-            fieldnames=(
-                "iteration",
-                "mse",
-                "errorRms",
-                "nmseDb",
-                "linearCompensatedMse",
-                "linearCompensatedNmseDb",
-                "evmAlignedMse",
-                "evmDb",
-                "complexGainMagnitudeDb",
-                "complexGainPhaseDegrees",
-                "inputPeak",
-            ),
-        )
-        csvWriter.writeheader()
-        for iterationRecord in ilcResult.history:
-            csvWriter.writerow(
-                {
-                    "iteration": iterationRecord.iteration,
-                    "mse": iterationRecord.mse,
-                    "errorRms": iterationRecord.errorRms,
-                    "nmseDb": iterationRecord.nmseDb,
-                    "linearCompensatedMse": (
-                        iterationRecord.linearCompensatedMse
-                    ),
-                    "linearCompensatedNmseDb": (
-                        iterationRecord.linearCompensatedNmseDb
-                    ),
-                    "evmAlignedMse": iterationRecord.evmAlignedMse,
-                    "evmDb": iterationRecord.evmDb,
-                    "complexGainMagnitudeDb": (
-                        iterationRecord.complexGainMagnitudeDb
-                    ),
-                    "complexGainPhaseDegrees": (
-                        iterationRecord.complexGainPhaseDegrees
-                    ),
-                    "inputPeak": iterationRecord.inputPeak,
-                }
-            )
-    Draw(convergenceFileStem=f"convergence_{safeName}").SaveConvergenceCurve(
-        ilcResult.history, outputDirectory
-    )
-
-def ReportHistory(
-    methodName: str,
-    ilcResult: ILCResult,
-    resultAnalysis: Analysis,
-    outputDirectory: Path,
-) -> None:
-    """Print and save one method's complete per-iteration MSE history.
-
-    Processing details:
-        Algorithm: Use ``Analysis`` for the console table, then serialize the
-        same immutable records and render their convergence figure without
-        recalculating any metric.
-
-    Args:
-        methodName: Human-readable ILC method label.
-        ilcResult: Completed ILC result containing ordered history records.
-        resultAnalysis: Analysis instance used for consistent presentation.
-        outputDirectory: Destination for CSV and PNG result artifacts.
-
-    Returns:
-        result: None. Console and file outputs are produced as side effects.
-    """
-
-    resultAnalysis.PrintConvergence(
-        ilcResult.history, f"{methodName} iteration metrics"
-    )
-    SaveHistory(methodName, ilcResult, outputDirectory)
-
-def EvaluateDeployment(
-    predistorter,
-    validationSignal: np.ndarray,
-    paModel,
-    resultAnalysis: Analysis,
-    maxAmplitude: float,
-) -> SignalMetrics:
-    """Evaluate one fitted DPD on a held-out Wi-Fi packet.
-
-    Processing details:
-        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
-
-    Args:
-        predistorter: Caller-supplied value consumed according to the function contract.
-        validationSignal: Independent complex waveform used to evaluate generalization.
-        paModel: PA object exposing Process and SmallSignalGain operations.
-        resultAnalysis: Caller-supplied value consumed according to the function contract.
-        maxAmplitude: Maximum allowed complex-envelope magnitude.
-
-    Returns:
-        result: SignalMetrics. The computed value described by the summary, with documented units, shape, and normalization.
-    """
-
-    predistortedInput = LimitAmplitude(
-        predistorter.Process(validationSignal), maxAmplitude
-    )
-    paOutput = paModel.Process(predistortedInput)
-    return resultAnalysis.Analyze(paOutput)
-
-def RunIlcCurvePoint(
-    referenceSignal: np.ndarray,
-    driveRms: float,
-    paModel,
-    waveform,
-    methodName: str,
-    methodFunction,
-    methodConfig: ILCConfig,
-) -> np.ndarray:
-    """Run one selected ILC method at one power-EVM sweep point.
-
-    Processing details:
-        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
-
-    Args:
-        referenceSignal: Ideal complex baseband samples used as the target or regression input.
-        driveRms: Current RMS drive value in the power sweep.
-        paModel: PA object exposing Process and SmallSignalGain operations.
-        waveform: Wi-Fi metadata defining field locations, FFT sizes, and subcarriers.
-        methodName: Human-readable algorithm or deployment-model label.
-        methodFunction: Selected ILC update-law callable.
-        methodConfig: Validated ILC configuration for the selected update law.
-
-    Returns:
-        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
-    """
-
-    del driveRms
-    pointAnalysis = Analysis(referenceSignal, waveform)
-    pointConfig = replace(
-        methodConfig,
-        evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
-    )
-    if methodName == "Frequency-domain ILC":
-        return RunFrequencyDomainIlc(
-            referenceSignal,
-            paModel,
-            waveform.sampleRateHz,
-            waveform.bandwidthHz,
-            pointConfig,
-        ).outputSignal
-    return methodFunction(
-        referenceSignal, paModel, pointConfig
-    ).outputSignal
-
-def RunAllIlcBenchmark(config: BenchmarkConfig = BenchmarkConfig()) -> List[BenchmarkRow]:
-    """Run every update law and every ILC-label deployment model.
-
-    Waveform update laws use one repeated training packet. Deployment models
-    are fitted to frequency-domain ILC labels and evaluated on an independent
-    payload generated with a different seed. Augmented ILC uses an IQ-image
-    scenario, and noise-aware ILC learns from averaged noisy feedback while
-    final metrics are measured on the clean PA output.
-    """
-
-    outputDirectory = Path(config.outputDirectory)
-    outputDirectory.mkdir(parents=True, exist_ok=True)
-    sharedWifiParameters = {
-        "frameFormat": config.frameFormat,
-        "bandwidthMhz": config.bandwidthMhz,
-        "mcs": config.mcs,
-        "numDataSymbols": config.numDataSymbols,
-        "guardIntervalUs": config.guardIntervalUs,
-        "oversampling": config.oversampling,
-    }
-    trainingParameters = dict(sharedWifiParameters)
-    trainingParameters["seed"] = config.seed
-    validationParameters = dict(sharedWifiParameters)
-    validationParameters["seed"] = config.seed + 97
-    trainingGenerator = GenWifi(parameters=trainingParameters)
-    validationGenerator = GenWifi(parameters=validationParameters)
-    trainingWaveform = trainingGenerator.Generate()
-    validationWaveform = validationGenerator.Generate()
-    trainingSignal = config.driveRms * trainingWaveform.samples
-    validationSignal = config.driveRms * validationWaveform.samples
-    paParameters = {"modelName": config.paModelName}
-    paModel = PaModel(parameters=paParameters)
-    trainingAnalysis = Analysis(trainingSignal, trainingWaveform)
-    validationAnalysis = Analysis(validationSignal, validationWaveform)
-    maxAmplitude = max(2.0, 1.6 * np.max(np.abs(trainingSignal)))
-
-    baselineOutput = paModel.Process(trainingSignal)
-    baselineMetrics = trainingAnalysis.Analyze(baselineOutput)
-    powerEvaluators = {
-        "PA baseline": lambda pointReference, _: paModel.Process(
-            pointReference
-        )
-    }
-    rows: List[BenchmarkRow] = []
-    AddRow(
-        rows,
-        "PA baseline",
-        "baseline",
-        "nominal repeated waveform",
-        baselineMetrics,
-        baselineMetrics,
-    )
-
-    # Each algorithm receives tuned but conservative learning parameters. The
-    # waveform, PA, iteration budget, and metrics remain identical.
-    scalarConfig = ILCConfig(
-        numIterations=config.numIterations,
-        learningRate=0.10,
-        maxAmplitude=maxAmplitude,
-        randomSeed=config.seed + 1,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
-    )
-    complexConfig = ILCConfig(
-        numIterations=config.numIterations,
-        learningRate=0.15,
-        maxAmplitude=maxAmplitude,
-        randomSeed=config.seed + 2,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
-    )
-    firConfig = ILCConfig(
-        numIterations=config.numIterations,
-        learningRate=0.15,
-        maxAmplitude=maxAmplitude,
-        randomSeed=config.seed + 3,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
-    )
-    frequencyConfig = ILCConfig(
-        numIterations=config.numIterations,
-        learningRate=0.15,
-        maxAmplitude=maxAmplitude,
-        randomSeed=config.seed + 4,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
-    )
-    gaussNewtonConfig = ILCConfig(
-        numIterations=config.numIterations,
-        learningRate=0.65,
-        maxAmplitude=maxAmplitude,
-        randomSeed=config.seed + 5,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
-    )
-    parameterConfig = ILCConfig(
-        numIterations=config.numIterations,
-        learningRate=0.20,
-        maxAmplitude=maxAmplitude,
-        randomSeed=config.seed + 6,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
-    )
-
-    methodRuns = (
-        ("Scalar P ILC", RunScalarPIlc, scalarConfig),
-        ("Complex-gain ILC", RunComplexGainIlc, complexConfig),
-        ("FIR ILC", RunFirIlc, firConfig),
-        ("Frequency-domain ILC", None, frequencyConfig),
-        (
-            "Directional Gauss-Newton ILC",
-            RunDirectionalGaussNewtonIlc,
-            gaussNewtonConfig,
-        ),
-        ("Parameter-domain MP ILC", RunParameterDomainIlc, parameterConfig),
-    )
-    frequencyResult = None
-    for methodName, methodFunction, methodConfig in methodRuns:
-        if methodName == "Frequency-domain ILC":
-            methodResult = RunFrequencyDomainIlc(
-                trainingSignal,
-                paModel,
-                trainingWaveform.sampleRateHz,
-                trainingWaveform.bandwidthHz,
-                methodConfig,
-            )
-            frequencyResult = methodResult
-        else:
-            methodResult = methodFunction(
-                trainingSignal, paModel, methodConfig
-            )
-        methodMetrics = trainingAnalysis.Analyze(methodResult.outputSignal)
-        AddRow(
-            rows,
-            methodName,
-            "ILC update law",
-            "nominal repeated waveform",
-            methodMetrics,
-            baselineMetrics,
-        )
-        ReportHistory(
-            methodName, methodResult, trainingAnalysis, outputDirectory
-        )
-        powerEvaluators[methodName] = (
-            lambda pointReference,
-            pointDrive,
-            selectedName=methodName,
-            selectedFunction=methodFunction,
-            selectedConfig=methodConfig: RunIlcCurvePoint(
-                pointReference,
-                pointDrive,
-                paModel,
-                trainingWaveform,
-                selectedName,
-                selectedFunction,
-                selectedConfig,
-            )
-        )
-
-    if frequencyResult is None:
-        raise RuntimeError("frequency-domain ILC result was not generated")
-
-    # Constrained ILC uses a peak only 5 percent above the original waveform.
-    constrainedPeak = 1.05 * np.max(np.abs(trainingSignal))
-    constrainedResult = RunFrequencyDomainIlc(
-        trainingSignal,
-        paModel,
-        trainingWaveform.sampleRateHz,
-        trainingWaveform.bandwidthHz,
-        ILCConfig(
-            numIterations=config.numIterations,
-            learningRate=0.12,
-            maxAmplitude=constrainedPeak,
-            randomSeed=config.seed + 7,
-            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
-        ),
-    )
-    constrainedMetrics = trainingAnalysis.Analyze(
-        constrainedResult.outputSignal
-    )
-    AddRow(
-        rows,
-        "Constrained CFR-ILC",
-        "ILC update law",
-        "peak-constrained waveform",
-        constrainedMetrics,
-        baselineMetrics,
-    )
-    ReportHistory(
-        "Constrained CFR-ILC",
-        constrainedResult,
-        trainingAnalysis,
-        outputDirectory,
-    )
-    powerEvaluators["Constrained CFR-ILC"] = (
-        lambda pointReference, _: RunFrequencyDomainIlc(
-            pointReference,
-            paModel,
-            trainingWaveform.sampleRateHz,
-            trainingWaveform.bandwidthHz,
-            ILCConfig(
-                numIterations=config.numIterations,
-                learningRate=0.12,
-                maxAmplitude=1.05 * np.max(np.abs(pointReference)),
-                randomSeed=config.seed + 7,
-            ),
-        ).outputSignal
-    )
-
-    # Noise-aware learning uses a higher regularization and four averaged
-    # feedback captures at 32 dB feedback SNR.
-    noisyBaselineMetrics = baselineMetrics
-    AddRow(
-        rows,
-        "Noisy-feedback baseline",
-        "baseline",
-        "32 dB averaged feedback",
-        noisyBaselineMetrics,
-        noisyBaselineMetrics,
-    )
-    noiseAwareResult = RunFrequencyDomainIlc(
-        trainingSignal,
-        paModel,
-        trainingWaveform.sampleRateHz,
-        trainingWaveform.bandwidthHz,
-        ILCConfig(
-            numIterations=config.numIterations,
-            learningRate=0.10,
-            regularization=1e-2,
-            maxAmplitude=maxAmplitude,
-            feedbackSnrDb=32.0,
-            feedbackAverages=4,
-            randomSeed=config.seed + 8,
-            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
-        ),
-    )
-    noiseAwareMetrics = trainingAnalysis.Analyze(
-        noiseAwareResult.outputSignal
-    )
-    AddRow(
-        rows,
-        "Noise-aware ILC",
-        "ILC update law",
-        "32 dB averaged feedback",
-        noiseAwareMetrics,
-        noisyBaselineMetrics,
-    )
-    ReportHistory(
-        "Noise-aware ILC",
-        noiseAwareResult,
-        trainingAnalysis,
-        outputDirectory,
-    )
-    powerEvaluators["Noise-aware ILC"] = (
-        lambda pointReference, _: RunFrequencyDomainIlc(
-            pointReference,
-            paModel,
-            trainingWaveform.sampleRateHz,
-            trainingWaveform.bandwidthHz,
-            ILCConfig(
-                numIterations=config.numIterations,
-                learningRate=0.10,
-                regularization=1e-2,
-                maxAmplitude=maxAmplitude,
-                feedbackSnrDb=32.0,
-                feedbackAverages=4,
-                randomSeed=config.seed + 8,
-            ),
-        ).outputSignal
-    )
-
-    # Augmented ILC is evaluated in the IQ-image scenario for which its
-    # conjugate branch is designed.
-    iqPaModel = IQImbalancePA(PaModel(parameters=paParameters))
-    iqBaselineOutput = iqPaModel.Process(trainingSignal)
-    iqBaselineMetrics = trainingAnalysis.Analyze(iqBaselineOutput)
-    AddRow(
-        rows,
-        "IQ-imbalance baseline",
-        "baseline",
-        "IQ image impairment",
-        iqBaselineMetrics,
-        iqBaselineMetrics,
-    )
-    augmentedResult = RunAugmentedIqIlc(
-        trainingSignal,
-        iqPaModel,
-        ILCConfig(
-            numIterations=config.numIterations,
-            learningRate=0.18,
-            maxAmplitude=maxAmplitude,
-            randomSeed=config.seed + 9,
-            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
-        ),
-    )
-    augmentedMetrics = trainingAnalysis.Analyze(
-        augmentedResult.outputSignal
-    )
-    AddRow(
-        rows,
-        "Augmented IQ ILC",
-        "ILC update law",
-        "IQ image impairment",
-        augmentedMetrics,
-        iqBaselineMetrics,
-    )
-    ReportHistory(
-        "Augmented IQ ILC",
-        augmentedResult,
-        trainingAnalysis,
-        outputDirectory,
-    )
-    powerEvaluators["IQ-imbalance baseline"] = (
-        lambda pointReference, _: iqPaModel.Process(pointReference)
-    )
-    powerEvaluators["Augmented IQ ILC"] = (
-        lambda pointReference, _: RunAugmentedIqIlc(
-            pointReference,
-            iqPaModel,
-            ILCConfig(
-                numIterations=config.numIterations,
-                learningRate=0.18,
-                maxAmplitude=maxAmplitude,
-                randomSeed=config.seed + 9,
-            ),
-        ).outputSignal
-    )
-
-    # Fit every deployable model to the same converged ILC labels, then test
-    # on a held-out Wi-Fi payload to measure generalization rather than recall.
-    validationBaselineOutput = paModel.Process(validationSignal)
-    validationBaselineMetrics = validationAnalysis.Analyze(
-        validationBaselineOutput
-    )
-    AddRow(
-        rows,
-        "Validation baseline",
-        "baseline",
-        "held-out Wi-Fi packet",
-        validationBaselineMetrics,
-        validationBaselineMetrics,
-    )
-    deploymentModels = (
-        (
-            "ILC label + MP",
-            FitGmpPredistorter(
-                trainingSignal,
-                frequencyResult.learnedInput,
-                nonlinearOrders=(1, 3, 5, 7),
-                memoryDepth=3,
-                crossMemoryDepth=0,
-            ),
-        ),
-        (
-            "ILC label + GMP",
-            FitGmpPredistorter(
-                trainingSignal,
-                frequencyResult.learnedInput,
-                nonlinearOrders=(1, 3, 5, 7),
-                memoryDepth=3,
-                crossMemoryDepth=2,
-            ),
-        ),
-        (
-            "ILC label + Volterra",
-            FitVolterraPredistorter(
-                trainingSignal,
-                frequencyResult.learnedInput,
-                memoryDepth=3,
-            ),
-        ),
-        (
-            "ILC label + LUT",
-            FitLutPredistorter(
-                trainingSignal,
-                frequencyResult.learnedInput,
-                binCount=64,
-            ),
-        ),
-        (
-            "ILC label + NN",
-            FitNeuralPredistorter(
-                trainingSignal,
-                frequencyResult.learnedInput,
-                memoryDepth=4,
-                hiddenUnitCount=32,
-                randomSeed=config.seed + 10,
-            ),
-        ),
-    )
-    for methodName, predistorter in deploymentModels:
-        methodMetrics = EvaluateDeployment(
-            predistorter,
-            validationSignal,
-            paModel,
-            validationAnalysis,
-            maxAmplitude,
-        )
-        AddRow(
-            rows,
-            methodName,
-            "ILC label deployment",
-            "held-out Wi-Fi packet",
-            methodMetrics,
-            validationBaselineMetrics,
-        )
-        powerEvaluators[methodName] = (
-            lambda pointReference,
-            _,
-            selectedPredistorter=predistorter: paModel.Process(
-                LimitAmplitude(
-                    selectedPredistorter.Process(pointReference),
-                    maxAmplitude,
-                )
-            )
-        )
-    metadata: Mapping[str, object] = {
-        "frameFormat": trainingWaveform.frameFormat,
-        "bandwidthMhz": config.bandwidthMhz,
-        "mcs": config.mcs,
-        "numDataSymbols": config.numDataSymbols,
-        "oversampling": config.oversampling,
-        "guardIntervalUs": config.guardIntervalUs,
-        "driveRms": config.driveRms,
-        "numIterations": config.numIterations,
-        "paModel": config.paModelName,
-        "trainingSeed": config.seed,
-        "validationSeed": config.seed + 97,
-        "powerStartRms": config.powerStartRms,
-        "powerStopRms": config.powerStopRms,
-        "powerPointCount": config.powerPointCount,
-        "generatePowerEvmCurve": config.generatePowerEvmCurve,
-    }
-    SaveBenchmarkResults(rows, outputDirectory, metadata)
-    powerCurvePaths = None
-    if config.generatePowerEvmCurve:
-        powerDriveValues = np.geomspace(
-            config.powerStartRms,
-            config.powerStopRms,
-            config.powerPointCount,
-        )
-        powerEvmCurve = trainingAnalysis.AnalyzePowerEvmCurve(
-            powerDriveValues, powerEvaluators
-        )
-        powerDataPaths = trainingAnalysis.SavePowerEvmCurveData(
-            outputDirectory,
-            fileStem="all_ilc_power_evm_curve",
-        )
-        powerFigurePath = Draw(
-            powerEvmFileStem="all_ilc_power_evm_curve"
-        ).SavePowerEvmCurve(powerEvmCurve, outputDirectory)
-        powerCurvePaths = (*powerDataPaths, powerFigurePath)
-    PrintBenchmarkResults(rows)
-    if powerCurvePaths is not None:
-        powerCsvPath, powerJsonPath, powerFigurePath = powerCurvePaths
-        print(f"\nPower-EVM CSV:  {powerCsvPath.resolve()}")
-        print(f"Power-EVM JSON: {powerJsonPath.resolve()}")
-        print(f"Power-EVM plot: {powerFigurePath.resolve()}")
-    return rows
-
-def SaveBenchmarkResults(
-    rows: List[BenchmarkRow],
-    outputDirectory: Path,
-    metadata: Mapping[str, object],
-) -> None:
-    """Save the complete all-method benchmark as flat CSV and structured JSON.
-
-    Processing details:
-        Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
-
-    Args:
-        rows: Benchmark rows accumulated or emitted by the reporting operation.
-        outputDirectory: Directory in which result artifacts are written.
-        metadata: Caller-supplied value consumed according to the function contract.
-
-    Returns:
-        result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
-    """
-
-    outputDirectory.mkdir(parents=True, exist_ok=True)
-    csvPath = outputDirectory / "all_ilc_metrics.csv"
-    jsonPath = outputDirectory / "all_ilc_metrics.json"
-    flatRows = [row.ToDict() for row in rows]
-    with csvPath.open("w", newline="", encoding="utf-8-sig") as csvFile:
-        csvWriter = csv.DictWriter(csvFile, fieldnames=list(flatRows[0].keys()))
-        csvWriter.writeheader()
-        csvWriter.writerows(flatRows)
-    with jsonPath.open("w", encoding="utf-8") as jsonFile:
-        json.dump(
-            {"metadata": dict(metadata), "results": flatRows},
-            jsonFile,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-def PrintBenchmarkResults(rows: List[BenchmarkRow]) -> None:
-    """Print a compact all-method SNR, EVM, and worst-ACLR table.
-
-    Processing details:
-        Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
-
-    Args:
-        rows: Benchmark rows accumulated or emitted by the reporting operation.
-
-    Returns:
-        result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
-    """
-
-    header = (
-        f"{'Method':<32} {'Scenario':<25} {'SNR':>8} "
-        f"{'EVM%':>9} {'ACLR-W':>9} {'dEVM':>8}"
-    )
-    print(header)
-    print("-" * len(header))
-    for row in rows:
-        print(
-            f"{row.methodName:<32} {row.scenario:<25} "
-            f"{row.metrics.snrDb:>8.2f} {row.metrics.evmPercent:>9.3f} "
-            f"{row.metrics.aclrWorstDb:>9.2f} "
-            f"{row.evmImprovementDb:>8.2f}"
-        )

@@ -6,7 +6,7 @@ from collections import ChainMap
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -1381,7 +1381,11 @@ class Analysis:
                 csvWriter.writerow(rowData)
         return jsonPath, csvPath
 
-    def SaveConvergence(self, ilcHistory, outputDirectory: Path) -> Path:
+    def SaveConvergence(
+        self,
+        ilcHistory: Sequence[Any],
+        outputDirectory: Path,
+    ) -> Path:
         """Save the per-iteration ILC convergence history as a CSV file.
 
         Processing details:
@@ -1443,7 +1447,9 @@ class Analysis:
         return convergencePath
 
     def PrintConvergence(
-        self, ilcHistory, historyName: str = "ILC convergence"
+        self,
+        ilcHistory: Sequence[Any],
+        historyName: str = "ILC convergence",
     ) -> None:
         """Print every ILC iteration with raw and EVM-oriented MSE values.
 

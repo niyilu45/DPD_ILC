@@ -31,109 +31,6 @@ class MCSInfo:
     bitsPerSubcarrier: int
 
 
-# EHT MCS 0 through 13 cover BPSK through 4096-QAM.
-ehtMcsTable: Mapping[int, MCSInfo] = {
-    0: MCSInfo(0, "BPSK", 2, 1.0 / 2.0, 1),
-    1: MCSInfo(1, "QPSK", 4, 1.0 / 2.0, 2),
-    2: MCSInfo(2, "QPSK", 4, 3.0 / 4.0, 2),
-    3: MCSInfo(3, "16-QAM", 16, 1.0 / 2.0, 4),
-    4: MCSInfo(4, "16-QAM", 16, 3.0 / 4.0, 4),
-    5: MCSInfo(5, "64-QAM", 64, 2.0 / 3.0, 6),
-    6: MCSInfo(6, "64-QAM", 64, 3.0 / 4.0, 6),
-    7: MCSInfo(7, "64-QAM", 64, 5.0 / 6.0, 6),
-    8: MCSInfo(8, "256-QAM", 256, 3.0 / 4.0, 8),
-    9: MCSInfo(9, "256-QAM", 256, 5.0 / 6.0, 8),
-    10: MCSInfo(10, "1024-QAM", 1024, 3.0 / 4.0, 10),
-    11: MCSInfo(11, "1024-QAM", 1024, 5.0 / 6.0, 10),
-    12: MCSInfo(12, "4096-QAM", 4096, 3.0 / 4.0, 12),
-    13: MCSInfo(13, "4096-QAM", 4096, 5.0 / 6.0, 12),
-}
-
-# HE uses the same modulation and rate mapping through MCS 11. MCS 12 and 13
-# are EHT-only because 4096-QAM was introduced by IEEE 802.11be.
-heMcsTable: Mapping[int, MCSInfo] = {
-    mcsIndex: mcsInfo
-    for mcsIndex, mcsInfo in ehtMcsTable.items()
-    if mcsIndex <= 11
-}
-
-# IEEE 802.11ac VHT defines MCS 0 through 9 for the single-stream modulation
-# mapping used by this project. The numerical mappings match HE/EHT through
-# 256-QAM, while later PHY generations add the higher MCS values.
-vhtMcsTable: Mapping[int, MCSInfo] = {
-    mcsIndex: mcsInfo
-    for mcsIndex, mcsInfo in ehtMcsTable.items()
-    if mcsIndex <= 9
-}
-
-
-# Inputs are normalized to one canonical PHY name so every downstream module
-# sees only VHT, HE, or EHT. Both common shortened standard names and formal
-# IEEE amendment names are accepted without case sensitivity.
-frameFormatAliases: Mapping[str, str] = MappingProxyType(
-    {
-        "VHT": "VHT",
-        "11AC": "VHT",
-        "802.11AC": "VHT",
-        "HE": "HE",
-        "11AX": "HE",
-        "802.11AX": "HE",
-        "EHT": "EHT",
-        "11BE": "EHT",
-        "802.11BE": "EHT",
-    }
-)
-
-
-# VHT uses 312.5 kHz data-subcarrier spacing. HE and EHT use 78.125 kHz,
-# therefore the newer formats require four times as many IFFT bins at a given
-# channel bandwidth before optional oversampling is applied.
-vhtBaseFftLength = {20: 64, 40: 128, 80: 256, 160: 512}
-heEhtBaseFftLength = {20: 256, 40: 512, 80: 1024, 160: 2048}
-vhtActiveToneCount = {20: 56, 40: 114, 80: 242, 160: 484}
-heEhtActiveToneCount = {20: 242, 40: 484, 80: 996, 160: 1992}
-vhtPilotToneCount = {20: 4, 40: 6, 80: 8, 160: 16}
-heEhtPilotToneCount = {20: 8, 40: 16, 80: 16, 160: 32}
-mcsTableByFormat: Mapping[str, Mapping[int, MCSInfo]] = MappingProxyType(
-    {
-        "VHT": vhtMcsTable,
-        "HE": heMcsTable,
-        "EHT": ehtMcsTable,
-    }
-)
-guardIntervalsByFormat: Mapping[str, Tuple[float, ...]] = MappingProxyType(
-    {
-        "VHT": (0.4, 0.8),
-        "HE": (0.8, 1.6, 3.2),
-        "EHT": (0.8, 1.6, 3.2),
-    }
-)
-
-# VHT, HE, and the finalized EHT PPDU configuration define up to eight
-# spatial streams. The project remains a single-user, full-band waveform
-# generator; MU user allocation is outside this class.
-maximumSpatialStreamsByFormat: Mapping[str, int] = MappingProxyType(
-    {"VHT": 8, "HE": 8, "EHT": 8}
-)
-
-# Per-transmit-chain cyclic shifts follow the standard WLAN pattern for all
-# eight supported chains. Values are represented in nanoseconds and applied
-# as frequency-dependent phase rotations before every IFFT.
-cyclicShiftNanoseconds = np.asarray(
-    (
-        0.0,
-        -400.0,
-        -200.0,
-        -600.0,
-        -350.0,
-        -650.0,
-        -100.0,
-        -750.0,
-    ),
-    dtype=float,
-)
-
-
 def NormalizeFrameFormat(frameFormat: str) -> str:
     """Convert a standard-generation or PHY-format name to VHT, HE, or EHT.
 
@@ -149,6 +46,19 @@ def NormalizeFrameFormat(frameFormat: str) -> str:
         result: Canonical string equal to VHT, HE, or EHT.
     """
 
+    frameFormatAliases: Mapping[str, str] = MappingProxyType(
+        {
+            "VHT": "VHT",
+            "11AC": "VHT",
+            "802.11AC": "VHT",
+            "HE": "HE",
+            "11AX": "HE",
+            "802.11AX": "HE",
+            "EHT": "EHT",
+            "11BE": "EHT",
+            "802.11BE": "EHT",
+        }
+    )
     if not isinstance(frameFormat, str):
         raise TypeError("frameFormat must be a string")
     normalizedInput = frameFormat.strip().upper()
@@ -216,6 +126,55 @@ class GenWifi:
             self.defaultParameters,
         )
         self.Validate()
+
+    def ResolveMcsTable(
+        self, frameFormat: str
+    ) -> Mapping[int, MCSInfo]:
+        """Build the immutable MCS table for one normalized PHY format.
+
+        Processing details:
+            Algorithm: Define the complete EHT modulation/rate mapping inside
+            this method, normalize the requested format, and return only the
+            index range standardized by VHT, HE, or EHT. No module-level
+            table or mutable global configuration is retained.
+
+        Args:
+            frameFormat: PHY name or equivalent 802.11 generation alias.
+
+        Returns:
+            result: Immutable mapping from MCS index to modulation metadata.
+        """
+
+        normalizedFormat = NormalizeFrameFormat(frameFormat)
+        ehtMcsTable: Mapping[int, MCSInfo] = MappingProxyType(
+            {
+                0: MCSInfo(0, "BPSK", 2, 1.0 / 2.0, 1),
+                1: MCSInfo(1, "QPSK", 4, 1.0 / 2.0, 2),
+                2: MCSInfo(2, "QPSK", 4, 3.0 / 4.0, 2),
+                3: MCSInfo(3, "16-QAM", 16, 1.0 / 2.0, 4),
+                4: MCSInfo(4, "16-QAM", 16, 3.0 / 4.0, 4),
+                5: MCSInfo(5, "64-QAM", 64, 2.0 / 3.0, 6),
+                6: MCSInfo(6, "64-QAM", 64, 3.0 / 4.0, 6),
+                7: MCSInfo(7, "64-QAM", 64, 5.0 / 6.0, 6),
+                8: MCSInfo(8, "256-QAM", 256, 3.0 / 4.0, 8),
+                9: MCSInfo(9, "256-QAM", 256, 5.0 / 6.0, 8),
+                10: MCSInfo(10, "1024-QAM", 1024, 3.0 / 4.0, 10),
+                11: MCSInfo(11, "1024-QAM", 1024, 5.0 / 6.0, 10),
+                12: MCSInfo(12, "4096-QAM", 4096, 3.0 / 4.0, 12),
+                13: MCSInfo(13, "4096-QAM", 4096, 5.0 / 6.0, 12),
+            }
+        )
+        maximumMcsByFormat: Mapping[str, int] = MappingProxyType(
+            {"VHT": 9, "HE": 11, "EHT": 13}
+        )
+        maximumMcs = maximumMcsByFormat[normalizedFormat]
+        return MappingProxyType(
+            {
+                mcsIndex: mcsInfo
+                for mcsIndex, mcsInfo in ehtMcsTable.items()
+                if mcsIndex <= maximumMcs
+            }
+        )
 
     @property
     def FrameFormat(self) -> str:
@@ -460,13 +419,23 @@ class GenWifi:
         normalizedFormat = NormalizeFrameFormat(
             cast(str, self.parameters["frameFormat"])
         )
+        supportedBandwidths = (20, 40, 80, 160)
+        guardIntervalsByFormat: Mapping[
+            str, Tuple[float, ...]
+        ] = MappingProxyType(
+            {
+                "VHT": (0.4, 0.8),
+                "HE": (0.8, 1.6, 3.2),
+                "EHT": (0.8, 1.6, 3.2),
+            }
+        )
         if not isinstance(self.bandwidthMhz, int) or isinstance(
             self.bandwidthMhz, bool
         ):
             raise TypeError("bandwidthMhz must be an integer")
-        if self.bandwidthMhz not in heEhtBaseFftLength:
+        if self.bandwidthMhz not in supportedBandwidths:
             raise ValueError("bandwidthMhz must be one of 20, 40, 80, 160")
-        selectedMcsTable = mcsTableByFormat[normalizedFormat]
+        selectedMcsTable = self.ResolveMcsTable(normalizedFormat)
         if not isinstance(self.mcs, int) or isinstance(self.mcs, bool):
             raise TypeError("mcs must be an integer")
         if self.mcs not in selectedMcsTable:
@@ -500,9 +469,7 @@ class GenWifi:
             raise ValueError("oversampling must be a positive integer")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise TypeError("seed must be an integer")
-        maximumSpatialStreams = maximumSpatialStreamsByFormat[
-            normalizedFormat
-        ]
+        maximumSpatialStreams = 8
         for parameterName, parameterValue in (
             ("numTransmitAntennas", self.numTransmitAntennas),
             ("numSpatialStreams", self.numSpatialStreams),
@@ -574,7 +541,7 @@ class GenWifi:
         """
 
         self.Validate()
-        return mcsTableByFormat[self.frameFormat][self.mcs]
+        return self.ResolveMcsTable(self.frameFormat)[self.mcs]
 
     def Generate(self) -> "WifiWaveform":
         """Generate one configured VHT, HE, or EHT packet and its metadata.
@@ -639,7 +606,13 @@ def ActiveTones(
     """
 
     normalizedFormat = NormalizeFrameFormat(frameFormat)
-    if bandwidthMhz not in heEhtBaseFftLength:
+    vhtActiveToneCount: Mapping[int, int] = MappingProxyType(
+        {20: 56, 40: 114, 80: 242, 160: 484}
+    )
+    heEhtActiveToneCount: Mapping[int, int] = MappingProxyType(
+        {20: 242, 40: 484, 80: 996, 160: 1992}
+    )
+    if bandwidthMhz not in heEhtActiveToneCount:
         raise ValueError("bandwidthMhz must be one of 20, 40, 80, 160")
 
     if normalizedFormat == "VHT":
@@ -1047,6 +1020,19 @@ def GetCyclicShifts(config: GenWifi) -> np.ndarray:
         result: Floating-point vector of shifts in seconds.
     """
 
+    cyclicShiftNanoseconds = np.asarray(
+        (
+            0.0,
+            -400.0,
+            -200.0,
+            -600.0,
+            -350.0,
+            -650.0,
+            -100.0,
+            -750.0,
+        ),
+        dtype=float,
+    )
     selectedShifts = cyclicShiftNanoseconds[
         : config.numTransmitAntennas
     ].copy()
@@ -1236,6 +1222,18 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
     randomGenerator = np.random.default_rng(config.seed)
     mcsInfo = config.GetMcsInfo()
     bandwidthHz = float(config.bandwidthMhz) * 1e6
+    vhtBaseFftLength: Mapping[int, int] = MappingProxyType(
+        {20: 64, 40: 128, 80: 256, 160: 512}
+    )
+    heEhtBaseFftLength: Mapping[int, int] = MappingProxyType(
+        {20: 256, 40: 512, 80: 1024, 160: 2048}
+    )
+    vhtPilotToneCount: Mapping[int, int] = MappingProxyType(
+        {20: 4, 40: 6, 80: 8, 160: 16}
+    )
+    heEhtPilotToneCount: Mapping[int, int] = MappingProxyType(
+        {20: 8, 40: 16, 80: 16, 160: 32}
+    )
     if normalizedFormat == "VHT":
         baseFftLength = vhtBaseFftLength[config.bandwidthMhz]
         expectedPilotCount = vhtPilotToneCount[config.bandwidthMhz]

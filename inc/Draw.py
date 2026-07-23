@@ -3,7 +3,7 @@
 from collections import ChainMap
 from pathlib import Path
 from types import MappingProxyType
-from typing import Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -216,7 +216,9 @@ class Draw:
                     f"power-EVM method '{methodName}' contains non-finite data"
                 )
 
-    def CreatePowerEvmFigure(self, powerEvmCurve: PowerEvmCurve):
+    def CreatePowerEvmFigure(
+        self, powerEvmCurve: PowerEvmCurve
+    ) -> Any:
         """Create one comparison figure containing every EVM method curve.
 
         Processing details:
@@ -367,7 +369,9 @@ class Draw:
             ):
                 raise ValueError("evmDb must be complete and finite when present")
 
-    def CreateConvergenceFigure(self, ilcHistory: Sequence[object]):
+    def CreateConvergenceFigure(
+        self, ilcHistory: Sequence[object]
+    ) -> Any:
         """Create a raw-NMSE, compensated-NMSE, and EVM convergence figure.
 
         Processing details:
