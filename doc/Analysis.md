@@ -536,6 +536,234 @@ flowchart TB
 
 此外，当 $|\hat{g}_k|$ 接近零时，除以 $|\hat{g}_k|^2$ 会显著放大反馈噪声和数值误差，此时 LC-MSE 不再具有稳定的工程含义。实际使用时应同时检查公共增益、Raw MSE 和 PA 输出功率；如果目标是评价绝对功率或增益压缩，就不能只使用 LC-MSE。如果目标是评价最终 Wi-Fi 调制质量，则应优先使用下一节定义的 EVM 对齐 MSE。
 
+#### 5.7.1 PA 的线性影响和非线性影响是否都被考虑
+
+需要把这个问题分成三个层次：
+
+1. PA 行为模型是否包含线性和非线性影响；
+2. ILC 更新是否同时面对线性和非线性影响；
+3. 结果统计是否已经把两种影响分别输出。
+
+本工程在前两个层次都考虑了线性和非线性影响，但当前结果统计没有把频率选择性线性误差与非线性误差单独列成两条功率曲线。
+
+对于任意工作点，可以先选定一个小信号线性算子 $\mathbf{H}_{\mathrm{lin}}$，然后把 PA 输出分解为：
+
+```math
+\boxed{
+\mathbf{y}_k
+=\mathbf{H}_{\mathrm{lin}}\mathbf{u}_k
++\mathbf{d}_{\mathrm{NL},k}
++\mathbf{n}_k
+}
+```
+
+其中：
+
+- $\mathbf{u}_k$ 是第 $k$ 轮送入 PA 的复基带波形；
+- $\mathbf{H}_{\mathrm{lin}}\mathbf{u}_k$ 是小信号线性增益、线性记忆、幅频响应、相频响应和群时延共同形成的输出；
+- $\mathbf{d}_{\mathrm{NL},k}$ 是相对于所选线性算子的非线性残差，包含 AM-AM、AM-PM、互调和非线性记忆；
+- $\mathbf{n}_k$ 是反馈噪声、量化噪声或其他测量误差。
+
+非线性残差的定义为：
+
+```math
+\boxed{
+\mathbf{d}_{\mathrm{NL},k}
+=\mathbf{y}_k
+-\mathbf{H}_{\mathrm{lin}}\mathbf{u}_k
+-\mathbf{n}_k
+}
+```
+
+这里的分解依赖于如何定义 $\mathbf{H}_{\mathrm{lin}}$。本工程频域 ILC 使用低功率探测波形估计线性频率响应，因为低功率工作点能够尽量减小增益压缩和谱再生对线性估计的污染：
+
+```math
+\hat{H}_{\mathrm{lin}}[m]
+\approx
+\frac{
+Y_{\mathrm{probe}}[m]U_{\mathrm{probe}}^*[m]
+}{
+|U_{\mathrm{probe}}[m]|^2+\lambda
+}.
+```
+
+然后构造正则化学习滤波器：
+
+```math
+L[m]
+=\mu
+\frac{
+\hat{H}_{\mathrm{lin}}^*[m]
+}{
+|\hat{H}_{\mathrm{lin}}[m]|^2+\lambda
+}.
+```
+
+因此 ILC 对线性部分不是只使用一个公共复增益，而是利用逐频点线性响应补偿 PA 的线性记忆。非线性部分则不被假定为固定线性传递函数；每一轮都重新测量完整 PA 输出：
+
+```math
+\mathbf{e}_k
+=\mathbf{x}-\mathcal{P}(\mathbf{u}_k),
+```
+
+所以当前工作点下的增益压缩、AM-PM、非线性记忆和削顶都会进入下一轮更新。
+
+Wiener PA 的结构可以概括为：
+
+```math
+\mathbf{u}
+\rightarrow
+\mathbf{H}_{\mathrm{lin}}\mathbf{u}
+\rightarrow
+f_{\mathrm{AM-AM,AM-PM}}
+\rightarrow
+\mathbf{y}.
+```
+
+其中 FIR 部分表示线性记忆，Rapp AM-AM 和幅度相关相位旋转表示无记忆非线性。GMP PA 则把一阶项和高阶项放在同一基函数展开中：
+
+```math
+y[n]
+=
+\sum_m a_{1,m}u[n-m]
++
+\sum_{p=3,5,\ldots}\sum_m
+a_{p,m}u[n-m]|u[n-m]|^{p-1}
++
+\mathcal{C}_{\mathrm{GMP}}[n].
+```
+
+第一项是线性记忆；高阶主支路和交叉项 $\mathcal{C}_{\mathrm{GMP}}[n]$ 表示非线性及非线性记忆。
+
+公共复增益 $\hat{g}_k$ 只是整个线性算子中的一个标量分量。LC-MSE 删除的是：
+
+```math
+\hat{g}_k\mathbf{x},
+```
+
+而不是完整的：
+
+```math
+\mathbf{H}_{\mathrm{lin}}\mathbf{u}_k.
+```
+
+所以即使 $\hat{g}_k$ 在迭代后期基本不变，频率选择性的线性影响仍然可能变化。原因是 PA 的线性算子虽然固定，但 ILC 输入每轮都在变化：
+
+```math
+\mathbf{u}_{k+1}\ne\mathbf{u}_k
+\quad\Longrightarrow\quad
+\mathbf{H}_{\mathrm{lin}}\mathbf{u}_{k+1}
+\ne
+\mathbf{H}_{\mathrm{lin}}\mathbf{u}_k.
+```
+
+若暂时忽略噪声，定义线性跟踪误差：
+
+```math
+\mathbf{e}_{\mathrm{lin},k}
+=\mathbf{x}
+-\mathbf{H}_{\mathrm{lin}}\mathbf{u}_k,
+```
+
+则总跟踪误差为：
+
+```math
+\mathbf{e}_k
+=\mathbf{e}_{\mathrm{lin},k}
+-\mathbf{d}_{\mathrm{NL},k}.
+```
+
+普通 MSE 不能简单理解为“线性误差功率加非线性误差功率”，因为两部分通常相关，还存在交叉项：
+
+```math
+\boxed{
+\mathrm{MSE}_{\mathrm{raw},k}
+=P_{\mathrm{lin},k}
++P_{\mathrm{NL},k}
+-\frac{2}{N}
+\Re\left\{
+\mathbf{e}_{\mathrm{lin},k}^{H}
+\mathbf{d}_{\mathrm{NL},k}
+\right\}
+}
+```
+
+其中：
+
+```math
+P_{\mathrm{lin},k}
+=\frac{1}{N}
+\|\mathbf{e}_{\mathrm{lin},k}\|_2^2,
+\qquad
+P_{\mathrm{NL},k}
+=\frac{1}{N}
+\|\mathbf{d}_{\mathrm{NL},k}\|_2^2.
+```
+
+这意味着 ILC 可能在降低数据子载波非线性误差的同时改变线性误差与非线性误差之间的相消或相长关系，使普通 MSE 和 EVM 出现不同趋势。
+
+EVM 同样不是纯非线性指标。它观察的是接收处理算子 $\mathcal{A}$ 投影后的总数据子载波误差：
+
+```math
+\mathrm{MSE}_{\mathrm{EVM},k}
+=
+\frac{
+\left\|
+\mathcal{A}(\mathbf{e}_{\mathrm{lin},k})
+-\mathcal{A}(\mathbf{d}_{\mathrm{NL},k})
+-\mathcal{A}(\mathbf{n}_k)
+\right\|_2^2
+}{
+\|\mathcal{A}(\mathbf{x})\|_2^2
+}.
+```
+
+因此数据子载波上的线性幅相起伏、非线性失真和残余噪声都会进入 EVM；接收机删除的只是公共复增益、同步误差和未被选中的时频分量。
+
+```mermaid
+flowchart LR
+    input["第 k 轮 PA 输入 u_k"] --> linear["小信号线性算子 H_lin"]
+    input --> fullPa["完整非线性 PA"]
+    linear --> linearOutput["线性预测输出 y_lin,k"]
+    fullPa --> measured["实际输出 y_k"]
+    linearOutput --> subtract["y_k - y_lin,k"]
+    measured --> subtract
+    subtract --> nonlinear["非线性残差 d_NL,k"]
+    target["目标 x"] --> linearError["线性跟踪误差 e_lin,k"]
+    linearOutput --> linearError
+    linearError --> total["总误差 e_k"]
+    nonlinear --> total
+    total --> raw["Raw / LC-MSE"]
+    total --> receiver["Wi-Fi 接收投影 A"]
+    receiver --> evm["EVM-MSE"]
+```
+
+**图 5-3 说明**：小信号线性算子提供一个明确的分解基准，实际 PA 输出与线性预测输出之差定义为非线性残差。Raw MSE、LC-MSE 和 EVM-MSE 当前都消费两部分合成后的总误差，只是补偿与投影空间不同；它们没有把线性功率、非线性功率和交叉项分别输出。
+
+如果后续需要显式观察两种影响，应增加以下诊断量：
+
+```math
+\mathrm{MSE}_{\mathrm{linear},k}
+=
+\frac{1}{N}
+\left\|
+\mathbf{x}
+-\mathbf{H}_{\mathrm{lin}}\mathbf{u}_k
+\right\|_2^2,
+```
+
+```math
+P_{\mathrm{NL},k}
+=
+\frac{1}{N}
+\left\|
+\mathbf{y}_k
+-\mathbf{H}_{\mathrm{lin}}\mathbf{u}_k
+\right\|_2^2,
+```
+
+以及线性—非线性交叉项。还可以把两个分量分别送入相同的 Wi-Fi 接收投影 $\mathcal{A}$，得到数据子载波上的线性 EVM 贡献、非线性 EVM 贡献和交叉贡献。需要注意，这种分解不是唯一的，必须同时记录所采用的小信号探测幅度、线性响应估计方法和正则化参数。
+
 ### 5.8 第二级优化：严格的 EVM 对齐 MSE
 
 定义一个接收处理算子：
