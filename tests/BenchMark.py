@@ -328,7 +328,9 @@ def RunIlcCurvePoint(
     paModel: Any,
     waveform: WifiWaveform,
     methodName: str,
-    methodFunction: Callable[[np.ndarray, Any, ILCConfig], ILCResult],
+    methodFunction: Optional[
+        Callable[[np.ndarray, Any, ILCConfig], ILCResult]
+    ],
     methodConfig: ILCConfig,
 ) -> np.ndarray:
     """Run one selected ILC method at one power-EVM sweep point.
@@ -345,7 +347,9 @@ def RunIlcCurvePoint(
         paModel: PA object exposing Process and SmallSignalGain operations.
         waveform: Wi-Fi metadata defining field locations, FFT sizes, and subcarriers.
         methodName: Human-readable algorithm or deployment-model label.
-        methodFunction: Selected ILC update-law callable.
+        methodFunction: Selected ILC update-law callable. ``None`` selects
+            the dedicated frequency-domain call path, which also needs the
+            waveform sample rate and occupied bandwidth.
         methodConfig: Validated ILC configuration for the selected update law.
 
     Returns:
@@ -366,6 +370,8 @@ def RunIlcCurvePoint(
             waveform.bandwidthHz,
             pointConfig,
         ).outputSignal
+    if methodFunction is None:
+        raise ValueError("methodFunction is required for non-frequency ILC")
     return methodFunction(
         referenceSignal, paModel, pointConfig
     ).outputSignal
@@ -378,10 +384,12 @@ def RunAllIlcBenchmark(
     Processing details:
         Algorithm: Construct a nominal repeated-packet scenario, a
         peak-constrained scenario, a noisy-feedback scenario, an IQ-image
-        scenario, and an independent-packet deployment scenario. Run all
-        applicable ILC methods under controlled settings, calculate SNR, EVM,
-        and ACLR, save convergence histories, and optionally generate the
-        common power-EVM comparison.
+        scenario, and an independent-packet deployment scenario. Each
+        specialized plant includes a matching baseline and at least one
+        structurally simpler comparison method. Run all applicable ILC
+        methods under controlled settings, calculate SNR, EVM, and ACLR,
+        save convergence histories, and optionally generate the common
+        power-EVM comparison.
 
     Args:
         config: Optional caller overrides. ``None`` creates defaults inside
@@ -541,6 +549,29 @@ def RunAllIlcBenchmark(
     if frequencyResult is None:
         raise RuntimeError("frequency-domain ILC result was not generated")
 
+    # Repeat the physically identical baseline and unconstrained result under
+    # the peak scenario label so scenario-filtered reports contain the full
+    # baseline-versus-performance-versus-feasibility comparison.
+    frequencyMetrics = trainingAnalysis.Analyze(
+        frequencyResult.outputSignal
+    )
+    AddRow(
+        rows,
+        "Peak-constrained baseline",
+        "baseline",
+        "peak-constrained waveform",
+        baselineMetrics,
+        baselineMetrics,
+    )
+    AddRow(
+        rows,
+        "Unconstrained frequency-domain ILC",
+        "ILC update law",
+        "peak-constrained waveform",
+        frequencyMetrics,
+        baselineMetrics,
+    )
+
     # Constrained ILC uses a peak only 5 percent above the original waveform.
     constrainedPeak = 1.05 * np.max(np.abs(trainingSignal))
     constrainedResult = RunFrequencyDomainIlc(
@@ -574,30 +605,65 @@ def RunAllIlcBenchmark(
         outputDirectory,
     )
     powerEvaluators["Constrained CFR-ILC"] = (
-        lambda pointReference, _: RunFrequencyDomainIlc(
+        lambda pointReference, pointDrive: RunIlcCurvePoint(
             pointReference,
+            pointDrive,
             paModel,
-            trainingWaveform.sampleRateHz,
-            trainingWaveform.bandwidthHz,
+            trainingWaveform,
+            "Frequency-domain ILC",
+            None,
             ILCConfig(
                 numIterations=config.numIterations,
                 learningRate=0.12,
                 maxAmplitude=1.05 * np.max(np.abs(pointReference)),
                 randomSeed=config.seed + 7,
             ),
-        ).outputSignal
+        )
     )
 
-    # Noise-aware learning uses a higher regularization and four averaged
-    # feedback captures at 32 dB feedback SNR.
+    # The noise scenario compares an ordinary single-capture frequency-domain
+    # ILC against stronger regularization and four-capture feedback averaging.
     noisyBaselineMetrics = baselineMetrics
     AddRow(
         rows,
         "Noisy-feedback baseline",
         "baseline",
-        "32 dB averaged feedback",
+        "32 dB feedback robustness",
         noisyBaselineMetrics,
         noisyBaselineMetrics,
+    )
+    naiveNoisyResult = RunFrequencyDomainIlc(
+        trainingSignal,
+        paModel,
+        trainingWaveform.sampleRateHz,
+        trainingWaveform.bandwidthHz,
+        ILCConfig(
+            numIterations=config.numIterations,
+            learningRate=0.15,
+            regularization=1e-3,
+            maxAmplitude=maxAmplitude,
+            feedbackSnrDb=32.0,
+            feedbackAverages=1,
+            randomSeed=config.seed + 18,
+            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
+        ),
+    )
+    naiveNoisyMetrics = trainingAnalysis.Analyze(
+        naiveNoisyResult.outputSignal
+    )
+    AddRow(
+        rows,
+        "Naive noisy-feedback ILC",
+        "ILC update law",
+        "32 dB feedback robustness",
+        naiveNoisyMetrics,
+        noisyBaselineMetrics,
+    )
+    ReportHistory(
+        "Naive noisy-feedback ILC",
+        naiveNoisyResult,
+        trainingAnalysis,
+        outputDirectory,
     )
     noiseAwareResult = RunFrequencyDomainIlc(
         trainingSignal,
@@ -622,7 +688,7 @@ def RunAllIlcBenchmark(
         rows,
         "Noise-aware ILC",
         "ILC update law",
-        "32 dB averaged feedback",
+        "32 dB feedback robustness",
         noiseAwareMetrics,
         noisyBaselineMetrics,
     )
@@ -632,12 +698,33 @@ def RunAllIlcBenchmark(
         trainingAnalysis,
         outputDirectory,
     )
-    powerEvaluators["Noise-aware ILC"] = (
-        lambda pointReference, _: RunFrequencyDomainIlc(
+    powerEvaluators["Naive noisy-feedback ILC"] = (
+        lambda pointReference, pointDrive: RunIlcCurvePoint(
             pointReference,
+            pointDrive,
             paModel,
-            trainingWaveform.sampleRateHz,
-            trainingWaveform.bandwidthHz,
+            trainingWaveform,
+            "Frequency-domain ILC",
+            None,
+            ILCConfig(
+                numIterations=config.numIterations,
+                learningRate=0.15,
+                regularization=1e-3,
+                maxAmplitude=maxAmplitude,
+                feedbackSnrDb=32.0,
+                feedbackAverages=1,
+                randomSeed=config.seed + 18,
+            ),
+        )
+    )
+    powerEvaluators["Noise-aware ILC"] = (
+        lambda pointReference, pointDrive: RunIlcCurvePoint(
+            pointReference,
+            pointDrive,
+            paModel,
+            trainingWaveform,
+            "Frequency-domain ILC",
+            None,
             ILCConfig(
                 numIterations=config.numIterations,
                 learningRate=0.10,
@@ -647,11 +734,11 @@ def RunAllIlcBenchmark(
                 feedbackAverages=4,
                 randomSeed=config.seed + 8,
             ),
-        ).outputSignal
+        )
     )
 
-    # Augmented ILC is evaluated in the IQ-image scenario for which its
-    # conjugate branch is designed.
+    # The IQ scenario compares an ordinary frequency-domain update against the
+    # augmented direct-plus-conjugate inverse on exactly the same IQ plant.
     iqPaModel = IQImbalancePA(PaModel(parameters=paParameters))
     iqBaselineOutput = iqPaModel.Process(trainingSignal)
     iqBaselineMetrics = trainingAnalysis.Analyze(iqBaselineOutput)
@@ -662,6 +749,36 @@ def RunAllIlcBenchmark(
         "IQ image impairment",
         iqBaselineMetrics,
         iqBaselineMetrics,
+    )
+    ordinaryIqResult = RunFrequencyDomainIlc(
+        trainingSignal,
+        iqPaModel,
+        trainingWaveform.sampleRateHz,
+        trainingWaveform.bandwidthHz,
+        ILCConfig(
+            numIterations=config.numIterations,
+            learningRate=0.15,
+            maxAmplitude=maxAmplitude,
+            randomSeed=config.seed + 19,
+            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
+        ),
+    )
+    ordinaryIqMetrics = trainingAnalysis.Analyze(
+        ordinaryIqResult.outputSignal
+    )
+    AddRow(
+        rows,
+        "Frequency-domain ILC on IQ plant",
+        "ILC update law",
+        "IQ image impairment",
+        ordinaryIqMetrics,
+        iqBaselineMetrics,
+    )
+    ReportHistory(
+        "Frequency-domain ILC on IQ plant",
+        ordinaryIqResult,
+        trainingAnalysis,
+        outputDirectory,
     )
     augmentedResult = RunAugmentedIqIlc(
         trainingSignal,
@@ -694,17 +811,37 @@ def RunAllIlcBenchmark(
     powerEvaluators["IQ-imbalance baseline"] = (
         lambda pointReference, _: iqPaModel.Process(pointReference)
     )
-    powerEvaluators["Augmented IQ ILC"] = (
-        lambda pointReference, _: RunAugmentedIqIlc(
+    powerEvaluators["Frequency-domain ILC on IQ plant"] = (
+        lambda pointReference, pointDrive: RunIlcCurvePoint(
             pointReference,
+            pointDrive,
             iqPaModel,
+            trainingWaveform,
+            "Frequency-domain ILC",
+            None,
+            ILCConfig(
+                numIterations=config.numIterations,
+                learningRate=0.15,
+                maxAmplitude=maxAmplitude,
+                randomSeed=config.seed + 19,
+            ),
+        )
+    )
+    powerEvaluators["Augmented IQ ILC"] = (
+        lambda pointReference, pointDrive: RunIlcCurvePoint(
+            pointReference,
+            pointDrive,
+            iqPaModel,
+            trainingWaveform,
+            "Augmented IQ ILC",
+            RunAugmentedIqIlc,
             ILCConfig(
                 numIterations=config.numIterations,
                 learningRate=0.18,
                 maxAmplitude=maxAmplitude,
                 randomSeed=config.seed + 9,
             ),
-        ).outputSignal
+        )
     )
 
     # Fit every deployable model to the same converged ILC labels, then test

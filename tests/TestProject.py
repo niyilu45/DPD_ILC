@@ -291,13 +291,26 @@ def CheckBenchmarkSeparation() -> None:
     requiredScenarioLabels = (
         "nominal repeated waveform",
         "peak-constrained waveform",
-        "32 dB averaged feedback",
+        "32 dB feedback robustness",
         "IQ image impairment",
         "held-out Wi-Fi packet",
     )
     for scenarioLabel in requiredScenarioLabels:
         assert scenarioLabel in benchmarkSource, (
             f"missing benchmark scenario: {scenarioLabel}"
+        )
+
+    requiredComparisonMethods = (
+        "Peak-constrained baseline",
+        "Unconstrained frequency-domain ILC",
+        "Naive noisy-feedback ILC",
+        "Noise-aware ILC",
+        "Frequency-domain ILC on IQ plant",
+        "Augmented IQ ILC",
+    )
+    for methodName in requiredComparisonMethods:
+        assert methodName in benchmarkSource, (
+            f"missing same-scenario comparison method: {methodName}"
         )
 
     requiredDocumentSections = (
@@ -307,6 +320,16 @@ def CheckBenchmarkSeparation() -> None:
         "D类：IQ失衡增广场景",
         "E类：ILC标签部署泛化场景",
         "F类：功率-EVM扫描场景",
+        "BenchMark.py函数级结构与完整执行时序",
+        "结果文件字段与审计方法",
+        "公平性、可复现性和统计限制",
+        "分层验收清单",
+        "五种baseline的对比",
+        "同场景方法优缺点对比",
+        "C类同场景对比结论",
+        "D类同场景选择结论",
+        "同场景部署模型优缺点对比",
+        "功率维度的优缺点对比",
     )
     for sectionTitle in requiredDocumentSections:
         assert sectionTitle in benchmarkDocument, (
