@@ -90,7 +90,7 @@ J(g)
 为了避免把文字和公式挤在同一行，几何关系完整写为：
 
 ```math
-\operatorname{proj}_{\operatorname{span}(\mathbf{x})}(\mathbf{y})
+\mathrm{proj}_{\mathrm{span}(\mathbf{x})}(\mathbf{y})
 =\hat{g}\,\mathbf{x}
 =\frac{\mathbf{x}^{H}\mathbf{y}}
        {\mathbf{x}^{H}\mathbf{x}}\,\mathbf{x}.
@@ -175,7 +175,7 @@ z[n]=x[n]+d_{\mathrm{NL}}[n]+d_{\mathrm{mem}}[n]+w[n],
 所以误差功率包含：
 
 ```math
-P_e\approx P_{\mathrm{NL}}+P_{\mathrm{mem}}+P_n+\text{交叉项}.
+P_e\approx P_{\mathrm{NL}}+P_{\mathrm{mem}}+P_n+P_{\mathrm{cross}}.
 ```
 
 因此它也可以理解为信号与总失真加噪声之比（接近 SINAD 思想）。指标越大越好。
@@ -338,7 +338,7 @@ EVM 会综合反映：
 
 ```math
 \boxed{
-\operatorname{MSE}_{\mathrm{raw},k}
+\mathrm{MSE}_{\mathrm{raw},k}
 =\frac{1}{N}\left\|\mathbf{x}-\mathbf{y}_k\right\|_2^2
 }
 ```
@@ -346,7 +346,7 @@ EVM 会综合反映：
 对应的归一化值为：
 
 ```math
-\operatorname{NMSE}_{\mathrm{raw},k}
+\mathrm{NMSE}_{\mathrm{raw},k}
 =\frac{\left\|\mathbf{x}-\mathbf{y}_k\right\|_2^2}
        {\left\|\mathbf{x}\right\|_2^2}.
 ```
@@ -414,7 +414,7 @@ flowchart TB
 
 ```math
 \boxed{
-\operatorname{NMSE}_{\mathrm{raw},k}
+\mathrm{NMSE}_{\mathrm{raw},k}
 =\left|\hat{g}_k-1\right|^2
 +\frac{\left\|\mathbf{e}_{\perp,k}\right\|_2^2}
        {\left\|\mathbf{x}\right\|_2^2}
@@ -432,7 +432,7 @@ flowchart TB
 此时 EVM 在复增益补偿后理论上为零，但原始归一化 MSE 为：
 
 ```math
-\operatorname{NMSE}_{\mathrm{raw}}
+\mathrm{NMSE}_{\mathrm{raw}}
 =|0.7-1|^2
 =0.09
 \approx-10.46\ \mathrm{dB}.
@@ -452,7 +452,7 @@ flowchart TB
 
 ```math
 \boxed{
-\operatorname{MSE}_{\mathrm{LC},k}
+\mathrm{MSE}_{\mathrm{LC},k}
 =\frac{1}{N}
  \left\|\frac{\mathbf{y}_k}{\hat{g}_k}-\mathbf{x}\right\|_2^2
 =\frac{\left\|\mathbf{e}_{\perp,k}\right\|_2^2}
@@ -464,8 +464,8 @@ flowchart TB
 
 ```math
 \boxed{
-\operatorname{NMSE}_{\mathrm{LC},k}
-=\frac{\operatorname{MSE}_{\mathrm{LC},k}}
+\mathrm{NMSE}_{\mathrm{LC},k}
+=\frac{\mathrm{MSE}_{\mathrm{LC},k}}
        {\frac{1}{N}\left\|\mathbf{x}\right\|_2^2}
 }
 ```
@@ -498,7 +498,7 @@ flowchart TB
 先定义星座域的绝对均方误差：
 
 ```math
-\operatorname{MSE}_{\mathrm{symbol},k}
+\mathrm{MSE}_{\mathrm{symbol},k}
 =\frac{1}{K}\left\|\mathbf{R}_k-\mathbf{S}\right\|_2^2.
 ```
 
@@ -506,7 +506,7 @@ flowchart TB
 
 ```math
 \boxed{
-\operatorname{MSE}_{\mathrm{EVM},k}
+\mathrm{MSE}_{\mathrm{EVM},k}
 =\frac{\left\|\mathbf{R}_k-\mathbf{S}\right\|_2^2}
        {\left\|\mathbf{S}\right\|_2^2}
 }
@@ -516,8 +516,8 @@ flowchart TB
 
 ```math
 \boxed{
-\operatorname{MSE}_{\mathrm{EVM},k}
-=\operatorname{EVM}_{\mathrm{rms},k}^{2}
+\mathrm{MSE}_{\mathrm{EVM},k}
+=\mathrm{EVM}_{\mathrm{rms},k}^{2}
 }
 ```
 
@@ -525,16 +525,16 @@ flowchart TB
 
 ```math
 \boxed{
-\operatorname{EVM}_{\mathrm{dB},k}
-=10\log_{10}\operatorname{MSE}_{\mathrm{EVM},k}
+\mathrm{EVM}_{\mathrm{dB},k}
+=10\log_{10}\mathrm{MSE}_{\mathrm{EVM},k}
 }
 ```
 
 注意最后一个公式使用 $10\log_{10}$，因为这里输入的是已经平方后的功率比；它与对 RMS 幅度比使用 $20\log_{10}$ 完全等价：
 
 ```math
-10\log_{10}(\operatorname{EVM}_{\mathrm{rms}}^2)
-=20\log_{10}(\operatorname{EVM}_{\mathrm{rms}}).
+10\log_{10}(\mathrm{EVM}_{\mathrm{rms}}^2)
+=20\log_{10}(\mathrm{EVM}_{\mathrm{rms}}).
 ```
 
 代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子，`ILCIteration.evmAlignedMse` 保存每轮的无量纲平方误差，`ILCIteration.evmDb` 保存它的 dB 值。标准 SISO 主流程和全方法 benchmark 会把这个计算器传入 ILC，因此最佳轮次也按照与最终 EVM 相同的目标选择。
@@ -830,7 +830,7 @@ MIMO 参考和测量数组采用
 
 ```math
 \hat{\mathbf y}_m
-=\operatorname{SigProcess}(\mathbf x_m,\mathbf y_m).
+=\mathrm{SigProcess}(\mathbf x_m,\mathbf y_m).
 ```
 
 这会产生 $N_{TX}$ 个 `SignalProcessingResult`。`GetLastSignalProcessingResult()` 为兼容旧接口返回第一路；`GetLastSignalProcessingResults()` 返回全部链。

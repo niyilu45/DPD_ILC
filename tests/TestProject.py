@@ -185,6 +185,75 @@ def CheckFunctionPrincipleCoverage() -> None:
     assert checkedDefinitionCount >= 197
 
 
+def CheckDocumentationMathCompatibility() -> None:
+    """Verify that every principle document uses portable math syntax.
+
+    Processing details:
+        Algorithm: Scan every Markdown document for unsupported macros,
+        invisible control characters, legacy display delimiters, incomplete
+        math fences, and unbalanced braces inside fenced equations.
+
+    Returns:
+        result: None. Assertion failures identify the affected document and
+        equation before incompatible formulas can be published.
+    """
+
+    documentPaths = sorted((projectRoot / "doc").glob("*.md"))
+    forbiddenMacros = (r"\operatorname", r"\text", r"\dfrac")
+    fenceMarker = chr(96) * 3
+    mathFenceMarker = fenceMarker + "math"
+    mathBlockPattern = (
+        re.escape(mathFenceMarker)
+        + r"[ \t]*\r?\n(.*?)"
+        + re.escape(fenceMarker)
+    )
+    assert documentPaths
+    for documentPath in documentPaths:
+        markdownText = documentPath.read_text(encoding="utf-8")
+        controlCharacters = [
+            character
+            for character in markdownText
+            if ord(character) < 32 and character not in "\n\r\t"
+        ]
+        assert not controlCharacters, (
+            f"control character in documentation: {documentPath}"
+        )
+        assert "$$" not in markdownText, (
+            f"legacy display-math delimiter in documentation: {documentPath}"
+        )
+        for forbiddenMacro in forbiddenMacros:
+            assert forbiddenMacro not in markdownText, (
+                f"unsupported math macro {forbiddenMacro}: {documentPath}"
+            )
+
+        mathBlocks = re.findall(
+            mathBlockPattern,
+            markdownText,
+            flags=re.DOTALL,
+        )
+        assert len(mathBlocks) == markdownText.count(mathFenceMarker), (
+            f"incomplete math fence in documentation: {documentPath}"
+        )
+        for blockIndex, mathBlock in enumerate(mathBlocks, start=1):
+            braceDepth = 0
+            for characterIndex, character in enumerate(mathBlock):
+                isEscaped = (
+                    characterIndex > 0
+                    and mathBlock[characterIndex - 1] == "\\"
+                )
+                if character == "{" and not isEscaped:
+                    braceDepth += 1
+                elif character == "}" and not isEscaped:
+                    braceDepth -= 1
+                assert braceDepth >= 0, (
+                    f"unexpected closing brace in {documentPath}, "
+                    f"math block {blockIndex}"
+                )
+            assert braceDepth == 0, (
+                f"unbalanced braces in {documentPath}, math block {blockIndex}"
+            )
+
+
 def CheckInternalDefaultConfiguration() -> None:
     """Verify internal defaults, live external edits, and direct overrides.
 
@@ -924,6 +993,7 @@ def RunTests() -> None:
     CheckFrameFormatAliases()
     CheckFunctionStyle()
     CheckFunctionPrincipleCoverage()
+    CheckDocumentationMathCompatibility()
     CheckInternalDefaultConfiguration()
     CheckWifiFormats()
     CheckWifiBandwidths()

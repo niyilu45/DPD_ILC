@@ -113,7 +113,7 @@ j2\pi\frac{\Delta f}{F_s}n_b
 $n_b$ 是第 $b$ 个窗口的中心样点。于是窗口增益相位满足近似直线：
 
 ```math
-\phi_b=\operatorname{unwrap}(\angle g_b)
+\phi_b=\mathrm{unwrap}(\angle g_b)
 \approx\phi_0+\omega n_b,
 ```
 
@@ -203,15 +203,15 @@ d(n)=d_0+\epsilon n.
 m(n)
 =\hat d_{\mathrm{int}}
 +\hat d_{\mathrm{frac}}
-+n\left(1+rac{\widehat{\epsilon}_{\mathrm{ppm}}}{10^6}\right).
++n\left(1+\frac{\widehat{\epsilon}_{\mathrm{ppm}}}{10^6}\right).
 ```
 
 由于 $m(n)$ 通常不是整数，需要插值。代码使用有限长度 Lanczos-sinc 核：
 
 ```math
 h(t)
-=\operatorname{sinc}(t)
-\operatorname{sinc}\!\left(\frac{t}{L}\right),
+=\mathrm{sinc}(t)
+\mathrm{sinc}\!\left(\frac{t}{L}\right),
 \qquad |t|<L.
 ```
 

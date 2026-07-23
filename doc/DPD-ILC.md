@@ -452,7 +452,7 @@ u[n]=\sum_{p=0}^{P}\sum_{q=0}^{Q}
 \sum_{\boldsymbol\tau}\sum_{\boldsymbol\kappa}
 h_{p,q}[\boldsymbol\tau,\boldsymbol\kappa]
 \prod_{i=1}^{p}s[n-\tau_i]
-\prod_{j=1}^{q}s^*[n-\kappa_j],qquad p+q\ge 1
+\prod_{j=1}^{q}s^*[n-\kappa_j],\qquad p+q\ge 1
 ```
 
 其中 $\boldsymbol\tau$ 和 $\boldsymbol\kappa$ 分别是非共轭项与共轭项的记忆索引。该模型表达能力强，但复杂度极高；实际带通信号的等效复基带模型还会根据频带选择规则删去大量不会落回工作带内的项，因此工程中常使用 DDR、简化 Volterra 或 GMP。
@@ -464,7 +464,7 @@ ILC 标签结合 MP/GMP/Volterra 是 WiFi DPD 中很实用的路线：ILC 提供
 Memoryless LUT 可写为
 
 ```math
-u[n]=c_{b(n)}s[n],\qquad b(n)=\operatorname{bin}(\lvert s[n]\rvert)
+u[n]=c_{b(n)}s[n],\qquad b(n)=\mathrm{bin}(\lvert s[n]\rvert)
 ```
 
 对每个 bin $b$ 求
@@ -678,7 +678,7 @@ J(\mathbf{u})=\left\lVert\mathbf{r}-\mathcal{P}(\mathbf{u})\right\rVert_2^2
 若噪声独立同分布，则
 
 ```math
-\operatorname{Var}(\bar{\boldsymbol\nu})=\frac{1}{R}\operatorname{Var}(\boldsymbol\nu)
+\mathrm{Var}(\bar{\boldsymbol\nu})=\frac{1}{R}\mathrm{Var}(\boldsymbol\nu)
 ```
 
 可提升反馈 SNR。
@@ -759,7 +759,7 @@ N_{\mathrm{feature}}
 \widetilde{\boldsymbol\Phi}
 =\boldsymbol\Phi\mathbf D^{-1},
 \qquad
-\mathbf D=\operatorname{diag}(d_1,\ldots,d_P).
+\mathbf D=\mathrm{diag}(d_1,\ldots,d_P).
 ```
 
 然后求正则化解：
@@ -916,7 +916,7 @@ H_{\mathrm{local}}[k]
 \Pi_{A}(u)
 =\begin{cases}
 u,&|u|\le A,\\
-A\dfrac{u}{|u|},&|u|>A.
+A\frac{u}{|u|},&|u|>A.
 \end{cases}
 }
 ```
@@ -928,13 +928,13 @@ A\dfrac{u}{|u|},&|u|>A.
 `MeasurePaOutput` 和 `MeasureOutput` 对 $R$ 次独立反馈求平均。若每次噪声方差为 $\sigma^2$，平均后为：
 
 ```math
-\operatorname{Var}(\bar w)=\frac{\sigma^2}{R}.
+\mathrm{Var}(\bar w)=\frac{\sigma^2}{R}.
 ```
 
 对应理想 SNR 提升：
 
 ```math
-\Delta\operatorname{SNR}=10\log_{10}R.
+\Delta\mathrm{SNR}=10\log_{10}R.
 ```
 
 平均不会消除每次都相同的系统性误差、PA 失真或同步偏置。

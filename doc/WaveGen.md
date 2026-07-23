@@ -138,10 +138,10 @@ HE/EHT 的基础 FFT 和音调规划为：
 
 ```math
 \frac{80\ \mathrm{MHz}}{256}=312.5\ \mathrm{kHz}
-\quad\text{(VHT)},
+\quad\mathrm{(VHT)},
 \qquad
 \frac{80\ \mathrm{MHz}}{1024}=78.125\ \mathrm{kHz}
-\quad\text{(HE/EHT)}.
+\quad\mathrm{(HE/EHT)}.
 ```
 
 当过采样倍数为 $L$ 时：
@@ -339,7 +339,7 @@ Y[k]=H[k]X[k].
 本工程的数据符号 CP 点数为
 
 ```math
-N_{\mathrm{CP}}=\operatorname{round}(T_{\mathrm{GI}}f_s),
+N_{\mathrm{CP}}=\mathrm{round}(T_{\mathrm{GI}}f_s),
 ```
 
 支持的 GI 和总数据符号时长取决于 PHY 代际：
@@ -510,7 +510,7 @@ D_m[k]=\exp\left(-j2\pi k\Delta f\tau_m\right).
 
 ```math
 \mathbf D_{\mathrm{CSD}}[k]
-=\operatorname{diag}\{D_1[k],\ldots,D_{N_{TX}}[k]\},
+=\mathrm{diag}\{D_1[k],\ldots,D_{N_{TX}}[k]\},
 ```
 
 最终送入各链 IFFT 的频域样本为

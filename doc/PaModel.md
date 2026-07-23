@@ -282,11 +282,11 @@ GMP 在主支路之外增加滞后与超前交叉项：
 ```math
 \begin{aligned}
 y[n]={}&
-\underbrace{\sum_{p,m}a_{p,m}x[n-m]|x[n-m]|^{p-1}}_{\text{主支路}}\\
+\underbrace{\sum_{p,m}a_{p,m}x[n-m]|x[n-m]|^{p-1}}_{\mathrm{main}}\\
 &+\underbrace{\sum_{p,m,l}b_{p,m,l}
-x[n-m]|x[n-m-l]|^{p-1}}_{\text{滞后包络交叉项}}\\
+x[n-m]|x[n-m-l]|^{p-1}}_{\mathrm{lag}}\\
 &+\underbrace{\sum_{p,m,l}c_{p,m,l}
-x[n-m-l]|x[n-m]|^{p-1}}_{\text{超前包络交叉项}}.
+x[n-m-l]|x[n-m]|^{p-1}}_{\mathrm{lead}}.
 \end{aligned}
 ```
 
