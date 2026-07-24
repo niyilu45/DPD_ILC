@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .PaModel import PowerCalibration
 from .SigProcess import SigProcess, SignalProcessingResult
 from .waveGen import BuildCsdPhaseMatrix, WifiWaveform
 
@@ -73,10 +74,10 @@ class MimoSignalMetrics:
 
 @dataclass
 class PowerEvmCurve:
-    """Store a multi-method EVM sweep over PA input RMS drive levels."""
+    """Store a multi-method EVM sweep over absolute PA input powers."""
 
+    inputPowerDbmValues: np.ndarray
     driveRmsValues: np.ndarray
-    inputPowerDb: np.ndarray
     evmDbByMethod: Dict[str, np.ndarray]
     evmPercentByMethod: Dict[str, np.ndarray]
 
@@ -91,8 +92,10 @@ class PowerEvmCurve:
         """
 
         return {
+            "inputPowerDbmValues": self.inputPowerDbmValues
+            .astype(float)
+            .tolist(),
             "driveRmsValues": self.driveRmsValues.astype(float).tolist(),
-            "inputPowerDb": self.inputPowerDb.astype(float).tolist(),
             "methods": {
                 methodName: {
                     "evmDb": self.evmDbByMethod[methodName]
@@ -198,6 +201,7 @@ class Analysis:
                 "minimumAclrOversampling": 3.0,
                 "powerEvmFileStem": "power_evm_curve",
                 "signalProcessingParameters": None,
+                "loadResistanceOhm": 50.0,
             }
         )
         complexReference = np.asarray(referenceSignal, dtype=np.complex128)
@@ -328,6 +332,9 @@ class Analysis:
             raise TypeError(
                 "signalProcessingParameters must be a mapping or None"
             )
+        PowerCalibration(
+            loadResistanceOhm=self.parameters["loadResistanceOhm"]
+        )
         # Constructing one temporary processor per conducted chain validates
         # nested settings without duplicating synchronization constraints.
         referenceMatrix = (
@@ -901,8 +908,9 @@ class Analysis:
         )
         if sampleRateHz < minimumAclrOversampling * channelBandwidthHz:
             raise ValueError(
-                "ACLR analysis requires at least "
-                f"{minimumAclrOversampling:g}x oversampling"
+                "sampleRateHz must be at least "
+                f"{minimumAclrOversampling:g} times bandwidthHz "
+                "for ACLR analysis"
             )
         accumulatedSpectrum = None
         frequencyBins = None
@@ -951,8 +959,9 @@ class Analysis:
             < minimumAclrOversampling * self.waveform.bandwidthHz
         ):
             raise ValueError(
-                "ACLR analysis requires at least "
-                f"{minimumAclrOversampling:g}x oversampling"
+                "sampleRateHz must be at least "
+                f"{minimumAclrOversampling:g} times bandwidthHz "
+                "for ACLR analysis"
             )
         dataSlice = self.waveform.fieldSlices[self.waveform.dataFieldName]
         lowerValues = []
@@ -1055,28 +1064,59 @@ class Analysis:
 
     def AnalyzePowerEvmCurve(
         self,
-        driveRmsValues: Sequence[float],
+        inputPowerDbmValues: Sequence[float],
         methodEvaluators: Mapping[
             str, Callable[[np.ndarray, float], np.ndarray]
         ],
     ) -> PowerEvmCurve:
-        """Evaluate multiple methods over one common RMS input-power sweep.
+        """Evaluate multiple methods over one common absolute-power sweep.
 
         Every evaluator receives the reference waveform scaled to the current
-        RMS drive and the numeric drive value. An ILC evaluator may relearn at
-        every point, while a deployed DPD evaluator may reuse fixed nominal-
-        power coefficients. All methods are scored with identical references.
+        dBm input power and the numeric dBm value. The configured resistive
+        load converts each dBm point to the RMS voltage that scales the
+        unit-RMS waveform. An ILC evaluator may relearn at every point, while
+        a deployed DPD evaluator may reuse fixed nominal-power coefficients.
+        All methods are scored with identical references.
+
+        Args:
+            inputPowerDbmValues: Strictly increasing absolute PA input powers
+                in dBm. Negative dBm values are valid.
+            methodEvaluators: Mapping from display name to a callable that
+                accepts the calibrated point reference and its dBm value, and
+                returns the corresponding measured output waveform.
+
+        Returns:
+            result: Power-EVM curve containing dBm points, their calibrated
+                RMS voltages, and per-method EVM arrays.
         """
 
-        driveArray = np.asarray(driveRmsValues, dtype=float).reshape(-1)
-        if driveArray.size < 2:
-            raise ValueError("driveRmsValues must contain at least two points")
-        if not np.all(np.isfinite(driveArray)) or np.any(driveArray <= 0.0):
-            raise ValueError("driveRmsValues must contain finite positive values")
-        if np.any(np.diff(driveArray) <= 0.0):
-            raise ValueError("driveRmsValues must be strictly increasing")
+        powerDbmArray = np.asarray(
+            inputPowerDbmValues, dtype=float
+        ).reshape(-1)
+        if powerDbmArray.size < 2:
+            raise ValueError(
+                "inputPowerDbmValues must contain at least two points"
+            )
+        if not np.all(np.isfinite(powerDbmArray)):
+            raise ValueError(
+                "inputPowerDbmValues must contain finite values"
+            )
+        if np.any(np.diff(powerDbmArray) <= 0.0):
+            raise ValueError(
+                "inputPowerDbmValues must be strictly increasing"
+            )
         if not methodEvaluators:
             raise ValueError("methodEvaluators cannot be empty")
+        powerCalibration = PowerCalibration(
+            loadResistanceOhm=self.parameters["loadResistanceOhm"]
+        )
+        driveRmsArray = np.asarray(
+            [
+                powerCalibration.DbmToRms(inputPowerDbm)
+                for inputPowerDbm in powerDbmArray
+            ],
+            dtype=float,
+        )
 
         # Forward only values that differ from this instance's internal
         # defaults. Each point Analysis reconstructs its own default layer.
@@ -1090,10 +1130,12 @@ class Analysis:
         for methodName, methodEvaluator in methodEvaluators.items():
             methodEvmDb = []
             methodEvmPercent = []
-            for driveRms in driveArray:
+            for inputPowerDbm, driveRms in zip(
+                powerDbmArray, driveRmsArray
+            ):
                 pointReference = float(driveRms) * self.waveform.samples
                 measuredSignal = methodEvaluator(
-                    pointReference, float(driveRms)
+                    pointReference, float(inputPowerDbm)
                 )
                 pointAnalysis = Analysis(
                     pointReference,
@@ -1109,8 +1151,8 @@ class Analysis:
             )
 
         self.powerEvmCurve = PowerEvmCurve(
-            driveRmsValues=driveArray,
-            inputPowerDb=20.0 * np.log10(driveArray),
+            inputPowerDbmValues=powerDbmArray,
+            driveRmsValues=driveRmsArray,
             evmDbByMethod=evmDbByMethod,
             evmPercentByMethod=evmPercentByMethod,
         )
@@ -1158,7 +1200,7 @@ class Analysis:
         jsonPath = outputPath / f"{selectedFileStem}.json"
         methodNames = list(selectedCurve.evmDbByMethod)
 
-        fieldNames = ["driveRms", "inputPowerDb"]
+        fieldNames = ["inputPowerDbm", "driveRmsVoltage"]
         for methodName in methodNames:
             fieldNames.extend(
                 [f"{methodName} evmDb", f"{methodName} evmPercent"]
@@ -1166,13 +1208,13 @@ class Analysis:
         with csvPath.open("w", newline="", encoding="utf-8-sig") as csvFile:
             csvWriter = csv.DictWriter(csvFile, fieldnames=fieldNames)
             csvWriter.writeheader()
-            for pointIndex, driveRms in enumerate(
-                selectedCurve.driveRmsValues
+            for pointIndex, inputPowerDbm in enumerate(
+                selectedCurve.inputPowerDbmValues
             ):
                 rowData = {
-                    "driveRms": float(driveRms),
-                    "inputPowerDb": float(
-                        selectedCurve.inputPowerDb[pointIndex]
+                    "inputPowerDbm": float(inputPowerDbm),
+                    "driveRmsVoltage": float(
+                        selectedCurve.driveRmsValues[pointIndex]
                     ),
                 }
                 for methodName in methodNames:

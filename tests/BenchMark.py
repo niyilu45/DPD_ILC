@@ -9,7 +9,7 @@ multi-method power-EVM curve. Production ILC algorithms remain in
 import argparse
 import csv
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional
@@ -53,7 +53,7 @@ from inc.DpdIlc import (
     RunParameterDomainIlc,
     RunScalarPIlc,
 )
-from inc.PaModel import IQImbalancePA, PaModel
+from inc.PaModel import IQImbalancePA, PaModel, PowerCalibration
 from inc.waveGen import GenWifi, WifiWaveform
 
 
@@ -69,14 +69,16 @@ class BenchmarkConfig:
     bandwidthMhz: int = 20
     mcs: int = 7
     numDataSymbols: int = 10
+    sampleRateHz: Optional[float] = None
     oversampling: int = 4
     guardIntervalUs: float = 0.8
-    driveRms: float = 0.24
+    inputPowerDbm: float = 0.6145247908719321
+    loadResistanceOhm: float = 50.0
     numIterations: int = 10
     paModelName: str = "wiener"
     seed: int = 101
-    powerStartRms: float = 0.08
-    powerStopRms: float = 0.40
+    powerStartDbm: float = -8.927900303521316
+    powerStopDbm: float = 5.051499783199061
     powerPointCount: int = 5
     generatePowerEvmCurve: bool = True
     outputDirectory: Path = Path("results/all_ilc_benchmark")
@@ -97,18 +99,42 @@ class BenchmarkConfig:
 
         if self.numDataSymbols < 1:
             raise ValueError("numDataSymbols must be positive")
-        if self.oversampling < 3:
+        if (
+            not isinstance(self.oversampling, int)
+            or isinstance(self.oversampling, bool)
+            or self.oversampling < 1
+        ):
+            raise ValueError("oversampling must be a positive integer")
+        if self.sampleRateHz is not None and (
+            not isinstance(self.sampleRateHz, (int, float))
+            or isinstance(self.sampleRateHz, bool)
+            or not np.isfinite(self.sampleRateHz)
+            or self.sampleRateHz <= 0.0
+        ):
             raise ValueError(
-                "oversampling must be at least three for ACLR analysis"
+                "sampleRateHz must be finite and positive or None"
             )
-        if self.driveRms <= 0.0:
-            raise ValueError("driveRms must be positive")
+        bandwidthHz = float(self.bandwidthMhz) * 1.0e6
+        effectiveSampleRateHz = (
+            bandwidthHz * float(self.oversampling)
+            if self.sampleRateHz is None
+            else float(self.sampleRateHz)
+        )
+        if effectiveSampleRateHz < 3.0 * bandwidthHz:
+            raise ValueError(
+                "sampleRateHz must be at least three times the channel "
+                "bandwidth for ACLR analysis"
+            )
+        powerCalibration = PowerCalibration(
+            loadResistanceOhm=self.loadResistanceOhm
+        )
+        powerCalibration.DbmToRms(self.inputPowerDbm)
         if self.numIterations < 1:
             raise ValueError("numIterations must be positive")
-        if self.powerStartRms <= 0.0:
-            raise ValueError("powerStartRms must be positive")
-        if self.powerStopRms <= self.powerStartRms:
-            raise ValueError("powerStopRms must exceed powerStartRms")
+        powerCalibration.DbmToRms(self.powerStartDbm)
+        powerCalibration.DbmToRms(self.powerStopDbm)
+        if self.powerStopDbm <= self.powerStartDbm:
+            raise ValueError("powerStopDbm must exceed powerStartDbm")
         if self.powerPointCount < 2:
             raise ValueError("powerPointCount must be at least two")
 
@@ -324,26 +350,24 @@ def EvaluateDeployment(
 
 def RunIlcCurvePoint(
     referenceSignal: np.ndarray,
-    driveRms: float,
+    inputPowerDbm: float,
     paModel: Any,
     waveform: WifiWaveform,
     methodName: str,
-    methodFunction: Optional[
-        Callable[[np.ndarray, Any, ILCConfig], ILCResult]
-    ],
+    methodFunction: Optional[Callable[..., ILCResult]],
     methodConfig: ILCConfig,
 ) -> np.ndarray:
     """Run one selected ILC method at one power-EVM sweep point.
 
     Processing details:
-        Algorithm: Bind a fresh EVM-MSE evaluator to the waveform after power
-        scaling, clone the selected method configuration, dispatch the
-        frequency-domain signature separately from ordinary waveform-update
-        signatures, and return the selected best PA output.
+        Algorithm: Construct a fresh Analysis context after power scaling,
+        pass its EVM-MSE method as an independent iteration evaluator,
+        dispatch the frequency-domain signature separately from ordinary
+        waveform-update signatures, and return the selected best PA output.
 
     Args:
         referenceSignal: Ideal complex baseband samples used as the target or regression input.
-        driveRms: Current RMS drive value in the power sweep.
+        inputPowerDbm: Current absolute PA input power in dBm.
         paModel: PA object exposing Process and SmallSignalGain operations.
         waveform: Wi-Fi metadata defining field locations, FFT sizes, and subcarriers.
         methodName: Human-readable algorithm or deployment-model label.
@@ -356,24 +380,24 @@ def RunIlcCurvePoint(
         result: Complex PA output learned specifically for this power point.
     """
 
-    del driveRms
+    del inputPowerDbm
     pointAnalysis = Analysis(referenceSignal, waveform)
-    pointConfig = replace(
-        methodConfig,
-        evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
-    )
     if methodName == "Frequency-domain ILC":
         return RunFrequencyDomainIlc(
             referenceSignal,
             paModel,
             waveform.sampleRateHz,
             waveform.bandwidthHz,
-            pointConfig,
+            methodConfig,
+            evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
         ).outputSignal
     if methodFunction is None:
         raise ValueError("methodFunction is required for non-frequency ILC")
     return methodFunction(
-        referenceSignal, paModel, pointConfig
+        referenceSignal,
+        paModel,
+        methodConfig,
+        evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
     ).outputSignal
 
 def RunAllIlcBenchmark(
@@ -411,8 +435,11 @@ def RunAllIlcBenchmark(
         "mcs": config.mcs,
         "numDataSymbols": config.numDataSymbols,
         "guardIntervalUs": config.guardIntervalUs,
-        "oversampling": config.oversampling,
     }
+    if config.sampleRateHz is None:
+        sharedWifiParameters["oversampling"] = config.oversampling
+    else:
+        sharedWifiParameters["sampleRateHz"] = config.sampleRateHz
     trainingParameters = dict(sharedWifiParameters)
     trainingParameters["seed"] = config.seed
     validationParameters = dict(sharedWifiParameters)
@@ -421,12 +448,24 @@ def RunAllIlcBenchmark(
     validationGenerator = GenWifi(parameters=validationParameters)
     trainingWaveform = trainingGenerator.Generate()
     validationWaveform = validationGenerator.Generate()
-    trainingSignal = config.driveRms * trainingWaveform.samples
-    validationSignal = config.driveRms * validationWaveform.samples
+    powerCalibration = PowerCalibration(
+        loadResistanceOhm=config.loadResistanceOhm
+    )
+    inputDriveRms = powerCalibration.DbmToRms(config.inputPowerDbm)
+    trainingSignal = inputDriveRms * trainingWaveform.samples
+    validationSignal = inputDriveRms * validationWaveform.samples
     paParameters = {"modelName": config.paModelName}
     paModel = PaModel(parameters=paParameters)
-    trainingAnalysis = Analysis(trainingSignal, trainingWaveform)
-    validationAnalysis = Analysis(validationSignal, validationWaveform)
+    trainingAnalysis = Analysis(
+        trainingSignal,
+        trainingWaveform,
+        loadResistanceOhm=config.loadResistanceOhm,
+    )
+    validationAnalysis = Analysis(
+        validationSignal,
+        validationWaveform,
+        loadResistanceOhm=config.loadResistanceOhm,
+    )
     maxAmplitude = max(2.0, 1.6 * np.max(np.abs(trainingSignal)))
 
     baselineOutput = paModel.Process(trainingSignal)
@@ -453,42 +492,36 @@ def RunAllIlcBenchmark(
         learningRate=0.10,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 1,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     complexConfig = ILCConfig(
         numIterations=config.numIterations,
         learningRate=0.15,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 2,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     firConfig = ILCConfig(
         numIterations=config.numIterations,
         learningRate=0.15,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 3,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     frequencyConfig = ILCConfig(
         numIterations=config.numIterations,
         learningRate=0.15,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 4,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     gaussNewtonConfig = ILCConfig(
         numIterations=config.numIterations,
         learningRate=0.65,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 5,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     parameterConfig = ILCConfig(
         numIterations=config.numIterations,
         learningRate=0.20,
         maxAmplitude=maxAmplitude,
         randomSeed=config.seed + 6,
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
 
     methodRuns = (
@@ -512,11 +545,15 @@ def RunAllIlcBenchmark(
                 trainingWaveform.sampleRateHz,
                 trainingWaveform.bandwidthHz,
                 methodConfig,
+                evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
             )
             frequencyResult = methodResult
         else:
             methodResult = methodFunction(
-                trainingSignal, paModel, methodConfig
+                trainingSignal,
+                paModel,
+                methodConfig,
+                evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
             )
         methodMetrics = trainingAnalysis.Analyze(methodResult.outputSignal)
         AddRow(
@@ -584,8 +621,8 @@ def RunAllIlcBenchmark(
             learningRate=0.12,
             maxAmplitude=constrainedPeak,
             randomSeed=config.seed + 7,
-            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
         ),
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     constrainedMetrics = trainingAnalysis.Analyze(
         constrainedResult.outputSignal
@@ -645,8 +682,8 @@ def RunAllIlcBenchmark(
             feedbackSnrDb=32.0,
             feedbackAverages=1,
             randomSeed=config.seed + 18,
-            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
         ),
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     naiveNoisyMetrics = trainingAnalysis.Analyze(
         naiveNoisyResult.outputSignal
@@ -678,8 +715,8 @@ def RunAllIlcBenchmark(
             feedbackSnrDb=32.0,
             feedbackAverages=4,
             randomSeed=config.seed + 8,
-            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
         ),
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     noiseAwareMetrics = trainingAnalysis.Analyze(
         noiseAwareResult.outputSignal
@@ -760,8 +797,8 @@ def RunAllIlcBenchmark(
             learningRate=0.15,
             maxAmplitude=maxAmplitude,
             randomSeed=config.seed + 19,
-            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
         ),
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     ordinaryIqMetrics = trainingAnalysis.Analyze(
         ordinaryIqResult.outputSignal
@@ -788,8 +825,8 @@ def RunAllIlcBenchmark(
             learningRate=0.18,
             maxAmplitude=maxAmplitude,
             randomSeed=config.seed + 9,
-            evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
         ),
+        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
     )
     augmentedMetrics = trainingAnalysis.Analyze(
         augmentedResult.outputSignal
@@ -935,30 +972,33 @@ def RunAllIlcBenchmark(
     metadata: Mapping[str, object] = {
         "frameFormat": trainingWaveform.frameFormat,
         "bandwidthMhz": config.bandwidthMhz,
+        "sampleRateHz": trainingWaveform.sampleRateHz,
         "mcs": config.mcs,
         "numDataSymbols": config.numDataSymbols,
-        "oversampling": config.oversampling,
+        "oversampling": trainingWaveform.oversampling,
         "guardIntervalUs": config.guardIntervalUs,
-        "driveRms": config.driveRms,
+        "inputPowerDbm": config.inputPowerDbm,
+        "inputDriveRmsVoltage": inputDriveRms,
+        "loadResistanceOhm": config.loadResistanceOhm,
         "numIterations": config.numIterations,
         "paModel": config.paModelName,
         "trainingSeed": config.seed,
         "validationSeed": config.seed + 97,
-        "powerStartRms": config.powerStartRms,
-        "powerStopRms": config.powerStopRms,
+        "powerStartDbm": config.powerStartDbm,
+        "powerStopDbm": config.powerStopDbm,
         "powerPointCount": config.powerPointCount,
         "generatePowerEvmCurve": config.generatePowerEvmCurve,
     }
     SaveBenchmarkResults(rows, outputDirectory, metadata)
     powerCurvePaths = None
     if config.generatePowerEvmCurve:
-        powerDriveValues = np.geomspace(
-            config.powerStartRms,
-            config.powerStopRms,
+        inputPowerDbmValues = np.linspace(
+            config.powerStartDbm,
+            config.powerStopDbm,
             config.powerPointCount,
         )
         powerEvmCurve = trainingAnalysis.AnalyzePowerEvmCurve(
-            powerDriveValues, powerEvaluators
+            inputPowerDbmValues, powerEvaluators
         )
         powerDataPaths = trainingAnalysis.SavePowerEvmCurveData(
             outputDirectory,
@@ -1084,9 +1124,23 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
         default=10,
     )
     argumentParser.add_argument(
+        "--sample-rate-hz",
+        dest="sampleRateHz",
+        type=float,
+        default=None,
+        help=(
+            "Complex-baseband sample rate in Hz; overrides legacy "
+            "--oversampling when supplied"
+        ),
+    )
+    argumentParser.add_argument(
         "--oversampling",
         type=int,
         default=4,
+        help=(
+            "Legacy bandwidth multiplier used only when --sample-rate-hz "
+            "is omitted"
+        ),
     )
     argumentParser.add_argument(
         "--guard-interval",
@@ -1095,10 +1149,21 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
         default=0.8,
     )
     argumentParser.add_argument(
-        "--drive",
-        dest="driveRms",
+        "--input-power-dbm",
+        dest="inputPowerDbm",
         type=float,
-        default=0.24,
+        default=0.6145247908719321,
+        help=(
+            "Absolute nominal PA input power in dBm "
+            "(default: 0.614525 dBm)"
+        ),
+    )
+    argumentParser.add_argument(
+        "--load-resistance-ohm",
+        dest="loadResistanceOhm",
+        type=float,
+        default=50.0,
+        help="Resistive PA port used for dBm conversion (default: 50 ohms)",
     )
     argumentParser.add_argument(
         "--iterations",
@@ -1114,16 +1179,18 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
     )
     argumentParser.add_argument("--seed", type=int, default=101)
     argumentParser.add_argument(
-        "--power-start",
-        dest="powerStartRms",
+        "--power-start-dbm",
+        dest="powerStartDbm",
         type=float,
-        default=0.08,
+        default=-8.927900303521316,
+        help="First absolute PA input power in the sweep, in dBm",
     )
     argumentParser.add_argument(
-        "--power-stop",
-        dest="powerStopRms",
+        "--power-stop-dbm",
+        dest="powerStopDbm",
         type=float,
-        default=0.40,
+        default=5.051499783199061,
+        help="Last absolute PA input power in the sweep, in dBm",
     )
     argumentParser.add_argument(
         "--power-points",
@@ -1149,14 +1216,16 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
         bandwidthMhz=arguments.bandwidthMhz,
         mcs=arguments.mcs,
         numDataSymbols=arguments.numDataSymbols,
+        sampleRateHz=arguments.sampleRateHz,
         oversampling=arguments.oversampling,
         guardIntervalUs=arguments.guardIntervalUs,
-        driveRms=arguments.driveRms,
+        inputPowerDbm=arguments.inputPowerDbm,
+        loadResistanceOhm=arguments.loadResistanceOhm,
         numIterations=arguments.numIterations,
         paModelName=arguments.paModelName,
         seed=arguments.seed,
-        powerStartRms=arguments.powerStartRms,
-        powerStopRms=arguments.powerStopRms,
+        powerStartDbm=arguments.powerStartDbm,
+        powerStopDbm=arguments.powerStopDbm,
         powerPointCount=arguments.powerPointCount,
         generatePowerEvmCurve=arguments.generatePowerEvmCurve,
         outputDirectory=arguments.outputDirectory,

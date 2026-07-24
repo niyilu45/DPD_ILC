@@ -35,7 +35,12 @@ from .PaModel import AddAwgn, MimoPaModel
 
 @dataclass(frozen=True)
 class ILCConfig:
-    """Configure regularized frequency-domain iterative learning control."""
+    """Configure ILC updates, constraints, and feedback acquisition.
+
+    Signal-quality evaluators are intentionally excluded. Callers pass an
+    optional iteration evaluator directly to a SISO ``Run...Ilc`` entry and
+    send the returned PA output to ``Analysis`` for final SNR, EVM, and ACLR.
+    """
 
     numIterations: int = 8
     learningRate: float = 0.15
@@ -46,7 +51,6 @@ class ILCConfig:
     projectionBandwidthFactor: float = 1.6
     responseFloorDb: float = -45.0
     randomSeed: int = 19
-    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None
 
     def Validate(self) -> None:
         """Validate convergence, regularization, and feedback parameters.
@@ -70,10 +74,6 @@ class ILCConfig:
             raise ValueError("feedbackAverages must be positive")
         if self.projectionBandwidthFactor <= 1.0:
             raise ValueError("projectionBandwidthFactor must exceed 1")
-        if self.evmMseEvaluator is not None and not callable(
-            self.evmMseEvaluator
-        ):
-            raise TypeError("evmMseEvaluator must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -164,6 +164,8 @@ def CalculateIterationMetrics(
     evmAlignedMse = None
     evmDb = None
     if evmMseEvaluator is not None:
+        if not callable(evmMseEvaluator):
+            raise TypeError("evmMseEvaluator must be callable or None")
         evaluatedMse = float(evmMseEvaluator(complexMeasured))
         if not np.isfinite(evaluatedMse) or evaluatedMse < 0.0:
             raise ValueError(
@@ -269,6 +271,7 @@ def RunFrequencyDomainIlc(
     sampleRateHz: float,
     channelBandwidthHz: float,
     config: ILCConfig = ILCConfig(),
+    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None,
 ) -> ILCResult:
     """Learn a PA input waveform using regularized frequency-domain ILC.
 
@@ -277,6 +280,24 @@ def RunFrequencyDomainIlc(
     least-squares gain, preventing division by spectral nulls. The update is
     projected onto a bandwidth wider than the wanted channel so the ILC can
     synthesize out-of-band cancellation components needed to reduce ACLR.
+
+    Performance reporting remains outside ``ILCConfig``. The optional
+    ``evmMseEvaluator`` is supplied independently by ``Analysis`` only when
+    exact Wi-Fi EVM-MSE is needed for per-iteration diagnostics and
+    best-iteration selection.
+
+    Args:
+        referenceSignal: Ideal complex baseband PA output target.
+        paModel: Repeatable PA object exposing ``Process``.
+        sampleRateHz: Complex sampling rate in samples per second.
+        channelBandwidthHz: Wanted channel bandwidth in hertz.
+        config: Algorithm, constraint, and feedback-measurement settings.
+        evmMseEvaluator: Independent optional callable that accepts the
+            current PA output and returns normalized EVM-aligned MSE.
+
+    Returns:
+        result: Best measured PA input, its clean PA output, and iteration
+        diagnostics.
     """
 
     config.Validate()
@@ -286,7 +307,9 @@ def RunFrequencyDomainIlc(
     if sampleRateHz <= 0.0 or channelBandwidthHz <= 0.0:
         raise ValueError("sampleRateHz and channelBandwidthHz must be positive")
     if sampleRateHz < 2.0 * channelBandwidthHz:
-        raise ValueError("ILC requires at least 2x waveform oversampling")
+        raise ValueError(
+            "sampleRateHz must be at least twice channelBandwidthHz"
+        )
 
     randomGenerator = np.random.default_rng(config.randomSeed)
     inputSignal = LimitAmplitude(targetSignal.copy(), config.maxAmplitude)
@@ -370,7 +393,7 @@ def RunFrequencyDomainIlc(
             targetSignal,
             measuredOutput,
             currentInputPeak,
-            config.evmMseEvaluator,
+            evmMseEvaluator,
         )
         selectionError = (
             iterationMetrics.evmAlignedMse
@@ -1076,6 +1099,7 @@ def RunWaveformUpdate(
         [np.ndarray, np.ndarray, np.ndarray, int],
         np.ndarray,
     ],
+    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None,
 ) -> ILCResult:
     """Run a generic waveform ILC loop with best-iteration retention.
 
@@ -1087,6 +1111,8 @@ def RunWaveformUpdate(
         paModel: PA object exposing Process and SmallSignalGain operations.
         config: Validated configuration object controlling this operation.
         updateFunction: Caller-supplied value consumed according to the function contract.
+        evmMseEvaluator: Independent optional EVM-MSE evaluator used for
+            diagnostics and best-iteration selection.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1112,7 +1138,7 @@ def RunWaveformUpdate(
             targetSignal,
             measuredOutput,
             float(np.max(np.abs(inputSignal))),
-            config.evmMseEvaluator,
+            evmMseEvaluator,
         )
         selectionError = (
             iterationMetrics.evmAlignedMse
@@ -1167,6 +1193,7 @@ def RunScalarPIlc(
     referenceSignal: np.ndarray,
     paModel: Any,
     config: ILCConfig = ILCConfig(),
+    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None,
 ) -> ILCResult:
     """Run scalar P-type ILC using the nominal target gain of one.
 
@@ -1177,6 +1204,7 @@ def RunScalarPIlc(
         referenceSignal: Ideal complex baseband samples used as the target or regression input.
         paModel: PA object exposing Process and SmallSignalGain operations.
         config: Validated configuration object controlling this operation.
+        evmMseEvaluator: Independent optional EVM-MSE evaluator.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1205,12 +1233,19 @@ def RunScalarPIlc(
 
         return config.learningRate * errorSignal
 
-    return RunWaveformUpdate(referenceSignal, paModel, config, BuildUpdate)
+    return RunWaveformUpdate(
+        referenceSignal,
+        paModel,
+        config,
+        BuildUpdate,
+        evmMseEvaluator,
+    )
 
 def RunComplexGainIlc(
     referenceSignal: np.ndarray,
     paModel: Any,
     config: ILCConfig = ILCConfig(),
+    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None,
 ) -> ILCResult:
     """Run regularized complex-gain-normalized ILC.
 
@@ -1221,6 +1256,7 @@ def RunComplexGainIlc(
         referenceSignal: Ideal complex baseband samples used as the target or regression input.
         paModel: PA object exposing Process and SmallSignalGain operations.
         config: Validated configuration object controlling this operation.
+        evmMseEvaluator: Independent optional EVM-MSE evaluator.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1257,7 +1293,13 @@ def RunComplexGainIlc(
 
         return learningGain * errorSignal
 
-    return RunWaveformUpdate(referenceSignal, paModel, config, BuildUpdate)
+    return RunWaveformUpdate(
+        referenceSignal,
+        paModel,
+        config,
+        BuildUpdate,
+        evmMseEvaluator,
+    )
 
 def EstimateFrequencyResponse(
     referenceSignal: np.ndarray,
@@ -1304,6 +1346,7 @@ def RunFirIlc(
     paModel: Any,
     config: ILCConfig = ILCConfig(),
     firLength: int = 17,
+    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None,
 ) -> ILCResult:
     """Run FIR-filtered ILC using a truncated regularized inverse response.
 
@@ -1315,6 +1358,7 @@ def RunFirIlc(
         paModel: PA object exposing Process and SmallSignalGain operations.
         config: Validated configuration object controlling this operation.
         firLength: Number of taps in the learned FIR update filter.
+        evmMseEvaluator: Independent optional EVM-MSE evaluator.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1370,19 +1414,40 @@ def RunFirIlc(
         errorSpectrum = np.fft.fft(errorSignal, fftLength)
         return np.fft.ifft(firResponse * errorSpectrum)[: errorSignal.size]
 
-    return RunWaveformUpdate(targetSignal, paModel, config, BuildUpdate)
+    return RunWaveformUpdate(
+        targetSignal,
+        paModel,
+        config,
+        BuildUpdate,
+        evmMseEvaluator,
+    )
 
 def RunDirectionalGaussNewtonIlc(
     referenceSignal: np.ndarray,
     paModel: Any,
     config: ILCConfig = ILCConfig(),
     finiteDifferenceRms: float = 1e-3,
+    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None,
 ) -> ILCResult:
     """Run a model-aware Gauss-Newton step projected onto the error direction.
 
     A finite-difference PA call evaluates ``J*e``. Solving the regularized
     one-dimensional least-squares problem gives the best complex step in the
     current error direction while retaining PA memory effects.
+
+    The optional evaluator is an analysis dependency supplied separately from
+    the immutable ILC algorithm configuration.
+
+    Args:
+        referenceSignal: Ideal complex baseband PA output target.
+        paModel: Repeatable PA object exposing ``Process``.
+        config: Algorithm, constraint, and feedback-measurement settings.
+        finiteDifferenceRms: RMS size of the Jacobian-direction probe.
+        evmMseEvaluator: Independent optional EVM-MSE evaluator.
+
+    Returns:
+        result: Best measured PA input, its clean PA output, and iteration
+        diagnostics.
     """
 
     def BuildUpdate(
@@ -1425,7 +1490,13 @@ def RunDirectionalGaussNewtonIlc(
         )
         return config.learningRate * stepGain * errorSignal
 
-    return RunWaveformUpdate(referenceSignal, paModel, config, BuildUpdate)
+    return RunWaveformUpdate(
+        referenceSignal,
+        paModel,
+        config,
+        BuildUpdate,
+        evmMseEvaluator,
+    )
 
 def MemoryPolynomialBasis(
     inputSignal: np.ndarray,
@@ -1466,6 +1537,7 @@ def RunParameterDomainIlc(
     config: ILCConfig = ILCConfig(),
     nonlinearOrders: tuple = (1, 3, 5, 7),
     memoryDepth: int = 3,
+    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None,
 ) -> ILCResult:
     """Update memory-polynomial DPD coefficients directly in each ILC round.
 
@@ -1478,6 +1550,7 @@ def RunParameterDomainIlc(
         config: Validated configuration object controlling this operation.
         nonlinearOrders: Positive odd polynomial orders included in the model.
         memoryDepth: Number of causal sample delays included in the model.
+        evmMseEvaluator: Independent optional EVM-MSE evaluator.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1525,7 +1598,7 @@ def RunParameterDomainIlc(
             targetSignal,
             measuredOutput,
             float(np.max(np.abs(inputSignal))),
-            config.evmMseEvaluator,
+            evmMseEvaluator,
         )
         selectionError = (
             iterationMetrics.evmAlignedMse
@@ -1553,6 +1626,7 @@ def RunAugmentedIqIlc(
     referenceSignal: np.ndarray,
     paModel: Any,
     config: ILCConfig = ILCConfig(),
+    evmMseEvaluator: Optional[Callable[[np.ndarray], float]] = None,
 ) -> ILCResult:
     """Run widely-linear augmented ILC with error and conjugate-error paths.
 
@@ -1563,6 +1637,7 @@ def RunAugmentedIqIlc(
         referenceSignal: Ideal complex baseband samples used as the target or regression input.
         paModel: PA object exposing Process and SmallSignalGain operations.
         config: Validated configuration object controlling this operation.
+        evmMseEvaluator: Independent optional EVM-MSE evaluator.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1618,7 +1693,13 @@ def RunAugmentedIqIlc(
 
         return directLearning * errorSignal + imageLearning * np.conj(errorSignal)
 
-    return RunWaveformUpdate(targetSignal, paModel, config, BuildUpdate)
+    return RunWaveformUpdate(
+        targetSignal,
+        paModel,
+        config,
+        BuildUpdate,
+        evmMseEvaluator,
+    )
 
 
 # =============================================================================
@@ -1768,10 +1849,6 @@ def RunMimoFrequencyDomainIlc(
         chainConfig = replace(
             config,
             randomSeed=config.randomSeed + chainIndex,
-            # A per-chain waveform cannot be evaluated by the full MIMO
-            # post-spatial-demapping EVM callback. The common complex-gain
-            # compensated MSE remains available for every physical PA.
-            evmMseEvaluator=None,
         )
         chainResults.append(
             RunFrequencyDomainIlc(

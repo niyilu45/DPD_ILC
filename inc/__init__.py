@@ -6,7 +6,7 @@ from .waveGen import (
     NormalizeFrameFormat,
     WifiWaveform,
 )
-from .PaModel import GMPPA, MimoPaModel, PaModel, WienerPA
+from .PaModel import GMPPA, MimoPaModel, PaModel, PowerCalibration, WienerPA
 from .SigProcess import SigProcess, SignalProcessingResult
 from .Analysis import (
     Analysis,

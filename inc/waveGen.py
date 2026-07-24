@@ -1,10 +1,11 @@
 """Generate IEEE 802.11ac VHT, 802.11ax HE, or 802.11be EHT waveforms.
 
 Callers first construct ``GenWifi`` with the requested frame format, bandwidth,
-MCS, guard interval, and packet length, and then call ``Generate``. The class
-creates a single-user full-band complex baseband packet with the appropriate
-VHT, HE-SU, or EHT field order, OFDM numerology, and MCS table. Standard names
-such as ``11ac`` are accepted as aliases of the PHY names such as ``VHT``.
+sample rate, MCS, guard interval, and packet length, and then call ``Generate``.
+The class creates a single-user full-band complex baseband packet with the
+appropriate VHT, HE-SU, or EHT field order, OFDM numerology, and MCS table.
+Standard names such as ``11ac`` are accepted as aliases of PHY names such as
+``VHT``.
 
 DPD characterization only requires statistically representative coded
 symbols. Therefore, this module creates randomized post-FEC stimulus bits
@@ -108,6 +109,7 @@ class GenWifi:
                 "mcs": 9,
                 "numDataSymbols": 20,
                 "guardIntervalUs": 0.8,
+                "sampleRateHz": None,
                 "oversampling": 4,
                 "seed": 7,
                 "numTransmitAntennas": 1,
@@ -252,17 +254,46 @@ class GenWifi:
     guardIntervalUs = GuardIntervalUs
 
     @property
-    def Oversampling(self) -> int:
-        """Return the currently resolved oversampling factor.
+    def SampleRateHz(self) -> float:
+        """Return the user-selected or backward-compatible sample rate.
 
         Processing details:
-            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+            Algorithm: Use ``sampleRateHz`` whenever the caller supplies it.
+            Otherwise multiply channel bandwidth by the legacy integer
+            ``oversampling`` value so existing call sites retain their
+            previous waveform lengths.
 
         Returns:
-            result: int. The computed value described by the summary, with documented units, shape, and normalization.
+            result: Positive complex-baseband sampling rate in hertz.
         """
 
-        return cast(int, self.parameters["oversampling"])
+        configuredSampleRate = self.parameters["sampleRateHz"]
+        if configuredSampleRate is not None:
+            return float(cast(float, configuredSampleRate))
+        return (
+            float(self.bandwidthMhz)
+            * 1.0e6
+            * float(cast(int, self.parameters["oversampling"]))
+        )
+
+    sampleRateHz = SampleRateHz
+
+    @property
+    def Oversampling(self) -> float:
+        """Return the derived sample-rate-to-bandwidth ratio.
+
+        Processing details:
+            Algorithm: Divide the authoritative resolved sample rate by the
+            configured channel bandwidth. This value is metadata and may be
+            noninteger when ``sampleRateHz`` directly selects a compatible
+            OFDM clock.
+
+        Returns:
+            result: Dimensionless effective oversampling ratio.
+        """
+
+        bandwidthHz = float(self.bandwidthMhz) * 1.0e6
+        return self.sampleRateHz / bandwidthHz
 
     oversampling = Oversampling
 
@@ -374,7 +405,10 @@ class GenWifi:
             result: Dict[str, object]. The computed value described by the summary, with documented units, shape, and normalization.
         """
 
-        return dict(self.parameters)
+        resolvedParameters = dict(self.parameters)
+        resolvedParameters["sampleRateHz"] = self.sampleRateHz
+        resolvedParameters["oversampling"] = self.oversampling
+        return resolvedParameters
 
     def UpdateParameters(self, **parameterOverrides: object) -> None:
         """Apply validated high-priority overrides to this generator.
@@ -461,12 +495,54 @@ class GenWifi:
             raise ValueError(
                 f"{normalizedFormat} guardIntervalUs must be one of {intervalText}"
             )
+        rawOversampling = self.parameters["oversampling"]
         if (
-            not isinstance(self.oversampling, int)
-            or isinstance(self.oversampling, bool)
-            or self.oversampling < 1
+            not isinstance(rawOversampling, int)
+            or isinstance(rawOversampling, bool)
+            or rawOversampling < 1
         ):
             raise ValueError("oversampling must be a positive integer")
+        rawSampleRateHz = self.parameters["sampleRateHz"]
+        if rawSampleRateHz is not None and (
+            not isinstance(rawSampleRateHz, (int, float))
+            or isinstance(rawSampleRateHz, bool)
+            or not np.isfinite(rawSampleRateHz)
+            or rawSampleRateHz <= 0.0
+        ):
+            raise ValueError("sampleRateHz must be finite and positive or None")
+        bandwidthHz = float(self.bandwidthMhz) * 1.0e6
+        sampleRateHz = self.sampleRateHz
+        if sampleRateHz < bandwidthHz:
+            raise ValueError(
+                "sampleRateHz must be at least the channel bandwidth"
+            )
+
+        # Direct sample-rate selection must preserve exact integer sample
+        # counts for every OFDM timing interval used by this PHY. This allows
+        # noninteger bandwidth ratios, such as 30 MHz for a 20 MHz VHT frame,
+        # without silently rounding the nominal subcarrier spacing or GI.
+        usefulDurationUs = 3.2 if normalizedFormat == "VHT" else 12.8
+        requiredDurationsUs = [
+            ("legacy useful symbol", 3.2),
+            ("legacy guard interval", 0.8),
+            ("data useful symbol", usefulDurationUs),
+            ("configured guard interval", float(self.guardIntervalUs)),
+        ]
+        if normalizedFormat in ("HE", "EHT") and self.guardIntervalUs == 1.6:
+            requiredDurationsUs.append(("2x LTF useful symbol", 6.4))
+        for durationName, durationUs in requiredDurationsUs:
+            sampleCount = sampleRateHz * durationUs * 1.0e-6
+            if not np.isclose(
+                sampleCount,
+                round(sampleCount),
+                rtol=0.0,
+                atol=1.0e-8,
+            ):
+                raise ValueError(
+                    "sampleRateHz is incompatible with the "
+                    f"{durationName} duration; choose a rate that gives an "
+                    "integer sample count"
+                )
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise TypeError("seed must be an integer")
         maximumSpatialStreams = 8
@@ -565,7 +641,7 @@ class WifiWaveform:
     bandwidthHz: float
     fftLength: int
     cpLength: int
-    oversampling: int
+    oversampling: float
     activeSubcarriers: np.ndarray
     dataSubcarriers: np.ndarray
     pilotSubcarriers: np.ndarray
@@ -851,7 +927,7 @@ def OfdmSymbol(
 def TrainingField(
     symbolCount: int,
     legacyFftLength: int,
-    oversampling: int,
+    subchannelCount: int,
     randomGenerator: np.random.Generator,
     fieldNumber: int,
 ) -> np.ndarray:
@@ -863,7 +939,7 @@ def TrainingField(
     Args:
         symbolCount: Number of OFDM symbols generated for the selected field.
         legacyFftLength: Bonded legacy-compatible FFT length at the active sample rate.
-        oversampling: Integer sample-rate expansion relative to channel bandwidth.
+        subchannelCount: Number of bonded 20 MHz legacy subchannels.
         randomGenerator: NumPy random generator that makes results reproducible.
         fieldNumber: Stable field identifier used to derive deterministic random seeds.
 
@@ -872,9 +948,6 @@ def TrainingField(
     """
 
     legacyCpLength = legacyFftLength // 4
-    # Oversampling enlarges the IFFT without creating additional 20 MHz
-    # subchannels. Divide it out before constructing bonded legacy segments.
-    subchannelCount = legacyFftLength // (64 * oversampling)
     subchannelCenters = (
         np.arange(subchannelCount) - (subchannelCount - 1) / 2.0
     ) * 64
@@ -1240,8 +1313,10 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
     else:
         baseFftLength = heEhtBaseFftLength[config.bandwidthMhz]
         expectedPilotCount = heEhtPilotToneCount[config.bandwidthMhz]
-    fftLength = baseFftLength * config.oversampling
-    sampleRateHz = bandwidthHz * config.oversampling
+    sampleRateHz = config.sampleRateHz
+    fftLength = int(
+        round(baseFftLength * sampleRateHz / bandwidthHz)
+    )
     cpLength = int(round(config.guardIntervalUs * 1e-6 * sampleRateHz))
     subcarrierSpacingHz = sampleRateHz / float(fftLength)
     spatialMappingMatrix = BuildSpatialMappingMatrix(config)
@@ -1299,9 +1374,8 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
         )
         sampleCursor += complexSamples.shape[0]
 
-    legacyFftLength = (
-        64 * (config.bandwidthMhz // 20) * config.oversampling
-    )
+    legacyFftLength = int(round(3.2e-6 * sampleRateHz))
+    legacySubchannelCount = config.bandwidthMhz // 20
     # All three PHY generations start with a legacy-compatible prefix. VHT
     # then uses its VHT signaling fields, while HE/EHT add RL-SIG and their
     # newer format-specific signaling fields.
@@ -1347,7 +1421,7 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
         fieldSamples = TrainingField(
             symbolCount,
             legacyFftLength,
-            config.oversampling,
+            legacySubchannelCount,
             randomGenerator,
             fieldNumber,
         )
@@ -1365,7 +1439,7 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
     shortTrainingSamples = TrainingField(
             1,
             legacyFftLength,
-            config.oversampling,
+            legacySubchannelCount,
             randomGenerator,
             len(preambleSpecification),
         )
@@ -1434,7 +1508,7 @@ def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
         vhtSigBSamples = TrainingField(
                 1,
                 legacyFftLength,
-                config.oversampling,
+                legacySubchannelCount,
                 randomGenerator,
                 len(preambleSpecification) + 1,
             )

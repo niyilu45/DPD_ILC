@@ -22,6 +22,198 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, cast
 import numpy as np
 
 
+class PowerCalibration:
+    """Convert PA complex-envelope RMS voltage and absolute dBm power.
+
+    The project uses the explicit convention that the RMS magnitude of a
+    complex baseband waveform is the RMS voltage delivered to the configured
+    resistive port. Under this convention ``P = Vrms**2 / R``. Keeping the
+    resistance in one object prevents command-line, benchmark, and plotting
+    code from applying inconsistent power scales.
+    """
+
+    def __init__(
+        self,
+        loadResistanceOhm: Optional[float] = None,
+        parameters: Optional[Mapping[str, object]] = None,
+        **parameterOverrides: object,
+    ) -> None:
+        """Initialize a live ChainMap-backed RF power calibration.
+
+        Processing details:
+            Algorithm: Define the standard 50-ohm default inside this
+            constructor, layer caller values ahead of it, and validate the
+            resolved resistance before any logarithmic conversion.
+
+        Args:
+            loadResistanceOhm: Optional resistive port value in ohms.
+            parameters: Optional caller-owned mapping of calibration values.
+            parameterOverrides: Highest-priority local calibration overrides.
+
+        Returns:
+            result: None. The converter is ready for dBm/RMS transformations.
+        """
+
+        self.defaultParameters: Mapping[str, object] = MappingProxyType(
+            {"loadResistanceOhm": 50.0}
+        )
+        directOverrides = dict(parameterOverrides)
+        if loadResistanceOhm is not None:
+            directOverrides["loadResistanceOhm"] = loadResistanceOhm
+        if parameters is not None and not isinstance(parameters, Mapping):
+            raise TypeError("parameters must be a mapping or None")
+        externalParameters = {} if parameters is None else parameters
+        self.parameters: ChainMap[str, object] = ChainMap(
+            directOverrides,
+            externalParameters,
+            self.defaultParameters,
+        )
+        self.Validate()
+
+    @property
+    def LoadResistanceOhm(self) -> float:
+        """Return the resolved resistive PA port value in ohms.
+
+        Processing details:
+            Algorithm: Read the highest-priority ChainMap value after
+            constructor and update validation.
+
+        Returns:
+            result: Positive finite resistance in ohms.
+        """
+
+        return float(cast(float, self.parameters["loadResistanceOhm"]))
+
+    loadResistanceOhm = LoadResistanceOhm
+
+    def GetParameters(self) -> Dict[str, object]:
+        """Return a flattened calibration parameter snapshot.
+
+        Processing details:
+            Algorithm: Resolve all ChainMap layers without changing the live
+            caller-owned mapping.
+
+        Returns:
+            result: Ordinary dictionary containing the resolved resistance.
+        """
+
+        return dict(self.parameters)
+
+    def UpdateParameters(self, **parameterOverrides: object) -> None:
+        """Apply and validate high-priority calibration overrides.
+
+        Processing details:
+            Algorithm: Update the local ChainMap layer transactionally and
+            restore the previous values if validation fails.
+
+        Args:
+            parameterOverrides: Local calibration values to replace.
+
+        Returns:
+            result: None. The active converter is updated in place.
+        """
+
+        previousOverrides = dict(self.parameters.maps[0])
+        self.parameters.maps[0].update(parameterOverrides)
+        try:
+            self.Validate()
+        except (TypeError, ValueError):
+            self.parameters.maps[0].clear()
+            self.parameters.maps[0].update(previousOverrides)
+            raise
+
+    def Validate(self) -> None:
+        """Validate the resolved resistance and reject unknown settings.
+
+        Processing details:
+            Algorithm: Check the exact supported key set, numeric type,
+            finiteness, and positive physical domain.
+
+        Returns:
+            result: None. Invalid calibration raises an exception.
+        """
+
+        unknownParameters = set(self.parameters).difference(
+            self.defaultParameters
+        )
+        if unknownParameters:
+            unknownNames = ", ".join(
+                sorted(str(parameterName) for parameterName in unknownParameters)
+            )
+            raise TypeError(
+                f"unknown PowerCalibration parameters: {unknownNames}"
+            )
+        resistanceValue = self.parameters["loadResistanceOhm"]
+        if (
+            not isinstance(resistanceValue, (int, float))
+            or isinstance(resistanceValue, bool)
+            or not np.isfinite(resistanceValue)
+            or resistanceValue <= 0.0
+        ):
+            raise ValueError(
+                "loadResistanceOhm must be finite and positive"
+            )
+
+    def DbmToRms(self, inputPowerDbm: float) -> float:
+        """Convert absolute port power in dBm to complex-envelope RMS volts.
+
+        Processing details:
+            Algorithm: Convert dBm to watts with the one-milliwatt reference,
+            multiply by resistance, and take the positive RMS square root.
+
+        Args:
+            inputPowerDbm: Absolute available power in dBm.
+
+        Returns:
+            result: Positive RMS voltage used to scale a unit-RMS waveform.
+        """
+
+        if (
+            not isinstance(inputPowerDbm, (int, float))
+            or isinstance(inputPowerDbm, bool)
+            or not np.isfinite(inputPowerDbm)
+        ):
+            raise ValueError("inputPowerDbm must be finite")
+        # Compute the voltage directly with a 20-log amplitude exponent. This
+        # is algebraically identical to converting through watts, while NumPy
+        # lets the explicit finite-range check handle overflow and underflow.
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            rmsVoltage = (
+                np.sqrt(1.0e-3 * self.loadResistanceOhm)
+                * np.power(10.0, float(inputPowerDbm) / 20.0)
+            )
+        if not np.isfinite(rmsVoltage) or rmsVoltage <= 0.0:
+            raise ValueError("inputPowerDbm is outside the numeric range")
+        return float(rmsVoltage)
+
+    def RmsToDbm(self, signalRms: float) -> float:
+        """Convert complex-envelope RMS volts to absolute port power in dBm.
+
+        Processing details:
+            Algorithm: Divide squared RMS voltage by resistance to obtain
+            watts, normalize by one milliwatt, and take ten-base logarithms.
+
+        Args:
+            signalRms: Positive complex-envelope RMS voltage.
+
+        Returns:
+            result: Absolute resistive-port power in dBm.
+        """
+
+        if (
+            not isinstance(signalRms, (int, float))
+            or isinstance(signalRms, bool)
+            or not np.isfinite(signalRms)
+            or signalRms <= 0.0
+        ):
+            raise ValueError("signalRms must be finite and positive")
+        # The logarithmic form avoids squaring a very large finite voltage.
+        return float(
+            20.0 * np.log10(float(signalRms))
+            - 10.0 * np.log10(self.loadResistanceOhm * 1.0e-3)
+        )
+
+
 @dataclass(frozen=True)
 class WienerConfig:
     """Configure the linear-memory and memoryless-nonlinearity cascade."""
@@ -494,7 +686,8 @@ class MimoPaModel:
     """Operate independent nonlinear PA models on all transmit chains.
 
     Each chain can select its own Wiener/GMP configuration, input drive,
-    relative output power, and optional absolute output RMS target. The class
+    relative output power, and optional absolute output-power target in dBm.
+    A legacy RMS-voltage target remains available for compatibility. The class
     intentionally does not add electrical crosstalk; a coupled MIMO PA can be
     introduced later without changing the samples-by-chains interface.
     """
@@ -526,6 +719,8 @@ class MimoPaModel:
                 "inputPowerDbPerChain": None,
                 "outputPowerDbPerChain": None,
                 "targetOutputRmsPerChain": None,
+                "targetOutputPowerDbmPerChain": None,
+                "loadResistanceOhm": 50.0,
             }
         )
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -685,7 +880,8 @@ class MimoPaModel:
 
         Processing details:
             Algorithm: Reject unknown keys, validate the positive chain count,
-            resolve all per-chain sequences, and require positive RMS targets.
+            resolve all per-chain sequences, validate the resistive port, and
+            reject conflicting legacy RMS and absolute dBm targets.
 
         Returns:
             result: None. Invalid settings raise descriptive exceptions.
@@ -720,6 +916,27 @@ class MimoPaModel:
             raise ValueError(
                 "targetOutputRmsPerChain entries must be positive or None"
             )
+        targetOutputPowerDbmValues = self.ResolveNumericSequence(
+            "targetOutputPowerDbmPerChain",
+            0.0,
+            allowNoneEntries=True,
+        )
+        if any(
+            rmsTarget is not None and dbmTarget is not None
+            for rmsTarget, dbmTarget in zip(
+                targetOutputRmsValues,
+                targetOutputPowerDbmValues,
+            )
+        ):
+            raise ValueError(
+                "one chain cannot set both target output RMS and dBm"
+            )
+        powerCalibration = PowerCalibration(
+            loadResistanceOhm=self.parameters["loadResistanceOhm"]
+        )
+        for targetPowerDbm in targetOutputPowerDbmValues:
+            if targetPowerDbm is not None:
+                powerCalibration.DbmToRms(targetPowerDbm)
 
     def SynchronizeModels(self) -> None:
         """Rebuild per-chain PA objects after live configuration changes.
@@ -795,15 +1012,69 @@ class MimoPaModel:
             else list(rawTargets)
         )
         targetValues[chainIndex] = targetOutputRms
-        self.UpdateParameters(targetOutputRmsPerChain=tuple(targetValues))
+        rawPowerTargets = self.parameters["targetOutputPowerDbmPerChain"]
+        powerTargetValues = (
+            [None] * self.numTransmitChains
+            if rawPowerTargets is None
+            else list(rawPowerTargets)
+        )
+        powerTargetValues[chainIndex] = None
+        self.UpdateParameters(
+            targetOutputRmsPerChain=tuple(targetValues),
+            targetOutputPowerDbmPerChain=tuple(powerTargetValues),
+        )
+
+    def SetTargetOutputPowerDbm(
+        self,
+        chainIndex: int,
+        targetOutputPowerDbm: Optional[float],
+    ) -> None:
+        """Set or disable one chain's absolute output-power target in dBm.
+
+        Processing details:
+            Algorithm: Replace one dBm target, clear the legacy RMS target for
+            the same chain, and validate the requested power through the
+            configured resistive-port calibration.
+
+        Args:
+            chainIndex: Zero-based transmit-chain index.
+            targetOutputPowerDbm: Finite absolute output power in dBm, or None.
+
+        Returns:
+            result: None. The selected chain is recalibrated on later calls.
+        """
+
+        if not isinstance(chainIndex, int) or isinstance(chainIndex, bool):
+            raise TypeError("chainIndex must be an integer")
+        if chainIndex < 0 or chainIndex >= self.numTransmitChains:
+            raise IndexError("chainIndex is outside the configured chain range")
+        rawPowerTargets = self.parameters["targetOutputPowerDbmPerChain"]
+        powerTargetValues = (
+            [None] * self.numTransmitChains
+            if rawPowerTargets is None
+            else list(rawPowerTargets)
+        )
+        powerTargetValues[chainIndex] = targetOutputPowerDbm
+        rawRmsTargets = self.parameters["targetOutputRmsPerChain"]
+        rmsTargetValues = (
+            [None] * self.numTransmitChains
+            if rawRmsTargets is None
+            else list(rawRmsTargets)
+        )
+        rmsTargetValues[chainIndex] = None
+        self.UpdateParameters(
+            targetOutputPowerDbmPerChain=tuple(powerTargetValues),
+            targetOutputRmsPerChain=tuple(rmsTargetValues),
+        )
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
         """Process every transmit column through its independent PA chain.
 
         Processing details:
             Algorithm: Apply per-chain input dB drive, nonlinear PA processing,
-            relative output dB calibration, and optional absolute RMS scaling;
-            stack outputs with the original samples-by-chains orientation.
+            relative output dB calibration, and optional absolute dBm scaling
+            after conversion to an RMS voltage; stack outputs with the original
+            samples-by-chains orientation.
 
         Args:
             inputSignal: Complex vector for one chain or matrix shaped samples
@@ -880,6 +1151,11 @@ class MimoPaModel:
         targetOutputRmsValues = self.ResolveNumericSequence(
             "targetOutputRmsPerChain", 0.0, allowNoneEntries=True
         )
+        targetOutputPowerDbmValues = self.ResolveNumericSequence(
+            "targetOutputPowerDbmPerChain",
+            0.0,
+            allowNoneEntries=True,
+        )
         inputScale = 10.0 ** (
             float(inputPowerDbValues[chainIndex]) / 20.0
         )
@@ -891,6 +1167,11 @@ class MimoPaModel:
         )
         chainOutput = outputScale * chainOutput
         targetOutputRms = targetOutputRmsValues[chainIndex]
+        targetOutputPowerDbm = targetOutputPowerDbmValues[chainIndex]
+        if targetOutputPowerDbm is not None:
+            targetOutputRms = PowerCalibration(
+                loadResistanceOhm=self.parameters["loadResistanceOhm"]
+            ).DbmToRms(targetOutputPowerDbm)
         if targetOutputRms is not None:
             currentRms = np.sqrt(np.mean(np.abs(chainOutput) ** 2))
             if currentRms <= np.finfo(float).tiny:
@@ -901,17 +1182,37 @@ class MimoPaModel:
         return chainOutput
 
     def GetOutputRmsPerChain(self) -> Tuple[float, ...]:
-        """Return RMS output powers measured during the most recent call.
+        """Return legacy RMS output voltages measured by the most recent call.
 
         Processing details:
             Algorithm: Return an immutable tuple already calculated from each
             output column, without reprocessing the waveform.
 
         Returns:
-            result: One RMS complex-envelope value per transmit chain.
+            result: One complex-envelope RMS voltage per transmit chain.
         """
 
         return tuple(self.lastOutputRmsPerChain)
+
+    def GetOutputPowerDbmPerChain(self) -> Tuple[float, ...]:
+        """Return the most recently measured output powers in dBm.
+
+        Processing details:
+            Algorithm: Convert every retained chain RMS through the same
+            resistive-port calibration used by absolute dBm targets.
+
+        Returns:
+            result: Chain-ordered absolute output powers in dBm, or an empty
+            tuple before the first complete matrix ``Process`` call.
+        """
+
+        powerCalibration = PowerCalibration(
+            loadResistanceOhm=self.parameters["loadResistanceOhm"]
+        )
+        return tuple(
+            powerCalibration.RmsToDbm(outputRms)
+            for outputRms in self.lastOutputRmsPerChain
+        )
 
 
 class IQImbalancePA:

@@ -42,13 +42,13 @@ flowchart LR
 射频输入写成
 
 ```math
-v_{\mathrm{in,RF}}(t)=\Re\left\{x(t)e^{j2\pi f_ct}\right\},
+v_{\mathrm{in,RF}}(t)=\sqrt{2}\Re\left\{x(t)e^{j2\pi f_ct}\right\},
 ```
 
 输出写成
 
 ```math
-v_{\mathrm{out,RF}}(t)=\Re\left\{y(t)e^{j2\pi f_ct}\right\}.
+v_{\mathrm{out,RF}}(t)=\sqrt{2}\Re\left\{y(t)e^{j2\pi f_ct}\right\}.
 ```
 
 $x(t)$ 和 $y(t)$ 是相对载波变化较慢的复包络。只要模型正确保留包络的幅度、相位和记忆，PA 在载波附近产生的带内失真与邻道频谱再生就能在基带中观察，不需要显式生成 GHz 载波。
@@ -60,6 +60,49 @@ c=|c|e^{j\angle c}.
 ```
 
 因此 GMP 中一个复系数的实部/虚部组合能够共同表达 AM-AM 和 AM-PM 行为。
+
+### 2.1 dBm与复包络RMS的物理标定
+
+本工程把复包络RMS定义为端口的等效RMS电压：
+
+```math
+V_{\mathrm{RMS}}
+=\sqrt{\frac{1}{N}\sum_{n=0}^{N-1}|x[n]|^2}.
+```
+
+对于阻值为 $R$ 的纯电阻端口，平均功率为：
+
+```math
+P_{\mathrm{W}}
+=\frac{V_{\mathrm{RMS}}^2}{R}.
+```
+
+dBm以1 mW为参考，因此：
+
+```math
+P_{\mathrm{dBm}}
+=10\log_{10}\left(
+\frac{V_{\mathrm{RMS}}^2}
+{R\cdot10^{-3}}
+\right).
+```
+
+反向换算为：
+
+```math
+V_{\mathrm{RMS}}
+=\sqrt{
+R\cdot10^{-3}\cdot10^{P_{\mathrm{dBm}}/10}
+}.
+```
+
+`PowerCalibration` 实现这两个方向的换算，`loadResistanceOhm` 默认是50 Ω，也允许用户修改。以50 Ω为例：
+
+- `0 dBm` 等于1 mW，对应约 `0.223607 V RMS`；
+- `0.24 V RMS` 对应约 `0.6145 dBm`；
+- `-10 dBm` 对应约 `0.070711 V RMS`。
+
+这个阻抗标定非常重要。若只把旧的归一化RMS数值改写成“dBm”标签而不引入 $R$，得到的不是绝对功率。现在主程序、Benchmark、功率-EVM横轴和MIMO绝对输出目标都通过同一个 `PowerCalibration` 换算。
 
 ---
 
@@ -554,14 +597,15 @@ flowchart LR
     split --> in0["输入 dB：aₘ"]
     in0 --> pa0["独立 fₘ：Wiener/GMP"]
     pa0 --> out0["输出 dB：bₘ"]
-    out0 --> target{"启用绝对 RMS?"}
+    out0 --> target{"启用绝对 dBm?"}
     target -->|否| column["zₘ"]
-    target -->|是| normalize["缩放到 r_target,m"]
+    target -->|是| convert["dBm和端口阻抗换算RMS"]
+    convert --> normalize["缩放到 r_target,m"]
     normalize --> column
     column --> stack["按原链顺序堆叠 Z"]
 ```
 
-**图 7 说明**：输入 dB 改变的是非线性 PA 的工作点，因此也会改变压缩和频谱再生；输出 dB 是 PA 后的线性校准，只改变幅度。绝对 RMS 目标位于最后一级，启用时最终输出严格满足指定 RMS。
+**图 7 说明**：输入 dB 改变的是非线性 PA 的工作点，因此也会改变压缩和频谱再生；输出 dB 是 PA 后的线性校准，只改变幅度。绝对dBm目标位于最后一级，程序先根据 `loadResistanceOhm` 换算目标RMS，再让最终输出严格满足指定功率。
 
 若设绝对目标 $r_{\mathrm{target},m}$，代码先算未经绝对校准的
 
@@ -575,7 +619,9 @@ r_m=\sqrt{\frac{1}{N}\sum_n|z_m[n]|^2},
 y_m[n]=\frac{r_{\mathrm{target},m}}{r_m}z_m[n].
 ```
 
-这适合模拟各 RF 链功率校准或比较相同输出 RMS 下的失真。它本质上是“对整段记录求得的理想增益控制”；若研究真实动态 AGC、功率环路瞬态或 DPD 的幅度外推，应关闭绝对目标，仅使用固定 dB 标尺并另建闭环模型。
+这适合模拟各 RF 链功率校准或比较相同绝对输出功率 dBm 下的失真。它本质上是“对整段记录求得的理想增益控制”；若研究真实动态 AGC、功率环路瞬态或 DPD 的幅度外推，应关闭绝对目标，仅使用固定 dB 标尺并另建闭环模型。
+
+Python接口优先使用 `targetOutputPowerDbmPerChain` 和 `SetTargetOutputPowerDbm`。`targetOutputRmsPerChain` 与 `SetTargetOutputRms` 仅保留为旧接口；同一条链不能同时设置RMS和dBm目标。`GetOutputPowerDbmPerChain` 返回最近一次完整处理后按相同端口阻抗换算的实际功率。
 
 ### 10.1 独立 PA 假设的边界
 
@@ -640,6 +686,12 @@ classDiagram
         +Process(inputSignal)
         +SmallSignalGain()
     }
+    class PowerCalibration {
+        +DbmToRms(inputPowerDbm)
+        +RmsToDbm(signalRms)
+        +GetParameters()
+        +UpdateParameters()
+    }
     class WienerConfig
     class WienerPA {
         +Process(inputSignal)
@@ -658,9 +710,12 @@ classDiagram
         +ProcessChain(inputSignal, chainIndex)
         +SetOutputPowerDb(chainIndex, outputPowerDb)
         +SetTargetOutputRms(chainIndex, targetOutputRms)
+        +SetTargetOutputPowerDbm(chainIndex, targetOutputPowerDbm)
         +GetOutputRmsPerChain()
+        +GetOutputPowerDbmPerChain()
     }
     MimoPaModel o-- PaModel : one per transmit chain
+    MimoPaModel --> PowerCalibration : absolute dBm calibration
     PaModel --> WienerPA : modelName=wiener
     PaModel --> GMPPA : modelName=gmp
     WienerPA --> WienerConfig
@@ -716,13 +771,17 @@ mimoPaModel = MimoPaModel(
         {"modelName": "gmp"},
     ),
     outputPowerDbPerChain=(0.0, -1.0, -2.0, -3.0),
-    targetOutputRmsPerChain=(None, None, 0.18, 0.16),
+    targetOutputPowerDbmPerChain=(None, None, 2.0, 0.0),
+    loadResistanceOhm=50.0,
 )
 mimoOutput = mimoPaModel.Process(mimoInput)
-print(mimoPaModel.GetOutputRmsPerChain())
+print(mimoPaModel.GetOutputPowerDbmPerChain())
 
 # Change only the second physical PA after construction.
-mimoPaModel.SetOutputPowerDb(chainIndex=1, outputPowerDb=-4.0)
+mimoPaModel.SetTargetOutputPowerDbm(
+    chainIndex=1,
+    targetOutputPowerDbm=-3.0,
+)
 ```
 
 `PaModel` 在构造函数内部建立参数层：直接构造参数或 `UpdateParameters(...)` 位于最高优先级，调用方的外部覆盖字典位于中间层，类内不可变默认值是后备层。调用方不需要显式创建 `ChainMap`；`GetParameters()` 返回当前解析结果的字典快照。

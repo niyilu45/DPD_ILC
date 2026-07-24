@@ -51,9 +51,7 @@ class Draw:
                 "legendColumnThreshold": 6,
                 "plotTitle": "Power-EVM comparison",
                 "convergencePlotTitle": "ILC MSE convergence",
-                "xAxisLabel": (
-                    "Input RMS power relative to unit saturation (dB)"
-                ),
+                "xAxisLabel": "PA input power (dBm)",
                 "yAxisLabel": "RMS EVM (dB, lower is better)",
                 "convergenceXAxisLabel": "ILC iteration",
                 "convergenceYAxisLabel": (
@@ -195,13 +193,24 @@ class Draw:
 
         if not isinstance(powerEvmCurve, PowerEvmCurve):
             raise TypeError("powerEvmCurve must be a PowerEvmCurve")
-        pointCount = powerEvmCurve.inputPowerDb.size
+        pointCount = powerEvmCurve.inputPowerDbmValues.size
         if pointCount < 2:
             raise ValueError("powerEvmCurve must contain at least two points")
         if powerEvmCurve.driveRmsValues.size != pointCount:
             raise ValueError("power-EVM coordinate arrays must have equal length")
-        if not np.all(np.isfinite(powerEvmCurve.inputPowerDb)):
+        if not np.all(np.isfinite(powerEvmCurve.inputPowerDbmValues)):
             raise ValueError("power-EVM input powers must be finite")
+        if np.any(np.diff(powerEvmCurve.inputPowerDbmValues) <= 0.0):
+            raise ValueError(
+                "power-EVM input powers must be strictly increasing in dBm"
+            )
+        if (
+            not np.all(np.isfinite(powerEvmCurve.driveRmsValues))
+            or np.any(powerEvmCurve.driveRmsValues <= 0.0)
+        ):
+            raise ValueError(
+                "power-EVM calibrated RMS voltages must be finite and positive"
+            )
         if not powerEvmCurve.evmDbByMethod:
             raise ValueError("powerEvmCurve must contain at least one method")
         for methodName, evmDbValues in powerEvmCurve.evmDbByMethod.items():
@@ -256,7 +265,7 @@ class Draw:
         methodNames = list(powerEvmCurve.evmDbByMethod)
         for methodIndex, methodName in enumerate(methodNames):
             axes.plot(
-                powerEvmCurve.inputPowerDb,
+                powerEvmCurve.inputPowerDbmValues,
                 powerEvmCurve.evmDbByMethod[methodName],
                 label=methodName,
                 marker=markerStyles[methodIndex % len(markerStyles)],

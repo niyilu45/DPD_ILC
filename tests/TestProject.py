@@ -36,7 +36,7 @@ from inc.DpdIlc import (
     RunMimoFrequencyDomainIlc,
 )
 from inc.Draw import Draw
-from inc.PaModel import MimoPaModel, PaModel
+from inc.PaModel import MimoPaModel, PaModel, PowerCalibration
 from inc.SigProcess import SigProcess
 from inc.waveGen import (
     GenWifi,
@@ -714,6 +714,69 @@ def CheckWifiBandwidths() -> None:
             assert waveform.pilotSubcarriers.size == pilotToneCount
 
 
+def CheckSampleRateConfiguration() -> None:
+    """Verify direct sample-rate control and legacy oversampling fallback.
+
+    Processing details:
+        Algorithm: Generate VHT and EHT packets at compatible noninteger
+        bandwidth ratios, require the requested clock to determine FFT and
+        guard lengths, confirm ``sampleRateHz`` overrides the legacy factor,
+        and reject clocks that cannot represent exact OFDM timing intervals.
+
+    Returns:
+        result: None. Assertions identify sample-clock configuration
+        regressions before waveform metadata reaches analysis or ILC.
+    """
+
+    ehtWaveform = GenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=7,
+        numDataSymbols=2,
+        sampleRateHz=50.0e6,
+        oversampling=8,
+    ).Generate()
+    assert ehtWaveform.sampleRateHz == 50.0e6
+    assert ehtWaveform.oversampling == 2.5
+    assert ehtWaveform.fftLength == 640
+    assert ehtWaveform.cpLength == 40
+
+    vhtWaveform = GenWifi(
+        frameFormat="VHT",
+        bandwidthMhz=20,
+        mcs=7,
+        numDataSymbols=2,
+        guardIntervalUs=0.4,
+        sampleRateHz=30.0e6,
+    ).Generate()
+    assert vhtWaveform.sampleRateHz == 30.0e6
+    assert vhtWaveform.oversampling == 1.5
+    assert vhtWaveform.fftLength == 96
+    assert vhtWaveform.cpLength == 12
+
+    legacyGenerator = GenWifi(
+        bandwidthMhz=20,
+        mcs=0,
+        numDataSymbols=1,
+        oversampling=3,
+    )
+    assert legacyGenerator.sampleRateHz == 60.0e6
+    assert legacyGenerator.GetParameters()["sampleRateHz"] == 60.0e6
+
+    try:
+        GenWifi(
+            frameFormat="EHT",
+            bandwidthMhz=20,
+            sampleRateHz=61.44e6,
+        )
+    except ValueError as error:
+        assert "integer sample count" in str(error)
+    else:
+        raise AssertionError(
+            "incompatible sampleRateHz must be rejected"
+        )
+
+
 def CheckMimoSpatialStructure() -> None:
     """Verify VHT/HE/EHT streams, mapping, CSD, and LTF dimensions.
 
@@ -795,7 +858,7 @@ def CheckMimoPaAndDpd() -> None:
 
     Processing details:
         Algorithm: Drive equal chain inputs through equal PA models, verify
-        relative dB and absolute RMS controls, then exercise one short ILC and
+        relative dB and absolute dBm controls, then exercise one short ILC and
         fitted-GMP pass while preserving samples-by-chains shapes.
 
     Returns:
@@ -817,11 +880,21 @@ def CheckMimoPaAndDpd() -> None:
         10.0 ** (-6.0 / 20.0),
         rtol=1e-12,
     )
-    mimoPaModel.SetTargetOutputRms(0, 0.12)
-    mimoPaModel.SetTargetOutputRms(1, 0.21)
+    powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
+    targetOutputPowerDbm = (
+        powerCalibration.RmsToDbm(0.12),
+        powerCalibration.RmsToDbm(0.21),
+    )
+    mimoPaModel.SetTargetOutputPowerDbm(0, targetOutputPowerDbm[0])
+    mimoPaModel.SetTargetOutputPowerDbm(1, targetOutputPowerDbm[1])
     mimoPaModel.Process(testMatrix)
     assert np.allclose(
         mimoPaModel.GetOutputRmsPerChain(), (0.12, 0.21), atol=1e-12
+    )
+    assert np.allclose(
+        mimoPaModel.GetOutputPowerDbmPerChain(),
+        targetOutputPowerDbm,
+        atol=1e-12,
     )
 
     waveform = GenWifi(
@@ -835,7 +908,9 @@ def CheckMimoPaAndDpd() -> None:
     ).Generate()
     referenceSignal = 0.18 * waveform.samples
     # Disable absolute normalization for a meaningful repeatable ILC plant.
-    mimoPaModel.UpdateParameters(targetOutputRmsPerChain=(None, None))
+    mimoPaModel.UpdateParameters(
+        targetOutputPowerDbmPerChain=(None, None)
+    )
     ilcResult = RunMimoFrequencyDomainIlc(
         referenceSignal,
         mimoPaModel,
@@ -1041,11 +1116,35 @@ def CheckPowerEvmCurve() -> None:
         seed=43,
     )
     waveform = wifiGenerator.Generate()
-    nominalReference = 0.24 * waveform.samples
+    powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
+    assert np.isclose(
+        powerCalibration.DbmToRms(0.0),
+        np.sqrt(0.001 * 50.0),
+    )
+    assert np.isclose(
+        powerCalibration.RmsToDbm(np.sqrt(0.001 * 50.0)),
+        0.0,
+    )
+    nominalInputPowerDbm = powerCalibration.RmsToDbm(0.24)
+    assert np.isclose(
+        powerCalibration.DbmToRms(nominalInputPowerDbm),
+        0.24,
+    )
+    nominalReference = powerCalibration.DbmToRms(
+        nominalInputPowerDbm
+    ) * waveform.samples
     paModel = PaModel(modelName="wiener")
-    resultAnalysis = Analysis(nominalReference, waveform)
+    resultAnalysis = Analysis(
+        nominalReference,
+        waveform,
+        loadResistanceOhm=powerCalibration.loadResistanceOhm,
+    )
+    inputPowerDbmValues = tuple(
+        powerCalibration.RmsToDbm(driveRms)
+        for driveRms in (0.10, 0.20, 0.30)
+    )
     curve = resultAnalysis.AnalyzePowerEvmCurve(
-        (0.10, 0.20, 0.30),
+        inputPowerDbmValues,
         {
             "Ideal": lambda pointReference, _: pointReference,
             "PA baseline": lambda pointReference, _: paModel.Process(
@@ -1053,7 +1152,12 @@ def CheckPowerEvmCurve() -> None:
             ),
         },
     )
-    assert curve.inputPowerDb.size == 3
+    assert curve.inputPowerDbmValues.size == 3
+    assert np.allclose(
+        curve.inputPowerDbmValues,
+        inputPowerDbmValues,
+    )
+    assert np.allclose(curve.driveRmsValues, (0.10, 0.20, 0.30))
     assert set(curve.evmDbByMethod) == {"Ideal", "PA baseline"}
     assert np.all(curve.evmDbByMethod["Ideal"] < -250.0)
 
@@ -1188,6 +1292,7 @@ def CheckMseEvmConvergence() -> None:
     ).Generate()
     referenceSignal = 0.20 * waveform.samples
     resultAnalysis = Analysis(referenceSignal, waveform)
+    assert not hasattr(ILCConfig(), "evmMseEvaluator")
     complexGain = 0.72 * np.exp(1j * 0.37)
     gainOnlyOutput = complexGain * referenceSignal
     gainOnlyMetrics = CalculateIterationMetrics(
@@ -1211,8 +1316,8 @@ def CheckMseEvmConvergence() -> None:
             numIterations=3,
             learningRate=0.25,
             maxAmplitude=1.25,
-            evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
         ),
+        evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
     )
     assert len(ilcResult.history) == 3
     for iterationRecord in ilcResult.history:
@@ -1259,6 +1364,7 @@ def RunTests() -> None:
     CheckInternalDefaultConfiguration()
     CheckWifiFormats()
     CheckWifiBandwidths()
+    CheckSampleRateConfiguration()
     CheckMimoSpatialStructure()
     CheckMimoPaAndDpd()
     CheckFormatSpecificMcsValidation()

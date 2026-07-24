@@ -40,7 +40,8 @@ flowchart LR
 | 函数 | 类型 | 原理或职责 | 详细依据 |
 |---|---|---|---|
 | `main.ParseFloatSequence` | E | 把每 PA 的 dB 配置解析为有限实数序列；不改变功率定义 | [PaModel.md：多路输出功率](./PaModel.md) |
-| `main.ParseOptionalFloatSequence` | E | 把绝对 RMS 目标解析为正数或 `None`；`None` 表示不做绝对归一化 | [PaModel.md：多路输出功率](./PaModel.md) |
+| `main.ParseOptionalFloatSequence` | E | 兼容旧接口：把 RMS 电压目标解析为正数或 `None`；新调用应使用 dBm 目标 | [PaModel.md：多路输出功率](./PaModel.md) |
+| `main.ParseOptionalDbmSequence` | E | 把每PA的绝对dBm目标解析为有限实数或 `None`；允许负dBm | [PaModel.md：多路输出功率](./PaModel.md) |
 | `main.Main` | E | 按“波形→PA→ILC→部署 DPD→同步→指标→绘图”编排；物理计算由被调用模块完成 | [README 工作流](../README.md)、图 1 |
 
 ## 3. `waveGen.py`：Wi-Fi 波形函数
@@ -51,7 +52,7 @@ flowchart LR
 |---|---|---|---|
 | `waveGen.NormalizeFrameFormat` | E | 把 11ac/11ax/11be 别名规范为 VHT/HE/EHT，不改变波形 | WaveGen §8.1 |
 | `GenWifi.__init__`, `GenWifi.GetParameters`, `GenWifi.UpdateParameters`, `GenWifi.Validate` | E | ChainMap 配置、单位和合法域校验；保证后续公式输入有效 | WaveGen §12–14 |
-| `GenWifi.FrameFormat`, `GenWifi.BandwidthMhz`, `GenWifi.Mcs`, `GenWifi.NumDataSymbols`, `GenWifi.GuardIntervalUs`, `GenWifi.Oversampling`, `GenWifi.Seed`, `GenWifi.NumTransmitAntennas`, `GenWifi.NumSpatialStreams`, `GenWifi.SpatialMapping`, `GenWifi.SpatialMappingMatrix`, `GenWifi.CyclicShiftEnabled` | E | 返回已验证配置，不做额外物理变换 | WaveGen §12 |
+| `GenWifi.FrameFormat`, `GenWifi.BandwidthMhz`, `GenWifi.Mcs`, `GenWifi.NumDataSymbols`, `GenWifi.GuardIntervalUs`, `GenWifi.SampleRateHz`, `GenWifi.Oversampling`, `GenWifi.Seed`, `GenWifi.NumTransmitAntennas`, `GenWifi.NumSpatialStreams`, `GenWifi.SpatialMapping`, `GenWifi.SpatialMappingMatrix`, `GenWifi.CyclicShiftEnabled` | E | 返回已验证配置；采样率由 `sampleRateHz` 直接决定，旧 `oversampling` 只在未配置采样率时用于兼容推导 | WaveGen §12 |
 | `GenWifi.ResolveMcsTable`, `GenWifi.GetMcsInfo` | P/E | 在方法内部构造不可变 MCS 表并返回调制阶数、名义码率和每音调比特数，不保留模块级查表变量 | WaveGen §5 |
 | `GenWifi.Generate`, `waveGen.GenerateWifiWaveform` | P/E | 组装完整 VHT/HE/EHT 复基带帧并保存解调元数据 | WaveGen §2、§8、§10 |
 | `waveGen.ActiveTones`, `waveGen.PilotTones` | P | 依据 FFT 网格选择活动、数据和导频子载波 | WaveGen §4 |
@@ -72,6 +73,8 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
+| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate` | E | 用ChainMap保存并验证可配置的电阻端口，默认50 Ω | PaModel §2 |
+| `PowerCalibration.DbmToRms`, `PowerCalibration.RmsToDbm` | P/N | 按 $P=V_{\mathrm{RMS}}^2/R$ 在绝对dBm功率与复包络RMS电压之间双向换算 | PaModel §2 |
 | `WienerConfig.Validate`, `GMPConfig.Validate` | E | 检查饱和幅度、阶次、记忆和系数合法性 | PaModel §3.6、§4 |
 | `WienerPA.__init__`, `GMPPA.__init__` | E | 保存已验证模型参数，不另引入物理过程 | PaModel §3、§4 |
 | `WienerPA.Process` | P/N | FIR 线性记忆→Rapp AM-AM→幅度相关 AM-PM | PaModel §3.1–§3.4 |
@@ -83,9 +86,9 @@ flowchart LR
 | `PaModel.Process`, `PaModel.SmallSignalGain` | E/P | 统一分派到选定物理 PA 的同名计算 | PaModel §9、§12 |
 | `MimoPaModel.__init__`, `MimoPaModel.ResolveNumericSequence`, `MimoPaModel.ResolvePaParametersPerChain`, `MimoPaModel.ValidateParameters`, `MimoPaModel.SynchronizeModels` | E | 把标量/序列配置扩展到每条物理链并构造独立 PA | PaModel §10 |
 | `MimoPaModel.NumTransmitChains`, `MimoPaModel.GetParameters`, `MimoPaModel.UpdateParameters` | E | 返回或更新多路配置，不改变功率定义 | PaModel §10、§12 |
-| `MimoPaModel.SetOutputPowerDb`, `MimoPaModel.SetTargetOutputRms` | P/E | 设置相对幅度比例或绝对 RMS 目标；dB 幅度比例为 $10^{P_{dB}/20}$ | PaModel §10 |
-| `MimoPaModel.Process`, `MimoPaModel.ProcessChain` | P/N | 每列通过独立 PA，再执行相对/绝对输出 RMS 校准 | PaModel §10、§10.2 |
-| `MimoPaModel.GetOutputRmsPerChain` | E | 返回最近一次实际链输出 RMS | PaModel §10 |
+| `MimoPaModel.SetOutputPowerDb`, `MimoPaModel.SetTargetOutputRms`, `MimoPaModel.SetTargetOutputPowerDbm` | P/E | 设置相对幅度比例、旧RMS目标或基于端口阻抗的绝对dBm目标；dB幅度比例为 $10^{P_{dB}/20}$ | PaModel §10 |
+| `MimoPaModel.Process`, `MimoPaModel.ProcessChain` | P/N | 每列通过独立 PA，再执行相对增益或经端口阻抗换算的绝对 dBm 校准 | PaModel §10、§10.2 |
+| `MimoPaModel.GetOutputRmsPerChain`, `MimoPaModel.GetOutputPowerDbmPerChain` | E/P | 返回最近一次实际链输出RMS，并可通过端口阻抗换算为dBm | PaModel §10 |
 | `IQImbalancePA.__init__`, `IQImbalancePA.Process`, `IQImbalancePA.SmallSignalGain` | P/N | 广义线性模型 $y=\alpha v+\beta v^*$ 及其直接支路小信号增益 | PaModel §7 |
 | `PaModel.AsComplexVector` | N | 把输入约束为有限一维复包络；不改变样值 | PaModel §2 |
 | `PaModel.DelaySignal` | N | 因果整数延迟并对历史补零 | PaModel §4 |
@@ -98,8 +101,8 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `ILCConfig.Validate` | E | 校验学习率、正则化、峰值、平均次数和投影带宽 | DPD-ILC §3.3、§3.11–§3.12 |
-| `DpdIlc.CalculateIterationMetrics` | N/P | 计算 Raw MSE、复增益正交残差和严格 EVM-MSE | Analysis §5.5–§5.10 |
+| `ILCConfig.Validate` | E | 只校验学习率、正则化、峰值、平均次数和投影带宽；不保存EVM、SNR或ACLR计算器 | DPD-ILC §3.3、§3.11–§3.12 |
+| `DpdIlc.CalculateIterationMetrics` | N/P | 计算 Raw MSE和复增益正交残差；若ILC入口独立传入EVM-MSE评估器，再记录严格EVM-MSE | Analysis §5.5–§5.10 |
 | `DpdIlc.NextPowerOfTwo` | N | 选择零填充 FFT 长度；提高采样密度/效率但不创造物理分辨率 | DPD-ILC §3.14 |
 | `DpdIlc.LimitAmplitude` | N/P | 把复样点投影到峰值圆盘，模拟 DAC/PA 输入约束 | DPD-ILC §3.11、§3.14 |
 | `DpdIlc.MeasurePaOutput` | P/N | 重复 PA 反馈、添加 AWGN 并平均，噪声方差降为 $1/R$ | DPD-ILC §3.12、§3.14 |
@@ -195,7 +198,7 @@ flowchart LR
 | `Analysis.IntegrateAclr` | P/N | 等宽主/邻道 PSD 积分并取较差邻道 | Analysis §6.1、§6.3 |
 | `Analysis.CalculateAclr`, `Analysis.CalculatePreparedAclr`, `Analysis.CalculatePreparedAclrPerChain` | P/N | 数据字段 Welch PSD 的汇总/逐链 ACLR | Analysis §6、§9.3 |
 | `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让 SNR/EVM/ACLR 共用一次同步结果并保存阶段映射 | Analysis §1 |
-| `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同 RMS 驱动点和参考下公平比较各方法 EVM | Analysis §8 |
+| `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同绝对 dBm 输入功率点和参考下公平比较各方法 EVM，并保存端口电阻换算后的 RMS 电压 | Analysis §8 |
 | `Analysis.SavePowerEvmCurveData`, `Analysis.Print`, `Analysis.PrintMimo`, `Analysis.Save`, `Analysis.SaveConvergence`, `Analysis.PrintConvergence` | E | 展示/序列化既有结果，不改变物理指标 | Analysis §10–§11 |
 
 ## 8. `Draw.py`：图形函数

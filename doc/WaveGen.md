@@ -144,19 +144,30 @@ HE/EHT 的基础 FFT 和音调规划为：
 \quad\mathrm{(HE/EHT)}.
 ```
 
-当过采样倍数为 $L$ 时：
+本工程现在由用户直接配置复基带采样率 `sampleRateHz`。FFT长度由物理有效符号时长决定：
 
 ```math
-f_s=L\,B,\qquad N_{\mathrm{FFT}}=L\,N_{\mathrm{base}},
+N_{\mathrm{FFT}}
+=f_sT_u.
 ```
 
-所以
+因此实际采样率与带宽之比可以是非整数：
 
 ```math
-\frac{f_s}{N_{\mathrm{FFT}}}=\frac{B}{N_{\mathrm{base}}}
+L_{\mathrm{effective}}
+=\frac{f_s}{B}.
 ```
 
-仍然等于所选格式的基础子载波间隔。换句话说，过采样增加的是频谱观察范围和时域采样密度，不会改变 VHT 的 312.5 kHz 或 HE/EHT 的 78.125 kHz 物理间隔。
+只要 `sampleRateHz` 使FFT有效时长、GI、3.2 µs传统有效符号和0.8 µs传统GI都对应整数采样点，就有：
+
+```math
+\frac{f_s}{N_{\mathrm{FFT}}}
+=\frac{1}{T_u}.
+```
+
+子载波间隔仍保持VHT的312.5 kHz或HE/EHT的78.125 kHz。例如20 MHz EHT可以直接设置50 MHz采样率，此时有效过采样比为2.5，FFT长度为640；20 MHz VHT可以设置30 MHz采样率，此时有效过采样比为1.5，FFT长度为96。
+
+旧参数 `oversampling` 只用于兼容：当 `sampleRateHz=None` 时，程序按 `带宽×oversampling` 推导采样率。一旦用户提供 `sampleRateHz`，它就是权威采样时钟，`oversampling` 属性仅作为实际 `sampleRateHz/带宽` 的派生元数据。
 
 ---
 
@@ -585,7 +596,7 @@ x_{\mathrm{rms,total}}
 \sum_{m=1}^{N_{TX}}|x_m[n]|^2}.
 ```
 
-归一化后该总 RMS 为 1；主程序乘 `driveRms=d` 后，总传导 RMS 为 $d$。单路 RMS 取决于空间映射、CSD、字段和数据，但可在 `MimoPaModel` 中再次独立调整。
+归一化后该总 RMS 为 1。调用方配置总输入功率 `inputPowerDbm` 后，`PowerCalibration` 按端口电阻换算总复包络 RMS 电压 $d$，主程序再把整包乘以 $d$。单路 RMS 和单路功率取决于空间映射、CSD、字段和数据，也可在 `MimoPaModel` 中再次独立调整。
 
 ---
 
@@ -639,19 +650,32 @@ x_{\mathrm{norm}}[n]=\frac{x[n]}{x_{\mathrm{rms}}}.
 \mathrm{RMS}\{x_{\mathrm{norm}}\}=1.
 ```
 
-主程序再乘 `driveRms`：
+调用方把 PA 输入功率配置为 $p_{\mathrm{dBm}}$。对于纯电阻端口 $R$，`PowerCalibration` 先计算
+
+```math
+P_{\mathrm{W}}=10^{-3}10^{p_{\mathrm{dBm}}/10},
+```
+
+```math
+d=V_{\mathrm{RMS}}=\sqrt{R P_{\mathrm{W}}},
+```
+
+主程序再缩放单位 RMS 波形：
 
 ```math
 x_d[n]=d\,x_{\mathrm{norm}}[n].
 ```
 
-这使 `driveRms=d` 具有直观含义。相对输入功率横坐标为
+反向换算关系为
 
 ```math
-P_{\mathrm{in,dB}}=10\log_{10}(d^2)=20\log_{10}d.
+p_{\mathrm{dBm}}
+=10\log_{10}\left(
+\frac{d^2}{R\,10^{-3}}
+\right).
 ```
 
-注意归一化是针对**整包**，不同字段的局部 RMS 可能不同。这种选择保证不同配置生成的整包在统一 PA 标尺下可比较。
+因此对外的模拟功率单位是 dBm，`d` 只是 PA 数值运算所需的内部 RMS 电压。默认 $R=50$ Ω 时，0 dBm 等于 1 mW，并对应约 0.223607 V RMS。注意归一化是针对**整包**，不同字段的局部 RMS 可能不同。这种选择保证不同配置生成的整包在统一绝对功率标尺下可比较。
 
 ---
 
@@ -672,11 +696,12 @@ P_{\mathrm{in,dB}}=10\log_{10}(d^2)=20\log_{10}d.
 | `GenWifi` 参数 | 物理作用 | 常见观察 |
 |---|---|---|
 | `frameFormat` | 选择 VHT/HE/EHT 的字段、FFT、GI 和 MCS 上限 | `11ac/11ax/11be` 会分别归一化为 VHT/HE/EHT |
-| `bandwidthMhz` | 改变 FFT、活动音调数和采样率 | 同带宽下 HE/EHT 的 FFT 点数为 VHT 的四倍 |
+| `bandwidthMhz` | 改变活动音调规划和基础OFDM参数 | 同带宽下 HE/EHT 的有效符号时长为VHT的四倍 |
 | `mcs` | 改变星座密度与名义编码率 | 高阶 QAM 的 EVM 容限更严格 |
 | `numDataSymbols` | 改变数据观测长度 | 更长帧更容易包含罕见高峰，PSD 也更稳定 |
 | `guardIntervalUs` | 改变 CP 和 LTF 模式 | GI 越长，抗长多径能力越强，效率越低 |
-| `oversampling` | 扩大可观察频率范围 | ACLR 至少需要 3x，本工程默认 4x |
+| `sampleRateHz` | 直接确定复基带采样时钟、FFT和CP采样点数 | ACLR要求实际采样率至少为3倍带宽；速率必须兼容OFDM整数采样时长 |
+| `oversampling` | 在未配置 `sampleRateHz` 时兼容推导采样率 | 默认4；配置采样率后只作为派生比值 |
 | `seed` | 控制随机激励 | 固定 seed 可保证公平比较 |
 | `numTransmitAntennas` | 改变物理发射链与 PA 列数 | VHT/HE/EHT 最大 8 |
 | `numSpatialStreams` | 改变独立 QAM/导频/训练维度 | 不得大于发射链数 |
@@ -690,7 +715,7 @@ P_{\mathrm{in,dB}}=10\log_{10}(d^2)=20\log_{10}d.
 
 | 物理步骤 | 代码入口 | 主要输出 |
 |---|---|---|
-| 配置验证 | `GenWifi.Validate` | 合法格式、带宽、MCS、GI、过采样 |
+| 配置验证 | `GenWifi.Validate` | 合法格式、带宽、MCS、GI、采样率及整数OFDM时长 |
 | 名称归一化 | `NormalizeFrameFormat` | `11ac→VHT`、`11ax→HE`、`11be→EHT` |
 | MCS 查询 | `GenWifi.GetMcsInfo` | 调制阶数、编码率、每音调比特数 |
 | 星座映射 | `QamModulate` | 单位平均功率 BPSK/QAM |

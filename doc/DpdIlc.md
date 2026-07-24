@@ -25,21 +25,23 @@
 
 ```mermaid
 flowchart LR
-    wave["GenWifi.Generate<br/>生成SISO或MIMO Wi-Fi参考信号"] --> scale["按driveRms缩放"]
+    power["用户配置PA输入功率 dBm"] --> calibration["PowerCalibration<br/>按端口电阻换算RMS电压"]
+    wave["GenWifi.Generate<br/>生成SISO或MIMO Wi-Fi参考信号"] --> scale["按RMS电压缩放"]
+    calibration --> scale
     scale --> reference["referenceSignal<br/>期望PA输出及ILC初始输入"]
     reference --> baseline["PaModel.Process<br/>未补偿baseline"]
     reference --> ilc["DpdIlc中的Run...Ilc"]
     pa["PaModel或MimoPaModel"] --> baseline
     pa --> ilc
-    analysis["Analysis.CalculateEvmAlignedMse"] --> config["ILCConfig"]
-    config --> ilc
+    config["ILCConfig<br/>仅含算法和反馈参数"] --> ilc
+    analysis["Analysis.CalculateEvmAlignedMse<br/>独立逐轮评估器"] --> ilc
     ilc --> learned["ILCResult.learnedInput<br/>最佳已测轮的PA输入"]
     ilc --> output["ILCResult.outputSignal<br/>最佳输入对应的PA输出"]
     ilc --> history["ILCResult.history<br/>每轮MSE与峰值"]
     learned --> fit["FitGmp / FitVolterra / FitLut / FitNeural"]
     reference --> fit
     fit --> deploy["Predistorter.Process<br/>处理独立Wi-Fi帧"]
-    baseline --> metrics["Analysis.AnalyzeStages"]
+    baseline --> metrics["resultAnalysis.Analyze或AnalyzeStages<br/>SNR、EVM、ACLR"]
     output --> metrics
     deploy --> metrics
 ```
@@ -49,7 +51,8 @@ flowchart LR
 - `GenWifi` 决定PHY格式、带宽、MCS、空间流和采样率。
 - `PaModel` 或 `MimoPaModel` 是ILC反复测量的plant。
 - `DpdIlc.py` 只负责算法，不负责选择benchmark场景或保存整套测试报告。
-- `Analysis` 提供严格的Wi-Fi数据子载波EVM-MSE回调，并在ILC结束后计算SNR、EVM和ACLR。
+- `ILCConfig` 不保存任何EVM、SNR或ACLR计算器；它只控制学习更新、幅度约束和反馈采集。
+- `Analysis` 的EVM-MSE方法可以作为独立参数传给ILC入口；ILC结束后，再把PA输出交给 `resultAnalysis.Analyze` 或 `AnalyzeStages` 计算SNR、EVM和ACLR。
 - 波形ILC得到的 `learnedInput` 只对当前重复波形直接有效；拟合部署模型后，才能处理独立的新Wi-Fi帧。
 
 ---
@@ -137,11 +140,16 @@ chainSignal = referenceSignal[:, chainIndex]
 通常先让 `GenWifi` 生成单位RMS波形，再设置工作点：
 
 ```python
+from inc.PaModel import PowerCalibration
+
 waveform = wifiGenerator.Generate()
-referenceSignal = 0.24 * waveform.samples
+powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
+paInputPowerDbm = 0.0
+paInputRms = powerCalibration.DbmToRms(paInputPowerDbm)
+referenceSignal = paInputRms * waveform.samples
 ```
 
-这里的 `0.24` 是归一化复包络RMS，不是dBm。真实功率换算需要额外的阻抗、满量程和硬件标定信息。
+对调用方公开的模拟功率是 `paInputPowerDbm`，单位 dBm。`PowerCalibration` 使用端口电阻把它换算成 PA 数值模型需要的复包络 RMS 电压。默认使用 50 Ω；若仿真对象不是 50 Ω 系统，必须显式修改 `loadResistanceOhm`。
 
 ### 4.4 PA对象接口要求
 
@@ -168,10 +176,12 @@ outputSignal = paModel.Process(inputSignal)
 ```python
 from pathlib import Path
 
+import numpy as np
+
 from inc.Analysis import Analysis
 from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
 from inc.Draw import Draw
-from inc.PaModel import PaModel
+from inc.PaModel import PaModel, PowerCalibration
 from inc.waveGen import GenWifi
 
 wifiGenerator = GenWifi(
@@ -180,24 +190,38 @@ wifiGenerator = GenWifi(
         "bandwidthMhz": 20,
         "mcs": 7,
         "numDataSymbols": 10,
-        "oversampling": 4,
+        "sampleRateHz": 80.0e6,
         "seed": 101,
     }
 )
 waveform = wifiGenerator.Generate()
-referenceSignal = 0.24 * waveform.samples
+
+# Convert the configured absolute input power to the RMS voltage required by
+# the complex-envelope PA model. The generated SISO packet has unit RMS.
+loadResistanceOhm = 50.0
+paInputPowerDbm = 0.0
+powerCalibration = PowerCalibration(
+    loadResistanceOhm=loadResistanceOhm
+)
+paInputRms = powerCalibration.DbmToRms(paInputPowerDbm)
+referenceSignal = paInputRms * waveform.samples
 
 paModel = PaModel(parameters={"modelName": "wiener"})
 baselineOutput = paModel.Process(referenceSignal)
+baselineOutputRms = float(np.sqrt(np.mean(np.abs(baselineOutput) ** 2)))
+baselineOutputPowerDbm = powerCalibration.RmsToDbm(baselineOutputRms)
 
-resultAnalysis = Analysis(referenceSignal, waveform)
+resultAnalysis = Analysis(
+    referenceSignal,
+    waveform,
+    loadResistanceOhm=loadResistanceOhm,
+)
 ilcConfig = ILCConfig(
     numIterations=8,
     learningRate=0.15,
     regularization=1e-3,
     maxAmplitude=2.0,
     randomSeed=1019,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 
 ilcResult = RunFrequencyDomainIlc(
@@ -206,6 +230,7 @@ ilcResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     ilcConfig,
+    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 
 stageMetrics = resultAnalysis.AnalyzeStages(
@@ -230,16 +255,46 @@ Draw().SaveConvergenceCurve(
 
 print(stageMetrics["PA baseline"].ToDict())
 print(stageMetrics["Frequency-domain ILC"].ToDict())
+print(f"Configured PA input power: {paInputPowerDbm:.2f} dBm")
+print(f"Equivalent PA input RMS voltage: {paInputRms:.6f} V")
+print(f"Measured PA output power: {baselineOutputPowerDbm:.2f} dBm")
+print(f"Measured PA output RMS voltage: {baselineOutputRms:.6f} V")
 print(ilcResult.learnedInput.shape)
 ```
 
-这个示例中最重要的配置是：
+这个示例中，`paInputPowerDbm` 是需要显式设置的模拟功率参数。`GenWifi` 已把SISO整包波形归一化到单位RMS。dBm先换算成瓦特，再通过端口电阻换算成复包络 RMS 电压：
+
+```math
+P_{\mathrm{in,W}}
+=10^{-3}10^{P_{\mathrm{in,dBm}}/10},
+```
+
+```math
+V_{\mathrm{in,RMS}}
+=\sqrt{R P_{\mathrm{in,W}}}.
+```
+
+反向关系为
+
+```math
+P_{\mathrm{dBm}}
+=10\log_{10}\left(
+\frac{V_{\mathrm{RMS}}^2}
+{R\,10^{-3}}
+\right).
+```
+
+当 `loadResistanceOhm=50` 且 `paInputPowerDbm=0` 时，输入为 1 mW，对应约 0.223607 V RMS。提高 dBm 会提高 PA 数值模型的 RMS 驱动，把 PA 推向更深的压缩区，通常会增加非线性失真和频谱再生；降低 dBm 则让 PA 更接近小信号线性区。
+
+`baselineOutputRms` 和 `baselineOutputPowerDbm` 是 PA 处理后的实测值，不是另一个输入配置。它们同时包含小信号增益、记忆效应和非线性压缩。若只在 PA 之后乘一个常数，只会改变线性输出标尺，不会改变 PA 内部非线性工作点。
+
+除了上述功率工作点，ILC最佳轮选择使用的独立评估参数是：
 
 ```python
 evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse
 ```
 
-提供该回调后，每轮都会计算严格的数据子载波EVM-MSE，并按照EVM-MSE保留最佳已测轮。若不提供，算法只能使用线性补偿NMSE选择最佳轮。
+该参数直接传给 `RunFrequencyDomainIlc`，不属于 `ILCConfig`。提供后，每轮都会计算严格的数据子载波EVM-MSE，并按照EVM-MSE保留最佳已测轮。若不提供，算法使用线性补偿NMSE选择最佳轮。最终SNR、EVM和ACLR仍通过 `resultAnalysis.Analyze(ilcResult.outputSignal)` 或 `AnalyzeStages` 独立计算。
 
 ---
 
@@ -267,7 +322,10 @@ ilcConfig = ILCConfig(
 | `projectionBandwidthFactor` | `1.6` | 大于1 | 频域更新相对信道带宽的允许范围 | 过小会限制带外抵消，过大可能增加峰值 |
 | `responseFloorDb` | `-45.0` | 当前不单独限幅 | 低激励FFT频点的响应置信度门限 | 频谱零点不稳定时提高门限 |
 | `randomSeed` | `19` | 整数语义 | 反馈噪声随机种子 | 公平比较时每次实验固定 |
-| `evmMseEvaluator` | `None` | 可调用对象或 `None` | 计算每轮严格EVM-MSE并选择最佳轮 | Wi-Fi信号建议始终设置 |
+
+`evmMseEvaluator` 不在上表中，因为它不是算法配置。它是各SISO `Run...Ilc` 入口的独立可选参数，由 `Analysis` 提供。
+
+旧写法 `ILCConfig(evmMseEvaluator=...)` 已不再支持。迁移时保留原 `ILCConfig`，把同一个回调移动到 `Run...Ilc(..., evmMseEvaluator=...)` 即可。
 
 ### 6.1 验证配置
 
@@ -340,7 +398,7 @@ Generate next input
 
 ### 7.2 为什么返回结果不一定对应最后一行
 
-若提供 `evmMseEvaluator`，最佳轮满足：
+若向ILC入口独立提供 `evmMseEvaluator`，最佳轮满足：
 
 ```math
 k^\star
@@ -382,7 +440,7 @@ EVM百分比可由 `evmAlignedMse` 换算：
 | `RunScalarPIlc` | 无 | 标量误差比例更新 | 最简单，适合流程验证 | 不显式补偿公共复增益和频率选择性记忆 |
 | `RunComplexGainIlc` | 无 | 平均复增益逆 | 可校正平均增益和相位 | 不能完整补偿频率选择性记忆 |
 | `RunFirIlc` | `firLength=17` | 有限长时域逆滤波 | 适合线性记忆明显的PA | FIR长度和截断影响效果 |
-| `RunFrequencyDomainIlc` | 采样率、信道带宽 | 正则化逐频点逆和带宽投影 | 宽带Wi-Fi的推荐通用入口 | 需要至少2倍过采样和低功率响应探测 |
+| `RunFrequencyDomainIlc` | 采样率、信道带宽 | 正则化逐频点逆和带宽投影 | 宽带Wi-Fi的推荐通用入口 | 采样率至少为2倍信道带宽，并执行低功率响应探测 |
 | `RunDirectionalGaussNewtonIlc` | `finiteDifferenceRms=1e-3` | 当前误差方向上的局部雅可比 | 确定性plant上收敛快 | 每轮额外调用PA，对噪声和漂移敏感 |
 | `RunParameterDomainIlc` | 阶数、记忆深度 | 直接更新MP系数空间 | 学习输入天然受模型空间约束 | 表达能力受基函数限制 |
 | `RunAugmentedIqIlc` | 无 | 直接支路加共轭误差支路 | 适合IQ镜像或广义线性plant | 增广矩阵病态时需更强正则化 |
@@ -408,6 +466,7 @@ ilcResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     ilcConfig,
+    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -425,24 +484,27 @@ from inc.DpdIlc import (
 commonConfig = ILCConfig(
     numIterations=8,
     maxAmplitude=2.0,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
+iterationEvaluator = resultAnalysis.CalculateEvmAlignedMse
 
 scalarResult = RunScalarPIlc(
     referenceSignal,
     paModel,
     commonConfig,
+    evmMseEvaluator=iterationEvaluator,
 )
 complexResult = RunComplexGainIlc(
     referenceSignal,
     paModel,
     commonConfig,
+    evmMseEvaluator=iterationEvaluator,
 )
 firResult = RunFirIlc(
     referenceSignal,
     paModel,
     commonConfig,
     firLength=17,
+    evmMseEvaluator=iterationEvaluator,
 )
 frequencyResult = RunFrequencyDomainIlc(
     referenceSignal,
@@ -450,10 +512,11 @@ frequencyResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     commonConfig,
+    evmMseEvaluator=iterationEvaluator,
 )
 ```
 
-公平比较时应保持参考波形、PA、迭代数、峰值限制和指标回调一致。不同算法的更新方向尺度不同，因此“所有方法强制使用相同学习率”不一定公平；应记录每种方法的实际学习率。
+公平比较时应保持参考波形、PA、迭代数、峰值限制和独立指标回调一致。不同算法的更新方向尺度不同，因此“所有方法强制使用相同学习率”不一定公平；应记录每种方法的实际学习率。
 
 ---
 
@@ -482,16 +545,16 @@ f_s\ge2B_{\mathrm{channel}}.
 低于该条件会抛出：
 
 ```text
-ValueError: ILC requires at least 2x waveform oversampling
+ValueError: sampleRateHz must be at least twice channelBandwidthHz
 ```
 
-如果还要计算上下邻道ACLR，工程的 `Analysis` 通常要求至少3倍过采样，因此完整Wi-Fi仿真建议使用：
+如果还要计算上下邻道ACLR，工程的 `Analysis` 要求采样率至少为信道带宽的3倍。以20 MHz信道为例：
 
 ```python
-oversampling = 3
+sampleRateHz = 60.0e6
 ```
 
-或更高。
+用户可以直接配置其他兼容OFDM时长的采样率，不要求采样率与带宽之比一定是整数。
 
 ### 9.3 峰值约束
 
@@ -516,7 +579,6 @@ constrainedConfig = ILCConfig(
     numIterations=8,
     learningRate=0.12,
     maxAmplitude=constrainedPeak,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -553,7 +615,6 @@ noiseAwareConfig = ILCConfig(
     feedbackSnrDb=32.0,
     feedbackAverages=4,
     randomSeed=109,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 
 noiseAwareResult = RunFrequencyDomainIlc(
@@ -562,6 +623,7 @@ noiseAwareResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     noiseAwareConfig,
+    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -586,32 +648,51 @@ noiseAwareResult = RunFrequencyDomainIlc(
 
 ---
 
-## 11. 精确EVM-MSE回调
+## 11. 独立的ILC性能评估
 
 ### 11.1 推荐写法
 
 ```python
 resultAnalysis = Analysis(referenceSignal, waveform)
-ilcConfig = ILCConfig(
+ilcConfig = ILCConfig(numIterations=8, learningRate=0.15)
+ilcResult = RunFrequencyDomainIlc(
+    referenceSignal,
+    paModel,
+    waveform.sampleRateHz,
+    waveform.bandwidthHz,
+    ilcConfig,
     evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
+ilcMetrics = resultAnalysis.Analyze(ilcResult.outputSignal)
+
+print(ilcMetrics.snrDb)
+print(ilcMetrics.evmDb)
+print(ilcMetrics.aclrWorstDb)
 ```
 
-该回调内部使用Wi-Fi元数据完成同步、频偏与增益补偿，并只在有效数据子载波上计算归一化误差。
+这里有两个明确分离的步骤：
+
+1. `evmMseEvaluator` 是ILC入口的独立可选参数，只负责逐轮EVM-MSE和最佳轮选择；
+2. `resultAnalysis.Analyze(ilcResult.outputSignal)` 接收最终PA输出，独立完成同步补偿以及SNR、EVM、ACLR计算，并返回 `SignalMetrics`。
+
+`ILCConfig` 不参与性能指标计算，也不保存任何 `Analysis` 回调。
 
 ### 11.2 不能混用其他参考波形的回调
 
 功率扫描中每个功率点都应创建与当前参考匹配的 `Analysis`：
 
 ```python
-from dataclasses import replace
-
 pointReference = 0.30 * waveform.samples
 pointAnalysis = Analysis(pointReference, waveform)
-pointConfig = replace(
+pointResult = RunFrequencyDomainIlc(
+    pointReference,
+    paModel,
+    waveform.sampleRateHz,
+    waveform.bandwidthHz,
     ilcConfig,
     evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
 )
+pointMetrics = pointAnalysis.Analyze(pointResult.outputSignal)
 ```
 
 不要用标称功率参考构造的回调去评价另一个功率点，否则最佳轮选择会与当前参考不一致。
@@ -621,7 +702,11 @@ pointConfig = replace(
 如果输入不是 `GenWifi` 生成的帧，可以不设置回调：
 
 ```python
-ilcConfig = ILCConfig(evmMseEvaluator=None)
+ilcResult = RunScalarPIlc(
+    referenceSignal,
+    paModel,
+    config=ILCConfig(),
+)
 ```
 
 此时算法根据线性补偿NMSE保留最佳轮。它能去除公共复增益影响，但不能替代PHY数据子载波EVM。
@@ -640,6 +725,7 @@ firResult = RunFirIlc(
     paModel,
     ilcConfig,
     firLength=17,
+    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -655,13 +741,13 @@ gaussNewtonConfig = ILCConfig(
     learningRate=0.65,
     regularization=1e-3,
     maxAmplitude=2.0,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 gaussNewtonResult = RunDirectionalGaussNewtonIlc(
     referenceSignal,
     paModel,
     gaussNewtonConfig,
     finiteDifferenceRms=1e-3,
+    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -680,10 +766,10 @@ parameterResult = RunParameterDomainIlc(
         learningRate=0.20,
         regularization=1e-3,
         maxAmplitude=2.0,
-        evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
     ),
     nonlinearOrders=(1, 3, 5, 7),
     memoryDepth=3,
+    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -706,8 +792,8 @@ augmentedResult = RunAugmentedIqIlc(
         learningRate=0.18,
         regularization=1e-3,
         maxAmplitude=2.0,
-        evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
     ),
+    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -752,7 +838,7 @@ trainingGenerator = GenWifi(
         "bandwidthMhz": 20,
         "mcs": 7,
         "numDataSymbols": 20,
-        "oversampling": 4,
+        "sampleRateHz": 80.0e6,
         "seed": 101,
     }
 )
@@ -762,7 +848,7 @@ validationGenerator = GenWifi(
         "bandwidthMhz": 20,
         "mcs": 7,
         "numDataSymbols": 20,
-        "oversampling": 4,
+        "sampleRateHz": 80.0e6,
         "seed": 198,
     }
 )
@@ -778,7 +864,6 @@ trainingConfig = ILCConfig(
     numIterations=10,
     learningRate=0.15,
     maxAmplitude=2.0,
-    evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
 )
 trainingResult = RunFrequencyDomainIlc(
     trainingReference,
@@ -786,6 +871,7 @@ trainingResult = RunFrequencyDomainIlc(
     trainingWaveform.sampleRateHz,
     trainingWaveform.bandwidthHz,
     trainingConfig,
+    evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
 )
 
 gmpPredistorter = FitGmpPredistorter(
@@ -927,7 +1013,7 @@ from inc.DpdIlc import (
     ILCConfig,
     RunMimoFrequencyDomainIlc,
 )
-from inc.PaModel import MimoPaModel
+from inc.PaModel import MimoPaModel, PowerCalibration
 from inc.waveGen import GenWifi
 
 wifiGenerator = GenWifi(
@@ -936,7 +1022,7 @@ wifiGenerator = GenWifi(
         "bandwidthMhz": 40,
         "mcs": 9,
         "numDataSymbols": 10,
-        "oversampling": 4,
+        "sampleRateHz": 160.0e6,
         "numTransmitAntennas": 4,
         "numSpatialStreams": 2,
         "spatialMapping": "dft",
@@ -944,7 +1030,10 @@ wifiGenerator = GenWifi(
     }
 )
 waveform = wifiGenerator.Generate()
-referenceSignal = 0.20 * waveform.samples
+powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
+referenceSignal = (
+    powerCalibration.DbmToRms(-1.0) * waveform.samples
+)
 
 mimoPaModel = MimoPaModel(
     parameters={
@@ -961,12 +1050,13 @@ mimoPaModel = MimoPaModel(
             -2.0,
             -3.0,
         ),
-        "targetOutputRmsPerChain": (
+        "targetOutputPowerDbmPerChain": (
             None,
             None,
             None,
             None,
         ),
+        "loadResistanceOhm": 50.0,
     }
 )
 
@@ -1043,26 +1133,26 @@ mimoPaModel.SetOutputPowerDb(
 )
 ```
 
-也可以设置绝对输出RMS：
+也可以设置绝对输出功率 dBm：
 
 ```python
-mimoPaModel.SetTargetOutputRms(
+mimoPaModel.SetTargetOutputPowerDbm(
     chainIndex=3,
-    targetOutputRms=0.17,
+    targetOutputPowerDbm=-3.0,
 )
 ```
 
-学习PA非线性时更推荐使用固定 `outputPowerDbPerChain`，并把 `targetOutputRmsPerChain` 设置为 `None`。绝对RMS模式会根据整包当前输出重新缩放，可能掩盖部分AM-AM幅度变化；它更适合完成PA处理后的系统级功率对齐。若必须在ILC过程中启用绝对RMS，应确保每路参考目标的RMS与目标设置一致，并单独验证收敛。
+学习 PA 非线性时更推荐使用固定 `outputPowerDbPerChain`，并把 `targetOutputPowerDbmPerChain` 设置为 `None`。绝对 dBm 模式会根据整包当前输出重新缩放，可能掩盖部分 AM-AM 幅度变化；它更适合完成 PA 处理后的系统级功率对齐。若必须在 ILC 过程中启用绝对 dBm 目标，应确保每路参考目标的功率与目标设置一致，并单独验证收敛。
 
-### 14.5 读取每路实际输出RMS
+### 14.5 读取每路实际输出功率
 
 ```python
 paOutput = mimoPaModel.Process(referenceSignal)
-outputRmsPerChain = mimoPaModel.GetOutputRmsPerChain()
-print(outputRmsPerChain)
+outputPowerDbmPerChain = mimoPaModel.GetOutputPowerDbmPerChain()
+print(outputPowerDbmPerChain)
 ```
 
-`GetOutputRmsPerChain` 返回最近一次完整 `Process` 的结果。只调用 `ProcessChain` 不会更新这组完整矩阵统计。
+`GetOutputPowerDbmPerChain` 返回最近一次完整 `Process` 的结果，按同一个 `loadResistanceOhm` 换算。只调用 `ProcessChain` 不会更新这组完整矩阵统计。旧的 `GetOutputRmsPerChain` 仍可用于检查内部 RMS 电压。
 
 ---
 
@@ -1072,41 +1162,37 @@ print(outputRmsPerChain)
 
 ```python
 import numpy as np
-from dataclasses import replace
 
-driveRmsValues = np.geomspace(0.08, 0.40, 7)
+inputPowerDbmValues = np.linspace(-9.0, 5.0, 7)
 
 def RunPointIlc(
     pointReference,
-    driveRms,
+    inputPowerDbm,
 ):
     """Run point-specific ILC with a matching EVM objective."""
 
-    del driveRms
+    del inputPowerDbm
     pointAnalysis = Analysis(pointReference, waveform)
-    pointConfig = replace(
-        ilcConfig,
-        evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
-    )
     return RunFrequencyDomainIlc(
         pointReference,
         paModel,
         waveform.sampleRateHz,
         waveform.bandwidthHz,
-        pointConfig,
+        ilcConfig,
+        evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
     ).outputSignal
 
 powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
-    driveRmsValues=driveRmsValues,
+    inputPowerDbmValues=inputPowerDbmValues,
     methodEvaluators={
         "PA baseline": (
-            lambda pointReference, driveRms: paModel.Process(
+            lambda pointReference, inputPowerDbm: paModel.Process(
                 pointReference
             )
         ),
         "Frequency-domain ILC": RunPointIlc,
         "Fixed GMP deployment": (
-            lambda pointReference, driveRms: paModel.Process(
+            lambda pointReference, inputPowerDbm: paModel.Process(
                 gmpPredistorter.Process(pointReference)
             )
         ),
@@ -1174,21 +1260,39 @@ resultAnalysis.PrintConvergence(
 ### 17.2 完整ILC入口
 
 ```python
-RunScalarPIlc(referenceSignal, paModel, config=ILCConfig())
-RunComplexGainIlc(referenceSignal, paModel, config=ILCConfig())
-RunFirIlc(referenceSignal, paModel, config=ILCConfig(), firLength=17)
+RunScalarPIlc(
+    referenceSignal,
+    paModel,
+    config=ILCConfig(),
+    evmMseEvaluator=None,
+)
+RunComplexGainIlc(
+    referenceSignal,
+    paModel,
+    config=ILCConfig(),
+    evmMseEvaluator=None,
+)
+RunFirIlc(
+    referenceSignal,
+    paModel,
+    config=ILCConfig(),
+    firLength=17,
+    evmMseEvaluator=None,
+)
 RunFrequencyDomainIlc(
     referenceSignal,
     paModel,
     sampleRateHz,
     channelBandwidthHz,
     config=ILCConfig(),
+    evmMseEvaluator=None,
 )
 RunDirectionalGaussNewtonIlc(
     referenceSignal,
     paModel,
     config=ILCConfig(),
     finiteDifferenceRms=1e-3,
+    evmMseEvaluator=None,
 )
 RunParameterDomainIlc(
     referenceSignal,
@@ -1196,8 +1300,14 @@ RunParameterDomainIlc(
     config=ILCConfig(),
     nonlinearOrders=(1, 3, 5, 7),
     memoryDepth=3,
+    evmMseEvaluator=None,
 )
-RunAugmentedIqIlc(referenceSignal, paModel, config=ILCConfig())
+RunAugmentedIqIlc(
+    referenceSignal,
+    paModel,
+    config=ILCConfig(),
+    evmMseEvaluator=None,
+)
 RunMimoFrequencyDomainIlc(
     referenceSignal,
     mimoPaModel,
@@ -1206,6 +1316,8 @@ RunMimoFrequencyDomainIlc(
     config=ILCConfig(),
 )
 ```
+
+上述SISO入口的 `evmMseEvaluator` 都是与 `config` 平级的独立参数。将 `resultAnalysis.CalculateEvmAlignedMse` 传入可记录逐轮严格EVM-MSE；最终性能仍使用 `resultAnalysis.Analyze(ilcResult.outputSignal)` 计算。MIMO入口按物理PA链独立学习，完整空间解映射后的EVM应在矩阵输出产生后由MIMO `Analysis` 统一计算。
 
 ### 17.3 部署模型拟合
 
@@ -1336,11 +1448,11 @@ nextInput = LimitAmplitude(inputSignal + updateSignal)
 
 处理：确认已调用 `GenWifi.Generate()`，并且没有错误切片。
 
-### 19.2 `ILC requires at least 2x waveform oversampling`
+### 19.2 `sampleRateHz must be at least twice channelBandwidthHz`
 
 原因：`sampleRateHz` 小于两倍信道带宽。
 
-处理：提高 `GenWifi` 的 `oversampling`，完整ACLR测试建议不小于3。
+处理：直接提高 `GenWifi` 的 `sampleRateHz`；完整ACLR测试要求它不小于3倍信道带宽。
 
 ### 19.3 EVM在下降，但Raw MSE不按相同趋势下降
 
@@ -1428,9 +1540,9 @@ referenceSignal.shape[1] == mimoPaModel.numTransmitChains
 检查：
 
 - `outputPowerDbPerChain` 是否让某一路目标增益偏差过大；
-- `targetOutputRmsPerChain` 是否在每轮重新归一化并掩盖AM-AM；
+- `targetOutputPowerDbmPerChain` 是否在每轮重新归一化并掩盖 AM-AM；
 - 每路 `paParametersPerChain` 是否使用了过强非线性；
-- 每路参考RMS是否与期望PA输出一致；
+- 每路参考功率 dBm 是否与期望 PA 输出一致；
 - 是否需要按链使用不同学习率或峰值限制。
 
 当前 `RunMimoFrequencyDomainIlc` 对所有链共享一份除随机种子外的 `ILCConfig`。若各链差异很大，应分别调用 `RunFrequencyDomainIlc` 和 `MimoPaChain`，为每路提供独立配置。
@@ -1443,7 +1555,7 @@ referenceSignal.shape[1] == mimoPaModel.numTransmitChains
 
 1. 使用固定种子生成一个过采样Wi-Fi帧；
 2. 计算PA baseline；
-3. 用 `evmMseEvaluator` 运行6至10轮ILC；
+3. 向ILC入口独立传入 `evmMseEvaluator`，运行6至10轮；
 4. 检查Raw、LC和EVM三种MSE；
 5. 检查每轮输入峰值；
 6. 与同场景baseline和至少一种更简单方法比较；
@@ -1510,9 +1622,9 @@ python tests/BenchMark.py --format EHT --bandwidth 20 --mcs 7 --iterations 6
 - [ ] `referenceSignal` 已按目标工作点缩放；
 - [ ] `paModel.Process` 输入输出等长；
 - [ ] 频域ILC采样率至少为信道带宽的2倍；
-- [ ] ACLR分析时过采样倍数不小于3；
+- [ ] ACLR分析时采样率不小于3倍信道带宽；
 - [ ] `ILCConfig.Validate()` 通过；
-- [ ] Wi-Fi信号已配置匹配的 `evmMseEvaluator`；
+- [ ] Wi-Fi信号已向ILC入口传入匹配的独立 `evmMseEvaluator`；
 - [ ] `maxAmplitude` 对应真实可实现峰值；
 - [ ] 带噪比较固定了随机种子；
 - [ ] 每种特殊场景使用自己的baseline；
