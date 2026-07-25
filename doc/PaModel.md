@@ -1,6 +1,6 @@
 # 功率放大器模型：Wiener、GMP 的物理原理与公式推导
 
-本文解释 `inc/PaModel.py` 中功率放大器（Power Amplifier，PA）模型的物理意义、数学来源、参数作用和适用边界。工程支持两类模型：
+本文解释 `inc/lib/PaModel.py` 中功率放大器（Power Amplifier，PA）模型的物理意义、数学来源、参数作用和适用边界。工程支持两类模型：
 
 - **Wiener 模型**：线性记忆滤波器后接无记忆非线性，直观、参数少；
 - **GMP 模型**：主记忆多项式加包络超前/滞后交叉项，表达能力更强。
@@ -96,7 +96,7 @@ R\cdot10^{-3}\cdot10^{P_{\mathrm{dBm}}/10}
 }.
 ```
 
-`PowerCalibration` 定义在 `inc/SigProc.py`，`PaModel.py` 只导入并复用它。该类实现这两个方向的换算，`loadResistanceOhm` 默认是50 Ω，也允许用户修改。以50 Ω为例：
+`PowerCalibration` 定义在 `inc/utils/SigProc.py`，`PaModel.py` 只导入并复用它。该类实现这两个方向的换算，`loadResistanceOhm` 默认是50 Ω，也允许用户修改。以50 Ω为例：
 
 - `0 dBm` 等于1 mW，对应约 `0.223607 V RMS`；
 - `0.24 V RMS` 对应约 `0.6145 dBm`；
@@ -729,7 +729,7 @@ classDiagram
 **图 8 说明**：`PaModel` 是统一面向对象入口，内部选择 Wiener 或 GMP。`MimoPaModel` 按物理链持有多个 `PaModel` 并执行独立功率校准。`PowerCalibration` 是 `SigProc.py` 提供的独立单位换算类，并非 PA 非线性模型；`MimoPaModel` 依赖它完成绝对 dBm 标定，但 `Analysis` 无需因此导入 `PaModel.py`。`IQImbalancePA` 可以包装任意具有 `Process` 接口的 PA；反馈噪声则由独立的 `AddAwgn` 在测量链上添加。
 
 ```python
-from inc.PaModel import (
+from inc.lib.PaModel import (
     GMPConfig,
     PaModel,
     WienerConfig,
@@ -763,7 +763,7 @@ gmpOutput = paModel.Process(inputSignal)
 多路调用只传需要修改的覆盖值，默认值仍在类内部：
 
 ```python
-from inc.PaModel import MimoPaModel
+from inc.lib.PaModel import MimoPaModel
 
 mimoPaModel = MimoPaModel(
     numTransmitChains=4,
@@ -787,7 +787,7 @@ mimoPaModel.SetTargetOutputPowerDbm(
 )
 ```
 
-`PaModel` 在构造函数内部建立参数层：直接构造参数或 `UpdateParameters(...)` 位于最高优先级，调用方的外部覆盖字典位于中间层，类内不可变默认值是后备层。调用方不需要显式创建 `ChainMap`；`GetParameters()` 返回当前解析结果的字典快照。
+`PaModel` 在构造函数内部建立参数层：直接构造参数或 `UpdateParameters(...)` 位于最高优先级，调用方的外部覆盖字典位于中间层，类内不可变默认值是后备层。调用方不需要显式创建 `ChainMap`；`GetParameters()` 返回当前解析结果的字典快照。`PaModel` 与 `MimoPaModel` 都会对未知键发出 `UserWarning`、忽略该键并继续运行；已识别但不合法的模型名、系数对象或功率参数仍会抛出异常。
 
 ---
 
@@ -807,4 +807,4 @@ mimoPaModel.SetTargetOutputPowerDbm(
 - [C. Rapp, “Effects of HPA-Nonlinearity on a 4-DPSK/OFDM-Signal,” 1991](https://elib.dlr.de/33776/)
 - [D. R. Morgan 等, “A Generalized Memory Polynomial Model for Digital Predistortion of RF Power Amplifiers,” IEEE TSP, 2006](https://doi.org/10.1109/TSP.2006.879264)
 
-本工程的 Rapp AM-AM、有界 AM-PM 和默认 GMP 系数是面向教学与算法比较的组合实现；具体公式和默认值以 `inc/PaModel.py` 为准。
+本工程的 Rapp AM-AM、有界 AM-PM 和默认 GMP 系数是面向教学与算法比较的组合实现；具体公式和默认值以 `inc/lib/PaModel.py` 为准。

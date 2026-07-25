@@ -1,6 +1,6 @@
 # Wi-Fi 帧处理的物理原理与代码映射
 
-本文对应 `inc/FrameProcess.py`。该模块负责已经完成时延、频偏和公共复增益校正后的 Wi-Fi 帧处理，包括循环前缀删除、FFT、数据子载波选择、循环移位分集撤销和空间流解映射。
+本文对应 `inc/utils/FrameProcess.py`。该模块负责已经完成时延、频偏和公共复增益校正后的 Wi-Fi 帧处理，包括循环前缀删除、FFT、数据子载波选择、循环移位分集撤销和空间流解映射。
 
 ## 1. 模块边界
 
@@ -123,7 +123,7 @@ classDiagram
 ## 6. 典型调用
 
 ```python
-from inc.FrameProcess import FrameProcess
+from inc.utils.FrameProcess import FrameProcess
 
 frameProcessor = FrameProcess(wifiWaveform)
 spatialStreamSymbols = frameProcessor.DemodulatePreparedWifiData(

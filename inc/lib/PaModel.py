@@ -21,8 +21,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
-
-from .SigProc import PowerCalibration
+from ..utils.ConfigUtils import (
+    FilterRecognizedParameters,
+    RecognizedParameterView,
+)
+from ..utils.SigProc import PowerCalibration
 
 
 @dataclass(frozen=True)
@@ -299,6 +302,7 @@ class PaModel:
         wienerConfig: Optional[WienerConfig] = None,
         gmpConfig: Optional[GMPConfig] = None,
         parameters: Optional[Mapping[str, object]] = None,
+        **parameterOverrides: object,
     ) -> None:
         """Initialize the PA facade and select its active model family.
 
@@ -312,6 +316,8 @@ class PaModel:
             wienerConfig: Optional Wiener configuration; None selects built-in values.
             gmpConfig: Optional GMP configuration; None selects built-in values.
             parameters: Optional external mapping layered ahead of the built-in defaults.
+            parameterOverrides: Additional keyword settings. Unsupported names
+                produce a warning and are ignored.
 
         Returns:
             result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
@@ -323,18 +329,31 @@ class PaModel:
                 "gmpConfig": None,
             }
         )
-        parameterOverrides: Dict[str, object] = {}
+        directOverrides = dict(parameterOverrides)
         if modelName is not None:
-            parameterOverrides["modelName"] = modelName
+            directOverrides["modelName"] = modelName
         if wienerConfig is not None:
-            parameterOverrides["wienerConfig"] = wienerConfig
+            directOverrides["wienerConfig"] = wienerConfig
         if gmpConfig is not None:
-            parameterOverrides["gmpConfig"] = gmpConfig
+            directOverrides["gmpConfig"] = gmpConfig
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
-        externalParameters = {} if parameters is None else parameters
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "PaModel",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
+            directOverrides,
+            self.defaultParameters,
+            "PaModel",
+        )
         self.parameters: ChainMap[str, object] = ChainMap(
-            parameterOverrides,
+            recognizedOverrides,
             externalParameters,
             self.defaultParameters,
         )
@@ -385,8 +404,13 @@ class PaModel:
             result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
         """
 
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "PaModel.UpdateParameters",
+        )
         previousOverrides = dict(self.parameters.maps[0])
-        self.parameters.maps[0].update(parameterOverrides)
+        self.parameters.maps[0].update(recognizedOverrides)
         try:
             self.SynchronizeModel()
         except (TypeError, ValueError):
@@ -407,14 +431,6 @@ class PaModel:
             result: Tuple[str, Optional[WienerConfig], Optional[GMPConfig]]. The computed value described by the summary, with documented units, shape, and normalization.
         """
 
-        unknownParameters = set(self.parameters).difference(
-            self.defaultParameters
-        )
-        if unknownParameters:
-            unknownNames = ", ".join(
-                sorted(str(parameterName) for parameterName in unknownParameters)
-            )
-            raise TypeError(f"unknown PaModel parameters: {unknownNames}")
         rawModelName = self.parameters["modelName"]
         if not isinstance(rawModelName, str):
             raise TypeError("modelName must be a string")
@@ -537,9 +553,22 @@ class MimoPaModel:
         )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
-        externalParameters = {} if parameters is None else parameters
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "MimoPaModel",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "MimoPaModel",
+        )
         self.parameters: ChainMap[str, object] = ChainMap(
-            dict(parameterOverrides),
+            recognizedOverrides,
             externalParameters,
             self.defaultParameters,
         )
@@ -590,8 +619,13 @@ class MimoPaModel:
             result: None. Valid settings affect subsequent ``Process`` calls.
         """
 
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "MimoPaModel.UpdateParameters",
+        )
         previousOverrides = dict(self.parameters.maps[0])
-        self.parameters.maps[0].update(parameterOverrides)
+        self.parameters.maps[0].update(recognizedOverrides)
         try:
             self.SynchronizeModels()
         except (TypeError, ValueError):
@@ -691,22 +725,15 @@ class MimoPaModel:
         """Validate chain count, model mappings, and power controls.
 
         Processing details:
-            Algorithm: Reject unknown keys, validate the positive chain count,
-            resolve all per-chain sequences, validate the resistive port, and
-            reject conflicting legacy RMS and absolute dBm targets.
+            Algorithm: Validate the positive chain count, resolve all per-chain
+            sequences, validate the resistive port, and reject conflicting
+            legacy RMS and absolute dBm targets. Unknown keys have already
+            been warned about and filtered at the configuration boundary.
 
         Returns:
             result: None. Invalid settings raise descriptive exceptions.
         """
 
-        unknownParameters = set(self.parameters).difference(
-            self.defaultParameters
-        )
-        if unknownParameters:
-            unknownNames = ", ".join(
-                sorted(str(parameterName) for parameterName in unknownParameters)
-            )
-            raise TypeError(f"unknown MimoPaModel parameters: {unknownNames}")
         numTransmitChains = self.parameters["numTransmitChains"]
         if (
             not isinstance(numTransmitChains, int)

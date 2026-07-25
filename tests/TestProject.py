@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import sys
 from tempfile import TemporaryDirectory
+import warnings
 
 import numpy as np
 
@@ -28,19 +29,19 @@ def GetProjectRoot() -> Path:
 if str(GetProjectRoot()) not in sys.path:
     sys.path.insert(0, str(GetProjectRoot()))
 
-from inc.Analysis import Analysis
-from inc.DpdIlc import (
+from inc.lib.Analysis import Analysis
+from inc.lib.DpdIlc import (
     CalculateIterationMetrics,
     FitMimoGmpPredistorter,
     ILCConfig,
     RunFrequencyDomainIlc,
     RunMimoFrequencyDomainIlc,
 )
-from inc.Draw import Draw
-from inc.PaModel import MimoPaModel, PaModel
-from inc.ParseWifi import ParseWifi
-from inc.SigProc import PowerCalibration, SigProc
-from inc.WaveGenWifi import (
+from inc.utils.Draw import Draw
+from inc.lib.PaModel import MimoPaModel, PaModel
+from inc.utils.ParseWifi import ParseWifi
+from inc.utils.SigProc import PowerCalibration, SigProc
+from inc.lib.WaveGenWifi import (
     NormalizeFrameFormat,
     WaveGenWifi,
 )
@@ -129,7 +130,7 @@ def CheckFunctionStyle() -> None:
     """
 
     sourceFiles = [GetProjectRoot() / "main.py"]
-    sourceFiles.extend(sorted((GetProjectRoot() / "inc").glob("*.py")))
+    sourceFiles.extend(sorted((GetProjectRoot() / "inc").rglob("*.py")))
     sourceFiles.extend(sorted((GetProjectRoot() / "tests").glob("*.py")))
     pascalCasePattern = re.compile(r"[A-Z][A-Za-z0-9]*")
     for sourceFile in sourceFiles:
@@ -232,7 +233,7 @@ def CheckNoGlobalDataVariables() -> None:
     """
 
     productionFiles = [GetProjectRoot() / "main.py"]
-    productionFiles.extend(sorted((GetProjectRoot() / "inc").glob("*.py")))
+    productionFiles.extend(sorted((GetProjectRoot() / "inc").rglob("*.py")))
     productionFiles.extend(
         sorted((GetProjectRoot() / "tests").glob("*.py"))
     )
@@ -267,28 +268,41 @@ def CheckModuleResponsibilityBoundaries() -> None:
 
     projectRoot = GetProjectRoot()
     analysisSource = (
-        projectRoot / "inc" / "Analysis.py"
+        projectRoot / "inc" / "lib" / "Analysis.py"
     ).read_text(encoding="utf-8")
-    paSource = (projectRoot / "inc" / "PaModel.py").read_text(
+    paSource = (projectRoot / "inc" / "lib" / "PaModel.py").read_text(
         encoding="utf-8"
     )
     waveGeneratorSource = (
-        projectRoot / "inc" / "WaveGenWifi.py"
+        projectRoot / "inc" / "lib" / "WaveGenWifi.py"
     ).read_text(encoding="utf-8")
     signalProcessorSource = (
-        projectRoot / "inc" / "SigProc.py"
+        projectRoot / "inc" / "utils" / "SigProc.py"
     ).read_text(encoding="utf-8")
     frameProcessorSource = (
-        projectRoot / "inc" / "FrameProcess.py"
+        projectRoot / "inc" / "utils" / "FrameProcess.py"
     ).read_text(encoding="utf-8")
     metadataSource = (
-        projectRoot / "inc" / "WifiMetadata.py"
+        projectRoot / "inc" / "utils" / "WifiMetadata.py"
     ).read_text(encoding="utf-8")
-    ilcSource = (projectRoot / "inc" / "DpdIlc.py").read_text(
+    ilcSource = (projectRoot / "inc" / "lib" / "DpdIlc.py").read_text(
         encoding="utf-8"
     )
 
     assert not (projectRoot / "inc" / "SigProcess.py").exists()
+    for movedModuleName in (
+        "Analysis.py",
+        "DpdIlc.py",
+        "PaModel.py",
+        "WaveGenWifi.py",
+        "Draw.py",
+        "FrameProcess.py",
+        "ParseWifi.py",
+        "SigProc.py",
+        "WifiMetadata.py",
+        "ConfigUtils.py",
+    ):
+        assert not (projectRoot / "inc" / movedModuleName).exists()
     assert "class SigProc:" in signalProcessorSource
     assert "class PowerCalibration:" in signalProcessorSource
     assert "class PowerCalibration:" not in paSource
@@ -296,11 +310,11 @@ def CheckModuleResponsibilityBoundaries() -> None:
     assert "def BuildCsdPhaseMatrix(" not in waveGeneratorSource
     assert "class MCSInfo:" in metadataSource
     assert "class WifiWaveform:" in metadataSource
-    assert "from .SigProc import" in analysisSource
-    assert "from .FrameProcess import FrameProcess" in analysisSource
-    assert "from .WifiMetadata import WifiWaveform" in analysisSource
-    assert "from .PaModel import" not in analysisSource
-    assert "from .WaveGenWifi import" not in analysisSource
+    assert "from ..utils.SigProc import" in analysisSource
+    assert "from ..utils.FrameProcess import FrameProcess" in analysisSource
+    assert "from ..utils.WifiMetadata import WifiWaveform" in analysisSource
+    assert "PaModel import" not in analysisSource
+    assert "WaveGenWifi import" not in analysisSource
     assert "evmMseEvaluator" not in ilcSource
     assert "CalculateEvm" not in ilcSource
 
@@ -310,7 +324,8 @@ def CheckBenchmarkSeparation() -> None:
 
     Processing details:
         Algorithm: Inspect both source files, reject benchmark configuration,
-        scenario orchestration, or report functions in ``inc/DpdIlc.py``, and
+        scenario orchestration, or report functions in
+        ``inc/lib/DpdIlc.py``, and
         require the standalone test module plus its classified documentation
         to expose every expected scenario and result section.
 
@@ -320,7 +335,7 @@ def CheckBenchmarkSeparation() -> None:
     """
 
     ilcSource = (
-        GetProjectRoot() / "inc" / "DpdIlc.py"
+        GetProjectRoot() / "inc" / "lib" / "DpdIlc.py"
     ).read_text(encoding="utf-8")
     benchmarkPath = GetProjectRoot() / "tests" / "BenchMark.py"
     benchmarkSource = benchmarkPath.read_text(encoding="utf-8")
@@ -406,7 +421,7 @@ def CheckFunctionPrincipleCoverage() -> None:
     auditPath = GetProjectRoot() / "doc" / "FunctionPrinciples.md"
     auditText = auditPath.read_text(encoding="utf-8")
     sourceFiles = [GetProjectRoot() / "main.py"]
-    sourceFiles.extend(sorted((GetProjectRoot() / "inc").glob("*.py")))
+    sourceFiles.extend(sorted((GetProjectRoot() / "inc").rglob("*.py")))
     checkedDefinitionCount = 0
     for sourceFile in sourceFiles:
         syntaxTree = ast.parse(sourceFile.read_text(encoding="utf-8"))
@@ -644,7 +659,7 @@ def CheckInternalDefaultConfiguration() -> None:
     )
 
     # Production call sites must not reconstruct internal default layers.
-    for relativePath in ("main.py", "inc/DpdIlc.py"):
+    for relativePath in ("main.py", "inc/lib/DpdIlc.py"):
         callSiteSource = (GetProjectRoot() / relativePath).read_text(
             encoding="utf-8"
         )
@@ -1178,13 +1193,13 @@ def CheckSignalProcessingCompensation() -> None:
             encoding="utf-8-sig"
         )
     analysisSource = (
-        GetProjectRoot() / "inc" / "Analysis.py"
+        GetProjectRoot() / "inc" / "lib" / "Analysis.py"
     ).read_text(
         encoding="utf-8"
     )
-    assert "from .SigProc import" in analysisSource
-    assert "from .PaModel import" not in analysisSource
-    assert "from .WaveGenWifi import" not in analysisSource
+    assert "from ..utils.SigProc import" in analysisSource
+    assert "PaModel import" not in analysisSource
+    assert "WaveGenWifi import" not in analysisSource
     assert "def BestComplexGain" not in analysisSource
 
 
@@ -1292,7 +1307,7 @@ def CheckPowerEvmCurve() -> None:
         assert figurePath.is_file()
 
     analysisSource = (
-        GetProjectRoot() / "inc" / "Analysis.py"
+        GetProjectRoot() / "inc" / "lib" / "Analysis.py"
     ).read_text(
         encoding="utf-8"
     )
@@ -1665,6 +1680,133 @@ def CheckMseEvmConvergence() -> None:
         assert figurePath.is_file()
 
 
+def CheckUnknownConfigurationWarnings() -> None:
+    """Verify unknown configuration keys warn, disappear, and do not stop work.
+
+    Processing details:
+        Algorithm: Exercise constructor mappings, direct keyword overrides,
+        live external edits, and update methods across every ChainMap-backed
+        public class; capture warnings and confirm recognized settings remain
+        operational.
+
+    Returns:
+        result: None. Assertions enforce nonfatal unknown-key behavior.
+    """
+
+    externalWifiParameters = {
+        "mcs": 2,
+        "unknownWifiSetting": 100,
+    }
+    with warnings.catch_warnings(record=True) as capturedWarnings:
+        warnings.simplefilter("always")
+        wifiGenerator = WaveGenWifi(parameters=externalWifiParameters)
+        externalWifiParameters["lateUnknownWifiSetting"] = 200
+        wifiGenerator.GetParameters()
+        wifiGenerator.UpdateParameters(
+            numDataSymbols=2,
+            unknownWifiUpdate=300,
+        )
+        waveform = wifiGenerator.Generate()
+
+        paModel = PaModel(
+            parameters={
+                "modelName": "wiener",
+                "unknownPaSetting": 1,
+            },
+            unknownPaKeyword=2,
+        )
+        paModel.UpdateParameters(unknownPaUpdate=3)
+        paModel.Process(waveform.samples)
+
+        mimoPaModel = MimoPaModel(
+            parameters={
+                "numTransmitChains": 1,
+                "unknownMimoPaSetting": 1,
+            }
+        )
+        mimoPaModel.Process(waveform.samples)
+
+        powerCalibration = PowerCalibration(
+            parameters={
+                "loadResistanceOhm": 50.0,
+                "unknownPowerSetting": 1,
+            }
+        )
+        powerCalibration.DbmToRms(20.0)
+
+        signalProcessor = SigProc(
+            waveform.samples,
+            waveform.sampleRateHz,
+            parameters={"unknownSignalSetting": 1},
+        )
+        signalProcessor.Process(waveform.samples)
+
+        wifiParser = ParseWifi(
+            parameters={"unknownParserSetting": 1}
+        )
+        wifiParser.GetParameters()
+
+        resultAnalysis = Analysis(
+            waveform.samples,
+            waveform,
+            parameters={"unknownAnalysisSetting": 1},
+        )
+        resultAnalysis.Analyze(waveform.samples)
+
+        resultDraw = Draw(
+            parameters={"unknownDrawSetting": 1}
+        )
+        resultDraw.GetParameters()
+
+    warningText = "\n".join(
+        str(warningRecord.message)
+        for warningRecord in capturedWarnings
+    )
+    expectedUnknownNames = (
+        "unknownWifiSetting",
+        "lateUnknownWifiSetting",
+        "unknownWifiUpdate",
+        "unknownPaSetting",
+        "unknownPaKeyword",
+        "unknownPaUpdate",
+        "unknownMimoPaSetting",
+        "unknownPowerSetting",
+        "unknownSignalSetting",
+        "unknownParserSetting",
+        "unknownAnalysisSetting",
+        "unknownDrawSetting",
+    )
+    for unknownName in expectedUnknownNames:
+        assert unknownName in warningText
+    assert "unknownWifiSetting" not in wifiGenerator.GetParameters()
+    assert "unknownPaSetting" not in paModel.GetParameters()
+    assert "unknownMimoPaSetting" not in mimoPaModel.GetParameters()
+    assert (
+        "unknownPowerSetting"
+        not in powerCalibration.GetParameters()
+    )
+    assert "unknownSignalSetting" not in signalProcessor.GetParameters()
+    assert "unknownParserSetting" not in wifiParser.GetParameters()
+    assert "unknownAnalysisSetting" not in resultAnalysis.GetParameters()
+    assert "unknownDrawSetting" not in resultDraw.GetParameters()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            WaveGenWifi(
+                parameters={
+                    "mcs": 99,
+                    "unknownButIgnored": True,
+                }
+            )
+        except ValueError as error:
+            assert "MCS" in str(error)
+        else:
+            raise AssertionError(
+                "recognized invalid values must still raise an error"
+            )
+
+
 def RunTests() -> None:
     """Run all project checks and report a compact success message.
 
@@ -1684,6 +1826,7 @@ def RunTests() -> None:
     CheckFunctionPrincipleCoverage()
     CheckDocumentationMathCompatibility()
     CheckInternalDefaultConfiguration()
+    CheckUnknownConfigurationWarnings()
     CheckWifiFormats()
     CheckWifiBandwidths()
     CheckSampleRateConfiguration()

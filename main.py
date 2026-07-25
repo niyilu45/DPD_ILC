@@ -5,18 +5,18 @@ from pathlib import Path
 
 import numpy as np
 
-from inc.Analysis import Analysis
-from inc.DpdIlc import (
+from inc.lib.Analysis import Analysis
+from inc.lib.DpdIlc import (
     FitGmpPredistorter,
     FitMimoGmpPredistorter,
     ILCConfig,
     RunFrequencyDomainIlc,
     RunMimoFrequencyDomainIlc,
 )
-from inc.Draw import Draw
-from inc.PaModel import MimoPaModel, PaModel
-from inc.SigProc import PowerCalibration
-from inc.WaveGenWifi import (
+from inc.utils.Draw import Draw
+from inc.lib.PaModel import MimoPaModel, PaModel
+from inc.utils.SigProc import PowerCalibration
+from inc.lib.WaveGenWifi import (
     NormalizeFrameFormat,
     WaveGenWifi,
 )

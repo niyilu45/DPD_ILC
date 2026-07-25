@@ -2,7 +2,7 @@
 
 ## 1. 文档目的
 
-`inc/DpdIlc.py` 集中提供本工程全部可复用的ILC算法、逐轮结果结构、ILC标签部署模型以及独立逐PA的MIMO ILC。本文件只说明程序接口如何使用、参数如何配置、返回值如何解释以及常见问题如何定位。
+`inc/lib/DpdIlc.py` 集中提供本工程全部可复用的ILC算法、逐轮结果结构、ILC标签部署模型以及独立逐PA的MIMO ILC。本文件只说明程序接口如何使用、参数如何配置、返回值如何解释以及常见问题如何定位。
 
 物理原理和数学推导继续由现有原理文档负责。本手册不会修改或替代 `doc/DPD-ILC.md`。
 
@@ -79,10 +79,10 @@ from inc import (
 )
 ```
 
-其他更新律和部署模型应直接从 `inc.DpdIlc` 导入：
+其他更新律和部署模型应直接从 `inc.lib.DpdIlc` 导入：
 
 ```python
-from inc.DpdIlc import (
+from inc.lib.DpdIlc import (
     FitGmpPredistorter,
     FitLutPredistorter,
     FitNeuralPredistorter,
@@ -144,7 +144,7 @@ chainSignal = referenceSignal[:, chainIndex]
 通常先让 `WaveGenWifi` 生成单位RMS波形，再设置工作点：
 
 ```python
-from inc.SigProc import PowerCalibration
+from inc.utils.SigProc import PowerCalibration
 
 waveform = wifiGenerator.Generate()
 powerCalibration = PowerCalibration(
@@ -187,12 +187,12 @@ from pathlib import Path
 
 import numpy as np
 
-from inc.Analysis import Analysis
-from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
-from inc.Draw import Draw
-from inc.PaModel import PaModel
-from inc.SigProc import PowerCalibration
-from inc.WaveGenWifi import WaveGenWifi
+from inc.lib.Analysis import Analysis
+from inc.lib.DpdIlc import ILCConfig, RunFrequencyDomainIlc
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.utils.Draw import Draw
+from inc.utils.SigProc import PowerCalibration
 
 wifiGenerator = WaveGenWifi(
     parameters={
@@ -477,7 +477,7 @@ ilcResult = RunFrequencyDomainIlc(
 ### 8.2 同一信号比较多种更新律
 
 ```python
-from inc.DpdIlc import (
+from inc.lib.DpdIlc import (
     ILCConfig,
     RunComplexGainIlc,
     RunFirIlc,
@@ -729,7 +729,7 @@ ilcResult = RunScalarPIlc(
 ### 12.1 FIR ILC
 
 ```python
-from inc.DpdIlc import RunFirIlc
+from inc.lib.DpdIlc import RunFirIlc
 
 firResult = RunFirIlc(
     referenceSignal,
@@ -744,7 +744,7 @@ firResult = RunFirIlc(
 ### 12.2 Directional Gauss-Newton ILC
 
 ```python
-from inc.DpdIlc import RunDirectionalGaussNewtonIlc
+from inc.lib.DpdIlc import RunDirectionalGaussNewtonIlc
 
 gaussNewtonConfig = ILCConfig(
     numIterations=8,
@@ -765,7 +765,7 @@ gaussNewtonResult = RunDirectionalGaussNewtonIlc(
 ### 12.3 参数域Memory Polynomial ILC
 
 ```python
-from inc.DpdIlc import RunParameterDomainIlc
+from inc.lib.DpdIlc import RunParameterDomainIlc
 
 parameterResult = RunParameterDomainIlc(
     referenceSignal,
@@ -786,8 +786,8 @@ parameterResult = RunParameterDomainIlc(
 ### 12.4 增广IQ ILC
 
 ```python
-from inc.DpdIlc import RunAugmentedIqIlc
-from inc.PaModel import IQImbalancePA, PaModel
+from inc.lib.DpdIlc import RunAugmentedIqIlc
+from inc.lib.PaModel import IQImbalancePA, PaModel
 
 iqPaModel = IQImbalancePA(
     PaModel(parameters={"modelName": "wiener"})
@@ -831,15 +831,15 @@ x[n]\longrightarrow u^\star[n].
 ```python
 import numpy as np
 
-from inc.Analysis import Analysis
-from inc.DpdIlc import (
+from inc.lib.Analysis import Analysis
+from inc.lib.DpdIlc import (
     FitGmpPredistorter,
     ILCConfig,
     LimitAmplitude,
     RunFrequencyDomainIlc,
 )
-from inc.PaModel import PaModel
-from inc.WaveGenWifi import WaveGenWifi
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
 
 trainingGenerator = WaveGenWifi(
     parameters={
@@ -950,7 +950,7 @@ gmpPredistorter = FitGmpPredistorter(
 ### 13.5 其他部署模型示例
 
 ```python
-from inc.DpdIlc import (
+from inc.lib.DpdIlc import (
     FitLutPredistorter,
     FitNeuralPredistorter,
     FitVolterraPredistorter,
@@ -1018,15 +1018,15 @@ flowchart LR
 ### 14.2 完整4×2示例
 
 ```python
-from inc.Analysis import Analysis
-from inc.DpdIlc import (
+from inc.lib.Analysis import Analysis
+from inc.lib.DpdIlc import (
     FitMimoGmpPredistorter,
     ILCConfig,
     RunMimoFrequencyDomainIlc,
 )
-from inc.PaModel import MimoPaModel
-from inc.SigProc import PowerCalibration
-from inc.WaveGenWifi import WaveGenWifi
+from inc.lib.PaModel import MimoPaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.utils.SigProc import PowerCalibration
 
 wifiGenerator = WaveGenWifi(
     parameters={
@@ -1269,7 +1269,7 @@ powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
 ```python
 from pathlib import Path
 
-from inc.Draw import Draw
+from inc.utils.Draw import Draw
 
 outputDirectory = Path("results/custom_ilc")
 
@@ -1471,7 +1471,7 @@ def BuildUpdate(
 完整调用：
 
 ```python
-from inc.DpdIlc import RunWaveformUpdate
+from inc.lib.DpdIlc import RunWaveformUpdate
 
 customResult = RunWaveformUpdate(
     referenceSignal,

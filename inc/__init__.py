@@ -1,15 +1,15 @@
 """DPD-ILC simulation package."""
 
-from .WaveGenWifi import (
+from .lib.WaveGenWifi import (
     NormalizeFrameFormat,
     WaveGenWifi,
 )
-from .WifiMetadata import MCSInfo, WifiWaveform
-from .FrameProcess import BuildCsdPhaseMatrix, FrameProcess
-from .ParseWifi import ParsedWifiFrame, ParseWifi
-from .PaModel import GMPPA, MimoPaModel, PaModel, WienerPA
-from .SigProc import PowerCalibration, SigProc, SignalProcessingResult
-from .Analysis import (
+from .utils.WifiMetadata import MCSInfo, WifiWaveform
+from .utils.FrameProcess import BuildCsdPhaseMatrix, FrameProcess
+from .utils.ParseWifi import ParsedWifiFrame, ParseWifi
+from .lib.PaModel import GMPPA, MimoPaModel, PaModel, WienerPA
+from .utils.SigProc import PowerCalibration, SigProc, SignalProcessingResult
+from .lib.Analysis import (
     Analysis,
     ILCAnalysisResult,
     ILCPerformanceIteration,
@@ -17,8 +17,8 @@ from .Analysis import (
     PowerEvmCurve,
     SignalMetrics,
 )
-from .Draw import Draw
-from .DpdIlc import (
+from .utils.Draw import Draw
+from .lib.DpdIlc import (
     CalculateIterationMetrics,
     FitMimoGmpPredistorter,
     GMPPredistorter,

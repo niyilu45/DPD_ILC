@@ -1,4 +1,4 @@
-"""Reusable synchronization, compensation, and RF-power utilities."""
+"""Shared synchronization, compensation, and RF-power utilities."""
 
 from collections import ChainMap
 from dataclasses import dataclass
@@ -6,6 +6,11 @@ from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
+
+from .ConfigUtils import (
+    FilterRecognizedParameters,
+    RecognizedParameterView,
+)
 
 
 class PowerCalibration:
@@ -57,9 +62,22 @@ class PowerCalibration:
             )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
-        externalParameters = {} if parameters is None else parameters
-        self.parameters: ChainMap[str, object] = ChainMap(
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "PowerCalibration",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
             directOverrides,
+            self.defaultParameters,
+            "PowerCalibration",
+        )
+        self.parameters: ChainMap[str, object] = ChainMap(
+            recognizedOverrides,
             externalParameters,
             self.defaultParameters,
         )
@@ -126,8 +144,13 @@ class PowerCalibration:
             result: None. The active converter is updated in place.
         """
 
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "PowerCalibration.UpdateParameters",
+        )
         previousOverrides = dict(self.parameters.maps[0])
-        self.parameters.maps[0].update(parameterOverrides)
+        self.parameters.maps[0].update(recognizedOverrides)
         try:
             self.Validate()
         except (TypeError, ValueError):
@@ -136,26 +159,16 @@ class PowerCalibration:
             raise
 
     def Validate(self) -> None:
-        """Validate the resolved resistance and reject unknown settings.
+        """Validate the resolved resistance and output-power limit.
 
         Processing details:
-            Algorithm: Check the exact supported key set, numeric type,
-            finiteness, and positive physical domain.
+            Algorithm: Check numeric type, finiteness, and positive physical
+            domain after unknown keys have been warned about and filtered.
 
         Returns:
             result: None. Invalid calibration raises an exception.
         """
 
-        unknownParameters = set(self.parameters).difference(
-            self.defaultParameters
-        )
-        if unknownParameters:
-            unknownNames = ", ".join(
-                sorted(str(parameterName) for parameterName in unknownParameters)
-            )
-            raise TypeError(
-                f"unknown PowerCalibration parameters: {unknownNames}"
-            )
         resistanceValue = self.parameters["loadResistanceOhm"]
         if (
             not isinstance(resistanceValue, (int, float))
@@ -494,9 +507,22 @@ class SigProc:
         self.sampleRateHz = float(sampleRateHz)
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
-        externalParameters = {} if parameters is None else parameters
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "SigProc",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "SigProc",
+        )
         self.parameters: ChainMap[str, object] = ChainMap(
-            dict(parameterOverrides),
+            recognizedOverrides,
             externalParameters,
             self.defaultParameters,
         )
@@ -555,8 +581,13 @@ class SigProc:
             result: None. Valid values affect subsequent processing calls.
         """
 
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "SigProc.UpdateParameters",
+        )
         previousOverrides = dict(self.parameters.maps[0])
-        self.parameters.maps[0].update(parameterOverrides)
+        self.parameters.maps[0].update(recognizedOverrides)
         try:
             self.ValidateParameters()
         except (TypeError, ValueError):
@@ -568,22 +599,13 @@ class SigProc:
         """Validate all resolved synchronization parameters.
 
         Processing details:
-            Algorithm: Reject unknown keys first, then validate switches,
-            physical search limits, estimator window sizes, and interpolation
-            support in a deterministic order.
+            Algorithm: Validate switches, physical search limits, estimator
+            window sizes, and interpolation support after unknown keys have
+            been warned about and filtered at the configuration boundary.
 
         Returns:
             result: None. Invalid settings raise a descriptive exception.
         """
-
-        unknownParameters = set(self.parameters).difference(
-            self.defaultParameters
-        )
-        if unknownParameters:
-            unknownNames = ", ".join(
-                sorted(str(parameterName) for parameterName in unknownParameters)
-            )
-            raise TypeError(f"unknown SigProc parameters: {unknownNames}")
 
         switchNames = (
             "enableIntegerDelayCompensation",

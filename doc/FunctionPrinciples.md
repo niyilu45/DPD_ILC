@@ -1,11 +1,11 @@
 # 全工程函数与物理原理覆盖审计
 
-本文是 `main.py` 和 `inc/*.py` 的函数级原理索引。它回答两个问题：
+本文是 `main.py` 和 `inc/**/*.py` 的函数级原理索引。它回答两个问题：
 
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `inc` 中183个函数/方法定义位置，以及 `main.py` 中3个入口函数。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
+本次审计共检查 `main.py` 和 `inc/**/*.py` 中 232 个函数/方法定义位置。核心业务类位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
 
 ## 1. 分类规则
 
@@ -29,7 +29,7 @@ flowchart LR
     pa --> sync
     sync --> analysis["Analysis.md：MSE/SNR/EVM/ACLR"]
     analysis --> report["打印/保存/绘图"]
-    audit["本文：197 个定义位置逐项索引"] -.-> wave
+    audit["本文：232 个定义位置逐项索引"] -.-> wave
     audit -.-> pa
     audit -.-> ilc
     audit -.-> sync
@@ -47,6 +47,16 @@ flowchart LR
 | `main.ParseOptionalDbmSequence` | E | 把每PA的绝对dBm目标解析为有限实数或 `None`；允许负dBm | [PaModel.md：多路输出功率](./PaModel.md) |
 | `main.Main` | E | 按“波形→PA→ILC→部署 DPD→同步→指标→绘图”编排；物理计算由被调用模块完成 | [README 工作流](../README.md)、图 1 |
 
+### 2.1 `ConfigUtils.py`：未知配置容错
+
+| 函数/方法 | 类型 | 原理或职责 | 详细依据 |
+|---|---|---|---|
+| `ConfigUtils.FindUnknownParameterNames` | E | 比较调用方键和类内默认键集合，稳定列出无法识别的配置名；不改变任何物理量 | [README 配置容错](../README.md) |
+| `ConfigUtils.WarnUnknownParameters` | E | 通过标准 `UserWarning` 一次报告一组被忽略配置，不中断仿真 | [README 配置容错](../README.md) |
+| `ConfigUtils.FilterRecognizedParameters` | E | 为构造函数直接覆盖和 `UpdateParameters` 复制已识别键、忽略未知键 | [README 配置容错](../README.md) |
+| `RecognizedParameterView.__init__`, `RecognizedParameterView.WarnForNewUnknownParameters` | E | 保留外部字典动态更新语义，并对运行期间新加入的未知键只警告一次 | [README 配置容错](../README.md) |
+| `RecognizedParameterView.__getitem__`, `RecognizedParameterView.__iter__`, `RecognizedParameterView.__len__` | E | 实现只暴露已识别键的实时只读映射视图，供各类内部 `ChainMap` 使用 | [README 配置容错](../README.md) |
+
 ## 3. `WaveGenWifi.py`：Wi-Fi 波形函数
 
 详细物理推导统一见 [WaveGenWifi.md](./WaveGenWifi.md)。
@@ -54,7 +64,7 @@ flowchart LR
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
 | `WaveGenWifi.NormalizeFrameFormat` | E | 把 11ac/11ax/11be 别名规范为 VHT/HE/EHT，不改变波形 | WaveGenWifi §8.1 |
-| `WaveGenWifi.__init__`, `WaveGenWifi.GetParameters`, `WaveGenWifi.UpdateParameters`, `WaveGenWifi.Validate` | E | ChainMap 配置、单位和合法域校验；保证后续公式输入有效 | WaveGenWifi §12–14 |
+| `WaveGenWifi.__init__`, `WaveGenWifi.GetParameters`, `WaveGenWifi.UpdateParameters`, `WaveGenWifi.Validate` | E | ChainMap 配置、未知键警告后忽略、已识别值合法域校验；保证后续公式输入有效 | WaveGenWifi §12–14 |
 | `WaveGenWifi.FrameFormat`, `WaveGenWifi.BandwidthMhz`, `WaveGenWifi.Mcs`, `WaveGenWifi.NumDataSymbols`, `WaveGenWifi.GuardIntervalUs`, `WaveGenWifi.SampleRateHz`, `WaveGenWifi.Oversampling`, `WaveGenWifi.Seed`, `WaveGenWifi.NumTransmitAntennas`, `WaveGenWifi.NumSpatialStreams`, `WaveGenWifi.SpatialMapping`, `WaveGenWifi.SpatialMappingMatrix`, `WaveGenWifi.CyclicShiftEnabled` | E | 返回已验证配置；采样率由 `sampleRateHz` 直接决定，旧 `oversampling` 只在未配置采样率时用于兼容推导 | WaveGenWifi §12 |
 | `WaveGenWifi.ResolveMcsTable`, `WaveGenWifi.GetMcsInfo` | P/E | 在方法内部构造不可变 MCS 表并返回调制阶数、名义码率和每音调比特数，不保留模块级查表变量 | WaveGenWifi §5 |
 | `WaveGenWifi.Generate`, `WaveGenWifi.GenerateWifiWaveform` | P/E | 组装完整 VHT/HE/EHT 复基带帧并保存解调元数据 | WaveGenWifi §2、§8、§10 |
@@ -80,7 +90,7 @@ flowchart LR
 | `ParseWifi.CalculateDescriptorCrc` | N | 按CRC-16-CCITT多项式验证描述字段的时序、采样率和内容 | ParseWifi §3.3 |
 | `ParseWifi.BuildWifiDescriptorBits`, `ParseWifi.DecodeWifiDescriptorBits` | E/N | 打包或恢复格式、带宽、MCS、GI、空间流、映射和随机种子 | ParseWifi §3 |
 | `ParseWifi.BuildWifiDescriptorField` | P/N | 把104个描述比特映射到两个重复发送的52音调BPSK传统OFDM符号 | ParseWifi §4 |
-| `ParseWifi.__init__`, `ParseWifi.GetParameters`, `ParseWifi.UpdateParameters`, `ParseWifi.ValidateParameters` | E | 在类内建立ChainMap默认参数并验证接收时钟、搜索范围和自定义空间映射 | ParseWifi §7 |
+| `ParseWifi.__init__`, `ParseWifi.GetParameters`, `ParseWifi.UpdateParameters`, `ParseWifi.ValidateParameters` | E | 在类内建立ChainMap默认参数，警告并忽略未知键，再验证接收时钟、搜索范围和自定义空间映射 | ParseWifi §7 |
 | `ParseWifi.ResolveSampleRates` | E | 使用显式接收时钟，或产生按顺序尝试的常见复基带采样率 | ParseWifi §5.2 |
 | `ParseWifi.ValidateReceivedSignal` | E/N | 自动从NumPy数组或 `WifiWaveform.samples` 取样，并检查SISO向量或samples×chains矩阵的形状与有限性 | ParseWifi §5.1 |
 | `ParseWifi.DecodeDescriptorAt` | P/N | 对候选时刻去CP、FFT、用magic word去公共相位、BPSK硬判决并验证CRC | ParseWifi §5.3 |
@@ -101,10 +111,10 @@ flowchart LR
 | `WienerPA.SmallSignalGain` | P/N | 取零幅度极限，返回线性 FIR 直流复增益 | PaModel §3.5 |
 | `GMPPA.Process` | P/N | 计算主、滞后包络和超前包络 GMP 支路 | PaModel §4.2–§4.6 |
 | `GMPPA.SmallSignalGain` | P/N | 只保留一阶主支路得到小信号增益 | PaModel §4.7 |
-| `PaModel.__init__`, `PaModel.ResolveConfiguration`, `PaModel.SynchronizeModel` | E | ChainMap 覆盖解析并构造选定 Wiener/GMP 内核 | PaModel §12 |
+| `PaModel.__init__`, `PaModel.ResolveConfiguration`, `PaModel.SynchronizeModel` | E | ChainMap 覆盖解析、未知键警告后忽略，并构造选定 Wiener/GMP 内核 | PaModel §12 |
 | `PaModel.ModelName`, `PaModel.GetParameters`, `PaModel.UpdateParameters` | E | 查询或更新配置；更新后重建模型以保持状态一致 | PaModel §12 |
 | `PaModel.Process`, `PaModel.SmallSignalGain` | E/P | 统一分派到选定物理 PA 的同名计算 | PaModel §9、§12 |
-| `MimoPaModel.__init__`, `MimoPaModel.ResolveNumericSequence`, `MimoPaModel.ResolvePaParametersPerChain`, `MimoPaModel.ValidateParameters`, `MimoPaModel.SynchronizeModels` | E | 把标量/序列配置扩展到每条物理链并构造独立 PA | PaModel §10 |
+| `MimoPaModel.__init__`, `MimoPaModel.ResolveNumericSequence`, `MimoPaModel.ResolvePaParametersPerChain`, `MimoPaModel.ValidateParameters`, `MimoPaModel.SynchronizeModels` | E | 警告并忽略未知键，把已识别标量/序列配置扩展到每条物理链并构造独立PA | PaModel §10 |
 | `MimoPaModel.NumTransmitChains`, `MimoPaModel.GetParameters`, `MimoPaModel.UpdateParameters` | E | 返回或更新多路配置，不改变功率定义 | PaModel §10、§12 |
 | `MimoPaModel.SetOutputPowerDb`, `MimoPaModel.SetTargetOutputRms`, `MimoPaModel.SetTargetOutputPowerDbm` | P/E | 设置相对幅度比例、旧RMS目标或基于端口阻抗的绝对dBm目标；dB幅度比例为 $10^{P_{dB}/20}$ | PaModel §10 |
 | `MimoPaModel.Process`, `MimoPaModel.ProcessChain` | P/N | 每列通过独立 PA，再执行相对增益或经端口阻抗换算的绝对 dBm 校准 | PaModel §10、§10.2 |
@@ -183,12 +193,12 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.MaximumOutputPowerDbm`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate` | E | 用ChainMap保存并验证50 Ω端口与默认25 dBm额定输出极限 | SigProc §13 |
+| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.MaximumOutputPowerDbm`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate` | E | 用ChainMap保存50 Ω端口与默认25 dBm额定输出极限；未知键警告后忽略，已识别值继续严格验证 | SigProc §13 |
 | `PowerCalibration.DbmToRms`, `PowerCalibration.RmsToDbm` | P/N | 按 $P=V_{\mathrm{RMS}}^2/R$ 在绝对 dBm 功率与复包络 RMS 电压之间双向换算 | SigProc §13 |
 | `PowerCalibration.OutputPowerToDriveScale` | P | 按目标输出相对额定极限的输出回退量计算归一化PA驱动比例 | SigProc §13 |
 | `PowerCalibration.ScaleSignalToOutputPower`, `PowerCalibration.ScaleSignalToOutputPowers` | P/E | 以不改变EVM和ACLR比值的逐链常数增益，把PA输出标定到目标dBm | SigProc §13 |
 | `SignalProcessingResult.ToDict` | E | 只序列化估计标量，不重新计算同步 | SigProc §9 |
-| `SigProc.__init__`, `SigProc.ValidateSignal`, `SigProc.GetParameters`, `SigProc.UpdateParameters`, `SigProc.ValidateParameters` | E | 保存参考、解析 ChainMap、检查单位和有限性 | SigProc §9–§10 |
+| `SigProc.__init__`, `SigProc.ValidateSignal`, `SigProc.GetParameters`, `SigProc.UpdateParameters`, `SigProc.ValidateParameters` | E | 保存参考、解析ChainMap、警告并忽略未知键、检查已识别配置的单位和有限性 | SigProc §9–§10 |
 | `SigProc.ResolveMaximumIntegerDelay` | N/E | 把自动/外部时延边界转换为有限相关搜索半径 | SigProc §3、§12 |
 | `SigProc.EstimateIntegerDelay` | P/N | FFT 互相关并按重叠能量归一化，最大相关峰给出整数时延 | SigProc §3 |
 | `SigProc.ExtractIntegerAligned` | N | 按估计时延提取重叠样点并对缺失位置补零 | SigProc §3 |
@@ -221,7 +231,7 @@ flowchart LR
 | `Analysis.Analyze`, `Analysis.GetLastMimoMetrics` | E | 直接返回普通指标字典，调用方使用固定键读取SNR、EVM、ACLR和MIMO明细 | Analysis §10 |
 | `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把曲线或逐轮记录转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann 窗、50% 重叠的 Welch PSD 平均 | Analysis §6.2 |
-| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 保留显式参考路径；省略 `waveform` 时调用ParseWifi恢复参考和元数据，再解析指标/同步参数并校验 | Analysis §1–§2、§11、ParseWifi §8 |
+| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 保留显式参考路径；省略 `waveform` 时调用ParseWifi恢复参考和元数据；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§2、§11、ParseWifi §8 |
 | `Analysis.GetParsedWifiFrame` | E | 返回仅接收帧构造路径保存的解析结果；显式参考路径返回 `None` | Analysis §1、ParseWifi §8 |
 | `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc` | Analysis §2、§9 |
 | `Analysis.GetLastSignalProcessingResult`, `Analysis.GetLastSignalProcessingResults`, `Analysis.GetLastMimoMetrics`, `Analysis.GetStageSignalProcessingResults`, `Analysis.GetStageMimoMetrics` | E | 返回缓存的不可变结果，不重新估计 | Analysis §9–§10 |
@@ -246,7 +256,7 @@ flowchart LR
 
 | 函数/方法 | 原理或职责 | 数据来源 |
 |---|---|---|
-| `Draw.__init__`, `Draw.GetParameters`, `Draw.UpdateParameters`, `Draw.ValidateParameters` | ChainMap 图形参数、尺寸、DPI、文字和文件名校验 | README 的 Draw 参数表 |
+| `Draw.__init__`, `Draw.GetParameters`, `Draw.UpdateParameters`, `Draw.ValidateParameters` | E | ChainMap图形参数解析；未知键警告后忽略，已识别尺寸、DPI、文字和文件名继续校验 | README 的 Draw 参数表 |
 | `Draw.ValidatePowerEvmCurve` | 检查横坐标、方法数组长度及有限性 | `Analysis.AnalyzePowerEvmCurve` |
 | `Draw.CreatePowerEvmFigure`, `Draw.SavePowerEvmCurve` | 在同一坐标绘制/保存多方法 EVM；不重算 EVM | Analysis §8 |
 | `Draw.ValidateConvergenceHistory` | 检查轮次递增和 Raw/LC/EVM 序列完整性 | Analysis §5.10 |

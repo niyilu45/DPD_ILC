@@ -1,4 +1,4 @@
-"""Wi-Fi OFDM frame demodulation and spatial-stream processing.
+"""Shared Wi-Fi OFDM frame demodulation and spatial-stream processing.
 
 The module contains receiver-side frame operations shared by waveform
 analysis and any future Wi-Fi receiver. It depends only on neutral waveform

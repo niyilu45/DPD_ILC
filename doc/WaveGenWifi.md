@@ -1,6 +1,6 @@
 # VHT/HE/EHT Wi-Fi 帧生成：物理原理、公式推导与代码映射
 
-本文解释 `inc/WaveGenWifi.py` 中 `WaveGenWifi` 的物理意义和数学实现。阅读目标不是只知道“代码怎样运行”，而是理解一串随机比特为什么能变成具有 Wi-Fi 带宽、频谱形状、峰均比和帧结构的复基带波形。
+本文解释 `inc/lib/WaveGenWifi.py` 中 `WaveGenWifi` 的物理意义和数学实现。阅读目标不是只知道“代码怎样运行”，而是理解一串随机比特为什么能变成具有 Wi-Fi 带宽、频谱形状、峰均比和帧结构的复基带波形。
 
 > **实现边界**：本工程生成的是用于 PA/DPD/ILC 仿真的 **VHT/HE/EHT PHY 激励波形**。它保留带宽、子载波间隔、MCS、OFDM、保护间隔和字段时长等关键特征，但没有实现完整 BCC/LDPC 编码、标准交织、逐比特 SIG 编码和逐采样标准训练序列，因此不能替代协议一致性测试仪或标准接收机。
 
@@ -748,7 +748,7 @@ R\,10^{-3}10^{p_{\mathrm{out,dBm}}/10}
 最典型的调用方式只提供需要修改的普通字典；默认值由 `WaveGenWifi` 构造函数在类内部补齐：
 
 ```python
-from inc.WaveGenWifi import WaveGenWifi
+from inc.lib.WaveGenWifi import WaveGenWifi
 
 wifiOverrides = {
     "frameFormat": "11ac",
@@ -766,7 +766,7 @@ wifiOverrides["guardIntervalUs"] = 0.8
 updatedWaveform = wifiGenerator.Generate()
 ```
 
-`WaveGenWifi` 在构造函数内部建立“构造函数直接覆盖 → 外部映射 → 类内只读默认值”的 `ChainMap`。调用方不需要导入默认参数表，也不需要显式创建 `ChainMap`。`UpdateParameters(...)` 可写入最高优先级层，`GetParameters()` 可取得当前解析结果的字典快照。
+`WaveGenWifi` 在构造函数内部建立“构造函数直接覆盖 → 外部映射 → 类内只读默认值”的 `ChainMap`。调用方不需要导入默认参数表，也不需要显式创建 `ChainMap`。`UpdateParameters(...)` 可写入最高优先级层，`GetParameters()` 可取得当前解析结果的字典快照。无法识别的键会产生 `UserWarning` 并被忽略；其余已识别配置继续生效，已识别但取值非法的配置仍会报错。
 
 ---
 
@@ -790,4 +790,4 @@ updatedWaveform = wifiGenerator.Generate()
 - [Keysight 802.11be 信号配置简介：EHT 最多 8 空间流](https://helpfiles.keysight.com/csg/n5186/Content/WLAN/802%2011be%20Introduction.htm)
 - [IEEE Standards Board：802.11be-2024 批准信息](https://standards.ieee.org/about/sasb/sba/26sep2024/)
 
-以上标准链接用于说明 VHT/HE/EHT 的标准来源；本文中的具体“工程实现边界”以 `inc/WaveGenWifi.py` 为准。
+以上标准链接用于说明 VHT/HE/EHT 的标准来源；本文中的具体“工程实现边界”以 `inc/lib/WaveGenWifi.py` 为准。

@@ -2,7 +2,7 @@
 
 ## 1. 文档目的
 
-`tests/BenchMark.py` 是工程中唯一负责“构造测试场景并比较 ILC 性能”的文件。`inc/DpdIlc.py` 只保存可复用的 ILC 更新律、SISO/MIMO 执行函数和标签部署模型，不再生成测试波形、不再选择测试场景，也不再保存 benchmark 报告。
+`tests/BenchMark.py` 是工程中唯一负责“构造测试场景并比较 ILC 性能”的文件。`inc/lib/DpdIlc.py` 只保存可复用的 ILC 更新律、SISO/MIMO 执行函数和标签部署模型，不再生成测试波形、不再选择测试场景，也不再保存 benchmark 报告。
 
 本文件对 benchmark 做分层说明。每一类都按以下顺序展开：
 
@@ -509,14 +509,14 @@ benchmarkRows = RunAllIlcBenchmark(benchmarkConfig)
 
 ### 13.1 为什么benchmark必须独立于DpdIlc.py
 
-`inc/DpdIlc.py` 回答“某一种ILC如何计算更新”，`tests/BenchMark.py` 回答“在什么条件下比较哪些算法、使用什么baseline、输出哪些结果”。两者职责不同：
+`inc/lib/DpdIlc.py` 回答“某一种ILC如何计算更新”，`tests/BenchMark.py` 回答“在什么条件下比较哪些算法、使用什么baseline、输出哪些结果”。两者职责不同：
 
 | 层次 | 负责内容 | 不负责内容 |
 |---|---|---|
-| `inc/DpdIlc.py` | 更新律、峰值投影、反馈测量、迭代记录、标签模型拟合 | 选择测试帧、构造IQ失衡场景、决定报告目录 |
+| `inc/lib/DpdIlc.py` | 更新律、峰值投影、反馈测量、迭代记录、标签模型拟合 | 选择测试帧、构造IQ失衡场景、决定报告目录 |
 | `tests/BenchMark.py` | 测试帧、PA工作点、特殊损伤、算法组合、结果保存、预期验证 | 重新实现ILC数学更新 |
-| `inc/Analysis.py` | 同步补偿、SNR、EVM、ACLR及功率扫描数据 | 决定哪个算法应参加哪个场景 |
-| `inc/Draw.py` | 把已经计算好的数据绘图 | 重新计算指标或修改测试信号 |
+| `inc/lib/Analysis.py` | 同步补偿、SNR、EVM、ACLR及功率扫描数据 | 决定哪个算法应参加哪个场景 |
+| `inc/utils/Draw.py` | 把已经计算好的数据绘图 | 重新计算指标或修改测试信号 |
 
 这种拆分使算法可以被主程序、单元测试或硬件控制程序复用，同时避免生产模块在被导入时隐式创建测试文件。
 

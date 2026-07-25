@@ -1,4 +1,4 @@
-"""Unified iterative learning control and deployable DPD implementations.
+"""Core iterative learning control and deployable DPD implementations.
 
 This module is the single home of reusable ILC-related algorithms in the
 project. It contains common convergence records, every waveform and parameter

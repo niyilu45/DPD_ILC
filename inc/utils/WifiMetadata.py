@@ -1,4 +1,4 @@
-"""Shared Wi-Fi modulation and waveform metadata.
+"""Utility Wi-Fi modulation and waveform metadata.
 
 This module contains data-only structures consumed by waveform generation,
 frame processing, and result analysis. Keeping these structures independent

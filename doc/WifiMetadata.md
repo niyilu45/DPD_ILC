@@ -1,6 +1,6 @@
 # Wi-Fi 共享元数据的数据契约
 
-本文对应 `inc/WifiMetadata.py`。该模块不生成波形，也不计算指标，只定义 `MCSInfo` 和 `WifiWaveform` 两个跨模块数据结构。
+本文对应 `inc/utils/WifiMetadata.py`。该模块不生成波形，也不计算指标，只定义 `MCSInfo` 和 `WifiWaveform` 两个跨模块数据结构。
 
 ## 1. 为什么需要独立元数据模块
 

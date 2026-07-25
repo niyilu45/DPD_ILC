@@ -7,7 +7,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
-from .Analysis import PowerEvmCurve
+from ..lib.Analysis import PowerEvmCurve
+from .ConfigUtils import (
+    FilterRecognizedParameters,
+    RecognizedParameterView,
+)
 
 
 class Draw:
@@ -61,9 +65,22 @@ class Draw:
         )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
-        externalParameters = {} if parameters is None else parameters
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "Draw",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "Draw",
+        )
         self.parameters: ChainMap[str, object] = ChainMap(
-            dict(parameterOverrides),
+            recognizedOverrides,
             externalParameters,
             self.defaultParameters,
         )
@@ -97,8 +114,13 @@ class Draw:
             result: None. Valid values become active for subsequent plots.
         """
 
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "Draw.UpdateParameters",
+        )
         previousOverrides = dict(self.parameters.maps[0])
-        self.parameters.maps[0].update(parameterOverrides)
+        self.parameters.maps[0].update(recognizedOverrides)
         try:
             self.ValidateParameters()
         except (TypeError, ValueError):
@@ -110,22 +132,13 @@ class Draw:
         """Validate every resolved plotting parameter and file-name setting.
 
         Processing details:
-            Algorithm: Reject unknown keys first, then check string fields,
-            positive dimensions, integer DPI, and legend layout constraints in
-            a deterministic order.
+            Algorithm: Check string fields, positive dimensions, integer DPI,
+            and legend layout constraints in a deterministic order. Unknown
+            keys have already been warned about and filtered at the boundary.
 
         Returns:
             result: None. Invalid configuration raises a descriptive error.
         """
-
-        unknownParameters = set(self.parameters).difference(
-            self.defaultParameters
-        )
-        if unknownParameters:
-            unknownNames = ", ".join(
-                sorted(str(parameterName) for parameterName in unknownParameters)
-            )
-            raise TypeError(f"unknown Draw parameters: {unknownNames}")
 
         for parameterName in ("powerEvmFileStem", "convergenceFileStem"):
             fileStem = self.parameters[parameterName]

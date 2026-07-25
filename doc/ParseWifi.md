@@ -2,7 +2,7 @@
 
 ## 1. 模块目标
 
-`inc/ParseWifi.py` 用于从接收到的VHT、HE或EHT复基带波形中恢复 `Analysis` 所需的参考信号和帧元数据。
+`inc/utils/ParseWifi.py` 用于从接收到的VHT、HE或EHT复基带波形中恢复 `Analysis` 所需的参考信号和帧元数据。
 
 工程现在保留两条Analysis入口：
 
@@ -423,7 +423,7 @@ parseParameters = {
 parser = ParseWifi(parameters=parseParameters)
 ```
 
-外部字典变化会保持ChainMap的动态覆盖语义。也可以使用：
+外部字典变化会保持ChainMap的动态覆盖语义。未知键会产生 `UserWarning` 并被忽略，不会阻止接收解析；已识别但非法的采样率、搜索范围或空间映射仍会报错。也可以使用：
 
 ```python
 parser.UpdateParameters(
@@ -438,7 +438,7 @@ parser.UpdateParameters(
 ### 8.1 最简仅接收帧分析
 
 ```python
-from inc.Analysis import Analysis
+from inc.lib.Analysis import Analysis
 
 resultAnalysis = Analysis(receivedSignal)
 metrics = resultAnalysis.Analyze()
@@ -505,7 +505,7 @@ metrics = resultAnalysis.Analyze(receivedSignal)
 ### 8.5 独立使用ParseWifi
 
 ```python
-from inc.ParseWifi import ParseWifi
+from inc.utils.ParseWifi import ParseWifi
 
 parser = ParseWifi(
     sampleRateHz=80.0e6,

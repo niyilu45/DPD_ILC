@@ -1,6 +1,6 @@
 # 信号同步、补偿与功率标定的物理原理和推导
 
-本文对应 `inc/SigProc.py`。该模块位于“测量/仿真输出”和“性能指标计算”之间，专门处理整数时延、分数时延、载波频偏、采样频偏、公共复增益和 dBm/RMS 功率标定。`Analysis` 只消费校正后的信号并计算 SNR、EVM、ACLR，避免把同步误差错误地解释为 PA 非线性。
+本文对应 `inc/utils/SigProc.py`。该模块位于“测量/仿真输出”和“性能指标计算”之间，专门处理整数时延、分数时延、载波频偏、采样频偏、公共复增益和 dBm/RMS 功率标定。`Analysis` 只消费校正后的信号并计算 SNR、EVM、ACLR，避免把同步误差错误地解释为 PA 非线性。
 
 ---
 
@@ -292,7 +292,7 @@ classDiagram
 
 ## 10. 可配置参数
 
-所有默认值都定义在 `SigProc.__init__` 内部，调用方只传需要覆盖的键。
+所有默认值都定义在 `SigProc.__init__` 内部，调用方只传需要覆盖的键。未知键通过 `UserWarning` 报告后被忽略，信号处理继续使用其余已识别配置；已识别配置如果类型、单位或范围非法，仍会抛出异常。
 
 | 参数 | 默认值 | 物理含义 |
 |---|---:|---|
@@ -315,7 +315,7 @@ classDiagram
 直接使用工具类：
 
 ```python
-from inc.SigProc import SigProc
+from inc.utils.SigProc import SigProc
 
 signalProcessor = SigProc(
     referenceSignal,
@@ -334,7 +334,7 @@ print(processingResult.ToDict())
 通过 `Analysis` 自动调用：
 
 ```python
-from inc.Analysis import Analysis
+from inc.lib.Analysis import Analysis
 
 resultAnalysis = Analysis(
     referenceSignal,
@@ -412,7 +412,7 @@ flowchart LR
     resistance --> dbmOutput
 ```
 
-**图 3 说明：**`PowerCalibration` 为主程序、`PaModel`、`Analysis` 和 Benchmark 提供同一个端口阻抗基准。它位于 `SigProc.py` 后，`Analysis` 不再需要为了功率换算而导入 `PaModel.py`。
+**图 3 说明：**`PowerCalibration` 为主程序、`PaModel`、`Analysis` 和 Benchmark 提供同一个端口阻抗基准。它位于 `SigProc.py` 后，`Analysis` 不再需要为了功率换算而导入 `PaModel.py`。其 `ChainMap` 参数同样遵循“未知键警告并忽略、已识别非法值继续报错”的规则。
 
 默认每路PA极限输出功率为
 
@@ -445,7 +445,7 @@ V_{\mathrm{RMS}}
 ```python
 import numpy as np
 
-from inc.SigProc import PowerCalibration
+from inc.utils.SigProc import PowerCalibration
 
 powerCalibration = PowerCalibration(
     loadResistanceOhm=50.0,

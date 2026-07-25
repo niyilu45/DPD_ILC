@@ -1,6 +1,6 @@
 # 结果计算：SNR、EVM、ACLR 与功率–EVM 曲线原理
 
-本文解释 `inc/Analysis.py` 中结果统计的物理含义和公式推导。分析器最终都以理想发送参考波形和 `WifiWaveform` 元数据为基准；这些信息既可以由调用方显式提供，也可以由 `ParseWifi` 从接收帧恢复。随后对 PA、ILC 或部署型 DPD 输出统一计算：
+本文解释 `inc/lib/Analysis.py` 中结果统计的物理含义和公式推导。分析器最终都以理想发送参考波形和 `WifiWaveform` 元数据为基准；这些信息既可以由调用方显式提供，也可以由 `ParseWifi` 从接收帧恢复。随后对 PA、ILC 或部署型 DPD 输出统一计算：
 
 - 数据字段时域 SNR；
 - Wi-Fi 数据子载波 RMS EVM；
@@ -83,7 +83,7 @@ from pathlib import Path
 
 import numpy as np
 
-from inc.Analysis import Analysis
+from inc.lib.Analysis import Analysis
 
 
 # Load one complete receive capture, including the project signaling field.
@@ -122,9 +122,9 @@ print(f"EVM: {metrics['evmPercent']:.3f} %")
 ```python
 import numpy as np
 
-from inc.Analysis import Analysis
-from inc.PaModel import PaModel
-from inc.WaveGenWifi import WaveGenWifi
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
 
 
 # Generate the waveform only to construct a reproducible receive example.
@@ -1460,7 +1460,7 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 曲线计算与显示采用职责分离：
 
 - `Analysis.SavePowerEvmCurveData` 生成 CSV 和 JSON，分别用于表格处理和保存方法分组结构；
-- `Draw.SavePowerEvmCurve` 位于 `inc/Draw.py`，只负责把全部方法绘制到同一张 PNG 图中。
+- `Draw.SavePowerEvmCurve` 位于 `inc/utils/Draw.py`，只负责把全部方法绘制到同一张 PNG 图中。
 
 ILC 每轮收敛结果另外输出：
 
@@ -1505,8 +1505,8 @@ ILC 每轮收敛结果另外输出：
 ```python
 import numpy as np
 
-from inc.Analysis import Analysis
-from inc.Draw import Draw
+from inc.lib.Analysis import Analysis
+from inc.utils.Draw import Draw
 
 analysisOverrides = {
     "maxSegmentLength": 8192,
@@ -1576,7 +1576,7 @@ if wifiWaveform.numTransmitAntennas > 1:
     print(mimoMetrics)
 ```
 
-`Analysis`、`Draw` 和 `SigProc` 都在各自构造函数内部定义只读默认参数并建立 `ChainMap`；调用方只传需要修改的普通字典。`signalProcessingParameters` 是传给 `SigProc` 的嵌套覆盖字典。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。
+`Analysis`、`Draw` 和 `SigProc` 都在各自构造函数内部定义只读默认参数并建立 `ChainMap`；调用方只传需要修改的普通字典。`signalProcessingParameters` 是传给 `SigProc` 的嵌套覆盖字典。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。任何层出现未知键时，代码会发出 `UserWarning`、忽略该键并继续；已识别键的类型、单位和物理范围仍严格校验。
 
 功率–EVM 扫描的评估器接口为：
 
@@ -1645,4 +1645,4 @@ EVM/SNR 去除了一个标量增益和相位。如果要研究 AM-AM 平均增�
 - [IEEE 802.11ax-2021 标准页面](https://standards.ieee.org/ieee/802.11ax/7180/)
 - [IEEE 802.11be-2024 标准页面](https://standards.ieee.org/ieee/802.11be/7516/)
 
-ETSI 链接用于说明 ACLR 的通用物理定义，不表示本工程采用 3GPP 的具体测量滤波器或限值；本工程的实际积分窗口以 `inc/Analysis.py` 为准。
+ETSI 链接用于说明 ACLR 的通用物理定义，不表示本工程采用 3GPP 的具体测量滤波器或限值；本工程的实际积分窗口以 `inc/lib/Analysis.py` 为准。

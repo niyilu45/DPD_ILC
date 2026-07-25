@@ -20,10 +20,14 @@ from typing import (
 
 import numpy as np
 
-from .FrameProcess import FrameProcess
-from .ParseWifi import ParsedWifiFrame, ParseWifi
-from .SigProc import PowerCalibration, SigProc, SignalProcessingResult
-from .WifiMetadata import WifiWaveform
+from ..utils.ConfigUtils import (
+    FilterRecognizedParameters,
+    RecognizedParameterView,
+)
+from ..utils.FrameProcess import FrameProcess
+from ..utils.ParseWifi import ParsedWifiFrame, ParseWifi
+from ..utils.SigProc import PowerCalibration, SigProc, SignalProcessingResult
+from ..utils.WifiMetadata import WifiWaveform
 
 
 class SignalMetrics(TypedDict):
@@ -310,9 +314,22 @@ class Analysis:
         self.frameProcessor = FrameProcess(selectedWaveform)
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
-        externalParameters = {} if parameters is None else parameters
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "Analysis",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "Analysis",
+        )
         self.parameters: ChainMap[str, object] = ChainMap(
-            dict(parameterOverrides),
+            recognizedOverrides,
             externalParameters,
             self.defaultParameters,
         )
@@ -370,8 +387,13 @@ class Analysis:
             result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
         """
 
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "Analysis.UpdateParameters",
+        )
         previousOverrides = dict(self.parameters.maps[0])
-        self.parameters.maps[0].update(parameterOverrides)
+        self.parameters.maps[0].update(recognizedOverrides)
         try:
             self.ValidateParameters()
         except (TypeError, ValueError):
@@ -389,14 +411,6 @@ class Analysis:
             result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
         """
 
-        unknownParameters = set(self.parameters).difference(
-            self.defaultParameters
-        )
-        if unknownParameters:
-            unknownNames = ", ".join(
-                sorted(str(parameterName) for parameterName in unknownParameters)
-            )
-            raise TypeError(f"unknown Analysis parameters: {unknownNames}")
         maxSegmentLength = self.parameters["maxSegmentLength"]
         if (
             not isinstance(maxSegmentLength, int)

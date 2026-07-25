@@ -17,6 +17,10 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 
+from .ConfigUtils import (
+    FilterRecognizedParameters,
+    RecognizedParameterView,
+)
 from .WifiMetadata import WifiWaveform
 
 
@@ -419,9 +423,22 @@ class ParseWifi:
         )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
-        externalParameters = {} if parameters is None else parameters
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "ParseWifi",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "ParseWifi",
+        )
         self.parameters: ChainMap[str, object] = ChainMap(
-            dict(parameterOverrides),
+            recognizedOverrides,
             externalParameters,
             self.defaultParameters,
         )
@@ -454,8 +471,13 @@ class ParseWifi:
             result: None. Valid overrides remain active.
         """
 
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "ParseWifi.UpdateParameters",
+        )
         previousOverrides = dict(self.parameters.maps[0])
-        self.parameters.maps[0].update(parameterOverrides)
+        self.parameters.maps[0].update(recognizedOverrides)
         try:
             self.ValidateParameters()
         except (TypeError, ValueError):
@@ -467,22 +489,14 @@ class ParseWifi:
         """Validate parser options before searching a receive capture.
 
         Processing details:
-            Algorithm: Reject unknown names, invalid clock candidates, unsafe
-            packet-offset ranges, confidence values outside zero through one,
-            and malformed optional custom spatial matrices.
+            Algorithm: Check clock candidates, packet-offset ranges, confidence
+            values, and optional custom spatial matrices after unknown keys
+            have been warned about and filtered at the configuration boundary.
 
         Returns:
             result: None. Invalid parameters raise descriptive exceptions.
         """
 
-        unknownParameters = set(self.parameters).difference(
-            self.defaultParameters
-        )
-        if unknownParameters:
-            unknownNames = ", ".join(
-                sorted(str(parameterName) for parameterName in unknownParameters)
-            )
-            raise TypeError(f"unknown ParseWifi parameters: {unknownNames}")
         sampleRateHz = self.parameters["sampleRateHz"]
         if sampleRateHz is not None and (
             not isinstance(sampleRateHz, (int, float))
@@ -1110,7 +1124,7 @@ class ParseWifi:
 
         # Import locally to keep the receive-parser module free of a module-load
         # cycle while allowing the transmitter to reuse the descriptor writer.
-        from .WaveGenWifi import WaveGenWifi
+        from ..lib.WaveGenWifi import WaveGenWifi
 
         referenceWaveform = WaveGenWifi(
             parameters=generatorParameters

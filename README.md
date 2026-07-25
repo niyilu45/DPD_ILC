@@ -20,21 +20,22 @@
 python -m pip install -r requirements.txt
 ```
 
-工程使用 NumPy 完成信号处理；Matplotlib 只由 `inc/Draw.py` 调用，用于生成 PNG 曲线图。
+工程使用 NumPy 完成信号处理；Matplotlib 只由 `inc/utils/Draw.py` 调用，用于生成 PNG 曲线图。
 
 ## 工程结构
 
 ```text
 main.py                 命令行主程序
-inc/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
-inc/WifiMetadata.py     MCSInfo 与 WifiWaveform 纯数据契约
-inc/FrameProcess.py     Wi-Fi 去 CP、FFT、CSD 撤销与空间流解映射
-inc/ParseWifi.py        接收帧描述解析、包起点检测与参考波形恢复
-inc/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
-inc/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
-inc/SigProc.py          SigProc 同步补偿、SignalProcessingResult 与 PowerCalibration
-inc/Analysis.py         SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
-inc/Draw.py             功率-EVM 多方法同图绘制与 PNG 输出
+inc/lib/Analysis.py         SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
+inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
+inc/lib/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
+inc/lib/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
+inc/utils/ConfigUtils.py    ChainMap未知配置警告、过滤与外部活动映射视图
+inc/utils/Draw.py           功率-EVM 多方法同图绘制与 PNG 输出
+inc/utils/FrameProcess.py   Wi-Fi 去 CP、FFT、CSD 撤销与空间流解映射
+inc/utils/ParseWifi.py      接收帧描述解析、包起点检测与参考波形恢复
+inc/utils/SigProc.py        SigProc 同步补偿、SignalProcessingResult 与 PowerCalibration
+inc/utils/WifiMetadata.py   MCSInfo 与 WifiWaveform 纯数据契约
 inc/__init__.py         公共接口汇总
 tests/TestProject.py    自包含验证脚本
 tests/BenchMark.py      分类场景 ILC 性能基准、结果保存和功率-EVM比较
@@ -125,7 +126,30 @@ flowchart TD
 
 以下结构图中，箭头 `A → B` 表示 `A` 调用、创建或依赖 `B`；以类名标记的节点保存配置或运行状态，以函数名标记的节点执行具体算法。
 
-### `inc/WaveGenWifi.py`
+### `inc/utils/ConfigUtils.py`
+
+```mermaid
+flowchart LR
+    caller["构造函数或UpdateParameters"] --> find["FindUnknownParameterNames"]
+    find --> warn["WarnUnknownParameters"]
+    caller --> filter["FilterRecognizedParameters"]
+    filter --> find
+    external["调用方活动字典"] --> view["RecognizedParameterView"]
+    view --> refresh["WarnForNewUnknownParameters"]
+    refresh --> find
+    view --> mapping["__getitem__ / __iter__ / __len__"]
+    mapping --> chainMap["各业务类内部ChainMap"]
+    filter --> chainMap
+```
+
+**图示说明：**
+
+- 构造函数直接关键字和 `UpdateParameters` 通过 `FilterRecognizedParameters` 复制已识别键；未知键由 `WarnUnknownParameters` 一次汇总报告并被忽略。
+- `RecognizedParameterView` 不复制调用方外部字典，因此保留运行期间修改配置的动态语义；视图只向 `ChainMap` 暴露已识别键。
+- 外部字典后来加入新的未知键时，`WarnForNewUnknownParameters` 在下一次访问时报告该键。相同未知名称不会在每个采样点重复刷屏。
+- 该模块只处理配置编排，不参与 Wi-Fi、PA、ILC、EVM 或功率计算。
+
+### `inc/lib/WaveGenWifi.py`
 
 ```mermaid
 flowchart TD
@@ -178,7 +202,7 @@ flowchart TD
 - `BuildWifiDescriptorField` 在VHT-SIG-A、HE-SIG-A或U-SIG位置写入两个CRC保护的BPSK OFDM符号，使仅接收波形路径能够恢复本工程随机激励所需参数；它是仿真解析描述，不是bit-exact标准SIG编码器。
 - `WaveGenWifi.Generate` 是面向调用方的波形入口，并由内部辅助函数 `GenerateWifiWaveform` 完成组帧，最终返回 `WifiWaveform`；其中既有时域样本，也有后续 EVM 解调所需的格式、字段切片和参考星座。
 
-### `inc/WifiMetadata.py`
+### `inc/utils/WifiMetadata.py`
 
 ```mermaid
 flowchart TD
@@ -195,7 +219,7 @@ flowchart TD
 - `WaveGenWifi` 负责创建 `WifiWaveform`；`FrameProcess` 和 `Analysis` 只消费这份稳定的数据契约，因此不需要导入波形生成算法。
 - `WifiWaveform` 保存时域样点、采样率、FFT/GI 参数、数据字段起点、音调索引、空间映射矩阵、CSD、确定性生成种子和参考空间流星座。
 
-### `inc/ParseWifi.py`
+### `inc/utils/ParseWifi.py`
 
 ```mermaid
 flowchart TD
@@ -224,7 +248,7 @@ flowchart TD
 - 发送辅助路径使用逐链能量归一化互相关细化接收包起点，对低SNR、PA压缩和MIMO链间相位差更稳健。
 - 详细字段布局、相关公式、参数表、适用边界和完整调用示例见[ParseWifi说明文档](doc/ParseWifi.md)。
 
-### `inc/FrameProcess.py`
+### `inc/utils/FrameProcess.py`
 
 ```mermaid
 flowchart TD
@@ -249,7 +273,7 @@ flowchart TD
 - `FrameProcess` 只处理已由 `SigProc` 对齐到参考采样网格的信号，输出空间流域 Wi-Fi 数据星座。
 - 未知空口 MIMO 信道估计、均衡和相位噪声跟踪不属于当前类的职责。
 
-### `inc/PaModel.py`
+### `inc/lib/PaModel.py`
 
 ```mermaid
 flowchart TD
@@ -298,7 +322,7 @@ flowchart TD
 - `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。
 - `MimoPaModel` 不在链间引入隐含耦合：每一列进入独立 `PaModel`。`ProcessChain` 是单路 ILC 看到的真实 plant；相对 dB 与绝对 dBm 功率设置均在该路径中生效。
 
-### `inc/DpdIlc.py`
+### `inc/lib/DpdIlc.py`
 
 ```mermaid
 flowchart TD
@@ -373,7 +397,7 @@ flowchart TD
 
 **图示说明：**`BenchMark.py` 只负责场景编排和结果呈现，不重新实现任何ILC更新律。场景分类、预期趋势和本机参考结果见[BenchMark场景说明](doc/BenchMark.md)。
 
-### `inc/SigProc.py`
+### `inc/utils/SigProc.py`
 
 ```mermaid
 flowchart TD
@@ -404,7 +428,7 @@ flowchart TD
 - `SignalProcessingResult` 同时保存校正样点和所有标量估计，`ToDict()` 可用于记录估计结果。
 - `PowerCalibration` 在同一信号处理模块中集中完成复包络 RMS 电压与绝对功率 dBm 的双向换算，PA 与功率扫描共享相同端口阻抗约定。
 
-### `inc/Analysis.py`
+### `inc/lib/Analysis.py`
 
 ```mermaid
 flowchart TD
@@ -469,7 +493,7 @@ flowchart TD
 - MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
 - `AnalyzePowerEvmCurve` 接收一组严格递增的每路PA输出功率点和多个方法求值器，以25 dBm默认极限为0 dB输出回退确定归一化驱动，并把各方法结果标定到相同输出功率后计算EVM；`SavePowerEvmCurveData` 只保存原始CSV/JSON数据，不导入或调用任何绘图库。
 
-### `inc/Draw.py`
+### `inc/utils/Draw.py`
 
 ```mermaid
 flowchart TD
@@ -631,7 +655,7 @@ flowchart LR
 `sampleRateHz` 是采样时钟的权威输入。例如：
 
 ```python
-from inc.WaveGenWifi import WaveGenWifi
+from inc.lib.WaveGenWifi import WaveGenWifi
 
 wifiGenerator = WaveGenWifi(
     frameFormat="EHT",
@@ -647,7 +671,7 @@ assert waveform.oversampling == 2.5
 
 采样率与带宽的比值可以是非整数，但采样率必须让有效OFDM符号、GI和传统前导时长得到整数采样点。若未提供 `sampleRateHz`，旧 `oversampling` 参数仍可兼容现有调用。
 
-### `PowerCalibration` 参数与方法（位于 `inc/SigProc.py`）
+### `PowerCalibration` 参数与方法（位于 `inc/utils/SigProc.py`）
 
 `PowerCalibration(parameters=None, **parameterOverrides)` 负责绝对功率标定。工程约定复包络的 RMS 幅度等于电阻端口上的 RF RMS 电压，因此
 
@@ -951,11 +975,42 @@ PA 辅助接口还包括：
 
 调用方省略的键会自动从对应类的内部默认层读取。外部字典仍是活动映射：构造实例后继续修改它，下一次 `Generate()`、`Process()`、分析计算或绘图会读取新值。
 
+### 配置容错：未知键警告后忽略
+
+所有面向用户的 `ChainMap` 配置入口采用统一规则：
+
+- 未知配置键通过标准 `UserWarning` 报告；
+- 未知键不会写入有效参数层，也不会中断函数；
+- 同一个外部活动字典在运行期间新加入未知键时，也会在下一次访问时警告并忽略；
+- `UpdateParameters(...)` 同样只应用能够识别的键；
+- 已识别键如果类型错误、超出范围或违反物理约束，仍然抛出异常。
+
 ```python
-from inc.Analysis import Analysis
-from inc.Draw import Draw
-from inc.PaModel import PaModel
-from inc.WaveGenWifi import WaveGenWifi
+import warnings
+
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+wifiOverrides = {
+    "mcs": 9,
+    "unsupportedOption": 123,
+}
+
+with warnings.catch_warnings(record=True) as warningRecords:
+    warnings.simplefilter("always")
+    wifiGenerator = WaveGenWifi(parameters=wifiOverrides)
+    waveform = wifiGenerator.Generate()
+
+print(warningRecords[0].message)
+# WaveGenWifi ignored unknown configuration parameter(s): unsupportedOption
+```
+
+这里 `mcs=9` 正常生效，`unsupportedOption` 被忽略，波形仍会生成。该策略适合长时间 benchmark 和仪表联调：拼写错误或旧版本遗留键不会让整批任务停止，但警告仍会明确记录配置问题。
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.utils.Draw import Draw
 
 # Only externally changed values are placed in the first mapping.
 wifiOverrides = {
@@ -1048,10 +1103,10 @@ python main.py --format EHT --bandwidth 20 --tx-antennas 4 --spatial-streams 2 -
 ```python
 import numpy as np
 
-from inc.Analysis import Analysis
-from inc.PaModel import MimoPaModel
-from inc.SigProc import PowerCalibration
-from inc.WaveGenWifi import WaveGenWifi
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import MimoPaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.utils.SigProc import PowerCalibration
 
 wifiGenerator = WaveGenWifi(
     frameFormat="11ax",
@@ -1107,9 +1162,9 @@ resultAnalysis.PrintMimo()
 ### 示例七：使用 Python 实例接口完成 PA 和指标分析
 
 ```python
-from inc.Analysis import Analysis
-from inc.PaModel import PaModel
-from inc.WaveGenWifi import WaveGenWifi
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
 
 wifiGenerator = WaveGenWifi(
     parameters={
@@ -1144,8 +1199,8 @@ print(resultAnalysis.GetLastSignalProcessingResult().ToDict())
 ### 示例八：自定义 Wiener PA
 
 ```python
-from inc.PaModel import PaModel, WienerConfig
-from inc.WaveGenWifi import WaveGenWifi
+from inc.lib.PaModel import PaModel, WienerConfig
+from inc.lib.WaveGenWifi import WaveGenWifi
 
 wifiGenerator = WaveGenWifi(
     parameters={
@@ -1177,10 +1232,10 @@ paOutput = paModel.Process(referenceSignal)
 ### 示例九：程序化运行频域 ILC 并批量分析
 
 ```python
-from inc.Analysis import Analysis
-from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
-from inc.PaModel import PaModel
-from inc.WaveGenWifi import WaveGenWifi
+from inc.lib.Analysis import Analysis
+from inc.lib.DpdIlc import ILCConfig, RunFrequencyDomainIlc
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
 
 wifiGenerator = WaveGenWifi(
     parameters={
@@ -1232,7 +1287,7 @@ print(stageMetrics["Frequency-domain ILC"])
 ```python
 from pathlib import Path
 
-from inc.Draw import Draw
+from inc.utils.Draw import Draw
 
 outputDirectory = Path("results/programmatic_curve")
 powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
@@ -1330,7 +1385,7 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 完全不提供发送参考：
 
 ```python
-from inc.Analysis import Analysis
+from inc.lib.Analysis import Analysis
 
 resultAnalysis = Analysis(
     receivedInput,

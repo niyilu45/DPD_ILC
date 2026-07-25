@@ -3,7 +3,7 @@
 This test module owns waveform construction, impairment scenarios, metric
 comparison, convergence reporting, held-out deployment validation, and the
 multi-method power-EVM curve. Production ILC algorithms remain in
-``inc.DpdIlc`` and do not depend on this benchmark harness.
+``inc.lib.DpdIlc`` and do not depend on this benchmark harness.
 """
 
 import argparse
@@ -35,9 +35,9 @@ def GetProjectRoot() -> Path:
 if str(GetProjectRoot()) not in sys.path:
     sys.path.insert(0, str(GetProjectRoot()))
 
-from inc.Analysis import Analysis, ILCAnalysisResult, SignalMetrics
-from inc.Draw import Draw
-from inc.DpdIlc import (
+from inc.lib.Analysis import Analysis, ILCAnalysisResult, SignalMetrics
+from inc.utils.Draw import Draw
+from inc.lib.DpdIlc import (
     FitGmpPredistorter,
     FitLutPredistorter,
     FitNeuralPredistorter,
@@ -53,10 +53,10 @@ from inc.DpdIlc import (
     RunParameterDomainIlc,
     RunScalarPIlc,
 )
-from inc.PaModel import IQImbalancePA, PaModel
-from inc.SigProc import PowerCalibration
-from inc.WaveGenWifi import WaveGenWifi
-from inc.WifiMetadata import WifiWaveform
+from inc.lib.PaModel import IQImbalancePA, PaModel
+from inc.utils.SigProc import PowerCalibration
+from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.utils.WifiMetadata import WifiWaveform
 
 
 # =============================================================================

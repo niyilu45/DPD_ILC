@@ -19,9 +19,13 @@ from typing import Dict, Mapping, Optional, Tuple, cast
 
 import numpy as np
 
-from .FrameProcess import BuildCsdPhaseMatrix
-from .ParseWifi import BuildWifiDescriptorField
-from .WifiMetadata import MCSInfo, WifiWaveform
+from ..utils.ConfigUtils import (
+    FilterRecognizedParameters,
+    RecognizedParameterView,
+)
+from ..utils.FrameProcess import BuildCsdPhaseMatrix
+from ..utils.ParseWifi import BuildWifiDescriptorField
+from ..utils.WifiMetadata import MCSInfo, WifiWaveform
 
 
 def NormalizeFrameFormat(frameFormat: str) -> str:
@@ -113,9 +117,22 @@ class WaveGenWifi:
         )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
-        externalParameters = {} if parameters is None else parameters
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "WaveGenWifi",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "WaveGenWifi",
+        )
         self.parameters: ChainMap[str, object] = ChainMap(
-            dict(parameterOverrides),
+            recognizedOverrides,
             externalParameters,
             self.defaultParameters,
         )
@@ -415,8 +432,13 @@ class WaveGenWifi:
             result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
         """
 
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "WaveGenWifi.UpdateParameters",
+        )
         previousOverrides = dict(self.parameters.maps[0])
-        self.parameters.maps[0].update(parameterOverrides)
+        self.parameters.maps[0].update(recognizedOverrides)
         try:
             self.Validate()
         except (TypeError, ValueError):
@@ -434,14 +456,6 @@ class WaveGenWifi:
             result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
         """
 
-        unknownParameters = set(self.parameters).difference(
-            self.defaultParameters
-        )
-        if unknownParameters:
-            unknownNames = ", ".join(
-                sorted(str(parameterName) for parameterName in unknownParameters)
-            )
-            raise TypeError(f"unknown WaveGenWifi parameters: {unknownNames}")
         normalizedFormat = NormalizeFrameFormat(
             cast(str, self.parameters["frameFormat"])
         )
