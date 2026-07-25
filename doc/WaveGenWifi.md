@@ -722,7 +722,7 @@ p_{\mathrm{dBm}}
 | 活动/导频音调 | `ActiveTones`、`PilotTones` | 中心化子载波索引 |
 | OFDM 调制 | `OfdmSymbol` | IFFT 有效符号和 CP |
 | 空间映射 | `BuildSpatialMappingMatrix`、`SpatialMapTones` | 每子载波物理链向量 |
-| 循环移位 | `GetCyclicShifts`、`BuildCsdPhaseMatrix` | 各链频率相关相位 |
+| 循环移位 | `GetCyclicShifts`、`FrameProcess.BuildCsdPhaseMatrix` | 各链频率相关相位 |
 | 多流训练 | `GetLtfSymbolCount`、`BuildLtfTrainingMatrix` | 正交 LTF 符号 |
 | MIMO OFDM | `BuildMimoOfdmSymbol` | `samples × transmitChains` 时域符号 |
 | 前导激励 | `TrainingField` | 4 µs 传统速率宽带字段 |

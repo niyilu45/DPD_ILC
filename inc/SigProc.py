@@ -1,11 +1,203 @@
-"""Reusable synchronization and impairment-compensation utilities."""
+"""Reusable synchronization, compensation, and RF-power utilities."""
 
 from collections import ChainMap
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple, cast
 
 import numpy as np
+
+
+class PowerCalibration:
+    """Convert complex-envelope RMS voltage and absolute dBm power.
+
+    The project uses the explicit convention that the RMS magnitude of a
+    complex baseband waveform is the RMS voltage delivered to the configured
+    resistive port. Under this convention ``P = Vrms**2 / R``. Keeping the
+    resistance beside the signal-processing utilities gives PA models,
+    analysis, benchmarks, and command-line code one independent power scale.
+    """
+
+    def __init__(
+        self,
+        loadResistanceOhm: Optional[float] = None,
+        parameters: Optional[Mapping[str, object]] = None,
+        **parameterOverrides: object,
+    ) -> None:
+        """Initialize a live ChainMap-backed RF power calibration.
+
+        Processing details:
+            Algorithm: Define the standard 50-ohm default inside this
+            constructor, layer caller values ahead of it, and validate the
+            resolved resistance before any logarithmic conversion.
+
+        Args:
+            loadResistanceOhm: Optional resistive port value in ohms.
+            parameters: Optional caller-owned mapping of calibration values.
+            parameterOverrides: Highest-priority local calibration overrides.
+
+        Returns:
+            result: None. The converter is ready for dBm/RMS transformations.
+        """
+
+        self.defaultParameters: Mapping[str, object] = MappingProxyType(
+            {"loadResistanceOhm": 50.0}
+        )
+        directOverrides = dict(parameterOverrides)
+        if loadResistanceOhm is not None:
+            directOverrides["loadResistanceOhm"] = loadResistanceOhm
+        if parameters is not None and not isinstance(parameters, Mapping):
+            raise TypeError("parameters must be a mapping or None")
+        externalParameters = {} if parameters is None else parameters
+        self.parameters: ChainMap[str, object] = ChainMap(
+            directOverrides,
+            externalParameters,
+            self.defaultParameters,
+        )
+        self.Validate()
+
+    @property
+    def LoadResistanceOhm(self) -> float:
+        """Return the resolved resistive port value in ohms.
+
+        Processing details:
+            Algorithm: Read the highest-priority ChainMap value after
+            constructor and update validation.
+
+        Returns:
+            result: Positive finite resistance in ohms.
+        """
+
+        return float(cast(float, self.parameters["loadResistanceOhm"]))
+
+    loadResistanceOhm = LoadResistanceOhm
+
+    def GetParameters(self) -> Dict[str, object]:
+        """Return a flattened calibration parameter snapshot.
+
+        Processing details:
+            Algorithm: Resolve all ChainMap layers without changing the live
+            caller-owned mapping.
+
+        Returns:
+            result: Ordinary dictionary containing the resolved resistance.
+        """
+
+        return dict(self.parameters)
+
+    def UpdateParameters(self, **parameterOverrides: object) -> None:
+        """Apply and validate high-priority calibration overrides.
+
+        Processing details:
+            Algorithm: Update the local ChainMap layer transactionally and
+            restore the previous values if validation fails.
+
+        Args:
+            parameterOverrides: Local calibration values to replace.
+
+        Returns:
+            result: None. The active converter is updated in place.
+        """
+
+        previousOverrides = dict(self.parameters.maps[0])
+        self.parameters.maps[0].update(parameterOverrides)
+        try:
+            self.Validate()
+        except (TypeError, ValueError):
+            self.parameters.maps[0].clear()
+            self.parameters.maps[0].update(previousOverrides)
+            raise
+
+    def Validate(self) -> None:
+        """Validate the resolved resistance and reject unknown settings.
+
+        Processing details:
+            Algorithm: Check the exact supported key set, numeric type,
+            finiteness, and positive physical domain.
+
+        Returns:
+            result: None. Invalid calibration raises an exception.
+        """
+
+        unknownParameters = set(self.parameters).difference(
+            self.defaultParameters
+        )
+        if unknownParameters:
+            unknownNames = ", ".join(
+                sorted(str(parameterName) for parameterName in unknownParameters)
+            )
+            raise TypeError(
+                f"unknown PowerCalibration parameters: {unknownNames}"
+            )
+        resistanceValue = self.parameters["loadResistanceOhm"]
+        if (
+            not isinstance(resistanceValue, (int, float))
+            or isinstance(resistanceValue, bool)
+            or not np.isfinite(resistanceValue)
+            or resistanceValue <= 0.0
+        ):
+            raise ValueError(
+                "loadResistanceOhm must be finite and positive"
+            )
+
+    def DbmToRms(self, inputPowerDbm: float) -> float:
+        """Convert absolute port power in dBm to complex-envelope RMS volts.
+
+        Processing details:
+            Algorithm: Convert dBm to watts with the one-milliwatt reference,
+            multiply by resistance, and take the positive RMS square root.
+
+        Args:
+            inputPowerDbm: Absolute available power in dBm.
+
+        Returns:
+            result: Positive RMS voltage used to scale a unit-RMS waveform.
+        """
+
+        if (
+            not isinstance(inputPowerDbm, (int, float))
+            or isinstance(inputPowerDbm, bool)
+            or not np.isfinite(inputPowerDbm)
+        ):
+            raise ValueError("inputPowerDbm must be finite")
+        # Compute the voltage directly with a 20-log amplitude exponent. This
+        # is algebraically identical to converting through watts, while NumPy
+        # lets the explicit finite-range check handle overflow and underflow.
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            rmsVoltage = (
+                np.sqrt(1.0e-3 * self.loadResistanceOhm)
+                * np.power(10.0, float(inputPowerDbm) / 20.0)
+            )
+        if not np.isfinite(rmsVoltage) or rmsVoltage <= 0.0:
+            raise ValueError("inputPowerDbm is outside the numeric range")
+        return float(rmsVoltage)
+
+    def RmsToDbm(self, signalRms: float) -> float:
+        """Convert complex-envelope RMS volts to absolute port power in dBm.
+
+        Processing details:
+            Algorithm: Divide squared RMS voltage by resistance to obtain
+            watts, normalize by one milliwatt, and take ten-base logarithms.
+
+        Args:
+            signalRms: Positive complex-envelope RMS voltage.
+
+        Returns:
+            result: Absolute resistive-port power in dBm.
+        """
+
+        if (
+            not isinstance(signalRms, (int, float))
+            or isinstance(signalRms, bool)
+            or not np.isfinite(signalRms)
+            or signalRms <= 0.0
+        ):
+            raise ValueError("signalRms must be finite and positive")
+        # The logarithmic form avoids squaring a very large finite voltage.
+        return float(
+            20.0 * np.log10(float(signalRms))
+            - 10.0 * np.log10(self.loadResistanceOhm * 1.0e-3)
+        )
 
 
 @dataclass(frozen=True)
@@ -49,7 +241,7 @@ class SignalProcessingResult:
         }
 
 
-class SigProcess:
+class SigProc:
     """Estimate and compensate deterministic baseband signal impairments.
 
     The processor uses a known complex reference waveform. A data-aided
@@ -202,7 +394,7 @@ class SigProcess:
             unknownNames = ", ".join(
                 sorted(str(parameterName) for parameterName in unknownParameters)
             )
-            raise TypeError(f"unknown SigProcess parameters: {unknownNames}")
+            raise TypeError(f"unknown SigProc parameters: {unknownNames}")
 
         switchNames = (
             "enableIntegerDelayCompensation",
@@ -800,10 +992,10 @@ class SigProcess:
             result: Least-squares complex gain applied by the measured path.
         """
 
-        complexReference = SigProcess.ValidateSignal(
+        complexReference = SigProc.ValidateSignal(
             referenceSignal, "referenceSignal"
         )
-        complexMeasured = SigProcess.ValidateSignal(
+        complexMeasured = SigProc.ValidateSignal(
             measuredSignal, "measuredSignal"
         )
         if complexReference.size != complexMeasured.size:

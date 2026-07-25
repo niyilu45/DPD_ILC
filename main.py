@@ -14,7 +14,8 @@ from inc.DpdIlc import (
     RunMimoFrequencyDomainIlc,
 )
 from inc.Draw import Draw
-from inc.PaModel import MimoPaModel, PaModel, PowerCalibration
+from inc.PaModel import MimoPaModel, PaModel
+from inc.SigProc import PowerCalibration
 from inc.WaveGenWifi import (
     NormalizeFrameFormat,
     WaveGenWifi,

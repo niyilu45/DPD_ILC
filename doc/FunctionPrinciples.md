@@ -22,7 +22,10 @@ flowchart LR
     wave["WaveGenWifi.md：激励波形"] --> pa["PaModel.md：PA 与反馈链"]
     pa --> ilc["DPD-ILC.md：学习与部署 DPD"]
     wave --> ilc
-    ilc --> sync["SigProcess.md：同步与补偿"]
+    ilc --> sync["SigProc.md：同步、补偿与功率标定"]
+    wave --> metadata["WifiMetadata.md：共享数据契约"]
+    metadata --> frame["FrameProcess.md：OFDM与空间解映射"]
+    frame --> analysis
     pa --> sync
     sync --> analysis["Analysis.md：MSE/SNR/EVM/ACLR"]
     analysis --> report["打印/保存/绘图"]
@@ -62,7 +65,7 @@ flowchart LR
 | `WaveGenWifi.TrainingField` | P/N | 在 bonded 20 MHz 子信道上构造传统训练激励 | WaveGenWifi §8.5 |
 | `WaveGenWifi.BuildSpatialMappingMatrix`, `WaveGenWifi.SpatialMapTones` | P/N | 构造列正交映射矩阵并完成空间流到天线映射 | WaveGenWifi §8.7 |
 | `WaveGenWifi.GetLtfSymbolCount`, `WaveGenWifi.BuildLtfTrainingMatrix` | P/N | 选择训练符号数并用正交矩阵分离空间流 | WaveGenWifi §8.6、§8.9 |
-| `WaveGenWifi.GetCyclicShifts`, `WaveGenWifi.BuildCsdPhaseMatrix` | P/N | 时移在频域表示为线性相位，形成循环移位分集 | WaveGenWifi §8.8 |
+| `WaveGenWifi.GetCyclicShifts` | P/N | 返回各物理链的格式相关循环移位；相位矩阵由独立 FrameProcess 模块构造 | WaveGenWifi §8.8、FrameProcess §2 |
 | `WaveGenWifi.BuildMimoOfdmSymbol` | P/N | 合并 QAM、导频、空间映射、CSD、IFFT 和 CP | WaveGenWifi §3、§8.7–§8.9 |
 | `WaveGenWifi.MapCommonFieldToAntennas` | P/E | 把公共前导复制到物理链并施加链级 CSD，保持公共字段含义 | WaveGenWifi §8.8、§8.10 |
 | `WaveGenWifi.AppendField` | E | 内部闭包：顺序拼接字段并记录切片，不改变字段采样值 | WaveGenWifi §8.2–§8.5 |
@@ -73,8 +76,6 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate` | E | 用ChainMap保存并验证可配置的电阻端口，默认50 Ω | PaModel §2 |
-| `PowerCalibration.DbmToRms`, `PowerCalibration.RmsToDbm` | P/N | 按 $P=V_{\mathrm{RMS}}^2/R$ 在绝对dBm功率与复包络RMS电压之间双向换算 | PaModel §2 |
 | `WienerConfig.Validate`, `GMPConfig.Validate` | E | 检查饱和幅度、阶次、记忆和系数合法性 | PaModel §3.6、§4 |
 | `WienerPA.__init__`, `GMPPA.__init__` | E | 保存已验证模型参数，不另引入物理过程 | PaModel §3、§4 |
 | `WienerPA.Process` | P/N | FIR 线性记忆→Rapp AM-AM→幅度相关 AM-PM | PaModel §3.1–§3.4 |
@@ -157,27 +158,40 @@ flowchart LR
 
 若存在天线耦合、电源耦合或串扰，上述逐链分解不成立，必须使用 DPD-ILC §3.10 的联合增广 MIMO 模型。
 
-## 6. `SigProcess.py`：同步和补偿函数
+## 6. `SigProc.py`：同步、补偿和功率标定函数
 
-详细推导统一见 [SigProcess.md](./SigProcess.md)。
+详细推导统一见 [SigProc.md](./SigProc.md)。
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `SignalProcessingResult.ToDict` | E | 只序列化估计标量，不重新计算同步 | SigProcess §9 |
-| `SigProcess.__init__`, `SigProcess.ValidateSignal`, `SigProcess.GetParameters`, `SigProcess.UpdateParameters`, `SigProcess.ValidateParameters` | E | 保存参考、解析 ChainMap、检查单位和有限性 | SigProcess §9–§10 |
-| `SigProcess.ResolveMaximumIntegerDelay` | N/E | 把自动/外部时延边界转换为有限相关搜索半径 | SigProcess §3、§12 |
-| `SigProcess.EstimateIntegerDelay` | P/N | FFT 互相关并按重叠能量归一化，最大相关峰给出整数时延 | SigProcess §3 |
-| `SigProcess.ExtractIntegerAligned` | N | 按估计时延提取重叠样点并对缺失位置补零 | SigProcess §3 |
-| `SigProcess.EstimateCarrierFrequencyOffset` | P/N | 分块复增益相位随时间的斜率估计 CFO | SigProcess §4.1 |
-| `SigProcess.CompensateCarrierFrequencyOffset` | P/N | 乘 $e^{-j2\pi\hat f n/f_s}$ 撤销载波相位斜率 | SigProcess §4.2 |
-| `SigProcess.RefineCorrelationPeak` | N | 对相关峰邻点做抛物线插值得到亚采样峰位置 | SigProcess §5 |
-| `SigProcess.EstimateTimingOffsets` | P/N | 多窗口局部相关位置的截距给分数时延、斜率给 SFO | SigProcess §5–§6 |
-| `SigProcess.InterpolateSignal` | N/P | 加窗 sinc/Lanczos 重采样，实现分数时延和采样率校正 | SigProcess §7 |
-| `SigProcess.EstimateComplexGain` | N/P | 最小二乘正交投影得到公共复增益 | SigProcess §8、Analysis §3 |
-| `SigProcess.ResolveEstimationSlice` | E | 把数据字段或调用方切片限制到有效参考范围 | SigProcess §9、Analysis §4.4 |
-| `SigProcess.Process` | E/P | 按整数时延→CFO→分数时延/SFO→重采样→复增益的顺序执行 | SigProcess §2 |
+| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate` | E | 用 ChainMap 保存并验证可配置电阻端口，默认 50 Ω | SigProc §13 |
+| `PowerCalibration.DbmToRms`, `PowerCalibration.RmsToDbm` | P/N | 按 $P=V_{\mathrm{RMS}}^2/R$ 在绝对 dBm 功率与复包络 RMS 电压之间双向换算 | SigProc §13 |
+| `SignalProcessingResult.ToDict` | E | 只序列化估计标量，不重新计算同步 | SigProc §9 |
+| `SigProc.__init__`, `SigProc.ValidateSignal`, `SigProc.GetParameters`, `SigProc.UpdateParameters`, `SigProc.ValidateParameters` | E | 保存参考、解析 ChainMap、检查单位和有限性 | SigProc §9–§10 |
+| `SigProc.ResolveMaximumIntegerDelay` | N/E | 把自动/外部时延边界转换为有限相关搜索半径 | SigProc §3、§12 |
+| `SigProc.EstimateIntegerDelay` | P/N | FFT 互相关并按重叠能量归一化，最大相关峰给出整数时延 | SigProc §3 |
+| `SigProc.ExtractIntegerAligned` | N | 按估计时延提取重叠样点并对缺失位置补零 | SigProc §3 |
+| `SigProc.EstimateCarrierFrequencyOffset` | P/N | 分块复增益相位随时间的斜率估计 CFO | SigProc §4.1 |
+| `SigProc.CompensateCarrierFrequencyOffset` | P/N | 乘 $e^{-j2\pi\hat f n/f_s}$ 撤销载波相位斜率 | SigProc §4.2 |
+| `SigProc.RefineCorrelationPeak` | N | 对相关峰邻点做抛物线插值得到亚采样峰位置 | SigProc §5 |
+| `SigProc.EstimateTimingOffsets` | P/N | 多窗口局部相关位置的截距给分数时延、斜率给 SFO | SigProc §5–§6 |
+| `SigProc.InterpolateSignal` | N/P | 加窗 sinc/Lanczos 重采样，实现分数时延和采样率校正 | SigProc §7 |
+| `SigProc.EstimateComplexGain` | N/P | 最小二乘正交投影得到公共复增益 | SigProc §8、Analysis §3 |
+| `SigProc.ResolveEstimationSlice` | E | 把数据字段或调用方切片限制到有效参考范围 | SigProc §9、Analysis §4.4 |
+| `SigProc.Process` | E/P | 按整数时延→CFO→分数时延/SFO→重采样→复增益的顺序执行 | SigProc §2 |
 
-## 7. `Analysis.py`：指标与每轮 MSE 函数
+## 7. `FrameProcess.py` 与 `WifiMetadata.py`：帧处理和共享数据
+
+详细推导见 [FrameProcess.md](./FrameProcess.md)，数据契约见 [WifiMetadata.md](./WifiMetadata.md)。
+
+| 函数/方法 | 类型 | 原理或职责 | 对应章节 |
+|---|---|---|---|
+| `FrameProcess.BuildCsdPhaseMatrix` | P/N | 按 $\exp(-j2\pi k\Delta f\tau_m)$ 构造逐音调逐链 CSD 相位矩阵 | FrameProcess §2 |
+| `FrameProcess.__init__`, `FrameProcess.ValidateMetadata` | E | 保存并验证独立 `WifiWaveform` 数据契约 | FrameProcess §1、§5 |
+| `FrameProcess.ValidatePreparedSignal` | E | 检查校正后信号形状、链数和有限性 | FrameProcess §5–§7 |
+| `FrameProcess.DemodulatePreparedWifiData` | P/N | 去 CP、单位化 FFT、选择数据音调、撤销 CSD 和空间映射 | FrameProcess §3–§4 |
+
+## 8. `Analysis.py`：指标与每轮 MSE 函数
 
 详细推导统一见 [Analysis.md](./Analysis.md)。
 
@@ -186,11 +200,11 @@ flowchart LR
 | `SignalMetrics.ToDict`, `MimoSignalMetrics.ToDict`, `PowerEvmCurve.ToDict` | E | 把已经计算的指标转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann 窗、50% 重叠的 Welch PSD 平均 | Analysis §6.2 |
 | `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 保存参考和元数据，解析指标/同步参数并校验 | Analysis §1–§2、§11 |
-| `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProcess` | Analysis §2、§9 |
+| `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc` | Analysis §2、§9 |
 | `Analysis.GetLastSignalProcessingResult`, `Analysis.GetLastSignalProcessingResults`, `Analysis.GetLastMimoMetrics`, `Analysis.GetStageSignalProcessingResults`, `Analysis.GetStageMimoMetrics` | E | 返回缓存的不可变结果，不重新估计 | Analysis §9–§10 |
 | `Analysis.ValidatePreparedSignal` | E | 确保 prepared 数据与参考网格形状和有限性一致 | Analysis §2 |
 | `Analysis.CalculateSnr`, `Analysis.CalculatePreparedSnr` | P/N | 数据字段参考功率/校正残差功率 | Analysis §4 |
-| `Analysis.DemodulateWifiData`, `Analysis.DemodulatePreparedWifiData` | P/N | 去 CP、单位化 FFT、数据音调选择、撤销 CSD/空间映射 | Analysis §5.1、§9.1 |
+| `Analysis.DemodulateWifiData`, `Analysis.DemodulatePreparedWifiData` | E/P | 把校正信号委托给 `FrameProcess` 完成 Wi-Fi OFDM 与空间解映射 | Analysis §5.1、FrameProcess §3–§4 |
 | `Analysis.CalculateEvm`, `Analysis.CalculatePreparedEvm` | P/N | 数据星座 RMS EVM 及 dB/% 换算 | Analysis §5.2 |
 | `Analysis.CalculateEvmAlignedMse`, `Analysis.CalculatePreparedEvmAlignedMse` | P/N | 与 EVM 接收链一致的归一化符号 MSE，严格等于 EVM² | Analysis §5.8 |
 | `Analysis.CalculatePreparedSnrPerChain` | P/N | 每条物理 PA 链独立能量比 | Analysis §9.2 |
@@ -201,7 +215,7 @@ flowchart LR
 | `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同绝对 dBm 输入功率点和参考下公平比较各方法 EVM，并保存端口电阻换算后的 RMS 电压 | Analysis §8 |
 | `Analysis.SavePowerEvmCurveData`, `Analysis.Print`, `Analysis.PrintMimo`, `Analysis.Save`, `Analysis.SaveConvergence`, `Analysis.PrintConvergence` | E | 展示/序列化既有结果，不改变物理指标 | Analysis §10–§11 |
 
-## 8. `Draw.py`：图形函数
+## 9. `Draw.py`：图形函数
 
 这些函数全部属于 E 类。它们只改变视觉表示，不参与 MSE、EVM 或功率计算。
 
@@ -215,7 +229,7 @@ flowchart LR
 
 图上的连线只帮助阅读离散采样点，不表示功率点或迭代轮次之间存在连续物理轨迹。
 
-## 9. `DpdIlc.py`：统一基准编排与报告函数
+## 10. `tests/BenchMark.py`：统一基准编排与报告函数
 
 这些函数主要属于 E 类；其科学原则是控制变量和独立验证，而不是新的 PA 方程。
 
@@ -229,7 +243,7 @@ flowchart LR
 | `BenchMark.RunAllIlcBenchmark` | E | 固定波形、PA、迭代预算和指标定义；按类别构造全部场景 | BenchMark §2–§10 |
 | `BenchMark.SaveBenchmarkResults`, `BenchMark.PrintBenchmarkResults` | E | 输出统一表格/文件，不重新计算指标 | BenchMark §3–§4 |
 
-## 10. 审计结论与维护规则
+## 11. 审计结论与维护规则
 
 审计结果如下：
 

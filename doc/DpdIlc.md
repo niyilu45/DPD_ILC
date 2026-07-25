@@ -140,7 +140,7 @@ chainSignal = referenceSignal[:, chainIndex]
 通常先让 `WaveGenWifi` 生成单位RMS波形，再设置工作点：
 
 ```python
-from inc.PaModel import PowerCalibration
+from inc.SigProc import PowerCalibration
 
 waveform = wifiGenerator.Generate()
 powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
@@ -181,7 +181,8 @@ import numpy as np
 from inc.Analysis import Analysis
 from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
 from inc.Draw import Draw
-from inc.PaModel import PaModel, PowerCalibration
+from inc.PaModel import PaModel
+from inc.SigProc import PowerCalibration
 from inc.WaveGenWifi import WaveGenWifi
 
 wifiGenerator = WaveGenWifi(
@@ -1013,7 +1014,8 @@ from inc.DpdIlc import (
     ILCConfig,
     RunMimoFrequencyDomainIlc,
 )
-from inc.PaModel import MimoPaModel, PowerCalibration
+from inc.PaModel import MimoPaModel
+from inc.SigProc import PowerCalibration
 from inc.WaveGenWifi import WaveGenWifi
 
 wifiGenerator = WaveGenWifi(

@@ -53,8 +53,10 @@ from inc.DpdIlc import (
     RunParameterDomainIlc,
     RunScalarPIlc,
 )
-from inc.PaModel import IQImbalancePA, PaModel, PowerCalibration
-from inc.WaveGenWifi import WaveGenWifi, WifiWaveform
+from inc.PaModel import IQImbalancePA, PaModel
+from inc.SigProc import PowerCalibration
+from inc.WaveGenWifi import WaveGenWifi
+from inc.WifiMetadata import WifiWaveform
 
 
 # =============================================================================

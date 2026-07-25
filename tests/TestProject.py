@@ -36,8 +36,8 @@ from inc.DpdIlc import (
     RunMimoFrequencyDomainIlc,
 )
 from inc.Draw import Draw
-from inc.PaModel import MimoPaModel, PaModel, PowerCalibration
-from inc.SigProcess import SigProcess
+from inc.PaModel import MimoPaModel, PaModel
+from inc.SigProc import PowerCalibration, SigProc
 from inc.WaveGenWifi import (
     NormalizeFrameFormat,
     WaveGenWifi,
@@ -249,6 +249,53 @@ def CheckNoGlobalDataVariables() -> None:
                 f"module-level data variable is forbidden: "
                 f"{sourceFile}:{syntaxNode.lineno}"
             )
+
+
+def CheckModuleResponsibilityBoundaries() -> None:
+    """Verify the renamed classes and decoupled module ownership.
+
+    Processing details:
+        Algorithm: Inspect production source text and file paths, require each
+        moved definition to have one authoritative module, and reject the old
+        signal-processing file or Analysis dependencies on generator/PA code.
+
+    Returns:
+        result: None. Architecture regressions fail with direct assertions.
+    """
+
+    projectRoot = GetProjectRoot()
+    analysisSource = (
+        projectRoot / "inc" / "Analysis.py"
+    ).read_text(encoding="utf-8")
+    paSource = (projectRoot / "inc" / "PaModel.py").read_text(
+        encoding="utf-8"
+    )
+    waveGeneratorSource = (
+        projectRoot / "inc" / "WaveGenWifi.py"
+    ).read_text(encoding="utf-8")
+    signalProcessorSource = (
+        projectRoot / "inc" / "SigProc.py"
+    ).read_text(encoding="utf-8")
+    frameProcessorSource = (
+        projectRoot / "inc" / "FrameProcess.py"
+    ).read_text(encoding="utf-8")
+    metadataSource = (
+        projectRoot / "inc" / "WifiMetadata.py"
+    ).read_text(encoding="utf-8")
+
+    assert not (projectRoot / "inc" / "SigProcess.py").exists()
+    assert "class SigProc:" in signalProcessorSource
+    assert "class PowerCalibration:" in signalProcessorSource
+    assert "class PowerCalibration:" not in paSource
+    assert "def BuildCsdPhaseMatrix(" in frameProcessorSource
+    assert "def BuildCsdPhaseMatrix(" not in waveGeneratorSource
+    assert "class MCSInfo:" in metadataSource
+    assert "class WifiWaveform:" in metadataSource
+    assert "from .SigProc import" in analysisSource
+    assert "from .FrameProcess import FrameProcess" in analysisSource
+    assert "from .WifiMetadata import WifiWaveform" in analysisSource
+    assert "from .PaModel import" not in analysisSource
+    assert "from .WaveGenWifi import" not in analysisSource
 
 
 def CheckBenchmarkSeparation() -> None:
@@ -992,7 +1039,7 @@ def CheckSignalProcessingCompensation() -> None:
     Processing details:
         Algorithm: Synthesize a measurement with known integer and fractional
         delay, carrier offset, sample-rate offset, and complex gain; require
-        ``SigProcess`` to recover each value and ``Analysis`` to consume the
+        ``SigProc`` to recover each value and ``Analysis`` to consume the
         same utility path before calculating metrics.
 
     Returns:
@@ -1014,7 +1061,7 @@ def CheckSignalProcessingCompensation() -> None:
         "timingWindowLength": 1024,
         "interpolationHalfLength": 16,
     }
-    signalProcessor = SigProcess(
+    signalProcessor = SigProc(
         referenceSignal,
         waveform.sampleRateHz,
         parameters=signalProcessingParameters,
@@ -1095,7 +1142,9 @@ def CheckSignalProcessingCompensation() -> None:
     ).read_text(
         encoding="utf-8"
     )
-    assert "from .SigProcess import" in analysisSource
+    assert "from .SigProc import" in analysisSource
+    assert "from .PaModel import" not in analysisSource
+    assert "from .WaveGenWifi import" not in analysisSource
     assert "def BestComplexGain" not in analysisSource
 
 
@@ -1360,6 +1409,7 @@ def RunTests() -> None:
     CheckFrameFormatAliases()
     CheckFunctionStyle()
     CheckNoGlobalDataVariables()
+    CheckModuleResponsibilityBoundaries()
     CheckBenchmarkSeparation()
     CheckFunctionPrincipleCoverage()
     CheckDocumentationMathCompatibility()

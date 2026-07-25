@@ -10,9 +10,9 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .PaModel import PowerCalibration
-from .SigProcess import SigProcess, SignalProcessingResult
-from .WaveGenWifi import BuildCsdPhaseMatrix, WifiWaveform
+from .FrameProcess import FrameProcess
+from .SigProc import PowerCalibration, SigProc, SignalProcessingResult
+from .WifiMetadata import WifiWaveform
 
 
 @dataclass(frozen=True)
@@ -225,6 +225,7 @@ class Analysis:
             raise ValueError("referenceSignal contains NaN or infinite values")
         self.referenceSignal = complexReference
         self.waveform = waveform
+        self.frameProcessor = FrameProcess(waveform)
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
         externalParameters = {} if parameters is None else parameters
@@ -343,7 +344,7 @@ class Analysis:
             else self.referenceSignal
         )
         for chainIndex in range(referenceMatrix.shape[1]):
-            SigProcess(
+            SigProc(
                 referenceMatrix[:, chainIndex],
                 self.waveform.sampleRateHz,
                 parameters=signalProcessingParameters,
@@ -353,7 +354,7 @@ class Analysis:
         """Synchronize and compensate one signal before metric processing.
 
         Processing details:
-            Algorithm: Construct ``SigProcess`` with the current nested
+            Algorithm: Construct ``SigProc`` with the current nested
             settings, estimate and compensate timing, carrier frequency,
             sampling frequency, and complex gain, then retain all estimates.
 
@@ -396,7 +397,7 @@ class Analysis:
         processingResults = []
         processedColumns = []
         for chainIndex in range(referenceMatrix.shape[1]):
-            signalProcessor = SigProcess(
+            signalProcessor = SigProc(
                 referenceMatrix[:, chainIndex],
                 self.waveform.sampleRateHz,
                 parameters=signalProcessingParameters,
@@ -488,28 +489,17 @@ class Analysis:
         """Validate a signal already mapped onto the reference sample grid.
 
         Processing details:
-            Algorithm: Delegate finite-array conversion to ``SigProcess`` and
-            require the exact stored reference length.
+            Algorithm: Delegate finite-array conversion, exact reference-grid
+            shape checks, and finite-value checks to ``FrameProcess``.
 
         Args:
             preparedSignal: Synchronized and compensated complex samples.
 
         Returns:
-            result: Valid one-dimensional complex128 array.
+            result: Valid complex128 vector or samples-by-chains matrix.
         """
 
-        complexPrepared = np.asarray(preparedSignal, dtype=np.complex128)
-        if complexPrepared.shape != self.referenceSignal.shape:
-            raise ValueError(
-                "preparedSignal and referenceSignal must have equal shape"
-            )
-        if complexPrepared.ndim not in (1, 2) or not np.all(
-            np.isfinite(complexPrepared)
-        ):
-            raise ValueError(
-                "preparedSignal must be a finite vector or matrix"
-            )
-        return complexPrepared
+        return self.frameProcessor.ValidatePreparedSignal(preparedSignal)
 
     def CalculateSnr(self, measuredSignal: np.ndarray) -> float:
         """Calculate data-field SNR after removing one complex gain and phase.
@@ -532,7 +522,7 @@ class Analysis:
 
         Processing details:
             Algorithm: Compare the prepared data field directly with the
-            stored reference because ``SigProcess`` has already removed the
+            stored reference because ``SigProc`` has already removed the
             deterministic complex gain and synchronization impairments.
 
         Args:
@@ -584,8 +574,8 @@ class Analysis:
         """FFT-demodulate data from an already compensated Wi-Fi signal.
 
         Processing details:
-            Algorithm: Validate the reference-grid signal, remove each cyclic
-            prefix, perform a unitary FFT, and select configured data tones.
+            Algorithm: Delegate cyclic-prefix removal, unitary FFT, data-tone
+            selection, CSD removal, and spatial demapping to ``FrameProcess``.
 
         Args:
             preparedSignal: Signal returned by ``PrepareMeasuredSignal``.
@@ -595,45 +585,9 @@ class Analysis:
         """
 
         complexMeasured = self.ValidatePreparedSignal(preparedSignal)
-        demodulatedSymbols = []
-        for symbolStart in self.waveform.dataSymbolStarts:
-            usefulStart = int(symbolStart) + self.waveform.cpLength
-            usefulStop = usefulStart + self.waveform.fftLength
-            if usefulStop > complexMeasured.size:
-                raise ValueError(
-                    "measuredSignal is shorter than the Wi-Fi data field"
-                )
-            usefulSamples = complexMeasured[usefulStart:usefulStop]
-            usefulMatrix = (
-                usefulSamples.reshape(-1, 1)
-                if usefulSamples.ndim == 1
-                else usefulSamples
-            )
-            frequencyGrid = np.fft.fft(usefulMatrix, axis=0) / np.sqrt(
-                self.waveform.fftLength
-            )
-            antennaData = frequencyGrid[
-                np.mod(
-                    self.waveform.dataSubcarriers,
-                    self.waveform.fftLength,
-                )
-            ]
-            csdPhaseMatrix = BuildCsdPhaseMatrix(
-                self.waveform.dataSubcarriers,
-                self.waveform.sampleRateHz / self.waveform.fftLength,
-                self.waveform.cyclicShiftsSeconds,
-            )
-            # The transmit mapping is y = s Q^T D_csd. Because Q has
-            # orthonormal columns and D_csd is unitary, its left inverse is
-            # obtained by conjugating both terms in reverse order.
-            spatialStreams = (
-                antennaData * np.conj(csdPhaseMatrix)
-            ) @ np.conj(self.waveform.spatialMappingMatrix)
-            demodulatedSymbols.append(spatialStreams)
-        demodulatedArray = np.asarray(demodulatedSymbols)
-        if self.waveform.numTransmitAntennas == 1:
-            return demodulatedArray[:, :, 0]
-        return demodulatedArray
+        return self.frameProcessor.DemodulatePreparedWifiData(
+            complexMeasured
+        )
 
     def CalculateEvm(self, measuredSignal: np.ndarray) -> Tuple[float, float]:
         """Calculate RMS EVM in dB and percent on Wi-Fi data subcarriers.

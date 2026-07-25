@@ -14,22 +14,13 @@ is a Wi-Fi PHY stimulus, not a bit-exact protocol conformance implementation.
 """
 
 from collections import ChainMap
-from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Tuple, cast
 
 import numpy as np
 
-
-@dataclass(frozen=True)
-class MCSInfo:
-    """Describe the modulation and nominal coding parameters of one Wi-Fi MCS."""
-
-    index: int
-    modulation: str
-    qamOrder: int
-    codeRate: float
-    bitsPerSubcarrier: int
+from .FrameProcess import BuildCsdPhaseMatrix
+from .WifiMetadata import MCSInfo, WifiWaveform
 
 
 def NormalizeFrameFormat(frameFormat: str) -> str:
@@ -632,38 +623,6 @@ class WaveGenWifi:
         return GenerateWifiWaveform(self)
 
 
-@dataclass
-class WifiWaveform:
-    """Return waveform samples and metadata required for EVM demodulation."""
-
-    samples: np.ndarray
-    sampleRateHz: float
-    bandwidthHz: float
-    fftLength: int
-    cpLength: int
-    oversampling: float
-    activeSubcarriers: np.ndarray
-    dataSubcarriers: np.ndarray
-    pilotSubcarriers: np.ndarray
-    referenceDataSymbols: np.ndarray
-    fieldSlices: Dict[str, slice]
-    dataSymbolStarts: np.ndarray
-    symbolLength: int
-    mcsInfo: MCSInfo
-    normalizationScale: float
-    codedBitsPerSymbol: int
-    informationBitsPerSymbol: int
-    frameFormat: str
-    dataFieldName: str
-    formatName: str
-    numTransmitAntennas: int
-    numSpatialStreams: int
-    spatialMapping: str
-    spatialMappingMatrix: np.ndarray
-    cyclicShiftsSeconds: np.ndarray
-    ltfSymbolCount: int
-
-
 def ActiveTones(
     bandwidthMhz: int,
     frameFormat: str = "EHT",
@@ -1112,34 +1071,6 @@ def GetCyclicShifts(config: WaveGenWifi) -> np.ndarray:
     if not config.cyclicShiftEnabled:
         selectedShifts.fill(0.0)
     return selectedShifts * 1.0e-9
-
-
-def BuildCsdPhaseMatrix(
-    subcarrierIndices: np.ndarray,
-    subcarrierSpacingHz: float,
-    cyclicShiftsSeconds: np.ndarray,
-) -> np.ndarray:
-    """Build frequency-dependent CSD phases for all tones and chains.
-
-    Processing details:
-        Algorithm: Evaluate ``exp(-j*2*pi*k*deltaF*tau)`` for every centered
-        subcarrier index and transmit-chain cyclic shift.
-
-    Args:
-        subcarrierIndices: Centered signed OFDM tone indices.
-        subcarrierSpacingHz: Tone spacing in hertz.
-        cyclicShiftsSeconds: Per-chain cyclic shifts in seconds.
-
-    Returns:
-        result: Matrix shaped tones by transmit antennas.
-    """
-
-    toneFrequencies = (
-        np.asarray(subcarrierIndices, dtype=float).reshape(-1, 1)
-        * float(subcarrierSpacingHz)
-    )
-    shifts = np.asarray(cyclicShiftsSeconds, dtype=float).reshape(1, -1)
-    return np.exp(-1j * 2.0 * np.pi * toneFrequencies * shifts)
 
 
 def SpatialMapTones(

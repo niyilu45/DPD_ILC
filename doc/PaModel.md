@@ -96,7 +96,7 @@ R\cdot10^{-3}\cdot10^{P_{\mathrm{dBm}}/10}
 }.
 ```
 
-`PowerCalibration` 实现这两个方向的换算，`loadResistanceOhm` 默认是50 Ω，也允许用户修改。以50 Ω为例：
+`PowerCalibration` 定义在 `inc/SigProc.py`，`PaModel.py` 只导入并复用它。该类实现这两个方向的换算，`loadResistanceOhm` 默认是50 Ω，也允许用户修改。以50 Ω为例：
 
 - `0 dBm` 等于1 mW，对应约 `0.223607 V RMS`；
 - `0.24 V RMS` 对应约 `0.6145 dBm`；
@@ -723,7 +723,7 @@ classDiagram
     IQImbalancePA o-- PaModel : wraps
 ```
 
-**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择 Wiener 或 GMP。`MimoPaModel` 按物理链持有多个 `PaModel` 并执行独立功率校准。`IQImbalancePA` 可以包装任意具有 `Process` 接口的 PA；反馈噪声则由独立的 `AddAwgn` 在测量链上添加。
+**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择 Wiener 或 GMP。`MimoPaModel` 按物理链持有多个 `PaModel` 并执行独立功率校准。`PowerCalibration` 是 `SigProc.py` 提供的独立单位换算类，并非 PA 非线性模型；`MimoPaModel` 依赖它完成绝对 dBm 标定，但 `Analysis` 无需因此导入 `PaModel.py`。`IQImbalancePA` 可以包装任意具有 `Process` 接口的 PA；反馈噪声则由独立的 `AddAwgn` 在测量链上添加。
 
 ```python
 from inc.PaModel import (

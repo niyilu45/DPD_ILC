@@ -7,7 +7,7 @@
 - 上、下邻道 ACLR；
 - 多方法功率–EVM 曲线。
 
-> **重要定义**：进入指标计算前，`Analysis` 会调用 `SigProcess` 消除整数/分数时延、载波频偏、采样频偏和最佳公共复增益。这里的 SNR 是校正后理想信号功率与全部残差功率之比；残差仍包含随机噪声、PA 非线性、记忆失真和同步估计残差，因此不一定等于仪器意义上的纯热噪声 SNR。
+> **重要定义**：进入指标计算前，`Analysis` 会调用 `SigProc` 消除整数/分数时延、载波频偏、采样频偏和最佳公共复增益。这里的 SNR 是校正后理想信号功率与全部残差功率之比；残差仍包含随机噪声、PA 非线性、记忆失真和同步估计残差，因此不一定等于仪器意义上的纯热噪声 SNR。
 
 ---
 
@@ -16,7 +16,7 @@
 ```mermaid
 flowchart TB
     A["理想参考波形 x[n]"] --> B["字段边界与参考 QAM"]
-    C["PA/DPD/采集输出 y[m]"] --> D["SigProcess 同步与补偿"]
+    C["PA/DPD/采集输出 y[m]"] --> D["SigProc 同步与补偿"]
     A --> D
     D --> corrected["统一校正信号 z[n]"]
     B --> E["数据字段时域拟合"]
@@ -30,13 +30,13 @@ flowchart TB
     K --> L["ACLR-L / ACLR-U / Worst"]
 ```
 
-**图 1 说明**：每个待测信号只执行一次 `SigProcess.Process`，SNR、EVM、ACLR 共用完全相同的校正样点。SNR 在数据字段时域样点上计算；EVM 在去 CP、FFT 后的数据子载波上计算；ACLR 在数据字段功率谱上计算。三者观察的是不同维度，不能用单一指标替代全部结果。
+**图 1 说明**：每个待测信号只执行一次 `SigProc.Process`，SNR、EVM、ACLR 共用完全相同的校正样点。SNR 在数据字段时域样点上计算；EVM 由 `FrameProcess` 在去 CP、FFT、撤销 CSD 和空间解映射后的数据子载波上计算；ACLR 在数据字段功率谱上计算。三者观察的是不同维度，不能用单一指标替代全部结果。
 
 ---
 
 ## 2. 所有指标共同的前提：先同步再分析
 
-`Analysis.PrepareMeasuredSignal` 会构造 `SigProcess` 并执行以下处理：
+`Analysis.PrepareMeasuredSignal` 会构造 `SigProc` 并执行以下处理：
 
 ```mermaid
 flowchart LR
@@ -47,7 +47,7 @@ flowchart LR
     E --> F["SNR/EVM/ACLR"]
 ```
 
-**图 2 说明**：同步误差必须在非线性评价之前处理，否则分析器会把“没有对齐”误判为 PA 或 DPD 失真。待测数组在同步前可以与参考长度不同；重采样结果固定映射到参考网格。完整估计公式、参数和边界见 [SigProcess.md](./SigProcess.md)。
+**图 2 说明**：同步误差必须在非线性评价之前处理，否则分析器会把“没有对齐”误判为 PA 或 DPD 失真。待测数组在同步前可以与参考长度不同；重采样结果固定映射到参考网格。完整估计公式、参数和边界见 [SigProc.md](./SigProc.md)。
 
 ---
 
@@ -85,7 +85,7 @@ J(g)
 }
 ```
 
-这就是 `SigProcess.EstimateComplexGain`。`SigProcess.Process` 随后计算 $\mathbf z=\mathbf y/\hat g$，`Analysis` 对 $\mathbf z$ 进行指标统计。
+这就是 `SigProc.EstimateComplexGain`。`SigProc.Process` 随后计算 $\mathbf z=\mathbf y/\hat g$，`Analysis` 对 $\mathbf z$ 进行指标统计。
 
 为了避免把文字和公式挤在同一行，几何关系完整写为：
 
@@ -116,7 +116,7 @@ J(g)
 
 ### 4.1 代码定义
 
-分析器只截取当前格式对应的 VHT-Data、HE-Data 或 EHT-Data 字段。令参考数据字段为 $\mathbf x$，`SigProcess` 输出的校正数据字段为 $\mathbf z$，则
+分析器只截取当前格式对应的 VHT-Data、HE-Data 或 EHT-Data 字段。令参考数据字段为 $\mathbf x$，`SigProc` 输出的校正数据字段为 $\mathbf z$，则
 
 ```math
 \mathbf s=\mathbf x,
@@ -160,7 +160,7 @@ L_{\mathrm{dB}}=10\log_{10}\frac{P_1}{P_0}.
 
 ### 4.3 这里的残差包含什么
 
-在 `SigProcess` 已消除同步误差和公共复增益后，如果
+在 `SigProc` 已消除同步误差和公共复增益后，如果
 
 ```math
 z[n]=x[n]+w[n],
@@ -233,10 +233,10 @@ R_q[k]=\frac{1}{\sqrt N}
 
 ```mermaid
 flowchart LR
-    A["SigProcess 校正信号"] --> B["删除 CP"]
+    A["SigProc 校正信号"] --> B["FrameProcess 删除 CP"]
     reference["时域参考信号"] --> B2["相同的删除 CP"]
-    B --> C["FFT / sqrt(N)"]
-    B2 --> C2["相同 FFT / sqrt(N)"]
+    B --> C["FrameProcess FFT / sqrt(N)"]
+    B2 --> C2["FrameProcess 相同 FFT / sqrt(N)"]
     C --> D["提取测量数据子载波 R"]
     C2 --> D2["提取参考数据子载波 S"]
     D --> G["RMS EVM"]
@@ -247,7 +247,7 @@ flowchart LR
 
 ### 5.2 RMS EVM 公式
 
-把所有数据符号和数据子载波展平成向量。理想星座为 $\mathbf S$，校正后的测量星座为 $\mathbf R$。公共复增益已经在时域由 `SigProcess` 去除，因此这里不再执行第二次增益拟合。误差为
+把所有数据符号和数据子载波展平成向量。理想星座为 $\mathbf S$，校正后的测量星座为 $\mathbf R$。公共复增益已经在时域由 `SigProc` 去除，因此这里不再执行第二次增益拟合。误差为
 
 ```math
 \mathbf E=\mathbf R-\mathbf S.
@@ -301,7 +301,7 @@ EVM 会综合反映：
 - 噪声；
 - 同步估计残差和未均衡的频率选择性响应。
 
-`SigProcess` 会去掉一个统一的复增益，因此不会惩罚全体星座共同的固定缩放和旋转；频率选择性幅相起伏仍会进入 EVM。
+`SigProc` 会去掉一个统一的复增益，因此不会惩罚全体星座共同的固定缩放和旋转；频率选择性幅相起伏仍会进入 EVM。
 
 ### 5.4 EVM 与 SNR 的近似关系
 
@@ -1130,11 +1130,11 @@ MIMO 参考和测量数组采用
 \mathbf X,\mathbf Y\in\mathbb C^{N\times N_{TX}},
 ```
 
-行对应时间样点，列对应物理 PA/发射链。传导 MIMO 测试中，每条链可能有不同的电缆时延、本振残差、采样时钟残差和复增益，因此 `Analysis.PrepareMeasuredSignal` 对第 $m$ 列独立运行 `SigProcess`：
+行对应时间样点，列对应物理 PA/发射链。传导 MIMO 测试中，每条链可能有不同的电缆时延、本振残差、采样时钟残差和复增益，因此 `Analysis.PrepareMeasuredSignal` 对第 $m$ 列独立运行 `SigProc`：
 
 ```math
 \hat{\mathbf y}_m
-=\mathrm{SigProcess}(\mathbf x_m,\mathbf y_m).
+=\mathrm{SigProc}(\mathbf x_m,\mathbf y_m).
 ```
 
 这会产生 $N_{TX}$ 个 `SignalProcessingResult`。`GetLastSignalProcessingResult()` 为兼容旧接口返回第一路；`GetLastSignalProcessingResults()` 返回全部链。
@@ -1143,7 +1143,7 @@ MIMO 参考和测量数组采用
 flowchart LR
     reference["参考矩阵 X"] --> splitRef["按物理链拆分"]
     measured["测量矩阵 Y"] --> splitMeas["按物理链拆分"]
-    splitRef --> sync["每链 SigProcess"]
+    splitRef --> sync["每链 SigProc"]
     splitMeas --> sync
     sync --> corrected["校正矩阵 Ŷ"]
     corrected --> chainMetrics["逐 PA SNR / ACLR"]
@@ -1275,11 +1275,12 @@ ILC 每轮收敛结果另外输出：
 
 | 计算步骤 | 方法 |
 |---|---|
-| 同步与补偿总入口 | `SigProcess.Process` / `Analysis.PrepareMeasuredSignal` |
-| 整数时延 | `SigProcess.EstimateIntegerDelay` |
-| 分数时延与采样频偏 | `SigProcess.EstimateTimingOffsets` |
-| 载波频偏 | `SigProcess.EstimateCarrierFrequencyOffset` |
-| 最佳复增益 | `SigProcess.EstimateComplexGain` |
+| 同步与补偿总入口 | `SigProc.Process` / `Analysis.PrepareMeasuredSignal` |
+| 整数时延 | `SigProc.EstimateIntegerDelay` |
+| 分数时延与采样频偏 | `SigProc.EstimateTimingOffsets` |
+| 载波频偏 | `SigProc.EstimateCarrierFrequencyOffset` |
+| 最佳复增益 | `SigProc.EstimateComplexGain` |
+| Wi-Fi 数据字段处理 | `FrameProcess.DemodulatePreparedWifiData` |
 | 数据字段 SNR | `Analysis.CalculateSnr` |
 | OFDM 数据解调 | `Analysis.DemodulateWifiData` |
 | EVM 对齐 MSE | `Analysis.CalculateEvmAlignedMse` |
@@ -1360,7 +1361,7 @@ if wifiWaveform.numTransmitAntennas > 1:
     print(mimoMetrics.ToDict())
 ```
 
-`Analysis`、`Draw` 和 `SigProcess` 都在各自构造函数内部定义只读默认参数并建立 `ChainMap`；调用方只传需要修改的普通字典。`signalProcessingParameters` 是传给 `SigProcess` 的嵌套覆盖字典。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。
+`Analysis`、`Draw` 和 `SigProc` 都在各自构造函数内部定义只读默认参数并建立 `ChainMap`；调用方只传需要修改的普通字典。`signalProcessingParameters` 是传给 `SigProc` 的嵌套覆盖字典。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。
 
 功率–EVM 扫描的评估器接口为：
 
@@ -1403,7 +1404,7 @@ EVM/SNR 去除了一个标量增益和相位。如果要研究 AM-AM 平均增�
 
 ### 12.6 真实采集数据的同步边界
 
-`Analysis` 已通过 `SigProcess` 对每条传导链执行整数/分数时延、载波频偏、采样频偏和复增益补偿，并能撤销已知发送端 CSD/空间映射；但它不估计未知频率选择性 MIMO 空口信道，不执行相位噪声跟踪或突发时钟跳变修复。真实示波器/VSA 数据应在帧前后保留保护样点；OTA 信号还需要增加 MIMO 信道估计与均衡。
+`Analysis` 已通过 `SigProc` 对每条传导链执行整数/分数时延、载波频偏、采样频偏和复增益补偿，并将去 CP、FFT、已知发送端 CSD 撤销和空间解映射委托给 `FrameProcess`；但它不估计未知频率选择性 MIMO 空口信道，不执行相位噪声跟踪或突发时钟跳变修复。真实示波器/VSA 数据应在帧前后保留保护样点；OTA 信号还需要增加 MIMO 信道估计与均衡。
 
 ---
 

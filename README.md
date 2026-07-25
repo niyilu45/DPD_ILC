@@ -6,7 +6,9 @@
 
 - [Wi-Fi 帧生成物理原理与推导](doc/WaveGenWifi.md)：复基带、OFDM 正交性、QAM 归一化、MCS、循环前缀、VHT/HE/EHT 字段和 PAPR。
 - [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、Rapp AM-AM、AM-PM、GMP、频谱再生、IQ 失衡和反馈噪声。
-- [信号同步与补偿物理原理](doc/SigProcess.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样和复增益补偿。
+- [信号同步、补偿与功率标定原理](doc/SigProc.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样、复增益补偿和 dBm/RMS 换算。
+- [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
+- [Wi-Fi 元数据契约](doc/WifiMetadata.md)：`MCSInfo` 与 `WifiWaveform` 的字段、数组形状和模块边界。
 - [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
 - [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
 - [全工程函数与物理原理覆盖审计](doc/FunctionPrinciples.md)：逐项索引 `main.py` 与 `inc` 中全部函数，区分物理模型、数值实现和工程编排，并链接到对应推导。
@@ -24,9 +26,11 @@ python -m pip install -r requirements.txt
 ```text
 main.py                 命令行主程序
 inc/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
+inc/WifiMetadata.py     MCSInfo 与 WifiWaveform 纯数据契约
+inc/FrameProcess.py     Wi-Fi 去 CP、FFT、CSD 撤销与空间流解映射
 inc/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
 inc/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
-inc/SigProcess.py       时延、载波/采样频偏和复增益估计与补偿
+inc/SigProc.py          SigProc 同步补偿、SignalProcessingResult 与 PowerCalibration
 inc/Analysis.py         SNR、EVM、ACLR、功率-EVM 数据计算及结果输出
 inc/Draw.py             功率-EVM 多方法同图绘制与 PNG 输出
 inc/__init__.py         公共接口汇总
@@ -69,11 +73,13 @@ flowchart TD
 
     overrideMap --> analysis["创建 Analysis；类内追加默认参数层"]
     reference --> analysis
-    reference --> signalProcess["SigProcess：时延 / CFO / SFO / 复增益补偿"]
-    baseline --> signalProcess
-    frequencyIlc --> signalProcess
-    correctedOutput --> signalProcess
-    signalProcess --> analysisMethod["Analysis.Analyze / AnalyzeStages"]
+    reference --> sigProc["SigProc：时延 / CFO / SFO / 复增益补偿"]
+    baseline --> sigProc
+    frequencyIlc --> sigProc
+    correctedOutput --> sigProc
+    sigProc --> frameProcess["FrameProcess：去 CP / FFT / CSD / 空间解映射"]
+    sigProc --> analysisMethod["Analysis.Analyze / AnalyzeStages"]
+    frameProcess --> analysisMethod
     analysis --> analysisMethod
     analysisMethod --> metrics["汇总 SNR / EVM / ACLR"]
     analysisMethod --> mimoMetrics["逐 PA SNR/ACLR + 逐空间流 EVM"]
@@ -100,7 +106,7 @@ flowchart TD
 2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
 3. `MimoPaModel` 为每个矩阵列建立独立 PA，可分别设置输入驱动增益 dB、相对输出功率 dB 或绝对输出功率 dBm。`PowerCalibration` 按用户配置的端口电阻把 dBm 换算成 PA 模型使用的复包络 RMS 电压。单方案模式对每个 PA 独立执行正则化频域 ILC，再对各路 ILC 标签分别拟合 GMP；全方案基准当前仅用于 SISO。
 4. 收敛后的 `u*` 可直接用于重复波形测试，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN，从而形成可用于其他帧的部署模型。
-5. 所有输出最终传给同一个 `Analysis` 实例；MIMO 时每条物理链分别调用 `SigProcess` 完成整数/分数时延、载波频偏、采样频偏和复增益补偿。ACLR 对各链 PSD 求和形成汇总值，同时保留每链结果；EVM 在撤销 CSD 和空间映射后按空间流统计。`AnalyzePowerEvmCurve` 在多个绝对 dBm 输入功率点调用各方法，生成不包含绘图逻辑的 `PowerEvmCurve` 数据对象。
+5. 所有输出最终传给同一个 `Analysis` 实例；MIMO 时每条物理链分别调用 `SigProc` 完成整数/分数时延、载波频偏、采样频偏和复增益补偿。`FrameProcess` 再执行 Wi-Fi 去 CP、FFT、CSD 撤销和空间解映射。ACLR 对各链 PSD 求和形成汇总值，同时保留每链结果；EVM 按空间流统计。`AnalyzePowerEvmCurve` 在多个绝对 dBm 输入功率点调用各方法，生成不包含绘图逻辑的 `PowerEvmCurve` 数据对象。
 6. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
 
 图中从“生成独立验证 VHT/HE/EHT 帧”开始的支路专门验证部署模型的泛化能力；它使用相同格式配置和不同随机种子的载荷，不与 ILC 训练帧重复。
@@ -131,7 +137,8 @@ flowchart TD
     privateGenerate --> qam["QamModulate"]
     privateGenerate --> pilotSequence["PilotSequence"]
     privateGenerate --> mapping["BuildSpatialMappingMatrix"]
-    privateGenerate --> csd["GetCyclicShifts / BuildCsdPhaseMatrix"]
+    privateGenerate --> csd["GetCyclicShifts"]
+    csd --> csdMatrix["FrameProcess.BuildCsdPhaseMatrix"]
     privateGenerate --> ltf["GetLtfSymbolCount / BuildLtfTrainingMatrix"]
     privateGenerate --> mimoOfdm["BuildMimoOfdmSymbol"]
 
@@ -139,6 +146,7 @@ flowchart TD
     training --> pilotSequence
     mapping --> spatialTones["SpatialMapTones"]
     csd --> spatialTones
+    csdMatrix --> spatialTones
     qam --> spatialTones
     pilotSequence --> spatialTones
     spatialTones --> mimoOfdm
@@ -157,6 +165,48 @@ flowchart TD
 - `BuildSpatialMappingMatrix` 产生 direct、DFT 或调用方自定义的正交映射；`SpatialMapTones` 为每个子载波执行空间映射并叠加 CSD，`BuildMimoOfdmSymbol` 再完成各发射链 IFFT 和循环前缀。
 - `BuildLtfTrainingMatrix` 产生跨 LTF 符号的正交训练码；LTF 数量随空间流增加。公共字段由 `MapCommonFieldToAntennas` 复制到各链并保留 CSD。
 - `WaveGenWifi.Generate` 是面向调用方的波形入口，并由内部辅助函数 `GenerateWifiWaveform` 完成组帧，最终返回 `WifiWaveform`；其中既有时域样本，也有后续 EVM 解调所需的格式、字段切片和参考星座。
+
+### `inc/WifiMetadata.py`
+
+```mermaid
+flowchart TD
+    mcs["MCSInfo：调制阶数与码率"] --> generator["WaveGenWifi"]
+    generator --> waveform["WifiWaveform：样点与帧元数据"]
+    waveform --> frameProcessor["FrameProcess"]
+    waveform --> analysis["Analysis"]
+    waveform --> caller["外部调用方"]
+```
+
+**图示说明：**
+
+- `WifiMetadata.py` 只定义数据类，不生成波形、不解调帧，也不计算性能指标。
+- `WaveGenWifi` 负责创建 `WifiWaveform`；`FrameProcess` 和 `Analysis` 只消费这份稳定的数据契约，因此不需要导入波形生成算法。
+- `WifiWaveform` 保存时域样点、采样率、FFT/GI 参数、数据字段起点、音调索引、空间映射矩阵、CSD 和参考空间流星座。
+
+### `inc/FrameProcess.py`
+
+```mermaid
+flowchart TD
+    tones["子载波索引 / 间隔 / CSD"] --> csd["BuildCsdPhaseMatrix"]
+    waveform["WifiWaveform"] --> processor["构造 FrameProcess"]
+    processor --> metadata["FrameProcess.ValidateMetadata"]
+    prepared["SigProc 校正信号"] --> signalCheck["FrameProcess.ValidatePreparedSignal"]
+    metadata --> demod["FrameProcess.DemodulatePreparedWifiData"]
+    signalCheck --> demod
+    demod --> cp["删除循环前缀"]
+    cp --> fft["单位化 FFT"]
+    fft --> dataTones["选择数据音调"]
+    dataTones --> csdUndo["调用 BuildCsdPhaseMatrix 撤销 CSD"]
+    csd --> csdUndo
+    csdUndo --> demap["空间映射伪逆"]
+    demap --> streams["数据符号 × 数据音调 × 空间流"]
+```
+
+**图示说明：**
+
+- `BuildCsdPhaseMatrix` 是发送端和接收端共用的 CSD 相位约定；`WaveGenWifi` 用它施加 CSD，`FrameProcess` 用其共轭撤销 CSD。
+- `FrameProcess` 只处理已由 `SigProc` 对齐到参考采样网格的信号，输出空间流域 Wi-Fi 数据星座。
+- 未知空口 MIMO 信道估计、均衡和相位噪声跟踪不属于当前类的职责。
 
 ### `inc/PaModel.py`
 
@@ -282,12 +332,12 @@ flowchart TD
 
 **图示说明：**`BenchMark.py` 只负责场景编排和结果呈现，不重新实现任何ILC更新律。场景分类、预期趋势和本机参考结果见[BenchMark场景说明](doc/BenchMark.md)。
 
-### `inc/SigProcess.py`
+### `inc/SigProc.py`
 
 ```mermaid
 flowchart TD
-    caller["Analysis 或直接调用方"] --> processor["构造 SigProcess；内部合并默认参数"]
-    processor --> process["SigProcess.Process"]
+    caller["Analysis 或直接调用方"] --> processor["构造 SigProc；内部合并默认参数"]
+    processor --> process["SigProc.Process"]
     reference["已知参考信号"] --> integer["EstimateIntegerDelay"]
     measured["测量/仿真输出"] --> integer
     process --> integer
@@ -299,15 +349,19 @@ flowchart TD
     gain --> result["SignalProcessingResult"]
     result --> corrected["processedSignal"]
     result --> estimates["时延 / CFO / SFO / 复增益估计"]
+    powerCaller["PA / 功率扫描调用方"] --> calibration["PowerCalibration"]
+    calibration --> dbmToRms["DbmToRms"]
+    calibration --> rmsToDbm["RmsToDbm"]
 ```
 
 **图示说明：**
 
-- `SigProcess` 使用已知参考做数据辅助同步；正整数时延表示测量信号晚于参考。
+- `SigProc` 使用已知参考做数据辅助同步；正整数时延表示测量信号晚于参考。
 - CFO 由多个时间窗口的复增益相位斜率估计，避免逐样点 PA 相位扰动产生明显假频偏。
 - 多窗口局部相关峰的截距给出分数时延，随时间的斜率给出采样频偏 ppm。
 - `InterpolateSignal` 使用有限长度 Lanczos-sinc 核把测量记录重采样到参考网格，随后除去最小二乘公共复增益。
 - `SignalProcessingResult` 同时保存校正样点和所有标量估计，`ToDict()` 可用于记录估计结果。
+- `PowerCalibration` 在同一信号处理模块中集中完成复包络 RMS 电压与绝对功率 dBm 的双向换算，PA 与功率扫描共享相同端口阻抗约定。
 
 ### `inc/Analysis.py`
 
@@ -317,8 +371,8 @@ flowchart TD
     context --> stages["Analysis.AnalyzeStages"]
     stages --> analyze["Analysis.Analyze"]
     analyze --> prepare["Analysis.PrepareMeasuredSignal"]
-    prepare --> sigProcess["SigProcess.Process"]
-    sigProcess --> prepared["同一份校正信号"]
+    prepare --> sigProc["SigProc.Process"]
+    sigProc --> prepared["同一份校正信号"]
     prepared --> snr["Analysis.CalculatePreparedSnr"]
     prepared --> evm["Analysis.CalculatePreparedEvm"]
     prepared --> evmMse["CalculatePreparedEvmAlignedMse"]
@@ -329,7 +383,8 @@ flowchart TD
 
     evm --> demod["Analysis.DemodulatePreparedWifiData"]
     streamEvm --> demod
-    demod --> undo["撤销 CSD 与空间映射 Q"]
+    demod --> frameProcess["FrameProcess.DemodulatePreparedWifiData"]
+    frameProcess --> undo["去 CP / FFT / 撤销 CSD 与空间映射 Q"]
     aclr --> psd["AveragePeriodogram"]
 
     snr --> metrics["SignalMetrics"]
@@ -352,13 +407,13 @@ flowchart TD
 **图示说明：**
 
 - `Analysis` 构造时保存参考信号和 `WifiWaveform` 元数据；后续每个待测输出只需传给 `Analyze`，多个命名阶段可一次传给 `AnalyzeStages`。
-- 每次 `Analyze` 只调用一次 `SigProcess.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
-- SNR 直接计算校正后数据字段与参考的残差功率；EVM 根据 `WifiWaveform` 的数据字段位置去循环前缀并 FFT，再与采用相同 FFT 路径得到的参考星座比较。
+- 每次 `Analyze` 只调用一次 `SigProc.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
+- SNR 直接计算校正后数据字段与参考的残差功率；EVM 由 `FrameProcess` 根据 `WifiWaveform` 的数据字段位置去循环前缀、FFT、撤销 CSD 和空间解映射，再与采用相同接收路径得到的参考星座比较。
 - ACLR 通过 `AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
 - 三类指标封装为 `SignalMetrics`，由同一实例的 `Print` 输出到终端，或由 `Save` 写入 JSON/CSV。
 - `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
 - `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、公共复增益幅相和输入峰值。
-- MIMO 输入按列分别同步；`DemodulatePreparedWifiData` 在 FFT 后撤销每链 CSD 相位和空间映射矩阵。`MimoSignalMetrics` 保存逐 PA SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
+- MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。`MimoSignalMetrics` 保存逐 PA SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
 - `AnalyzePowerEvmCurve` 接收一组严格递增的绝对 dBm 输入功率点和多个方法求值器，先按 `loadResistanceOhm` 换算复包络 RMS 电压，再在每个功率点使用相同参考信号计算 EVM；`SavePowerEvmCurveData` 只保存原始 CSV/JSON 数据，不导入或调用任何绘图库。
 
 ### `inc/Draw.py`
@@ -395,9 +450,11 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    init["inc/__init__.py"] --> waveApi["WaveGenWifi / WifiWaveform / MCSInfo"]
+    init["inc/__init__.py"] --> waveApi["WaveGenWifi"]
+    init --> metadataApi["WifiWaveform / MCSInfo"]
+    init --> frameApi["FrameProcess / BuildCsdPhaseMatrix"]
     init --> paApi["PaModel / MimoPaModel / WienerPA / GMPPA"]
-    init --> signalApi["SigProcess / SignalProcessingResult"]
+    init --> signalApi["SigProc / SignalProcessingResult / PowerCalibration"]
     init --> analysisApi["Analysis / SignalMetrics / MimoSignalMetrics"]
     init --> drawApi["Draw / PowerEvmCurve 绘图入口"]
     init --> ilcApi["ILCConfig / RunFrequencyDomainIlc"]
@@ -536,7 +593,7 @@ assert waveform.oversampling == 2.5
 
 采样率与带宽的比值可以是非整数，但采样率必须让有效OFDM符号、GI和传统前导时长得到整数采样点。若未提供 `sampleRateHz`，旧 `oversampling` 参数仍可兼容现有调用。
 
-### `PowerCalibration` 参数与方法
+### `PowerCalibration` 参数与方法（位于 `inc/SigProc.py`）
 
 `PowerCalibration(parameters=None, **parameterOverrides)` 负责绝对功率标定。工程约定复包络的 RMS 幅度等于电阻端口上的 RF RMS 电压，因此
 
@@ -613,9 +670,9 @@ PA 辅助接口还包括：
 | `IQImbalancePA(paModel, directCoefficient, imageCoefficient)` | `paModel`、直通系数、镜像系数 | `directCoefficient=1+0j`，`imageCoefficient=0.045·exp(j·0.35)`。 |
 | `AddAwgn(inputSignal, snrDb, randomGenerator)` | 输入、反馈 SNR、NumPy 随机数生成器 | `snrDb=None` 时原样复制输入，否则加入复高斯白噪声。 |
 
-### `SigProcess` 参数与方法
+### `SigProc` 参数与方法
 
-构造函数 `SigProcess(referenceSignal, sampleRateHz, parameters=None, **parameterOverrides)` 保存已知参考和采样率；全部默认值定义在构造函数内部，调用方只传覆盖字典。
+构造函数 `SigProc(referenceSignal, sampleRateHz, parameters=None, **parameterOverrides)` 保存已知参考和采样率；全部默认值定义在构造函数内部，调用方只传覆盖字典。
 
 | 配置参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -644,6 +701,21 @@ PA 辅助接口还包括：
 
 `SignalProcessingResult` 包含 `processedSignal`、`integerDelaySamples`、`fractionalDelaySamples`、`carrierFrequencyOffsetHz`、`samplingFrequencyOffsetPpm` 和 `complexGain`。
 
+同文件中的 `PowerCalibration` 参数、公式和接口见上方独立小节。
+
+### `FrameProcess` 与 `WifiMetadata`
+
+`FrameProcess(waveform)` 接收 `WifiWaveform` 数据契约并立即验证数组形状与帧元数据，不保存独立可调 RF 参数。
+
+| 接口 | 参数 | 返回值或作用 |
+| --- | --- | --- |
+| `BuildCsdPhaseMatrix(subcarrierIndices, subcarrierSpacingHz, cyclicShiftsSeconds)` | 音调索引、音调间隔、每链 CSD | 返回 `numTones × numTransmitChains` 复相位矩阵。 |
+| `FrameProcess.ValidateMetadata()` | 无 | 检查 FFT/GI、字段起点、音调、空间映射和 CSD 维度。 |
+| `FrameProcess.ValidatePreparedSignal(preparedSignal)` | 已同步 SISO/MIMO 信号 | 返回统一为二维的 `samples × transmitChains` 数组。 |
+| `FrameProcess.DemodulatePreparedWifiData(preparedSignal, maximumSymbolCount=None)` | 已同步信号、可选最大符号数 | 返回 `symbols × dataTones × spatialStreams` 星座。 |
+
+`MCSInfo` 保存单个 MCS 的调制阶数与码率；`WifiWaveform` 保存波形样点及接收处理所需元数据。二者均是纯数据类，不包含 PA、同步或指标算法。
+
 ### `Analysis` 参数与方法
 
 构造函数 `Analysis(referenceSignal, waveform, parameters=None, **parameterOverrides)` 要求参考信号为非空有限复数组，且形状与 `WifiWaveform.samples` 相同；MIMO 采用 `samples × transmitChains`。传入的待测信号可以在同步前具有不同样点数，但列数必须保持一致。
@@ -655,11 +727,11 @@ PA 辅助接口还包括：
 | `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
 | `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
 | `loadResistanceOhm` | `50.0` | 功率扫描中 dBm 与参考波形 RMS 电压换算所用的端口电阻。 |
-| `signalProcessingParameters` | `None` | 传给 `SigProcess` 的普通覆盖字典；`None` 使用其内部默认值。 |
+| `signalProcessingParameters` | `None` | 传给 `SigProc` 的普通覆盖字典；`None` 使用其内部默认值。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
-| `Analyze(measuredSignal)` | PA/DPD 输出或采集信号 | 先调用 `SigProcess`，再返回一个 `SignalMetrics`。 |
+| `Analyze(measuredSignal)` | PA/DPD 输出或采集信号 | 先调用 `SigProc` 和所需的 `FrameProcess` 接收处理，再返回一个 `SignalMetrics`。 |
 | `AnalyzeStages(stageSignals)` | `{阶段名称: 输出数组}` 映射 | 批量计算并保存各阶段指标。 |
 | `PrepareMeasuredSignal(measuredSignal)` | 原始待测信号 | 返回与参考等长的同步、频偏和复增益校正信号。 |
 | `GetLastSignalProcessingResult()` | 无 | 返回最近一次第一路 `SignalProcessingResult`，尚未分析时返回 `None`。 |
@@ -886,7 +958,8 @@ python main.py --format EHT --bandwidth 20 --tx-antennas 4 --spatial-streams 2 -
 
 ```python
 from inc.Analysis import Analysis
-from inc.PaModel import MimoPaModel, PowerCalibration
+from inc.PaModel import MimoPaModel
+from inc.SigProc import PowerCalibration
 from inc.WaveGenWifi import WaveGenWifi
 
 wifiGenerator = WaveGenWifi(
@@ -1159,8 +1232,8 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 
 ## 指标定义
 
-- SNR：`SigProcess` 完成时延、CFO、SFO 和公共复增益补偿后，数据字段参考功率与残差功率之比。
-- EVM：使用同一份 `SigProcess` 校正信号，对当前格式的 `VHT-Data`、`HE-Data` 或 `EHT-Data` 去循环前缀、FFT 后，在数据子载波上相对同路径参考星座计算 RMS EVM，同时输出 dB 与百分比。
+- SNR：`SigProc` 完成时延、CFO、SFO 和公共复增益补偿后，数据字段参考功率与残差功率之比。
+- EVM：使用同一份 `SigProc` 校正信号，由 `FrameProcess` 对当前格式的 `VHT-Data`、`HE-Data` 或 `EHT-Data` 去循环前缀、FFT、撤销 CSD 和空间解映射后，在数据子载波上相对同路径参考星座计算 RMS EVM，同时输出 dB 与百分比。
 - 每轮 MSE：Raw MSE 保留绝对增益、相位及整帧误差；LC-MSE 删除最优公共复增益，是一般复基带的 EVM 代理；EVM-MSE 使用完整 Wi-Fi 接收链，并严格满足 `EVM-MSE = EVM_rms²` 与 `EVM(dB) = 10·log10(EVM-MSE)`。详细推导见 [结果计算物理原理与推导](doc/Analysis.md#55-为什么原始-mse-不能总是反映-evm)。
 - ACLR：主信道功率与上下相邻同带宽信道功率之比，输出上下邻道和较差值。为完整覆盖两个邻道，命令行采样倍率限制为 4 或 8。
 - 功率-EVM：横轴为 PA 端口绝对输入功率 dBm；`Analysis` 按 `P=Vrms²/R` 将其换算为仿真参考波形的 RMS 电压。纵轴为 RMS EVM dB，数值越低表示性能越好。普通模式比较 PA 基线、每个功率点重新学习的频域 ILC、以及复用标称功率训练系数的 GMP DPD。

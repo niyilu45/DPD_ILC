@@ -1,6 +1,6 @@
-# 信号同步与补偿的物理原理和推导
+# 信号同步、补偿与功率标定的物理原理和推导
 
-本文对应 `inc/SigProcess.py`。该模块位于“测量/仿真输出”和“性能指标计算”之间，专门处理整数时延、分数时延、载波频偏、采样频偏和公共复增益。`Analysis` 只消费校正后的信号并计算 SNR、EVM、ACLR，避免把同步误差错误地解释为 PA 非线性。
+本文对应 `inc/SigProc.py`。该模块位于“测量/仿真输出”和“性能指标计算”之间，专门处理整数时延、分数时延、载波频偏、采样频偏、公共复增益和 dBm/RMS 功率标定。`Analysis` 只消费校正后的信号并计算 SNR、EVM、ACLR，避免把同步误差错误地解释为 PA 非线性。
 
 ---
 
@@ -263,7 +263,7 @@ z[n]=\frac{z_0[n]}{\hat g}.
 
 ```mermaid
 classDiagram
-    class SigProcess {
+    class SigProc {
         +Process(measuredSignal, estimationSlice)
         +EstimateIntegerDelay(measuredSignal)
         +EstimateCarrierFrequencyOffset(integerAlignedSignal)
@@ -282,17 +282,17 @@ classDiagram
         +complexGain
         +ToDict()
     }
-    SigProcess --> SignalProcessingResult : Process returns
-    Analysis --> SigProcess : preprocessing
+    SigProc --> SignalProcessingResult : Process returns
+    Analysis --> SigProc : preprocessing
 ```
 
-**图 2 说明：**`SigProcess` 持有参考信号、采样率和估计配置；`Process` 返回不可变的 `SignalProcessingResult`。样点数组用于后续指标计算，`ToDict()` 只输出适合 JSON/CSV 记录的标量估计。
+**图 2 说明：**`SigProc` 持有参考信号、采样率和估计配置；`Process` 返回不可变的 `SignalProcessingResult`。样点数组用于后续指标计算，`ToDict()` 只输出适合 JSON/CSV 记录的标量估计。
 
 ---
 
 ## 10. 可配置参数
 
-所有默认值都定义在 `SigProcess.__init__` 内部，调用方只传需要覆盖的键。
+所有默认值都定义在 `SigProc.__init__` 内部，调用方只传需要覆盖的键。
 
 | 参数 | 默认值 | 物理含义 |
 |---|---:|---|
@@ -315,9 +315,9 @@ classDiagram
 直接使用工具类：
 
 ```python
-from inc.SigProcess import SigProcess
+from inc.SigProc import SigProc
 
-signalProcessor = SigProcess(
+signalProcessor = SigProc(
     referenceSignal,
     sampleRateHz,
     parameters={
@@ -360,3 +360,74 @@ processingResult = resultAnalysis.GetLastSignalProcessingResult()
 4. 单一线性采样频偏模型不描述采样时钟抖动或随时间变化的非线性漂移。
 5. 公共复增益只消除统一幅相误差，不等于频率选择性信道均衡；真实 OTA MIMO 测量仍需要信道估计和均衡。
 6. 插值会改变记录边缘；测量采集应在帧前后保留足够保护样点，避免时延补偿后丢失有效数据。
+
+---
+
+## 13. dBm 与复包络 RMS 电压标定
+
+`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它只负责物理单位换算，不修改信号样点，也不执行 PA 非线性。
+
+工程约定复包络 RMS 幅度等于纯电阻端口上的 RF RMS 电压。设端口电阻为 $R$，RMS 电压为 $V_{\mathrm{RMS}}$，则端口平均功率为
+
+```math
+P_{\mathrm{W}}
+=\frac{V_{\mathrm{RMS}}^2}{R}.
+```
+
+dBm 使用 1 mW 作为参考：
+
+```math
+P_{\mathrm{dBm}}
+=10\log_{10}\left(
+\frac{P_{\mathrm{W}}}{10^{-3}}
+\right).
+```
+
+因此从 dBm 到 RMS 电压的换算为
+
+```math
+V_{\mathrm{RMS}}
+=\sqrt{
+R\,10^{-3}10^{P_{\mathrm{dBm}}/10}
+}.
+```
+
+反向换算为
+
+```math
+P_{\mathrm{dBm}}
+=10\log_{10}\left(
+\frac{V_{\mathrm{RMS}}^2}{R\,10^{-3}}
+\right).
+```
+
+```mermaid
+flowchart LR
+    dbm["绝对功率 dBm"] --> watt["按1 mW参考换算瓦特"]
+    resistance["loadResistanceOhm"] --> rms["计算RMS电压"]
+    watt --> rms
+    rms --> signal["缩放单位RMS复包络"]
+    signal --> measured["测量RMS电压"]
+    measured --> dbmOutput["换算输出功率 dBm"]
+    resistance --> dbmOutput
+```
+
+**图 3 说明：**`PowerCalibration` 为主程序、`PaModel`、`Analysis` 和 Benchmark 提供同一个端口阻抗基准。它位于 `SigProc.py` 后，`Analysis` 不再需要为了功率换算而导入 `PaModel.py`。
+
+50 Ω 端口上，0 dBm 等于 1 mW，对应
+
+```math
+V_{\mathrm{RMS}}
+=\sqrt{50\times10^{-3}}
+\approx0.223607\ \mathrm{V}.
+```
+
+典型调用：
+
+```python
+from inc.SigProc import PowerCalibration
+
+powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
+inputRmsVoltage = powerCalibration.DbmToRms(0.0)
+measuredPowerDbm = powerCalibration.RmsToDbm(inputRmsVoltage)
+```

@@ -738,7 +738,7 @@ flowchart LR
     analysis --> baseline["PA baseline"]
 ```
 
-这里没有单独的无线信道、接收噪声或频偏。`SigProcess` 仍由 `Analysis` 调用，使baseline与其他场景走相同分析入口。
+这里没有单独的无线信道、接收噪声或频偏。`SigProc` 仍由 `Analysis` 调用，使 baseline 与其他场景走相同分析入口。
 
 ### 15.2 baseline不是一个全局通用数字
 
