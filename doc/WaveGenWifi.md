@@ -443,7 +443,7 @@ flowchart LR
     H --> I["EHT-Data<br/>QAM/OFDM 数据"]
 ```
 
-**图 4 说明**：EHT 帧先发送传统设备可识别的兼容前缀，再发送 EHT 专用信令和训练字段，最后进入数据字段。当前代码复现字段顺序和持续时间；U-SIG位置承载本工程CRC保护的接收解析描述，其他训练字段使用确定性随机BPSK宽带激励。它不声称逐采样复制标准规定的训练或SIG编码内容。
+**图 4 说明**：EHT 帧先发送传统设备可识别的兼容前缀，再发送 EHT 专用信令和训练字段，最后进入数据字段。当前代码复现字段顺序和持续时间；U-SIG位置承载本工程带导频、跨符号交织和短块LDPC保护的接收解析描述，其他训练字段使用确定性随机BPSK宽带激励。它不声称逐采样复制标准规定的训练或SIG编码内容。
 
 ### 8.4 HE 激励帧
 
@@ -459,7 +459,7 @@ flowchart LR
 
 `TrainingField` 用 64 点传统 OFDM 基准，在每个 20 MHz 子信道放置 52 个 BPSK 音调；多带宽时按 bonded 20 MHz 分段扩展。传统符号的有效时长约为 3.2 µs，CP 为 0.8 µs，合计 4 µs。
 
-为了支持只输入接收波形的Analysis路径，`BuildWifiDescriptorField` 在VHT-SIG-A、HE-SIG-A或U-SIG位置写入两个52音调BPSK符号。描述内容包括格式、带宽、MCS、GI、数据符号数、空间维度、映射方式和32位随机种子，并由CRC-16保护。发送字段布局和接收推导见 [ParseWifi.md](./ParseWifi.md)。
+为了支持只输入接收波形的Analysis路径，`BuildWifiDescriptorField` 在VHT-SIG-A、HE-SIG-A或U-SIG位置写入两个52音调BPSK符号。描述内容包括格式、带宽、MCS、GI、数据符号数、空间维度、映射方式和10 bit随机种子；55 bit有效载荷编码为90 bit短块LDPC码字，再与14个已知导频共同填满104个音调。Parser还保留历史32 bit seed加CRC-16描述的只读兼容。发送字段布局和接收推导见 [ParseWifi.md](./ParseWifi.md)。
 
 VHT 中，L-STF/L-LTF/L-SIG 分别占 8/8/4 µs，VHT-SIG-A 占 8 µs，VHT-STF 和 VHT-SIG-B 各占 4 µs；每个 VHT-LTF 占 4 µs，字段总时长随空间流所需的 LTF 符号数增长。
 
@@ -718,7 +718,7 @@ R\,10^{-3}10^{p_{\mathrm{out,dBm}}/10}
 | `guardIntervalUs` | 改变 CP 和 LTF 模式 | GI 越长，抗长多径能力越强，效率越低 |
 | `sampleRateHz` | 直接确定复基带采样时钟、FFT和CP采样点数 | ACLR要求实际采样率至少为3倍带宽；速率必须兼容OFDM整数采样时长 |
 | `oversampling` | 在未配置 `sampleRateHz` 时兼容推导采样率 | 默认4；配置采样率后只作为派生比值 |
-| `seed` | 0至 $2^{32}-1$ | 控制随机激励并写入接收解析描述；固定seed可保证公平比较 |
+| `seed` | 0至1023 | 控制随机激励并以10 bit形式写入LDPC保护的接收解析描述；固定seed可保证公平比较 |
 | `numTransmitAntennas` | 改变物理发射链与 PA 列数 | VHT/HE/EHT 最大 8 |
 | `numSpatialStreams` | 改变独立 QAM/导频/训练维度 | 不得大于发射链数 |
 | `spatialMapping` | 选择 direct、DFT 或 custom 正交映射 | 改变各空间流在 PA 之间的分布 |

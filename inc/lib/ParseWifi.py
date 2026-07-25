@@ -1,9 +1,10 @@
 """Recover analysis metadata from a received project Wi-Fi waveform.
 
-The simulated VHT, HE, and EHT generator writes a compact, CRC-protected PHY
+The simulated VHT, HE, and EHT generator writes a compact, LDPC-protected PHY
 descriptor into the format-specific signaling field. ``ParseWifi`` locates
 that descriptor, restores the transmitted configuration, regenerates the ideal
-reference packet, and returns every object required by ``Analysis``.
+reference packet, and returns every object required by ``Analysis``. Legacy
+CRC-protected descriptors remain decodable for saved waveform compatibility.
 
 The descriptor is a project receiver aid, not a bit-exact IEEE signaling-field
 codec. It is necessary because the project intentionally generates randomized
@@ -25,6 +26,8 @@ from typing import (
 )
 
 import numpy as np
+
+from .Fec import DecodeDescriptorLdpc, EncodeDescriptorLdpc
 
 # Support both the canonical ``inc.lib`` package and the compatibility
 # ``lib`` package used when callers place the ``inc`` directory on sys.path.
@@ -53,7 +56,7 @@ class ParsedWifiFrame:
         referenceSignal: Regenerated ideal packet samples.
         waveform: Regenerated ``WifiWaveform`` metadata used by ``Analysis``.
         packetStartSample: Detected packet start in the original capture.
-        parseConfidence: Normalized signaling-field magic-word correlation.
+        parseConfidence: Normalized signaling-field pilot or magic correlation.
         detectedParameters: Descriptor values recovered from the frame.
     """
 
@@ -150,137 +153,110 @@ def CalculateDescriptorCrc(payloadBits: np.ndarray) -> int:
     return crcValue
 
 
-def BuildWifiDescriptorBits(
-    frameFormat: str,
-    bandwidthMhz: int,
-    mcs: int,
-    numDataSymbols: int,
-    guardIntervalUs: float,
-    seed: int,
-    numTransmitAntennas: int,
-    numSpatialStreams: int,
-    spatialMapping: str,
-    cyclicShiftEnabled: bool,
-) -> np.ndarray:
-    """Pack one Wi-Fi simulation configuration into 104 protected bits.
+def DescriptorLdpcPhysicalLayout(
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return pilot and code-bit positions for two descriptor symbols.
 
     Processing details:
-        Algorithm: Encode a magic word, descriptor version, PHY parameters,
-        spatial configuration, and random seed into fixed-width fields; append
-        CRC-16; then zero-pad the result to two 52-tone legacy OFDM symbols.
-
-    Args:
-        frameFormat: Canonical VHT, HE, or EHT PHY name.
-        bandwidthMhz: Nominal channel bandwidth in megahertz.
-        mcs: Modulation-and-coding-scheme index.
-        numDataSymbols: Number of payload OFDM symbols.
-        guardIntervalUs: Payload guard interval in microseconds.
-        seed: Unsigned 32-bit waveform random seed.
-        numTransmitAntennas: Physical transmit-chain count from one through
-            eight.
-        numSpatialStreams: Spatial-stream count from one through eight.
-        spatialMapping: Direct, DFT, or custom spatial mapping.
-        cyclicShiftEnabled: Whether cyclic-shift diversity is enabled.
+        Algorithm: Place seven known BPSK pilots across each 52-tone symbol,
+        retain the remaining 90 positions for the LDPC codeword, and map even
+        and odd codeword indices into different OFDM symbols. The distribution
+        gives each symbol an independent complex-gain estimate and prevents
+        one symbol-local PA error burst from corrupting a contiguous field.
 
     Returns:
-        result: Binary vector of length 104.
+        result: Pilot positions, pilot bits, nonpilot physical positions, and
+            the codeword-index order stored at those nonpilot positions.
     """
 
-    formatCodes: Mapping[str, int] = MappingProxyType(
-        {"VHT": 0, "HE": 1, "EHT": 2}
+    pilotPositionsPerSymbol = np.array(
+        [0, 8, 17, 26, 34, 43, 51],
+        dtype=np.int64,
     )
-    bandwidthCodes: Mapping[int, int] = MappingProxyType(
-        {20: 0, 40: 1, 80: 2, 160: 3}
+    pilotPositions = np.r_[
+        pilotPositionsPerSymbol,
+        52 + pilotPositionsPerSymbol,
+    ]
+    firstPilotBits = np.array(
+        [0, 0, 1, 0, 1, 1, 0],
+        dtype=np.uint8,
     )
-    guardIntervalCodes: Mapping[float, int] = MappingProxyType(
-        {0.4: 0, 0.8: 1, 1.6: 2, 3.2: 3}
+    pilotBits = np.r_[firstPilotBits, 1 - firstPilotBits].astype(
+        np.uint8
     )
-    mappingCodes: Mapping[str, int] = MappingProxyType(
-        {"direct": 0, "dft": 1, "custom": 2}
+    codePhysicalPositions = np.setdiff1d(
+        np.arange(104, dtype=np.int64),
+        pilotPositions,
+        assume_unique=True,
     )
-    normalizedFormat = str(frameFormat).strip().upper()
-    normalizedMapping = str(spatialMapping).strip().lower()
-    if normalizedFormat not in formatCodes:
-        raise ValueError("frameFormat must be VHT, HE, or EHT")
-    if bandwidthMhz not in bandwidthCodes:
-        raise ValueError("bandwidthMhz must be 20, 40, 80, or 160")
-    if guardIntervalUs not in guardIntervalCodes:
-        raise ValueError("unsupported descriptor guardIntervalUs")
-    if normalizedMapping not in mappingCodes:
-        raise ValueError("unsupported descriptor spatialMapping")
-    if not isinstance(cyclicShiftEnabled, bool):
-        raise TypeError("cyclicShiftEnabled must be boolean")
-
-    fieldValues: Tuple[Tuple[int, int], ...] = (
-        (0xD5B, 12),
-        (1, 2),
-        (formatCodes[normalizedFormat], 2),
-        (bandwidthCodes[bandwidthMhz], 2),
-        (int(mcs), 4),
-        (int(round(guardIntervalCodes[guardIntervalUs])), 2),
-        (int(numDataSymbols), 12),
-        (int(numTransmitAntennas) - 1, 3),
-        (int(numSpatialStreams) - 1, 3),
-        (mappingCodes[normalizedMapping], 2),
-        (int(cyclicShiftEnabled), 1),
-        (int(seed), 32),
+    codewordOrder = np.r_[
+        np.arange(0, 90, 2, dtype=np.int64),
+        np.arange(1, 90, 2, dtype=np.int64),
+    ]
+    return (
+        pilotPositions,
+        pilotBits,
+        codePhysicalPositions,
+        codewordOrder,
     )
-    payloadBits = np.concatenate(
-        [
-            IntegerToBits(integerValue, bitWidth)
-            for integerValue, bitWidth in fieldValues
-        ]
-    )
-    crcBits = IntegerToBits(CalculateDescriptorCrc(payloadBits), 16)
-    descriptorBits = np.r_[payloadBits, crcBits]
-    if descriptorBits.size > 104:
-        raise RuntimeError("internal Wi-Fi descriptor width overflow")
-    return np.pad(
-        descriptorBits,
-        (0, 104 - descriptorBits.size),
-        mode="constant",
-    ).astype(np.uint8)
 
 
-def DecodeWifiDescriptorBits(descriptorBits: np.ndarray) -> Dict[str, object]:
-    """Decode and validate one 104-bit project Wi-Fi descriptor.
+def DecodeWifiDescriptorPayload(
+    payloadBits: np.ndarray,
+) -> Dict[str, object]:
+    """Decode and validate the 55-bit version-two descriptor payload.
 
     Processing details:
-        Algorithm: Slice fields in the same order used by the transmitter,
-        validate the magic word, version, CRC, reserved bits, and enum codes,
-        then return generator-compatible parameter names.
+        Algorithm: Slice the fixed-width PHY fields, require the version-two
+        magic and version values, and apply the same format, MCS, guard
+        interval, spatial, and stream-count semantic checks used by the legacy
+        receiver. The random seed occupies ten bits.
 
     Args:
-        descriptorBits: Two-symbol binary descriptor candidate.
+        payloadBits: Corrected systematic LDPC payload of exactly 55 bits.
 
     Returns:
-        result: Decoded generator parameters.
+        result: Generator-compatible descriptor parameter dictionary.
     """
 
-    bitArray = np.asarray(descriptorBits, dtype=np.uint8).reshape(-1)
-    if bitArray.size != 104 or np.any(bitArray > 1):
-        raise ValueError("descriptorBits must contain exactly 104 bits")
-    fieldWidths = (12, 2, 2, 2, 4, 2, 12, 3, 3, 2, 1, 32)
+    bitArray = np.asarray(payloadBits, dtype=np.uint8).reshape(-1)
+    if bitArray.size != 55 or np.any(bitArray > 1):
+        raise ValueError("payloadBits must contain exactly 55 binary values")
+    fieldWidths = (12, 2, 2, 2, 4, 2, 12, 3, 3, 2, 1, 10)
     fieldValues = []
     bitCursor = 0
     for bitWidth in fieldWidths:
         fieldValues.append(
-            BitsToInteger(bitArray[bitCursor : bitCursor + bitWidth])
+            BitsToInteger(bitArray[bitCursor:bitCursor + bitWidth])
         )
         bitCursor += bitWidth
-    payloadStop = bitCursor
-    receivedCrc = BitsToInteger(bitArray[payloadStop : payloadStop + 16])
-    calculatedCrc = CalculateDescriptorCrc(bitArray[:payloadStop])
-    reservedBits = bitArray[payloadStop + 16 :]
     if fieldValues[0] != 0xD5B:
         raise ValueError("Wi-Fi descriptor magic word is invalid")
-    if fieldValues[1] != 1:
+    if fieldValues[1] != 2:
         raise ValueError("Wi-Fi descriptor version is unsupported")
-    if receivedCrc != calculatedCrc:
-        raise ValueError("Wi-Fi descriptor CRC is invalid")
-    if np.any(reservedBits):
-        raise ValueError("Wi-Fi descriptor reserved bits are nonzero")
+    return BuildDecodedDescriptorParameters(fieldValues)
 
+
+def BuildDecodedDescriptorParameters(
+    fieldValues: Sequence[int],
+) -> Dict[str, object]:
+    """Validate decoded descriptor fields and build generator parameters.
+
+    Processing details:
+        Algorithm: Map compact enum fields to public names and reject illegal
+        MCS, guard interval, antenna, stream, or spatial-mapping combinations.
+        This shared semantic layer keeps version-one CRC and version-two LDPC
+        decoding behavior identical after error correction.
+
+    Args:
+        fieldValues: Twelve decoded integer fields in transmitter order.
+
+    Returns:
+        result: Valid generator-compatible parameter dictionary.
+    """
+
+    if len(fieldValues) != 12:
+        raise ValueError("fieldValues must contain exactly twelve values")
     formats: Mapping[int, str] = MappingProxyType(
         {0: "VHT", 1: "HE", 2: "EHT"}
     )
@@ -295,6 +271,10 @@ def DecodeWifiDescriptorBits(descriptorBits: np.ndarray) -> Dict[str, object]:
     )
     if fieldValues[2] not in formats or fieldValues[9] not in mappings:
         raise ValueError("Wi-Fi descriptor enum code is invalid")
+    if fieldValues[3] not in bandwidths:
+        raise ValueError("Wi-Fi descriptor bandwidth code is invalid")
+    if fieldValues[5] not in guardIntervals:
+        raise ValueError("Wi-Fi descriptor guard interval code is invalid")
     frameFormat = formats[fieldValues[2]]
     guardIntervalUs = guardIntervals[fieldValues[5]]
     mcs = fieldValues[4]
@@ -339,6 +319,213 @@ def DecodeWifiDescriptorBits(descriptorBits: np.ndarray) -> Dict[str, object]:
         "cyclicShiftEnabled": bool(fieldValues[10]),
         "seed": fieldValues[11],
     }
+
+
+def BuildWifiDescriptorBits(
+    frameFormat: str,
+    bandwidthMhz: int,
+    mcs: int,
+    numDataSymbols: int,
+    guardIntervalUs: float,
+    seed: int,
+    numTransmitAntennas: int,
+    numSpatialStreams: int,
+    spatialMapping: str,
+    cyclicShiftEnabled: bool,
+) -> np.ndarray:
+    """Pack one Wi-Fi simulation configuration into 104 protected bits.
+
+    Processing details:
+        Algorithm: Encode a version-two 55-bit payload with a ten-bit seed,
+        apply the systematic rate-55/90 LDPC code, interleave even and odd
+        codeword positions across two symbols, and insert fourteen distributed
+        BPSK pilots for independent per-symbol complex-gain estimation.
+
+    Args:
+        frameFormat: Canonical VHT, HE, or EHT PHY name.
+        bandwidthMhz: Nominal channel bandwidth in megahertz.
+        mcs: Modulation-and-coding-scheme index.
+        numDataSymbols: Number of payload OFDM symbols.
+        guardIntervalUs: Payload guard interval in microseconds.
+        seed: Unsigned 10-bit waveform random seed.
+        numTransmitAntennas: Physical transmit-chain count from one through
+            eight.
+        numSpatialStreams: Spatial-stream count from one through eight.
+        spatialMapping: Direct, DFT, or custom spatial mapping.
+        cyclicShiftEnabled: Whether cyclic-shift diversity is enabled.
+
+    Returns:
+        result: Binary vector of length 104.
+    """
+
+    formatCodes: Mapping[str, int] = MappingProxyType(
+        {"VHT": 0, "HE": 1, "EHT": 2}
+    )
+    bandwidthCodes: Mapping[int, int] = MappingProxyType(
+        {20: 0, 40: 1, 80: 2, 160: 3}
+    )
+    guardIntervalCodes: Mapping[float, int] = MappingProxyType(
+        {0.4: 0, 0.8: 1, 1.6: 2, 3.2: 3}
+    )
+    mappingCodes: Mapping[str, int] = MappingProxyType(
+        {"direct": 0, "dft": 1, "custom": 2}
+    )
+    normalizedFormat = str(frameFormat).strip().upper()
+    normalizedMapping = str(spatialMapping).strip().lower()
+    if normalizedFormat not in formatCodes:
+        raise ValueError("frameFormat must be VHT, HE, or EHT")
+    if bandwidthMhz not in bandwidthCodes:
+        raise ValueError("bandwidthMhz must be 20, 40, 80, or 160")
+    if guardIntervalUs not in guardIntervalCodes:
+        raise ValueError("unsupported descriptor guardIntervalUs")
+    if normalizedMapping not in mappingCodes:
+        raise ValueError("unsupported descriptor spatialMapping")
+    if not isinstance(cyclicShiftEnabled, bool):
+        raise TypeError("cyclicShiftEnabled must be boolean")
+
+    fieldValues: Tuple[Tuple[int, int], ...] = (
+        (0xD5B, 12),
+        (2, 2),
+        (formatCodes[normalizedFormat], 2),
+        (bandwidthCodes[bandwidthMhz], 2),
+        (int(mcs), 4),
+        (int(round(guardIntervalCodes[guardIntervalUs])), 2),
+        (int(numDataSymbols), 12),
+        (int(numTransmitAntennas) - 1, 3),
+        (int(numSpatialStreams) - 1, 3),
+        (mappingCodes[normalizedMapping], 2),
+        (int(cyclicShiftEnabled), 1),
+        (int(seed), 10),
+    )
+    messageBits = np.concatenate(
+        [
+            IntegerToBits(integerValue, bitWidth)
+            for integerValue, bitWidth in fieldValues
+        ]
+    )
+    codeword = EncodeDescriptorLdpc(messageBits)
+    (
+        pilotPositions,
+        pilotBits,
+        codePhysicalPositions,
+        codewordOrder,
+    ) = DescriptorLdpcPhysicalLayout()
+    descriptorBits = np.zeros(104, dtype=np.uint8)
+    descriptorBits[pilotPositions] = pilotBits
+    descriptorBits[codePhysicalPositions] = codeword[codewordOrder]
+    return descriptorBits
+
+
+def DecodeLegacyWifiDescriptorBits(
+    descriptorBits: np.ndarray,
+) -> Dict[str, object]:
+    """Decode and validate one legacy version-one CRC descriptor.
+
+    Processing details:
+        Algorithm: Slice the original 32-bit-seed layout, validate its magic,
+        version, CRC-16, reserved bits, and field semantics, and return the
+        same public parameter dictionary as the version-two LDPC path.
+
+    Args:
+        descriptorBits: Two-symbol binary descriptor candidate.
+
+    Returns:
+        result: Decoded generator parameters.
+    """
+
+    bitArray = np.asarray(descriptorBits, dtype=np.uint8).reshape(-1)
+    if bitArray.size != 104 or np.any(bitArray > 1):
+        raise ValueError("descriptorBits must contain exactly 104 bits")
+    fieldWidths = (12, 2, 2, 2, 4, 2, 12, 3, 3, 2, 1, 32)
+    fieldValues = []
+    bitCursor = 0
+    for bitWidth in fieldWidths:
+        fieldValues.append(
+            BitsToInteger(bitArray[bitCursor : bitCursor + bitWidth])
+        )
+        bitCursor += bitWidth
+    payloadStop = bitCursor
+    receivedCrc = BitsToInteger(bitArray[payloadStop : payloadStop + 16])
+    calculatedCrc = CalculateDescriptorCrc(bitArray[:payloadStop])
+    reservedBits = bitArray[payloadStop + 16 :]
+    if fieldValues[0] != 0xD5B:
+        raise ValueError("Wi-Fi descriptor magic word is invalid")
+    if fieldValues[1] != 1:
+        raise ValueError("Wi-Fi descriptor version is unsupported")
+    if receivedCrc != calculatedCrc:
+        raise ValueError("Wi-Fi descriptor CRC is invalid")
+    if np.any(reservedBits):
+        raise ValueError("Wi-Fi descriptor reserved bits are nonzero")
+
+    return BuildDecodedDescriptorParameters(fieldValues)
+
+
+def DecodeWifiDescriptorLdpcValues(
+    normalizedDescriptorValues: np.ndarray,
+) -> Dict[str, object]:
+    """Decode normalized version-two descriptor symbols with LDPC.
+
+    Processing details:
+        Algorithm: Remove the fourteen known pilot positions, invert the
+        even/odd cross-symbol interleaver, run soft normalized-min-sum LDPC
+        decoding, and validate the recovered 55-bit semantic payload.
+
+    Args:
+        normalizedDescriptorValues: Complex or real soft BPSK values in the
+            104 physical descriptor-tone order.
+
+    Returns:
+        result: Generator-compatible descriptor parameters.
+    """
+
+    physicalValues = np.asarray(
+        normalizedDescriptorValues,
+        dtype=np.complex128,
+    ).reshape(-1)
+    if physicalValues.size != 104 or not np.all(
+        np.isfinite(physicalValues)
+    ):
+        raise ValueError(
+            "normalizedDescriptorValues must contain 104 finite values"
+        )
+    (
+        _,
+        _,
+        codePhysicalPositions,
+        codewordOrder,
+    ) = DescriptorLdpcPhysicalLayout()
+    softCodeword = np.zeros(90, dtype=float)
+    softCodeword[codewordOrder] = physicalValues[
+        codePhysicalPositions
+    ].real
+    messageBits = DecodeDescriptorLdpc(softCodeword)
+    return DecodeWifiDescriptorPayload(messageBits)
+
+
+def DecodeWifiDescriptorBits(descriptorBits: np.ndarray) -> Dict[str, object]:
+    """Decode version-two LDPC or legacy version-one descriptor bits.
+
+    Processing details:
+        Algorithm: Interpret hard values first as the new pilot-interleaved
+        LDPC format and fall back to the original sequential CRC format. The
+        fallback preserves receive compatibility with waveforms generated
+        before the ten-bit seed transition.
+
+    Args:
+        descriptorBits: Two-symbol binary descriptor candidate.
+
+    Returns:
+        result: Decoded generator parameters.
+    """
+
+    bitArray = np.asarray(descriptorBits, dtype=np.uint8).reshape(-1)
+    if bitArray.size != 104 or np.any(bitArray > 1):
+        raise ValueError("descriptorBits must contain exactly 104 bits")
+    hardValues = 1.0 - 2.0 * bitArray.astype(float)
+    try:
+        return DecodeWifiDescriptorLdpcValues(hardValues)
+    except ValueError:
+        return DecodeLegacyWifiDescriptorBits(bitArray)
 
 
 def DecodeWifiDescriptorBitsWithCorrection(
@@ -428,7 +615,7 @@ def DecodeWifiDescriptorBitsWithCorrection(
     correctedBits[12:14] = IntegerToBits(1, 2)
     correctedBits[93:] = 0
     try:
-        return DecodeWifiDescriptorBits(correctedBits)
+        return DecodeLegacyWifiDescriptorBits(correctedBits)
     except ValueError:
         pass
 
@@ -553,7 +740,9 @@ def DecodeWifiDescriptorBitsWithCorrection(
         candidateBits = correctedBits.copy()
         candidateBits[list(flippedIndices)] ^= 1
         try:
-            decodedParameters = DecodeWifiDescriptorBits(candidateBits)
+            decodedParameters = DecodeLegacyWifiDescriptorBits(
+                candidateBits
+            )
         except ValueError:
             continue
         if candidateEvaluator is None:
@@ -587,7 +776,8 @@ def DecodeWifiDescriptorBitsWithCorrection(
                 ),
             )[2]
     raise ValueError(
-        "no CRC-valid Wi-Fi descriptor was found within the correction limit"
+        "no legacy CRC-valid Wi-Fi descriptor was found within the "
+        "correction limit"
     )
 
 
@@ -619,7 +809,7 @@ def BuildWifiDescriptorField(
         mcs: Modulation-and-coding-scheme index.
         numDataSymbols: Number of payload OFDM symbols.
         guardIntervalUs: Payload guard interval in microseconds.
-        seed: Unsigned 32-bit waveform random seed.
+        seed: Unsigned 10-bit waveform random seed.
         numTransmitAntennas: Physical transmit-chain count.
         numSpatialStreams: Spatial-stream count.
         spatialMapping: Direct, DFT, or custom mapping name.
@@ -930,7 +1120,7 @@ class ParseWifi:
         packetStartSample: int,
         sampleRateHz: float,
     ) -> float:
-        """Score one CRC-valid descriptor against the complete receive packet.
+        """Score one protected descriptor against the complete receive packet.
 
         Processing details:
             Algorithm: Regenerate the candidate deterministic Wi-Fi waveform,
@@ -938,8 +1128,8 @@ class ParseWifi:
             magnitude correlation independently per physical chain, average
             the chain scores, and mildly penalize candidates that explain only
             a short prefix of the available capture. The full packet score
-            resolves CRC collisions that cannot be distinguished from the
-            two descriptor OFDM symbols alone.
+            rejects a semantically valid but incorrect LDPC or legacy CRC
+            candidate that cannot be distinguished from the descriptor alone.
 
         Args:
             decodedParameters: Semantically valid descriptor parameter map.
@@ -1041,16 +1231,18 @@ class ParseWifi:
         Processing details:
             Algorithm: Remove each legacy cyclic prefix, FFT two signaling
             symbols from the first receive chain, recover one repeated copy per
-            20 MHz subchannel, use the known magic word to remove common phase,
-            hard-decision the BPSK values, and accept only CRC-valid metadata.
+            20 MHz subchannel, and first try the version-two distributed pilots
+            with independent per-symbol gain estimates and soft LDPC decoding.
+            Fall back to version-one magic-word gain estimation and bounded
+            CRC correction for previously generated waveforms.
 
         Args:
             receivedSignal: Validated receive vector or matrix.
             packetStartSample: Proposed first packet sample.
             sampleRateHz: Proposed receiver sample rate in hertz.
             descriptorOffsetSymbols: Five for VHT or six for HE/EHT.
-            evaluateCorrectionCandidates: Whether multiple CRC-valid soft
-                decisions are disambiguated with full-packet correlation.
+            evaluateCorrectionCandidates: Whether valid protected candidates
+                are checked with full-packet correlation.
 
         Returns:
             result: Pair containing decoded parameters and correlation score.
@@ -1117,6 +1309,122 @@ class ParseWifi:
                         for spectrum in symbolSpectra
                     ]
                 )
+
+                # Version two distributes seven known pilots over each OFDM
+                # symbol. Separate gain estimates prevent PA memory or burst
+                # distortion in one symbol from rotating the other symbol.
+                (
+                    pilotPositions,
+                    pilotBits,
+                    _,
+                    _,
+                ) = DescriptorLdpcPhysicalLayout()
+                ldpcNormalizedValues = np.zeros(
+                    104,
+                    dtype=np.complex128,
+                )
+                pilotCorrelations = []
+                ldpcGainIsValid = True
+                for symbolIndex in range(2):
+                    symbolStart = 52 * symbolIndex
+                    symbolStop = symbolStart + 52
+                    symbolPilotMask = (
+                        (pilotPositions >= symbolStart)
+                        & (pilotPositions < symbolStop)
+                    )
+                    symbolPilotPositions = pilotPositions[
+                        symbolPilotMask
+                    ]
+                    expectedPilotSymbols = (
+                        1.0
+                        - 2.0
+                        * pilotBits[symbolPilotMask].astype(float)
+                    ).astype(np.complex128)
+                    receivedPilots = receivedValues[
+                        symbolPilotPositions
+                    ]
+                    pilotEnergy = float(
+                        np.vdot(receivedPilots, receivedPilots).real
+                    )
+                    expectedPilotEnergy = float(
+                        np.vdot(
+                            expectedPilotSymbols,
+                            expectedPilotSymbols,
+                        ).real
+                    )
+                    if (
+                        pilotEnergy <= np.finfo(float).tiny
+                        or expectedPilotEnergy <= np.finfo(float).tiny
+                    ):
+                        ldpcGainIsValid = False
+                        break
+                    symbolGain = np.vdot(
+                        expectedPilotSymbols,
+                        receivedPilots,
+                    ) / expectedPilotEnergy
+                    if np.abs(symbolGain) <= np.finfo(float).tiny:
+                        ldpcGainIsValid = False
+                        break
+                    ldpcNormalizedValues[
+                        symbolStart:symbolStop
+                    ] = (
+                        receivedValues[symbolStart:symbolStop]
+                        / symbolGain
+                    )
+                    pilotCorrelations.append(
+                        float(
+                            np.abs(
+                                np.vdot(
+                                    expectedPilotSymbols,
+                                    receivedPilots,
+                                )
+                            )
+                            / np.sqrt(
+                                expectedPilotEnergy * pilotEnergy
+                            )
+                        )
+                    )
+                if ldpcGainIsValid and pilotCorrelations:
+                    ldpcCorrelation = float(
+                        np.mean(pilotCorrelations)
+                    )
+                    if ldpcCorrelation >= float(
+                        self.parameters["minimumParseConfidence"]
+                    ):
+                        try:
+                            ldpcParameters = (
+                                DecodeWifiDescriptorLdpcValues(
+                                    ldpcNormalizedValues
+                                )
+                            )
+                        except ValueError:
+                            ldpcParameters = None
+                        if ldpcParameters is not None:
+                            ldpcCandidateScore = ldpcCorrelation
+                            if evaluateCorrectionCandidates:
+                                fullPacketScore = (
+                                    self.ScoreDescriptorCandidate(
+                                        ldpcParameters,
+                                        receivedSignal,
+                                        packetStartSample,
+                                        sampleRateHz,
+                                    )
+                                )
+                                if np.isfinite(fullPacketScore):
+                                    ldpcCandidateScore = min(
+                                        ldpcCandidateScore,
+                                        max(fullPacketScore, 0.0),
+                                    )
+                                else:
+                                    ldpcParameters = None
+                            if ldpcParameters is not None:
+                                descriptorCopies.append(ldpcParameters)
+                                correlationScores.append(
+                                    ldpcCandidateScore
+                                )
+
+                # Version-one fallback uses the original sequential magic,
+                # CRC, and 32-bit seed layout.
                 receivedMagic = receivedValues[:12]
                 magicEnergy = float(np.vdot(receivedMagic, receivedMagic).real)
                 if magicEnergy <= np.finfo(float).tiny:
@@ -1169,7 +1477,9 @@ class ParseWifi:
                 descriptorCopies.append(descriptorParameters)
                 correlationScores.append(correlation)
         if not descriptorCopies:
-            raise ValueError("no CRC-valid Wi-Fi descriptor was found")
+            raise ValueError(
+                "no LDPC-valid or legacy CRC-valid Wi-Fi descriptor was found"
+            )
         bestIndex = int(np.argmax(correlationScores))
         return descriptorCopies[bestIndex], correlationScores[bestIndex]
 
@@ -1183,8 +1493,9 @@ class ParseWifi:
         Processing details:
             Algorithm: Test exact capture start first, then scan the configured
             leading-offset range. For each receiver-clock candidate, try the
-            VHT and HE/EHT signaling positions and accept only descriptors whose
-            CRC, format-dependent offset, antenna count, and confidence agree.
+            VHT and HE/EHT signaling positions and accept only protected
+            descriptors whose format-dependent offset, antenna count, and
+            confidence agree.
 
         Args:
             receivedSignal: Validated receive waveform.
@@ -1263,9 +1574,9 @@ class ParseWifi:
                         continue
                     # A cyclic prefix can make a descriptor decodable a few
                     # samples before or after the true packet boundary. Refine
-                    # around the first CRC-valid point and choose the maximum
-                    # magic-word correlation so the returned packet crop is
-                    # aligned to the original transmit sample grid.
+                    # around the first protected-descriptor point and choose
+                    # the maximum pilot or magic correlation so the returned
+                    # packet crop is aligned to the original transmit grid.
                     legacyCpLength = int(
                         round(0.8e-6 * sampleRateHz)
                     )

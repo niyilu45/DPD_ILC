@@ -629,7 +629,7 @@ Save convergence histories and power-EVM data
 | `loadResistanceOhm` | 50 | 50 | dBm与复包络RMS电压换算 |
 | `numIterations` | 10 | 6 | 每种ILC记录轮数 |
 | `paModelName` | wiener | wiener | 被测PA模型 |
-| `seed` | 101 | 101 | 训练帧及方法种子基准 |
+| `seed` | 101 | 101 | 训练帧及方法种子基准；允许0至926，验证帧使用 `seed + 97` |
 | `powerStartDbm` | 10 | 10 | 每路输出功率扫描起点，单位dBm |
 | `powerStopDbm` | 25 | 25 | 每路输出功率扫描终点，单位dBm |
 | `powerPointCount` | 5 | 4 | 功率曲线点数 |
@@ -647,6 +647,7 @@ Save convergence histories and power-EVM data
 - `outputPowerDbm`、`powerStartDbm` 和 `powerStopDbm` 均不得超过 `maximumOutputPowerDbm`；
 - `loadResistanceOhm` 必须大于0；
 - `numIterations` 必须大于0；
+- `seed` 必须为0至926的整数，使训练seed和自动增加97的验证seed都保持在10 bit范围内；
 - `powerStartDbm` 和 `powerStopDbm` 必须是有限数；
 - `powerStopDbm` 必须大于 `powerStartDbm`；
 - `powerPointCount` 必须不小于2。

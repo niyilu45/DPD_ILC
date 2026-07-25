@@ -68,7 +68,7 @@ class WifiWaveform:
         spatialMappingMatrix: Orthonormal antenna-by-stream mapping matrix.
         cyclicShiftsSeconds: Per-antenna cyclic shifts in seconds.
         ltfSymbolCount: Number of format-specific long-training symbols.
-        seed: Unsigned 32-bit random seed used for deterministic regeneration.
+        seed: Unsigned 10-bit random seed used for deterministic regeneration.
         cyclicShiftEnabled: Original generator CSD enable configuration.
     """
 

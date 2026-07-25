@@ -137,6 +137,16 @@ class BenchmarkConfig:
         )
         if self.numIterations < 1:
             raise ValueError("numIterations must be positive")
+        if (
+            not isinstance(self.seed, int)
+            or isinstance(self.seed, bool)
+            or self.seed < 0
+            or self.seed + 97 >= 2**10
+        ):
+            raise ValueError(
+                "seed must be from zero through 926 so the independent "
+                "validation waveform remains inside the 10-bit range"
+            )
         powerCalibration.OutputPowerToDriveScale(
             self.powerStartDbm
         )

@@ -566,8 +566,8 @@ class WaveGenWifi:
                 )
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise TypeError("seed must be an integer")
-        if self.seed < 0 or self.seed >= 2**32:
-            raise ValueError("seed must be from zero through 2**32 - 1")
+        if self.seed < 0 or self.seed >= 2**10:
+            raise ValueError("seed must be from zero through 2**10 - 1")
         maximumSpatialStreams = 8
         for parameterName, parameterValue in (
             ("numTransmitAntennas", self.numTransmitAntennas),

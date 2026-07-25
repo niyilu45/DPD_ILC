@@ -5,10 +5,11 @@
 ## 理论文档
 
 - [Wi-Fi 帧生成物理原理与推导](doc/WaveGenWifi.md)：复基带、OFDM 正交性、QAM 归一化、MCS、循环前缀、VHT/HE/EHT 字段和 PAPR。
+- [FEC编码译码原理与用法](doc/Fec.md)：55/90短块LDPC校验矩阵、系统编码、软输入normalized min-sum译码和调用示例。
 - [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、Rapp AM-AM、AM-PM、GMP、频谱再生、IQ 失衡和反馈噪声。
 - [信号同步、补偿与功率标定原理](doc/SigProc.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样、复增益补偿和 dBm/RMS 换算。
 - [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
-- [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：描述字段、CRC、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
+- [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：10 bit seed、短块LDPC、历史CRC兼容、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
 - [Wi-Fi 元数据契约](doc/WifiMetadata.md)：`MCSInfo` 与 `WifiWaveform` 的字段、数组形状和模块边界。
 - [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
 - [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
@@ -22,12 +23,15 @@ python -m pip install -r requirements.txt
 
 工程使用 NumPy 完成信号处理；Matplotlib 只由 `inc/utils/Draw.py` 调用，用于生成 PNG 曲线图。
 
+工程源代码同时支持Python 3.9和Python 3.12。描述字段LDPC编码器和软输入译码器只依赖NumPy，没有引入要求特定Python小版本的LDPC编译扩展。
+
 ## 工程结构
 
 ```text
 main.py                 命令行主程序
 inc/lib/Analysis.py         SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
 inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
+inc/lib/Fec.py              55/90短块LDPC矩阵构造、系统编码和软输入译码
 inc/lib/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
 inc/lib/ParseWifi.py        接收帧描述解析、包起点检测与参考波形恢复
 inc/lib/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
@@ -40,6 +44,7 @@ inc/__init__.py         公共接口汇总
 tests/TestProject.py    自包含验证脚本
 tests/BenchMark.py      分类场景 ILC 性能基准、结果保存和功率-EVM比较
 doc/BenchMark.md        各 benchmark 场景的构造、预期和参考仿真结果
+doc/Fec.md              FEC物理原理、数学推导、接口约束和调用示例
 doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整示例
 ```
 
@@ -51,6 +56,7 @@ doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整�
 
 ```python
 from inc.lib.Analysis import Analysis
+from inc.lib.Fec import EncodeDescriptorLdpc
 from inc.lib.ParseWifi import ParseWifi
 from inc.lib.WaveGenWifi import WaveGenWifi
 ```
@@ -59,6 +65,7 @@ from inc.lib.WaveGenWifi import WaveGenWifi
 
 ```python
 from lib.Analysis import Analysis
+from lib.Fec import EncodeDescriptorLdpc
 from lib.ParseWifi import ParseWifi
 from lib.WaveGenWifi import WaveGenWifi
 ```
@@ -191,7 +198,7 @@ flowchart TD
     privateGenerate --> qam["QamModulate"]
     privateGenerate --> pilotSequence["PilotSequence"]
     privateGenerate --> mapping["BuildSpatialMappingMatrix"]
-    privateGenerate --> descriptor["BuildWifiDescriptorField<br/>格式/MCS/GI/空间结构/seed + CRC"]
+    privateGenerate --> descriptor["BuildWifiDescriptorField<br/>格式/MCS/GI/空间结构/10 bit seed + LDPC"]
     privateGenerate --> csd["GetCyclicShifts"]
     csd --> csdMatrix["FrameProcess.BuildCsdPhaseMatrix"]
     privateGenerate --> ltf["GetLtfSymbolCount / BuildLtfTrainingMatrix"]
@@ -219,8 +226,32 @@ flowchart TD
 - `ActiveTones` 与 `PilotTones` 决定不同带宽下的数据、导频和空子载波位置；`QamModulate` 完成 Gray 编码星座映射。
 - `BuildSpatialMappingMatrix` 产生 direct、DFT 或调用方自定义的正交映射；`SpatialMapTones` 为每个子载波执行空间映射并叠加 CSD，`BuildMimoOfdmSymbol` 再完成各发射链 IFFT 和循环前缀。
 - `BuildLtfTrainingMatrix` 产生跨 LTF 符号的正交训练码；LTF 数量随空间流增加。公共字段由 `MapCommonFieldToAntennas` 复制到各链并保留 CSD。
-- `BuildWifiDescriptorField` 在VHT-SIG-A、HE-SIG-A或U-SIG位置写入两个CRC保护的BPSK OFDM符号，使仅接收波形路径能够恢复本工程随机激励所需参数；它是仿真解析描述，不是bit-exact标准SIG编码器。
+- `BuildWifiDescriptorField` 在VHT-SIG-A、HE-SIG-A或U-SIG位置写入两个带导频、跨符号交织和短块LDPC保护的BPSK OFDM符号，使仅接收波形路径能够恢复本工程随机激励所需参数；Parser仍兼容历史CRC描述，但该字段是仿真解析描述，不是bit-exact标准SIG编码器。
+- LDPC校验矩阵、系统编码和软输入译码由独立的 `Fec.py` 提供；`WaveGenWifi.py` 与 `ParseWifi.py` 不再定义编译码算法。
 - `WaveGenWifi.Generate` 是面向调用方的波形入口，并由内部辅助函数 `GenerateWifiWaveform` 完成组帧，最终返回 `WifiWaveform`；其中既有时域样本，也有后续 EVM 解调所需的格式、字段切片和参考星座。
+
+### `inc/lib/Fec.py`
+
+```mermaid
+flowchart LR
+    build["BuildDescriptorLdpcMatrices"] --> matrixA["35×55稀疏信息矩阵A"]
+    build --> matrixH["35×90校验矩阵H"]
+    message["55 bit信息"] --> encode["EncodeDescriptorLdpc"]
+    matrixA --> encode
+    matrixH --> encode
+    encode --> codeword["90 bit系统码字"]
+    soft["90个软BPSK值"] --> decode["DecodeDescriptorLdpc"]
+    matrixH --> decode
+    decode --> syndrome["逐轮综合检查"]
+    syndrome --> recovered["55 bit纠正信息"]
+```
+
+**图示说明：**
+
+- `BuildDescriptorLdpcMatrices` 在函数内部确定性构造稀疏矩阵并缓存结果，不保存模块级数据全局变量。
+- `EncodeDescriptorLdpc` 保留55 bit原始信息并递推生成35 bit累加校验位；返回前验证完整综合为零。
+- `DecodeDescriptorLdpc` 接收“正值倾向bit 0、负值倾向bit 1”的90个软值，执行normalized min-sum迭代，只有全部35个校验方程通过才返回。
+- FEC模块不处理OFDM、导频或帧字段；物理音调布局和语义恢复仍由 `ParseWifi` 负责。完整推导和调用示例见[Fec说明文档](doc/Fec.md)。
 
 ### `inc/utils/WifiMetadata.py`
 
@@ -251,8 +282,13 @@ flowchart TD
     validate --> receiveDescriptor
     descriptorSource --> find["FindDescriptor"]
     receiveDescriptor --> find
-    find --> decode["DecodeDescriptorAt<br/>去CP / FFT / magic去相位 / CRC"]
-    decode --> parameters["格式 / 带宽 / MCS / GI / 空间流 / seed"]
+    find --> decode["DecodeDescriptorAt<br/>去CP / FFT / 逐符号导频均衡"]
+    decode --> deinterleave["去导频 / 撤销跨符号交织"]
+    deinterleave --> fecDecode["Fec.DecodeDescriptorLdpc"]
+    decode --> legacy["历史magic / CRC兼容路径"]
+    fecDecode --> parameters
+    legacy --> parameters
+    parameters["格式 / 带宽 / MCS / GI / 空间流 / seed"]
     parameters --> regenerate["WaveGenWifi确定性重生成参考与元数据"]
     objectPath --> correlate["EstimateSignalOverlap"]
     regenerate --> correlate
@@ -263,7 +299,7 @@ flowchart TD
 **图示说明：**
 
 - 接收输入和可选发送输入都使用统一参数名，并且都支持NumPy数组或 `WifiWaveform`；调用方不需要选择不同函数。
-- 没有发送参考时，Parser联合搜索采样率、包起点和格式信令位置，只有magic、版本、CRC、链数和置信度全部通过才接受候选。
+- 没有发送参考时，Parser联合搜索采样率、包起点和格式信令位置；新版字段必须通过导频置信度、LDPC校验和字段语义检查，旧保存波形才进入magic与CRC兼容路径。
 - 可选发送输入为NumPy数组时，Parser从发送样值解码元数据并保留原数组作为参考；输入为 `WifiWaveform` 时直接读取完整元数据。
 - 发送辅助路径使用逐链能量归一化互相关细化接收包起点，对低SNR、PA压缩和MIMO链间相位差更稳健；相关只处理发送与接收的有效重叠区间，不要求两者长度相等。
 - 详细字段布局、相关公式、参数表、适用边界和完整调用示例见[ParseWifi说明文档](doc/ParseWifi.md)。
@@ -645,7 +681,7 @@ flowchart LR
 | `--max-amplitude` | 正浮点数 | `2.0` | ILC 学习输入和部署 DPD 输入的峰值限制。 |
 | `--feedback-snr` | 浮点数或省略 | `None` | 反馈链 SNR，单位 dB；省略时使用无噪反馈。 |
 | `--feedback-averages` | 正整数 | `1` | 每轮 ILC 重复采集并平均的反馈次数。 |
-| `--seed` | 整数 | `7` | Wi-Fi 数据、训练字段及相关随机过程的种子。 |
+| `--seed` | `0–1023` 的整数 | `7` | Wi-Fi 数据、训练字段及相关随机过程的10 bit种子。 |
 | `--output-dir` | 路径 | `results` | JSON、CSV、收敛历史和可选波形文件的输出目录。 |
 | `--save-waveforms` | 开关 | 关闭 | 额外保存 `waveforms.npz`。 |
 
@@ -665,7 +701,7 @@ flowchart LR
 | `guardIntervalUs` | VHT：`0.4/0.8`；HE/EHT：`0.8/1.6/3.2` | `0.8` | 数据 GI，单位 μs。 |
 | `sampleRateHz` | 正数或 `None` | `None` | 用户直接配置的复基带采样率，单位 Hz；`None` 时才使用旧 `oversampling` 推导。必须不低于信道带宽，并保证OFDM各时长对应整数采样点。 |
 | `oversampling` | 正整数 | `4` | 旧接口兼容项；`sampleRateHz=None` 时采样率等于 `bandwidthMhz×1e6×oversampling`。生成后该属性表示实际采样率与带宽之比，允许为非整数。 |
-| `seed` | 整数 | `7` | 载荷、导频和训练字段随机种子。 |
+| `seed` | `0–1023` 的整数 | `7` | 载荷、导频和训练字段的10 bit随机种子；描述字段用LDPC保护。 |
 | `numTransmitAntennas` | `1–8` | `1` | VHT/HE/EHT 物理发射链数量；MIMO 输出矩阵的列数。 |
 | `numSpatialStreams` | `1..numTransmitAntennas` | `1` | 独立 QAM、导频和训练流数量。 |
 | `spatialMapping` | `"direct"`、`"dft"`、`"custom"` | `"direct"` | 每个子载波采用的空间映射方式。 |
@@ -836,7 +872,7 @@ PA 辅助接口还包括：
 | `sampleRateHz` | `None` | 显式接收采样率；`None`时自动尝试候选采样率。 |
 | `sampleRateCandidatesHz` | 20至640 MHz常见速率 | 自动解析时按顺序尝试的复基带采样率。 |
 | `maximumPacketOffsetSamples` | `2000` | 捕获开头允许的最大前置样点数；不限制发送侧裁剪位置。 |
-| `minimumParseConfidence` | `0.80` | 描述magic或发送接收互相关的最低置信度。 |
+| `minimumParseConfidence` | `0.80` | 新版描述导频、历史magic或发送接收互相关的最低置信度。 |
 | `referenceSearchSamples` | `4096` | 发送辅助归一化互相关使用的参考样点数。 |
 | `spatialMappingMatrix` | `None` | 无 `WifiWaveform` 元数据时为custom MIMO映射补充矩阵。 |
 
@@ -853,7 +889,7 @@ PA 辅助接口还包括：
 
 发送参考可以包含帧外前后补零，也可以长于实际PA输入或接收捕获。Parser不会把发送长度大于接收长度视为错误，而是在公共有效区间内估计有符号时延。若裁剪删除的只是帧外补零，性能指标保持不变；若裁剪切入OFDM帧内部，缺失样点无法恢复并会反映到EVM中。
 
-当接收数组是 `PaModel.Process(...)` 的输出时，Parser会先做magic相关和公共复增益补偿，再利用位置信度、固定描述字段及CRC进行有限软判决纠错。因此典型20 dBm输出回退下的Wiener和GMP输出可以直接使用 `Analysis(paOutput).Analyze()`。若PA已进入严重饱和、描述字段相关度低于门限，任何无参考解析都不能可靠恢复随机种子；此时应使用 `Analysis(paOutput, transmittedSignal=transmitSamples)`，其中 `transmitSamples` 可以是原始NumPy发送数组或 `WifiWaveform`。
+当接收数组是 `PaModel.Process(...)` 的输出时，Parser会分别用每个描述OFDM符号的已知导频估计复增益，撤销跨符号交织，再对90 bit短块LDPC码字执行软输入归一化min-sum译码。因此典型20 dBm输出下的Wiener和GMP输出可以直接使用 `Analysis(paOutput).Analyze()`。Parser仍可读取旧版magic加CRC描述。若PA已进入严重饱和、描述字段相关度低于门限，任何无参考解析都不能可靠恢复随机种子；此时应使用 `Analysis(paOutput, transmittedSignal=transmitSamples)`，其中 `transmitSamples` 可以是原始NumPy发送数组或 `WifiWaveform`。
 
 ```python
 from inc.lib.Analysis import Analysis
@@ -1017,7 +1053,7 @@ print(assistedMetrics["evmDb"])
 | `loadResistanceOhm` | `50.0` | dBm 与复包络 RMS 电压换算所用端口电阻。 |
 | `numIterations` | `10` | 每种 ILC 的迭代预算。 |
 | `paModelName` | `"wiener"` | `"wiener"` 或 `"gmp"`。 |
-| `seed` | `101` | 训练帧随机种子；验证帧自动使用 `seed + 97`。 |
+| `seed` | `101` | 训练帧10 bit随机种子，范围0至926；验证帧自动使用 `seed + 97`，因此仍不超过1023。 |
 | `powerStartDbm` | `10.0` | 全方法功率-EVM输出功率扫描起点。 |
 | `powerStopDbm` | `25.0` | 全方法功率-EVM输出功率扫描终点。 |
 | `powerPointCount` | `5` | 基准模式的扫描点数。 |

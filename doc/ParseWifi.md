@@ -42,7 +42,7 @@ metrics = resultAnalysis.Analyze()
 - 接收采样率；
 - 描述字段位置；
 - 描述比特；
-- CRC是否正确。
+- LDPC校验方程是否成立，或历史CRC是否正确。
 
 提供发送样值后，可以计算发送与接收波形的归一化互相关。包起点由整段波形能量共同决定，不再只依赖两个描述OFDM符号。
 
@@ -91,9 +91,9 @@ C(d)
 
 ### 3.1 为什么需要工程描述字段
 
-本工程的Wi-Fi发生器用于PA和DPD算法研究。它生成符合VHT、HE和EHT字段顺序、OFDM参数、活动音调、MCS星座和空间流结构的复基带激励，但没有实现完整的MAC、BCC、LDPC和标准SIG字段编解码器。
+本工程的Wi-Fi发生器用于PA和DPD算法研究。它生成符合VHT、HE和EHT字段顺序、OFDM参数、活动音调、MCS星座和空间流结构的复基带激励，但没有实现完整的MAC、标准数据字段BCC/LDPC和标准SIG字段编解码器。本章的短块LDPC只保护工程解析描述。
 
-如果只生成随机SIG激励，接收端无法从随机波形恢复随机种子、MCS和数据符号数。因此 `WaveGenWifi` 在格式相关信令字段中写入一个CRC保护的工程描述信息：
+如果只生成随机SIG激励，接收端无法从随机波形恢复随机种子、MCS和数据符号数。因此 `WaveGenWifi` 在格式相关信令字段中写入一个LDPC保护的工程描述信息：
 
 - VHT使用 `VHT-SIG-A`；
 - HE使用 `HE-SIG-A`；
@@ -101,14 +101,14 @@ C(d)
 
 该描述字段服务于本工程的可复现仿真，不应当解释为IEEE一致性测试所需的bit-exact SIG编码。
 
-### 3.2 104比特布局
+### 3.2 55 bit有效载荷
 
-描述信息占用两个传统OFDM符号，每个符号使用52个BPSK音调，共104比特。
+新版描述版本为2。有效载荷由55 bit组成，其中seed由原来的32 bit缩减为10 bit，取值范围为0至1023。
 
 | 字段 | 位数 | 含义 |
 |---|---:|---|
 | magic word | 12 | 固定同步字 `0xD5B` |
-| version | 2 | 当前版本为1 |
+| version | 2 | 新版LDPC描述固定为2 |
 | frame format | 2 | VHT、HE或EHT |
 | bandwidth | 2 | 20、40、80或160 MHz |
 | MCS | 4 | MCS 0至13 |
@@ -118,37 +118,121 @@ C(d)
 | spatial stream count | 3 | 一至八条空间流 |
 | spatial mapping | 2 | direct、DFT或custom |
 | CSD enabled | 1 | 是否启用循环移位 |
-| random seed | 32 | 波形确定性重生成种子 |
-| CRC-16 | 16 | 描述有效性校验 |
-| reserved | 11 | 保留并置零 |
+| random seed | 10 | 波形确定性重生成种子，范围0至1023 |
+| 合计 | 55 | LDPC系统信息位 |
 
-### 3.3 CRC-16-CCITT
+### 3.3 90 bit短码LDPC
 
-描述字段使用生成多项式：
+55 bit有效载荷经过系统短码LDPC编码，生成90 bit码字：
+
+```math
+\mathbf{c}
+=
+\begin{bmatrix}
+\mathbf{m} \\
+\mathbf{p}
+\end{bmatrix},
+\qquad
+\mathbf{m}\in\{0,1\}^{55},
+\qquad
+\mathbf{p}\in\{0,1\}^{35}.
+```
+
+校验矩阵写成：
+
+```math
+\mathbf{H}
+=
+\begin{bmatrix}
+\mathbf{A} & \mathbf{B}
+\end{bmatrix}.
+```
+
+$\mathbf{A}$ 是35乘55的稀疏消息矩阵，每个消息位连接三个校验节点；构造时优先避免两个消息列重复使用同一对校验行，以减少短环。$\mathbf{B}$ 是35乘35的下双对角累加矩阵。编码器递推求解：
+
+```math
+\mathbf{B}\mathbf{p}
+=
+\mathbf{A}\mathbf{m}
+\pmod 2,
+```
+
+从而保证：
+
+```math
+\mathbf{H}\mathbf{c}
+=
+\mathbf{0}
+\pmod 2.
+```
+
+码率为：
+
+```math
+R
+=
+\frac{55}{90}
+\approx
+0.611.
+```
+
+接收端使用软输入归一化min-sum译码。设变量节点$v$到校验节点$c$的输入消息为 $L_{v,c}$，校验节点输出近似为：
+
+```math
+L_{c,v}
+=
+0.5
+\left(
+\prod_{u\ne v}
+\mathrm{sign}(L_{u,c})
+\right)
+\min_{u\ne v}
+\left|L_{u,c}\right|.
+```
+
+系数0.5用于稳定短码中的低度累加节点。每轮得到后验软值并作硬判决；当全部35个校验方程同时满足时停止。实现仅依赖NumPy，不依赖编译扩展，因此同一代码支持Python 3.9和Python 3.12。
+
+### 3.4 14个分布式导频与跨符号交织
+
+104个物理BPSK音调由以下部分组成：
+
+- 90个LDPC码字音调；
+- 14个已知BPSK导频，每个描述OFDM符号放置7个。
+
+每个符号独立使用自己的7个导频估计复增益：
+
+```math
+\hat g_s
+=
+\frac{
+\sum_i p_{s,i}^{*}z_{s,i}
+}{
+\sum_i |p_{s,i}|^2
+}.
+```
+
+LDPC码字偶数位和奇数位被分散到不同描述符号。这样，某一个OFDM符号受到PA记忆效应、公共相位变化或突发削顶时，不会连续破坏seed或校验字段。
+
+### 3.5 旧版CRC描述兼容
+
+接收端仍可识别历史版本1波形。旧版使用32 bit seed、16 bit CRC-16-CCITT和11 bit保留位。其CRC多项式为：
 
 ```math
 G(x)=x^{16}+x^{12}+x^5+1.
 ```
 
-其十六进制表示为 `0x1021`，初始状态为 `0xFFFF`。
+新版发送器不再生成版本1描述，但Parser在LDPC路径失败后会回退到旧版magic、CRC和有限软翻转流程。因此已有保存波形不需要立即转换；新生成波形统一使用10 bit seed和LDPC保护。
 
-CRC同时验证：
+### 3.6 Python 3.9和3.12兼容策略
 
-- 候选采样率是否正确；
-- OFDM符号起点是否正确；
-- VHT或HE/EHT描述字段偏移是否正确；
-- BPSK硬判决是否可靠；
-- 描述字段是否被严重失真。
+工程没有把描述字段绑定到外部LDPC运行库。现有Python LDPC包要么要求Python 3.10或更高版本，要么还需要SciPy、Numba或编译扩展。为了同时覆盖Python 3.9和Python 3.12，当前实现把编码域步骤集中写在 `inc/lib/Fec.py` 中：
 
-错误候选随机通过16位CRC的概率约为：
+1. 确定性构造稀疏校验矩阵；
+2. 系统LDPC编码；
+3. 软输入归一化min-sum译码；
+4. 校验综合检查。
 
-```math
-P_{\mathrm{false}}
-\approx
-2^{-16}.
-```
-
-magic word、版本号、保留位和天线数检查会进一步降低误接受概率。
+`ParseWifi.py` 只负责描述载荷装包、导频、交织、均衡和字段语义检查。运行时只使用项目已有的NumPy依赖，没有增加只适配某个Python小版本的二进制包。矩阵在FEC函数内部构造并缓存，不使用模块级可变全局变量。这里的短码用于本工程接收解析描述，不是IEEE 802.11数据字段规定的标准LDPC码字。完整FEC推导和独立函数示例见 [Fec.md](./Fec.md)。
 
 ---
 
@@ -242,9 +326,9 @@ N_{\mathrm{L}}
 3.2\times 10^{-6}F_s.
 ```
 
-CRC只允许正确采样率候选继续。
+只有通过新版LDPC校验或历史CRC校验的采样率候选才能继续。
 
-### 5.3 描述字段解调
+### 5.3 新版LDPC描述字段解调
 
 对候选包起点，Parser删除传统CP并计算单位化FFT：
 
@@ -258,51 +342,62 @@ y[n]\exp\left(
 \right).
 ```
 
-magic word对应的理想BPSK序列记为 $p_i$，接收值为 $z_i$。公共复增益估计为：
+第 $s$ 个描述OFDM符号中的已知导频记为 $p_{s,i}$，接收值为 $z_{s,i}$。每个符号独立估计复增益：
 
 ```math
-\hat g
+\hat g_s
 =
 \frac{
-\sum_i p_i^*z_i
+\sum_i p_{s,i}^*z_{s,i}
 }{
-\sum_i |p_i|^2
+\sum_i |p_{s,i}|^2
 }.
 ```
 
-补偿后的BPSK硬判决为：
+独立补偿避免把第一个描述符号的增益和相位强加给第二个符号。设数据音调补偿值为：
 
 ```math
-\hat b_i
+q_{s,i}
 =
-\begin{cases}
-0,&\Re\{z_i/\hat g\}\ge 0,\\
-1,&\Re\{z_i/\hat g\}<0.
-\end{cases}
-```
-
-PA非线性可能使少量描述音调越过BPSK判决边界。Parser不会因为一次硬判决CRC失败就立即放弃，而是先计算每一位到判决边界的距离：
-
-```math
-r_i
-=
-\left|
 \Re\left\{
-\frac{z_i}{\hat g}
-\right\}
-\right|.
+\frac{z_{s,i}}{\hat g_s}
+\right\}.
 ```
 
-$r_i$ 越小，该位越不可靠。magic、版本号和保留位是协议内已知值，Parser先恢复这些固定字段；随后只在可靠度最低的有限候选位中搜索少量翻转组合。CRC-16的综合值用于meet-in-the-middle搜索，候选仍必须同时通过：
+$q_{s,i}>0$ 倾向于bit 0，$q_{s,i}<0$ 倾向于bit 1，绝对值表示可靠程度。Parser删除14个导频并撤销偶数位、奇数位跨符号交织，得到90个按码字顺序排列的软输入。
 
-- magic和版本检查；
-- CRC-16检查；
-- 保留位检查；
-- 帧格式、带宽、GI和空间映射枚举检查。
+初始对数似然近似值为：
 
-因此这是“CRC辅助的有限软判决纠错”，不是忽略CRC或猜测任意参数。它主要解决Wiener/GMP PA压缩引起的少量描述位错误。若PA严重饱和导致magic相关度低于 `minimumParseConfidence`，Parser不会启动纠错，以避免在无可信帧头时产生误解析。
+```math
+L_i^{(0)}
+=
+\frac{2q_i}{\alpha},
+```
 
-CRC长度有限，多个低可靠度翻转组合仍可能偶然产生不同的CRC有效参数。Parser只对最低代价的少量候选重新生成完整确定性帧。第 $c$ 个候选在第 $m$ 条物理链上的整帧一致性为：
+其中 $\alpha$ 是非零 $|q_i|$ 的中位数，用于消除整体增益尺度。变量节点和校验节点迭代交换消息，得到后验值：
+
+```math
+L_i^{\mathrm{post}}
+=
+L_i^{(0)}
++
+\sum_c L_{c,i}.
+```
+
+每轮按 $L_i^{\mathrm{post}}$ 的符号硬判决。只有综合向量满足：
+
+```math
+\mathbf{s}
+=
+\mathbf{H}\hat{\mathbf{c}}
+\pmod 2
+=
+\mathbf{0}
+```
+
+时才接受码字，然后继续检查magic、version、格式、带宽、MCS、GI、空间流和seed范围。如果最多60轮仍无法得到零综合，LDPC路径判为失败，不会把不满足校验的比特当作有效配置。
+
+为了进一步排除“校验有效但参数错误”的极小概率事件，Parser用译码参数重新生成完整确定性帧。第 $c$ 个候选在第 $m$ 条物理链上的整帧一致性为：
 
 ```math
 \gamma_{c,m}
@@ -319,16 +414,16 @@ CRC长度有限，多个低可靠度翻转组合仍可能偶然产生不同的CR
 }.
 ```
 
-其中 $\mathbf{x}_{c,m}$ 是由候选格式、MCS、符号数和随机种子重生成的发送帧，$\mathbf{y}_{m}$ 是接收端仍然可用的重叠样值。二者不要求总长度相等；相关只使用公共有效区间，并用“实际参与相关的样点数/候选帧样点数”的平方根降低不完整候选的评分。逐链相关幅度平均后，Parser选择整帧一致性最高的候选。错误随机种子即使碰巧通过CRC，也无法同时匹配随机载荷，因此会被排除。采样率低于候选带宽或空间结构不一致时仍直接判为无效。
+其中 $\mathbf{x}_{c,m}$ 是由候选格式、MCS、符号数和随机种子重生成的发送帧，$\mathbf{y}_{m}$ 是接收端仍然可用的重叠样值。二者不要求总长度相等；相关只使用公共有效区间，并用“实际参与相关的样点数/候选帧样点数”的平方根降低不完整候选的评分。逐链相关幅度平均后，Parser选择整帧一致性最高的候选。错误随机种子即使形成一个校验有效码字，也无法同时匹配随机载荷，因此会被排除。采样率低于候选带宽或空间结构不一致时仍直接判为无效。
 
-magic相关置信度为：
+第 $s$ 个描述符号的导频相关置信度为：
 
 ```math
-\rho
+\rho_s
 =
 \frac{
 \left|
-\sum_i p_i^*z_i
+\sum_i p_{s,i}^*z_{s,i}
 \right|
 }{
 \sqrt{
@@ -338,9 +433,13 @@ magic相关置信度为：
 }.
 ```
 
+两个描述符号的置信度取 $\rho_0$ 和 $\rho_1$ 的平均值。它必须不低于 `minimumParseConfidence`。
+
+如果新版LDPC译码失败，Parser才进入历史版本1兼容路径。兼容路径使用magic word估计公共复增益，并用CRC-16综合值在最低可靠度位中进行有限翻转搜索。旧算法仅用于读取以前保存的32 bit seed波形，新发送器不会再生成这种字段。
+
 ### 5.4 包起点细化
 
-CP会使相邻少量采样偏移仍可能得到可判决的FFT结果。Parser找到第一个CRC有效候选后，不立即返回，而是在一个传统CP范围内重新搜索，并选择magic相关值最大的采样位置。
+CP会使相邻少量采样偏移仍可能得到可判决的FFT结果。Parser找到第一个LDPC有效或历史CRC有效候选后，不立即返回，而是在一个传统CP范围内重新搜索，并选择导频或magic相关值最大的采样位置。
 
 这一步避免把真实包起点前一个采样误判为包起点。
 
@@ -367,7 +466,7 @@ metrics = resultAnalysis.Analyze()
 
 ### 5.5 参考重生成
 
-描述字段包含生成器参数和32位随机种子。Parser构造新的 `WaveGenWifi` 实例：
+新版描述字段包含生成器参数和10 bit随机种子。Parser构造新的 `WaveGenWifi` 实例：
 
 ```python
 referenceWaveform = WaveGenWifi(
@@ -500,7 +599,7 @@ Parser通过运行时数据类型自动分派。
 | `sampleRateHz` | `None` | 已知接收采样率；`None`表示自动尝试候选值 |
 | `sampleRateCandidatesHz` | 20、40、80、160、320、640 MHz | 自动采样率候选 |
 | `maximumPacketOffsetSamples` | `2000` | 接收捕获前允许搜索的最大前置样点数；不限制发送侧裁剪位置 |
-| `minimumParseConfidence` | `0.80` | 描述magic或发送接收相关的最低置信度 |
+| `minimumParseConfidence` | `0.80` | 新版描述导频、历史magic或发送接收相关的最低置信度 |
 | `referenceSearchSamples` | `4096` | 发送辅助互相关使用的最大参考样点数 |
 | `spatialMappingMatrix` | `None` | custom MIMO映射时由用户补充的矩阵 |
 

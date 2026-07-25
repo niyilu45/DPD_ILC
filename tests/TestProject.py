@@ -39,9 +39,19 @@ from inc.lib.DpdIlc import (
     RunFrequencyDomainIlc,
     RunMimoFrequencyDomainIlc,
 )
+from inc.lib.Fec import (
+    BuildDescriptorLdpcMatrices,
+    DecodeDescriptorLdpc,
+    EncodeDescriptorLdpc,
+)
 from inc.utils.Draw import Draw
 from inc.lib.PaModel import MimoPaModel, PaModel
-from inc.lib.ParseWifi import ParseWifi
+from inc.lib.ParseWifi import (
+    BuildWifiDescriptorBits,
+    DecodeWifiDescriptorBits,
+    DescriptorLdpcPhysicalLayout,
+    ParseWifi,
+)
 from inc.utils.SigProc import PowerCalibration, SigProc
 from inc.lib.WaveGenWifi import (
     NormalizeFrameFormat,
@@ -281,6 +291,9 @@ def CheckModuleResponsibilityBoundaries() -> None:
     parserSource = (
         projectRoot / "inc" / "lib" / "ParseWifi.py"
     ).read_text(encoding="utf-8")
+    fecSource = (
+        projectRoot / "inc" / "lib" / "Fec.py"
+    ).read_text(encoding="utf-8")
     signalProcessorSource = (
         projectRoot / "inc" / "utils" / "SigProc.py"
     ).read_text(encoding="utf-8")
@@ -301,6 +314,7 @@ def CheckModuleResponsibilityBoundaries() -> None:
     for movedModuleName in (
         "Analysis.py",
         "DpdIlc.py",
+        "Fec.py",
         "PaModel.py",
         "WaveGenWifi.py",
         "Draw.py",
@@ -319,6 +333,11 @@ def CheckModuleResponsibilityBoundaries() -> None:
     assert "class MCSInfo:" in metadataSource
     assert "class WifiWaveform:" in metadataSource
     assert "class ParseWifi:" in parserSource
+    assert "def EncodeDescriptorLdpc(" in fecSource
+    assert "def DecodeDescriptorLdpc(" in fecSource
+    assert "def EncodeDescriptorLdpc(" not in parserSource
+    assert "def DecodeDescriptorLdpc(" not in parserSource
+    assert "from .Fec import" in parserSource
     assert "from .ParseWifi import" in analysisSource
     assert (
         "from .ParseWifi import BuildWifiDescriptorField"
@@ -327,6 +346,7 @@ def CheckModuleResponsibilityBoundaries() -> None:
     compatibilityImportCode = (
         "from lib.ParseWifi import ParseWifi; "
         "from lib.Analysis import Analysis; "
+        "from lib.Fec import EncodeDescriptorLdpc; "
         "from lib.WaveGenWifi import WaveGenWifi; "
         "from lib.PaModel import PaModel; "
         "from utils.Draw import Draw"
@@ -1245,6 +1265,14 @@ def CheckFormatSpecificMcsValidation() -> None:
     else:
         raise AssertionError("VHT GI 1.6 us must be rejected")
 
+    assert WaveGenWifi(seed=1023).Generate().seed == 1023
+    try:
+        WaveGenWifi(seed=1024).Generate()
+    except ValueError as error:
+        assert "2**10 - 1" in str(error)
+    else:
+        raise AssertionError("a seed wider than 10 bits must be rejected")
+
 
 def CheckIdealMetrics() -> None:
     """Verify that a perfect signal path has effectively zero EVM.
@@ -1634,6 +1662,53 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         "HE": 11,
         "EHT": 13,
     }
+    fecMessageBits = np.zeros(55, dtype=np.uint8)
+    fecMessageBits[::4] = 1
+    fecCodeword = EncodeDescriptorLdpc(fecMessageBits)
+    parityCheckMatrix, messageMatrix = BuildDescriptorLdpcMatrices()
+    assert parityCheckMatrix.shape == (35, 90)
+    assert messageMatrix.shape == (35, 55)
+    assert not np.any(
+        np.mod(
+            parityCheckMatrix.astype(np.int64)
+            @ fecCodeword.astype(np.int64),
+            2,
+        )
+    )
+    fecSoftCodeword = 1.0 - 2.0 * fecCodeword.astype(float)
+    fecSoftCodeword[[2, 17, 44, 71]] *= -1.0
+    assert np.array_equal(
+        DecodeDescriptorLdpc(fecSoftCodeword),
+        fecMessageBits,
+    )
+
+    descriptorBits = BuildWifiDescriptorBits(
+        "EHT",
+        20,
+        7,
+        10,
+        0.8,
+        101,
+        1,
+        1,
+        "direct",
+        True,
+    )
+    (
+        _,
+        _,
+        codePhysicalPositions,
+        _,
+    ) = DescriptorLdpcPhysicalLayout()
+    corruptedDescriptorBits = descriptorBits.copy()
+    corruptedDescriptorBits[
+        codePhysicalPositions[[2, 17, 44, 71]]
+    ] ^= 1
+    correctedDescriptor = DecodeWifiDescriptorBits(
+        corruptedDescriptorBits
+    )
+    assert correctedDescriptor["seed"] == 101
+
     for formatIndex, (frameFormat, maximumMcs) in enumerate(
         maximumMcsByFormat.items()
     ):
@@ -1764,6 +1839,38 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
             rtol=1.0e-10,
             atol=1.0e-10,
         )
+
+    smallestSisoWaveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=7,
+        numDataSymbols=10,
+        sampleRateHz=80.0e6,
+        seed=101,
+    ).Generate()
+    smallestSisoDriveScale = 10.0 ** (-5.0 / 20.0)
+    smallestSisoPaOutput = PaModel(modelName="gmp").Process(
+        smallestSisoDriveScale * smallestSisoWaveform.samples
+    )
+    smallestSisoReferenceMetrics = Analysis(
+        smallestSisoDriveScale * smallestSisoWaveform.samples,
+        smallestSisoWaveform,
+    ).Analyze(smallestSisoPaOutput)
+    smallestSisoReceiveAnalysis = Analysis(smallestSisoPaOutput)
+    smallestSisoReceiveMetrics = (
+        smallestSisoReceiveAnalysis.Analyze()
+    )
+    smallestSisoParsedFrame = (
+        smallestSisoReceiveAnalysis.GetParsedWifiFrame()
+    )
+    assert smallestSisoParsedFrame is not None
+    assert smallestSisoParsedFrame.detectedParameters["seed"] == 101
+    assert np.allclose(
+        np.asarray(tuple(smallestSisoReferenceMetrics.values())),
+        np.asarray(tuple(smallestSisoReceiveMetrics.values())),
+        rtol=1.0e-10,
+        atol=1.0e-10,
+    )
 
     autoWaveform = WaveGenWifi(
         frameFormat="EHT",
