@@ -1,6 +1,6 @@
 # 结果计算：SNR、EVM、ACLR 与功率–EVM 曲线原理
 
-本文解释 `inc/Analysis.py` 中结果统计的物理含义和公式推导。分析器以理想发送参考波形和 `WifiWaveform` 元数据为基准，对 PA、ILC 或部署型 DPD 输出统一计算：
+本文解释 `inc/Analysis.py` 中结果统计的物理含义和公式推导。分析器最终都以理想发送参考波形和 `WifiWaveform` 元数据为基准；这些信息既可以由调用方显式提供，也可以由 `ParseWifi` 从接收帧恢复。随后对 PA、ILC 或部署型 DPD 输出统一计算：
 
 - 数据字段时域 SNR；
 - Wi-Fi 数据子载波 RMS EVM；
@@ -15,6 +15,9 @@
 
 ```mermaid
 flowchart TB
+    receiveOnly["仅接收帧<br/>NumPy或WifiWaveform"] --> parser["ParseWifi"]
+    optionalTransmit["可选发送帧<br/>NumPy或WifiWaveform"] --> parser
+    parser --> A
     A["理想参考波形 x[n]"] --> B["字段边界与参考 QAM"]
     C["PA/DPD/采集输出 y[m]"] --> D["SigProc 同步与补偿"]
     A --> D
@@ -30,7 +33,150 @@ flowchart TB
     K --> L["ACLR-L / ACLR-U / Worst"]
 ```
 
-**图 1 说明**：每个待测信号只执行一次 `SigProc.Process`，SNR、EVM、ACLR 共用完全相同的校正样点。SNR 在数据字段时域样点上计算；EVM 由 `FrameProcess` 在去 CP、FFT、撤销 CSD 和空间解映射后的数据子载波上计算；ACLR 在数据字段功率谱上计算。三者观察的是不同维度，不能用单一指标替代全部结果。
+**图 1 说明**：显式参考路径直接进入理想参考节点；仅接收路径先由ParseWifi恢复同样的参考和元数据。之后每个待测信号只执行一次 `SigProc.Process`，SNR、EVM、ACLR共用完全相同的校正样点。SNR在数据字段时域样点上计算；EVM由 `FrameProcess` 在去CP、FFT、撤销CSD和空间解映射后的数据子载波上计算；ACLR在数据字段功率谱上计算。三者观察的是不同维度，不能用单一指标替代全部结果。
+
+### 1.1 两种Analysis构造方式
+
+原有方式保持不变：
+
+```python
+resultAnalysis = Analysis(referenceSignal, wifiWaveform)
+metrics = resultAnalysis.Analyze(receivedSignal)
+```
+
+仅接收帧方式为：
+
+```python
+resultAnalysis = Analysis(receivedInput)
+metrics = resultAnalysis.Analyze()
+```
+
+`receivedInput` 可以是NumPy数组或 `WifiWaveform`。仅接收路径构造时已经保存了解析、裁剪后的接收包，所以 `Analyze()` 可以省略实参；显式参考路径仍必须把待测波形传给 `Analyze`。
+
+### 1.2 可选发送输入
+
+仅接收路径可以额外提供：
+
+```python
+resultAnalysis = Analysis(
+    receivedInput,
+    transmittedSignal=optionalTransmitInput,
+)
+metrics = resultAnalysis.Analyze()
+```
+
+接收输入和发送输入均自动支持两种类型：
+
+- NumPy一维SISO数组或 `samples × chains` MIMO矩阵；
+- `WifiWaveform` 对象。
+
+发送输入为NumPy数组时，Parser从发送样值解码描述字段，并用发送与接收互相关恢复精确包起点；发送输入为 `WifiWaveform` 时，直接使用对象元数据。两种情况都保留发送样值作为Analysis参考。
+
+完整字段布局、CRC、归一化互相关公式、参数和适用边界见 [ParseWifi.md](./ParseWifi.md)。
+
+### 1.3 直接输入接收波形估计EVM
+
+如果接收波形已经保存为 NumPy 文件，Analysis不要求调用方同时提供理想参考波形。下面的代码只把接收采集送入Analysis，然后直接读取EVM：
+
+```python
+from pathlib import Path
+
+import numpy as np
+
+from inc.Analysis import Analysis
+
+
+# Load one complete receive capture, including the project signaling field.
+receivedSignal = np.load(
+    Path("captures") / "ehtReceiveCapture.npy"
+)
+
+# Supplying the known sample rate narrows the parser search range.
+resultAnalysis = Analysis(
+    receivedSignal,
+    parseParameters={"sampleRateHz": 80.0e6},
+)
+metrics = resultAnalysis.Analyze()
+
+print(f"EVM: {metrics.evmDb:.3f} dB")
+print(f"EVM: {metrics.evmPercent:.3f} %")
+```
+
+这里没有向 `Analysis` 传入发送波形或 `WifiWaveform` 元数据。内部处理顺序是：
+
+1. `ParseWifi` 在接收样值中搜索本工程的Wi-Fi描述字段；
+2. 恢复帧格式、带宽、MCS、GI、空间流、随机种子和包起点；
+3. 根据恢复结果重新生成理想参考帧；
+4. `SigProc` 补偿整数时延、分数时延、载波频偏、采样频偏和公共复增益；
+5. `FrameProcess` 去CP、执行FFT、提取数据子载波并计算EVM。
+
+`sampleRateHz` 不是必须参数；省略时Parser会测试默认采样率候选列表。已知采样率时建议显式提供，这样可以减少搜索量并避免采样率候选歧义。接收数组应满足以下约定：
+
+- SISO：形状为 `numSamples`；
+- MIMO：形状为 `numSamples × numReceiveChains`；
+- 数组中必须包含完整的本工程VHT、HE或EHT帧描述字段；
+- 包前可以带有零样值、静默区或采集时延，默认最大搜索范围由 `maximumPacketOffsetSamples` 控制。
+
+下面是一个不依赖外部采集文件、可以在本工程中直接运行的完整示例。虽然代码用PA模型产生接收波形，但送给Analysis的仍然只有 `receivedSignal`，没有提供发送参考：
+
+```python
+import numpy as np
+
+from inc.Analysis import Analysis
+from inc.PaModel import PaModel
+from inc.WaveGenWifi import WaveGenWifi
+
+
+# Generate the waveform only to construct a reproducible receive example.
+wifiWaveform = WaveGenWifi(
+    frameFormat="EHT",
+    bandwidthMhz=20,
+    mcs=7,
+    numDataSymbols=4,
+    sampleRateHz=80.0e6,
+    seed=101,
+).Generate()
+
+# Treat the nonlinear PA output as the received baseband waveform.
+paModel = PaModel(modelName="wiener")
+paOutput = paModel.Process(0.22 * wifiWaveform.samples)
+receivedSignal = np.r_[
+    np.zeros(24, dtype=np.complex128),
+    paOutput,
+    np.zeros(16, dtype=np.complex128),
+]
+
+# No transmittedSignal or reference waveform is passed to Analysis.
+resultAnalysis = Analysis(
+    receivedSignal,
+    parseParameters={"sampleRateHz": 80.0e6},
+)
+metrics = resultAnalysis.Analyze()
+
+print(f"SNR: {metrics.snrDb:.3f} dB")
+print(f"EVM: {metrics.evmDb:.3f} dB")
+print(f"EVM: {metrics.evmPercent:.3f} %")
+print(f"Worst ACLR: {metrics.aclrWorstDb:.3f} dB")
+```
+
+如果接收端已经把样值和元数据包装成 `WifiWaveform`，入口不变：
+
+```python
+resultAnalysis = Analysis(receivedWifiWaveform)
+metrics = resultAnalysis.Analyze()
+print(metrics.evmDb, metrics.evmPercent)
+```
+
+`Analysis` 会在内部读取 `receivedWifiWaveform.samples`，调用方不需要选择另一套函数。对于MIMO接收波形，汇总EVM仍由 `metrics.evmDb` 和 `metrics.evmPercent` 给出；各空间流结果可以这样读取：
+
+```python
+mimoMetrics = resultAnalysis.GetLastMimoMetrics()
+if mimoMetrics is not None:
+    print(mimoMetrics.evmDbPerSpatialStream)
+    print(mimoMetrics.evmPercentPerSpatialStream)
+```
+
+上述“仅接收波形”方式适用于由本工程 `WaveGenWifi` 生成且保留项目描述字段的波形。对于不含该描述字段的商业仪器抓包，应额外提供发送样值或完整接收配置；Parser不能仅凭任意未知波形无条件恢复随机载荷对应的理想星座。
 
 ---
 
@@ -1286,7 +1432,7 @@ ILC 每轮收敛结果另外输出：
 
 - `ilc_convergence.csv`：每轮 Raw MSE、Raw NMSE、LC-MSE、LC-NMSE、EVM-MSE、EVM dB、公共复增益和输入峰值；
 - `ilc_convergence.png`：把 Raw NMSE、LC-NMSE 和 EVM-MSE/EVM dB 画在同一个 dB 坐标系中；
-- MIMO 时每条物理 PA 链写入独立的 `pa_chain_N` 目录；单链没有完整空间流时，EVM-MSE 列为空，图中只画 Raw NMSE 和 LC-NMSE。
+- MIMO时 `AnalyzeMimoIlcHistory` 按轮组合全部PA链，再输出包含完整空间流EVM的统一收敛历史。
 
 ---
 
@@ -1294,6 +1440,8 @@ ILC 每轮收敛结果另外输出：
 
 | 计算步骤 | 方法 |
 |---|---|
+| 仅接收帧解析 | `ParseWifi.Parse` |
+| 取得解析结果 | `Analysis.GetParsedWifiFrame` |
 | 同步与补偿总入口 | `SigProc.Process` / `Analysis.PrepareMeasuredSignal` |
 | 整数时延 | `SigProc.EstimateIntegerDelay` |
 | 分数时延与采样频偏 | `SigProc.EstimateTimingOffsets` |

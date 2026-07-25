@@ -8,6 +8,7 @@
 - [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、Rapp AM-AM、AM-PM、GMP、频谱再生、IQ 失衡和反馈噪声。
 - [信号同步、补偿与功率标定原理](doc/SigProc.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样、复增益补偿和 dBm/RMS 换算。
 - [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
+- [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：描述字段、CRC、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
 - [Wi-Fi 元数据契约](doc/WifiMetadata.md)：`MCSInfo` 与 `WifiWaveform` 的字段、数组形状和模块边界。
 - [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
 - [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
@@ -28,6 +29,7 @@ main.py                 命令行主程序
 inc/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
 inc/WifiMetadata.py     MCSInfo 与 WifiWaveform 纯数据契约
 inc/FrameProcess.py     Wi-Fi 去 CP、FFT、CSD 撤销与空间流解映射
+inc/ParseWifi.py        接收帧描述解析、包起点检测与参考波形恢复
 inc/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
 inc/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
 inc/SigProc.py          SigProc 同步补偿、SignalProcessingResult 与 PowerCalibration
@@ -37,6 +39,7 @@ inc/__init__.py         公共接口汇总
 tests/TestProject.py    自包含验证脚本
 tests/BenchMark.py      分类场景 ILC 性能基准、结果保存和功率-EVM比较
 doc/BenchMark.md        各 benchmark 场景的构造、预期和参考仿真结果
+doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整示例
 ```
 
 所有代码注释与文档字符串均为英文；除 Python 协议强制要求的 `__init__` 等双下划线方法外，所有函数（包括内部辅助函数）都使用大驼峰命名。变量和对外对象属性使用小驼峰命名；属性底层访问器使用大驼峰函数名，并通过小驼峰属性别名保持调用接口一致。
@@ -73,6 +76,11 @@ flowchart TD
     predistortedInput --> paImplementation
     paImplementation --> correctedOutput["PA 校正输出"]
 
+    receiveCapture["仅接收Wi-Fi波形<br/>NumPy或WifiWaveform"] --> parser["ParseWifi.Parse"]
+    optionalTransmit["可选发送波形<br/>NumPy或WifiWaveform"] --> parser
+    parser --> parsedContext["恢复参考波形、帧元数据与包起点"]
+    parsedContext --> analysis
+
     overrideMap --> analysis["创建 Analysis；类内追加默认参数层"]
     reference --> analysis
     reference --> sigProc["SigProc：时延 / CFO / SFO / 复增益补偿"]
@@ -108,7 +116,7 @@ flowchart TD
 2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
 3. `MimoPaModel` 为每个矩阵列建立独立 PA，可分别设置输入驱动增益 dB、相对输出功率 dB 或绝对输出功率 dBm。`PowerCalibration` 按用户配置的端口电阻把 dBm 换算成 PA 模型使用的复包络 RMS 电压。单方案模式对每个 PA 独立执行正则化频域 ILC，再对各路 ILC 标签分别拟合 GMP；全方案基准当前仅用于 SISO。
 4. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮输入、PA反馈输出和原生MSE。ILC返回后，`Analysis.AnalyzeIlcHistory` 或 `AnalyzeMimoIlcHistory` 才逐轮计算RF性能，并按严格EVM选择 `u*`。该输入可直接用于重复波形复测，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN，从而形成可用于其他帧的部署模型。
-5. 所有输出最终传给同一个 `Analysis` 实例；MIMO 时每条物理链分别调用 `SigProc` 完成整数/分数时延、载波频偏、采样频偏和复增益补偿。`FrameProcess` 再执行 Wi-Fi 去 CP、FFT、CSD 撤销和空间解映射。ACLR 对各链 PSD 求和形成汇总值，同时保留每链结果；EVM 按空间流统计。`AnalyzePowerEvmCurve` 在多个绝对 dBm 输入功率点调用各方法，生成不包含绘图逻辑的 `PowerEvmCurve` 数据对象。
+5. `Analysis` 同时支持显式参考和仅接收帧两条路径。仅接收帧路径由 `ParseWifi` 自动接受NumPy数组或 `WifiWaveform`；可选发送波形也支持这两种类型。Parser恢复包起点、格式、MCS、FFT/GI、空间结构和参考样值后，仍使用相同的 `SigProc` 与 `FrameProcess` 计算指标。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
 6. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
 
 图中从“生成独立验证 VHT/HE/EHT 帧”开始的支路专门验证部署模型的泛化能力；它使用相同格式配置和不同随机种子的载荷，不与 ILC 训练帧重复。
@@ -139,6 +147,7 @@ flowchart TD
     privateGenerate --> qam["QamModulate"]
     privateGenerate --> pilotSequence["PilotSequence"]
     privateGenerate --> mapping["BuildSpatialMappingMatrix"]
+    privateGenerate --> descriptor["BuildWifiDescriptorField<br/>格式/MCS/GI/空间结构/seed + CRC"]
     privateGenerate --> csd["GetCyclicShifts"]
     csd --> csdMatrix["FrameProcess.BuildCsdPhaseMatrix"]
     privateGenerate --> ltf["GetLtfSymbolCount / BuildLtfTrainingMatrix"]
@@ -166,6 +175,7 @@ flowchart TD
 - `ActiveTones` 与 `PilotTones` 决定不同带宽下的数据、导频和空子载波位置；`QamModulate` 完成 Gray 编码星座映射。
 - `BuildSpatialMappingMatrix` 产生 direct、DFT 或调用方自定义的正交映射；`SpatialMapTones` 为每个子载波执行空间映射并叠加 CSD，`BuildMimoOfdmSymbol` 再完成各发射链 IFFT 和循环前缀。
 - `BuildLtfTrainingMatrix` 产生跨 LTF 符号的正交训练码；LTF 数量随空间流增加。公共字段由 `MapCommonFieldToAntennas` 复制到各链并保留 CSD。
+- `BuildWifiDescriptorField` 在VHT-SIG-A、HE-SIG-A或U-SIG位置写入两个CRC保护的BPSK OFDM符号，使仅接收波形路径能够恢复本工程随机激励所需参数；它是仿真解析描述，不是bit-exact标准SIG编码器。
 - `WaveGenWifi.Generate` 是面向调用方的波形入口，并由内部辅助函数 `GenerateWifiWaveform` 完成组帧，最终返回 `WifiWaveform`；其中既有时域样本，也有后续 EVM 解调所需的格式、字段切片和参考星座。
 
 ### `inc/WifiMetadata.py`
@@ -183,7 +193,36 @@ flowchart TD
 
 - `WifiMetadata.py` 只定义数据类，不生成波形、不解调帧，也不计算性能指标。
 - `WaveGenWifi` 负责创建 `WifiWaveform`；`FrameProcess` 和 `Analysis` 只消费这份稳定的数据契约，因此不需要导入波形生成算法。
-- `WifiWaveform` 保存时域样点、采样率、FFT/GI 参数、数据字段起点、音调索引、空间映射矩阵、CSD 和参考空间流星座。
+- `WifiWaveform` 保存时域样点、采样率、FFT/GI 参数、数据字段起点、音调索引、空间映射矩阵、CSD、确定性生成种子和参考空间流星座。
+
+### `inc/ParseWifi.py`
+
+```mermaid
+flowchart TD
+    receive["receivedSignal<br/>NumPy或WifiWaveform"] --> validate["ValidateReceivedSignal"]
+    transmit["可选 transmittedSignal<br/>NumPy或WifiWaveform"] --> dispatch{"内部类型分派"}
+    dispatch -->|WifiWaveform| objectPath["直接读取samples与元数据"]
+    dispatch -->|NumPy| descriptorSource["从发送样值解析描述字段"]
+    dispatch -->|None| receiveDescriptor["从接收样值解析描述字段"]
+    validate --> receiveDescriptor
+    descriptorSource --> find["FindDescriptor"]
+    receiveDescriptor --> find
+    find --> decode["DecodeDescriptorAt<br/>去CP / FFT / magic去相位 / CRC"]
+    decode --> parameters["格式 / 带宽 / MCS / GI / 空间流 / seed"]
+    parameters --> regenerate["WaveGenWifi确定性重生成参考与元数据"]
+    objectPath --> correlate["EstimatePacketStartFromReference"]
+    regenerate --> correlate
+    correlate --> parsed["ParsedWifiFrame"]
+    parsed --> analysis["Analysis(receivedInput).Analyze()"]
+```
+
+**图示说明：**
+
+- 接收输入和可选发送输入都使用统一参数名，并且都支持NumPy数组或 `WifiWaveform`；调用方不需要选择不同函数。
+- 没有发送参考时，Parser联合搜索采样率、包起点和格式信令位置，只有magic、版本、CRC、链数和置信度全部通过才接受候选。
+- 可选发送输入为NumPy数组时，Parser从发送样值解码元数据并保留原数组作为参考；输入为 `WifiWaveform` 时直接读取完整元数据。
+- 发送辅助路径使用逐链能量归一化互相关细化接收包起点，对低SNR、PA压缩和MIMO链间相位差更稳健。
+- 详细字段布局、相关公式、参数表、适用边界和完整调用示例见[ParseWifi说明文档](doc/ParseWifi.md)。
 
 ### `inc/FrameProcess.py`
 
@@ -369,7 +408,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    caller["调用方"] --> context["构造 Analysis(referenceSignal, waveform)"]
+    aided["显式参考路径<br/>Analysis(referenceSignal, waveform)"] --> context["Analysis上下文"]
+    receiveOnly["仅接收路径<br/>Analysis(receivedInput)"] --> parser["ParseWifi.Parse"]
+    optionalTransmit["可选发送输入<br/>NumPy或WifiWaveform"] --> parser
+    parser --> parsed["ParsedWifiFrame<br/>参考 + 元数据 + 对齐接收包"]
+    parsed --> context
+    context --> parsedResult["Analysis.GetParsedWifiFrame"]
     context --> stages["Analysis.AnalyzeStages"]
     stages --> analyze["Analysis.Analyze"]
     analyze --> prepare["Analysis.PrepareMeasuredSignal"]
@@ -413,7 +457,8 @@ flowchart TD
 
 **图示说明：**
 
-- `Analysis` 构造时保存参考信号和 `WifiWaveform` 元数据；后续每个待测输出只需传给 `Analyze`，多个命名阶段可一次传给 `AnalyzeStages`。
+- 原有显式参考路径保持不变：构造时保存参考信号和 `WifiWaveform`，待测输出传给 `Analyze(measuredSignal)`。
+- 省略 `waveform` 时，第一个输入可以是NumPy数组或 `WifiWaveform` 接收帧；Analysis调用ParseWifi恢复上下文并允许零参数 `Analyze()`。可选 `transmittedSignal` 同样支持两种类型并由内部自动分派。
 - `AnalyzeIlcHistory` 在ILC完成后读取每轮保存的输入和PA输出，用普通 `Analyze` 逐轮计算SNR、EVM和ACLR；`AnalyzeMimoIlcHistory` 先按轮组合各PA链，再使用完整空间流接收结构分析。两者都在Analysis层按严格EVM返回最佳轮。
 - 每次 `Analyze` 只调用一次 `SigProc.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
 - SNR 直接计算校正后数据字段与参考的残差功率；EVM 由 `FrameProcess` 根据 `WifiWaveform` 的数据字段位置去循环前缀、FFT、撤销 CSD 和空间解映射，再与采用相同接收路径得到的参考星座比较。
@@ -569,7 +614,7 @@ flowchart LR
 | `frameFormat` | `"VHT"/"11ac"`、`"HE"/"11ax"`、`"EHT"/"11be"`，并接受带 `802.` 前缀的名称 | `"EHT"` | 不区分大小写；生成后规范化为 VHT、HE 或 EHT。 |
 | `bandwidthMhz` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
 | `mcs` | VHT：`0–9`；HE：`0–11`；EHT：`0–13` | `9` | MCS 索引；默认值对三种格式都有效。 |
-| `numDataSymbols` | 正整数 | `20` | 数据 OFDM 符号数。 |
+| `numDataSymbols` | 1至4095 | `20` | 数据OFDM符号数；上限由接收解析描述字段的12位计数决定。 |
 | `guardIntervalUs` | VHT：`0.4/0.8`；HE/EHT：`0.8/1.6/3.2` | `0.8` | 数据 GI，单位 μs。 |
 | `sampleRateHz` | 正数或 `None` | `None` | 用户直接配置的复基带采样率，单位 Hz；`None` 时才使用旧 `oversampling` 推导。必须不低于信道带宽，并保证OFDM各时长对应整数采样点。 |
 | `oversampling` | 正整数 | `4` | 旧接口兼容项；`sampleRateHz=None` 时采样率等于 `bandwidthMhz×1e6×oversampling`。生成后该属性表示实际采样率与带宽之比，允许为非整数。 |
@@ -580,7 +625,7 @@ flowchart LR
 | `spatialMappingMatrix` | 复矩阵或 `None` | `None` | 仅 custom 使用，形状为 `numTransmitAntennas × numSpatialStreams`，列必须正交归一。 |
 | `cyclicShiftEnabled` | `bool` | `True` | 是否对各物理链施加格式相关的循环移位分集相位。 |
 
-`Generate()` 返回 `WifiWaveform`。SISO 的 `samples` 是一维数组，MIMO 是 `samples × numTransmitAntennas` 矩阵；元数据还包含 `numSpatialStreams`、`spatialMappingMatrix`、`cyclicShiftsSeconds`、`ltfSymbolCount` 及三维参考空间流星座。
+`Generate()` 返回 `WifiWaveform`。SISO 的 `samples` 是一维数组，MIMO 是 `samples × numTransmitAntennas` 矩阵；元数据还包含 `numSpatialStreams`、`spatialMappingMatrix`、`cyclicShiftsSeconds`、`ltfSymbolCount`、`seed`、`cyclicShiftEnabled` 及三维参考空间流星座。
 
 `sampleRateHz` 是采样时钟的权威输入。例如：
 
@@ -724,9 +769,32 @@ PA 辅助接口还包括：
 
 `MCSInfo` 保存单个 MCS 的调制阶数与码率；`WifiWaveform` 保存波形样点及接收处理所需元数据。二者均是纯数据类，不包含 PA、同步或指标算法。
 
+### `ParseWifi` 参数与方法
+
+构造函数 `ParseWifi(parameters=None, **parameterOverrides)` 在类内定义默认值并通过 `ChainMap` 接收外部覆盖。`Parse(receivedSignal, transmittedSignal=None)` 的接收输入和可选发送输入都可以是NumPy数组或 `WifiWaveform`，Parser在内部自动识别类型。
+
+| 配置参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `sampleRateHz` | `None` | 显式接收采样率；`None`时自动尝试候选采样率。 |
+| `sampleRateCandidatesHz` | 20至640 MHz常见速率 | 自动解析时按顺序尝试的复基带采样率。 |
+| `maximumPacketOffsetSamples` | `4096` | 捕获开头允许的最大前置样点数。 |
+| `minimumParseConfidence` | `0.80` | 描述magic或发送接收互相关的最低置信度。 |
+| `referenceSearchSamples` | `4096` | 发送辅助归一化互相关使用的参考样点数。 |
+| `spatialMappingMatrix` | `None` | 无 `WifiWaveform` 元数据时为custom MIMO映射补充矩阵。 |
+
+| 方法 | 参数 | 返回值或作用 |
+| --- | --- | --- |
+| `Parse(receivedSignal, transmittedSignal=None)` | 接收输入、可选发送输入 | 返回 `ParsedWifiFrame`；两项输入都自动支持NumPy或 `WifiWaveform`。 |
+| `GetParameters()` | 无 | 返回当前解析后的Parser参数。 |
+| `UpdateParameters(**parameterOverrides)` | 任意受支持Parser参数 | 事务式更新最高优先级层。 |
+| `FindDescriptor(receivedSignal)` | 已验证样值 | 联合搜索采样率、包起点和VHT/HE/EHT描述字段。 |
+| `EstimatePacketStartFromReference(receivedSignal, transmittedSignal)` | 接收和发送NumPy样值 | 返回归一化互相关最佳包起点及置信度。 |
+
+`ParsedWifiFrame` 包含 `receivedSignal`、`referenceSignal`、`waveform`、`packetStartSample`、`parseConfidence` 和 `detectedParameters`。详细原理和用法见[ParseWifi说明文档](doc/ParseWifi.md)。
+
 ### `Analysis` 参数与方法
 
-构造函数 `Analysis(referenceSignal, waveform, parameters=None, **parameterOverrides)` 要求参考信号为非空有限复数组，且形状与 `WifiWaveform.samples` 相同；MIMO 采用 `samples × transmitChains`。传入的待测信号可以在同步前具有不同样点数，但列数必须保持一致。
+构造函数保留显式参考方式 `Analysis(referenceSignal, waveform, ...)`，同时支持仅接收方式 `Analysis(receivedInput, parseParameters=None, transmittedSignal=None, ...)`。接收输入和可选发送输入都可以是NumPy数组或 `WifiWaveform`；MIMO采用 `samples × transmitChains`，Parser内部完成类型分派。
 
 | 配置参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -736,10 +804,13 @@ PA 辅助接口还包括：
 | `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
 | `loadResistanceOhm` | `50.0` | 功率扫描中 dBm 与参考波形 RMS 电压换算所用的端口电阻。 |
 | `signalProcessingParameters` | `None` | 传给 `SigProc` 的普通覆盖字典；`None` 使用其内部默认值。 |
+| `parseParameters` | `None` | 仅接收路径传给 `ParseWifi` 的普通覆盖字典。 |
+| `transmittedSignal` | `None` | 可选发送NumPy数组或 `WifiWaveform`，用于提高描述恢复、包起点和参考准确度。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
-| `Analyze(measuredSignal)` | PA/DPD 输出或采集信号 | 先调用 `SigProc` 和所需的 `FrameProcess` 接收处理，再返回一个 `SignalMetrics`。 |
+| `Analyze(measuredSignal=None)` | 显式待测信号或解析后的默认接收帧 | 显式参考路径必须传入波形；仅接收路径可零参数调用并返回 `SignalMetrics`。 |
+| `GetParsedWifiFrame()` | 无 | 仅接收路径返回 `ParsedWifiFrame`，显式参考路径返回 `None`。 |
 | `AnalyzeStages(stageSignals)` | `{阶段名称: 输出数组}` 映射 | 批量计算并保存各阶段指标。 |
 | `PrepareMeasuredSignal(measuredSignal)` | 原始待测信号 | 返回与参考等长的同步、频偏和复增益校正信号。 |
 | `GetLastSignalProcessingResult()` | 无 | 返回最近一次第一路 `SignalProcessingResult`，尚未分析时返回 `None`。 |
@@ -1230,6 +1301,49 @@ Gauss-Newton 使用误差方向的有限差分 Jacobian 投影，避免为长 Wi
 波形构造不可接受的完整 Jacobian 矩阵。增广方案以 IQ 镜像为代表场景；
 其共轭误差路径与扩展到 MIMO/crosstalk 时采用相同的增广矩阵思想。
 标签部署模型全部在相同 VHT/HE/EHT 格式、不同随机种子的帧上验证，而非在训练帧上评分。
+
+### 示例十二：仅输入接收Wi-Fi帧进行Analysis
+
+完全不提供发送参考：
+
+```python
+from inc.Analysis import Analysis
+
+resultAnalysis = Analysis(
+    receivedInput,
+    parseParameters={"sampleRateHz": 80.0e6},
+)
+metrics = resultAnalysis.Analyze()
+parsedFrame = resultAnalysis.GetParsedWifiFrame()
+
+print(parsedFrame.detectedParameters)
+print(metrics.ToDict())
+```
+
+可选发送输入既可以是NumPy数组，也可以是 `WifiWaveform`，参数名不变：
+
+```python
+arrayAssistedAnalysis = Analysis(
+    receivedInput,
+    transmittedSignal=transmitSamples,
+)
+arrayMetrics = arrayAssistedAnalysis.Analyze()
+
+objectAssistedAnalysis = Analysis(
+    receivedInput,
+    transmittedSignal=wifiWaveform,
+)
+objectMetrics = objectAssistedAnalysis.Analyze()
+```
+
+接收输入本身也可以直接使用 `WifiWaveform`：
+
+```python
+receiveObjectAnalysis = Analysis(receivedWifiWaveform)
+receiveObjectMetrics = receiveObjectAnalysis.Analyze()
+```
+
+Parser会在内部自动处理NumPy和 `WifiWaveform`，无需外部指定类型。完整解析原理、独立 `ParseWifi` 用法和适用边界见[ParseWifi说明文档](doc/ParseWifi.md)。
 
 默认在 `results/` 生成：
 

@@ -20,6 +20,7 @@ from typing import Dict, Mapping, Optional, Tuple, cast
 import numpy as np
 
 from .FrameProcess import BuildCsdPhaseMatrix
+from .ParseWifi import BuildWifiDescriptorField
 from .WifiMetadata import MCSInfo, WifiWaveform
 
 
@@ -474,6 +475,10 @@ class WaveGenWifi:
             raise TypeError("numDataSymbols must be an integer")
         if self.numDataSymbols < 1:
             raise ValueError("numDataSymbols must be positive")
+        if self.numDataSymbols > 4095:
+            raise ValueError(
+                "numDataSymbols cannot exceed the 12-bit descriptor limit"
+            )
         if not isinstance(self.guardIntervalUs, (int, float)) or isinstance(
             self.guardIntervalUs, bool
         ):
@@ -536,6 +541,8 @@ class WaveGenWifi:
                 )
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise TypeError("seed must be an integer")
+        if self.seed < 0 or self.seed >= 2**32:
+            raise ValueError("seed must be from zero through 2**32 - 1")
         maximumSpatialStreams = 8
         for parameterName, parameterValue in (
             ("numTransmitAntennas", self.numTransmitAntennas),
@@ -1346,16 +1353,39 @@ def GenerateWifiWaveform(config: WaveGenWifi) -> WifiWaveform:
         longTrainingFieldName = "VHT-LTF"
         dataFieldName = "VHT-Data"
         formatName = "VHT single-user (IEEE 802.11ac)"
+    descriptorFieldNames: Mapping[str, str] = MappingProxyType(
+        {
+            "VHT": "VHT-SIG-A",
+            "HE": "HE-SIG-A",
+            "EHT": "U-SIG",
+        }
+    )
     for fieldNumber, (fieldName, symbolCount) in enumerate(
         preambleSpecification
     ):
-        fieldSamples = TrainingField(
-            symbolCount,
-            legacyFftLength,
-            legacySubchannelCount,
-            randomGenerator,
-            fieldNumber,
-        )
+        if fieldName == descriptorFieldNames[normalizedFormat]:
+            fieldSamples = BuildWifiDescriptorField(
+                normalizedFormat,
+                config.bandwidthMhz,
+                config.mcs,
+                config.numDataSymbols,
+                config.guardIntervalUs,
+                config.seed,
+                config.numTransmitAntennas,
+                config.numSpatialStreams,
+                config.spatialMapping,
+                config.cyclicShiftEnabled,
+                legacyFftLength,
+                legacySubchannelCount,
+            )
+        else:
+            fieldSamples = TrainingField(
+                symbolCount,
+                legacyFftLength,
+                legacySubchannelCount,
+                randomGenerator,
+                fieldNumber,
+            )
         AppendField(
             fieldName,
             MapCommonFieldToAntennas(
@@ -1554,4 +1584,6 @@ def GenerateWifiWaveform(config: WaveGenWifi) -> WifiWaveform:
         spatialMappingMatrix=spatialMappingMatrix,
         cyclicShiftsSeconds=cyclicShiftsSeconds,
         ltfSymbolCount=ltfSymbolCount,
+        seed=config.seed,
+        cyclicShiftEnabled=config.cyclicShiftEnabled,
     )

@@ -70,6 +70,25 @@ flowchart LR
 | `WaveGenWifi.MapCommonFieldToAntennas` | P/E | 把公共前导复制到物理链并施加链级 CSD，保持公共字段含义 | WaveGenWifi §8.8、§8.10 |
 | `WaveGenWifi.AppendField` | E | 内部闭包：顺序拼接字段并记录切片，不改变字段采样值 | WaveGenWifi §8.2–§8.5 |
 
+### 3.1 `ParseWifi.py`：接收帧解析与参考恢复
+
+详细原理、限制和调用方法见 [ParseWifi.md](./ParseWifi.md)。
+
+| 函数/方法 | 类型 | 原理或职责 | 对应章节 |
+|---|---|---|---|
+| `ParseWifi.IntegerToBits`, `ParseWifi.BitsToInteger` | N | 在固定宽度整数与MSB优先比特序列之间无损转换 | ParseWifi §3 |
+| `ParseWifi.CalculateDescriptorCrc` | N | 按CRC-16-CCITT多项式验证描述字段的时序、采样率和内容 | ParseWifi §3.3 |
+| `ParseWifi.BuildWifiDescriptorBits`, `ParseWifi.DecodeWifiDescriptorBits` | E/N | 打包或恢复格式、带宽、MCS、GI、空间流、映射和随机种子 | ParseWifi §3 |
+| `ParseWifi.BuildWifiDescriptorField` | P/N | 把104个描述比特映射到两个重复发送的52音调BPSK传统OFDM符号 | ParseWifi §4 |
+| `ParseWifi.__init__`, `ParseWifi.GetParameters`, `ParseWifi.UpdateParameters`, `ParseWifi.ValidateParameters` | E | 在类内建立ChainMap默认参数并验证接收时钟、搜索范围和自定义空间映射 | ParseWifi §7 |
+| `ParseWifi.ResolveSampleRates` | E | 使用显式接收时钟，或产生按顺序尝试的常见复基带采样率 | ParseWifi §5.2 |
+| `ParseWifi.ValidateReceivedSignal` | E/N | 自动从NumPy数组或 `WifiWaveform.samples` 取样，并检查SISO向量或samples×chains矩阵的形状与有限性 | ParseWifi §5.1 |
+| `ParseWifi.DecodeDescriptorAt` | P/N | 对候选时刻去CP、FFT、用magic word去公共相位、BPSK硬判决并验证CRC | ParseWifi §5.3 |
+| `ParseWifi.FindDescriptor` | P/N | 联合搜索采样率、包起点和VHT/HE/EHT描述字段位置，并用相关峰细化边界 | ParseWifi §5.4 |
+| `ParseWifi.EstimatePacketStartFromReference` | P/N | 有可选发送波形时执行逐链能量归一化互相关，避免链间相位抵消并选择精确接收包起点 | ParseWifi §6.1 |
+| `ParseWifi.BuildDetectedParameters` | E | 可选输入为 `WifiWaveform` 时直接读取中性元数据并转换为统一解析结果 | ParseWifi §6.2 |
+| `ParseWifi.Parse` | P/E | 自动区分 `WifiWaveform`、NumPy发送样值或无发送参考三种模式，统一返回对齐接收帧、参考和元数据 | ParseWifi §5–§6 |
+
 ## 4. `PaModel.py`：PA、噪声和多路功率函数
 
 详细物理推导统一见 [PaModel.md](./PaModel.md)。
@@ -199,7 +218,8 @@ flowchart LR
 |---|---|---|---|
 | `SignalMetrics.ToDict`, `MimoSignalMetrics.ToDict`, `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把已经计算的指标转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann 窗、50% 重叠的 Welch PSD 平均 | Analysis §6.2 |
-| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 保存参考和元数据，解析指标/同步参数并校验 | Analysis §1–§2、§11 |
+| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 保留显式参考路径；省略 `waveform` 时调用ParseWifi恢复参考和元数据，再解析指标/同步参数并校验 | Analysis §1–§2、§11、ParseWifi §8 |
+| `Analysis.GetParsedWifiFrame` | E | 返回仅接收帧构造路径保存的解析结果；显式参考路径返回 `None` | Analysis §1、ParseWifi §8 |
 | `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc` | Analysis §2、§9 |
 | `Analysis.GetLastSignalProcessingResult`, `Analysis.GetLastSignalProcessingResults`, `Analysis.GetLastMimoMetrics`, `Analysis.GetStageSignalProcessingResults`, `Analysis.GetStageMimoMetrics` | E | 返回缓存的不可变结果，不重新估计 | Analysis §9–§10 |
 | `Analysis.ValidatePreparedSignal` | E | 确保 prepared 数据与参考网格形状和有限性一致 | Analysis §2 |

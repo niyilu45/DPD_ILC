@@ -1,6 +1,7 @@
 """Self-contained project checks that preserve the requested naming style."""
 
 import ast
+from dataclasses import replace
 import json
 from pathlib import Path
 import re
@@ -37,6 +38,7 @@ from inc.DpdIlc import (
 )
 from inc.Draw import Draw
 from inc.PaModel import MimoPaModel, PaModel
+from inc.ParseWifi import ParseWifi
 from inc.SigProc import PowerCalibration, SigProc
 from inc.WaveGenWifi import (
     NormalizeFrameFormat,
@@ -1338,6 +1340,197 @@ def CheckIlcImprovement() -> None:
         assert ilcMetrics.snrDb > baselineMetrics.snrDb
 
 
+def CheckReceiveOnlyWifiAnalysis() -> None:
+    """Verify frame parsing and zero-reference Analysis operation.
+
+    Processing details:
+        Algorithm: Generate each PHY family with its maximum MCS, pass a
+        nonlinear PA output through both the original reference-aided path and
+        the new receive-only path, compare every metric, verify packet-offset
+        and sample-rate recovery, then repeat the parser check for 2x2 MIMO.
+
+    Returns:
+        result: None. Assertions enforce exact metadata recovery and equivalent
+            performance calculations between both public Analysis workflows.
+    """
+
+    maximumMcsByFormat = {
+        "VHT": 9,
+        "HE": 11,
+        "EHT": 13,
+    }
+    for formatIndex, (frameFormat, maximumMcs) in enumerate(
+        maximumMcsByFormat.items()
+    ):
+        waveform = WaveGenWifi(
+            frameFormat=frameFormat,
+            bandwidthMhz=20,
+            mcs=maximumMcs,
+            numDataSymbols=2,
+            sampleRateHz=80.0e6,
+            seed=501 + formatIndex,
+        ).Generate()
+        assert waveform.seed == 501 + formatIndex
+        assert waveform.cyclicShiftEnabled
+        measuredSignal = PaModel(modelName="wiener").Process(
+            0.22 * waveform.samples
+        )
+        referenceMetrics = Analysis(
+            waveform.samples, waveform
+        ).Analyze(measuredSignal)
+        leadingSamples = 13 + formatIndex
+        receiveCapture = np.r_[
+            np.zeros(leadingSamples, dtype=np.complex128),
+            measuredSignal,
+            np.zeros(7, dtype=np.complex128),
+        ]
+        receiveAnalysis = Analysis(
+            receiveCapture,
+            parseParameters={"sampleRateHz": 80.0e6},
+        )
+        receiveMetrics = receiveAnalysis.Analyze()
+        parsedFrame = receiveAnalysis.GetParsedWifiFrame()
+        assert parsedFrame is not None
+        assert parsedFrame.packetStartSample == leadingSamples
+        assert parsedFrame.detectedParameters["frameFormat"] == frameFormat
+        assert parsedFrame.detectedParameters["mcs"] == maximumMcs
+        assert parsedFrame.detectedParameters["numDataSymbols"] == 2
+        assert parsedFrame.parseConfidence > 0.95
+        assert np.allclose(
+            np.asarray(tuple(referenceMetrics.ToDict().values())),
+            np.asarray(tuple(receiveMetrics.ToDict().values())),
+            rtol=1.0e-10,
+            atol=1.0e-10,
+        )
+        assistedAnalysis = Analysis(
+            receiveCapture,
+            transmittedSignal=waveform.samples,
+        )
+        assistedMetrics = assistedAnalysis.Analyze()
+        assistedFrame = assistedAnalysis.GetParsedWifiFrame()
+        assert assistedFrame is not None
+        assert assistedFrame.packetStartSample == leadingSamples
+        assert assistedFrame.parseConfidence > 0.90
+        assert np.allclose(
+            np.asarray(tuple(referenceMetrics.ToDict().values())),
+            np.asarray(tuple(assistedMetrics.ToDict().values())),
+            rtol=1.0e-10,
+            atol=1.0e-10,
+        )
+        if formatIndex == 0:
+            objectAssistedAnalysis = Analysis(
+                receiveCapture,
+                transmittedSignal=waveform,
+            )
+            objectAssistedMetrics = objectAssistedAnalysis.Analyze()
+            objectAssistedFrame = (
+                objectAssistedAnalysis.GetParsedWifiFrame()
+            )
+            assert objectAssistedFrame is not None
+            assert objectAssistedFrame.packetStartSample == leadingSamples
+            assert np.allclose(
+                np.asarray(tuple(referenceMetrics.ToDict().values())),
+                np.asarray(
+                    tuple(objectAssistedMetrics.ToDict().values())
+                ),
+                rtol=1.0e-10,
+                atol=1.0e-10,
+            )
+            receivedWaveform = replace(
+                waveform,
+                samples=receiveCapture,
+            )
+            objectReceiveArrayTransmitAnalysis = Analysis(
+                receivedWaveform,
+                transmittedSignal=waveform.samples,
+            )
+            objectReceiveArrayTransmitMetrics = (
+                objectReceiveArrayTransmitAnalysis.Analyze()
+            )
+            objectReceiveObjectTransmitAnalysis = Analysis(
+                receivedWaveform,
+                transmittedSignal=waveform,
+            )
+            objectReceiveObjectTransmitMetrics = (
+                objectReceiveObjectTransmitAnalysis.Analyze()
+            )
+            for typeDispatchedMetrics in (
+                objectReceiveArrayTransmitMetrics,
+                objectReceiveObjectTransmitMetrics,
+            ):
+                assert np.allclose(
+                    np.asarray(
+                        tuple(referenceMetrics.ToDict().values())
+                    ),
+                    np.asarray(
+                        tuple(typeDispatchedMetrics.ToDict().values())
+                    ),
+                    rtol=1.0e-10,
+                    atol=1.0e-10,
+                )
+
+    autoWaveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=40,
+        mcs=5,
+        numDataSymbols=1,
+        sampleRateHz=160.0e6,
+        seed=514,
+    ).Generate()
+    autoParsedFrame = ParseWifi().Parse(autoWaveform.samples)
+    assert autoParsedFrame.detectedParameters["bandwidthMhz"] == 40
+    assert autoParsedFrame.detectedParameters["sampleRateHz"] == 160.0e6
+    assert np.array_equal(
+        autoParsedFrame.referenceSignal, autoWaveform.samples
+    )
+    objectReceivedAnalysis = Analysis(autoWaveform)
+    objectReceivedMetrics = objectReceivedAnalysis.Analyze()
+    objectReceivedFrame = objectReceivedAnalysis.GetParsedWifiFrame()
+    assert objectReceivedFrame is not None
+    assert (
+        objectReceivedFrame.detectedParameters["frameFormat"]
+        == autoWaveform.frameFormat
+    )
+    assert objectReceivedMetrics.evmDb < -200.0
+
+    mimoWaveform = WaveGenWifi(
+        frameFormat="HE",
+        bandwidthMhz=20,
+        mcs=7,
+        numDataSymbols=1,
+        sampleRateHz=80.0e6,
+        seed=515,
+        numTransmitAntennas=2,
+        numSpatialStreams=2,
+        spatialMapping="dft",
+    ).Generate()
+    mimoReceived = MimoPaModel(
+        numTransmitChains=2
+    ).Process(0.20 * mimoWaveform.samples)
+    mimoAnalysis = Analysis(
+        mimoReceived,
+        parseParameters={"sampleRateHz": 80.0e6},
+    )
+    mimoMetrics = mimoAnalysis.Analyze()
+    mimoParsedFrame = mimoAnalysis.GetParsedWifiFrame()
+    assert mimoParsedFrame is not None
+    assert mimoParsedFrame.detectedParameters["numTransmitAntennas"] == 2
+    assert mimoParsedFrame.detectedParameters["numSpatialStreams"] == 2
+    assert mimoParsedFrame.detectedParameters["spatialMapping"] == "dft"
+    assert np.isfinite(mimoMetrics.evmDb)
+    assert mimoAnalysis.GetLastMimoMetrics() is not None
+
+    explicitAnalysis = Analysis(autoWaveform.samples, autoWaveform)
+    try:
+        explicitAnalysis.Analyze()
+    except ValueError as error:
+        assert "measuredSignal is required" in str(error)
+    else:
+        raise AssertionError(
+            "reference-aided Analysis must require a measured signal"
+        )
+
+
 def CheckMseEvmConvergence() -> None:
     """Verify complete separation of ILC diagnostics and RF performance.
 
@@ -1457,6 +1650,7 @@ def RunTests() -> None:
     CheckPowerEvmCurve()
     CheckGuardIntervals()
     CheckIlcImprovement()
+    CheckReceiveOnlyWifiAnalysis()
     CheckMseEvmConvergence()
     print("All DPD-ILC project checks passed.")
 

@@ -6,11 +6,21 @@ from collections import ChainMap
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 
 from .FrameProcess import FrameProcess
+from .ParseWifi import ParsedWifiFrame, ParseWifi
 from .SigProc import PowerCalibration, SigProc, SignalProcessingResult
 from .WifiMetadata import WifiWaveform
 
@@ -210,35 +220,52 @@ def AveragePeriodogram(
 
 
 class Analysis:
-    """Analyze and save PA/DPD results for one reference Wi-Fi waveform.
+    """Analyze PA/DPD results with a supplied or frame-parsed reference.
 
-    Callers construct one instance from the transmitted reference signal and
-    its ``WifiWaveform`` metadata. Every PA, ILC, or deployed-DPD output is
-    then evaluated through the same stored analysis context.
+    The original data-aided path constructs an instance from a transmitted
+    reference and ``WifiWaveform`` metadata. The receive-only path omits
+    ``waveform``; ``ParseWifi`` then restores the reference and metadata from
+    the received frame's protected project signaling descriptor.
 
     Example:
         ``resultAnalysis = Analysis(referenceSignal, waveform)``
         ``metrics = resultAnalysis.Analyze(paOutput)``
+        ``receiveAnalysis = Analysis(receivedWifiFrame)``
+        ``metrics = receiveAnalysis.Analyze()``
     """
 
     def __init__(
         self,
-        referenceSignal: np.ndarray,
-        waveform: WifiWaveform,
+        referenceSignal: Union[np.ndarray, WifiWaveform],
+        waveform: Optional[WifiWaveform] = None,
         parameters: Optional[Mapping[str, object]] = None,
+        parseParameters: Optional[Mapping[str, object]] = None,
+        transmittedSignal: Optional[
+            Union[np.ndarray, WifiWaveform]
+        ] = None,
         **parameterOverrides: object,
     ) -> None:
-        """Initialize a reusable signal-analysis context and its live parameter layers.
+        """Initialize a reference-aided or receive-only analysis context.
 
         Processing details:
-            Algorithm: Define immutable analysis defaults inside the
-            constructor and layer direct and external overrides ahead of them,
-            keeping every default out of caller-side construction code.
+            Algorithm: When metadata is supplied, preserve the original
+            reference-aided construction. Otherwise parse ``referenceSignal``
+            as a received Wi-Fi frame, regenerate its ideal deterministic
+            reference, and retain the aligned received packet as the default
+            input for a later zero-argument ``Analyze`` call. Analysis defaults
+            remain inside this constructor and are resolved through ChainMap.
 
         Args:
-            referenceSignal: Ideal complex baseband samples used as the target or regression input.
-            waveform: Wi-Fi metadata defining field locations, FFT sizes, and subcarriers.
+            referenceSignal: Ideal reference samples when ``waveform`` is
+                supplied; otherwise a received NumPy array or ``WifiWaveform``
+                parsed internally.
+            waveform: Optional Wi-Fi metadata for the original data-aided path.
             parameters: Optional external mapping layered ahead of the built-in defaults.
+            parseParameters: Optional ``ParseWifi`` parameter mapping used only
+                when ``waveform`` is omitted.
+            transmittedSignal: Optional known transmit input. ``ParseWifi``
+                automatically accepts either a metadata-rich ``WifiWaveform``
+                or a NumPy waveform containing samples only.
             parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
 
         Returns:
@@ -253,10 +280,37 @@ class Analysis:
                 "loadResistanceOhm": 50.0,
             }
         )
-        complexReference = np.asarray(referenceSignal, dtype=np.complex128)
+        self.parsedWifiFrame: Optional[ParsedWifiFrame] = None
+        self.defaultMeasuredSignal: Optional[np.ndarray] = None
+        selectedWaveform = waveform
+        selectedReference: Union[np.ndarray, WifiWaveform] = referenceSignal
+        if selectedWaveform is None:
+            self.parsedWifiFrame = ParseWifi(
+                parameters=parseParameters
+            ).Parse(
+                referenceSignal,
+                transmittedSignal=transmittedSignal,
+            )
+            selectedReference = self.parsedWifiFrame.referenceSignal
+            selectedWaveform = self.parsedWifiFrame.waveform
+            self.defaultMeasuredSignal = (
+                self.parsedWifiFrame.receivedSignal.copy()
+            )
+        elif parseParameters is not None or transmittedSignal is not None:
+            raise ValueError(
+                "parseParameters and transmittedSignal are only valid when "
+                "waveform is omitted"
+            )
+        if not isinstance(selectedWaveform, WifiWaveform):
+            raise TypeError("waveform must be a WifiWaveform or None")
+        if isinstance(selectedReference, WifiWaveform):
+            selectedReference = selectedReference.samples
+        complexReference = np.asarray(
+            selectedReference, dtype=np.complex128
+        )
         if complexReference.size == 0:
             raise ValueError("referenceSignal cannot be empty")
-        expectedShape = np.asarray(waveform.samples).shape
+        expectedShape = np.asarray(selectedWaveform.samples).shape
         if complexReference.shape != expectedShape:
             raise ValueError(
                 "referenceSignal shape must match the Wi-Fi waveform"
@@ -265,7 +319,8 @@ class Analysis:
             raise ValueError("referenceSignal must be a vector or matrix")
         if (
             complexReference.ndim == 2
-            and complexReference.shape[1] != waveform.numTransmitAntennas
+            and complexReference.shape[1]
+            != selectedWaveform.numTransmitAntennas
         ):
             raise ValueError(
                 "referenceSignal must contain one column per transmit chain"
@@ -273,8 +328,8 @@ class Analysis:
         if not np.all(np.isfinite(complexReference)):
             raise ValueError("referenceSignal contains NaN or infinite values")
         self.referenceSignal = complexReference
-        self.waveform = waveform
-        self.frameProcessor = FrameProcess(waveform)
+        self.waveform = selectedWaveform
+        self.frameProcessor = FrameProcess(selectedWaveform)
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
         externalParameters = {} if parameters is None else parameters
@@ -297,6 +352,20 @@ class Analysis:
         ] = tuple()
         self.lastMimoMetrics: Optional[MimoSignalMetrics] = None
         self.powerEvmCurve: Optional[PowerEvmCurve] = None
+
+    def GetParsedWifiFrame(self) -> Optional[ParsedWifiFrame]:
+        """Return receive-only parser output retained by the constructor.
+
+        Processing details:
+            Algorithm: Preserve ``None`` for the original reference-aided path;
+            otherwise return the immutable parser result containing aligned
+            receive samples, recovered parameters, and parse diagnostics.
+
+        Returns:
+            result: Parsed frame or ``None`` when explicit metadata was used.
+        """
+
+        return self.parsedWifiFrame
 
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened snapshot of all resolved analysis parameters.
@@ -984,22 +1053,38 @@ class Analysis:
             worstValues.append(worstAclrDb)
         return tuple(lowerValues), tuple(upperValues), tuple(worstValues)
 
-    def Analyze(self, measuredSignal: np.ndarray) -> SignalMetrics:
-        """Calculate SNR, EVM, and ACLR for one PA or DPD output waveform.
+    def Analyze(
+        self, measuredSignal: Optional[np.ndarray] = None
+    ) -> SignalMetrics:
+        """Calculate SNR, EVM, and ACLR for one received Wi-Fi waveform.
 
         Processing details:
-            Algorithm: Perform the numerical calculation with explicit power, shape, and normalization handling for comparable results.
+            Algorithm: Use the explicit measured waveform in the original
+            reference-aided path, or the parsed and packet-aligned receive frame
+            when this instance was constructed without ``WifiWaveform``.
+            Synchronize once and feed the same corrected samples to every
+            metric so all results remain comparable.
 
         Args:
-            measuredSignal: Measured or simulated complex samples evaluated against the reference.
+            measuredSignal: Optional measured samples evaluated against the
+                stored reference. Omit only for a receive-only parsed instance.
 
         Returns:
             result: SignalMetrics. The computed value described by the summary, with documented units, shape, and normalization.
         """
 
+        selectedSignal = measuredSignal
+        if selectedSignal is None:
+            if self.defaultMeasuredSignal is None:
+                raise ValueError(
+                    "measuredSignal is required when Analysis was constructed "
+                    "with an explicit reference and waveform"
+                )
+            selectedSignal = self.defaultMeasuredSignal
+
         # Synchronization is intentionally executed once. The same corrected
         # samples feed all metrics so SNR, EVM, and ACLR remain comparable.
-        complexMeasured = self.PrepareMeasuredSignal(measuredSignal)
+        complexMeasured = self.PrepareMeasuredSignal(selectedSignal)
         snrDb = self.CalculatePreparedSnr(complexMeasured)
         evmDb, evmPercent = self.CalculatePreparedEvm(complexMeasured)
         (
