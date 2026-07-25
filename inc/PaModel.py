@@ -532,6 +532,7 @@ class MimoPaModel:
                 "targetOutputRmsPerChain": None,
                 "targetOutputPowerDbmPerChain": None,
                 "loadResistanceOhm": 50.0,
+                "maximumOutputPowerDbm": 25.0,
             }
         )
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -743,11 +744,16 @@ class MimoPaModel:
                 "one chain cannot set both target output RMS and dBm"
             )
         powerCalibration = PowerCalibration(
-            loadResistanceOhm=self.parameters["loadResistanceOhm"]
+            loadResistanceOhm=self.parameters["loadResistanceOhm"],
+            maximumOutputPowerDbm=self.parameters[
+                "maximumOutputPowerDbm"
+            ],
         )
         for targetPowerDbm in targetOutputPowerDbmValues:
             if targetPowerDbm is not None:
-                powerCalibration.DbmToRms(targetPowerDbm)
+                powerCalibration.OutputPowerToDriveScale(
+                    targetPowerDbm
+                )
 
     def SynchronizeModels(self) -> None:
         """Rebuild per-chain PA objects after live configuration changes.
@@ -981,7 +987,10 @@ class MimoPaModel:
         targetOutputPowerDbm = targetOutputPowerDbmValues[chainIndex]
         if targetOutputPowerDbm is not None:
             targetOutputRms = PowerCalibration(
-                loadResistanceOhm=self.parameters["loadResistanceOhm"]
+                loadResistanceOhm=self.parameters["loadResistanceOhm"],
+                maximumOutputPowerDbm=self.parameters[
+                    "maximumOutputPowerDbm"
+                ],
             ).DbmToRms(targetOutputPowerDbm)
         if targetOutputRms is not None:
             currentRms = np.sqrt(np.mean(np.abs(chainOutput) ** 2))
@@ -1018,7 +1027,10 @@ class MimoPaModel:
         """
 
         powerCalibration = PowerCalibration(
-            loadResistanceOhm=self.parameters["loadResistanceOhm"]
+            loadResistanceOhm=self.parameters["loadResistanceOhm"],
+            maximumOutputPowerDbm=self.parameters[
+                "maximumOutputPowerDbm"
+            ],
         )
         return tuple(
             powerCalibration.RmsToDbm(outputRms)

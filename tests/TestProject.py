@@ -955,6 +955,14 @@ def CheckMimoPaAndDpd() -> None:
         targetOutputPowerDbm,
         atol=1e-12,
     )
+    try:
+        mimoPaModel.SetTargetOutputPowerDbm(0, 25.1)
+    except ValueError as error:
+        assert "maximumOutputPowerDbm" in str(error)
+    else:
+        raise AssertionError(
+            "MIMO output power above the 25 dBm limit must fail"
+        )
 
     waveform = WaveGenWifi(
         frameFormat="EHT",
@@ -1208,26 +1216,24 @@ def CheckPowerEvmCurve() -> None:
         powerCalibration.RmsToDbm(np.sqrt(0.001 * 50.0)),
         0.0,
     )
-    nominalInputPowerDbm = powerCalibration.RmsToDbm(0.24)
+    assert powerCalibration.maximumOutputPowerDbm == 25.0
     assert np.isclose(
-        powerCalibration.DbmToRms(nominalInputPowerDbm),
-        0.24,
+        powerCalibration.OutputPowerToDriveScale(20.0),
+        10.0 ** (-5.0 / 20.0),
     )
-    nominalReference = powerCalibration.DbmToRms(
-        nominalInputPowerDbm
-    ) * waveform.samples
+    nominalReference = (
+        powerCalibration.OutputPowerToDriveScale(20.0)
+        * waveform.samples
+    )
     paModel = PaModel(modelName="wiener")
     resultAnalysis = Analysis(
         nominalReference,
         waveform,
         loadResistanceOhm=powerCalibration.loadResistanceOhm,
     )
-    inputPowerDbmValues = tuple(
-        powerCalibration.RmsToDbm(driveRms)
-        for driveRms in (0.10, 0.20, 0.30)
-    )
+    outputPowerDbmValues = (10.0, 20.0, 25.0)
     curve = resultAnalysis.AnalyzePowerEvmCurve(
-        inputPowerDbmValues,
+        outputPowerDbmValues,
         {
             "Ideal": lambda pointReference, _: pointReference,
             "PA baseline": lambda pointReference, _: paModel.Process(
@@ -1235,14 +1241,44 @@ def CheckPowerEvmCurve() -> None:
             ),
         },
     )
-    assert curve.inputPowerDbmValues.size == 3
+    assert curve.outputPowerDbmValues.size == 3
     assert np.allclose(
-        curve.inputPowerDbmValues,
-        inputPowerDbmValues,
+        curve.outputPowerDbmValues,
+        outputPowerDbmValues,
     )
-    assert np.allclose(curve.driveRmsValues, (0.10, 0.20, 0.30))
+    assert np.allclose(
+        curve.driveScaleValues,
+        tuple(
+            10.0 ** ((powerDbm - 25.0) / 20.0)
+            for powerDbm in outputPowerDbmValues
+        ),
+    )
+    assert np.allclose(
+        curve.targetOutputRmsValues,
+        tuple(
+            powerCalibration.DbmToRms(powerDbm)
+            for powerDbm in outputPowerDbmValues
+        ),
+    )
     assert set(curve.evmDbByMethod) == {"Ideal", "PA baseline"}
     assert np.all(curve.evmDbByMethod["Ideal"] < -250.0)
+    calibratedOutput = powerCalibration.ScaleSignalToOutputPower(
+        paModel.Process(nominalReference),
+        20.0,
+    )
+    calibratedRms = float(
+        np.sqrt(np.mean(np.abs(calibratedOutput) ** 2))
+    )
+    assert np.isclose(
+        powerCalibration.RmsToDbm(calibratedRms),
+        20.0,
+    )
+    try:
+        powerCalibration.OutputPowerToDriveScale(25.1)
+    except ValueError as error:
+        assert "maximumOutputPowerDbm" in str(error)
+    else:
+        raise AssertionError("output power above 25 dBm must fail")
 
     with TemporaryDirectory() as temporaryDirectory:
         dataPaths = resultAnalysis.SavePowerEvmCurveData(

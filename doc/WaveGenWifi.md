@@ -598,7 +598,24 @@ x_{\mathrm{rms,total}}
 \sum_{m=1}^{N_{TX}}|x_m[n]|^2}.
 ```
 
-归一化后该总 RMS 为 1。调用方配置总输入功率 `inputPowerDbm` 后，`PowerCalibration` 按端口电阻换算总复包络 RMS 电压 $d$，主程序再把整包乘以 $d$。单路 RMS 和单路功率取决于空间映射、CSD、字段和数据，也可在 `MimoPaModel` 中再次独立调整。
+归一化后该总 RMS 为 1。这个数值归一化不代表真实端口上已经产生 1 W 或某个固定 dBm；它只提供统一的 PA 驱动基准。
+
+调用方配置每路 PA 的目标输出功率 `outputPowerDbm`，并配置额定极限输出功率 `maximumOutputPowerDbm`。默认额定极限为 25 dBm。`PowerCalibration` 先按输出回退量计算归一化驱动比例：
+
+```math
+\mathrm{OBO}_{\mathrm{dB}}
+=P_{\mathrm{max,dBm}}-P_{\mathrm{out,dBm}},
+```
+
+```math
+d
+=10^{-\mathrm{OBO}_{\mathrm{dB}}/20}
+=10^{(P_{\mathrm{out,dBm}}-P_{\mathrm{max,dBm}})/20}.
+```
+
+例如目标输出 20 dBm、额定极限 25 dBm 时，驱动比例约为 0.5623；目标达到 25 dBm 时，驱动比例为 1。主程序先用该比例驱动归一化 PA，再对 PA 原始输出施加每路独立的常数增益，使最终 RMS 与目标输出 dBm 精确一致。这个常数只改变绝对电平，不改变 EVM、SNR 和 ACLR 等比值指标。
+
+对于 MIMO，每路 PA 都可配置独立的目标输出功率。整包总 RMS 归一化仍用于维持空间映射和公共字段的相对功率关系，但最终物理输出功率按每条 PA 链分别校准。
 
 ---
 
@@ -652,32 +669,29 @@ x_{\mathrm{norm}}[n]=\frac{x[n]}{x_{\mathrm{rms}}}.
 \mathrm{RMS}\{x_{\mathrm{norm}}\}=1.
 ```
 
-调用方把 PA 输入功率配置为 $p_{\mathrm{dBm}}$。对于纯电阻端口 $R$，`PowerCalibration` 先计算
+调用方把每路 PA 的目标输出功率配置为 $p_{\mathrm{out,dBm}}$，并把额定极限输出功率配置为 $p_{\mathrm{max,dBm}}$。默认极限为 25 dBm。`PowerCalibration` 先计算输出回退量对应的归一化驱动比例：
 
 ```math
-P_{\mathrm{W}}=10^{-3}10^{p_{\mathrm{dBm}}/10},
+d
+=10^{(p_{\mathrm{out,dBm}}-p_{\mathrm{max,dBm}})/20}.
 ```
 
-```math
-d=V_{\mathrm{RMS}}=\sqrt{R P_{\mathrm{W}}},
-```
-
-主程序再缩放单位 RMS 波形：
+主程序用该比例缩放单位 RMS 波形：
 
 ```math
 x_d[n]=d\,x_{\mathrm{norm}}[n].
 ```
 
-反向换算关系为
+PA 处理后，对每路原始输出施加常数增益，使其目标输出 RMS 电压满足：
 
 ```math
-p_{\mathrm{dBm}}
-=10\log_{10}\left(
-\frac{d^2}{R\,10^{-3}}
-\right).
+V_{\mathrm{target,RMS}}
+=\sqrt{
+R\,10^{-3}10^{p_{\mathrm{out,dBm}}/10}
+}.
 ```
 
-因此对外的模拟功率单位是 dBm，`d` 只是 PA 数值运算所需的内部 RMS 电压。默认 $R=50$ Ω 时，0 dBm 等于 1 mW，并对应约 0.223607 V RMS。注意归一化是针对**整包**，不同字段的局部 RMS 可能不同。这种选择保证不同配置生成的整包在统一绝对功率标尺下可比较。
+因此对外的模拟功率单位是输出 dBm；$d$ 是决定 PA 压缩程度的归一化驱动量，$V_{\mathrm{target,RMS}}$ 是最终物理输出电平。默认 $R=50$ Ω 时，20 dBm 对应 2.236068 V RMS，25 dBm 对应约 3.976354 V RMS。注意归一化是针对**整包**，不同字段的局部 RMS 可能不同；MIMO 最终按每条 PA 链独立校准。
 
 ---
 

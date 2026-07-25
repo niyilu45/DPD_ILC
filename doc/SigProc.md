@@ -363,9 +363,9 @@ processingResult = resultAnalysis.GetLastSignalProcessingResult()
 
 ---
 
-## 13. dBm 与复包络 RMS 电压标定
+## 13. PA输出dBm、输出回退与复包络标定
 
-`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它只负责物理单位换算，不修改信号样点，也不执行 PA 非线性。
+`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它负责dBm/RMS换算、根据额定输出功率计算归一化输出回退驱动，并用常数增益标定PA输出；它不执行PA非线性。
 
 工程约定复包络 RMS 幅度等于纯电阻端口上的 RF RMS 电压。设端口电阻为 $R$，RMS 电压为 $V_{\mathrm{RMS}}$，则端口平均功率为
 
@@ -414,6 +414,24 @@ flowchart LR
 
 **图 3 说明：**`PowerCalibration` 为主程序、`PaModel`、`Analysis` 和 Benchmark 提供同一个端口阻抗基准。它位于 `SigProc.py` 后，`Analysis` 不再需要为了功率换算而导入 `PaModel.py`。
 
+默认每路PA极限输出功率为
+
+```math
+P_{\max}=25\ \mathrm{dBm}.
+```
+
+目标输出 $P_{\mathrm{out}}$ 对应的输出回退与归一化驱动为
+
+```math
+\mathrm{OBO}=P_{\max}-P_{\mathrm{out}},
+```
+
+```math
+a=10^{-\mathrm{OBO}/20}.
+```
+
+默认20 dBm工作点对应5 dB回退和 $a\approx0.5623$。`ScaleSignalToOutputPower` 或 `ScaleSignalToOutputPowers` 在PA处理后按整段RMS施加常数增益，使每路达到目标dBm。常数增益不改变归一化EVM和ACLR功率比；压缩深度由标定前的 $a$ 决定。
+
 50 Ω 端口上，0 dBm 等于 1 mW，对应
 
 ```math
@@ -425,9 +443,20 @@ V_{\mathrm{RMS}}
 典型调用：
 
 ```python
+import numpy as np
+
 from inc.SigProc import PowerCalibration
 
-powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
-inputRmsVoltage = powerCalibration.DbmToRms(0.0)
-measuredPowerDbm = powerCalibration.RmsToDbm(inputRmsVoltage)
+powerCalibration = PowerCalibration(
+    loadResistanceOhm=50.0,
+    maximumOutputPowerDbm=25.0,
+)
+driveScale = powerCalibration.OutputPowerToDriveScale(20.0)
+rawOutput = paModel.Process(driveScale * waveform.samples)
+calibratedOutput = powerCalibration.ScaleSignalToOutputPower(
+    rawOutput,
+    20.0,
+)
+measuredRms = np.sqrt(np.mean(np.abs(calibratedOutput) ** 2))
+measuredPowerDbm = powerCalibration.RmsToDbm(measuredRms)
 ```

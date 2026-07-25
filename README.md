@@ -467,7 +467,7 @@ flowchart TD
 - `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
 - `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、公共复增益幅相和输入峰值。
 - MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
-- `AnalyzePowerEvmCurve` 接收一组严格递增的绝对 dBm 输入功率点和多个方法求值器，先按 `loadResistanceOhm` 换算复包络 RMS 电压，再在每个功率点使用相同参考信号计算 EVM；`SavePowerEvmCurveData` 只保存原始 CSV/JSON 数据，不导入或调用任何绘图库。
+- `AnalyzePowerEvmCurve` 接收一组严格递增的每路PA输出功率点和多个方法求值器，以25 dBm默认极限为0 dB输出回退确定归一化驱动，并把各方法结果标定到相同输出功率后计算EVM；`SavePowerEvmCurveData` 只保存原始CSV/JSON数据，不导入或调用任何绘图库。
 
 ### `inc/Draw.py`
 
@@ -582,15 +582,16 @@ flowchart LR
 | `--spatial-mapping` | `direct`、`dft` | `direct` | 空间流到发射链的正交映射。自定义矩阵通过 Python API 设置。 |
 | `--pa-input-power-db` | 逗号分隔浮点数 | 每路 `0` | 每路进入非线性 PA 前的独立驱动增益 dB，元素数必须等于发射链数。 |
 | `--pa-output-power-db` | 逗号分隔浮点数 | 每路 `0` | 每路 PA 后的独立相对输出功率调整 dB。 |
-| `--pa-output-power-dbm` | 逗号分隔 dBm 数值或 `none` | 每路 `none` | 每路 PA 后的绝对输出功率目标，单位 dBm；按 `--load-resistance-ohm` 换算。 |
+| `--pa-output-power-dbm` | 逗号分隔 dBm 数值或 `none` | 使用全局20 dBm目标 | 独立覆盖每路PA绝对输出功率；`none` 使用全局目标，且不得超过额定极限。 |
 | `--pa-output-rms` | 逗号分隔正数或 `none` | 每路 `none` | 旧接口：每路复包络输出 RMS 电压目标；不能与 `--pa-output-power-dbm` 同时使用。 |
 | `--symbols` | 正整数 | `20` | 数据 OFDM 符号数。 |
 | `--guard-interval` | `0.4`、`0.8`、`1.6`、`3.2` | `0.8` | VHT 使用 0.4/0.8 μs；HE/EHT 使用 0.8/1.6/3.2 μs。 |
 | `--sample-rate-hz` | 正浮点数 | 未显式设置时由兼容参数推导 | 用户指定的复基带采样率，单位 Hz；提供后优先于 `--oversampling`。采样率必须使所选PHY的FFT、GI和传统前导时长对应整数采样点。 |
 | `--oversampling` | `4`、`8` | `4` | 旧接口兼容项；仅在未提供 `--sample-rate-hz` 时按 `带宽×倍率` 推导采样率。 |
-| `--input-power-dbm` | 有限浮点数 | `0.615 dBm`（50 Ω） | PA 输入端口的绝对平均功率；默认值等效于 50 Ω 下 `0.24 V RMS`。 |
-| `--power-start-dbm` | 有限浮点数 | `−8.928 dBm`（50 Ω） | 功率-EVM 扫描的起始绝对输入功率。 |
-| `--power-stop-dbm` | 大于 `--power-start-dbm` 的浮点数 | `5.051 dBm`（50 Ω） | 功率-EVM 扫描的结束绝对输入功率。 |
+| `--output-power-dbm` | 不大于极限的有限浮点数 | `20 dBm` | 每路PA的目标平均输出功率。 |
+| `--maximum-output-power-dbm` | 有限浮点数 | `25 dBm` | 每路PA的额定极限输出功率，也是0 dB输出回退参考。 |
+| `--power-start-dbm` | 不大于极限的有限浮点数 | `10 dBm` | 功率-EVM扫描的起始PA输出功率。 |
+| `--power-stop-dbm` | 大于起点且不大于极限 | `25 dBm` | 功率-EVM扫描的结束PA输出功率。 |
 | `--load-resistance-ohm` | 正浮点数 | `50.0` | dBm 与复包络 RMS 电压换算所用的纯电阻端口，单位 Ω。 |
 | `--power-points` | 不小于 2 的整数 | `7` | 在起止功率之间按等 dBm 间隔生成的扫描点数。 |
 | `--skip-power-evm-curve` | 开关 | 关闭 | 跳过功率-EVM 扫描及 PNG/CSV/JSON 输出。 |
@@ -658,11 +659,15 @@ P(dBm) = 10 log10(P(W) / 0.001)
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `loadResistanceOhm` | `50.0` | PA 输入、输出端口的纯电阻负载，单位 Ω，必须为正数。 |
+| `maximumOutputPowerDbm` | `25.0` | 每路PA额定极限输出功率；请求的输出功率不得超过此值。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
-| `DbmToRms(inputPowerDbm)` | 任意有限 dBm 数值 | 返回该功率在所配置端口上的复包络 RMS 电压。 |
+| `DbmToRms(powerDbm)` | 任意有限 dBm 数值 | 返回该功率在所配置端口上的复包络 RMS 电压。 |
 | `RmsToDbm(signalRms)` | 正的有限 RMS 电压 | 返回对应的绝对功率 dBm。 |
+| `OutputPowerToDriveScale(outputPowerDbm)` | 不大于极限的输出dBm | 按输出回退量返回归一化PA驱动比例。 |
+| `ScaleSignalToOutputPower(signal, outputPowerDbm)` | PA输出、每路目标dBm | 用常数增益把单路或全部链标定到相同目标输出功率。 |
+| `ScaleSignalToOutputPowers(signal, outputPowerDbmPerChain)` | PA输出、逐链目标 | 分别标定每路PA输出功率。 |
 | `GetParameters()` | 无 | 返回当前解析参数。 |
 | `UpdateParameters(**parameterOverrides)` | 支持的任意配置 | 事务式更新覆盖层。 |
 
@@ -710,6 +715,7 @@ P(dBm) = 10 log10(P(W) / 0.001)
 | `outputPowerDbPerChain` | `None` | 每路相对输出 dB；`None` 展开为全 0。 |
 | `targetOutputPowerDbmPerChain` | `None` | 每路绝对输出功率 dBm 或 `None`；整个参数为 `None` 时全部禁用。 |
 | `loadResistanceOhm` | `50.0` | 绝对 dBm 目标与实测输出功率换算所用的端口电阻。 |
+| `maximumOutputPowerDbm` | `25.0` | 每路允许的最高目标输出功率。 |
 | `targetOutputRmsPerChain` | `None` | 旧接口：每路复包络输出 RMS 电压或 `None`；同一链不能同时设置 RMS 与 dBm 目标。 |
 
 `Process(matrix)` 逐列处理；`ProcessChain(vector, chainIndex)` 供单路测量或 ILC 使用；`SetOutputPowerDb`、`SetTargetOutputPowerDbm` 可在运行时只修改一路；`GetOutputPowerDbmPerChain` 返回最近一次矩阵处理测得的各路绝对功率。`SetTargetOutputRms` 和 `GetOutputRmsPerChain` 仅作为旧接口保留。
@@ -803,6 +809,7 @@ PA 辅助接口还包括：
 | `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
 | `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
 | `loadResistanceOhm` | `50.0` | 功率扫描中 dBm 与参考波形 RMS 电压换算所用的端口电阻。 |
+| `maximumOutputPowerDbm` | `25.0` | 功率扫描的每路PA极限输出，也是0 dB输出回退参考。 |
 | `signalProcessingParameters` | `None` | 传给 `SigProc` 的普通覆盖字典；`None` 使用其内部默认值。 |
 | `parseParameters` | `None` | 仅接收路径传给 `ParseWifi` 的普通覆盖字典。 |
 | `transmittedSignal` | `None` | 可选发送NumPy数组或 `WifiWaveform`，用于提高描述恢复、包起点和参考准确度。 |
@@ -830,10 +837,10 @@ PA 辅助接口还包括：
 | `PrintConvergence(ilcHistory, historyName="ILC convergence")` | Analysis生成的性能历史、可选标题 | 逐轮打印 Raw MSE、LC-MSE、SNR、EVM、ACLR、复增益幅相和输入峰值。 |
 | `Save(outputDirectory, runMetadata, stageMetrics=None)` | 输出路径、元数据、可选指标映射 | 写入 `metrics.json` 和 `metrics.csv`，并附带可用的各阶段同步估计。 |
 | `SaveConvergence(ilcHistory, outputDirectory)` | Analysis生成的性能历史、输出路径 | 写入包含三级MSE、SNR、EVM、ACLR和线性项诊断的 `ilc_convergence.csv`。 |
-| `AnalyzePowerEvmCurve(inputPowerDbmValues, methodEvaluators)` | 递增 dBm 点、`{方法名: 求值器}` 映射 | 计算并保存一个 `PowerEvmCurve`；求值器接收当前参考信号和绝对输入功率 dBm。 |
+| `AnalyzePowerEvmCurve(outputPowerDbmValues, methodEvaluators)` | 递增输出dBm点、`{方法名: 求值器}` 映射 | 按输出回退驱动PA，把每种方法标定到相同输出功率后计算EVM。 |
 | `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取实例解析后的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
 
-`Analyze` 返回字典的固定键包括 `snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。`ILCPerformanceIteration` 把这些RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存相同结构的普通字典。`PowerEvmCurve` 保存用户指定的 `inputPowerDbmValues`、内部换算得到的 `driveRmsValues` 以及各方法的 EVM dB/百分比数组。
+`Analyze` 返回字典的固定键包括 `snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。`ILCPerformanceIteration` 把这些RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存相同结构的普通字典。`PowerEvmCurve` 保存 `outputPowerDbmValues`、`driveScaleValues`、`targetOutputRmsValues` 以及各方法的EVM数组。
 
 ### `Draw` 参数与方法
 
@@ -852,7 +859,7 @@ PA 辅助接口还包括：
 | `legendColumnThreshold` | `6` | 方法数超过该值时，将图例移到绘图区右侧。 |
 | `plotTitle` | `"Power-EVM comparison"` | 图标题。 |
 | `convergencePlotTitle` | `"ILC MSE convergence"` | 每轮 MSE 收敛图标题。 |
-| `xAxisLabel` | `"PA input power (dBm)"` | 横轴标题。 |
+| `xAxisLabel` | `"PA output power per chain (dBm)"` | 横轴标题。 |
 | `yAxisLabel` | `"RMS EVM (dB, lower is better)"` | 纵轴标题。 |
 | `convergenceXAxisLabel` | `"ILC iteration"` | 收敛图横轴标题。 |
 | `convergenceYAxisLabel` | `"Normalized error / EVM (dB, lower is better)"` | 收敛图纵轴标题。 |
@@ -918,13 +925,14 @@ PA 辅助接口还包括：
 | `sampleRateHz` | `None` | 用户指定采样率；`None` 时由兼容 `oversampling` 推导。benchmark要求实际采样率不低于3倍带宽。 |
 | `oversampling` | `4` | 旧接口兼容项；仅在 `sampleRateHz=None` 时生效。 |
 | `guardIntervalUs` | `0.8` | VHT 为 0.4/0.8；HE/EHT 为 0.8/1.6/3.2 μs。 |
-| `inputPowerDbm` | `0.614525` | PA 输入端口绝对功率，单位 dBm；50 Ω 下等效于 `0.24 V RMS`。 |
+| `outputPowerDbm` | `20.0` | 标称每路PA输出功率，单位dBm。 |
+| `maximumOutputPowerDbm` | `25.0` | 每路PA额定极限输出功率。 |
 | `loadResistanceOhm` | `50.0` | dBm 与复包络 RMS 电压换算所用端口电阻。 |
 | `numIterations` | `10` | 每种 ILC 的迭代预算。 |
 | `paModelName` | `"wiener"` | `"wiener"` 或 `"gmp"`。 |
 | `seed` | `101` | 训练帧随机种子；验证帧自动使用 `seed + 97`。 |
-| `powerStartDbm` | `−8.927900` | 全方法功率-EVM 扫描起点，单位 dBm。 |
-| `powerStopDbm` | `5.051500` | 全方法功率-EVM 扫描终点，单位 dBm。 |
+| `powerStartDbm` | `10.0` | 全方法功率-EVM输出功率扫描起点。 |
+| `powerStopDbm` | `25.0` | 全方法功率-EVM输出功率扫描终点。 |
 | `powerPointCount` | `5` | 基准模式的扫描点数。 |
 | `generatePowerEvmCurve` | `True` | 是否生成全方法功率-EVM PNG/CSV/JSON。 |
 | `outputDirectory` | `results/all_ilc_benchmark` | 全方案 CSV、JSON 和各算法收敛历史目录。 |
@@ -1018,7 +1026,7 @@ python main.py --format EHT --bandwidth 160 --sample-rate-hz 640000000 --mcs 13 
 ### 示例四：指定功率范围、带噪反馈并保存波形
 
 ```powershell
-python main.py --input-power-dbm 1.0 --power-start-dbm -10 --power-stop-dbm 6 --power-points 9 --feedback-snr 45 --feedback-averages 4 --save-waveforms --output-dir results/noisy_feedback
+python main.py --output-power-dbm 20 --maximum-output-power-dbm 25 --power-start-dbm 10 --power-stop-dbm 25 --power-points 9 --feedback-snr 45 --feedback-averages 4 --save-waveforms --output-dir results/noisy_feedback
 ```
 
 ### 示例五：EHT 4×4 MIMO，并独立设置每路 PA 输出功率
@@ -1032,12 +1040,14 @@ python main.py --format 11be --bandwidth 80 --mcs 11 --tx-antennas 4 --spatial-s
 若要直接规定每路绝对输出功率，可使用 dBm 目标：
 
 ```powershell
-python main.py --format EHT --bandwidth 20 --tx-antennas 4 --spatial-streams 2 --pa-output-power-dbm 0,-1,-2,-3 --load-resistance-ohm 50 --skip-power-evm-curve
+python main.py --format EHT --bandwidth 20 --tx-antennas 4 --spatial-streams 2 --pa-output-power-dbm 22,21,20,19 --maximum-output-power-dbm 25 --load-resistance-ohm 50 --skip-power-evm-curve
 ```
 
 ### 示例六：Python API 构造 4×2 MIMO 和独立 PA
 
 ```python
+import numpy as np
+
 from inc.Analysis import Analysis
 from inc.PaModel import MimoPaModel
 from inc.SigProc import PowerCalibration
@@ -1052,9 +1062,20 @@ wifiGenerator = WaveGenWifi(
     spatialMapping="dft",
 )
 waveform = wifiGenerator.Generate()
-powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
-inputPowerDbm = 0.0
-referenceSignal = powerCalibration.DbmToRms(inputPowerDbm) * waveform.samples
+powerCalibration = PowerCalibration(
+    loadResistanceOhm=50.0,
+    maximumOutputPowerDbm=25.0,
+)
+outputPowerDbmPerChain = (22.0, 21.0, 20.0, 19.0)
+driveScalePerChain = np.asarray(
+    [
+        powerCalibration.OutputPowerToDriveScale(outputPowerDbm)
+        for outputPowerDbm in outputPowerDbmPerChain
+    ]
+)
+referenceSignal = (
+    waveform.samples * driveScalePerChain.reshape(1, -1)
+)
 
 mimoPaModel = MimoPaModel(
     numTransmitChains=4,
@@ -1064,20 +1085,20 @@ mimoPaModel = MimoPaModel(
         {"modelName": "gmp"},
         {"modelName": "gmp"},
     ),
-    outputPowerDbPerChain=(0.0, -1.0, -2.0, -3.0),
+    maximumOutputPowerDbm=25.0,
     loadResistanceOhm=50.0,
 )
-paOutput = mimoPaModel.Process(referenceSignal)
-print(mimoPaModel.GetOutputPowerDbmPerChain())
-
-# Runtime changes affect only the selected physical PA.
-mimoPaModel.SetOutputPowerDb(chainIndex=2, outputPowerDb=-4.0)
-mimoPaModel.SetTargetOutputPowerDbm(
-    chainIndex=3,
-    targetOutputPowerDbm=-3.0,
+rawPaOutput = mimoPaModel.Process(referenceSignal)
+paOutput = powerCalibration.ScaleSignalToOutputPowers(
+    rawPaOutput,
+    outputPowerDbmPerChain,
+)
+physicalReference = powerCalibration.ScaleSignalToOutputPowers(
+    referenceSignal,
+    outputPowerDbmPerChain,
 )
 
-resultAnalysis = Analysis(referenceSignal, waveform)
+resultAnalysis = Analysis(physicalReference, waveform)
 resultAnalysis.AnalyzeStages({"MIMO PA": paOutput})
 resultAnalysis.Print()
 resultAnalysis.PrintMimo()
@@ -1215,9 +1236,9 @@ from inc.Draw import Draw
 
 outputDirectory = Path("results/programmatic_curve")
 powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
-    inputPowerDbmValues=(-9.0, -6.0, -3.0, 0.0, 3.0),
+    outputPowerDbmValues=(10.0, 15.0, 20.0, 23.0, 25.0),
     methodEvaluators={
-        "PA baseline": lambda pointReference, inputPowerDbm: paModel.Process(
+        "PA baseline": lambda pointReference, outputPowerDbm: paModel.Process(
             pointReference
         ),
     },
@@ -1261,10 +1282,11 @@ benchmarkConfig = BenchmarkConfig(
     numDataSymbols=10,
     numIterations=10,
     paModelName="wiener",
-    inputPowerDbm=0.615,
+    outputPowerDbm=20.0,
+    maximumOutputPowerDbm=25.0,
     loadResistanceOhm=50.0,
-    powerStartDbm=-9.0,
-    powerStopDbm=5.0,
+    powerStartDbm=10.0,
+    powerStopDbm=25.0,
     powerPointCount=5,
     outputDirectory=Path("results/he_all_ilc"),
 )
@@ -1355,7 +1377,7 @@ Parser会在内部自动处理NumPy和 `WifiWaveform`，无需外部指定类型
 - `ilc_convergence.png`：在同一 dB 坐标中比较 Raw NMSE、LC-NMSE 与 EVM-MSE/EVM dB；
 - `waveforms.npz`：仅在指定 `--save-waveforms` 时输出。
 - `power_evm_curve.png`：PA 基线、频域 ILC、拟合 GMP DPD 的同图功率-EVM 曲线；
-- `power_evm_curve.csv`：每个绝对输入功率 dBm 点、对应 RMS 电压及各方法 EVM dB 和百分比；
+- `power_evm_curve.csv`：每个PA输出功率dBm点、归一化驱动比例、目标输出RMS电压及各方法EVM；
 - `power_evm_curve.json`：与曲线对应的结构化数据。
 
 ## 指标定义
@@ -1364,7 +1386,7 @@ Parser会在内部自动处理NumPy和 `WifiWaveform`，无需外部指定类型
 - EVM：使用同一份 `SigProc` 校正信号，由 `FrameProcess` 对当前格式的 `VHT-Data`、`HE-Data` 或 `EHT-Data` 去循环前缀、FFT、撤销 CSD 和空间解映射后，在数据子载波上相对同路径参考星座计算 RMS EVM，同时输出 dB 与百分比。
 - 每轮 MSE：Raw MSE 保留绝对增益、相位及整帧误差；LC-MSE 删除最优公共复增益，是一般复基带的 EVM 代理；EVM-MSE 使用完整 Wi-Fi 接收链，并严格满足 `EVM-MSE = EVM_rms²` 与 `EVM(dB) = 10·log10(EVM-MSE)`。详细推导见 [结果计算物理原理与推导](doc/Analysis.md#55-为什么原始-mse-不能总是反映-evm)。
 - ACLR：主信道功率与上下相邻同带宽信道功率之比，输出上下邻道和较差值。为完整覆盖两个邻道，命令行采样倍率限制为 4 或 8。
-- 功率-EVM：横轴为 PA 端口绝对输入功率 dBm；`Analysis` 按 `P=Vrms²/R` 将其换算为仿真参考波形的 RMS 电压。纵轴为 RMS EVM dB，数值越低表示性能越好。普通模式比较 PA 基线、每个功率点重新学习的频域 ILC、以及复用标称功率训练系数的 GMP DPD。
+- 功率-EVM：横轴为每路PA绝对输出功率dBm，默认扫描10至25 dBm。`Analysis` 用相对25 dBm极限的输出回退量控制归一化PA驱动，再按端口阻抗把输出标定到目标功率。纵轴为RMS EVM dB，数值越低表示性能越好。
 
 ## 验证
 

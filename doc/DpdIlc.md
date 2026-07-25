@@ -25,8 +25,8 @@
 
 ```mermaid
 flowchart LR
-    power["用户配置PA输入功率 dBm"] --> calibration["PowerCalibration<br/>按端口电阻换算RMS电压"]
-    wave["WaveGenWifi.Generate<br/>生成SISO或MIMO Wi-Fi参考信号"] --> scale["按RMS电压缩放"]
+    power["用户配置PA输出功率 dBm"] --> calibration["PowerCalibration<br/>相对25 dBm极限计算输出回退"]
+    wave["WaveGenWifi.Generate<br/>生成SISO或MIMO Wi-Fi参考信号"] --> scale["按归一化驱动比例缩放"]
     calibration --> scale
     scale --> reference["referenceSignal<br/>期望PA输出及ILC初始输入"]
     reference --> baseline["PaModel.Process<br/>未补偿baseline"]
@@ -147,13 +147,18 @@ chainSignal = referenceSignal[:, chainIndex]
 from inc.SigProc import PowerCalibration
 
 waveform = wifiGenerator.Generate()
-powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
-paInputPowerDbm = 0.0
-paInputRms = powerCalibration.DbmToRms(paInputPowerDbm)
-referenceSignal = paInputRms * waveform.samples
+powerCalibration = PowerCalibration(
+    loadResistanceOhm=50.0,
+    maximumOutputPowerDbm=25.0,
+)
+paOutputPowerDbm = 20.0
+driveScale = powerCalibration.OutputPowerToDriveScale(
+    paOutputPowerDbm
+)
+referenceSignal = driveScale * waveform.samples
 ```
 
-对调用方公开的模拟功率是 `paInputPowerDbm`，单位 dBm。`PowerCalibration` 使用端口电阻把它换算成 PA 数值模型需要的复包络 RMS 电压。默认使用 50 Ω；若仿真对象不是 50 Ω 系统，必须显式修改 `loadResistanceOhm`。
+对调用方公开的工作点是 `paOutputPowerDbm`。默认额定极限为25 dBm，20 dBm对应5 dB输出回退和约0.5623的归一化驱动比例。PA非线性处理后，再用常数增益把输出标定到20 dBm；该标定不会改变EVM或ACLR比值。
 
 ### 4.4 PA对象接口要求
 
@@ -201,18 +206,25 @@ wifiGenerator = WaveGenWifi(
 )
 waveform = wifiGenerator.Generate()
 
-# Convert the configured absolute input power to the RMS voltage required by
-# the complex-envelope PA model. The generated SISO packet has unit RMS.
+# Convert the requested output power to normalized output-backoff drive.
 loadResistanceOhm = 50.0
-paInputPowerDbm = 0.0
+maximumOutputPowerDbm = 25.0
+paOutputPowerDbm = 20.0
 powerCalibration = PowerCalibration(
-    loadResistanceOhm=loadResistanceOhm
+    loadResistanceOhm=loadResistanceOhm,
+    maximumOutputPowerDbm=maximumOutputPowerDbm,
 )
-paInputRms = powerCalibration.DbmToRms(paInputPowerDbm)
-referenceSignal = paInputRms * waveform.samples
+driveScale = powerCalibration.OutputPowerToDriveScale(
+    paOutputPowerDbm
+)
+referenceSignal = driveScale * waveform.samples
 
 paModel = PaModel(parameters={"modelName": "wiener"})
-baselineOutput = paModel.Process(referenceSignal)
+baselineOutputRaw = paModel.Process(referenceSignal)
+baselineOutput = powerCalibration.ScaleSignalToOutputPower(
+    baselineOutputRaw,
+    paOutputPowerDbm,
+)
 baselineOutputRms = float(np.sqrt(np.mean(np.abs(baselineOutput) ** 2)))
 baselineOutputPowerDbm = powerCalibration.RmsToDbm(baselineOutputRms)
 
@@ -238,7 +250,11 @@ ilcResult = RunFrequencyDomainIlc(
 )
 ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
 selectedIlcInput = ilcAnalysisResult.bestInputSignal
-selectedIlcOutput = paModel.Process(selectedIlcInput)
+selectedIlcOutputRaw = paModel.Process(selectedIlcInput)
+selectedIlcOutput = powerCalibration.ScaleSignalToOutputPower(
+    selectedIlcOutputRaw,
+    paOutputPowerDbm,
+)
 
 stageMetrics = resultAnalysis.AnalyzeStages(
     {
@@ -262,38 +278,33 @@ Draw().SaveConvergenceCurve(
 
 print(stageMetrics["PA baseline"])
 print(stageMetrics["Frequency-domain ILC"])
-print(f"Configured PA input power: {paInputPowerDbm:.2f} dBm")
-print(f"Equivalent PA input RMS voltage: {paInputRms:.6f} V")
+print(f"Configured PA output power: {paOutputPowerDbm:.2f} dBm")
+print(f"Rated maximum PA output: {maximumOutputPowerDbm:.2f} dBm")
+print(f"Normalized PA drive scale: {driveScale:.6f}")
 print(f"Measured PA output power: {baselineOutputPowerDbm:.2f} dBm")
 print(f"Measured PA output RMS voltage: {baselineOutputRms:.6f} V")
 print(selectedIlcInput.shape)
 ```
 
-这个示例中，`paInputPowerDbm` 是需要显式设置的模拟功率参数。`WaveGenWifi` 已把SISO整包波形归一化到单位RMS。dBm先换算成瓦特，再通过端口电阻换算成复包络 RMS 电压：
+这个示例中，`paOutputPowerDbm` 是工作点，`maximumOutputPowerDbm` 是额定极限。输出回退和归一化驱动关系为：
 
 ```math
-P_{\mathrm{in,W}}
-=10^{-3}10^{P_{\mathrm{in,dBm}}/10},
+\mathrm{OBO}
+=P_{\max,\mathrm{dBm}}-P_{\mathrm{out,dBm}},
 ```
 
 ```math
-V_{\mathrm{in,RMS}}
-=\sqrt{R P_{\mathrm{in,W}}}.
+a=10^{-\mathrm{OBO}/20}.
 ```
 
-反向关系为
+目标输出RMS电压按端口阻抗换算：
 
 ```math
-P_{\mathrm{dBm}}
-=10\log_{10}\left(
-\frac{V_{\mathrm{RMS}}^2}
-{R\,10^{-3}}
-\right).
+V_{\mathrm{out,RMS}}
+=\sqrt{R\,10^{-3}10^{P_{\mathrm{out,dBm}}/10}}.
 ```
 
-当 `loadResistanceOhm=50` 且 `paInputPowerDbm=0` 时，输入为 1 mW，对应约 0.223607 V RMS。提高 dBm 会提高 PA 数值模型的 RMS 驱动，把 PA 推向更深的压缩区，通常会增加非线性失真和频谱再生；降低 dBm 则让 PA 更接近小信号线性区。
-
-`baselineOutputRms` 和 `baselineOutputPowerDbm` 是 PA 处理后的实测值，不是另一个输入配置。它们同时包含小信号增益、记忆效应和非线性压缩。若只在 PA 之后乘一个常数，只会改变线性输出标尺，不会改变 PA 内部非线性工作点。
+20 dBm相对25 dBm极限具有5 dB输出回退。提高目标输出功率会提高归一化驱动，把PA推向更深压缩；降低目标输出功率则增加回退量。最终常数功率标定只改变输出标尺，不改变PA内部非线性工作点。
 
 ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和PA输出。运行结束后，`resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 才计算每轮严格的数据子载波EVM、SNR和ACLR，并返回分析层选择的 `bestInputSignal`。若反馈链加入了噪声，应像示例一样把最佳输入重新送入PA，得到用于最终性能报告的干净输出。
 
@@ -818,6 +829,8 @@ x[n]\longrightarrow u^\star[n].
 ### 13.2 完整训练和独立验证示例
 
 ```python
+import numpy as np
+
 from inc.Analysis import Analysis
 from inc.DpdIlc import (
     FitGmpPredistorter,
@@ -1029,9 +1042,23 @@ wifiGenerator = WaveGenWifi(
     }
 )
 waveform = wifiGenerator.Generate()
-powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
+targetOutputPowerDbmPerChain = np.asarray(
+    (22.0, 21.0, 20.0, 19.0),
+    dtype=float,
+)
+powerCalibration = PowerCalibration(
+    loadResistanceOhm=50.0,
+    maximumOutputPowerDbm=25.0,
+)
+driveScalePerChain = np.asarray(
+    [
+        powerCalibration.OutputPowerToDriveScale(powerDbm)
+        for powerDbm in targetOutputPowerDbmPerChain
+    ],
+    dtype=float,
+)
 referenceSignal = (
-    powerCalibration.DbmToRms(-1.0) * waveform.samples
+    waveform.samples * driveScalePerChain[np.newaxis, :]
 )
 
 mimoPaModel = MimoPaModel(
@@ -1043,19 +1070,8 @@ mimoPaModel = MimoPaModel(
             {"modelName": "gmp"},
             {"modelName": "gmp"},
         ),
-        "outputPowerDbPerChain": (
-            0.0,
-            -1.0,
-            -2.0,
-            -3.0,
-        ),
-        "targetOutputPowerDbmPerChain": (
-            None,
-            None,
-            None,
-            None,
-        ),
         "loadResistanceOhm": 50.0,
+        "maximumOutputPowerDbm": 25.0,
     }
 )
 
@@ -1077,7 +1093,7 @@ resultAnalysis = Analysis(referenceSignal, waveform)
 mimoIlcAnalysis = resultAnalysis.AnalyzeMimoIlcHistory(
     tuple(chainResult.history for chainResult in mimoResult.chainResults)
 )
-selectedMimoOutput = mimoPaModel.Process(
+selectedMimoRawOutput = mimoPaModel.Process(
     mimoIlcAnalysis.bestInputSignal
 )
 
@@ -1090,17 +1106,34 @@ mimoPredistorter = FitMimoGmpPredistorter(
     ridgeFactor=1e-6,
 )
 deployedInput = mimoPredistorter.Process(referenceSignal)
-deployedOutput = mimoPaModel.Process(deployedInput)
+deployedRawOutput = mimoPaModel.Process(deployedInput)
 
-resultAnalysis.AnalyzeStages(
+calibratedReference = powerCalibration.ScaleSignalToOutputPowers(
+    referenceSignal,
+    targetOutputPowerDbmPerChain,
+)
+baselineOutput = powerCalibration.ScaleSignalToOutputPowers(
+    mimoPaModel.Process(referenceSignal),
+    targetOutputPowerDbmPerChain,
+)
+selectedMimoOutput = powerCalibration.ScaleSignalToOutputPowers(
+    selectedMimoRawOutput,
+    targetOutputPowerDbmPerChain,
+)
+deployedOutput = powerCalibration.ScaleSignalToOutputPowers(
+    deployedRawOutput,
+    targetOutputPowerDbmPerChain,
+)
+physicalAnalysis = Analysis(calibratedReference, waveform)
+physicalAnalysis.AnalyzeStages(
     {
-        "MIMO PA baseline": mimoPaModel.Process(referenceSignal),
+        "MIMO PA baseline": baselineOutput,
         "MIMO ILC": selectedMimoOutput,
         "MIMO GMP deployment": deployedOutput,
     }
 )
-resultAnalysis.Print()
-resultAnalysis.PrintMimo()
+physicalAnalysis.Print()
+physicalAnalysis.PrintMimo()
 ```
 
 ### 14.3 `MimoIlcResult`
@@ -1120,34 +1153,47 @@ secondChainHistory = mimoResult.chainResults[chainIndex].history
 
 ### 14.4 每路独立输出功率
 
-创建模型时可一次配置：
+推荐先配置每路目标输出功率和 25 dBm 额定极限，再由 `PowerCalibration` 分别计算每路驱动比例：
+
+```python
+powerCalibration = PowerCalibration(
+    loadResistanceOhm=50.0,
+    maximumOutputPowerDbm=25.0,
+)
+targetOutputPowerDbmPerChain = (22.0, 21.0, 20.0, 19.0)
+driveScalePerChain = tuple(
+    powerCalibration.OutputPowerToDriveScale(powerDbm)
+    for powerDbm in targetOutputPowerDbmPerChain
+)
+```
+
+若只进行 PA 系统级功率对齐，也可直接给 `MimoPaModel` 设置绝对输出功率：
 
 ```python
 mimoPaModel = MimoPaModel(
-    numTransmitChains=4,
-    outputPowerDbPerChain=(0.0, -1.5, -3.0, -4.5),
+    parameters={
+        "numTransmitChains": 4,
+        "targetOutputPowerDbmPerChain": (
+            22.0,
+            21.0,
+            20.0,
+            19.0,
+        ),
+        "maximumOutputPowerDbm": 25.0,
+    }
 )
 ```
 
-运行时可修改单路：
-
-```python
-mimoPaModel.SetOutputPowerDb(
-    chainIndex=2,
-    outputPowerDb=-4.0,
-)
-```
-
-也可以设置绝对输出功率 dBm：
+运行时可修改单路目标：
 
 ```python
 mimoPaModel.SetTargetOutputPowerDbm(
     chainIndex=3,
-    targetOutputPowerDbm=-3.0,
+    targetOutputPowerDbm=20.0,
 )
 ```
 
-学习 PA 非线性时更推荐使用固定 `outputPowerDbPerChain`，并把 `targetOutputPowerDbmPerChain` 设置为 `None`。绝对 dBm 模式会根据整包当前输出重新缩放，可能掩盖部分 AM-AM 幅度变化；它更适合完成 PA 处理后的系统级功率对齐。若必须在 ILC 过程中启用绝对 dBm 目标，应确保每路参考目标的功率与目标设置一致，并单独验证收敛。
+学习 PA 非线性时，推荐把 `targetOutputPowerDbmPerChain` 保持为 `None`：先用输出回退量得到固定驱动比例，ILC 在未归一化的原始 PA 映射上学习，结束后再用 `ScaleSignalToOutputPowers` 校准物理输出电平。直接在每次 PA 调用内部强制绝对 dBm 会根据整包当前输出反复缩放，可能掩盖部分 AM-AM 幅度变化；它更适合完成 PA 处理后的系统级功率对齐。
 
 ### 14.5 读取每路实际输出功率
 
@@ -1168,15 +1214,15 @@ print(outputPowerDbmPerChain)
 ```python
 import numpy as np
 
-inputPowerDbmValues = np.linspace(-9.0, 5.0, 7)
+outputPowerDbmValues = np.linspace(10.0, 25.0, 7)
 
 def RunPointIlc(
     pointReference,
-    inputPowerDbm,
+    outputPowerDbm,
 ):
     """Run point-specific ILC with a matching EVM objective."""
 
-    del inputPowerDbm
+    del outputPowerDbm
     pointAnalysis = Analysis(pointReference, waveform)
     pointResult = RunFrequencyDomainIlc(
         pointReference,
@@ -1191,16 +1237,16 @@ def RunPointIlc(
     return paModel.Process(pointIlcAnalysis.bestInputSignal)
 
 powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
-    inputPowerDbmValues=inputPowerDbmValues,
+    outputPowerDbmValues=outputPowerDbmValues,
     methodEvaluators={
         "PA baseline": (
-            lambda pointReference, inputPowerDbm: paModel.Process(
+            lambda pointReference, outputPowerDbm: paModel.Process(
                 pointReference
             )
         ),
         "Frequency-domain ILC": RunPointIlc,
         "Fixed GMP deployment": (
-            lambda pointReference, inputPowerDbm: paModel.Process(
+            lambda pointReference, outputPowerDbm: paModel.Process(
                 gmpPredistorter.Process(pointReference)
             )
         ),

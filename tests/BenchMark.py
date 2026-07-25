@@ -74,13 +74,14 @@ class BenchmarkConfig:
     sampleRateHz: Optional[float] = None
     oversampling: int = 4
     guardIntervalUs: float = 0.8
-    inputPowerDbm: float = 0.6145247908719321
+    outputPowerDbm: float = 20.0
+    maximumOutputPowerDbm: float = 25.0
     loadResistanceOhm: float = 50.0
     numIterations: int = 10
     paModelName: str = "wiener"
     seed: int = 101
-    powerStartDbm: float = -8.927900303521316
-    powerStopDbm: float = 5.051499783199061
+    powerStartDbm: float = 10.0
+    powerStopDbm: float = 25.0
     powerPointCount: int = 5
     generatePowerEvmCurve: bool = True
     outputDirectory: Path = Path("results/all_ilc_benchmark")
@@ -128,13 +129,20 @@ class BenchmarkConfig:
                 "bandwidth for ACLR analysis"
             )
         powerCalibration = PowerCalibration(
-            loadResistanceOhm=self.loadResistanceOhm
+            loadResistanceOhm=self.loadResistanceOhm,
+            maximumOutputPowerDbm=self.maximumOutputPowerDbm,
         )
-        powerCalibration.DbmToRms(self.inputPowerDbm)
+        powerCalibration.OutputPowerToDriveScale(
+            self.outputPowerDbm
+        )
         if self.numIterations < 1:
             raise ValueError("numIterations must be positive")
-        powerCalibration.DbmToRms(self.powerStartDbm)
-        powerCalibration.DbmToRms(self.powerStopDbm)
+        powerCalibration.OutputPowerToDriveScale(
+            self.powerStartDbm
+        )
+        powerCalibration.OutputPowerToDriveScale(
+            self.powerStopDbm
+        )
         if self.powerStopDbm <= self.powerStartDbm:
             raise ValueError("powerStopDbm must exceed powerStartDbm")
         if self.powerPointCount < 2:
@@ -345,7 +353,7 @@ def EvaluateDeployment(
 
 def RunIlcCurvePoint(
     referenceSignal: np.ndarray,
-    inputPowerDbm: float,
+    outputPowerDbm: float,
     paModel: Any,
     waveform: WifiWaveform,
     methodName: str,
@@ -361,7 +369,7 @@ def RunIlcCurvePoint(
 
     Args:
         referenceSignal: Ideal complex baseband samples used as the target or regression input.
-        inputPowerDbm: Current absolute PA input power in dBm.
+        outputPowerDbm: Current absolute PA output power in dBm.
         paModel: PA object exposing Process and SmallSignalGain operations.
         waveform: Wi-Fi metadata defining field locations, FFT sizes, and subcarriers.
         methodName: Human-readable algorithm or deployment-model label.
@@ -374,7 +382,7 @@ def RunIlcCurvePoint(
         result: Complex PA output learned specifically for this power point.
     """
 
-    del inputPowerDbm
+    del outputPowerDbm
     pointAnalysis = Analysis(referenceSignal, waveform)
     if methodName == "Frequency-domain ILC":
         methodResult = RunFrequencyDomainIlc(
@@ -448,11 +456,14 @@ def RunAllIlcBenchmark(
     trainingWaveform = trainingGenerator.Generate()
     validationWaveform = validationGenerator.Generate()
     powerCalibration = PowerCalibration(
-        loadResistanceOhm=config.loadResistanceOhm
+        loadResistanceOhm=config.loadResistanceOhm,
+        maximumOutputPowerDbm=config.maximumOutputPowerDbm,
     )
-    inputDriveRms = powerCalibration.DbmToRms(config.inputPowerDbm)
-    trainingSignal = inputDriveRms * trainingWaveform.samples
-    validationSignal = inputDriveRms * validationWaveform.samples
+    driveScale = powerCalibration.OutputPowerToDriveScale(
+        config.outputPowerDbm
+    )
+    trainingSignal = driveScale * trainingWaveform.samples
+    validationSignal = driveScale * validationWaveform.samples
     paParameters = {"modelName": config.paModelName}
     paModel = PaModel(parameters=paParameters)
     trainingAnalysis = Analysis(
@@ -977,28 +988,32 @@ def RunAllIlcBenchmark(
         "numDataSymbols": config.numDataSymbols,
         "oversampling": trainingWaveform.oversampling,
         "guardIntervalUs": config.guardIntervalUs,
-        "inputPowerDbm": config.inputPowerDbm,
-        "inputDriveRmsVoltage": inputDriveRms,
+        "outputPowerDbm": config.outputPowerDbm,
+        "targetOutputRmsVoltage": powerCalibration.DbmToRms(
+            config.outputPowerDbm
+        ),
+        "normalizedDriveScale": driveScale,
+        "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
         "loadResistanceOhm": config.loadResistanceOhm,
         "numIterations": config.numIterations,
         "paModel": config.paModelName,
         "trainingSeed": config.seed,
         "validationSeed": config.seed + 97,
-        "powerStartDbm": config.powerStartDbm,
-        "powerStopDbm": config.powerStopDbm,
+        "outputPowerStartDbm": config.powerStartDbm,
+        "outputPowerStopDbm": config.powerStopDbm,
         "powerPointCount": config.powerPointCount,
         "generatePowerEvmCurve": config.generatePowerEvmCurve,
     }
     SaveBenchmarkResults(rows, outputDirectory, metadata)
     powerCurvePaths = None
     if config.generatePowerEvmCurve:
-        inputPowerDbmValues = np.linspace(
+        outputPowerDbmValues = np.linspace(
             config.powerStartDbm,
             config.powerStopDbm,
             config.powerPointCount,
         )
         powerEvmCurve = trainingAnalysis.AnalyzePowerEvmCurve(
-            inputPowerDbmValues, powerEvaluators
+            outputPowerDbmValues, powerEvaluators
         )
         powerDataPaths = trainingAnalysis.SavePowerEvmCurveData(
             outputDirectory,
@@ -1150,14 +1165,21 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
         default=0.8,
     )
     argumentParser.add_argument(
-        "--input-power-dbm",
-        dest="inputPowerDbm",
+        "--output-power-dbm",
+        dest="outputPowerDbm",
         type=float,
-        default=0.6145247908719321,
+        default=20.0,
         help=(
-            "Absolute nominal PA input power in dBm "
-            "(default: 0.614525 dBm)"
+            "Absolute nominal PA output power per chain "
+            "(default: 20 dBm)"
         ),
+    )
+    argumentParser.add_argument(
+        "--maximum-output-power-dbm",
+        dest="maximumOutputPowerDbm",
+        type=float,
+        default=25.0,
+        help="Rated per-PA output-power limit (default: 25 dBm)",
     )
     argumentParser.add_argument(
         "--load-resistance-ohm",
@@ -1183,15 +1205,15 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
         "--power-start-dbm",
         dest="powerStartDbm",
         type=float,
-        default=-8.927900303521316,
-        help="First absolute PA input power in the sweep, in dBm",
+        default=10.0,
+        help="First absolute PA output power in the sweep, in dBm",
     )
     argumentParser.add_argument(
         "--power-stop-dbm",
         dest="powerStopDbm",
         type=float,
-        default=5.051499783199061,
-        help="Last absolute PA input power in the sweep, in dBm",
+        default=25.0,
+        help="Last absolute PA output power in the sweep, in dBm",
     )
     argumentParser.add_argument(
         "--power-points",
@@ -1220,7 +1242,8 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
         sampleRateHz=arguments.sampleRateHz,
         oversampling=arguments.oversampling,
         guardIntervalUs=arguments.guardIntervalUs,
-        inputPowerDbm=arguments.inputPowerDbm,
+        outputPowerDbm=arguments.outputPowerDbm,
+        maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
         loadResistanceOhm=arguments.loadResistanceOhm,
         numIterations=arguments.numIterations,
         paModelName=arguments.paModelName,

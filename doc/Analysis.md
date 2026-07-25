@@ -1201,65 +1201,98 @@ DPD/ILC 在一个标称功率点表现优秀，不代表在低功率和高功率
 - 中等功率：开始压缩，DPD 能显著改善；
 - 高功率：接近不可逆饱和，任何预失真都难以完全恢复。
 
-所以需要扫描绝对输入功率 dBm，观察完整曲线。
+所以需要扫描绝对输出功率dBm，观察从输出回退区到额定极限的完整曲线。
 
 ### 8.2 横坐标推导
 
-Wi-Fi 波形已归一化为单位 RMS。用户给出第 $i$ 个 PA 端口输入功率 $p_i$，单位 dBm。先换算为瓦特：
+Wi-Fi波形已归一化。用户给出第 $i$ 个每路PA目标输出功率 $p_i$，额定极限为 $p_{\max}$。默认
+
+```math
+p_{\max}=25\ \mathrm{dBm}.
+```
+
+输出回退量为
+
+```math
+\mathrm{OBO}_i=p_{\max}-p_i.
+```
+
+归一化PA驱动比例取为
+
+```math
+a_i=10^{-\mathrm{OBO}_i/20}
+=10^{(p_i-p_{\max})/20}.
+```
+
+所以进入归一化PA模型的参考为
+
+```math
+x_i[n]=a_i x_{\mathrm{unit}}[n].
+```
+
+当 $p_i=p_{\max}$ 时，$a_i=1$；当输出回退5 dB时，$a_i\approx0.5623$。这个比例控制PA模型进入压缩区的深度，而不是把输出dBm误当成输入端电压。
+
+PA或DPD方法先产生归一化输出
+
+```math
+z_{i,m}[n]=\mathcal{F}_m(x_i[n]).
+```
+
+目标输出功率换算成每路复包络RMS电压：
 
 ```math
 P_i=10^{-3}10^{p_i/10}.
 ```
 
-对于纯电阻端口 $R$，所需复包络 RMS 电压为
-
 ```math
-d_i=\sqrt{R P_i}.
+V_i=\sqrt{R P_i}.
 ```
 
-因此进入 PA 模型的点参考为
+最后对每种方法施加一个常数输出标定增益：
 
 ```math
-x_i[n]=d_i x_{\mathrm{unit}}[n]
-=\sqrt{R\,10^{-3}10^{p_i/10}}\ x_{\mathrm{unit}}[n].
+g_{i,m}
+=\frac{V_i}
+{\sqrt{\frac{1}{N}\sum_n|z_{i,m}[n]|^2}},
 ```
-
-工程约定复包络 RMS 幅度等于端口 RF RMS 电压。反向换算为
 
 ```math
-p_i=10\log_{10}\left(\frac{d_i^2}{R\,10^{-3}}\right).
+y_{i,m}[n]=g_{i,m}z_{i,m}[n].
 ```
 
-`inputPowerDbmValues` 必须为有限数且严格递增；dBm 可以为负。`loadResistanceOhm` 必须为正数，默认 50 Ω。在 50 Ω 下，0 dBm 对应约 0.223607 V RMS。`driveRmsValues` 是分析器保存的内部换算结果，不再是用户配置的功率单位。
+因此每条曲线在横轴位置 $p_i$ 上都具有相同的实际平均输出功率。常数 $g_{i,m}$ 只改变整体幅度，不改变EVM、SNR残差比或ACLR功率比。
+
+`outputPowerDbmValues` 必须有限且严格递增，每一点都不得超过 `maximumOutputPowerDbm`。结果对象同时保存 `driveScaleValues` 和 `targetOutputRmsValues`，分别用于审计归一化压缩工作点和50 Ω物理输出标定。
 
 ### 8.3 公平比较原则
 
-对每个功率点和每种方法，分析器都使用同一个点参考：
+对每个输出功率点和每种方法，分析器都使用同一个输出回退驱动：
 
 ```math
 \mathbf x_i=
-\sqrt{R\,10^{-3}10^{p_i/10}}\ \mathbf x_{\mathrm{unit}}.
+10^{(p_i-p_{\max})/20}\mathbf x_{\mathrm{unit}}.
 ```
 
-所有方法的输出 $\mathbf y_{i,m}$ 都调用相同的 `CalculateEvm`。这样曲线差异来自方法本身，而不是输入帧、随机种子或指标定义不同。
+所有输出都标定到相同的 $p_i$ 后调用相同的 `CalculateEvm`。这样曲线差异来自补偿方法本身，而不是输出功率、输入帧、随机种子或指标定义不同。
 
 ```mermaid
 flowchart LR
-    P["绝对输入功率 p1,p2,... dBm"] --> K["PowerCalibration：按端口电阻换算 RMS 电压"]
-    A["单位 RMS Wi-Fi 波形"] --> B["乘 RMS 电压 d1,d2,..."]
+    P["目标输出功率 p1,p2,... dBm"] --> K["相对25 dBm极限计算输出回退"]
+    A["归一化Wi-Fi波形"] --> B["乘归一化驱动比例 a1,a2,..."]
     K --> B
     B --> C1["Baseline PA"]
     B --> C2["Frequency ILC"]
     B --> C3["Time-domain ILC"]
     B --> C4["Fitted/Deployed DPD"]
-    C1 --> D["统一 Analysis.CalculateEvm"]
-    C2 --> D
-    C3 --> D
-    C4 --> D
+    C1 --> G["每路输出标定到目标dBm"]
+    C2 --> G
+    C3 --> G
+    C4 --> G
+    G --> D["统一 Analysis.CalculateEvm"]
     D --> E["同图功率–EVM 曲线"]
 ```
 
-**图 7 说明**：每个方法必须看到完全相同的驱动点。学习型 ILC 可以在每个点重新迭代；部署型 DPD 可以固定标称点系数并跨功率测试。两者回答的问题不同，应在图例中清楚区分。
+**图 7 说明**：每个方法看到相同的归一化输出回退驱动，并在指标计算前达到相同的实际输出dBm。学习型ILC可以在每个点重新迭代；部署型DPD可以固定标称点系数并跨功率测试。
 
 ### 8.4 曲线怎样阅读
 
@@ -1271,7 +1304,7 @@ EVM(dB)
  | Baseline              /
  |        ______________/
  | DPD   _____________/
- |______/________________________________> PA 输入功率(dBm)
+ |______/________________________________> 每路PA输出功率(dBm)
        低功率       补偿有效区       饱和区
 ```
 
@@ -1418,8 +1451,9 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 
 `PowerEvmCurve` 保存：
 
-- `inputPowerDbmValues`：用户指定的绝对输入功率 dBm；
-- `driveRmsValues`：按 `loadResistanceOhm` 换算的复包络 RMS 电压，便于审计仿真工作点；
+- `outputPowerDbmValues`：用户指定的每路PA绝对输出功率；
+- `driveScaleValues`：相对额定极限计算的归一化驱动比例；
+- `targetOutputRmsValues`：按端口阻抗换算的目标输出RMS电压；
 - `evmDbByMethod`：每种方法的 EVM dB 数组；
 - `evmPercentByMethod`：每种方法的 EVM 百分比数组。
 
@@ -1547,12 +1581,12 @@ if wifiWaveform.numTransmitAntennas > 1:
 功率–EVM 扫描的评估器接口为：
 
 ```python
-def EvaluateMethod(pointReference, inputPowerDbm):
-    del inputPowerDbm
+def EvaluateMethod(pointReference, outputPowerDbm):
+    del outputPowerDbm
     return paModel.Process(pointReference)
 
 powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
-    inputPowerDbmValues=(-9.0, -6.0, -3.0, 0.0, 3.0),
+    outputPowerDbmValues=(10.0, 15.0, 20.0, 23.0, 25.0),
     methodEvaluators={"Baseline": EvaluateMethod},
 )
 resultAnalysis.SavePowerEvmCurveData(outputDirectory, powerEvmCurve)

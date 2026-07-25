@@ -102,7 +102,7 @@ R\cdot10^{-3}\cdot10^{P_{\mathrm{dBm}}/10}
 - `0.24 V RMS` 对应约 `0.6145 dBm`；
 - `-10 dBm` 对应约 `0.070711 V RMS`。
 
-这个阻抗标定非常重要。若只把旧的归一化RMS数值改写成“dBm”标签而不引入 $R$，得到的不是绝对功率。现在主程序、Benchmark、功率-EVM横轴和MIMO绝对输出目标都通过同一个 `PowerCalibration` 换算。
+这个阻抗标定非常重要。若只把旧的归一化RMS数值改写成“dBm”标签而不引入 $R$，得到的不是绝对功率。当前主程序和功率-EVM横轴使用每路PA输出功率：默认工作点20 dBm、默认额定极限25 dBm。
 
 ---
 
@@ -605,7 +605,7 @@ flowchart LR
     column --> stack["按原链顺序堆叠 Z"]
 ```
 
-**图 7 说明**：输入 dB 改变的是非线性 PA 的工作点，因此也会改变压缩和频谱再生；输出 dB 是 PA 后的线性校准，只改变幅度。绝对dBm目标位于最后一级，程序先根据 `loadResistanceOhm` 换算目标RMS，再让最终输出严格满足指定功率。
+**图 7 说明**：输入dB改变非线性PA工作点；输出dB是PA后的相对线性校准。绝对输出dBm目标位于最后一级，默认不得超过 `maximumOutputPowerDbm=25`。主程序另外用目标输出相对25 dBm极限的回退量确定归一化驱动，因此20 dBm工作点对应5 dB输出回退。
 
 若设绝对目标 $r_{\mathrm{target},m}$，代码先算未经绝对校准的
 
@@ -619,7 +619,7 @@ r_m=\sqrt{\frac{1}{N}\sum_n|z_m[n]|^2},
 y_m[n]=\frac{r_{\mathrm{target},m}}{r_m}z_m[n].
 ```
 
-这适合模拟各 RF 链功率校准或比较相同绝对输出功率 dBm 下的失真。它本质上是“对整段记录求得的理想增益控制”；若研究真实动态 AGC、功率环路瞬态或 DPD 的幅度外推，应关闭绝对目标，仅使用固定 dB 标尺并另建闭环模型。
+这适合模拟各RF链功率校准或比较相同绝对输出功率dBm下的失真。常数标定不改变EVM与ACLR；PA压缩深度必须由标定前的输出回退驱动决定。
 
 Python接口优先使用 `targetOutputPowerDbmPerChain` 和 `SetTargetOutputPowerDbm`。`targetOutputRmsPerChain` 与 `SetTargetOutputRms` 仅保留为旧接口；同一条链不能同时设置RMS和dBm目标。`GetOutputPowerDbmPerChain` 返回最近一次完整处理后按相同端口阻抗换算的实际功率。
 
@@ -687,8 +687,11 @@ classDiagram
         +SmallSignalGain()
     }
     class PowerCalibration {
-        +DbmToRms(inputPowerDbm)
+        +DbmToRms(powerDbm)
         +RmsToDbm(signalRms)
+        +OutputPowerToDriveScale(outputPowerDbm)
+        +ScaleSignalToOutputPower(signal, outputPowerDbm)
+        +ScaleSignalToOutputPowers(signal, powers)
         +GetParameters()
         +UpdateParameters()
     }
@@ -770,8 +773,8 @@ mimoPaModel = MimoPaModel(
         {"modelName": "gmp"},
         {"modelName": "gmp"},
     ),
-    outputPowerDbPerChain=(0.0, -1.0, -2.0, -3.0),
-    targetOutputPowerDbmPerChain=(None, None, 2.0, 0.0),
+    targetOutputPowerDbmPerChain=(22.0, 21.0, 20.0, 19.0),
+    maximumOutputPowerDbm=25.0,
     loadResistanceOhm=50.0,
 )
 mimoOutput = mimoPaModel.Process(mimoInput)
@@ -780,7 +783,7 @@ print(mimoPaModel.GetOutputPowerDbmPerChain())
 # Change only the second physical PA after construction.
 mimoPaModel.SetTargetOutputPowerDbm(
     chainIndex=1,
-    targetOutputPowerDbm=-3.0,
+    targetOutputPowerDbm=21.0,
 )
 ```
 

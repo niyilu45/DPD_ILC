@@ -44,7 +44,7 @@ flowchart TB
 本文“仿真结果”来自以下可重复命令：
 
 ```powershell
-python tests/BenchMark.py --format EHT --bandwidth 20 --sample-rate-hz 60000000 --mcs 7 --symbols 4 --guard-interval 0.8 --input-power-dbm 3.113299523 --load-resistance-ohm 50 --iterations 6 --pa wiener --seed 101 --power-start-dbm -2.907300390 --power-stop-dbm 5.051499783 --power-points 4 --output-dir results/benchmark_reference
+python tests/BenchMark.py --format EHT --bandwidth 20 --sample-rate-hz 60000000 --mcs 7 --symbols 4 --guard-interval 0.8 --output-power-dbm 20 --maximum-output-power-dbm 25 --load-resistance-ohm 50 --iterations 6 --pa wiener --seed 101 --power-start-dbm 10 --power-stop-dbm 25 --power-points 4 --output-dir results/benchmark_reference_output
 ```
 
 | 参数 | 参考值 | 作用 |
@@ -55,13 +55,14 @@ python tests/BenchMark.py --format EHT --bandwidth 20 --sample-rate-hz 60000000 
 | 数据符号数 | 4 | 控制每个包的数据长度 |
 | 采样率 | 60 MHz | 20 MHz信道的3倍，保留上下邻道并满足ACLR计算要求 |
 | GI | 0.8 µs | EHT 保护间隔 |
-| 标称输入功率 | 3.1133 dBm | 50 Ω 下等效于 0.32 V RMS，把 PA 推入可观察的非线性工作区 |
-| 端口电阻 | 50 Ω | 用于 dBm 与 PA 复包络 RMS 电压的物理换算 |
+| 标称每路输出功率 | 20 dBm | 常见台架工作点，额定极限以下回退 5 dB |
+| 每路极限输出功率 | 25 dBm | 定义归一化 PA 的额定饱和驱动点，不允许扫描超过该值 |
+| 端口电阻 | 50 Ω | 用于目标输出 dBm 与复包络 RMS 电压的物理换算 |
 | ILC 记录轮数 | 6 | 第 1 轮是更新前基线，随后执行 5 次有效更新 |
 | PA | Wiener | 线性记忆滤波器后接 AM-AM/AM-PM 非线性 |
 | 训练种子 | 101 | 固定训练帧 |
 | 验证种子 | 198 | 与训练帧独立，数值为训练种子加 97 |
-| 功率扫描 | −2.9073 至 5.0515 dBm | 50 Ω 下等效于 0.16 至 0.40 V RMS，观察从回退区到较强压缩区的变化 |
+| 功率扫描 | 10 至 25 dBm/路 | 覆盖 15 dB 输出回退区直至额定极限输出点 |
 | 功率点数 | 4 | 使用等 dBm 间隔 |
 
 结果目录包含：
@@ -101,7 +102,7 @@ EVM dB 定义为：
 
 ### 5.1 场景构造
 
-训练帧按 `inputPowerDbm=3.113299523` 和 `loadResistanceOhm=50` 换算为 0.32 V RMS 后直接进入 Wiener PA，不使用 DPD 或 ILC。该输出是标称波形更新律、峰值约束和噪声反馈场景的物理基准。
+训练帧使用 `outputPowerDbm=20` 和 `maximumOutputPowerDbm=25`。输出回退量为 5 dB，对应归一化驱动比例约 0.5623。波形直接进入 Wiener PA，不使用 DPD 或 ILC；PA 原始输出随后用每路常数增益校准到 20 dBm。该输出是标称波形更新律、峰值约束和噪声反馈场景的物理基准。
 
 ### 5.2 控制变量
 
@@ -118,15 +119,15 @@ EVM dB 定义为：
 
 | baseline | 物理差异 | SNR (dB) | EVM (%) | Worst ACLR (dB) | 对比用途 |
 |---|---|---:|---:|---:|---|
-| PA baseline | 标称训练帧和基础PA | 34.120 | 1.571 | 28.377 | B类的未补偿参考 |
-| Peak-constrained baseline | 与PA baseline物理输出相同，单独归入峰值场景 | 34.120 | 1.571 | 28.377 | C1按场景筛选时的未补偿参考 |
-| Noisy-feedback baseline | 最终输出与PA baseline相同，学习观测允许有噪声 | 34.120 | 1.571 | 28.377 | C2的未学习参考 |
-| IQ-imbalance baseline | 基础PA外增加共轭镜像支路 | 26.298 | 4.714 | 28.361 | D类的未补偿参考 |
-| Validation baseline | 独立验证帧直接通过基础PA | 33.706 | 1.695 | 34.919 | E类的泛化参考 |
+| PA baseline | 标称训练帧和基础PA | 20.788 | 7.292 | 27.333 | B类的未补偿参考 |
+| Peak-constrained baseline | 与PA baseline物理输出相同，单独归入峰值场景 | 20.788 | 7.292 | 27.333 | C1按场景筛选时的未补偿参考 |
+| Noisy-feedback baseline | 最终输出与PA baseline相同，学习观测允许有噪声 | 20.788 | 7.292 | 27.333 | C2的未学习参考 |
+| IQ-imbalance baseline | 基础PA外增加共轭镜像支路 | 19.864 | 8.488 | 27.428 | D类的未补偿参考 |
+| Validation baseline | 独立验证帧直接通过基础PA | 20.293 | 7.758 | 26.481 | E类的泛化参考 |
 
 ### 5.5 对比结论
 
-PA baseline的1.571% EVM足以观察迭代改善；28.377 dB ACLR说明当前工作点已经存在带外频谱再生。IQ baseline的EVM明显更差，证明共轭镜像损伤已生效。Validation baseline与训练baseline略有差异，反映两个独立QAM数据包具有不同的幅度统计。
+PA baseline 的 7.292% EVM 足以观察迭代改善；27.333 dB ACLR 说明 20 dBm 工作点已经存在明显带外频谱再生。IQ baseline 的 EVM 进一步恶化，证明共轭镜像损伤已生效。Validation baseline 与训练 baseline 略有差异，反映两个独立 QAM 数据包具有不同的幅度统计。
 
 这五行不能作为算法排行榜，因为它们不是全部使用相同输入和plant；它们的价值是为后续每一种方法提供同条件分母。Peak-constrained baseline和Noisy-feedback baseline与PA baseline相同也是有意设计：前者让CSV按峰值场景筛选后仍有完整对照，后者用于隔离学习反馈噪声；最终质量都在干净PA输出上评价。
 
@@ -166,13 +167,13 @@ PA baseline的1.571% EVM足以观察迭代改善；28.377 dB ACLR说明当前工
 
 | 方法 | SNR (dB) | EVM (%) | EVM改善 (dB) | Worst ACLR (dB) |
 |---|---:|---:|---:|---:|
-| PA baseline | 34.120 | 1.571 | 0.000 | 28.377 |
-| Scalar P ILC | 38.788 | 0.913 | 4.715 | 28.506 |
-| Complex-gain ILC | 41.005 | 0.705 | 6.952 | 28.532 |
-| FIR ILC | 41.503 | 0.704 | 6.976 | 28.562 |
-| Frequency-domain ILC | 39.494 | 0.700 | 7.013 | 28.498 |
-| Directional Gauss-Newton ILC | 67.617 | 0.039 | 32.026 | 28.583 |
-| Parameter-domain MP ILC | 43.501 | 0.523 | 9.556 | 28.547 |
+| PA baseline | 20.788 | 7.292 | 0.000 | 27.333 |
+| Scalar P ILC | 21.797 | 6.432 | 1.089 | 27.870 |
+| Complex-gain ILC | 22.089 | 6.192 | 1.420 | 28.009 |
+| FIR ILC | 22.167 | 6.300 | 1.270 | 28.293 |
+| Frequency-domain ILC | 21.709 | 5.996 | 1.699 | 27.171 |
+| Directional Gauss-Newton ILC | 21.789 | 6.325 | 1.236 | 27.841 |
+| Parameter-domain MP ILC | 22.305 | 5.970 | 1.737 | 28.033 |
 
 ### 6.5 逐轮结果示例
 
@@ -180,27 +181,27 @@ PA baseline的1.571% EVM足以观察迭代改善；28.377 dB ACLR说明当前工
 
 | 轮次 | Raw MSE | LC-MSE | EVM-MSE | EVM (dB) |
 |---:|---:|---:|---:|---:|
-| 1 | 2.0951e-4 | 7.1728e-5 | 2.4669e-4 | -36.08 |
-| 2 | 1.5371e-4 | 5.4550e-5 | 1.7892e-4 | -37.47 |
-| 3 | 1.1336e-4 | 4.1966e-5 | 1.2962e-4 | -38.87 |
-| 4 | 8.4169e-5 | 3.2744e-5 | 9.3829e-5 | -40.28 |
-| 5 | 6.3033e-5 | 2.5982e-5 | 6.7872e-5 | -41.68 |
-| 6 | 4.7720e-5 | 2.1020e-5 | 4.9069e-5 | -43.09 |
+| 1 | 4.6840e-3 | 3.8139e-3 | 5.3169e-3 | -22.74 |
+| 2 | 4.3351e-3 | 3.6180e-3 | 4.8250e-3 | -23.17 |
+| 3 | 4.0768e-3 | 3.4758e-3 | 4.4251e-3 | -23.54 |
+| 4 | 3.8862e-3 | 3.3742e-3 | 4.0965e-3 | -23.88 |
+| 5 | 3.7465e-3 | 3.3036e-3 | 3.8238e-3 | -24.18 |
+| 6 | 3.6455e-3 | 3.2569e-3 | 3.5954e-3 | -24.44 |
 
 ### 6.6 结果解释
 
-本次参考配置中所有标称方法都改善了 EVM。Directional Gauss-Newton 的优势很大，但这依赖确定性仿真、精确重复波形和当前局部方向的良好条件，不代表存在测量噪声和硬件漂移时仍能保持相同差距。ACLR只改善约0.1至0.2 dB，因为这些更新的主要选择目标是带内EVM，不能把EVM收益直接解释为等量ACLR收益。
+本次参考配置中所有标称方法都改善了 EVM。Directional Gauss-Newton 在第 2 轮达到最佳点，后续由于 20 dBm 工作点的强非线性和峰值投影出现反弹，因此最终汇总采用最佳轮而不是第 6 轮。各方法的 ACLR 变化方向并不完全一致，因为更新的主要选择目标是带内 EVM，不能把 EVM 收益直接解释为等量 ACLR 收益。
 
 ### 6.7 同场景方法优缺点对比
 
 | 方法 | 主要优势 | 主要缺点 | 本场景证据 | 更适合的条件 |
 |---|---|---|---|---|
-| Scalar P ILC | 结构最简单、每轮成本低 | 不能显式补偿公共相位和频率选择性记忆 | EVM降至0.913%，六种方法中改善最小 | PA近似无记忆、需要快速初始验证 |
-| Complex-gain ILC | 可同时处理平均增益与公共相位 | 仍不能描述频率选择性逆 | EVM降至0.705%，明显优于Scalar P | PA记忆较弱但存在公共相位 |
-| FIR ILC | 能补偿线性记忆，卷积结构直观 | 滤波器估计和抽头数影响稳定性 | EVM为0.704%，与复增益和频域法接近 | 线性记忆占主导且需要时域实现 |
-| Frequency-domain ILC | 每个频点正则化求逆，便于带宽投影 | 需要频响探测，低激励频点需门限保护 | EVM为0.700%，改善7.013 dB | 重复波形、频率选择性记忆明显 |
-| Directional Gauss-Newton | 局部方向准确时收敛非常快 | 每轮需要额外PA调用，对噪声和漂移敏感 | EVM为0.039%，但这是确定性无噪仿真 | 高重复性台架、反馈质量高 |
-| Parameter-domain MP ILC | 学完即得到有限维可部署参数 | 性能受阶数和记忆深度限制 | EVM为0.523%，优于前三种低成本更新 | 需要直接生成可部署多项式系数 |
+| Scalar P ILC | 结构最简单、每轮成本低 | 不能显式补偿公共相位和频率选择性记忆 | EVM降至6.432%，六种方法中改善较小 | PA近似无记忆、需要快速初始验证 |
+| Complex-gain ILC | 可同时处理平均增益与公共相位 | 仍不能描述频率选择性逆 | EVM降至6.192%，优于Scalar P | PA记忆较弱但存在公共相位 |
+| FIR ILC | 能补偿线性记忆，卷积结构直观 | 滤波器估计和抽头数影响稳定性 | EVM为6.300%，ACLR为本组最佳 | 线性记忆占主导且需要时域实现 |
+| Frequency-domain ILC | 每个频点正则化求逆，便于带宽投影 | 需要频响探测，低激励频点需门限保护 | EVM为5.996%，但ACLR略低于baseline | 重复波形、频率选择性记忆明显 |
+| Directional Gauss-Newton | 局部方向准确时收敛非常快 | 每轮需要额外PA调用，对强非线性和峰值投影敏感 | 第2轮最好，后期反弹，最佳EVM为6.325% | 高重复性台架、反馈质量高 |
+| Parameter-domain MP ILC | 学完即得到有限维可部署参数 | 性能受阶数和记忆深度限制 | EVM为5.970%，本组最低 | 需要直接生成可部署多项式系数 |
 
 这张表把“最终线性化质量”和“工程代价”分开。Directional Gauss-Newton在固定轮数下最好，不等于在相同PA调用次数、相同测量时间或有噪环境中仍然最好。
 
@@ -224,13 +225,13 @@ PA baseline的1.571% EVM足以观察迭代改善；28.377 dB ACLR说明当前工
 
 | 方法 | EVM (%) | EVM改善 (dB) | Worst ACLR (dB) |
 |---|---:|---:|---:|
-| Peak-constrained baseline | 1.571 | 0.000 | 28.377 |
-| Unconstrained frequency-domain ILC | 0.700 | 7.013 | 28.498 |
-| Constrained CFR-ILC | 0.833 | 5.510 | 28.487 |
+| Peak-constrained baseline | 7.292 | 0.000 | 27.333 |
+| Unconstrained frequency-domain ILC | 5.996 | 1.699 | 27.171 |
+| Constrained CFR-ILC | 6.189 | 1.424 | 27.257 |
 
 #### 结论
 
-峰值约束下仍获得5.510 dB的EVM改善，但弱于无约束频域ILC的7.013 dB，符合“可实现性换取部分线性化自由度”的预期。
+峰值约束下仍获得 1.424 dB 的 EVM 改善，但弱于无约束频域 ILC 的 1.699 dB，符合“可实现性换取部分线性化自由度”的预期。
 
 ### 7.2 C2：噪声反馈
 
@@ -255,19 +256,19 @@ PA baseline的1.571% EVM足以观察迭代改善；28.377 dB ACLR说明当前工
 
 | 方法 | SNR (dB) | EVM (%) | EVM改善 (dB) | Worst ACLR (dB) |
 |---|---:|---:|---:|---:|
-| Noisy-feedback baseline | 34.120 | 1.571 | 0.000 | 28.377 |
-| Naive noisy-feedback ILC | 37.938 | 0.896 | 4.872 | 28.474 |
-| Noise-aware ILC | 37.772 | 0.941 | 4.450 | 28.483 |
+| Noisy-feedback baseline | 20.788 | 7.292 | 0.000 | 27.333 |
+| Naive noisy-feedback ILC | 21.691 | 6.009 | 1.681 | 27.143 |
+| Noise-aware ILC | 21.523 | 6.339 | 1.216 | 27.301 |
 
 #### 结论
 
-两种方法都明显优于未学习baseline。当前单种子参考运行中，Naive方法的干净输出EVM为0.896%，略优于Noise-aware的0.941%；但Naive的含噪逐轮EVM在第6轮相对第5轮回退，而Noise-aware六轮连续改善。由此得到的正确结论是：平均与较强正则化改善了本次迭代轨迹的稳定性，但没有保证每一个随机种子下的最低最终EVM。要证明统计鲁棒性，需要多种子比较均值、方差和发散率。
+两种方法都优于未学习 baseline。当前单种子参考运行中，Naive 方法的干净输出 EVM 为 6.009%，优于 Noise-aware 的 6.339%；两者的含噪逐轮 EVM 在 6 轮内都持续下降。由此得到的正确结论是：平均与较强正则化降低反馈波动，但更保守的更新也可能限制固定轮数内的改善量。要证明统计鲁棒性，需要多种子比较均值、方差和发散率。
 
 | 方法 | 优点 | 缺点 | 当前结果体现 |
 |---|---|---|---|
-| Baseline | 无学习成本，不会学习噪声 | 保留全部PA失真 | EVM最高，为1.571% |
-| Naive noisy-feedback ILC | 更新更积极、采集次数少 | 单次观测方差大，后期可能回退 | 最终EVM最低，但第6轮含噪EVM变差 |
-| Noise-aware ILC | 平均降低噪声方差，轨迹更平滑 | 每轮采集4次，更新保守，成本更高 | 六轮单调改善，但最终EVM略高 |
+| Baseline | 无学习成本，不会学习噪声 | 保留全部PA失真 | EVM最高，为7.292% |
+| Naive noisy-feedback ILC | 更新更积极、采集次数少 | 单次观测方差大，后期可能回退 | 本次最终EVM最低，为6.009% |
+| Noise-aware ILC | 平均降低噪声方差，轨迹更平滑 | 每轮采集4次，更新保守，成本更高 | 六轮单调改善，最终EVM为6.339% |
 
 ---
 
@@ -293,19 +294,19 @@ PA baseline的1.571% EVM足以观察迭代改善；28.377 dB ACLR说明当前工
 
 | 方法 | SNR (dB) | EVM (%) | EVM改善 (dB) | Worst ACLR (dB) |
 |---|---:|---:|---:|---:|
-| IQ-imbalance baseline | 26.298 | 4.714 | 0.000 | 28.361 |
-| Frequency-domain ILC on IQ plant | 32.769 | 2.165 | 6.759 | 28.483 |
-| Augmented IQ ILC | 34.548 | 1.822 | 8.255 | 28.540 |
+| IQ-imbalance baseline | 19.864 | 8.488 | 0.000 | 27.428 |
+| Frequency-domain ILC on IQ plant | 21.337 | 6.435 | 2.405 | 27.189 |
+| Augmented IQ ILC | 21.928 | 6.364 | 2.501 | 28.067 |
 
 ### 8.5 结果解释
 
-IQ失衡使EVM从标称baseline的1.571%恶化到4.714%。普通频域ILC虽然没有显式共轭支路，仍可利用逐样点误差把EVM降低到2.165%，说明它能部分抵消综合误差；增广ILC进一步降低到1.822%，相对普通方法多获得1.496 dB EVM改善，证明显式镜像支路与plant结构更匹配。
+IQ 失衡使 EVM 从标称 baseline 的 7.292% 恶化到 8.488%。普通频域 ILC 虽然没有显式共轭支路，仍可利用逐样点误差把 EVM 降低到 6.435%，说明它能部分抵消综合误差；增广 ILC 进一步降低到 6.364%，相对普通方法多获得约 0.096 dB EVM 改善，同时 Worst ACLR 提高约 0.878 dB，证明显式镜像支路在当前强非线性工作点仍有收益，但优势已不如低功率旧场景显著。
 
 | 方法 | 优点 | 缺点 | 当前结果体现 |
 |---|---|---|---|
-| IQ baseline | 清楚量化未补偿镜像损伤 | 不提供线性化能力 | EVM为4.714% |
-| 普通频域ILC | 无需IQ专用模型，也能部分校正 | 不能显式区分直接与共轭支路 | EVM为2.165%，仍有结构性残差 |
-| 增广IQ ILC | 同时利用误差和误差共轭，结构匹配 | 参数更多，增广矩阵可能病态 | EVM最低，为1.822% |
+| IQ baseline | 清楚量化未补偿镜像损伤 | 不提供线性化能力 | EVM为8.488% |
+| 普通频域ILC | 无需IQ专用模型，也能部分校正 | 不能显式区分直接与共轭支路 | EVM为6.435%，仍有结构性残差 |
+| 增广IQ ILC | 同时利用误差和误差共轭，结构匹配 | 参数更多，增广矩阵可能病态 | EVM最低，为6.364%，ACLR也最好 |
 
 ---
 
@@ -342,28 +343,28 @@ IQ失衡使EVM从标称baseline的1.571%恶化到4.714%。普通频域ILC虽然�
 
 | 方法 | SNR (dB) | EVM (%) | EVM改善 (dB) | ACLR改善 (dB) |
 |---|---:|---:|---:|---:|
-| Validation baseline | 33.706 | 1.695 | 0.000 | 0.000 |
-| ILC label + MP | 39.406 | 0.830 | 6.200 | 0.596 |
-| ILC label + GMP | 39.121 | 0.782 | 6.723 | 0.445 |
-| ILC label + Volterra | 38.487 | 0.846 | 6.040 | 0.345 |
-| ILC label + LUT | 38.836 | 0.951 | 5.022 | 0.780 |
-| ILC label + NN | 36.299 | 1.173 | 3.195 | 0.149 |
+| Validation baseline | 20.293 | 7.758 | 0.000 | 0.000 |
+| ILC label + MP | 21.337 | 6.681 | 1.298 | 0.424 |
+| ILC label + GMP | 21.226 | 6.525 | 1.504 | -0.032 |
+| ILC label + Volterra | 21.161 | 6.489 | 1.552 | -0.187 |
+| ILC label + LUT | 21.369 | 6.792 | 1.155 | 0.582 |
+| ILC label + NN | 20.560 | 7.072 | 0.804 | -0.413 |
 
 ### 9.5 结果解释
 
-五种部署模型均优于独立验证baseline，说明ILC标签不是只对训练帧有效。当前参考配置中GMP取得最低EVM，说明主支路和交叉记忆项对该Wiener PA逆映射有效。NN结果仍有改善但弱于多项式模型，这与只有4个训练数据符号、固定隐藏层和较小网络规模有关，不能据此推断更充分训练下NN一定较差。
+五种部署模型的 EVM 均优于独立验证 baseline，说明 ILC 标签不是只对训练帧有效。当前参考配置中 Volterra 取得最低 EVM，GMP 紧随其后；LUT 的 ACLR 改善最大。NN 结果仍有改善但弱于多项式模型，这与只有 4 个训练数据符号、固定隐藏层和较小网络规模有关，不能据此推断更充分训练下 NN 一定较差。
 
 ### 9.6 同场景部署模型优缺点对比
 
 | 方法 | 主要优势 | 主要缺点 | 当前验证帧结论 |
 |---|---|---|---|
-| MP | 系数少、实现成熟 | 缺少交叉记忆项 | 0.830%，性能与复杂度均衡 |
-| GMP | 能描述包络滞后和超前交叉项 | 基函数更多，矩阵条件数可能变差 | 0.782%，当前EVM最好 |
-| Volterra | 表达一般非线性记忆关系 | 项数增长快，当前实现是简化三阶结构 | 0.846%，未超过GMP |
-| LUT | 查询速度快、易于硬件实现 | 幅度分箱难以描述动态记忆和相位上下文 | 0.951%，ACLR改善最大 |
-| NN | 可扩展到复杂非线性映射 | 依赖数据覆盖、结构和训练预算 | 1.173%，有限样本下收益最小 |
+| MP | 系数少、实现成熟 | 缺少交叉记忆项 | 6.681%，性能与复杂度均衡 |
+| GMP | 能描述包络滞后和超前交叉项 | 基函数更多，矩阵条件数可能变差 | 6.525%，接近当前最佳 |
+| Volterra | 表达一般非线性记忆关系 | 项数增长快，当前实现是简化三阶结构 | 6.489%，当前EVM最好 |
+| LUT | 查询速度快、易于硬件实现 | 幅度分箱难以描述动态记忆和相位上下文 | 6.792%，ACLR改善最大 |
+| NN | 可扩展到复杂非线性映射 | 依赖数据覆盖、结构和训练预算 | 7.072%，有限样本下收益最小 |
 
-不同模型必须同时看EVM、ACLR、模型规模和推理成本。本次GMP的EVM最佳，而LUT的ACLR改善最大，因此不存在脱离目标指标的单一“最好模型”。
+不同模型必须同时看 EVM、ACLR、模型规模和推理成本。本次 Volterra 的 EVM 最佳，而 LUT 的 ACLR 改善最大，因此不存在脱离目标指标的单一“最好模型”。
 
 ---
 
@@ -371,9 +372,9 @@ IQ失衡使EVM从标称baseline的1.571%恶化到4.714%。普通频域ILC虽然�
 
 ### 10.1 场景构造
 
-绝对输入功率在 −2.907300390 dBm 至 5.051499783 dBm 之间取 4 个等 dBm 间隔点。50 Ω 下，这恰好对应 0.16 V 至 0.40 V RMS 的几何间隔。每个功率点都重新缩放参考帧，并为波形 ILC 重新运行学习，不能把 3.113299523 dBm 工作点学到的逐样点输入直接缩放后冒充其他功率点的最优解。
+每路目标输出功率在 10 dBm 至 25 dBm 之间取 4 个等 dBm 间隔点。25 dBm 是归一化 PA 的额定极限输出，4 个点分别对应 15 dB、10 dB、5 dB 和 0 dB 输出回退。每个功率点都重新设置归一化驱动并为波形 ILC 重新运行学习，不能把 20 dBm 工作点学到的逐样点输入直接缩放后冒充其他功率点的最优解。
 
-第 $i$ 个绝对输入功率为：
+第 $i$ 个目标输出功率为：
 
 ```math
 p_i
@@ -382,13 +383,21 @@ p_i
 \left(p_{\max}-p_{\min}\right).
 ```
 
-`PowerCalibration` 再按
+`PowerCalibration` 先根据额定极限输出功率计算归一化驱动比例：
 
 ```math
-d_i=\sqrt{R\,10^{-3}10^{p_i/10}}
+d_i
+=10^{(p_i-p_{\mathrm{max}})/20}.
 ```
 
-得到 PA 模型使用的复包络 RMS 电压。这里的 $p_i$ 是 dBm，$R$ 是端口电阻。
+PA 处理完成后，再按
+
+```math
+v_{\mathrm{target},i}
+=\sqrt{R\,10^{-3}10^{p_i/10}}
+```
+
+对每路原始输出施加常数增益，使其物理 RMS 电压与目标 dBm 一致。这里 $p_i$ 和 $p_{\mathrm{max}}$ 的单位都是 dBm，$R$ 是端口电阻。后置常数增益不改变 EVM、SNR 和 ACLR。
 
 ### 10.2 结果预期
 
@@ -400,43 +409,43 @@ d_i=\sqrt{R\,10^{-3}10^{p_i/10}}
 
 ### 10.3 全方法端点结果
 
-| 方法 | EVM @ RMS 0.16 (%) | EVM @ RMS 0.40 (%) |
+| 方法 | EVM @ 10 dBm/路 (%) | EVM @ 25 dBm/路 (%) |
 |---|---:|---:|
-| PA baseline | 0.665 | 2.657 |
-| Scalar P ILC | 0.374 | 1.767 |
-| Complex-gain ILC | 0.287 | 1.484 |
-| FIR ILC | 0.290 | 1.502 |
-| Frequency-domain ILC | 0.294 | 1.442 |
-| Directional Gauss-Newton ILC | 0.021 | 0.562 |
-| Parameter-domain MP ILC | 0.215 | 1.231 |
-| Constrained CFR-ILC | 0.350 | 1.631 |
-| Naive noisy-feedback ILC | 0.492 | 1.493 |
-| Noise-aware ILC | 0.409 | 1.778 |
-| IQ-imbalance baseline | 4.545 | 5.103 |
-| Frequency-domain ILC on IQ plant | 2.069 | 2.507 |
-| Augmented IQ ILC | 1.724 | 2.200 |
-| ILC label + MP | 0.288 | 1.519 |
-| ILC label + GMP | 0.318 | 1.480 |
-| ILC label + Volterra | 0.389 | 1.583 |
-| ILC label + LUT | 0.535 | 1.652 |
-| ILC label + NN | 0.629 | 2.033 |
+| PA baseline | 0.738 | 19.833 |
+| Scalar P ILC | 0.414 | 19.802 |
+| Complex-gain ILC | 0.317 | 19.813 |
+| FIR ILC | 0.319 | 19.833 |
+| Frequency-domain ILC | 0.322 | 19.766 |
+| Directional Gauss-Newton ILC | 0.022 | 19.833 |
+| Parameter-domain MP ILC | 0.235 | 19.833 |
+| Constrained CFR-ILC | 0.385 | 19.766 |
+| Naive noisy-feedback ILC | 0.519 | 19.833 |
+| Noise-aware ILC | 0.452 | 19.764 |
+| IQ-imbalance baseline | 4.571 | 20.346 |
+| Frequency-domain ILC on IQ plant | 2.191 | 20.013 |
+| Augmented IQ ILC | 1.733 | 20.080 |
+| ILC label + MP | 0.374 | 30.398 |
+| ILC label + GMP | 0.347 | 30.769 |
+| ILC label + Volterra | 0.713 | 19.727 |
+| ILC label + LUT | 0.611 | 19.886 |
+| ILC label + NN | 3.085 | 20.567 |
 
 ### 10.4 结果解释
 
-PA baseline从0.665%恶化到2.657%，说明功率扫描确实穿过了更强的非线性区。所有标称波形ILC在高功率端仍优于PA baseline。IQ失衡baseline在全部功率点都受到明显镜像误差限制，增广ILC保持改善。部署模型在高功率端仍有收益，但不同模型之间的差距会随训练幅度覆盖和峰值投影变化。
+PA baseline 从 0.738% 恶化到 19.833%，说明扫描从 15 dB 回退区一直到达强压缩的额定极限。10 dBm 低功率端，各标称波形 ILC 均有明显收益；25 dBm 极限点，多数方法受峰值上限、局部逆模型失配和可用驱动余量限制，EVM 与 baseline 接近。MP/GMP 部署模型只在 20 dBm 标签上拟合，在 25 dBm 出现明显外推失效。这个端点不是“25 dBm 一定不可用”的硬件结论，而是当前归一化 PA 参数和固定算法配置下的仿真结果。
 
-完整4个功率点和全部方法保存在 `results/benchmark_reference/all_ilc_power_evm_curve.csv`，同图结果保存在 `all_ilc_power_evm_curve.png`。
+完整 4 个功率点和全部方法保存在 `results/benchmark_reference_output/all_ilc_power_evm_curve.csv`，同图结果保存在 `all_ilc_power_evm_curve.png`。
 
 ### 10.5 功率维度的优缺点对比
 
 | 方法组 | 低功率端表现 | 高功率端表现 | 优点 | 缺点 |
 |---|---|---|---|---|
-| PA baseline | 0.665% | 2.657% | 提供真实未补偿趋势 | 压缩增强后快速恶化 |
-| 标称逐点波形ILC | 全部优于PA baseline | 全部优于PA baseline | 每个功率点重新学习，可展示算法上限 | 需要逐点标定，不能直接部署 |
-| 峰值约束ILC | 0.350% | 1.631% | 峰值可实现性更好 | 比无约束频域ILC保留更多EVM |
-| 噪声反馈ILC | 0.409%至0.492% | 1.493%至1.778% | 能在有噪反馈下学习 | 排名随功率、随机噪声和正则化变化 |
-| IQ场景方法 | 1.724%至4.545% | 2.200%至5.103% | 增广法持续优于普通法和baseline | 与无IQ损伤方法不能直接排名 |
-| 固定部署模型 | 0.288%至0.629% | 1.480%至2.033% | 标称点训练后可直接跨功率推理 | 超出训练幅度覆盖时可能退化 |
+| PA baseline | 0.738% | 19.833% | 提供真实未补偿趋势 | 到额定极限后快速恶化 |
+| 标称逐点波形ILC | 全部优于PA baseline | 约19.77%至19.83% | 每个功率点重新学习，可展示算法上限 | 极限点剩余驱动余量不足，收益饱和 |
+| 峰值约束ILC | 0.385% | 19.766% | 峰值可实现性更好 | 极限点与无约束法都接近饱和 |
+| 噪声反馈ILC | 0.452%至0.519% | 19.764%至19.833% | 能在有噪反馈下学习 | 排名随功率、随机噪声和正则化变化 |
+| IQ场景方法 | 1.733%至4.571% | 20.013%至20.346% | 增广法在低功率端最优 | 极限点由PA压缩主导，与无IQ损伤方法不能直接排名 |
+| 固定部署模型 | 0.347%至3.085% | 19.727%至30.769% | 标称点训练后可直接跨功率推理 | MP/GMP在25 dBm明显超出训练覆盖 |
 
 功率扫描中的公平比较仍必须在同一方法组内进行：逐点重新学习的ILC曲线表示可达到的校准上限；只训练一次的部署模型曲线表示外推能力，两者的训练预算并不相同。
 
@@ -578,11 +587,11 @@ sequenceDiagram
 Validate(config)
 Create training waveform with seed
 Create validation waveform with seed + 97
-Convert inputPowerDbm to RMS voltage using loadResistanceOhm
-Scale both waveforms by the calibrated RMS voltage
+Convert outputPowerDbm and maximumOutputPowerDbm to normalized drive scale
+Scale both unit-RMS waveforms by the output-backoff drive scale
 Create one deterministic PA
 
-Measure nominal PA baseline
+Measure nominal PA baseline and calibrate each PA output to outputPowerDbm
 Run six nominal ILC update laws
 Compare unconstrained and peak-constrained frequency-domain ILC
 Compare single-sample and averaged noisy-feedback ILC
@@ -615,13 +624,14 @@ Save convergence histories and power-EVM data
 | `sampleRateHz` | None，兼容解析为80 MHz | 60 MHz | 用户直接指定复基带采样率 |
 | `oversampling` | 4 | 未使用 | 仅在 `sampleRateHz=None` 时兼容推导采样率 |
 | `guardIntervalUs` | 0.8 | 0.8 | 每个数据符号的CP长度 |
-| `inputPowerDbm` | 0.614525 | 3.113300 | PA输入端口绝对功率与压缩程度 |
+| `outputPowerDbm` | 20 | 20 | 每路PA目标输出功率 |
+| `maximumOutputPowerDbm` | 25 | 25 | 每路PA额定极限输出功率和0 dB回退参考点 |
 | `loadResistanceOhm` | 50 | 50 | dBm与复包络RMS电压换算 |
 | `numIterations` | 10 | 6 | 每种ILC记录轮数 |
 | `paModelName` | wiener | wiener | 被测PA模型 |
 | `seed` | 101 | 101 | 训练帧及方法种子基准 |
-| `powerStartDbm` | −8.927900 | −2.907300 | 功率扫描起点，单位dBm |
-| `powerStopDbm` | 5.051500 | 5.051500 | 功率扫描终点，单位dBm |
+| `powerStartDbm` | 10 | 10 | 每路输出功率扫描起点，单位dBm |
+| `powerStopDbm` | 25 | 25 | 每路输出功率扫描终点，单位dBm |
 | `powerPointCount` | 5 | 4 | 功率曲线点数 |
 | `generatePowerEvmCurve` | True | True | 是否输出联合曲线 |
 
@@ -633,7 +643,8 @@ Save convergence histories and power-EVM data
 
 - `numDataSymbols` 必须大于0；
 - 实际 `sampleRateHz` 必须不小于3倍信道带宽，因为ACLR需要同时观察主信道和上下邻道；
-- `inputPowerDbm` 必须是有限数，允许为负；
+- `outputPowerDbm` 和 `maximumOutputPowerDbm` 必须是有限数；
+- `outputPowerDbm`、`powerStartDbm` 和 `powerStopDbm` 均不得超过 `maximumOutputPowerDbm`；
 - `loadResistanceOhm` 必须大于0；
 - `numIterations` 必须大于0；
 - `powerStartDbm` 和 `powerStopDbm` 必须是有限数；
@@ -668,10 +679,12 @@ Save convergence histories and power-EVM data
 x_{\mathrm{train}}[n]
 =d_{\mathrm{nominal}}x_{\mathrm{unit}}[n],
 \qquad
-d_{\mathrm{nominal}}=0.32.
+d_{\mathrm{nominal}}
+=10^{(20-25)/20}
+\approx0.562341.
 ```
 
-参考运行中初始PA输入峰值约为0.9840。普通方法的统一幅度上限为：
+参考运行中初始 PA 输入峰值约为 1.7793。普通方法的统一幅度上限为：
 
 ```math
 A_{\max}
@@ -679,7 +692,7 @@ A_{\max}
 2.0,\,
 1.6\max_n|x_{\mathrm{train}}[n]|
 \right)
-=2.0.
+\approx2.8469.
 ```
 
 因此普通方法不会因为过紧的公共限幅而被不公平地截断；峰值约束方法使用单独的更小上限。
@@ -727,18 +740,19 @@ A_{\max}
 
 ```mermaid
 flowchart LR
-    power["输入功率 3.1133 dBm"] --> calibration["50 Ω端口换算为0.32 V RMS"]
-    unit["单位RMS EHT帧"] --> scale["乘已标定RMS电压"]
-    calibration --> scale
+    power["目标输出功率 20 dBm/路"] --> backoff["相对25 dBm极限回退5 dB"]
+    unit["单位RMS EHT帧"] --> scale["乘归一化驱动比例0.5623"]
+    backoff --> scale
     scale --> target["目标与初始PA输入"]
     target --> memory["Wiener线性记忆"]
     memory --> amam["Rapp AM-AM"]
     amam --> ampm["AM-PM"]
-    ampm --> analysis["同步补偿与SNR/EVM/ACLR"]
+    ampm --> outputCalibration["每路输出常数增益校准到20 dBm"]
+    outputCalibration --> analysis["同步补偿与SNR/EVM/ACLR"]
     analysis --> baseline["PA baseline"]
 ```
 
-这里没有单独的无线信道、接收噪声或频偏。`SigProc` 仍由 `Analysis` 调用，使 baseline 与其他场景走相同分析入口。
+**图 3 说明：**目标输出 dBm 同时决定归一化 PA 的驱动回退和最终物理电平。前者决定压缩程度，后者保证结果文件中的输出电平等于用户配置。后置常数增益不会改变 EVM、SNR 或 ACLR。这里没有单独的无线信道、接收噪声或频偏；`SigProc` 仍由 `Analysis` 调用，使 baseline 与其他场景走相同分析入口。
 
 ### 15.2 baseline不是一个全局通用数字
 
@@ -779,7 +793,7 @@ benchmark中存在5个baseline行：
 |---|---:|---|
 | `numIterations` | 6 | 保存6个更新前测量点 |
 | `regularization` | `1e-3` | 稳定逆增益或正规方程 |
-| `maxAmplitude` | 2.0 | 输入复包络峰值上限 |
+| `maxAmplitude` | `max(2.0, 1.6 × 初始峰值)` | 输入复包络峰值上限；参考运行约为2.8469 |
 | `feedbackSnrDb` | None | 标称场景无反馈噪声 |
 | `feedbackAverages` | 1 | 每轮只测一次 |
 | `projectionBandwidthFactor` | 1.6 | 频域更新允许一定带外抵消分量 |
@@ -853,14 +867,14 @@ k^\star
 
 | 方法 | 第1轮EVM (dB) | 第6轮EVM (dB) | 最佳轮 | 历史最大输入峰值 |
 |---|---:|---:|---:|---:|
-| Scalar P ILC | -36.078 | -40.794 | 6 | 1.0241 |
-| Complex-gain ILC | -36.078 | -43.031 | 6 | 1.0404 |
-| FIR ILC | -36.078 | -43.054 | 6 | 1.0470 |
-| Frequency-domain ILC | -36.078 | -43.092 | 6 | 1.0270 |
-| Directional Gauss-Newton | -36.078 | -68.104 | 6 | 1.2349 |
-| Parameter-domain MP ILC | -36.078 | -45.634 | 6 | 1.0585 |
+| Scalar P ILC | -22.743 | -23.833 | 6 | 2.1746 |
+| Complex-gain ILC | -22.743 | -24.163 | 6 | 2.3509 |
+| FIR ILC | -22.743 | -24.014 | 6 | 2.3784 |
+| Frequency-domain ILC | -22.743 | -24.443 | 6 | 2.2381 |
+| Directional Gauss-Newton | -22.743 | -23.211 | 2 | 2.8469 |
+| Parameter-domain MP ILC | -22.743 | -24.481 | 6 | 2.5088 |
 
-本次参考运行中6种方法都在第6轮取得最小EVM-MSE，说明尚未观察到后期反弹。但代码不能假设最佳轮永远是最后一轮。
+本次参考运行中除 Directional Gauss-Newton 外，其余 5 种方法都在第 6 轮取得最小 EVM-MSE。Directional Gauss-Newton 在第 2 轮最好，随后反弹，说明最佳轮保留机制在强非线性工作点确有必要。
 
 ### 16.6 质量验收与异常含义
 
@@ -869,7 +883,7 @@ k^\star
 | Raw MSE下降，EVM不下降 | 公共增益或非数据字段主导Raw MSE | 查看LC-MSE和EVM-MSE |
 | EVM下降，ACLR不变 | 更新目标主要改善带内调制质量 | 增加邻道目标或频谱权重 |
 | EVM后期变差但最终汇总仍好 | 最佳轮保留机制生效 | 查看完整 `convergence_*.csv` |
-| 输入峰值达到2.0 | 公共峰值约束开始主导 | 降低学习率或提高可实现上限 |
+| 输入峰值达到公共上限 | 公共峰值约束开始主导 | 降低学习率或提高可实现上限 |
 | Gauss-Newton突然恶化 | 有限差分方向受噪声或强非线性污染 | 调整差分RMS、正则化和学习率 |
 | FIR不优于复增益 | PA记忆弱、滤波器估计不足或轮数太少 | 检查频响和FIR长度 |
 
@@ -879,7 +893,7 @@ k^\star
 |---|---|---|
 | 最小实现复杂度 | Scalar P与Complex-gain | 用最少结构判断公共增益和相位是否主导 |
 | 补偿线性记忆 | FIR与Frequency-domain | 分别从时域和频域观察记忆逆 |
-| 最低重复波形EVM | Directional Gauss-Newton | 当前确定性场景精度最高，但必须计入额外PA调用 |
+| 最低重复波形EVM | Parameter-domain MP与Frequency-domain | 当前参考点表现最好，同时要结合ACLR与部署复杂度 |
 | 直接得到可部署结构 | Parameter-domain MP | 学习结果已经处于有限维模型空间 |
 
 选择方法时不应只拿最终EVM一列排序。测试报告至少应同时附上逐轮历史、最大输入峰值、PA调用预算和对噪声的敏感性。
@@ -890,14 +904,14 @@ k^\star
 
 ### 17.1 C1峰值约束的精确构造
 
-约束上限不是公共2.0，而是：
+约束上限不是公共动态上限，而是：
 
 ```math
 A_{\mathrm{CFR}}
 =1.05\max_n|x_{\mathrm{train}}[n]|.
 ```
 
-参考运行初始峰值约为0.9840，因此约束上限约为1.0332。实测6轮历史中的最大输入峰值为1.0196，没有越过约束。
+参考运行初始峰值约为 1.7793，因此约束上限约为 1.8683。实测 6 轮历史中的最大输入峰值为 1.8683，没有越过约束。
 
 每轮更新后执行复圆盘投影：
 
@@ -977,10 +991,10 @@ Naive方法只改变反馈是否含噪，因而接近“没有鲁棒化措施”
 
 | 方法 | 第1轮含噪EVM (dB) | 第5轮 (dB) | 第6轮 (dB) | 干净最终EVM (%) | 历史最大峰值 |
 |---|---:|---:|---:|---:|---:|
-| Naive noisy-feedback | -33.69 | -35.88 | -35.78 | 0.896 | 1.0265 |
-| Noise-aware | -35.24 | -37.94 | -39.00 | 0.941 | 1.0141 |
+| Naive noisy-feedback | -22.66 | -23.91 | -24.21 | 6.009 | 2.2369 |
+| Noise-aware | -22.70 | -23.70 | -23.90 | 6.339 | 2.0654 |
 
-Naive方法第6轮相对第5轮回退0.10 dB，最佳轮保留机制因此返回第5轮对应输入。Noise-aware曲线连续下降，但较小学习率使干净最终EVM没有在这个固定种子上超过Naive。含噪逐轮EVM和干净最终EVM使用不同观测条件，不能直接把两列当成同一个数值。
+两种方法在本次 6 轮记录内都持续改善。Noise-aware 的轨迹更保守，但较小学习率使干净最终 EVM 没有在这个固定种子上超过 Naive。含噪逐轮 EVM 和干净最终 EVM 使用不同观测条件，不能直接把两列当成同一个数值。
 
 验收时应同时检查：
 
@@ -997,17 +1011,17 @@ Naive方法第6轮相对第5轮回退0.10 dB，最佳轮保留机制因此返回
 
 | 方法 | EVM (%) | 最大峰值或约束 | 优点 | 缺点 |
 |---|---:|---|---|---|
-| PA baseline | 1.571 | 初始峰值约0.9840 | 无学习和实现成本 | EVM最高 |
-| 无约束Frequency-domain ILC | 0.700 | 公共上限2.0 | EVM最低 | 允许更大的校正峰值 |
-| Constrained CFR-ILC | 0.833 | 上限约1.0332 | 可实现峰值有明确保证 | 相对无约束损失约1.503 dB EVM改善 |
+| PA baseline | 7.292 | 初始峰值约1.7793 | 无学习和实现成本 | EVM最高 |
+| 无约束Frequency-domain ILC | 5.996 | 公共上限3.0 | EVM最低 | 允许更大的校正峰值 |
+| Constrained CFR-ILC | 6.189 | 上限约1.8683 | 可实现峰值有明确保证 | 相对无约束少约0.275 dB EVM改善 |
 
 #### C2反馈噪声对比
 
 | 方法 | 每轮PA反馈采集 | 最终EVM (%) | 优点 | 缺点 |
 |---|---:|---:|---|---|
-| Baseline | 0 | 1.571 | 成本最低 | 不补偿PA |
-| Naive | 1 | 0.896 | 本次最终EVM最低，采集成本低 | 轨迹有回退，对随机序列更敏感 |
-| Noise-aware | 4 | 0.941 | 本次逐轮曲线单调，正则化更强 | 采集成本约为Naive的4倍，更新较慢 |
+| Baseline | 0 | 7.292 | 成本最低 | 不补偿PA |
+| Naive | 1 | 6.009 | 本次最终EVM最低，采集成本低 | 对随机序列更敏感 |
+| Noise-aware | 4 | 6.339 | 本次逐轮曲线单调，正则化更强 | 采集成本约为Naive的4倍，更新较慢 |
 
 所以C类给出的不是“约束方法一定更差”或“平均方法一定更好”的绝对命题，而是性能、峰值可实现性、反馈成本和稳定性之间的可量化折中。
 
@@ -1055,7 +1069,7 @@ y_{\mathrm{IQ}}[n]
 +L_{\mathrm{image}}e^*[n].
 ```
 
-场景参数为学习率0.18、正则化 `1e-3`、种子110、公共峰值上限2.0。
+场景参数为学习率0.18、正则化 `1e-3`、种子110，并使用与标称方法相同的公共动态峰值上限。
 
 ### 18.3 对照关系
 
@@ -1081,14 +1095,14 @@ flowchart LR
 
 | 轮次 | 普通ILC EVM (dB) | 增广ILC EVM (dB) |
 |---:|---:|---:|
-| 1 | -26.53 | -26.53 |
-| 2 | -27.88 | -28.17 |
-| 3 | -29.23 | -29.82 |
-| 4 | -30.59 | -31.47 |
-| 5 | -31.94 | -33.13 |
-| 6 | -33.29 | -34.79 |
+| 1 | -21.42 | -21.42 |
+| 2 | -22.06 | -22.12 |
+| 3 | -22.61 | -22.70 |
+| 4 | -23.09 | -23.19 |
+| 5 | -23.49 | -23.59 |
+| 6 | -23.83 | -23.92 |
 
-两种方法最佳轮均为6；历史最大输入峰值分别为1.0034和1.0235。增广方法从第2轮开始持续领先，且差距逐轮扩大，说明共轭更新方向提供了普通解析频域逆没有显式表达的补偿自由度。
+两种方法最佳轮均为 6；历史最大输入峰值分别为 2.2008 和 2.4038。增广方法从第 2 轮开始持续小幅领先，说明共轭更新方向提供了普通解析频域逆没有显式表达的补偿自由度，但在 20 dBm 强非线性工作点，PA 压缩仍是主要误差来源。
 
 ### 18.5 D类验收和失败模式
 
@@ -1106,7 +1120,7 @@ flowchart LR
 | 普通频域ILC | IQ镜像较弱，或希望复用现有频域标定链 | 只能间接抵消镜像，结构性残差较大 |
 | 增广IQ ILC | 镜像误差是主要限制，需要同时校正直接和共轭支路 | 需要估计更多系数，矩阵病态时必须增强正则化 |
 
-当前结果中增广方法相对普通方法把EVM从2.165%降至1.822%，收益明确；若把 `imageCoefficient` 设为0后两者仍保持很大差距，则应检查实现或随机控制是否公平。
+当前结果中增广方法相对普通方法把 EVM 从 6.435% 降至 6.364%，并把 Worst ACLR 从 27.189 dB 提高到 28.067 dB；若把 `imageCoefficient` 设为 0 后两者仍保持很大差距，则应检查实现或随机控制是否公平。
 
 ---
 
@@ -1176,15 +1190,15 @@ flowchart LR
 
 ### 19.5 结果深入解读
 
-参考运行中GMP EVM为0.782%，优于MP的0.830%，说明交叉记忆项提供了额外表达能力。Volterra为0.846%，并不表示Volterra理论能力更弱，而是当前采用简化结构、有限训练长度和固定正则化。LUT为0.951%，说明纯幅度分箱能补偿主要压缩，但不能充分描述动态记忆。NN为1.173%，仍优于1.695%的验证baseline，但4个训练数据符号不足以代表“大数据训练”的神经网络性能。
+参考运行中 Volterra EVM 为 6.489%，略优于 GMP 的 6.525% 和 MP 的 6.681%。这不表示某一结构在理论上始终更强，而是当前强非线性工作点、简化结构、有限训练长度和固定正则化共同作用的结果。LUT 为 6.792%，其 ACLR 改善最大；NN 为 7.072%，仍优于 7.758% 的验证 baseline，但 4 个训练数据符号不足以代表“大数据训练”的神经网络性能。
 
 | 模型 | EVM改善 (dB) | ACLR改善 (dB) | 结构优势 | 结构短板 |
 |---|---:|---:|---|---|
-| MP | 6.200 | 0.596 | 复杂度较低、适合常见硬件流水 | 缺少交叉记忆 |
-| GMP | 6.723 | 0.445 | EVM最佳，能描述动态包络交叉项 | 列数更多、求解条件数更敏感 |
-| Volterra | 6.040 | 0.345 | 通用非线性记忆表达能力强 | 项数扩张快，当前仅使用简化三阶结构 |
-| LUT | 5.022 | 0.780 | ACLR改善最大、推理成本低 | 幅度分箱对记忆和上下文表达有限 |
-| NN | 3.195 | 0.149 | 可扩展到非多项式映射 | 当前训练样本少、结果依赖网络和种子 |
+| MP | 1.298 | 0.424 | 复杂度较低、适合常见硬件流水 | 缺少交叉记忆 |
+| GMP | 1.504 | -0.032 | 能描述动态包络交叉项 | 列数更多、求解条件数更敏感 |
+| Volterra | 1.552 | -0.187 | 当前EVM最佳，通用非线性记忆表达能力强 | 项数扩张快，当前仅使用简化三阶结构 |
+| LUT | 1.155 | 0.582 | ACLR改善最大、推理成本低 | 幅度分箱对记忆和上下文表达有限 |
+| NN | 0.804 | -0.413 | 可扩展到非多项式映射 | 当前训练样本少、结果依赖网络和种子 |
 
 ### 19.6 E类验收和失败模式
 
@@ -1215,16 +1229,16 @@ p_i
 i=0,1,\ldots,N-1.
 ```
 
-参考配置的 4 个功率点及其在 50 Ω 下的等效 RMS 电压为：
+参考配置的 4 个每路目标输出功率点、相对 25 dBm 极限的输出回退量、归一化驱动比例和 50 Ω 目标输出 RMS 电压为：
 
-| 点 | 输入功率 (dBm) | RMS电压 (V) |
-|---:|---:|---:|
-| 1 | −2.907300 | 0.160000 |
-| 2 | −0.254367 | 0.217153 |
-| 3 | 2.398567 | 0.294723 |
-| 4 | 5.051500 | 0.400000 |
+| 点 | 输出功率 (dBm/路) | 输出回退 (dB) | 归一化驱动比例 | 目标输出RMS (V) |
+|---:|---:|---:|---:|---:|
+| 1 | 10 | 15 | 0.177828 | 0.707107 |
+| 2 | 15 | 10 | 0.316228 | 1.257433 |
+| 3 | 20 | 5 | 0.562341 | 2.236068 |
+| 4 | 25 | 0 | 1.000000 | 3.976354 |
 
-等 dBm 间隔对应几何 RMS 电压间隔，更适合观察 PA 回退量变化。CSV 同时保存 dBm 和换算后的 RMS 电压，使物理功率配置与数值模型工作点均可审计。
+等 dBm 间隔对应几何驱动比例和几何 RMS 电压间隔，更适合观察 PA 输出回退量变化。CSV 同时保存目标输出 dBm、归一化驱动比例和目标输出 RMS 电压，使物理功率配置与数值模型工作点均可审计。
 
 ### 20.2 三类功率 evaluator行为不同
 
@@ -1242,8 +1256,9 @@ i=0,1,\ldots,N-1.
 
 ### 20.4 功率曲线验收
 
-- `inputPowerDbmValues` 必须严格递增并等间隔；
-- `driveRmsValues` 必须与端口电阻换算结果一致；
+- `outputPowerDbmValues` 必须严格递增并等间隔，且不得超过25 dBm额定极限；
+- `driveScaleValues` 必须与相对额定极限的输出回退换算一致；
+- `targetOutputRmsValues` 必须与目标输出 dBm 和端口电阻换算结果一致；
 - 每个方法必须在全部功率点都有EVM dB和EVM百分比；
 - EVM百分比必须为正且有限；
 - EVM dB与EVM百分比必须满足幅度比换算；
@@ -1253,18 +1268,18 @@ i=0,1,\ldots,N-1.
 
 ### 20.5 端点对比和方法选择
 
-| 方法或方法组 | RMS 0.16 EVM (%) | RMS 0.40 EVM (%) | 对比结论 |
+| 方法或方法组 | 10 dBm/路 EVM (%) | 25 dBm/路 EVM (%) | 对比结论 |
 |---|---:|---:|---|
-| PA baseline | 0.665 | 2.657 | 高功率压缩使EVM约增至4倍 |
-| Frequency-domain ILC | 0.294 | 1.442 | 全区间优于PA baseline，但每点都重新学习 |
-| Constrained CFR-ILC | 0.350 | 1.631 | 以峰值可实现性换取部分EVM |
-| Naive noisy-feedback | 0.492 | 1.493 | 低功率受噪声影响较明显，高功率本次优于Noise-aware |
-| Noise-aware | 0.409 | 1.778 | 低功率优于Naive，高功率保守更新限制了收益 |
-| IQ baseline | 4.545 | 5.103 | 镜像形成与功率相关性较弱的误差底 |
-| Ordinary ILC on IQ plant | 2.069 | 2.507 | 可部分抵消，但全区间弱于增广法 |
-| Augmented IQ ILC | 1.724 | 2.200 | 全区间在IQ三方法中最好 |
-| GMP deployment | 0.318 | 1.480 | 标称训练模型跨功率仍保持收益 |
-| NN deployment | 0.629 | 2.033 | 高功率外推弱于多项式模型 |
+| PA baseline | 0.738 | 19.833 | 额定极限处强压缩使EVM大幅恶化 |
+| Frequency-domain ILC | 0.322 | 19.766 | 低功率收益明显，极限点收益饱和 |
+| Constrained CFR-ILC | 0.385 | 19.766 | 低功率以峰值可实现性换取部分EVM |
+| Naive noisy-feedback | 0.519 | 19.833 | 低功率受噪声影响，极限点由压缩主导 |
+| Noise-aware | 0.452 | 19.764 | 低功率优于Naive，极限点同样饱和 |
+| IQ baseline | 4.571 | 20.346 | 低功率有镜像误差底，极限点叠加强压缩 |
+| Ordinary ILC on IQ plant | 2.191 | 20.013 | 低功率可部分抵消，极限点改善有限 |
+| Augmented IQ ILC | 1.733 | 20.080 | 低功率在IQ三方法中最好 |
+| GMP deployment | 0.347 | 30.769 | 标称20 dBm训练，25 dBm明显外推失效 |
+| NN deployment | 3.085 | 20.567 | 低功率也受训练覆盖和模型容量限制 |
 
 该表不能把Ordinary IQ ILC和无IQ损伤的Frequency-domain ILC直接排名，因为plant不同；它用于分别观察各场景中方法相对自己的baseline是否保持优势。
 
@@ -1374,7 +1389,7 @@ JSON顶层包括：
 
 这是宽表：
 
-- 前两列为 `inputPowerDbm` 和 `driveRmsVoltage`；
+- 前三列为 `outputPowerDbm`、`normalizedDriveScale` 和 `targetOutputRmsVoltage`；
 - 每种方法占两列：`方法名 evmDb` 和 `方法名 evmPercent`；
 - 参考运行有4行功率点；
 - JSON保存相同曲线数据；
@@ -1470,12 +1485,12 @@ JSON顶层包括：
 - [ ] 6种方法都产生6轮历史；
 - [ ] 每轮记录Raw、LC和EVM三类MSE；
 - [ ] 返回结果对应最佳已测轮；
-- [ ] 输入峰值不超过2.0；
+- [ ] 输入峰值不超过该场景计算得到的公共动态上限；
 - [ ] 参考配置下所有方法EVM改善为正。
 
 ### 23.4 C类鲁棒性
 
-- [ ] CFR输入峰值不超过约1.0332；
+- [ ] CFR输入峰值不超过约1.8683；
 - [ ] 噪声反馈为32 dB并平均4次；
 - [ ] 噪声场景正则化为 `1e-2`；
 - [ ] 最终指标来自干净PA输出；
@@ -1541,7 +1556,7 @@ python tests/BenchMark.py --symbols 2 --sample-rate-hz 60000000 --iterations 3 -
 
 ### 24.7 部署模型在高功率点退化
 
-模型只在标称 `inputPowerDbm=3.113299523` 的标签上拟合。高功率点可能超出训练幅度覆盖。可使用多功率 ILC 标签联合拟合，并在输入特征中加入绝对 dBm 工作点信息。
+模型只在标称 `outputPowerDbm=20` 的标签上拟合。25 dBm 极限点可能超出训练幅度覆盖。可使用多输出功率 ILC 标签联合拟合，并在输入特征中加入目标输出 dBm 或输出回退量信息。
 
 ### 24.8 重复运行数值不同
 

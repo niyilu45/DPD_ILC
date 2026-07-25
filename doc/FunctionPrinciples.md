@@ -183,8 +183,10 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate` | E | 用 ChainMap 保存并验证可配置电阻端口，默认 50 Ω | SigProc §13 |
+| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.MaximumOutputPowerDbm`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate` | E | 用ChainMap保存并验证50 Ω端口与默认25 dBm额定输出极限 | SigProc §13 |
 | `PowerCalibration.DbmToRms`, `PowerCalibration.RmsToDbm` | P/N | 按 $P=V_{\mathrm{RMS}}^2/R$ 在绝对 dBm 功率与复包络 RMS 电压之间双向换算 | SigProc §13 |
+| `PowerCalibration.OutputPowerToDriveScale` | P | 按目标输出相对额定极限的输出回退量计算归一化PA驱动比例 | SigProc §13 |
+| `PowerCalibration.ScaleSignalToOutputPower`, `PowerCalibration.ScaleSignalToOutputPowers` | P/E | 以不改变EVM和ACLR比值的逐链常数增益，把PA输出标定到目标dBm | SigProc §13 |
 | `SignalProcessingResult.ToDict` | E | 只序列化估计标量，不重新计算同步 | SigProc §9 |
 | `SigProc.__init__`, `SigProc.ValidateSignal`, `SigProc.GetParameters`, `SigProc.UpdateParameters`, `SigProc.ValidateParameters` | E | 保存参考、解析 ChainMap、检查单位和有限性 | SigProc §9–§10 |
 | `SigProc.ResolveMaximumIntegerDelay` | N/E | 把自动/外部时延边界转换为有限相关搜索半径 | SigProc §3、§12 |
@@ -235,7 +237,7 @@ flowchart LR
 | `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让 SNR/EVM/ACLR 共用一次同步结果并保存阶段映射 | Analysis §1 |
 | `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO PA输出，并在Analysis中按严格EVM选择最佳实测轮 | Analysis §5.10 |
 | `Analysis.AnalyzeMimoIlcHistory` | P/E | 按轮组合各PA链输出，以完整MIMO空间解映射统一计算性能并在Analysis中选择最佳轮 | Analysis §9 |
-| `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同绝对 dBm 输入功率点和参考下公平比较各方法 EVM，并保存端口电阻换算后的 RMS 电压 | Analysis §8 |
+| `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同的每路目标输出 dBm 点公平比较各方法EVM，按相对25 dBm额定极限的回退设置归一化驱动，并保存目标输出RMS电压 | Analysis §8 |
 | `Analysis.SavePowerEvmCurveData`, `Analysis.Print`, `Analysis.PrintMimo`, `Analysis.Save`, `Analysis.SaveConvergence`, `Analysis.PrintConvergence` | E | 展示/序列化既有结果，不改变物理指标 | Analysis §10–§11 |
 
 ## 9. `Draw.py`：图形函数

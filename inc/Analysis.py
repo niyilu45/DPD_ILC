@@ -55,10 +55,11 @@ class MimoSignalMetrics(TypedDict):
 
 @dataclass
 class PowerEvmCurve:
-    """Store a multi-method EVM sweep over absolute PA input powers."""
+    """Store a multi-method EVM sweep over absolute PA output powers."""
 
-    inputPowerDbmValues: np.ndarray
-    driveRmsValues: np.ndarray
+    outputPowerDbmValues: np.ndarray
+    driveScaleValues: np.ndarray
+    targetOutputRmsValues: np.ndarray
     evmDbByMethod: Dict[str, np.ndarray]
     evmPercentByMethod: Dict[str, np.ndarray]
 
@@ -73,10 +74,15 @@ class PowerEvmCurve:
         """
 
         return {
-            "inputPowerDbmValues": self.inputPowerDbmValues
+            "outputPowerDbmValues": self.outputPowerDbmValues
             .astype(float)
             .tolist(),
-            "driveRmsValues": self.driveRmsValues.astype(float).tolist(),
+            "driveScaleValues": self.driveScaleValues
+            .astype(float)
+            .tolist(),
+            "targetOutputRmsValues": self.targetOutputRmsValues
+            .astype(float)
+            .tolist(),
             "methods": {
                 methodName: {
                     "evmDb": self.evmDbByMethod[methodName]
@@ -249,6 +255,7 @@ class Analysis:
                 "powerEvmFileStem": "power_evm_curve",
                 "signalProcessingParameters": None,
                 "loadResistanceOhm": 50.0,
+                "maximumOutputPowerDbm": 25.0,
             }
         )
         self.parsedWifiFrame: Optional[ParsedWifiFrame] = None
@@ -423,7 +430,10 @@ class Analysis:
                 "signalProcessingParameters must be a mapping or None"
             )
         PowerCalibration(
-            loadResistanceOhm=self.parameters["loadResistanceOhm"]
+            loadResistanceOhm=self.parameters["loadResistanceOhm"],
+            maximumOutputPowerDbm=self.parameters[
+                "maximumOutputPowerDbm"
+            ],
         )
         # Constructing one temporary processor per conducted chain validates
         # nested settings without duplicating synchronization constraints.
@@ -1123,56 +1133,67 @@ class Analysis:
 
     def AnalyzePowerEvmCurve(
         self,
-        inputPowerDbmValues: Sequence[float],
+        outputPowerDbmValues: Sequence[float],
         methodEvaluators: Mapping[
             str, Callable[[np.ndarray, float], np.ndarray]
         ],
     ) -> PowerEvmCurve:
         """Evaluate multiple methods over one common absolute-power sweep.
 
-        Every evaluator receives the reference waveform scaled to the current
-        dBm input power and the numeric dBm value. The configured resistive
-        load converts each dBm point to the RMS voltage that scales the
-        unit-RMS waveform. An ILC evaluator may relearn at every point, while
-        a deployed DPD evaluator may reuse fixed nominal-power coefficients.
-        All methods are scored with identical references.
+        Every evaluator receives a reference waveform driven according to the
+        requested output backoff and the numeric output dBm value. The rated
+        maximum output is zero backoff. After nonlinear processing, one
+        constant per-chain gain calibrates every method to the requested
+        absolute output power. This gain does not alter EVM or ACLR ratios.
 
         Args:
-            inputPowerDbmValues: Strictly increasing absolute PA input powers
-                in dBm. Negative dBm values are valid.
+            outputPowerDbmValues: Strictly increasing absolute per-PA output
+                powers in dBm, no greater than ``maximumOutputPowerDbm``.
             methodEvaluators: Mapping from display name to a callable that
-                accepts the calibrated point reference and its dBm value, and
-                returns the corresponding measured output waveform.
+                accepts the output-backoff-scaled reference and target output
+                dBm, and returns the corresponding PA output waveform.
 
         Returns:
-            result: Power-EVM curve containing dBm points, their calibrated
-                RMS voltages, and per-method EVM arrays.
+            result: Power-EVM curve containing output powers, normalized drive
+                scales, target RMS voltages, and per-method EVM arrays.
         """
 
         powerDbmArray = np.asarray(
-            inputPowerDbmValues, dtype=float
+            outputPowerDbmValues, dtype=float
         ).reshape(-1)
         if powerDbmArray.size < 2:
             raise ValueError(
-                "inputPowerDbmValues must contain at least two points"
+                "outputPowerDbmValues must contain at least two points"
             )
         if not np.all(np.isfinite(powerDbmArray)):
             raise ValueError(
-                "inputPowerDbmValues must contain finite values"
+                "outputPowerDbmValues must contain finite values"
             )
         if np.any(np.diff(powerDbmArray) <= 0.0):
             raise ValueError(
-                "inputPowerDbmValues must be strictly increasing"
+                "outputPowerDbmValues must be strictly increasing"
             )
         if not methodEvaluators:
             raise ValueError("methodEvaluators cannot be empty")
         powerCalibration = PowerCalibration(
-            loadResistanceOhm=self.parameters["loadResistanceOhm"]
+            loadResistanceOhm=self.parameters["loadResistanceOhm"],
+            maximumOutputPowerDbm=self.parameters[
+                "maximumOutputPowerDbm"
+            ],
         )
-        driveRmsArray = np.asarray(
+        driveScaleArray = np.asarray(
             [
-                powerCalibration.DbmToRms(inputPowerDbm)
-                for inputPowerDbm in powerDbmArray
+                powerCalibration.OutputPowerToDriveScale(
+                    outputPowerDbm
+                )
+                for outputPowerDbm in powerDbmArray
+            ],
+            dtype=float,
+        )
+        targetOutputRmsArray = np.asarray(
+            [
+                powerCalibration.DbmToRms(outputPowerDbm)
+                for outputPowerDbm in powerDbmArray
             ],
             dtype=float,
         )
@@ -1189,12 +1210,20 @@ class Analysis:
         for methodName, methodEvaluator in methodEvaluators.items():
             methodEvmDb = []
             methodEvmPercent = []
-            for inputPowerDbm, driveRms in zip(
-                powerDbmArray, driveRmsArray
+            for outputPowerDbm, driveScale in zip(
+                powerDbmArray, driveScaleArray
             ):
-                pointReference = float(driveRms) * self.waveform.samples
-                measuredSignal = methodEvaluator(
-                    pointReference, float(inputPowerDbm)
+                pointReference = (
+                    float(driveScale) * self.waveform.samples
+                )
+                rawMeasuredSignal = methodEvaluator(
+                    pointReference, float(outputPowerDbm)
+                )
+                measuredSignal = (
+                    powerCalibration.ScaleSignalToOutputPower(
+                        rawMeasuredSignal,
+                        float(outputPowerDbm),
+                    )
                 )
                 pointAnalysis = Analysis(
                     pointReference,
@@ -1210,8 +1239,9 @@ class Analysis:
             )
 
         self.powerEvmCurve = PowerEvmCurve(
-            inputPowerDbmValues=powerDbmArray,
-            driveRmsValues=driveRmsArray,
+            outputPowerDbmValues=powerDbmArray,
+            driveScaleValues=driveScaleArray,
+            targetOutputRmsValues=targetOutputRmsArray,
             evmDbByMethod=evmDbByMethod,
             evmPercentByMethod=evmPercentByMethod,
         )
@@ -1259,7 +1289,11 @@ class Analysis:
         jsonPath = outputPath / f"{selectedFileStem}.json"
         methodNames = list(selectedCurve.evmDbByMethod)
 
-        fieldNames = ["inputPowerDbm", "driveRmsVoltage"]
+        fieldNames = [
+            "outputPowerDbm",
+            "normalizedDriveScale",
+            "targetOutputRmsVoltage",
+        ]
         for methodName in methodNames:
             fieldNames.extend(
                 [f"{methodName} evmDb", f"{methodName} evmPercent"]
@@ -1267,13 +1301,16 @@ class Analysis:
         with csvPath.open("w", newline="", encoding="utf-8-sig") as csvFile:
             csvWriter = csv.DictWriter(csvFile, fieldnames=fieldNames)
             csvWriter.writeheader()
-            for pointIndex, inputPowerDbm in enumerate(
-                selectedCurve.inputPowerDbmValues
+            for pointIndex, outputPowerDbm in enumerate(
+                selectedCurve.outputPowerDbmValues
             ):
                 rowData = {
-                    "inputPowerDbm": float(inputPowerDbm),
-                    "driveRmsVoltage": float(
-                        selectedCurve.driveRmsValues[pointIndex]
+                    "outputPowerDbm": float(outputPowerDbm),
+                    "normalizedDriveScale": float(
+                        selectedCurve.driveScaleValues[pointIndex]
+                    ),
+                    "targetOutputRmsVoltage": float(
+                        selectedCurve.targetOutputRmsValues[pointIndex]
                     ),
                 }
                 for methodName in methodNames:

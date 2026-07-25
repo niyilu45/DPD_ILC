@@ -3,7 +3,7 @@
 from collections import ChainMap
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Dict, Mapping, Optional, Tuple, cast
+from typing import Dict, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -21,6 +21,7 @@ class PowerCalibration:
     def __init__(
         self,
         loadResistanceOhm: Optional[float] = None,
+        maximumOutputPowerDbm: Optional[float] = None,
         parameters: Optional[Mapping[str, object]] = None,
         **parameterOverrides: object,
     ) -> None:
@@ -33,6 +34,7 @@ class PowerCalibration:
 
         Args:
             loadResistanceOhm: Optional resistive port value in ohms.
+            maximumOutputPowerDbm: Optional rated PA output-power ceiling.
             parameters: Optional caller-owned mapping of calibration values.
             parameterOverrides: Highest-priority local calibration overrides.
 
@@ -41,11 +43,18 @@ class PowerCalibration:
         """
 
         self.defaultParameters: Mapping[str, object] = MappingProxyType(
-            {"loadResistanceOhm": 50.0}
+            {
+                "loadResistanceOhm": 50.0,
+                "maximumOutputPowerDbm": 25.0,
+            }
         )
         directOverrides = dict(parameterOverrides)
         if loadResistanceOhm is not None:
             directOverrides["loadResistanceOhm"] = loadResistanceOhm
+        if maximumOutputPowerDbm is not None:
+            directOverrides["maximumOutputPowerDbm"] = (
+                maximumOutputPowerDbm
+            )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
         externalParameters = {} if parameters is None else parameters
@@ -71,6 +80,24 @@ class PowerCalibration:
         return float(cast(float, self.parameters["loadResistanceOhm"]))
 
     loadResistanceOhm = LoadResistanceOhm
+
+    @property
+    def MaximumOutputPowerDbm(self) -> float:
+        """Return the rated per-PA output-power ceiling in dBm.
+
+        Processing details:
+            Algorithm: Read the validated ChainMap value used to convert
+            requested output powers into normalized output-backoff drive.
+
+        Returns:
+            result: Finite maximum output power in dBm.
+        """
+
+        return float(
+            cast(float, self.parameters["maximumOutputPowerDbm"])
+        )
+
+    maximumOutputPowerDbm = MaximumOutputPowerDbm
 
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened calibration parameter snapshot.
@@ -139,8 +166,19 @@ class PowerCalibration:
             raise ValueError(
                 "loadResistanceOhm must be finite and positive"
             )
+        maximumOutputPowerDbm = self.parameters[
+            "maximumOutputPowerDbm"
+        ]
+        if (
+            not isinstance(maximumOutputPowerDbm, (int, float))
+            or isinstance(maximumOutputPowerDbm, bool)
+            or not np.isfinite(maximumOutputPowerDbm)
+        ):
+            raise ValueError(
+                "maximumOutputPowerDbm must be finite"
+            )
 
-    def DbmToRms(self, inputPowerDbm: float) -> float:
+    def DbmToRms(self, powerDbm: float) -> float:
         """Convert absolute port power in dBm to complex-envelope RMS volts.
 
         Processing details:
@@ -148,28 +186,28 @@ class PowerCalibration:
             multiply by resistance, and take the positive RMS square root.
 
         Args:
-            inputPowerDbm: Absolute available power in dBm.
+            powerDbm: Absolute available power in dBm.
 
         Returns:
             result: Positive RMS voltage used to scale a unit-RMS waveform.
         """
 
         if (
-            not isinstance(inputPowerDbm, (int, float))
-            or isinstance(inputPowerDbm, bool)
-            or not np.isfinite(inputPowerDbm)
+            not isinstance(powerDbm, (int, float))
+            or isinstance(powerDbm, bool)
+            or not np.isfinite(powerDbm)
         ):
-            raise ValueError("inputPowerDbm must be finite")
+            raise ValueError("powerDbm must be finite")
         # Compute the voltage directly with a 20-log amplitude exponent. This
         # is algebraically identical to converting through watts, while NumPy
         # lets the explicit finite-range check handle overflow and underflow.
         with np.errstate(over="ignore", under="ignore", invalid="ignore"):
             rmsVoltage = (
                 np.sqrt(1.0e-3 * self.loadResistanceOhm)
-                * np.power(10.0, float(inputPowerDbm) / 20.0)
+                * np.power(10.0, float(powerDbm) / 20.0)
             )
         if not np.isfinite(rmsVoltage) or rmsVoltage <= 0.0:
-            raise ValueError("inputPowerDbm is outside the numeric range")
+            raise ValueError("powerDbm is outside the numeric range")
         return float(rmsVoltage)
 
     def RmsToDbm(self, signalRms: float) -> float:
@@ -198,6 +236,157 @@ class PowerCalibration:
             20.0 * np.log10(float(signalRms))
             - 10.0 * np.log10(self.loadResistanceOhm * 1.0e-3)
         )
+
+    def OutputPowerToDriveScale(
+        self, outputPowerDbm: float
+    ) -> float:
+        """Convert requested PA output power to normalized backoff drive.
+
+        Processing details:
+            Algorithm: Treat ``maximumOutputPowerDbm`` as zero output
+            backoff, subtract it from the requested per-PA output power, and
+            convert the resulting dB backoff to a linear complex-envelope
+            scale. This controls the normalized PA compression point without
+            confusing output dBm with input-port voltage.
+
+        Args:
+            outputPowerDbm: Requested average output power for one PA.
+
+        Returns:
+            result: Positive normalized drive scale no greater than one.
+        """
+
+        if (
+            not isinstance(outputPowerDbm, (int, float))
+            or isinstance(outputPowerDbm, bool)
+            or not np.isfinite(outputPowerDbm)
+        ):
+            raise ValueError("outputPowerDbm must be finite")
+        numericPowerDbm = float(outputPowerDbm)
+        if numericPowerDbm > self.maximumOutputPowerDbm:
+            raise ValueError(
+                "outputPowerDbm cannot exceed maximumOutputPowerDbm"
+            )
+        return float(
+            np.power(
+                10.0,
+                (
+                    numericPowerDbm
+                    - self.maximumOutputPowerDbm
+                )
+                / 20.0,
+            )
+        )
+
+    def ScaleSignalToOutputPower(
+        self,
+        signal: np.ndarray,
+        outputPowerDbm: float,
+    ) -> np.ndarray:
+        """Scale every PA output chain to one absolute average power.
+
+        Processing details:
+            Algorithm: Validate a complex vector or samples-by-chain matrix,
+            calculate each chain RMS independently, convert the requested
+            per-chain dBm value to RMS voltage, and apply one constant gain
+            per chain. Constant post-PA gain preserves EVM and ACLR ratios.
+
+        Args:
+            signal: One PA output vector or a samples-by-PA matrix.
+            outputPowerDbm: Requested average output power per PA chain.
+
+        Returns:
+            result: Complex signal with every chain at the requested dBm.
+        """
+
+        complexSignal = np.asarray(signal, dtype=np.complex128)
+        if (
+            complexSignal.ndim not in (1, 2)
+            or complexSignal.size == 0
+            or complexSignal.shape[0] == 0
+            or not np.all(np.isfinite(complexSignal))
+        ):
+            raise ValueError(
+                "signal must be a finite nonempty vector or matrix"
+            )
+        signalMatrix = (
+            complexSignal.reshape(-1, 1)
+            if complexSignal.ndim == 1
+            else complexSignal
+        )
+        scaledMatrix = self.ScaleSignalToOutputPowers(
+            signalMatrix,
+            tuple(
+                float(outputPowerDbm)
+                for _ in range(signalMatrix.shape[1])
+            ),
+        )
+        if complexSignal.ndim == 1:
+            return scaledMatrix[:, 0]
+        return scaledMatrix
+
+    def ScaleSignalToOutputPowers(
+        self,
+        signal: np.ndarray,
+        outputPowerDbmPerChain: Sequence[float],
+    ) -> np.ndarray:
+        """Scale PA output columns to independent absolute powers.
+
+        Processing details:
+            Algorithm: Validate one target per matrix column, measure each
+            current RMS, convert every dBm target through the common port
+            resistance, and apply independent constant gains.
+
+        Args:
+            signal: Samples-by-PA complex matrix.
+            outputPowerDbmPerChain: Requested dBm target for every column.
+
+        Returns:
+            result: Calibrated matrix with unchanged column ordering.
+        """
+
+        complexSignal = np.asarray(signal, dtype=np.complex128)
+        if (
+            complexSignal.ndim not in (1, 2)
+            or complexSignal.size == 0
+            or complexSignal.shape[0] == 0
+            or not np.all(np.isfinite(complexSignal))
+        ):
+            raise ValueError(
+                "signal must be a finite nonempty vector or matrix"
+            )
+        inputWasVector = complexSignal.ndim == 1
+        signalMatrix = (
+            complexSignal.reshape(-1, 1)
+            if inputWasVector
+            else complexSignal
+        )
+        targetPowers = tuple(outputPowerDbmPerChain)
+        if len(targetPowers) != signalMatrix.shape[1]:
+            raise ValueError(
+                "outputPowerDbmPerChain must contain one value per chain"
+            )
+        targetRmsList = []
+        for targetPowerDbm in targetPowers:
+            self.OutputPowerToDriveScale(targetPowerDbm)
+            targetRmsList.append(
+                self.DbmToRms(float(targetPowerDbm))
+            )
+        targetRmsValues = np.asarray(targetRmsList, dtype=float)
+        currentRms = np.sqrt(
+            np.mean(np.abs(signalMatrix) ** 2, axis=0)
+        )
+        if np.any(currentRms <= np.finfo(float).tiny):
+            raise ValueError(
+                "cannot calibrate zero-power PA output"
+            )
+        scaledMatrix = (
+            signalMatrix
+            * (targetRmsValues / currentRms).reshape(1, -1)
+        )
+        if inputWasVector:
+            return scaledMatrix[:, 0]
+        return scaledMatrix
 
 
 @dataclass(frozen=True)

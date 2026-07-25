@@ -266,25 +266,32 @@ def Main() -> int:
         ),
     )
     argumentParser.add_argument(
-        "--input-power-dbm",
-        dest="inputPowerDbm",
+        "--output-power-dbm",
+        dest="outputPowerDbm",
         type=float,
         default=None,
-        help="Absolute PA input power in dBm (default: 0.62 dBm at 50 ohms)",
+        help="Target PA output power per chain in dBm (default: 20 dBm)",
+    )
+    argumentParser.add_argument(
+        "--maximum-output-power-dbm",
+        dest="maximumOutputPowerDbm",
+        type=float,
+        default=25.0,
+        help="Rated per-PA output-power limit in dBm (default: 25 dBm)",
     )
     argumentParser.add_argument(
         "--power-start-dbm",
         dest="powerStartDbm",
         type=float,
         default=None,
-        help="First PA input power in the EVM sweep (default: -8.93 dBm)",
+        help="First PA output power in the EVM sweep (default: 10 dBm)",
     )
     argumentParser.add_argument(
         "--power-stop-dbm",
         dest="powerStopDbm",
         type=float,
         default=None,
-        help="Last PA input power in the EVM sweep (default: 5.05 dBm)",
+        help="Last PA output power in the EVM sweep (default: 25 dBm)",
     )
     argumentParser.add_argument(
         "--load-resistance-ohm",
@@ -370,26 +377,27 @@ def Main() -> int:
 
     try:
         powerCalibration = PowerCalibration(
-            loadResistanceOhm=arguments.loadResistanceOhm
+            loadResistanceOhm=arguments.loadResistanceOhm,
+            maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
         )
-        inputPowerDbm = (
-            powerCalibration.RmsToDbm(0.24)
-            if arguments.inputPowerDbm is None
-            else float(arguments.inputPowerDbm)
+        outputPowerDbm = (
+            20.0
+            if arguments.outputPowerDbm is None
+            else float(arguments.outputPowerDbm)
         )
         powerStartDbm = (
-            powerCalibration.RmsToDbm(0.08)
+            10.0
             if arguments.powerStartDbm is None
             else float(arguments.powerStartDbm)
         )
         powerStopDbm = (
-            powerCalibration.RmsToDbm(0.40)
+            powerCalibration.maximumOutputPowerDbm
             if arguments.powerStopDbm is None
             else float(arguments.powerStopDbm)
         )
-        inputDriveRms = powerCalibration.DbmToRms(inputPowerDbm)
-        powerCalibration.DbmToRms(powerStartDbm)
-        powerCalibration.DbmToRms(powerStopDbm)
+        powerCalibration.OutputPowerToDriveScale(outputPowerDbm)
+        powerCalibration.OutputPowerToDriveScale(powerStartDbm)
+        powerCalibration.OutputPowerToDriveScale(powerStopDbm)
     except (TypeError, ValueError) as error:
         argumentParser.error(str(error))
     if powerStopDbm <= powerStartDbm:
@@ -433,6 +441,46 @@ def Main() -> int:
     )
     try:
         wifiGenerator = WaveGenWifi(parameters=wifiOverrides)
+        if arguments.paTargetOutputRmsPerChain is not None:
+            outputPowerDbmPerChain = tuple(
+                outputPowerDbm
+                if targetOutputRms is None
+                else powerCalibration.RmsToDbm(targetOutputRms)
+                for targetOutputRms in (
+                    arguments.paTargetOutputRmsPerChain
+                )
+            )
+        elif arguments.paTargetOutputPowerDbmPerChain is not None:
+            outputPowerDbmPerChain = tuple(
+                outputPowerDbm
+                if targetOutputPowerDbm is None
+                else float(targetOutputPowerDbm)
+                for targetOutputPowerDbm in (
+                    arguments.paTargetOutputPowerDbmPerChain
+                )
+            )
+        else:
+            outputPowerDbmPerChain = tuple(
+                outputPowerDbm
+                for _ in range(wifiGenerator.numTransmitAntennas)
+            )
+        if (
+            len(outputPowerDbmPerChain)
+            != wifiGenerator.numTransmitAntennas
+        ):
+            raise ValueError(
+                "per-chain output-power targets must contain one value "
+                "per transmit antenna"
+            )
+        driveScalePerChain = np.asarray(
+            [
+                powerCalibration.OutputPowerToDriveScale(
+                    targetOutputPowerDbm
+                )
+                for targetOutputPowerDbm in outputPowerDbmPerChain
+            ],
+            dtype=float,
+        )
         useMimoPaFacade = wifiGenerator.numTransmitAntennas > 1 or any(
             value is not None
             for value in (
@@ -448,6 +496,9 @@ def Main() -> int:
             mimoPaOverrides = {
                 "numTransmitChains": wifiGenerator.numTransmitAntennas,
                 "loadResistanceOhm": powerCalibration.loadResistanceOhm,
+                "maximumOutputPowerDbm": (
+                    powerCalibration.maximumOutputPowerDbm
+                ),
                 "paParametersPerChain": tuple(
                     dict(paOverrides)
                     for _ in range(wifiGenerator.numTransmitAntennas)
@@ -460,14 +511,6 @@ def Main() -> int:
             if arguments.paOutputPowerDbPerChain is not None:
                 mimoPaOverrides["outputPowerDbPerChain"] = (
                     arguments.paOutputPowerDbPerChain
-                )
-            if arguments.paTargetOutputRmsPerChain is not None:
-                mimoPaOverrides["targetOutputRmsPerChain"] = (
-                    arguments.paTargetOutputRmsPerChain
-                )
-            if arguments.paTargetOutputPowerDbmPerChain is not None:
-                mimoPaOverrides["targetOutputPowerDbmPerChain"] = (
-                    arguments.paTargetOutputPowerDbmPerChain
                 )
             paModel = MimoPaModel(parameters=mimoPaOverrides)
     except (TypeError, ValueError) as error:
@@ -488,17 +531,32 @@ def Main() -> int:
     )
 
     waveform = wifiGenerator.Generate()
-    referenceSignal = inputDriveRms * waveform.samples
+    if waveform.samples.ndim == 1:
+        referenceSignal = (
+            float(driveScalePerChain[0]) * waveform.samples
+        )
+    else:
+        referenceSignal = (
+            waveform.samples
+            * driveScalePerChain.reshape(1, -1)
+        )
     resultAnalysis = Analysis(
         referenceSignal,
         waveform,
         loadResistanceOhm=powerCalibration.loadResistanceOhm,
+        maximumOutputPowerDbm=(
+            powerCalibration.maximumOutputPowerDbm
+        ),
     )
     resultDraw = Draw()
 
     # The first pass establishes the unlinearized baseline at the requested
     # operating point. The same PA instance is reused for every comparison.
-    baselineOutput = paModel.Process(referenceSignal)
+    baselineOutputRaw = paModel.Process(referenceSignal)
+    baselineOutput = powerCalibration.ScaleSignalToOutputPowers(
+        baselineOutputRaw,
+        outputPowerDbmPerChain,
+    )
     baselineOutputMatrix = (
         baselineOutput.reshape(-1, 1)
         if baselineOutput.ndim == 1
@@ -509,6 +567,13 @@ def Main() -> int:
             np.mean(np.sum(np.abs(baselineOutputMatrix) ** 2, axis=1))
         )
     )
+    baselineOutputRmsPerChain = np.sqrt(
+        np.mean(np.abs(baselineOutputMatrix) ** 2, axis=0)
+    )
+    baselineOutputPowerDbmPerChain = [
+        powerCalibration.RmsToDbm(float(chainOutputRms))
+        for chainOutputRms in baselineOutputRmsPerChain
+    ]
     ilcConfig = ILCConfig(
         numIterations=arguments.numIterations,
         learningRate=arguments.learningRate,
@@ -546,7 +611,11 @@ def Main() -> int:
     selectedIlcInput = ilcAnalysisResult.bestInputSignal
     # Analysis selects the best measured round. Re-run that input through the
     # plant once so final reported performance excludes optional feedback noise.
-    selectedIlcOutput = paModel.Process(selectedIlcInput)
+    selectedIlcOutputRaw = paModel.Process(selectedIlcInput)
+    selectedIlcOutput = powerCalibration.ScaleSignalToOutputPowers(
+        selectedIlcOutputRaw,
+        outputPowerDbmPerChain,
+    )
 
     # ILC labels are waveform-specific. Ridge-regression fitting converts them
     # into a causal GMP that can be evaluated on subsequent Wi-Fi packets.
@@ -575,7 +644,11 @@ def Main() -> int:
         deployedDpdInput[overLimit] *= (
             arguments.maxAmplitude / deployedMagnitude[overLimit]
         )
-    deployedDpdOutput = paModel.Process(deployedDpdInput)
+    deployedDpdOutputRaw = paModel.Process(deployedDpdInput)
+    deployedDpdOutput = powerCalibration.ScaleSignalToOutputPowers(
+        deployedDpdOutputRaw,
+        outputPowerDbmPerChain,
+    )
 
     resultAnalysis.AnalyzeStages(
         {
@@ -591,18 +664,38 @@ def Main() -> int:
         f"{waveform.numTransmitAntennas} PA chain(s) | PA {paModelName}\n"
     )
     print(
-        f"Configured PA input power: {inputPowerDbm:.2f} dBm "
-        f"({inputDriveRms:.6f} V RMS into "
-        f"{powerCalibration.loadResistanceOhm:g} ohms)\n"
-    )
-    if isinstance(paModel, MimoPaModel):
-        outputPowerText = ", ".join(
-            f"PA {chainIndex + 1}={outputPowerDbm:.2f} dBm"
-            for chainIndex, outputPowerDbm in enumerate(
-                paModel.GetOutputPowerDbmPerChain()
+        "Configured PA output targets: "
+        + ", ".join(
+            f"PA {chainIndex + 1}={targetPowerDbm:.2f} dBm"
+            for chainIndex, targetPowerDbm in enumerate(
+                outputPowerDbmPerChain
             )
         )
-        print(f"Latest independent PA outputs: {outputPowerText}\n")
+        + (
+            f" | rated maximum "
+            f"{powerCalibration.maximumOutputPowerDbm:.2f} dBm\n"
+        )
+    )
+    print(
+        "Normalized output-backoff drive scales: "
+        + ", ".join(
+            f"PA {chainIndex + 1}={driveScale:.6f}"
+            for chainIndex, driveScale in enumerate(
+                driveScalePerChain
+            )
+        )
+        + "\n"
+    )
+    print(
+        "Measured baseline PA output powers: "
+        + ", ".join(
+            f"PA {chainIndex + 1}={measuredPowerDbm:.2f} dBm"
+            for chainIndex, measuredPowerDbm in enumerate(
+                baselineOutputPowerDbmPerChain
+            )
+        )
+        + "\n"
+    )
     resultAnalysis.Print()
     if waveform.numTransmitAntennas > 1:
         resultAnalysis.PrintMimo()
@@ -653,60 +746,31 @@ def Main() -> int:
                 )
             )
         ),
-        "paTargetOutputRmsPerChain": (
-            None
-            if not isinstance(paModel, MimoPaModel)
-            else list(
-                paModel.ResolveNumericSequence(
-                    "targetOutputRmsPerChain",
-                    0.0,
-                    allowNoneEntries=True,
-                )
-            )
+        "paTargetOutputRmsPerChain": [
+            powerCalibration.DbmToRms(targetOutputPowerDbm)
+            for targetOutputPowerDbm in outputPowerDbmPerChain
+        ],
+        "paTargetOutputPowerDbmPerChain": list(
+            outputPowerDbmPerChain
         ),
-        "paTargetOutputPowerDbmPerChain": (
-            None
-            if not isinstance(paModel, MimoPaModel)
-            else [
-                targetOutputPowerDbm
-                if targetOutputPowerDbm is not None
-                else (
-                    None
-                    if targetOutputRms is None
-                    else powerCalibration.RmsToDbm(targetOutputRms)
-                )
-                for targetOutputRms, targetOutputPowerDbm in zip(
-                    paModel.ResolveNumericSequence(
-                        "targetOutputRmsPerChain",
-                        0.0,
-                        allowNoneEntries=True,
-                    ),
-                    paModel.ResolveNumericSequence(
-                        "targetOutputPowerDbmPerChain",
-                        0.0,
-                        allowNoneEntries=True,
-                    ),
-                )
-            ]
+        "normalizedDriveScalePerChain": (
+            driveScalePerChain.tolist()
         ),
-        "paMeasuredOutputRmsPerChain": (
-            None
-            if not isinstance(paModel, MimoPaModel)
-            else list(paModel.GetOutputRmsPerChain())
+        "maximumOutputPowerDbm": (
+            powerCalibration.maximumOutputPowerDbm
         ),
-        "paMeasuredOutputPowerDbmPerChain": (
-            None
-            if not isinstance(paModel, MimoPaModel)
-            else list(paModel.GetOutputPowerDbmPerChain())
-        ),
-        "inputPowerDbm": inputPowerDbm,
-        "inputDriveRmsVoltage": inputDriveRms,
         "loadResistanceOhm": powerCalibration.loadResistanceOhm,
         "baselineOutputPowerDbm": powerCalibration.RmsToDbm(
             baselineOutputRms
         ),
-        "powerStartDbm": powerStartDbm,
-        "powerStopDbm": powerStopDbm,
+        "baselineTotalOutputPowerDbm": powerCalibration.RmsToDbm(
+            baselineOutputRms
+        ),
+        "baselineOutputPowerDbmPerChain": (
+            baselineOutputPowerDbmPerChain
+        ),
+        "outputPowerStartDbm": powerStartDbm,
+        "outputPowerStopDbm": powerStopDbm,
         "powerPointCount": arguments.powerPointCount,
         "generatePowerEvmCurve": not arguments.skipPowerEvmCurve,
         "ilcIterations": arguments.numIterations,
@@ -734,7 +798,7 @@ def Main() -> int:
     if not arguments.skipPowerEvmCurve:
         # Every power point constructs its own Analysis context. Performance
         # reporting therefore remains independent of the ILC configuration.
-        inputPowerDbmValues = np.linspace(
+        outputPowerDbmValues = np.linspace(
             powerStartDbm,
             powerStopDbm,
             arguments.powerPointCount,
@@ -768,7 +832,7 @@ def Main() -> int:
                 ).outputSignal
             )
         resultAnalysis.AnalyzePowerEvmCurve(
-            inputPowerDbmValues, methodEvaluators
+            outputPowerDbmValues, methodEvaluators
         )
         powerEvmCurve = resultAnalysis.powerEvmCurve
         powerDataPaths = resultAnalysis.SavePowerEvmCurveData(
