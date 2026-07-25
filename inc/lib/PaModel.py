@@ -21,11 +21,20 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
-from ..utils.ConfigUtils import (
-    FilterRecognizedParameters,
-    RecognizedParameterView,
-)
-from ..utils.SigProc import PowerCalibration
+# Cross-package imports support canonical ``inc.lib`` and compatibility
+# ``lib`` package entry points without relying on a parent that may not exist.
+if __package__ and "." in __package__:
+    from ..utils.ConfigUtils import (
+        FilterRecognizedParameters,
+        RecognizedParameterView,
+    )
+    from ..utils.SigProc import PowerCalibration
+else:
+    from utils.ConfigUtils import (
+        FilterRecognizedParameters,
+        RecognizedParameterView,
+    )
+    from utils.SigProc import PowerCalibration
 
 
 @dataclass(frozen=True)

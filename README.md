@@ -45,6 +45,26 @@ doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整�
 
 所有代码注释与文档字符串均为英文；除 Python 协议强制要求的 `__init__` 等双下划线方法外，所有函数（包括内部辅助函数）都使用大驼峰命名。变量和对外对象属性使用小驼峰命名；属性底层访问器使用大驼峰函数名，并通过小驼峰属性别名保持调用接口一致。
 
+### Python导入方式
+
+推荐从工程根目录使用完整包名：
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.ParseWifi import ParseWifi
+from inc.lib.WaveGenWifi import WaveGenWifi
+```
+
+为兼容把 `inc` 目录加入 `sys.path` 的既有工程，也支持：
+
+```python
+from lib.Analysis import Analysis
+from lib.ParseWifi import ParseWifi
+from lib.WaveGenWifi import WaveGenWifi
+```
+
+`lib` 与 `utils` 之间的跨包导入会根据当前包层级选择对应路径，因此第二种方式不会再触发 `attempted relative import beyond top-level package`。推荐方式仍是 `inc.lib.*`，因为它不需要调用方手动修改 `sys.path`。
+
 ## 工程工作流程图
 
 ```mermaid

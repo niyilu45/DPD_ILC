@@ -6,6 +6,7 @@ import inspect
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import warnings
@@ -322,6 +323,24 @@ def CheckModuleResponsibilityBoundaries() -> None:
     assert (
         "from .ParseWifi import BuildWifiDescriptorField"
         in waveGeneratorSource
+    )
+    compatibilityImportCode = (
+        "from lib.ParseWifi import ParseWifi; "
+        "from lib.Analysis import Analysis; "
+        "from lib.WaveGenWifi import WaveGenWifi; "
+        "from lib.PaModel import PaModel; "
+        "from utils.Draw import Draw"
+    )
+    compatibilityImportResult = subprocess.run(
+        [sys.executable, "-c", compatibilityImportCode],
+        cwd=projectRoot / "inc",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert compatibilityImportResult.returncode == 0, (
+        "top-level lib/utils compatibility imports failed: "
+        f"{compatibilityImportResult.stderr}"
     )
     assert "from ..utils.SigProc import" in analysisSource
     assert "from ..utils.FrameProcess import FrameProcess" in analysisSource

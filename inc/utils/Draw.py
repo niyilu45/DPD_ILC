@@ -7,11 +7,17 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
-from ..lib.Analysis import PowerEvmCurve
 from .ConfigUtils import (
     FilterRecognizedParameters,
     RecognizedParameterView,
 )
+
+# Support ``inc.utils`` and the compatibility ``utils`` package used when
+# callers place the ``inc`` directory on sys.path.
+if __package__ and "." in __package__:
+    from ..lib.Analysis import PowerEvmCurve
+else:
+    from lib.Analysis import PowerEvmCurve
 
 
 class Draw:

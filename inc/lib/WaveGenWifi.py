@@ -19,13 +19,24 @@ from typing import Dict, Mapping, Optional, Tuple, cast
 
 import numpy as np
 
-from ..utils.ConfigUtils import (
-    FilterRecognizedParameters,
-    RecognizedParameterView,
-)
-from ..utils.FrameProcess import BuildCsdPhaseMatrix
 from .ParseWifi import BuildWifiDescriptorField
-from ..utils.WifiMetadata import MCSInfo, WifiWaveform
+
+# Cross-package imports support canonical ``inc.lib`` and compatibility
+# ``lib`` package entry points without relying on a parent that may not exist.
+if __package__ and "." in __package__:
+    from ..utils.ConfigUtils import (
+        FilterRecognizedParameters,
+        RecognizedParameterView,
+    )
+    from ..utils.FrameProcess import BuildCsdPhaseMatrix
+    from ..utils.WifiMetadata import MCSInfo, WifiWaveform
+else:
+    from utils.ConfigUtils import (
+        FilterRecognizedParameters,
+        RecognizedParameterView,
+    )
+    from utils.FrameProcess import BuildCsdPhaseMatrix
+    from utils.WifiMetadata import MCSInfo, WifiWaveform
 
 
 def NormalizeFrameFormat(frameFormat: str) -> str:

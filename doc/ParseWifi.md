@@ -623,6 +623,8 @@ metrics = resultAnalysis.Analyze(
 )
 ```
 
+如果既有脚本把工程的 `inc` 目录加入了 `sys.path`，也可以使用 `from lib.ParseWifi import ParseWifi`。模块内部会自动选择与当前包层级匹配的 `utils` 导入路径，避免相对导入越过顶层包。新代码仍推荐使用完整的 `inc.lib.ParseWifi` 包名。
+
 ---
 
 ## 9. ParsedWifiFrame字段

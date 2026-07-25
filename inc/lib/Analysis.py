@@ -20,14 +20,34 @@ from typing import (
 
 import numpy as np
 
-from ..utils.ConfigUtils import (
-    FilterRecognizedParameters,
-    RecognizedParameterView,
-)
-from ..utils.FrameProcess import FrameProcess
 from .ParseWifi import ParsedWifiFrame, ParseWifi
-from ..utils.SigProc import PowerCalibration, SigProc, SignalProcessingResult
-from ..utils.WifiMetadata import WifiWaveform
+
+# Cross-package imports support ``inc.lib`` from the repository root and
+# ``lib`` when the caller places the ``inc`` directory on sys.path.
+if __package__ and "." in __package__:
+    from ..utils.ConfigUtils import (
+        FilterRecognizedParameters,
+        RecognizedParameterView,
+    )
+    from ..utils.FrameProcess import FrameProcess
+    from ..utils.SigProc import (
+        PowerCalibration,
+        SignalProcessingResult,
+        SigProc,
+    )
+    from ..utils.WifiMetadata import WifiWaveform
+else:
+    from utils.ConfigUtils import (
+        FilterRecognizedParameters,
+        RecognizedParameterView,
+    )
+    from utils.FrameProcess import FrameProcess
+    from utils.SigProc import (
+        PowerCalibration,
+        SignalProcessingResult,
+        SigProc,
+    )
+    from utils.WifiMetadata import WifiWaveform
 
 
 class SignalMetrics(TypedDict):

@@ -26,11 +26,21 @@ from typing import (
 
 import numpy as np
 
-from ..utils.ConfigUtils import (
-    FilterRecognizedParameters,
-    RecognizedParameterView,
-)
-from ..utils.WifiMetadata import WifiWaveform
+# Support both the canonical ``inc.lib`` package and the compatibility
+# ``lib`` package used when callers place the ``inc`` directory on sys.path.
+# Selecting by package depth avoids catching unrelated import failures.
+if __package__ and "." in __package__:
+    from ..utils.ConfigUtils import (
+        FilterRecognizedParameters,
+        RecognizedParameterView,
+    )
+    from ..utils.WifiMetadata import WifiWaveform
+else:
+    from utils.ConfigUtils import (
+        FilterRecognizedParameters,
+        RecognizedParameterView,
+    )
+    from utils.WifiMetadata import WifiWaveform
 
 
 @dataclass(frozen=True)
