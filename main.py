@@ -15,9 +15,9 @@ from inc.DpdIlc import (
 )
 from inc.Draw import Draw
 from inc.PaModel import MimoPaModel, PaModel, PowerCalibration
-from inc.waveGen import (
-    GenWifi,
+from inc.WaveGenWifi import (
     NormalizeFrameFormat,
+    WaveGenWifi,
 )
 
 
@@ -405,7 +405,7 @@ def Main() -> int:
             "--pa-output-rms and --pa-output-power-dbm are mutually exclusive"
         )
 
-    # Only explicitly supplied CLI values are passed to the object. GenWifi
+    # Only explicitly supplied CLI values are passed to the object. WaveGenWifi
     # and PaModel add their immutable default layers internally.
     wifiArgumentNames = (
         "frameFormat",
@@ -431,7 +431,7 @@ def Main() -> int:
         else {"modelName": arguments.paModelName}
     )
     try:
-        wifiGenerator = GenWifi(parameters=wifiOverrides)
+        wifiGenerator = WaveGenWifi(parameters=wifiOverrides)
         useMimoPaFacade = wifiGenerator.numTransmitAntennas > 1 or any(
             value is not None
             for value in (

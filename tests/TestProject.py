@@ -38,9 +38,9 @@ from inc.DpdIlc import (
 from inc.Draw import Draw
 from inc.PaModel import MimoPaModel, PaModel, PowerCalibration
 from inc.SigProcess import SigProcess
-from inc.waveGen import (
-    GenWifi,
+from inc.WaveGenWifi import (
     NormalizeFrameFormat,
+    WaveGenWifi,
 )
 
 
@@ -54,7 +54,7 @@ def CheckMcsTables() -> None:
         result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
     """
 
-    wifiGenerator = GenWifi()
+    wifiGenerator = WaveGenWifi()
     ehtMcsTable = wifiGenerator.ResolveMcsTable("EHT")
     heMcsTable = wifiGenerator.ResolveMcsTable("HE")
     vhtMcsTable = wifiGenerator.ResolveMcsTable("VHT")
@@ -95,7 +95,7 @@ def CheckFrameFormatAliases() -> None:
     for inputName, expectedFormat in aliasExpectations.items():
         assert NormalizeFrameFormat(inputName) == expectedFormat
         maximumMcs = {"VHT": 9, "HE": 11, "EHT": 13}[expectedFormat]
-        waveform = GenWifi(
+        waveform = WaveGenWifi(
             frameFormat=inputName,
             bandwidthMhz=20,
             mcs=maximumMcs,
@@ -528,7 +528,7 @@ def CheckInternalDefaultConfiguration() -> None:
         "numDataSymbols": 1,
         "oversampling": 4,
     }
-    wifiGenerator = GenWifi(parameters=externalWifiParameters)
+    wifiGenerator = WaveGenWifi(parameters=externalWifiParameters)
     assert wifiGenerator.frameFormat == "EHT"
     assert wifiGenerator.seed == 7
 
@@ -557,7 +557,7 @@ def CheckInternalDefaultConfiguration() -> None:
     assert paModel.model.__class__.__name__ == "GMPPA"
 
     analysisParameters = {"maxSegmentLength": 1024}
-    analysisWaveform = GenWifi(
+    analysisWaveform = WaveGenWifi(
         parameters={
             "bandwidthMhz": 20,
             "mcs": 0,
@@ -642,7 +642,7 @@ def CheckWifiFormats() -> None:
         ),
     }
     for frameFormat, expectedFields in formatExpectations.items():
-        wifiGenerator = GenWifi(
+        wifiGenerator = WaveGenWifi(
             frameFormat=frameFormat,
             bandwidthMhz=20,
             mcs=0,
@@ -701,7 +701,7 @@ def CheckWifiBandwidths() -> None:
             dataToneCount,
             pilotToneCount,
         ) in expectedValues.items():
-            wifiGenerator = GenWifi(
+            wifiGenerator = WaveGenWifi(
                 frameFormat=frameFormat,
                 bandwidthMhz=bandwidthMhz,
                 mcs=0,
@@ -728,7 +728,7 @@ def CheckSampleRateConfiguration() -> None:
         regressions before waveform metadata reaches analysis or ILC.
     """
 
-    ehtWaveform = GenWifi(
+    ehtWaveform = WaveGenWifi(
         frameFormat="EHT",
         bandwidthMhz=20,
         mcs=7,
@@ -741,7 +741,7 @@ def CheckSampleRateConfiguration() -> None:
     assert ehtWaveform.fftLength == 640
     assert ehtWaveform.cpLength == 40
 
-    vhtWaveform = GenWifi(
+    vhtWaveform = WaveGenWifi(
         frameFormat="VHT",
         bandwidthMhz=20,
         mcs=7,
@@ -754,7 +754,7 @@ def CheckSampleRateConfiguration() -> None:
     assert vhtWaveform.fftLength == 96
     assert vhtWaveform.cpLength == 12
 
-    legacyGenerator = GenWifi(
+    legacyGenerator = WaveGenWifi(
         bandwidthMhz=20,
         mcs=0,
         numDataSymbols=1,
@@ -764,7 +764,7 @@ def CheckSampleRateConfiguration() -> None:
     assert legacyGenerator.GetParameters()["sampleRateHz"] == 60.0e6
 
     try:
-        GenWifi(
+        WaveGenWifi(
             frameFormat="EHT",
             bandwidthMhz=20,
             sampleRateHz=61.44e6,
@@ -795,7 +795,7 @@ def CheckMimoSpatialStructure() -> None:
         ("EHT", 4, 4, 4),
     )
     for frameFormat, transmitCount, streamCount, ltfCount in formatCases:
-        waveform = GenWifi(
+        waveform = WaveGenWifi(
             frameFormat=frameFormat,
             bandwidthMhz=20,
             mcs=3,
@@ -834,13 +834,13 @@ def CheckMimoSpatialStructure() -> None:
     # Standard-generation stream limits are enforced independently from the
     # number of physical antennas available to the caller.
     for frameFormat in ("VHT", "HE", "EHT"):
-        GenWifi(
+        WaveGenWifi(
             frameFormat=frameFormat,
             numTransmitAntennas=8,
             numSpatialStreams=8,
         )
         try:
-            GenWifi(
+            WaveGenWifi(
                 frameFormat=frameFormat,
                 numTransmitAntennas=9,
                 numSpatialStreams=9,
@@ -897,7 +897,7 @@ def CheckMimoPaAndDpd() -> None:
         atol=1e-12,
     )
 
-    waveform = GenWifi(
+    waveform = WaveGenWifi(
         frameFormat="EHT",
         bandwidthMhz=20,
         mcs=2,
@@ -938,21 +938,23 @@ def CheckFormatSpecificMcsValidation() -> None:
     """
 
     try:
-        GenWifi(frameFormat="HE", mcs=12).Generate()
+        WaveGenWifi(frameFormat="HE", mcs=12).Generate()
     except ValueError as error:
         assert "HE MCS" in str(error)
     else:
         raise AssertionError("HE MCS 12 must be rejected")
 
     try:
-        GenWifi(frameFormat="11ac", mcs=10).Generate()
+        WaveGenWifi(frameFormat="11ac", mcs=10).Generate()
     except ValueError as error:
         assert "VHT MCS" in str(error)
     else:
         raise AssertionError("VHT MCS 10 must be rejected")
 
     try:
-        GenWifi(frameFormat="VHT", mcs=9, guardIntervalUs=1.6).Generate()
+        WaveGenWifi(
+            frameFormat="VHT", mcs=9, guardIntervalUs=1.6
+        ).Generate()
     except ValueError as error:
         assert "VHT guardIntervalUs" in str(error)
     else:
@@ -970,7 +972,7 @@ def CheckIdealMetrics() -> None:
     """
 
     for frameFormat, mcs in (("EHT", 13), ("HE", 11), ("VHT", 9)):
-        wifiGenerator = GenWifi(
+        wifiGenerator = WaveGenWifi(
             frameFormat=frameFormat,
             mcs=mcs,
             numDataSymbols=4,
@@ -997,7 +999,7 @@ def CheckSignalProcessingCompensation() -> None:
         result: None. Assertions bound estimator error and residual EVM.
     """
 
-    waveform = GenWifi(
+    waveform = WaveGenWifi(
         frameFormat="EHT",
         bandwidthMhz=20,
         mcs=9,
@@ -1107,7 +1109,7 @@ def CheckPowerEvmCurve() -> None:
         result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
     """
 
-    wifiGenerator = GenWifi(
+    wifiGenerator = WaveGenWifi(
         frameFormat="EHT",
         bandwidthMhz=20,
         mcs=7,
@@ -1194,7 +1196,7 @@ def CheckGuardIntervals() -> None:
     expectedLtfDurationUs = {0.8: 13.6, 1.6: 8.0, 3.2: 16.0}
     for frameFormat in ("EHT", "HE"):
         for guardIntervalUs, ltfDurationUs in expectedLtfDurationUs.items():
-            wifiGenerator = GenWifi(
+            wifiGenerator = WaveGenWifi(
                 frameFormat=frameFormat,
                 bandwidthMhz=20,
                 mcs=0,
@@ -1210,7 +1212,7 @@ def CheckGuardIntervals() -> None:
             )
 
     for guardIntervalUs in (0.4, 0.8):
-        waveform = GenWifi(
+        waveform = WaveGenWifi(
             frameFormat="11ac",
             bandwidthMhz=20,
             mcs=9,
@@ -1238,7 +1240,7 @@ def CheckIlcImprovement() -> None:
         result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
     """
 
-    wifiGenerator = GenWifi(
+    wifiGenerator = WaveGenWifi(
         frameFormat="HE",
         bandwidthMhz=20,
         mcs=7,
@@ -1282,7 +1284,7 @@ def CheckMseEvmConvergence() -> None:
         result: None. Assertions enforce metric identities and file content.
     """
 
-    waveform = GenWifi(
+    waveform = WaveGenWifi(
         frameFormat="EHT",
         bandwidthMhz=20,
         mcs=5,

@@ -1,10 +1,10 @@
 # DPD-ILC VHT/HE/EHT Wi-Fi 仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `GenWifi` 实例生成 802.11ac/VHT、802.11ax/HE 或 802.11be/EHT Wi-Fi 复基带训练波形，支持 1–8 条空间流及物理发射链，经每路独立的 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以每路 GMP 拟合可复用的 DPD，并输出汇总及逐 PA/逐空间流 SNR、EVM、ACLR，以及多方法功率-EVM 对比曲线。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `WaveGenWifi` 实例生成 802.11ac/VHT、802.11ax/HE 或 802.11be/EHT Wi-Fi 复基带训练波形，支持 1–8 条空间流及物理发射链，经每路独立的 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以每路 GMP 拟合可复用的 DPD，并输出汇总及逐 PA/逐空间流 SNR、EVM、ACLR，以及多方法功率-EVM 对比曲线。
 
 ## 理论文档
 
-- [Wi-Fi 帧生成物理原理与推导](doc/WaveGen.md)：复基带、OFDM 正交性、QAM 归一化、MCS、循环前缀、VHT/HE/EHT 字段和 PAPR。
+- [Wi-Fi 帧生成物理原理与推导](doc/WaveGenWifi.md)：复基带、OFDM 正交性、QAM 归一化、MCS、循环前缀、VHT/HE/EHT 字段和 PAPR。
 - [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、Rapp AM-AM、AM-PM、GMP、频谱再生、IQ 失衡和反馈噪声。
 - [信号同步与补偿物理原理](doc/SigProcess.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样和复增益补偿。
 - [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
@@ -23,7 +23,7 @@ python -m pip install -r requirements.txt
 
 ```text
 main.py                 命令行主程序
-inc/waveGen.py          GenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
+inc/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
 inc/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
 inc/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
 inc/SigProcess.py       时延、载波/采样频偏和复增益估计与补偿
@@ -42,9 +42,9 @@ doc/BenchMark.md        各 benchmark 场景的构造、预期和参考仿真结
 ```mermaid
 flowchart TD
     start["main.py：解析命令行参数"] --> overrideMap["仅收集调用方显式覆盖参数"]
-    overrideMap --> wifiGenerator["创建 GenWifi；类内追加默认参数层"]
-    wifiGenerator --> waveGen["GenWifi.Generate"]
-    waveGen --> streams["独立空间流：QAM / pilots / LTF"]
+    overrideMap --> wifiGenerator["创建 WaveGenWifi；类内追加默认参数层"]
+    wifiGenerator --> waveGenWifi["WaveGenWifi.Generate"]
+    waveGenWifi --> streams["独立空间流：QAM / pilots / LTF"]
     streams --> spatialMap["空间映射 Q + 每链 CSD"]
     spatialMap --> reference["samples × TX chains 参考矩阵 S 与帧元数据"]
 
@@ -61,7 +61,7 @@ flowchart TD
     learnedInput --> deployFit["拟合 MP / GMP / Volterra / LUT / NN"]
     deployFit --> deployedDpd["可复用 DPD 模型"]
 
-    waveGen --> validation["生成独立验证 VHT/HE/EHT 帧"]
+    waveGenWifi --> validation["生成独立验证 VHT/HE/EHT 帧"]
     validation --> deployedDpd
     deployedDpd --> predistortedInput["DPD 输出"]
     predistortedInput --> paImplementation
@@ -96,8 +96,8 @@ flowchart TD
 
 **图示说明：**
 
-1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `GenWifi`、`PaModel`、`Analysis` 和 `Draw`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
-2. 调用 `GenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
+1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `WaveGenWifi`、`PaModel`、`Analysis` 和 `Draw`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
+2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
 3. `MimoPaModel` 为每个矩阵列建立独立 PA，可分别设置输入驱动增益 dB、相对输出功率 dB 或绝对输出功率 dBm。`PowerCalibration` 按用户配置的端口电阻把 dBm 换算成 PA 模型使用的复包络 RMS 电压。单方案模式对每个 PA 独立执行正则化频域 ILC，再对各路 ILC 标签分别拟合 GMP；全方案基准当前仅用于 SISO。
 4. 收敛后的 `u*` 可直接用于重复波形测试，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN，从而形成可用于其他帧的部署模型。
 5. 所有输出最终传给同一个 `Analysis` 实例；MIMO 时每条物理链分别调用 `SigProcess` 完成整数/分数时延、载波频偏、采样频偏和复增益补偿。ACLR 对各链 PSD 求和形成汇总值，同时保留每链结果；EVM 在撤销 CSD 和空间映射后按空间流统计。`AnalyzePowerEvmCurve` 在多个绝对 dBm 输入功率点调用各方法，生成不包含绘图逻辑的 `PowerEvmCurve` 数据对象。
@@ -109,16 +109,16 @@ flowchart TD
 
 以下结构图中，箭头 `A → B` 表示 `A` 调用、创建或依赖 `B`；以类名标记的节点保存配置或运行状态，以函数名标记的节点执行具体算法。
 
-### `inc/waveGen.py`
+### `inc/WaveGenWifi.py`
 
 ```mermaid
 flowchart TD
-    caller["调用方"] --> config["构造 GenWifi 实例"]
+    caller["调用方"] --> config["构造 WaveGenWifi 实例"]
     config --> normalize["NormalizeFrameFormat"]
-    normalize --> validate["GenWifi.Validate"]
-    config --> mcs["GenWifi.GetMcsInfo"]
-    config --> generate["GenWifi.Generate"]
-    mcs --> resolveMcs["GenWifi.ResolveMcsTable：方法内局部不可变表"]
+    normalize --> validate["WaveGenWifi.Validate"]
+    config --> mcs["WaveGenWifi.GetMcsInfo"]
+    config --> generate["WaveGenWifi.Generate"]
+    mcs --> resolveMcs["WaveGenWifi.ResolveMcsTable：方法内局部不可变表"]
     resolveMcs --> vhtTable["VHT：MCS 0–9"]
     resolveMcs --> ehtTable["EHT：MCS 0–13"]
     resolveMcs --> heTable["HE：MCS 0–11"]
@@ -151,12 +151,12 @@ flowchart TD
 
 **图示说明：**
 
-- 调用方必须先构造 `GenWifi`，再调用实例方法；`NormalizeFrameFormat` 先把 `11ac/11ax/11be` 等效归一化为 `VHT/HE/EHT`，`GenWifi.Validate` 再检查带宽、格式对应的 MCS 范围、GI、符号数和采样率兼容性。
-- `GenWifi.GetMcsInfo` 调用 `GenWifi.ResolveMcsTable`，在方法内部构造局部不可变 MCS 表并根据规范化后的 `frameFormat` 选择范围；VHT 支持 MCS 0–9、HE 支持 MCS 0–11、EHT 支持 MCS 0–13，不使用模块级查表变量。
+- 调用方必须先构造 `WaveGenWifi`，再调用实例方法；`NormalizeFrameFormat` 先把 `11ac/11ax/11be` 等效归一化为 `VHT/HE/EHT`，`WaveGenWifi.Validate` 再检查带宽、格式对应的 MCS 范围、GI、符号数和采样率兼容性。
+- `WaveGenWifi.GetMcsInfo` 调用 `WaveGenWifi.ResolveMcsTable`，在方法内部构造局部不可变 MCS 表并根据规范化后的 `frameFormat` 选择范围；VHT 支持 MCS 0–9、HE 支持 MCS 0–11、EHT 支持 MCS 0–13，不使用模块级查表变量。
 - `ActiveTones` 与 `PilotTones` 决定不同带宽下的数据、导频和空子载波位置；`QamModulate` 完成 Gray 编码星座映射。
 - `BuildSpatialMappingMatrix` 产生 direct、DFT 或调用方自定义的正交映射；`SpatialMapTones` 为每个子载波执行空间映射并叠加 CSD，`BuildMimoOfdmSymbol` 再完成各发射链 IFFT 和循环前缀。
 - `BuildLtfTrainingMatrix` 产生跨 LTF 符号的正交训练码；LTF 数量随空间流增加。公共字段由 `MapCommonFieldToAntennas` 复制到各链并保留 CSD。
-- `GenWifi.Generate` 是面向调用方的波形入口，并由内部辅助函数 `GenerateWifiWaveform` 完成组帧，最终返回 `WifiWaveform`；其中既有时域样本，也有后续 EVM 解调所需的格式、字段切片和参考星座。
+- `WaveGenWifi.Generate` 是面向调用方的波形入口，并由内部辅助函数 `GenerateWifiWaveform` 完成组帧，最终返回 `WifiWaveform`；其中既有时域样本，也有后续 EVM 解调所需的格式、字段切片和参考星座。
 
 ### `inc/PaModel.py`
 
@@ -395,7 +395,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    init["inc/__init__.py"] --> waveApi["GenWifi / WifiWaveform / MCSInfo"]
+    init["inc/__init__.py"] --> waveApi["WaveGenWifi / WifiWaveform / MCSInfo"]
     init --> paApi["PaModel / MimoPaModel / WienerPA / GMPPA"]
     init --> signalApi["SigProcess / SignalProcessingResult"]
     init --> analysisApi["Analysis / SignalMetrics / MimoSignalMetrics"]
@@ -494,13 +494,13 @@ flowchart LR
 | `--output-dir` | 路径 | `results` | JSON、CSV、收敛历史和可选波形文件的输出目录。 |
 | `--save-waveforms` | 开关 | 关闭 | 额外保存 `waveforms.npz`。 |
 
-### `GenWifi` 参数
+### `WaveGenWifi` 参数
 
-调用方先构造 `GenWifi(...)`，再调用 `Generate()`。
+调用方先构造 `WaveGenWifi(...)`，再调用 `Generate()`。
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `GenWifi` 构造函数内部的不可变默认参数补齐。 |
+| `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `WaveGenWifi` 构造函数内部的不可变默认参数补齐。 |
 | `frameFormat` | `"VHT"/"11ac"`、`"HE"/"11ax"`、`"EHT"/"11be"`，并接受带 `802.` 前缀的名称 | `"EHT"` | 不区分大小写；生成后规范化为 VHT、HE 或 EHT。 |
 | `bandwidthMhz` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
 | `mcs` | VHT：`0–9`；HE：`0–11`；EHT：`0–13` | `9` | MCS 索引；默认值对三种格式都有效。 |
@@ -520,7 +520,9 @@ flowchart LR
 `sampleRateHz` 是采样时钟的权威输入。例如：
 
 ```python
-wifiGenerator = GenWifi(
+from inc.WaveGenWifi import WaveGenWifi
+
+wifiGenerator = WaveGenWifi(
     frameFormat="EHT",
     bandwidthMhz=20,
     sampleRateHz=50.0e6,
@@ -776,7 +778,7 @@ PA 辅助接口还包括：
 
 ## 默认参数由类内部 ChainMap 管理
 
-`GenWifi`、`PaModel`、`MimoPaModel`、`Analysis` 和 `Draw` 都在各自构造函数内部定义不可变默认参数，并在内部建立 `ChainMap`。调用方不导入默认参数表，也不显式构造 `ChainMap`，只传需要修改的普通字典。解析优先级为：
+`WaveGenWifi`、`PaModel`、`MimoPaModel`、`Analysis` 和 `Draw` 都在各自构造函数内部定义不可变默认参数，并在内部建立 `ChainMap`。调用方不导入默认参数表，也不显式构造 `ChainMap`，只传需要修改的普通字典。解析优先级为：
 
 ```text
 构造函数关键字或 UpdateParameters 覆盖
@@ -792,7 +794,7 @@ PA 辅助接口还包括：
 from inc.Analysis import Analysis
 from inc.Draw import Draw
 from inc.PaModel import PaModel
-from inc.waveGen import GenWifi
+from inc.WaveGenWifi import WaveGenWifi
 
 # Only externally changed values are placed in the first mapping.
 wifiOverrides = {
@@ -800,7 +802,7 @@ wifiOverrides = {
     "mcs": 9,
     "numDataSymbols": 12,
 }
-wifiGenerator = GenWifi(parameters=wifiOverrides)
+wifiGenerator = WaveGenWifi(parameters=wifiOverrides)
 firstWaveform = wifiGenerator.Generate()
 
 # The existing instance sees this external change on the next Generate call.
@@ -885,9 +887,9 @@ python main.py --format EHT --bandwidth 20 --tx-antennas 4 --spatial-streams 2 -
 ```python
 from inc.Analysis import Analysis
 from inc.PaModel import MimoPaModel, PowerCalibration
-from inc.waveGen import GenWifi
+from inc.WaveGenWifi import WaveGenWifi
 
-wifiGenerator = GenWifi(
+wifiGenerator = WaveGenWifi(
     frameFormat="11ax",
     bandwidthMhz=40,
     mcs=9,
@@ -932,9 +934,9 @@ resultAnalysis.PrintMimo()
 ```python
 from inc.Analysis import Analysis
 from inc.PaModel import PaModel
-from inc.waveGen import GenWifi
+from inc.WaveGenWifi import WaveGenWifi
 
-wifiGenerator = GenWifi(
+wifiGenerator = WaveGenWifi(
     parameters={
         "frameFormat": "11ax",
         "bandwidthMhz": 80,
@@ -967,9 +969,9 @@ print(resultAnalysis.GetLastSignalProcessingResult().ToDict())
 
 ```python
 from inc.PaModel import PaModel, WienerConfig
-from inc.waveGen import GenWifi
+from inc.WaveGenWifi import WaveGenWifi
 
-wifiGenerator = GenWifi(
+wifiGenerator = WaveGenWifi(
     parameters={
         "frameFormat": "EHT",
         "bandwidthMhz": 20,
@@ -1002,9 +1004,9 @@ paOutput = paModel.Process(referenceSignal)
 from inc.Analysis import Analysis
 from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
 from inc.PaModel import PaModel
-from inc.waveGen import GenWifi
+from inc.WaveGenWifi import WaveGenWifi
 
-wifiGenerator = GenWifi(
+wifiGenerator = WaveGenWifi(
     parameters={
         "frameFormat": "EHT",
         "bandwidthMhz": 20,

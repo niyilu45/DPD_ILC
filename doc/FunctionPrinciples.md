@@ -19,7 +19,7 @@
 
 ```mermaid
 flowchart LR
-    wave["WaveGen.md：激励波形"] --> pa["PaModel.md：PA 与反馈链"]
+    wave["WaveGenWifi.md：激励波形"] --> pa["PaModel.md：PA 与反馈链"]
     pa --> ilc["DPD-ILC.md：学习与部署 DPD"]
     wave --> ilc
     ilc --> sync["SigProcess.md：同步与补偿"]
@@ -44,28 +44,28 @@ flowchart LR
 | `main.ParseOptionalDbmSequence` | E | 把每PA的绝对dBm目标解析为有限实数或 `None`；允许负dBm | [PaModel.md：多路输出功率](./PaModel.md) |
 | `main.Main` | E | 按“波形→PA→ILC→部署 DPD→同步→指标→绘图”编排；物理计算由被调用模块完成 | [README 工作流](../README.md)、图 1 |
 
-## 3. `waveGen.py`：Wi-Fi 波形函数
+## 3. `WaveGenWifi.py`：Wi-Fi 波形函数
 
-详细物理推导统一见 [WaveGen.md](./WaveGen.md)。
+详细物理推导统一见 [WaveGenWifi.md](./WaveGenWifi.md)。
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `waveGen.NormalizeFrameFormat` | E | 把 11ac/11ax/11be 别名规范为 VHT/HE/EHT，不改变波形 | WaveGen §8.1 |
-| `GenWifi.__init__`, `GenWifi.GetParameters`, `GenWifi.UpdateParameters`, `GenWifi.Validate` | E | ChainMap 配置、单位和合法域校验；保证后续公式输入有效 | WaveGen §12–14 |
-| `GenWifi.FrameFormat`, `GenWifi.BandwidthMhz`, `GenWifi.Mcs`, `GenWifi.NumDataSymbols`, `GenWifi.GuardIntervalUs`, `GenWifi.SampleRateHz`, `GenWifi.Oversampling`, `GenWifi.Seed`, `GenWifi.NumTransmitAntennas`, `GenWifi.NumSpatialStreams`, `GenWifi.SpatialMapping`, `GenWifi.SpatialMappingMatrix`, `GenWifi.CyclicShiftEnabled` | E | 返回已验证配置；采样率由 `sampleRateHz` 直接决定，旧 `oversampling` 只在未配置采样率时用于兼容推导 | WaveGen §12 |
-| `GenWifi.ResolveMcsTable`, `GenWifi.GetMcsInfo` | P/E | 在方法内部构造不可变 MCS 表并返回调制阶数、名义码率和每音调比特数，不保留模块级查表变量 | WaveGen §5 |
-| `GenWifi.Generate`, `waveGen.GenerateWifiWaveform` | P/E | 组装完整 VHT/HE/EHT 复基带帧并保存解调元数据 | WaveGen §2、§8、§10 |
-| `waveGen.ActiveTones`, `waveGen.PilotTones` | P | 依据 FFT 网格选择活动、数据和导频子载波 | WaveGen §4 |
-| `waveGen.GrayToBinary`, `waveGen.QamModulate` | P/N | Gray 标号转自然坐标，构造单位平均功率 BPSK/QAM | WaveGen §6 |
-| `waveGen.PilotSequence` | P/N | 生成可复现 BPSK 导频符号；用于相位/信道参考，本仿真不执行接收端导频跟踪 | WaveGen §4、§11 |
-| `waveGen.OfdmSymbol` | P/N | 子载波映射、IFFT、能量归一化和循环前缀 | WaveGen §3、§7 |
-| `waveGen.TrainingField` | P/N | 在 bonded 20 MHz 子信道上构造传统训练激励 | WaveGen §8.5 |
-| `waveGen.BuildSpatialMappingMatrix`, `waveGen.SpatialMapTones` | P/N | 构造列正交映射矩阵并完成空间流到天线映射 | WaveGen §8.7 |
-| `waveGen.GetLtfSymbolCount`, `waveGen.BuildLtfTrainingMatrix` | P/N | 选择训练符号数并用正交矩阵分离空间流 | WaveGen §8.6、§8.9 |
-| `waveGen.GetCyclicShifts`, `waveGen.BuildCsdPhaseMatrix` | P/N | 时移在频域表示为线性相位，形成循环移位分集 | WaveGen §8.8 |
-| `waveGen.BuildMimoOfdmSymbol` | P/N | 合并 QAM、导频、空间映射、CSD、IFFT 和 CP | WaveGen §3、§8.7–§8.9 |
-| `waveGen.MapCommonFieldToAntennas` | P/E | 把公共前导复制到物理链并施加链级 CSD，保持公共字段含义 | WaveGen §8.8、§8.10 |
-| `waveGen.AppendField` | E | 内部闭包：顺序拼接字段并记录切片，不改变字段采样值 | WaveGen §8.2–§8.5 |
+| `WaveGenWifi.NormalizeFrameFormat` | E | 把 11ac/11ax/11be 别名规范为 VHT/HE/EHT，不改变波形 | WaveGenWifi §8.1 |
+| `WaveGenWifi.__init__`, `WaveGenWifi.GetParameters`, `WaveGenWifi.UpdateParameters`, `WaveGenWifi.Validate` | E | ChainMap 配置、单位和合法域校验；保证后续公式输入有效 | WaveGenWifi §12–14 |
+| `WaveGenWifi.FrameFormat`, `WaveGenWifi.BandwidthMhz`, `WaveGenWifi.Mcs`, `WaveGenWifi.NumDataSymbols`, `WaveGenWifi.GuardIntervalUs`, `WaveGenWifi.SampleRateHz`, `WaveGenWifi.Oversampling`, `WaveGenWifi.Seed`, `WaveGenWifi.NumTransmitAntennas`, `WaveGenWifi.NumSpatialStreams`, `WaveGenWifi.SpatialMapping`, `WaveGenWifi.SpatialMappingMatrix`, `WaveGenWifi.CyclicShiftEnabled` | E | 返回已验证配置；采样率由 `sampleRateHz` 直接决定，旧 `oversampling` 只在未配置采样率时用于兼容推导 | WaveGenWifi §12 |
+| `WaveGenWifi.ResolveMcsTable`, `WaveGenWifi.GetMcsInfo` | P/E | 在方法内部构造不可变 MCS 表并返回调制阶数、名义码率和每音调比特数，不保留模块级查表变量 | WaveGenWifi §5 |
+| `WaveGenWifi.Generate`, `WaveGenWifi.GenerateWifiWaveform` | P/E | 组装完整 VHT/HE/EHT 复基带帧并保存解调元数据 | WaveGenWifi §2、§8、§10 |
+| `WaveGenWifi.ActiveTones`, `WaveGenWifi.PilotTones` | P | 依据 FFT 网格选择活动、数据和导频子载波 | WaveGenWifi §4 |
+| `WaveGenWifi.GrayToBinary`, `WaveGenWifi.QamModulate` | P/N | Gray 标号转自然坐标，构造单位平均功率 BPSK/QAM | WaveGenWifi §6 |
+| `WaveGenWifi.PilotSequence` | P/N | 生成可复现 BPSK 导频符号；用于相位/信道参考，本仿真不执行接收端导频跟踪 | WaveGenWifi §4、§11 |
+| `WaveGenWifi.OfdmSymbol` | P/N | 子载波映射、IFFT、能量归一化和循环前缀 | WaveGenWifi §3、§7 |
+| `WaveGenWifi.TrainingField` | P/N | 在 bonded 20 MHz 子信道上构造传统训练激励 | WaveGenWifi §8.5 |
+| `WaveGenWifi.BuildSpatialMappingMatrix`, `WaveGenWifi.SpatialMapTones` | P/N | 构造列正交映射矩阵并完成空间流到天线映射 | WaveGenWifi §8.7 |
+| `WaveGenWifi.GetLtfSymbolCount`, `WaveGenWifi.BuildLtfTrainingMatrix` | P/N | 选择训练符号数并用正交矩阵分离空间流 | WaveGenWifi §8.6、§8.9 |
+| `WaveGenWifi.GetCyclicShifts`, `WaveGenWifi.BuildCsdPhaseMatrix` | P/N | 时移在频域表示为线性相位，形成循环移位分集 | WaveGenWifi §8.8 |
+| `WaveGenWifi.BuildMimoOfdmSymbol` | P/N | 合并 QAM、导频、空间映射、CSD、IFFT 和 CP | WaveGenWifi §3、§8.7–§8.9 |
+| `WaveGenWifi.MapCommonFieldToAntennas` | P/E | 把公共前导复制到物理链并施加链级 CSD，保持公共字段含义 | WaveGenWifi §8.8、§8.10 |
+| `WaveGenWifi.AppendField` | E | 内部闭包：顺序拼接字段并记录切片，不改变字段采样值 | WaveGenWifi §8.2–§8.5 |
 
 ## 4. `PaModel.py`：PA、噪声和多路功率函数
 

@@ -54,7 +54,7 @@ from inc.DpdIlc import (
     RunScalarPIlc,
 )
 from inc.PaModel import IQImbalancePA, PaModel, PowerCalibration
-from inc.waveGen import GenWifi, WifiWaveform
+from inc.WaveGenWifi import WaveGenWifi, WifiWaveform
 
 
 # =============================================================================
@@ -90,7 +90,7 @@ class BenchmarkConfig:
             Algorithm: Reject nonphysical waveform or power settings before
             any long-running scenario starts. PHY-specific format, bandwidth,
             MCS, and guard-interval combinations are validated later by
-            ``GenWifi`` using the same configuration.
+            ``WaveGenWifi`` using the same configuration.
 
         Returns:
             result: None. Invalid settings raise ``ValueError`` with the
@@ -444,8 +444,8 @@ def RunAllIlcBenchmark(
     trainingParameters["seed"] = config.seed
     validationParameters = dict(sharedWifiParameters)
     validationParameters["seed"] = config.seed + 97
-    trainingGenerator = GenWifi(parameters=trainingParameters)
-    validationGenerator = GenWifi(parameters=validationParameters)
+    trainingGenerator = WaveGenWifi(parameters=trainingParameters)
+    validationGenerator = WaveGenWifi(parameters=validationParameters)
     trainingWaveform = trainingGenerator.Generate()
     validationWaveform = validationGenerator.Generate()
     powerCalibration = PowerCalibration(

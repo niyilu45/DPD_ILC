@@ -1,9 +1,9 @@
 """DPD-ILC simulation package."""
 
-from .waveGen import (
-    GenWifi,
+from .WaveGenWifi import (
     MCSInfo,
     NormalizeFrameFormat,
+    WaveGenWifi,
     WifiWaveform,
 )
 from .PaModel import GMPPA, MimoPaModel, PaModel, PowerCalibration, WienerPA

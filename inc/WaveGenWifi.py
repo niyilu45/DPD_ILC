@@ -1,6 +1,6 @@
 """Generate IEEE 802.11ac VHT, 802.11ax HE, or 802.11be EHT waveforms.
 
-Callers first construct ``GenWifi`` with the requested frame format, bandwidth,
+Callers first construct ``WaveGenWifi`` with the requested frame format, bandwidth,
 sample rate, MCS, guard interval, and packet length, and then call ``Generate``.
 The class creates a single-user full-band complex baseband packet with the
 appropriate VHT, HE-SU, or EHT field order, OFDM numerology, and MCS table.
@@ -70,7 +70,7 @@ def NormalizeFrameFormat(frameFormat: str) -> str:
     return frameFormatAliases[normalizedInput]
 
 
-class GenWifi:
+class WaveGenWifi:
     """Configure and generate a SISO or MIMO VHT, HE, or EHT waveform.
 
     A ``ChainMap`` resolves explicit keyword overrides first, a caller-owned
@@ -79,7 +79,7 @@ class GenWifi:
     higher-priority keyword override shadows the same key.
 
     Example:
-        ``wifiGenerator = GenWifi(frameFormat="11be", bandwidthMhz=80, mcs=11)``
+        ``wifiGenerator = WaveGenWifi(frameFormat="11be", bandwidthMhz=80, mcs=11)``
         ``waveform = wifiGenerator.Generate()``
     """
 
@@ -449,7 +449,7 @@ class GenWifi:
             unknownNames = ", ".join(
                 sorted(str(parameterName) for parameterName in unknownParameters)
             )
-            raise TypeError(f"unknown GenWifi parameters: {unknownNames}")
+            raise TypeError(f"unknown WaveGenWifi parameters: {unknownNames}")
         normalizedFormat = NormalizeFrameFormat(
             cast(str, self.parameters["frameFormat"])
         )
@@ -976,7 +976,7 @@ def TrainingField(
     return np.concatenate(outputSymbols)
 
 
-def BuildSpatialMappingMatrix(config: GenWifi) -> np.ndarray:
+def BuildSpatialMappingMatrix(config: WaveGenWifi) -> np.ndarray:
     """Build the constant orthonormal spatial mapping matrix.
 
     Processing details:
@@ -1079,7 +1079,7 @@ def BuildLtfTrainingMatrix(
     )
 
 
-def GetCyclicShifts(config: GenWifi) -> np.ndarray:
+def GetCyclicShifts(config: WaveGenWifi) -> np.ndarray:
     """Return per-chain cyclic shifts in seconds.
 
     Processing details:
@@ -1279,7 +1279,7 @@ def MapCommonFieldToAntennas(
     return np.column_stack(antennaFields)
 
 
-def GenerateWifiWaveform(config: GenWifi) -> WifiWaveform:
+def GenerateWifiWaveform(config: WaveGenWifi) -> WifiWaveform:
     """Generate one VHT, HE, or EHT packet for a validated generator.
 
     Args:

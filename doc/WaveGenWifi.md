@@ -1,6 +1,6 @@
 # VHT/HE/EHT Wi-Fi 帧生成：物理原理、公式推导与代码映射
 
-本文解释 `inc/waveGen.py` 中 `GenWifi` 的物理意义和数学实现。阅读目标不是只知道“代码怎样运行”，而是理解一串随机比特为什么能变成具有 Wi-Fi 带宽、频谱形状、峰均比和帧结构的复基带波形。
+本文解释 `inc/WaveGenWifi.py` 中 `WaveGenWifi` 的物理意义和数学实现。阅读目标不是只知道“代码怎样运行”，而是理解一串随机比特为什么能变成具有 Wi-Fi 带宽、频谱形状、峰均比和帧结构的复基带波形。
 
 > **实现边界**：本工程生成的是用于 PA/DPD/ILC 仿真的 **VHT/HE/EHT PHY 激励波形**。它保留带宽、子载波间隔、MCS、OFDM、保护间隔和字段时长等关键特征，但没有实现完整 BCC/LDPC 编码、标准交织、逐比特 SIG 编码和逐采样标准训练序列，因此不能替代协议一致性测试仪或标准接收机。
 
@@ -24,11 +24,11 @@ x(t)=I(t)+jQ(t),
 
 ---
 
-## 2. `GenWifi` 的整体信号链
+## 2. `WaveGenWifi` 的整体信号链
 
 ```mermaid
 flowchart LR
-    A["配置 GenWifi<br/>11ac/ax/be 或 VHT/HE/EHT"] --> A1["名称归一化"]
+    A["配置 WaveGenWifi<br/>11ac/ax/be 或 VHT/HE/EHT"] --> A1["名称归一化"]
     A1 --> B["生成随机后 FEC 比特"]
     B --> C["Gray 编码 BPSK/QAM 映射"]
     C --> D["数据与导频映射到子载波"]
@@ -406,7 +406,7 @@ N_{\mathrm{CP}}=\mathrm{round}(T_{\mathrm{GI}}f_s),
 
 `802.11ac`、`802.11ax` 和 `802.11be` 是 IEEE 标准修订代际；VHT、HE 和 EHT 是对应的物理层格式名称。工程把两类名称视为等效输入：
 
-| IEEE 代际 | PHY 名称 | 常见商业名称 | `GenWifi` 可用输入 |
+| IEEE 代际 | PHY 名称 | 常见商业名称 | `WaveGenWifi` 可用输入 |
 |---|---|---|---|
 | 802.11ac | VHT | Wi-Fi 5 | `11ac`、`802.11ac`、`VHT` |
 | 802.11ax | HE | Wi-Fi 6/6E | `11ax`、`802.11ax`、`HE` |
@@ -693,7 +693,7 @@ p_{\mathrm{dBm}}
 
 ## 12. 参数如何影响物理波形
 
-| `GenWifi` 参数 | 物理作用 | 常见观察 |
+| `WaveGenWifi` 参数 | 物理作用 | 常见观察 |
 |---|---|---|
 | `frameFormat` | 选择 VHT/HE/EHT 的字段、FFT、GI 和 MCS 上限 | `11ac/11ax/11be` 会分别归一化为 VHT/HE/EHT |
 | `bandwidthMhz` | 改变活动音调规划和基础OFDM参数 | 同带宽下 HE/EHT 的有效符号时长为VHT的四倍 |
@@ -715,9 +715,9 @@ p_{\mathrm{dBm}}
 
 | 物理步骤 | 代码入口 | 主要输出 |
 |---|---|---|
-| 配置验证 | `GenWifi.Validate` | 合法格式、带宽、MCS、GI、采样率及整数OFDM时长 |
+| 配置验证 | `WaveGenWifi.Validate` | 合法格式、带宽、MCS、GI、采样率及整数OFDM时长 |
 | 名称归一化 | `NormalizeFrameFormat` | `11ac→VHT`、`11ax→HE`、`11be→EHT` |
-| MCS 查询 | `GenWifi.GetMcsInfo` | 调制阶数、编码率、每音调比特数 |
+| MCS 查询 | `WaveGenWifi.GetMcsInfo` | 调制阶数、编码率、每音调比特数 |
 | 星座映射 | `QamModulate` | 单位平均功率 BPSK/QAM |
 | 活动/导频音调 | `ActiveTones`、`PilotTones` | 中心化子载波索引 |
 | OFDM 调制 | `OfdmSymbol` | IFFT 有效符号和 CP |
@@ -729,10 +729,10 @@ p_{\mathrm{dBm}}
 | 帧拼接 | `GenerateWifiWaveform` | `fieldSlices`、数据起点、完整帧 |
 | RMS 归一化 | `GenerateWifiWaveform` 末尾 | 单位 RMS `samples` |
 
-最典型的调用方式只提供需要修改的普通字典；默认值由 `GenWifi` 构造函数在类内部补齐：
+最典型的调用方式只提供需要修改的普通字典；默认值由 `WaveGenWifi` 构造函数在类内部补齐：
 
 ```python
-from inc.waveGen import GenWifi
+from inc.WaveGenWifi import WaveGenWifi
 
 wifiOverrides = {
     "frameFormat": "11ac",
@@ -741,7 +741,7 @@ wifiOverrides = {
     "numDataSymbols": 20,
     "guardIntervalUs": 0.4,
 }
-wifiGenerator = GenWifi(parameters=wifiOverrides)
+wifiGenerator = WaveGenWifi(parameters=wifiOverrides)
 wifiWaveform = wifiGenerator.Generate()
 
 # The same instance now switches to the equivalent 802.11ax/HE input name.
@@ -750,7 +750,7 @@ wifiOverrides["guardIntervalUs"] = 0.8
 updatedWaveform = wifiGenerator.Generate()
 ```
 
-`GenWifi` 在构造函数内部建立“构造函数直接覆盖 → 外部映射 → 类内只读默认值”的 `ChainMap`。调用方不需要导入默认参数表，也不需要显式创建 `ChainMap`。`UpdateParameters(...)` 可写入最高优先级层，`GetParameters()` 可取得当前解析结果的字典快照。
+`WaveGenWifi` 在构造函数内部建立“构造函数直接覆盖 → 外部映射 → 类内只读默认值”的 `ChainMap`。调用方不需要导入默认参数表，也不需要显式创建 `ChainMap`。`UpdateParameters(...)` 可写入最高优先级层，`GetParameters()` 可取得当前解析结果的字典快照。
 
 ---
 
@@ -774,4 +774,4 @@ updatedWaveform = wifiGenerator.Generate()
 - [Keysight 802.11be 信号配置简介：EHT 最多 8 空间流](https://helpfiles.keysight.com/csg/n5186/Content/WLAN/802%2011be%20Introduction.htm)
 - [IEEE Standards Board：802.11be-2024 批准信息](https://standards.ieee.org/about/sasb/sba/26sep2024/)
 
-以上标准链接用于说明 VHT/HE/EHT 的标准来源；本文中的具体“工程实现边界”以 `inc/waveGen.py` 为准。
+以上标准链接用于说明 VHT/HE/EHT 的标准来源；本文中的具体“工程实现边界”以 `inc/WaveGenWifi.py` 为准。

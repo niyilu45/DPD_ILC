@@ -26,7 +26,7 @@
 ```mermaid
 flowchart LR
     power["用户配置PA输入功率 dBm"] --> calibration["PowerCalibration<br/>按端口电阻换算RMS电压"]
-    wave["GenWifi.Generate<br/>生成SISO或MIMO Wi-Fi参考信号"] --> scale["按RMS电压缩放"]
+    wave["WaveGenWifi.Generate<br/>生成SISO或MIMO Wi-Fi参考信号"] --> scale["按RMS电压缩放"]
     calibration --> scale
     scale --> reference["referenceSignal<br/>期望PA输出及ILC初始输入"]
     reference --> baseline["PaModel.Process<br/>未补偿baseline"]
@@ -48,7 +48,7 @@ flowchart LR
 
 **图1说明：**
 
-- `GenWifi` 决定PHY格式、带宽、MCS、空间流和采样率。
+- `WaveGenWifi` 决定PHY格式、带宽、MCS、空间流和采样率。
 - `PaModel` 或 `MimoPaModel` 是ILC反复测量的plant。
 - `DpdIlc.py` 只负责算法，不负责选择benchmark场景或保存整套测试报告。
 - `ILCConfig` 不保存任何EVM、SNR或ACLR计算器；它只控制学习更新、幅度约束和反馈采集。
@@ -137,7 +137,7 @@ chainSignal = referenceSignal[:, chainIndex]
 1. 它是期望PA输出的时域参考；
 2. 它是第1轮ILC的初始PA输入，随后每轮在其基础上学习校正量。
 
-通常先让 `GenWifi` 生成单位RMS波形，再设置工作点：
+通常先让 `WaveGenWifi` 生成单位RMS波形，再设置工作点：
 
 ```python
 from inc.PaModel import PowerCalibration
@@ -182,9 +182,9 @@ from inc.Analysis import Analysis
 from inc.DpdIlc import ILCConfig, RunFrequencyDomainIlc
 from inc.Draw import Draw
 from inc.PaModel import PaModel, PowerCalibration
-from inc.waveGen import GenWifi
+from inc.WaveGenWifi import WaveGenWifi
 
-wifiGenerator = GenWifi(
+wifiGenerator = WaveGenWifi(
     parameters={
         "frameFormat": "EHT",
         "bandwidthMhz": 20,
@@ -262,7 +262,7 @@ print(f"Measured PA output RMS voltage: {baselineOutputRms:.6f} V")
 print(ilcResult.learnedInput.shape)
 ```
 
-这个示例中，`paInputPowerDbm` 是需要显式设置的模拟功率参数。`GenWifi` 已把SISO整包波形归一化到单位RMS。dBm先换算成瓦特，再通过端口电阻换算成复包络 RMS 电压：
+这个示例中，`paInputPowerDbm` 是需要显式设置的模拟功率参数。`WaveGenWifi` 已把SISO整包波形归一化到单位RMS。dBm先换算成瓦特，再通过端口电阻换算成复包络 RMS 电压：
 
 ```math
 P_{\mathrm{in,W}}
@@ -699,7 +699,7 @@ pointMetrics = pointAnalysis.Analyze(pointResult.outputSignal)
 
 ### 11.3 没有Wi-Fi元数据时
 
-如果输入不是 `GenWifi` 生成的帧，可以不设置回调：
+如果输入不是 `WaveGenWifi` 生成的帧，可以不设置回调：
 
 ```python
 ilcResult = RunScalarPIlc(
@@ -830,9 +830,9 @@ from inc.DpdIlc import (
     RunFrequencyDomainIlc,
 )
 from inc.PaModel import PaModel
-from inc.waveGen import GenWifi
+from inc.WaveGenWifi import WaveGenWifi
 
-trainingGenerator = GenWifi(
+trainingGenerator = WaveGenWifi(
     parameters={
         "frameFormat": "EHT",
         "bandwidthMhz": 20,
@@ -842,7 +842,7 @@ trainingGenerator = GenWifi(
         "seed": 101,
     }
 )
-validationGenerator = GenWifi(
+validationGenerator = WaveGenWifi(
     parameters={
         "frameFormat": "EHT",
         "bandwidthMhz": 20,
@@ -1014,9 +1014,9 @@ from inc.DpdIlc import (
     RunMimoFrequencyDomainIlc,
 )
 from inc.PaModel import MimoPaModel, PowerCalibration
-from inc.waveGen import GenWifi
+from inc.WaveGenWifi import WaveGenWifi
 
-wifiGenerator = GenWifi(
+wifiGenerator = WaveGenWifi(
     parameters={
         "frameFormat": "HE",
         "bandwidthMhz": 40,
@@ -1446,13 +1446,13 @@ nextInput = LimitAmplitude(inputSignal + updateSignal)
 
 原因：传入空数组。
 
-处理：确认已调用 `GenWifi.Generate()`，并且没有错误切片。
+处理：确认已调用 `WaveGenWifi.Generate()`，并且没有错误切片。
 
 ### 19.2 `sampleRateHz must be at least twice channelBandwidthHz`
 
 原因：`sampleRateHz` 小于两倍信道带宽。
 
-处理：直接提高 `GenWifi` 的 `sampleRateHz`；完整ACLR测试要求它不小于3倍信道带宽。
+处理：直接提高 `WaveGenWifi` 的 `sampleRateHz`；完整ACLR测试要求它不小于3倍信道带宽。
 
 ### 19.3 EVM在下降，但Raw MSE不按相同趋势下降
 

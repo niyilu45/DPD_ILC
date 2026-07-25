@@ -535,7 +535,7 @@ benchmarkRows = RunAllIlcBenchmark(benchmarkConfig)
 sequenceDiagram
     participant User as "命令行或Python调用方"
     participant BM as "BenchMark.py"
-    participant WG as "GenWifi"
+    participant WG as "WaveGenWifi"
     participant PA as "PaModel / IQImbalancePA"
     participant ILC as "DpdIlc算法"
     participant AN as "Analysis"
@@ -640,7 +640,7 @@ Save convergence histories and power-EVM data
 - `powerStopDbm` 必须大于 `powerStartDbm`；
 - `powerPointCount` 必须不小于2。
 
-随后 `GenWifi` 继续检查PHY相关组合，例如VHT/HE/EHT支持的MCS范围和GI范围。`PaModel` 继续检查模型名称和物理参数。因此验证被分为“场景级”“波形级”“PA级”三层。
+随后 `WaveGenWifi` 继续检查PHY相关组合，例如VHT/HE/EHT支持的MCS范围和GI范围。`PaModel` 继续检查模型名称和物理参数。因此验证被分为“场景级”“波形级”“PA级”三层。
 
 ### 14.3 本文参考波形的派生参数
 

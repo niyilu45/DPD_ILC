@@ -12,7 +12,7 @@ import numpy as np
 
 from .PaModel import PowerCalibration
 from .SigProcess import SigProcess, SignalProcessingResult
-from .waveGen import BuildCsdPhaseMatrix, WifiWaveform
+from .WaveGenWifi import BuildCsdPhaseMatrix, WifiWaveform
 
 
 @dataclass(frozen=True)
