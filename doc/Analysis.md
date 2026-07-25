@@ -98,8 +98,8 @@ resultAnalysis = Analysis(
 )
 metrics = resultAnalysis.Analyze()
 
-print(f"EVM: {metrics.evmDb:.3f} dB")
-print(f"EVM: {metrics.evmPercent:.3f} %")
+print(f"EVM: {metrics['evmDb']:.3f} dB")
+print(f"EVM: {metrics['evmPercent']:.3f} %")
 ```
 
 这里没有向 `Analysis` 传入发送波形或 `WifiWaveform` 元数据。内部处理顺序是：
@@ -153,10 +153,10 @@ resultAnalysis = Analysis(
 )
 metrics = resultAnalysis.Analyze()
 
-print(f"SNR: {metrics.snrDb:.3f} dB")
-print(f"EVM: {metrics.evmDb:.3f} dB")
-print(f"EVM: {metrics.evmPercent:.3f} %")
-print(f"Worst ACLR: {metrics.aclrWorstDb:.3f} dB")
+print(f"SNR: {metrics['snrDb']:.3f} dB")
+print(f"EVM: {metrics['evmDb']:.3f} dB")
+print(f"EVM: {metrics['evmPercent']:.3f} %")
+print(f"Worst ACLR: {metrics['aclrWorstDb']:.3f} dB")
 ```
 
 如果接收端已经把样值和元数据包装成 `WifiWaveform`，入口不变：
@@ -164,16 +164,16 @@ print(f"Worst ACLR: {metrics.aclrWorstDb:.3f} dB")
 ```python
 resultAnalysis = Analysis(receivedWifiWaveform)
 metrics = resultAnalysis.Analyze()
-print(metrics.evmDb, metrics.evmPercent)
+print(metrics["evmDb"], metrics["evmPercent"])
 ```
 
-`Analysis` 会在内部读取 `receivedWifiWaveform.samples`，调用方不需要选择另一套函数。对于MIMO接收波形，汇总EVM仍由 `metrics.evmDb` 和 `metrics.evmPercent` 给出；各空间流结果可以这样读取：
+`Analysis` 会在内部读取 `receivedWifiWaveform.samples`，调用方不需要选择另一套函数。对于MIMO接收波形，汇总EVM仍由 `metrics["evmDb"]` 和 `metrics["evmPercent"]` 给出；各空间流结果可以这样读取：
 
 ```python
 mimoMetrics = resultAnalysis.GetLastMimoMetrics()
 if mimoMetrics is not None:
-    print(mimoMetrics.evmDbPerSpatialStream)
-    print(mimoMetrics.evmPercentPerSpatialStream)
+    print(mimoMetrics["evmDbPerSpatialStream"])
+    print(mimoMetrics["evmPercentPerSpatialStream"])
 ```
 
 上述“仅接收波形”方式适用于由本工程 `WaveGenWifi` 生成且保留项目描述字段的波形。对于不含该描述字段的商业仪器抓包，应额外提供发送样值或完整接收配置；Parser不能仅凭任意未知波形无条件恢复随机载荷对应的理想星座。
@@ -1386,7 +1386,7 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 
 再对该方向的合成波形计算 ACLR。
 
-### 9.4 `MimoSignalMetrics` 数据结构
+### 9.4 MIMO明细字典
 
 | 字段 | 索引对象 | 含义 |
 |---|---|---|
@@ -1397,13 +1397,13 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 | `evmDbPerSpatialStream` | 空间流 | 解映射后每流 RMS EVM dB |
 | `evmPercentPerSpatialStream` | 空间流 | 解映射后每流 RMS EVM 百分比 |
 
-`Analysis.Analyze` 仍返回向后兼容的汇总 `SignalMetrics`；MIMO 细节通过 `GetLastMimoMetrics()` 读取。`AnalyzeStages` 同时保存 `stageMimoMetrics`，`PrintMimo()` 打印详情，`Save()` 将其写入 `metrics.json` 的 `mimoMetrics` 节点，并在 CSV 中使用 `mimo.*` 列。
+`Analysis.Analyze` 返回普通汇总字典；MIMO细节通过 `GetLastMimoMetrics()` 读取，返回值同样是普通字典。`AnalyzeStages` 同时保存 `stageMimoMetrics`，`PrintMimo()` 打印详情，`Save()` 将其写入 `metrics.json` 的 `mimoMetrics` 节点，并在CSV中使用 `mimo.*` 列。
 
 ---
 
 ## 10. 输出数据结构和文件
 
-`SignalMetrics` 保存：
+`Analysis.Analyze` 直接返回普通Python字典，固定键为：
 
 | 字段 | 含义 | 趋势 |
 |---|---|---|
@@ -1495,9 +1495,14 @@ resultDraw = Draw(
 metrics = resultAnalysis.Analyze(paOutput)
 processingResult = resultAnalysis.GetLastSignalProcessingResult()
 print(processingResult.ToDict())
-print(metrics.snrDb)
-print(metrics.evmDb, metrics.evmPercent)
-print(metrics.aclrLowerDb, metrics.aclrUpperDb, metrics.aclrWorstDb)
+print(metrics)
+print(metrics["snrDb"])
+print(metrics["evmDb"], metrics["evmPercent"])
+print(
+    metrics["aclrLowerDb"],
+    metrics["aclrUpperDb"],
+    metrics["aclrWorstDb"],
+)
 
 stageMetrics = resultAnalysis.AnalyzeStages(
     {
@@ -1534,7 +1539,7 @@ if wifiWaveform.numTransmitAntennas > 1:
     resultAnalysis.PrintMimo()
     processingResults = resultAnalysis.GetLastSignalProcessingResults()
     mimoMetrics = resultAnalysis.GetLastMimoMetrics()
-    print(mimoMetrics.ToDict())
+    print(mimoMetrics)
 ```
 
 `Analysis`、`Draw` 和 `SigProc` 都在各自构造函数内部定义只读默认参数并建立 `ChainMap`；调用方只传需要修改的普通字典。`signalProcessingParameters` 是传给 `SigProc` 的嵌套覆盖字典。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。

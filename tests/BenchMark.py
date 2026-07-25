@@ -158,8 +158,8 @@ class BenchmarkRow:
 
         Processing details:
             Algorithm: Copy scenario identity and signed improvement fields,
-            flatten the immutable ``SignalMetrics`` record, and merge both
-            dictionaries without changing stored numerical values.
+            merge the ordinary ``SignalMetrics`` dictionary without changing
+            stored numerical values.
 
         Returns:
             result: One flat mapping suitable for a CSV row or JSON object.
@@ -173,7 +173,7 @@ class BenchmarkRow:
             "evmImprovementDb": self.evmImprovementDb,
             "aclrImprovementDb": self.aclrImprovementDb,
         }
-        rowData.update(self.metrics.ToDict())
+        rowData.update(self.metrics)
         return rowData
 
 def AddRow(
@@ -211,12 +211,18 @@ def AddRow(
             category=category,
             scenario=scenario,
             metrics=metrics,
-            snrImprovementDb=metrics.snrDb - baselineMetrics.snrDb,
+            snrImprovementDb=(
+                metrics["snrDb"] - baselineMetrics["snrDb"]
+            ),
             # More-negative EVM dB is better, so baseline minus result is a
             # positive improvement.
-            evmImprovementDb=baselineMetrics.evmDb - metrics.evmDb,
-            aclrImprovementDb=metrics.aclrWorstDb
-            - baselineMetrics.aclrWorstDb,
+            evmImprovementDb=(
+                baselineMetrics["evmDb"] - metrics["evmDb"]
+            ),
+            aclrImprovementDb=(
+                metrics["aclrWorstDb"]
+                - baselineMetrics["aclrWorstDb"]
+            ),
         )
     )
 
@@ -1071,8 +1077,9 @@ def PrintBenchmarkResults(rows: List[BenchmarkRow]) -> None:
     for row in rows:
         print(
             f"{row.methodName:<32} {row.scenario:<25} "
-            f"{row.metrics.snrDb:>8.2f} {row.metrics.evmPercent:>9.3f} "
-            f"{row.metrics.aclrWorstDb:>9.2f} "
+            f"{row.metrics['snrDb']:>8.2f} "
+            f"{row.metrics['evmPercent']:>9.3f} "
+            f"{row.metrics['aclrWorstDb']:>9.2f} "
             f"{row.evmImprovementDb:>8.2f}"
         )
 

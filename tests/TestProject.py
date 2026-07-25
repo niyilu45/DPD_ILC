@@ -881,9 +881,14 @@ def CheckMimoSpatialStructure() -> None:
         )
         idealMetrics = resultAnalysis.Analyze(waveform.samples)
         mimoMetrics = resultAnalysis.GetLastMimoMetrics()
-        assert idealMetrics.evmDb < -250.0
+        assert isinstance(idealMetrics, dict)
+        assert idealMetrics["evmDb"] < -250.0
         assert mimoMetrics is not None
-        assert len(mimoMetrics.evmDbPerSpatialStream) == streamCount
+        assert isinstance(mimoMetrics, dict)
+        assert (
+            len(mimoMetrics["evmDbPerSpatialStream"])
+            == streamCount
+        )
 
     # Standard-generation stream limits are enforced independently from the
     # number of physical antennas available to the caller.
@@ -1045,9 +1050,19 @@ def CheckIdealMetrics() -> None:
         waveform = wifiGenerator.Generate()
         resultAnalysis = Analysis(waveform.samples, waveform)
         metrics = resultAnalysis.Analyze(waveform.samples)
-        assert metrics.snrDb > 250.0
-        assert metrics.evmDb < -250.0
-        assert metrics.evmPercent < 1e-10
+        assert isinstance(metrics, dict)
+        assert set(metrics) == {
+            "snrDb",
+            "evmDb",
+            "evmPercent",
+            "aclrLowerDb",
+            "aclrUpperDb",
+            "aclrWorstDb",
+        }
+        assert not hasattr(metrics, "ToDict")
+        assert metrics["snrDb"] > 250.0
+        assert metrics["evmDb"] < -250.0
+        assert metrics["evmPercent"] < 1e-10
 
 
 def CheckSignalProcessingCompensation() -> None:
@@ -1140,7 +1155,7 @@ def CheckSignalProcessingCompensation() -> None:
         },
     )
     metrics = resultAnalysis.Analyze(measuredSignal)
-    assert metrics.evmDb < -30.0
+    assert metrics["evmDb"] < -30.0
     assert resultAnalysis.GetLastSignalProcessingResult() is not None
     resultAnalysis.AnalyzeStages({"Impaired": measuredSignal})
     assert "Impaired" in resultAnalysis.GetStageSignalProcessingResults()
@@ -1336,8 +1351,8 @@ def CheckIlcImprovement() -> None:
             ilcResult.history
         )
         ilcMetrics = ilcAnalysisResult.bestMetrics
-        assert ilcMetrics.evmDb < baselineMetrics.evmDb
-        assert ilcMetrics.snrDb > baselineMetrics.snrDb
+        assert ilcMetrics["evmDb"] < baselineMetrics["evmDb"]
+        assert ilcMetrics["snrDb"] > baselineMetrics["snrDb"]
 
 
 def CheckReceiveOnlyWifiAnalysis() -> None:
@@ -1397,8 +1412,8 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         assert parsedFrame.detectedParameters["numDataSymbols"] == 2
         assert parsedFrame.parseConfidence > 0.95
         assert np.allclose(
-            np.asarray(tuple(referenceMetrics.ToDict().values())),
-            np.asarray(tuple(receiveMetrics.ToDict().values())),
+            np.asarray(tuple(referenceMetrics.values())),
+            np.asarray(tuple(receiveMetrics.values())),
             rtol=1.0e-10,
             atol=1.0e-10,
         )
@@ -1412,8 +1427,8 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         assert assistedFrame.packetStartSample == leadingSamples
         assert assistedFrame.parseConfidence > 0.90
         assert np.allclose(
-            np.asarray(tuple(referenceMetrics.ToDict().values())),
-            np.asarray(tuple(assistedMetrics.ToDict().values())),
+            np.asarray(tuple(referenceMetrics.values())),
+            np.asarray(tuple(assistedMetrics.values())),
             rtol=1.0e-10,
             atol=1.0e-10,
         )
@@ -1429,10 +1444,8 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
             assert objectAssistedFrame is not None
             assert objectAssistedFrame.packetStartSample == leadingSamples
             assert np.allclose(
-                np.asarray(tuple(referenceMetrics.ToDict().values())),
-                np.asarray(
-                    tuple(objectAssistedMetrics.ToDict().values())
-                ),
+                np.asarray(tuple(referenceMetrics.values())),
+                np.asarray(tuple(objectAssistedMetrics.values())),
                 rtol=1.0e-10,
                 atol=1.0e-10,
             )
@@ -1459,12 +1472,8 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
                 objectReceiveObjectTransmitMetrics,
             ):
                 assert np.allclose(
-                    np.asarray(
-                        tuple(referenceMetrics.ToDict().values())
-                    ),
-                    np.asarray(
-                        tuple(typeDispatchedMetrics.ToDict().values())
-                    ),
+                    np.asarray(tuple(referenceMetrics.values())),
+                    np.asarray(tuple(typeDispatchedMetrics.values())),
                     rtol=1.0e-10,
                     atol=1.0e-10,
                 )
@@ -1491,7 +1500,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         objectReceivedFrame.detectedParameters["frameFormat"]
         == autoWaveform.frameFormat
     )
-    assert objectReceivedMetrics.evmDb < -200.0
+    assert objectReceivedMetrics["evmDb"] < -200.0
 
     mimoWaveform = WaveGenWifi(
         frameFormat="HE",
@@ -1517,7 +1526,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
     assert mimoParsedFrame.detectedParameters["numTransmitAntennas"] == 2
     assert mimoParsedFrame.detectedParameters["numSpatialStreams"] == 2
     assert mimoParsedFrame.detectedParameters["spatialMapping"] == "dft"
-    assert np.isfinite(mimoMetrics.evmDb)
+    assert np.isfinite(mimoMetrics["evmDb"])
     assert mimoAnalysis.GetLastMimoMetrics() is not None
 
     explicitAnalysis = Analysis(autoWaveform.samples, autoWaveform)

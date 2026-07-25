@@ -14,6 +14,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TypedDict,
     Union,
 )
 
@@ -25,9 +26,13 @@ from .SigProc import PowerCalibration, SigProc, SignalProcessingResult
 from .WifiMetadata import WifiWaveform
 
 
-@dataclass(frozen=True)
-class SignalMetrics:
-    """Collect the requested signal-quality and spectral-quality metrics."""
+class SignalMetrics(TypedDict):
+    """Define the keys returned by ``Analysis.Analyze``.
+
+    ``TypedDict`` provides static key and value information only. Every
+    runtime result is an ordinary Python ``dict`` and is accessed with
+    ``metrics["evmDb"]`` rather than custom-object attributes.
+    """
 
     snrDb: float
     evmDb: float
@@ -36,27 +41,9 @@ class SignalMetrics:
     aclrUpperDb: float
     aclrWorstDb: float
 
-    def ToDict(self) -> Dict[str, float]:
-        """Convert metrics to a JSON/CSV-ready dictionary.
 
-        Processing details:
-            Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
-
-        Returns:
-            result: Dict[str, float]. The computed value described by the summary, with documented units, shape, and normalization.
-        """
-
-        return {key: float(value) for key, value in asdict(self).items()}
-
-
-@dataclass(frozen=True)
-class MimoSignalMetrics:
-    """Collect per-chain and per-spatial-stream MIMO metric details.
-
-    Aggregate values remain available through ``SignalMetrics`` so existing
-    SISO callers keep the same API. This companion record exposes conducted
-    RF-chain SNR/ACLR and post-spatial-demapping EVM for each stream.
-    """
+class MimoSignalMetrics(TypedDict):
+    """Define ordinary-dictionary MIMO detail keys."""
 
     snrDbPerChain: Tuple[float, ...]
     evmDbPerSpatialStream: Tuple[float, ...]
@@ -64,22 +51,6 @@ class MimoSignalMetrics:
     aclrLowerDbPerChain: Tuple[float, ...]
     aclrUpperDbPerChain: Tuple[float, ...]
     aclrWorstDbPerChain: Tuple[float, ...]
-
-    def ToDict(self) -> Dict[str, object]:
-        """Convert MIMO metric tuples to a JSON-ready dictionary.
-
-        Processing details:
-            Algorithm: Convert each immutable numeric tuple into ordinary
-            float lists while preserving chain and stream ordering.
-
-        Returns:
-            result: Mapping containing all per-chain and per-stream metrics.
-        """
-
-        return {
-            metricName: [float(value) for value in metricValues]
-            for metricName, metricValues in asdict(self).items()
-        }
 
 
 @dataclass
@@ -1070,7 +1041,7 @@ class Analysis:
                 stored reference. Omit only for a receive-only parsed instance.
 
         Returns:
-            result: SignalMetrics. The computed value described by the summary, with documented units, shape, and normalization.
+            result: Ordinary dictionary containing SNR, EVM, and ACLR values.
         """
 
         selectedSignal = measuredSignal
@@ -1103,24 +1074,24 @@ class Analysis:
                 perChainAclrUpperDb,
                 perChainAclrWorstDb,
             ) = self.CalculatePreparedAclrPerChain(complexMeasured)
-            self.lastMimoMetrics = MimoSignalMetrics(
-                snrDbPerChain=perChainSnrDb,
-                evmDbPerSpatialStream=perStreamEvmDb,
-                evmPercentPerSpatialStream=perStreamEvmPercent,
-                aclrLowerDbPerChain=perChainAclrLowerDb,
-                aclrUpperDbPerChain=perChainAclrUpperDb,
-                aclrWorstDbPerChain=perChainAclrWorstDb,
-            )
+            self.lastMimoMetrics = {
+                "snrDbPerChain": perChainSnrDb,
+                "evmDbPerSpatialStream": perStreamEvmDb,
+                "evmPercentPerSpatialStream": perStreamEvmPercent,
+                "aclrLowerDbPerChain": perChainAclrLowerDb,
+                "aclrUpperDbPerChain": perChainAclrUpperDb,
+                "aclrWorstDbPerChain": perChainAclrWorstDb,
+            }
         else:
             self.lastMimoMetrics = None
-        return SignalMetrics(
-            snrDb=snrDb,
-            evmDb=evmDb,
-            evmPercent=evmPercent,
-            aclrLowerDb=aclrLowerDb,
-            aclrUpperDb=aclrUpperDb,
-            aclrWorstDb=aclrWorstDb,
-        )
+        return {
+            "snrDb": float(snrDb),
+            "evmDb": float(evmDb),
+            "evmPercent": float(evmPercent),
+            "aclrLowerDb": float(aclrLowerDb),
+            "aclrUpperDb": float(aclrUpperDb),
+            "aclrWorstDb": float(aclrWorstDb),
+        }
 
     def AnalyzeStages(
         self, stageSignals: Mapping[str, np.ndarray]
@@ -1231,8 +1202,8 @@ class Analysis:
                     parameters=pointParameterOverrides,
                 )
                 pointMetrics = pointAnalysis.Analyze(measuredSignal)
-                methodEvmDb.append(pointMetrics.evmDb)
-                methodEvmPercent.append(pointMetrics.evmPercent)
+                methodEvmDb.append(pointMetrics["evmDb"])
+                methodEvmPercent.append(pointMetrics["evmPercent"])
             evmDbByMethod[methodName] = np.asarray(methodEvmDb, dtype=float)
             evmPercentByMethod[methodName] = np.asarray(
                 methodEvmPercent, dtype=float
@@ -1353,11 +1324,12 @@ class Analysis:
         print("-" * len(header))
         for stageName, metrics in selectedMetrics.items():
             print(
-                f"{stageName:<16} {metrics.snrDb:>10.2f} "
-                f"{metrics.evmDb:>10.2f} {metrics.evmPercent:>10.3f} "
-                f"{metrics.aclrLowerDb:>10.2f} "
-                f"{metrics.aclrUpperDb:>10.2f} "
-                f"{metrics.aclrWorstDb:>10.2f}"
+                f"{stageName:<16} {metrics['snrDb']:>10.2f} "
+                f"{metrics['evmDb']:>10.2f} "
+                f"{metrics['evmPercent']:>10.3f} "
+                f"{metrics['aclrLowerDb']:>10.2f} "
+                f"{metrics['aclrUpperDb']:>10.2f} "
+                f"{metrics['aclrWorstDb']:>10.2f}"
             )
 
     def PrintMimo(
@@ -1393,21 +1365,23 @@ class Analysis:
                 f"{'PA':<8} {'SNR(dB)':>10} {'ACLR-L':>10} "
                 f"{'ACLR-U':>10} {'ACLR-W':>10}"
             )
-            for chainIndex, snrDb in enumerate(metrics.snrDbPerChain):
+            for chainIndex, snrDb in enumerate(
+                metrics["snrDbPerChain"]
+            ):
                 print(
                     f"PA {chainIndex + 1:<5} {snrDb:>10.2f} "
-                    f"{metrics.aclrLowerDbPerChain[chainIndex]:>10.2f} "
-                    f"{metrics.aclrUpperDbPerChain[chainIndex]:>10.2f} "
-                    f"{metrics.aclrWorstDbPerChain[chainIndex]:>10.2f}"
+                    f"{metrics['aclrLowerDbPerChain'][chainIndex]:>10.2f} "
+                    f"{metrics['aclrUpperDbPerChain'][chainIndex]:>10.2f} "
+                    f"{metrics['aclrWorstDbPerChain'][chainIndex]:>10.2f}"
                 )
             print(f"{stageName} - post-demapping spatial-stream EVM")
             print(f"{'Stream':<8} {'EVM(dB)':>10} {'EVM(%)':>10}")
             for streamIndex, evmDb in enumerate(
-                metrics.evmDbPerSpatialStream
+                metrics["evmDbPerSpatialStream"]
             ):
                 print(
                     f"SS {streamIndex + 1:<5} {evmDb:>10.2f} "
-                    f"{metrics.evmPercentPerSpatialStream[streamIndex]:>10.3f}"
+                    f"{metrics['evmPercentPerSpatialStream'][streamIndex]:>10.3f}"
                 )
 
     def Save(
@@ -1440,7 +1414,7 @@ class Analysis:
         jsonPath = outputPath / "metrics.json"
         csvPath = outputPath / "metrics.csv"
         serializableMetrics = {
-            stageName: metrics.ToDict()
+            stageName: dict(metrics)
             for stageName, metrics in selectedMetrics.items()
         }
         serializableProcessingResults = {
@@ -1454,7 +1428,7 @@ class Analysis:
             if stageName in self.stageSignalProcessingResults
         }
         serializableMimoMetrics = {
-            stageName: self.stageMimoMetrics[stageName].ToDict()
+            stageName: dict(self.stageMimoMetrics[stageName])
             for stageName in selectedMetrics
             if stageName in self.stageMimoMetrics
         }
@@ -1467,9 +1441,15 @@ class Analysis:
         with jsonPath.open("w", encoding="utf-8") as jsonFile:
             json.dump(jsonPayload, jsonFile, indent=2, ensure_ascii=False)
 
-        fieldNames = ["stage"] + list(
-            SignalMetrics.__dataclass_fields__.keys()
-        )
+        fieldNames = [
+            "stage",
+            "snrDb",
+            "evmDb",
+            "evmPercent",
+            "aclrLowerDb",
+            "aclrUpperDb",
+            "aclrWorstDb",
+        ]
         processingFieldNames = []
         for processingChains in serializableProcessingResults.values():
             for chainIndex, processingValues in enumerate(processingChains):
@@ -1492,7 +1472,7 @@ class Analysis:
             csvWriter.writeheader()
             for stageName, metrics in selectedMetrics.items():
                 rowData = {"stage": stageName}
-                rowData.update(metrics.ToDict())
+                rowData.update(metrics)
                 if stageName in serializableProcessingResults:
                     for chainIndex, processingValues in enumerate(
                         serializableProcessingResults[stageName]
@@ -1566,7 +1546,7 @@ class Analysis:
                 )
             signalMetrics = self.Analyze(outputSignal)
             evmAlignedMse = float(
-                (signalMetrics.evmPercent / 100.0) ** 2
+                (signalMetrics["evmPercent"] / 100.0) ** 2
             )
             performanceRecords.append(
                 ILCPerformanceIteration(
@@ -1587,13 +1567,13 @@ class Analysis:
                         iterationRecord.complexGainPhaseDegrees
                     ),
                     inputPeak=float(iterationRecord.inputPeak),
-                    snrDb=signalMetrics.snrDb,
+                    snrDb=signalMetrics["snrDb"],
                     evmAlignedMse=evmAlignedMse,
-                    evmDb=signalMetrics.evmDb,
-                    evmPercent=signalMetrics.evmPercent,
-                    aclrLowerDb=signalMetrics.aclrLowerDb,
-                    aclrUpperDb=signalMetrics.aclrUpperDb,
-                    aclrWorstDb=signalMetrics.aclrWorstDb,
+                    evmDb=signalMetrics["evmDb"],
+                    evmPercent=signalMetrics["evmPercent"],
+                    aclrLowerDb=signalMetrics["aclrLowerDb"],
+                    aclrUpperDb=signalMetrics["aclrUpperDb"],
+                    aclrWorstDb=signalMetrics["aclrWorstDb"],
                 )
             )
             inputSignals.append(inputSignal.copy())
@@ -1743,7 +1723,7 @@ class Analysis:
             )
             averageGain = np.mean(gainPhasors)
             evmAlignedMse = float(
-                (signalMetrics.evmPercent / 100.0) ** 2
+                (signalMetrics["evmPercent"] / 100.0) ** 2
             )
             performanceRecords.append(
                 ILCPerformanceIteration(
@@ -1782,13 +1762,13 @@ class Analysis:
                             for chainRecord in chainRecords
                         )
                     ),
-                    snrDb=signalMetrics.snrDb,
+                    snrDb=signalMetrics["snrDb"],
                     evmAlignedMse=evmAlignedMse,
-                    evmDb=signalMetrics.evmDb,
-                    evmPercent=signalMetrics.evmPercent,
-                    aclrLowerDb=signalMetrics.aclrLowerDb,
-                    aclrUpperDb=signalMetrics.aclrUpperDb,
-                    aclrWorstDb=signalMetrics.aclrWorstDb,
+                    evmDb=signalMetrics["evmDb"],
+                    evmPercent=signalMetrics["evmPercent"],
+                    aclrLowerDb=signalMetrics["aclrLowerDb"],
+                    aclrUpperDb=signalMetrics["aclrUpperDb"],
+                    aclrWorstDb=signalMetrics["aclrWorstDb"],
                 )
             )
             inputMatrices.append(inputMatrix.copy())

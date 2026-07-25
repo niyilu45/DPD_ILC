@@ -521,7 +521,7 @@ benchmarkRows = RunAllIlcBenchmark(benchmarkConfig)
 | `AddRow` | 方法指标、同场景baseline指标 | 向结果列表追加一行 | 统一SNR、EVM、ACLR改善量的正负方向 |
 | `SaveHistory` | 方法名、`ILCResult`、目录 | 每种方法一个CSV和PNG | 保存每一轮Raw MSE、LC-MSE、EVM-MSE和输入峰值 |
 | `ReportHistory` | 方法结果、`Analysis` | 控制台表格并调用 `SaveHistory` | 保证控制台和文件使用同一份不可变迭代记录 |
-| `EvaluateDeployment` | 拟合DPD、验证帧、PA、幅度上限 | `SignalMetrics` | 在独立帧上执行DPD、限幅、PA和统一分析 |
+| `EvaluateDeployment` | 拟合DPD、验证帧、PA、幅度上限 | 普通指标字典 | 在独立帧上执行DPD、限幅、PA和统一分析 |
 | `RunIlcCurvePoint` | 当前功率点参考、算法和配置 | 当前功率点PA输出 | 为功率扫描重新绑定EVM-MSE并重新运行波形ILC |
 | `RunAllIlcBenchmark` | 可选 `BenchmarkConfig` | 22行 `BenchmarkRow` | 按固定顺序构造A–F类场景并汇总全部结果 |
 | `SaveBenchmarkResults` | 结果行、目录、元数据 | 汇总CSV和JSON | 保存绝对指标、改善量及复现配置 |

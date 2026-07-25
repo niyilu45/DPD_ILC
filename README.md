@@ -433,13 +433,13 @@ flowchart TD
     frameProcess --> undo["去 CP / FFT / 撤销 CSD 与空间映射 Q"]
     aclr --> psd["AveragePeriodogram"]
 
-    snr --> metrics["SignalMetrics"]
+    snr --> metrics["普通指标字典"]
     evm --> metrics
     aclr --> metrics
-    chainSnr --> mimoMetrics["MimoSignalMetrics"]
+    chainSnr --> mimoMetrics["MIMO明细字典"]
     chainAclr --> mimoMetrics
     streamEvm --> mimoMetrics
-    metrics --> toDict["SignalMetrics.ToDict"]
+    metrics --> keys["metrics[key]"]
     metrics --> print["Analysis.Print"]
     metrics --> save["Analysis.Save"]
     nativeHistory["ILCIteration 列表"] --> analyzeHistory["Analysis.AnalyzeIlcHistory"]
@@ -463,10 +463,10 @@ flowchart TD
 - 每次 `Analyze` 只调用一次 `SigProc.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
 - SNR 直接计算校正后数据字段与参考的残差功率；EVM 由 `FrameProcess` 根据 `WifiWaveform` 的数据字段位置去循环前缀、FFT、撤销 CSD 和空间解映射，再与采用相同接收路径得到的参考星座比较。
 - ACLR 通过 `AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
-- 三类指标封装为 `SignalMetrics`，由同一实例的 `Print` 输出到终端，或由 `Save` 写入 JSON/CSV。
+- `Analyze` 直接返回包含SNR、EVM和ACLR的普通Python字典；调用方用 `metrics["evmDb"]` 读取结果。字典也可以直接交给 `Print`，或由 `Save` 写入JSON/CSV。
 - `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
 - `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、公共复增益幅相和输入峰值。
-- MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。`MimoSignalMetrics` 保存逐 PA SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
+- MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
 - `AnalyzePowerEvmCurve` 接收一组严格递增的绝对 dBm 输入功率点和多个方法求值器，先按 `loadResistanceOhm` 换算复包络 RMS 电压，再在每个功率点使用相同参考信号计算 EVM；`SavePowerEvmCurveData` 只保存原始 CSV/JSON 数据，不导入或调用任何绘图库。
 
 ### `inc/Draw.py`
@@ -508,7 +508,7 @@ flowchart LR
     init --> frameApi["FrameProcess / BuildCsdPhaseMatrix"]
     init --> paApi["PaModel / MimoPaModel / WienerPA / GMPPA"]
     init --> signalApi["SigProc / SignalProcessingResult / PowerCalibration"]
-    init --> analysisApi["Analysis / SignalMetrics / MimoSignalMetrics"]
+    init --> analysisApi["Analysis / 普通指标字典"]
     init --> drawApi["Draw / PowerEvmCurve 绘图入口"]
     init --> ilcApi["ILCConfig / RunFrequencyDomainIlc"]
     init --> mimoIlcApi["RunMimoFrequencyDomainIlc / MimoGmpPredistorter"]
@@ -809,13 +809,13 @@ PA 辅助接口还包括：
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
-| `Analyze(measuredSignal=None)` | 显式待测信号或解析后的默认接收帧 | 显式参考路径必须传入波形；仅接收路径可零参数调用并返回 `SignalMetrics`。 |
+| `Analyze(measuredSignal=None)` | 显式待测信号或解析后的默认接收帧 | 显式参考路径必须传入波形；仅接收路径可零参数调用；返回普通指标字典。 |
 | `GetParsedWifiFrame()` | 无 | 仅接收路径返回 `ParsedWifiFrame`，显式参考路径返回 `None`。 |
 | `AnalyzeStages(stageSignals)` | `{阶段名称: 输出数组}` 映射 | 批量计算并保存各阶段指标。 |
 | `PrepareMeasuredSignal(measuredSignal)` | 原始待测信号 | 返回与参考等长的同步、频偏和复增益校正信号。 |
 | `GetLastSignalProcessingResult()` | 无 | 返回最近一次第一路 `SignalProcessingResult`，尚未分析时返回 `None`。 |
 | `GetLastSignalProcessingResults()` | 无 | 返回最近一次所有物理链的同步结果元组。 |
-| `GetLastMimoMetrics()` | 无 | 返回最近一次逐 PA/逐空间流 `MimoSignalMetrics`。 |
+| `GetLastMimoMetrics()` | 无 | 返回最近一次逐PA/逐空间流明细字典。 |
 | `GetStageSignalProcessingResults()` | 无 | 返回 `AnalyzeStages` 保存的各阶段逐链同步估计。 |
 | `GetStageMimoMetrics()` | 无 | 返回各阶段详细 MIMO 指标。 |
 | `CalculateSnr(measuredSignal)` | 待测输出 | 返回数据字段 SNR，单位 dB。 |
@@ -833,7 +833,7 @@ PA 辅助接口还包括：
 | `AnalyzePowerEvmCurve(inputPowerDbmValues, methodEvaluators)` | 递增 dBm 点、`{方法名: 求值器}` 映射 | 计算并保存一个 `PowerEvmCurve`；求值器接收当前参考信号和绝对输入功率 dBm。 |
 | `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取实例解析后的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
 
-`SignalMetrics` 字段包括 `snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。`ILCPerformanceIteration` 把这些RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult` 保存完整分析历史、严格EVM最佳轮及其输入/输出。`PowerEvmCurve` 保存用户指定的 `inputPowerDbmValues`、内部换算得到的 `driveRmsValues` 以及各方法的 EVM dB/百分比数组。
+`Analyze` 返回字典的固定键包括 `snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。`ILCPerformanceIteration` 把这些RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存相同结构的普通字典。`PowerEvmCurve` 保存用户指定的 `inputPowerDbmValues`、内部换算得到的 `driveRmsValues` 以及各方法的 EVM dB/百分比数组。
 
 ### `Draw` 参数与方法
 
@@ -1115,7 +1115,8 @@ resultAnalysis = Analysis(
     },
 )
 metrics = resultAnalysis.Analyze(paOutput)
-print(metrics.ToDict())
+print(metrics)
+print(metrics["evmDb"])
 print(resultAnalysis.GetLastSignalProcessingResult().ToDict())
 ```
 
@@ -1200,7 +1201,7 @@ stageMetrics = resultAnalysis.AnalyzeStages(
 )
 resultAnalysis.Print()
 resultAnalysis.PrintConvergence(ilcAnalysisResult.history)
-print(stageMetrics["Frequency-domain ILC"].ToDict())
+print(stageMetrics["Frequency-domain ILC"])
 ```
 
 ### 示例十：程序化保存功率-EVM 数据并单独绘图
@@ -1317,7 +1318,8 @@ metrics = resultAnalysis.Analyze()
 parsedFrame = resultAnalysis.GetParsedWifiFrame()
 
 print(parsedFrame.detectedParameters)
-print(metrics.ToDict())
+print(metrics)
+print(metrics["evmDb"], metrics["evmPercent"])
 ```
 
 可选发送输入既可以是NumPy数组，也可以是 `WifiWaveform`，参数名不变：

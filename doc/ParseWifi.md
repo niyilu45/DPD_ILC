@@ -443,10 +443,10 @@ from inc.Analysis import Analysis
 resultAnalysis = Analysis(receivedSignal)
 metrics = resultAnalysis.Analyze()
 
-print(metrics.snrDb)
-print(metrics.evmDb)
-print(metrics.evmPercent)
-print(metrics.aclrWorstDb)
+print(metrics["snrDb"])
+print(metrics["evmDb"])
+print(metrics["evmPercent"])
+print(metrics["aclrWorstDb"])
 ```
 
 当采样率不是默认候选值时：

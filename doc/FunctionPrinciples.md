@@ -216,7 +216,8 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `SignalMetrics.ToDict`, `MimoSignalMetrics.ToDict`, `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把已经计算的指标转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
+| `Analysis.Analyze`, `Analysis.GetLastMimoMetrics` | E | 直接返回普通指标字典，调用方使用固定键读取SNR、EVM、ACLR和MIMO明细 | Analysis §10 |
+| `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把曲线或逐轮记录转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann 窗、50% 重叠的 Welch PSD 平均 | Analysis §6.2 |
 | `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 保留显式参考路径；省略 `waveform` 时调用ParseWifi恢复参考和元数据，再解析指标/同步参数并校验 | Analysis §1–§2、§11、ParseWifi §8 |
 | `Analysis.GetParsedWifiFrame` | E | 返回仅接收帧构造路径保存的解析结果；显式参考路径返回 `None` | Analysis §1、ParseWifi §8 |

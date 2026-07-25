@@ -260,8 +260,8 @@ Draw().SaveConvergenceCurve(
     fileStem="frequency_domain_ilc",
 )
 
-print(stageMetrics["PA baseline"].ToDict())
-print(stageMetrics["Frequency-domain ILC"].ToDict())
+print(stageMetrics["PA baseline"])
+print(stageMetrics["Frequency-domain ILC"])
 print(f"Configured PA input power: {paInputPowerDbm:.2f} dBm")
 print(f"Equivalent PA input RMS voltage: {paInputRms:.6f} V")
 print(f"Measured PA output power: {baselineOutputPowerDbm:.2f} dBm")
@@ -663,16 +663,16 @@ selectedInput = ilcAnalysisResult.bestInputSignal
 selectedOutput = paModel.Process(selectedInput)
 ilcMetrics = resultAnalysis.Analyze(selectedOutput)
 
-print(ilcMetrics.snrDb)
-print(ilcMetrics.evmDb)
-print(ilcMetrics.aclrWorstDb)
+print(ilcMetrics["snrDb"])
+print(ilcMetrics["evmDb"])
+print(ilcMetrics["aclrWorstDb"])
 ```
 
 这里有三个明确分离的步骤：
 
 1. `RunFrequencyDomainIlc` 只执行学习并保存每轮输入、PA输出和原生MSE；
 2. `resultAnalysis.AnalyzeIlcHistory` 在ILC返回后逐轮计算SNR、EVM和ACLR，并在分析层选择EVM最佳轮；
-3. 最佳输入重新送入PA后，`resultAnalysis.Analyze` 对干净最终输出生成 `SignalMetrics`。
+3. 最佳输入重新送入PA后，`resultAnalysis.Analyze` 对干净最终输出生成普通指标字典。
 
 `ILCConfig` 和所有 `Run...Ilc` 函数都不持有、接收或调用任何 `Analysis` 回调。
 
