@@ -10,6 +10,8 @@ from .PaModel import GMPPA, MimoPaModel, PaModel, WienerPA
 from .SigProc import PowerCalibration, SigProc, SignalProcessingResult
 from .Analysis import (
     Analysis,
+    ILCAnalysisResult,
+    ILCPerformanceIteration,
     MimoSignalMetrics,
     PowerEvmCurve,
     SignalMetrics,

@@ -35,7 +35,7 @@ def GetProjectRoot() -> Path:
 if str(GetProjectRoot()) not in sys.path:
     sys.path.insert(0, str(GetProjectRoot()))
 
-from inc.Analysis import Analysis, SignalMetrics
+from inc.Analysis import Analysis, ILCAnalysisResult, SignalMetrics
 from inc.Draw import Draw
 from inc.DpdIlc import (
     FitGmpPredistorter,
@@ -221,18 +221,20 @@ def AddRow(
     )
 
 def SaveHistory(
-    methodName: str, ilcResult: ILCResult, outputDirectory: Path
+    methodName: str,
+    analysisResult: ILCAnalysisResult,
+    outputDirectory: Path,
 ) -> None:
     """Save a separate convergence CSV without overwriting other methods.
 
     Processing details:
         Algorithm: Sanitize the method label into a stable file stem, write
-        every immutable iteration record with all three MSE definitions and
-        gain diagnostics, then ask ``Draw`` to render the same history.
+        every post-ILC performance record without recalculation, then ask
+        ``Draw`` to render the same independently analyzed history.
 
     Args:
         methodName: Human-readable algorithm or deployment-model label.
-        ilcResult: Completed ILC result containing ordered iteration records.
+        analysisResult: Post-ILC RF performance history and best candidate.
         outputDirectory: Directory in which result artifacts are written.
 
     Returns:
@@ -254,40 +256,23 @@ def SaveHistory(
                 "nmseDb",
                 "linearCompensatedMse",
                 "linearCompensatedNmseDb",
+                "snrDb",
                 "evmAlignedMse",
                 "evmDb",
+                "evmPercent",
+                "aclrLowerDb",
+                "aclrUpperDb",
+                "aclrWorstDb",
                 "complexGainMagnitudeDb",
                 "complexGainPhaseDegrees",
                 "inputPeak",
             ),
         )
         csvWriter.writeheader()
-        for iterationRecord in ilcResult.history:
-            csvWriter.writerow(
-                {
-                    "iteration": iterationRecord.iteration,
-                    "mse": iterationRecord.mse,
-                    "errorRms": iterationRecord.errorRms,
-                    "nmseDb": iterationRecord.nmseDb,
-                    "linearCompensatedMse": (
-                        iterationRecord.linearCompensatedMse
-                    ),
-                    "linearCompensatedNmseDb": (
-                        iterationRecord.linearCompensatedNmseDb
-                    ),
-                    "evmAlignedMse": iterationRecord.evmAlignedMse,
-                    "evmDb": iterationRecord.evmDb,
-                    "complexGainMagnitudeDb": (
-                        iterationRecord.complexGainMagnitudeDb
-                    ),
-                    "complexGainPhaseDegrees": (
-                        iterationRecord.complexGainPhaseDegrees
-                    ),
-                    "inputPeak": iterationRecord.inputPeak,
-                }
-            )
+        for iterationRecord in analysisResult.history:
+            csvWriter.writerow(iterationRecord.ToDict())
     Draw(convergenceFileStem=f"convergence_{safeName}").SaveConvergenceCurve(
-        ilcResult.history, outputDirectory
+        analysisResult.history, outputDirectory
     )
 
 def ReportHistory(
@@ -295,13 +280,13 @@ def ReportHistory(
     ilcResult: ILCResult,
     resultAnalysis: Analysis,
     outputDirectory: Path,
-) -> None:
+) -> ILCAnalysisResult:
     """Print and save one method's complete per-iteration MSE history.
 
     Processing details:
-        Algorithm: Use ``Analysis`` for the console table, then serialize the
-        same immutable records and render their convergence figure without
-        recalculating any metric.
+        Algorithm: Feed every PA output stored by ILC into ``Analysis``, select
+        the EVM-best measured candidate outside the algorithm, then print,
+        serialize, and render the same immutable performance records.
 
     Args:
         methodName: Human-readable ILC method label.
@@ -310,13 +295,15 @@ def ReportHistory(
         outputDirectory: Destination for CSV and PNG result artifacts.
 
     Returns:
-        result: None. Console and file outputs are produced as side effects.
+        result: Post-ILC history and the EVM-best measured candidate.
     """
 
+    analysisResult = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
     resultAnalysis.PrintConvergence(
-        ilcResult.history, f"{methodName} iteration metrics"
+        analysisResult.history, f"{methodName} iteration metrics"
     )
-    SaveHistory(methodName, ilcResult, outputDirectory)
+    SaveHistory(methodName, analysisResult, outputDirectory)
+    return analysisResult
 
 def EvaluateDeployment(
     predistorter: Any,
@@ -362,10 +349,9 @@ def RunIlcCurvePoint(
     """Run one selected ILC method at one power-EVM sweep point.
 
     Processing details:
-        Algorithm: Construct a fresh Analysis context after power scaling,
-        pass its EVM-MSE method as an independent iteration evaluator,
-        dispatch the frequency-domain signature separately from ordinary
-        waveform-update signatures, and return the selected best PA output.
+        Algorithm: Run ILC without any RF metric callback, construct a fresh
+        Analysis context after power scaling, analyze every stored PA output,
+        and return the externally selected minimum-EVM measured candidate.
 
     Args:
         referenceSignal: Ideal complex baseband samples used as the target or regression input.
@@ -385,22 +371,27 @@ def RunIlcCurvePoint(
     del inputPowerDbm
     pointAnalysis = Analysis(referenceSignal, waveform)
     if methodName == "Frequency-domain ILC":
-        return RunFrequencyDomainIlc(
+        methodResult = RunFrequencyDomainIlc(
             referenceSignal,
             paModel,
             waveform.sampleRateHz,
             waveform.bandwidthHz,
             methodConfig,
-            evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
-        ).outputSignal
-    if methodFunction is None:
-        raise ValueError("methodFunction is required for non-frequency ILC")
-    return methodFunction(
-        referenceSignal,
-        paModel,
-        methodConfig,
-        evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
-    ).outputSignal
+        )
+    else:
+        if methodFunction is None:
+            raise ValueError(
+                "methodFunction is required for non-frequency ILC"
+            )
+        methodResult = methodFunction(
+            referenceSignal,
+            paModel,
+            methodConfig,
+        )
+    analysisResult = pointAnalysis.AnalyzeIlcHistory(
+        methodResult.history
+    )
+    return paModel.Process(analysisResult.bestInputSignal)
 
 def RunAllIlcBenchmark(
     config: Optional[BenchmarkConfig] = None,
@@ -539,6 +530,7 @@ def RunAllIlcBenchmark(
         ("Parameter-domain MP ILC", RunParameterDomainIlc, parameterConfig),
     )
     frequencyResult = None
+    frequencyAnalysisResult = None
     for methodName, methodFunction, methodConfig in methodRuns:
         if methodName == "Frequency-domain ILC":
             methodResult = RunFrequencyDomainIlc(
@@ -547,7 +539,6 @@ def RunAllIlcBenchmark(
                 trainingWaveform.sampleRateHz,
                 trainingWaveform.bandwidthHz,
                 methodConfig,
-                evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
             )
             frequencyResult = methodResult
         else:
@@ -555,9 +546,18 @@ def RunAllIlcBenchmark(
                 trainingSignal,
                 paModel,
                 methodConfig,
-                evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
             )
-        methodMetrics = trainingAnalysis.Analyze(methodResult.outputSignal)
+        methodAnalysisResult = ReportHistory(
+            methodName,
+            methodResult,
+            trainingAnalysis,
+            outputDirectory,
+        )
+        methodMetrics = trainingAnalysis.Analyze(
+            paModel.Process(methodAnalysisResult.bestInputSignal)
+        )
+        if methodName == "Frequency-domain ILC":
+            frequencyAnalysisResult = methodAnalysisResult
         AddRow(
             rows,
             methodName,
@@ -565,9 +565,6 @@ def RunAllIlcBenchmark(
             "nominal repeated waveform",
             methodMetrics,
             baselineMetrics,
-        )
-        ReportHistory(
-            methodName, methodResult, trainingAnalysis, outputDirectory
         )
         powerEvaluators[methodName] = (
             lambda pointReference,
@@ -585,14 +582,14 @@ def RunAllIlcBenchmark(
             )
         )
 
-    if frequencyResult is None:
+    if frequencyResult is None or frequencyAnalysisResult is None:
         raise RuntimeError("frequency-domain ILC result was not generated")
 
     # Repeat the physically identical baseline and unconstrained result under
     # the peak scenario label so scenario-filtered reports contain the full
     # baseline-versus-performance-versus-feasibility comparison.
     frequencyMetrics = trainingAnalysis.Analyze(
-        frequencyResult.outputSignal
+        paModel.Process(frequencyAnalysisResult.bestInputSignal)
     )
     AddRow(
         rows,
@@ -624,10 +621,15 @@ def RunAllIlcBenchmark(
             maxAmplitude=constrainedPeak,
             randomSeed=config.seed + 7,
         ),
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
+    )
+    constrainedAnalysisResult = ReportHistory(
+        "Constrained CFR-ILC",
+        constrainedResult,
+        trainingAnalysis,
+        outputDirectory,
     )
     constrainedMetrics = trainingAnalysis.Analyze(
-        constrainedResult.outputSignal
+        paModel.Process(constrainedAnalysisResult.bestInputSignal)
     )
     AddRow(
         rows,
@@ -636,12 +638,6 @@ def RunAllIlcBenchmark(
         "peak-constrained waveform",
         constrainedMetrics,
         baselineMetrics,
-    )
-    ReportHistory(
-        "Constrained CFR-ILC",
-        constrainedResult,
-        trainingAnalysis,
-        outputDirectory,
     )
     powerEvaluators["Constrained CFR-ILC"] = (
         lambda pointReference, pointDrive: RunIlcCurvePoint(
@@ -685,10 +681,15 @@ def RunAllIlcBenchmark(
             feedbackAverages=1,
             randomSeed=config.seed + 18,
         ),
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
+    )
+    naiveNoisyAnalysisResult = ReportHistory(
+        "Naive noisy-feedback ILC",
+        naiveNoisyResult,
+        trainingAnalysis,
+        outputDirectory,
     )
     naiveNoisyMetrics = trainingAnalysis.Analyze(
-        naiveNoisyResult.outputSignal
+        paModel.Process(naiveNoisyAnalysisResult.bestInputSignal)
     )
     AddRow(
         rows,
@@ -697,12 +698,6 @@ def RunAllIlcBenchmark(
         "32 dB feedback robustness",
         naiveNoisyMetrics,
         noisyBaselineMetrics,
-    )
-    ReportHistory(
-        "Naive noisy-feedback ILC",
-        naiveNoisyResult,
-        trainingAnalysis,
-        outputDirectory,
     )
     noiseAwareResult = RunFrequencyDomainIlc(
         trainingSignal,
@@ -718,10 +713,15 @@ def RunAllIlcBenchmark(
             feedbackAverages=4,
             randomSeed=config.seed + 8,
         ),
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
+    )
+    noiseAwareAnalysisResult = ReportHistory(
+        "Noise-aware ILC",
+        noiseAwareResult,
+        trainingAnalysis,
+        outputDirectory,
     )
     noiseAwareMetrics = trainingAnalysis.Analyze(
-        noiseAwareResult.outputSignal
+        paModel.Process(noiseAwareAnalysisResult.bestInputSignal)
     )
     AddRow(
         rows,
@@ -730,12 +730,6 @@ def RunAllIlcBenchmark(
         "32 dB feedback robustness",
         noiseAwareMetrics,
         noisyBaselineMetrics,
-    )
-    ReportHistory(
-        "Noise-aware ILC",
-        noiseAwareResult,
-        trainingAnalysis,
-        outputDirectory,
     )
     powerEvaluators["Naive noisy-feedback ILC"] = (
         lambda pointReference, pointDrive: RunIlcCurvePoint(
@@ -800,10 +794,15 @@ def RunAllIlcBenchmark(
             maxAmplitude=maxAmplitude,
             randomSeed=config.seed + 19,
         ),
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
+    )
+    ordinaryIqAnalysisResult = ReportHistory(
+        "Frequency-domain ILC on IQ plant",
+        ordinaryIqResult,
+        trainingAnalysis,
+        outputDirectory,
     )
     ordinaryIqMetrics = trainingAnalysis.Analyze(
-        ordinaryIqResult.outputSignal
+        iqPaModel.Process(ordinaryIqAnalysisResult.bestInputSignal)
     )
     AddRow(
         rows,
@@ -812,12 +811,6 @@ def RunAllIlcBenchmark(
         "IQ image impairment",
         ordinaryIqMetrics,
         iqBaselineMetrics,
-    )
-    ReportHistory(
-        "Frequency-domain ILC on IQ plant",
-        ordinaryIqResult,
-        trainingAnalysis,
-        outputDirectory,
     )
     augmentedResult = RunAugmentedIqIlc(
         trainingSignal,
@@ -828,10 +821,15 @@ def RunAllIlcBenchmark(
             maxAmplitude=maxAmplitude,
             randomSeed=config.seed + 9,
         ),
-        evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
+    )
+    augmentedAnalysisResult = ReportHistory(
+        "Augmented IQ ILC",
+        augmentedResult,
+        trainingAnalysis,
+        outputDirectory,
     )
     augmentedMetrics = trainingAnalysis.Analyze(
-        augmentedResult.outputSignal
+        iqPaModel.Process(augmentedAnalysisResult.bestInputSignal)
     )
     AddRow(
         rows,
@@ -840,12 +838,6 @@ def RunAllIlcBenchmark(
         "IQ image impairment",
         augmentedMetrics,
         iqBaselineMetrics,
-    )
-    ReportHistory(
-        "Augmented IQ ILC",
-        augmentedResult,
-        trainingAnalysis,
-        outputDirectory,
     )
     powerEvaluators["IQ-imbalance baseline"] = (
         lambda pointReference, _: iqPaModel.Process(pointReference)
@@ -902,7 +894,7 @@ def RunAllIlcBenchmark(
             "ILC label + MP",
             FitGmpPredistorter(
                 trainingSignal,
-                frequencyResult.learnedInput,
+                frequencyAnalysisResult.bestInputSignal,
                 nonlinearOrders=(1, 3, 5, 7),
                 memoryDepth=3,
                 crossMemoryDepth=0,
@@ -912,7 +904,7 @@ def RunAllIlcBenchmark(
             "ILC label + GMP",
             FitGmpPredistorter(
                 trainingSignal,
-                frequencyResult.learnedInput,
+                frequencyAnalysisResult.bestInputSignal,
                 nonlinearOrders=(1, 3, 5, 7),
                 memoryDepth=3,
                 crossMemoryDepth=2,
@@ -922,7 +914,7 @@ def RunAllIlcBenchmark(
             "ILC label + Volterra",
             FitVolterraPredistorter(
                 trainingSignal,
-                frequencyResult.learnedInput,
+                frequencyAnalysisResult.bestInputSignal,
                 memoryDepth=3,
             ),
         ),
@@ -930,7 +922,7 @@ def RunAllIlcBenchmark(
             "ILC label + LUT",
             FitLutPredistorter(
                 trainingSignal,
-                frequencyResult.learnedInput,
+                frequencyAnalysisResult.bestInputSignal,
                 binCount=64,
             ),
         ),
@@ -938,7 +930,7 @@ def RunAllIlcBenchmark(
             "ILC label + NN",
             FitNeuralPredistorter(
                 trainingSignal,
-                frequencyResult.learnedInput,
+                frequencyAnalysisResult.bestInputSignal,
                 memoryDepth=4,
                 hiddenUnitCount=32,
                 randomSeed=config.seed + 10,

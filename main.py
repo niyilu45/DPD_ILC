@@ -525,7 +525,9 @@ def Main() -> int:
             waveform.sampleRateHz,
             waveform.bandwidthHz,
             ilcConfig,
-            evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
+        )
+        ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(
+            ilcResult.history
         )
     else:
         ilcResult = RunMimoFrequencyDomainIlc(
@@ -535,13 +537,23 @@ def Main() -> int:
             waveform.bandwidthHz,
             ilcConfig,
         )
+        ilcAnalysisResult = resultAnalysis.AnalyzeMimoIlcHistory(
+            tuple(
+                chainResult.history
+                for chainResult in ilcResult.chainResults
+            )
+        )
+    selectedIlcInput = ilcAnalysisResult.bestInputSignal
+    # Analysis selects the best measured round. Re-run that input through the
+    # plant once so final reported performance excludes optional feedback noise.
+    selectedIlcOutput = paModel.Process(selectedIlcInput)
 
     # ILC labels are waveform-specific. Ridge-regression fitting converts them
     # into a causal GMP that can be evaluated on subsequent Wi-Fi packets.
     if waveform.numTransmitAntennas == 1:
         gmpPredistorter = FitGmpPredistorter(
             referenceSignal,
-            ilcResult.learnedInput,
+            selectedIlcInput,
             nonlinearOrders=(1, 3, 5, 7),
             memoryDepth=3,
             crossMemoryDepth=2,
@@ -550,7 +562,7 @@ def Main() -> int:
     else:
         gmpPredistorter = FitMimoGmpPredistorter(
             referenceSignal,
-            ilcResult.learnedInput,
+            selectedIlcInput,
             nonlinearOrders=(1, 3, 5, 7),
             memoryDepth=3,
             crossMemoryDepth=2,
@@ -568,7 +580,7 @@ def Main() -> int:
     resultAnalysis.AnalyzeStages(
         {
             "PA baseline": baselineOutput,
-            "Waveform ILC": ilcResult.outputSignal,
+            "Waveform ILC": selectedIlcOutput,
             "Fitted GMP DPD": deployedDpdOutput,
         }
     )
@@ -594,16 +606,10 @@ def Main() -> int:
     resultAnalysis.Print()
     if waveform.numTransmitAntennas > 1:
         resultAnalysis.PrintMimo()
-    if waveform.numTransmitAntennas == 1:
-        resultAnalysis.PrintConvergence(
-            ilcResult.history, "Waveform ILC iteration metrics"
-        )
-    else:
-        for chainIndex, chainResult in enumerate(ilcResult.chainResults):
-            resultAnalysis.PrintConvergence(
-                chainResult.history,
-                f"PA {chainIndex + 1} ILC iteration metrics",
-            )
+    resultAnalysis.PrintConvergence(
+        ilcAnalysisResult.history,
+        "Waveform ILC post-analysis iteration metrics",
+    )
 
     runMetadata = {
         "format": waveform.formatName,
@@ -713,32 +719,16 @@ def Main() -> int:
     jsonPath, csvPath = resultAnalysis.Save(
         arguments.outputDirectory, runMetadata
     )
-    if waveform.numTransmitAntennas == 1:
-        convergencePaths = (
-            resultAnalysis.SaveConvergence(
-                ilcResult.history, arguments.outputDirectory
-            ),
-        )
-        convergenceFigurePaths = (
-            resultDraw.SaveConvergenceCurve(
-                ilcResult.history, arguments.outputDirectory
-            ),
-        )
-    else:
-        convergencePaths = tuple(
-            resultAnalysis.SaveConvergence(
-                chainResult.history,
-                arguments.outputDirectory / f"pa_chain_{chainIndex + 1}",
-            )
-            for chainIndex, chainResult in enumerate(ilcResult.chainResults)
-        )
-        convergenceFigurePaths = tuple(
-            resultDraw.SaveConvergenceCurve(
-                chainResult.history,
-                arguments.outputDirectory / f"pa_chain_{chainIndex + 1}",
-            )
-            for chainIndex, chainResult in enumerate(ilcResult.chainResults)
-        )
+    convergencePaths = (
+        resultAnalysis.SaveConvergence(
+            ilcAnalysisResult.history, arguments.outputDirectory
+        ),
+    )
+    convergenceFigurePaths = (
+        resultDraw.SaveConvergenceCurve(
+            ilcAnalysisResult.history, arguments.outputDirectory
+        ),
+    )
 
     powerCurvePaths = None
     if not arguments.skipPowerEvmCurve:
@@ -796,8 +786,8 @@ def Main() -> int:
             waveformPath,
             referenceSignal=referenceSignal,
             baselineOutput=baselineOutput,
-            learnedIlcInput=ilcResult.learnedInput,
-            ilcOutput=ilcResult.outputSignal,
+            learnedIlcInput=selectedIlcInput,
+            ilcOutput=selectedIlcOutput,
             deployedDpdInput=deployedDpdInput,
             deployedDpdOutput=deployedDpdOutput,
         )

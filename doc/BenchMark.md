@@ -1166,7 +1166,7 @@ flowchart LR
 
 ### 19.4 公平性控制
 
-- 5个模型读取完全相同的 `frequencyResult.learnedInput`；
+- 5个模型读取完全相同的 `frequencyAnalysisResult.bestInputSignal`，该标签由 `Analysis.AnalyzeIlcHistory` 在ILC结束后按严格EVM选择；
 - 验证帧完全相同；
 - PA参数完全相同；
 - 峰值上限完全相同；

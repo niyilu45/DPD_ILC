@@ -31,7 +31,7 @@ inc/FrameProcess.py     Wi-Fi 去 CP、FFT、CSD 撤销与空间流解映射
 inc/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
 inc/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
 inc/SigProc.py          SigProc 同步补偿、SignalProcessingResult 与 PowerCalibration
-inc/Analysis.py         SNR、EVM、ACLR、功率-EVM 数据计算及结果输出
+inc/Analysis.py         SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
 inc/Draw.py             功率-EVM 多方法同图绘制与 PNG 输出
 inc/__init__.py         公共接口汇总
 tests/TestProject.py    自包含验证脚本
@@ -61,7 +61,9 @@ flowchart TD
     reference --> frequencyIlc
     paModel --> frequencyIlc
 
-    frequencyIlc --> learnedInput["ILC 学得的理想 PA 输入 u*"]
+    frequencyIlc --> nativeHistory["保存每轮输入、PA输出和原生MSE"]
+    nativeHistory --> ilcAnalysis["Analysis.AnalyzeIlcHistory<br/>逐轮计算SNR / EVM / ACLR"]
+    ilcAnalysis --> learnedInput["按严格EVM选择的 PA 输入 u*"]
     learnedInput --> deployFit["拟合 MP / GMP / Volterra / LUT / NN"]
     deployFit --> deployedDpd["可复用 DPD 模型"]
 
@@ -105,7 +107,7 @@ flowchart TD
 1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `WaveGenWifi`、`PaModel`、`Analysis` 和 `Draw`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
 2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
 3. `MimoPaModel` 为每个矩阵列建立独立 PA，可分别设置输入驱动增益 dB、相对输出功率 dB 或绝对输出功率 dBm。`PowerCalibration` 按用户配置的端口电阻把 dBm 换算成 PA 模型使用的复包络 RMS 电压。单方案模式对每个 PA 独立执行正则化频域 ILC，再对各路 ILC 标签分别拟合 GMP；全方案基准当前仅用于 SISO。
-4. 收敛后的 `u*` 可直接用于重复波形测试，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN，从而形成可用于其他帧的部署模型。
+4. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮输入、PA反馈输出和原生MSE。ILC返回后，`Analysis.AnalyzeIlcHistory` 或 `AnalyzeMimoIlcHistory` 才逐轮计算RF性能，并按严格EVM选择 `u*`。该输入可直接用于重复波形复测，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN，从而形成可用于其他帧的部署模型。
 5. 所有输出最终传给同一个 `Analysis` 实例；MIMO 时每条物理链分别调用 `SigProc` 完成整数/分数时延、载波频偏、采样频偏和复增益补偿。`FrameProcess` 再执行 Wi-Fi 去 CP、FFT、CSD 撤销和空间解映射。ACLR 对各链 PSD 求和形成汇总值，同时保留每链结果；EVM 按空间流统计。`AnalyzePowerEvmCurve` 在多个绝对 dBm 输入功率点调用各方法，生成不包含绘图逻辑的 `PowerEvmCurve` 数据对象。
 6. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
 
@@ -265,9 +267,9 @@ flowchart TD
     frequency --> fft["NextPowerOfTwo"]
     frequency --> measure["MeasurePaOutput / AddAwgn"]
     frequency --> metrics["CalculateIterationMetrics"]
-    evaluator["独立 Analysis EVM-MSE评估器"] --> metrics
     frequency --> limit["LimitAmplitude"]
-    metrics --> history["ILCIteration / ILCResult"]
+    metrics --> history["ILCIteration：原生MSE + 输入/输出"]
+    history --> result["ILCResult"]
 
     scalar["RunScalarPIlc"] --> waveformCore["RunWaveformUpdate"]
     complexGain["RunComplexGainIlc"] --> estimateGain["EstimateComplexGain"]
@@ -304,7 +306,7 @@ flowchart TD
 **图示说明：**
 
 - `DpdIlc.py` 是工程中唯一的可复用 ILC 算法文件，集中保存公共配置和收敛记录、全部更新律、SISO/MIMO执行及ILC标签部署模型。
-- 频域 ILC 和其他波形更新律共享 `ILCConfig`、`CalculateIterationMetrics`、`LimitAmplitude` 与 `ILCResult`。`ILCConfig` 只保存算法和反馈参数；严格EVM-MSE由 `Analysis` 作为独立评估器传给ILC入口。
+- 频域 ILC 和其他波形更新律共享 `ILCConfig`、`CalculateIterationMetrics`、`LimitAmplitude` 与 `ILCResult`。`ILCConfig` 只保存算法和反馈参数；`CalculateIterationMetrics` 只记录Raw/LC误差、输入峰值以及该轮输入/PA输出，不调用任何RF性能评估器。
 - 标量 P、复增益、FIR、方向 Gauss-Newton 和增广 IQ 路线通过 `RunWaveformUpdate` 复用测量与迭代骨架；参数域 ILC 使用 `MemoryPolynomialBasis` 直接更新可部署系数。
 - GMP、Volterra、LUT 和神经网络拟合都消费收敛标签 `u*`。各 `Fit...` 函数负责训练，相应 `...Predistorter.Process` 方法负责在独立验证帧上推理。
 - MIMO 路线用 `MimoPaChain` 将每个物理 PA 暴露给同一频域 ILC，再按链保存历史并分别拟合 GMP；当前模型假设 PA 之间没有隐藏耦合。
@@ -396,7 +398,12 @@ flowchart TD
     metrics --> toDict["SignalMetrics.ToDict"]
     metrics --> print["Analysis.Print"]
     metrics --> save["Analysis.Save"]
-    convergence["ILCIteration 列表"] --> saveConvergence["Analysis.SaveConvergence"]
+    nativeHistory["ILCIteration 列表"] --> analyzeHistory["Analysis.AnalyzeIlcHistory"]
+    nativeMimoHistory["各PA链 ILCIteration 列表"] --> analyzeMimoHistory["Analysis.AnalyzeMimoIlcHistory"]
+    analyzeHistory --> convergence["ILCPerformanceIteration 列表"]
+    analyzeMimoHistory --> convergence
+    convergence --> bestRound["ILCAnalysisResult：EVM最佳轮"]
+    convergence --> saveConvergence["Analysis.SaveConvergence"]
     convergence --> printConvergence["Analysis.PrintConvergence"]
     context --> powerSweep["Analysis.AnalyzePowerEvmCurve"]
     powerSweep --> curve["PowerEvmCurve"]
@@ -407,6 +414,7 @@ flowchart TD
 **图示说明：**
 
 - `Analysis` 构造时保存参考信号和 `WifiWaveform` 元数据；后续每个待测输出只需传给 `Analyze`，多个命名阶段可一次传给 `AnalyzeStages`。
+- `AnalyzeIlcHistory` 在ILC完成后读取每轮保存的输入和PA输出，用普通 `Analyze` 逐轮计算SNR、EVM和ACLR；`AnalyzeMimoIlcHistory` 先按轮组合各PA链，再使用完整空间流接收结构分析。两者都在Analysis层按严格EVM返回最佳轮。
 - 每次 `Analyze` 只调用一次 `SigProc.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
 - SNR 直接计算校正后数据字段与参考的残差功率；EVM 由 `FrameProcess` 根据 `WifiWaveform` 的数据字段位置去循环前缀、FFT、撤销 CSD 和空间解映射，再与采用相同接收路径得到的参考星座比较。
 - ACLR 通过 `AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
@@ -429,7 +437,7 @@ flowchart TD
     styles --> figure["Matplotlib Figure"]
     figure --> save["Draw.SavePowerEvmCurve"]
     save --> png["功率-EVM PNG"]
-    history["ILCIteration 列表"] --> historyValidate["ValidateConvergenceHistory"]
+    history["ILCPerformanceIteration 列表"] --> historyValidate["ValidateConvergenceHistory"]
     historyValidate --> historyCreate["CreateConvergenceFigure"]
     draw --> historyCreate
     historyCreate --> historySave["SaveConvergenceCurve"]
@@ -438,11 +446,11 @@ flowchart TD
 
 **图示说明：**
 
-- `Draw` 只接收已经算好的 `PowerEvmCurve` 或 `ILCIteration` 历史，不计算 SNR、EVM、MSE 或 ACLR，也不负责 CSV/JSON 数据序列化。
+- `Draw` 只接收已经算好的 `PowerEvmCurve` 或 `ILCPerformanceIteration` 历史，不计算 SNR、EVM、MSE 或 ACLR，也不负责 CSV/JSON 数据序列化。
 - `ValidatePowerEvmCurve` 在创建图形前检查功率坐标、各方法数据长度和有限性，防止产生缺失或错位曲线。
 - `CreatePowerEvmFigure` 把所有方法绘制在同一坐标系中；方法较多时图例自动移到绘图区外，避免遮挡数据。
 - `SavePowerEvmCurve` 读取 `Draw` 在类内部解析后的绘图参数并仅输出 PNG；图形尺寸、DPI、线宽、标记大小、标题和坐标轴文字均可由外部覆盖。
-- `SaveConvergenceCurve` 在同一 dB 轴上绘制 Raw NMSE、LC-NMSE 和可用的 EVM-MSE/EVM dB，便于定位原始 MSE 停滞但 EVM 继续改善的原因。
+- `SaveConvergenceCurve` 在同一 dB 轴上绘制 Analysis 已计算好的 Raw NMSE、LC-NMSE 和 EVM-MSE/EVM dB，便于定位原始 MSE 停滞但 EVM 继续改善的原因。
 
 ### `inc/__init__.py`
 
@@ -744,15 +752,17 @@ PA 辅助接口还包括：
 | `CalculateEvm(measuredSignal)` | 待测输出 | 返回 `(evmDb, evmPercent)`。 |
 | `CalculateAclr(measuredSignal)` | 待测输出 | 返回 `(aclrLowerDb, aclrUpperDb, aclrWorstDb)`。 |
 | `DemodulateWifiData(measuredSignal)` | 待测输出 | 返回 VHT/HE/EHT 数据子载波星座。 |
+| `AnalyzeIlcHistory(ilcHistory)` | SISO原生ILC历史 | 逐轮计算SNR/EVM/ACLR，并返回EVM最佳轮及完整 `ILCPerformanceIteration` 历史。 |
+| `AnalyzeMimoIlcHistory(chainHistories)` | 每条PA链的原生ILC历史 | 按轮组合MIMO矩阵、执行空间流性能分析并返回EVM最佳轮。 |
 | `Print(stageMetrics=None)` | 可选指标映射 | 打印指标表；省略时使用最近一次 `AnalyzeStages` 的结果。 |
 | `PrintMimo(stageMimoMetrics=None)` | 可选详细指标映射 | 打印逐 PA SNR/ACLR 与逐空间流 EVM。 |
-| `PrintConvergence(ilcHistory, historyName="ILC convergence")` | ILC 历史、可选标题 | 逐轮打印 Raw MSE、LC-MSE、EVM-MSE、复增益幅相和输入峰值。 |
+| `PrintConvergence(ilcHistory, historyName="ILC convergence")` | Analysis生成的性能历史、可选标题 | 逐轮打印 Raw MSE、LC-MSE、SNR、EVM、ACLR、复增益幅相和输入峰值。 |
 | `Save(outputDirectory, runMetadata, stageMetrics=None)` | 输出路径、元数据、可选指标映射 | 写入 `metrics.json` 和 `metrics.csv`，并附带可用的各阶段同步估计。 |
-| `SaveConvergence(ilcHistory, outputDirectory)` | ILC 历史、输出路径 | 写入包含三级 MSE 和线性项诊断的 `ilc_convergence.csv`。 |
+| `SaveConvergence(ilcHistory, outputDirectory)` | Analysis生成的性能历史、输出路径 | 写入包含三级MSE、SNR、EVM、ACLR和线性项诊断的 `ilc_convergence.csv`。 |
 | `AnalyzePowerEvmCurve(inputPowerDbmValues, methodEvaluators)` | 递增 dBm 点、`{方法名: 求值器}` 映射 | 计算并保存一个 `PowerEvmCurve`；求值器接收当前参考信号和绝对输入功率 dBm。 |
 | `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取实例解析后的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
 
-`SignalMetrics` 字段包括 `snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。`PowerEvmCurve` 保存用户指定的 `inputPowerDbmValues`、内部换算得到的 `driveRmsValues` 以及各方法的 EVM dB/百分比数组。
+`SignalMetrics` 字段包括 `snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。`ILCPerformanceIteration` 把这些RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult` 保存完整分析历史、严格EVM最佳轮及其输入/输出。`PowerEvmCurve` 保存用户指定的 `inputPowerDbmValues`、内部换算得到的 `driveRmsValues` 以及各方法的 EVM dB/百分比数组。
 
 ### `Draw` 参数与方法
 
@@ -801,19 +811,19 @@ PA 辅助接口还包括：
 | `responseFloorDb` | `-45.0` | 频率响应估计的低激励置信度门限。 |
 | `randomSeed` | `19` | 反馈噪声及算法随机过程种子。 |
 
-`ILCConfig` 只包含学习算法、约束和反馈测量参数，不包含 EVM、SNR 或 ACLR 计算器。所有SISO ILC入口都可以独立接收可选的 `evmMseEvaluator` 参数；通常传入 `resultAnalysis.CalculateEvmAlignedMse`，只用于逐轮EVM-MSE记录和最佳轮选择。最终PA输出的SNR、EVM和ACLR统一通过 `resultAnalysis.Analyze(paOutputSignal)` 计算。
+`ILCConfig` 只包含学习算法、约束和反馈测量参数，不包含 EVM、SNR 或 ACLR 计算器。所有SISO和MIMO ILC入口都完全独立于 `Analysis`：它们只返回原生历史。调用方随后使用 `resultAnalysis.AnalyzeIlcHistory(...)` 或 `AnalyzeMimoIlcHistory(...)` 计算每轮RF性能并选择严格EVM最佳轮；最终干净PA输出仍通过 `resultAnalysis.Analyze(paOutputSignal)` 计算。
 
 所有 ILC 入口都接收 `referenceSignal`、`paModel` 和 `ILCConfig`。附加参数如下：
 
 | 算法入口 | 附加参数及默认值 |
 | --- | --- |
-| `RunFrequencyDomainIlc` | `sampleRateHz`、`channelBandwidthHz`、独立的 `evmMseEvaluator=None`。 |
-| `RunScalarPIlc` | 独立的 `evmMseEvaluator=None`。 |
-| `RunComplexGainIlc` | 独立的 `evmMseEvaluator=None`。 |
-| `RunFirIlc` | `firLength=17`、独立的 `evmMseEvaluator=None`。 |
-| `RunDirectionalGaussNewtonIlc` | `finiteDifferenceRms=1e-3`、独立的 `evmMseEvaluator=None`。 |
-| `RunParameterDomainIlc` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`、独立的 `evmMseEvaluator=None`。 |
-| `RunAugmentedIqIlc` | 独立的 `evmMseEvaluator=None`。 |
+| `RunFrequencyDomainIlc` | `sampleRateHz`、`channelBandwidthHz`。 |
+| `RunScalarPIlc` | 无额外参数。 |
+| `RunComplexGainIlc` | 无额外参数。 |
+| `RunFirIlc` | `firLength=17`。 |
+| `RunDirectionalGaussNewtonIlc` | `finiteDifferenceRms=1e-3`。 |
+| `RunParameterDomainIlc` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`。 |
+| `RunAugmentedIqIlc` | 无额外参数。 |
 
 部署模型拟合入口支持：
 
@@ -1107,16 +1117,18 @@ ilcResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     ilcConfig,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
+ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
+selectedIlcOutput = paModel.Process(ilcAnalysisResult.bestInputSignal)
 
 stageMetrics = resultAnalysis.AnalyzeStages(
     {
         "PA baseline": baselineOutput,
-        "Frequency-domain ILC": ilcResult.outputSignal,
+        "Frequency-domain ILC": selectedIlcOutput,
     }
 )
 resultAnalysis.Print()
+resultAnalysis.PrintConvergence(ilcAnalysisResult.history)
 print(stageMetrics["Frequency-domain ILC"].ToDict())
 ```
 

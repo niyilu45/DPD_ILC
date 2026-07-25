@@ -282,6 +282,9 @@ def CheckModuleResponsibilityBoundaries() -> None:
     metadataSource = (
         projectRoot / "inc" / "WifiMetadata.py"
     ).read_text(encoding="utf-8")
+    ilcSource = (projectRoot / "inc" / "DpdIlc.py").read_text(
+        encoding="utf-8"
+    )
 
     assert not (projectRoot / "inc" / "SigProcess.py").exists()
     assert "class SigProc:" in signalProcessorSource
@@ -296,6 +299,8 @@ def CheckModuleResponsibilityBoundaries() -> None:
     assert "from .WifiMetadata import WifiWaveform" in analysisSource
     assert "from .PaModel import" not in analysisSource
     assert "from .WaveGenWifi import" not in analysisSource
+    assert "evmMseEvaluator" not in ilcSource
+    assert "CalculateEvm" not in ilcSource
 
 
 def CheckBenchmarkSeparation() -> None:
@@ -963,13 +968,23 @@ def CheckMimoPaAndDpd() -> None:
         mimoPaModel,
         waveform.sampleRateHz,
         waveform.bandwidthHz,
-        ILCConfig(numIterations=1),
+        ILCConfig(numIterations=2),
     )
     assert ilcResult.learnedInput.shape == referenceSignal.shape
     assert ilcResult.outputSignal.shape == referenceSignal.shape
     assert len(ilcResult.chainResults) == 2
+    resultAnalysis = Analysis(referenceSignal, waveform)
+    mimoAnalysisResult = resultAnalysis.AnalyzeMimoIlcHistory(
+        tuple(
+            chainResult.history
+            for chainResult in ilcResult.chainResults
+        )
+    )
+    assert len(mimoAnalysisResult.history) == 2
+    assert mimoAnalysisResult.bestInputSignal.shape == referenceSignal.shape
+    assert mimoAnalysisResult.bestOutputSignal.shape == referenceSignal.shape
     predistorter = FitMimoGmpPredistorter(
-        referenceSignal, ilcResult.learnedInput
+        referenceSignal, mimoAnalysisResult.bestInputSignal
     )
     assert predistorter.Process(referenceSignal).shape == referenceSignal.shape
 
@@ -1315,19 +1330,21 @@ def CheckIlcImprovement() -> None:
                 maxAmplitude=1.25,
             ),
         )
-        ilcMetrics = resultAnalysis.Analyze(ilcResult.outputSignal)
+        ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(
+            ilcResult.history
+        )
+        ilcMetrics = ilcAnalysisResult.bestMetrics
         assert ilcMetrics.evmDb < baselineMetrics.evmDb
         assert ilcMetrics.snrDb > baselineMetrics.snrDb
 
 
 def CheckMseEvmConvergence() -> None:
-    """Verify that reported EVM-aligned MSE exactly represents RMS EVM.
+    """Verify complete separation of ILC diagnostics and RF performance.
 
     Processing details:
-        Algorithm: First apply only a common complex gain to prove that raw
-        MSE retains the linear mismatch while compensated metrics reject it.
-        Then run a short ILC, validate every new history field, and verify the
-        CSV and convergence PNG outputs used by normal result presentation.
+        Algorithm: Prove native ILC records contain only waveform diagnostics
+        and measured signals, then pass those outputs to ``Analysis``, verify
+        the EVM identity and best-round selection, and validate result files.
 
     Returns:
         result: None. Assertions enforce metric identities and file content.
@@ -1350,13 +1367,14 @@ def CheckMseEvmConvergence() -> None:
         1,
         referenceSignal,
         gainOnlyOutput,
-        float(np.max(np.abs(referenceSignal))),
-        resultAnalysis.CalculateEvmAlignedMse,
+        referenceSignal,
     )
     assert gainOnlyMetrics.mse > 1e-4
     assert gainOnlyMetrics.linearCompensatedMse < 1e-25
-    assert gainOnlyMetrics.evmAlignedMse is not None
-    assert gainOnlyMetrics.evmAlignedMse < 1e-20
+    assert not hasattr(gainOnlyMetrics, "evmAlignedMse")
+    assert not hasattr(gainOnlyMetrics, "evmDb")
+    assert np.array_equal(gainOnlyMetrics.inputSignal, referenceSignal)
+    assert np.array_equal(gainOnlyMetrics.outputSignal, gainOnlyOutput)
 
     ilcResult = RunFrequencyDomainIlc(
         referenceSignal,
@@ -1368,30 +1386,44 @@ def CheckMseEvmConvergence() -> None:
             learningRate=0.25,
             maxAmplitude=1.25,
         ),
-        evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
     )
     assert len(ilcResult.history) == 3
     for iterationRecord in ilcResult.history:
         assert np.isclose(iterationRecord.mse, iterationRecord.errorRms**2)
-        assert iterationRecord.evmAlignedMse is not None
-        assert iterationRecord.evmDb is not None
+        assert not hasattr(iterationRecord, "evmAlignedMse")
+        assert not hasattr(iterationRecord, "evmDb")
+        assert iterationRecord.inputSignal.shape == referenceSignal.shape
+        assert iterationRecord.outputSignal.shape == referenceSignal.shape
+
+    analysisResult = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
+    assert len(analysisResult.history) == 3
+    assert analysisResult.bestIteration in (1, 2, 3)
+    assert analysisResult.bestInputSignal.shape == referenceSignal.shape
+    assert analysisResult.bestOutputSignal.shape == referenceSignal.shape
+    for iterationRecord in analysisResult.history:
         assert np.isclose(
             iterationRecord.evmDb,
             10.0 * np.log10(iterationRecord.evmAlignedMse),
+        )
+        assert np.isclose(
+            iterationRecord.evmAlignedMse,
+            (iterationRecord.evmPercent / 100.0) ** 2,
         )
 
     with TemporaryDirectory() as temporaryDirectory:
         outputDirectory = Path(temporaryDirectory)
         csvPath = resultAnalysis.SaveConvergence(
-            ilcResult.history, outputDirectory
+            analysisResult.history, outputDirectory
         )
         figurePath = Draw().SaveConvergenceCurve(
-            ilcResult.history, outputDirectory
+            analysisResult.history, outputDirectory
         )
         csvText = csvPath.read_text(encoding="utf-8-sig")
         assert "mse" in csvText
         assert "linearCompensatedMse" in csvText
         assert "evmAlignedMse" in csvText
+        assert "snrDb" in csvText
+        assert "aclrWorstDb" in csvText
         assert figurePath.is_file()
 
 

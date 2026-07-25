@@ -342,15 +342,15 @@ class Draw:
         return figurePath
 
     def ValidateConvergenceHistory(self, ilcHistory: Sequence[object]) -> None:
-        """Validate iteration ordering and every drawable MSE diagnostic.
+        """Validate independently analyzed convergence records.
 
         Processing details:
             Algorithm: Require at least one record, strictly increasing
-            iteration indices, finite raw and linear-compensated NMSE values,
-            and either a complete finite EVM series or no EVM series.
+            iteration indices, and finite raw, linear-compensated, and strict
+            Wi-Fi EVM series produced by ``Analysis``.
 
         Args:
-            ilcHistory: Ordered objects exposing ``ILCIteration`` fields.
+            ilcHistory: Ordered ``ILCPerformanceIteration`` records.
 
         Returns:
             result: None. Invalid histories raise a descriptive error.
@@ -364,29 +364,29 @@ class Draw:
         )
         if np.any(np.diff(iterations) <= 0):
             raise ValueError("ILC iterations must be strictly increasing")
-        for fieldName in ("nmseDb", "linearCompensatedNmseDb"):
+        for fieldName in (
+            "nmseDb",
+            "linearCompensatedNmseDb",
+            "evmDb",
+            "snrDb",
+            "aclrWorstDb",
+        ):
             fieldValues = np.asarray(
                 [getattr(record, fieldName) for record in historyRecords],
                 dtype=float,
             )
             if not np.all(np.isfinite(fieldValues)):
                 raise ValueError(f"{fieldName} values must be finite")
-        evmValues = [record.evmDb for record in historyRecords]
-        if any(value is not None for value in evmValues):
-            if any(value is None for value in evmValues) or not np.all(
-                np.isfinite(np.asarray(evmValues, dtype=float))
-            ):
-                raise ValueError("evmDb must be complete and finite when present")
 
     def CreateConvergenceFigure(
         self, ilcHistory: Sequence[object]
     ) -> Any:
-        """Create a raw-NMSE, compensated-NMSE, and EVM convergence figure.
+        """Create a native-NMSE and post-analysis EVM convergence figure.
 
         Processing details:
             Algorithm: Plot normalized metrics on one decibel axis so their
-            iteration trends are directly comparable. Exact EVM is included
-            only when an EVM-aligned evaluator populated every record.
+            iteration trends are directly comparable. The EVM series comes
+            only from the independent post-ILC ``Analysis`` result.
 
         Args:
             ilcHistory: Ordered per-iteration ILC diagnostic records.
@@ -433,15 +433,14 @@ class Draw:
             markersize=float(self.parameters["markerSize"]),
             label="Complex-gain-compensated NMSE",
         )
-        if all(record.evmDb is not None for record in historyRecords):
-            axes.plot(
-                iterations,
-                [record.evmDb for record in historyRecords],
-                marker="^",
-                linewidth=float(self.parameters["lineWidth"]),
-                markersize=float(self.parameters["markerSize"]),
-                label="EVM-aligned MSE / EVM dB",
-            )
+        axes.plot(
+            iterations,
+            [record.evmDb for record in historyRecords],
+            marker="^",
+            linewidth=float(self.parameters["lineWidth"]),
+            markersize=float(self.parameters["markerSize"]),
+            label="Post-analysis Wi-Fi EVM",
+        )
         axes.set_xlabel(str(self.parameters["convergenceXAxisLabel"]))
         axes.set_ylabel(str(self.parameters["convergenceYAxisLabel"]))
         axes.set_title(str(self.parameters["convergencePlotTitle"]))
@@ -465,7 +464,7 @@ class Draw:
             close Matplotlib resources after saving.
 
         Args:
-            ilcHistory: Ordered per-iteration ILC diagnostic records.
+            ilcHistory: Ordered post-analysis performance records.
             outputDirectory: Directory in which the PNG image is written.
             fileStem: Optional filename overriding ``convergenceFileStem``.
 

@@ -103,11 +103,11 @@ flowchart LR
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
 | `ILCConfig.Validate` | E | 只校验学习率、正则化、峰值、平均次数和投影带宽；不保存EVM、SNR或ACLR计算器 | DPD-ILC §3.3、§3.11–§3.12 |
-| `DpdIlc.CalculateIterationMetrics` | N/P | 计算 Raw MSE和复增益正交残差；若ILC入口独立传入EVM-MSE评估器，再记录严格EVM-MSE | Analysis §5.5–§5.10 |
+| `DpdIlc.CalculateIterationMetrics` | N/P | 只计算 Raw MSE、复增益正交残差和输入峰值，并保存该轮输入/PA输出；不计算任何RF性能指标 | DpdIlc §7、Analysis §5.5 |
 | `DpdIlc.NextPowerOfTwo` | N | 选择零填充 FFT 长度；提高采样密度/效率但不创造物理分辨率 | DPD-ILC §3.14 |
 | `DpdIlc.LimitAmplitude` | N/P | 把复样点投影到峰值圆盘，模拟 DAC/PA 输入约束 | DPD-ILC §3.11、§3.14 |
 | `DpdIlc.MeasurePaOutput` | P/N | 重复 PA 反馈、添加 AWGN 并平均，噪声方差降为 $1/R$ | DPD-ILC §3.12、§3.14 |
-| `DpdIlc.RunFrequencyDomainIlc` | P/N | 小信号频响探测、正则化逆、带宽投影、峰值投影和 EVM 选优 | DPD-ILC §3.4、§3.14 |
+| `DpdIlc.RunFrequencyDomainIlc` | P/N | 小信号频响探测、正则化逆、带宽投影、峰值投影和原生LC-NMSE候选保留 | DPD-ILC §3.4、§3.14 |
 | `DpdIlc.BuildFeatureSpecs` | N | 枚举 GMP 主/滞后/超前包络基函数 | DPD-ILC §3.7、§3.14 |
 | `DpdIlc.DelayedSlice`, `DpdIlc.GetDelayed` | N | 因果零填充延迟和块内缓存；保持基函数时序一致 | DPD-ILC §3.14 |
 | `DpdIlc.BuildGmpBasisChunk` | N/P | 在有限块内计算 GMP 基矩阵 | DPD-ILC §3.7、§3.14 |
@@ -197,7 +197,7 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `SignalMetrics.ToDict`, `MimoSignalMetrics.ToDict`, `PowerEvmCurve.ToDict` | E | 把已经计算的指标转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
+| `SignalMetrics.ToDict`, `MimoSignalMetrics.ToDict`, `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把已经计算的指标转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann 窗、50% 重叠的 Welch PSD 平均 | Analysis §6.2 |
 | `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 保存参考和元数据，解析指标/同步参数并校验 | Analysis §1–§2、§11 |
 | `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc` | Analysis §2、§9 |
@@ -212,6 +212,8 @@ flowchart LR
 | `Analysis.IntegrateAclr` | P/N | 等宽主/邻道 PSD 积分并取较差邻道 | Analysis §6.1、§6.3 |
 | `Analysis.CalculateAclr`, `Analysis.CalculatePreparedAclr`, `Analysis.CalculatePreparedAclrPerChain` | P/N | 数据字段 Welch PSD 的汇总/逐链 ACLR | Analysis §6、§9.3 |
 | `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让 SNR/EVM/ACLR 共用一次同步结果并保存阶段映射 | Analysis §1 |
+| `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO PA输出，并在Analysis中按严格EVM选择最佳实测轮 | Analysis §5.10 |
+| `Analysis.AnalyzeMimoIlcHistory` | P/E | 按轮组合各PA链输出，以完整MIMO空间解映射统一计算性能并在Analysis中选择最佳轮 | Analysis §9 |
 | `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同绝对 dBm 输入功率点和参考下公平比较各方法 EVM，并保存端口电阻换算后的 RMS 电压 | Analysis §8 |
 | `Analysis.SavePowerEvmCurveData`, `Analysis.Print`, `Analysis.PrintMimo`, `Analysis.Save`, `Analysis.SaveConvergence`, `Analysis.PrintConvergence` | E | 展示/序列化既有结果，不改变物理指标 | Analysis §10–§11 |
 

@@ -110,6 +110,55 @@ class PowerEvmCurve:
         }
 
 
+@dataclass(frozen=True)
+class ILCPerformanceIteration:
+    """Combine native ILC diagnostics with independently analyzed RF metrics."""
+
+    iteration: int
+    mse: float
+    errorRms: float
+    nmseDb: float
+    linearCompensatedMse: float
+    linearCompensatedNmseDb: float
+    complexGainMagnitudeDb: float
+    complexGainPhaseDegrees: float
+    inputPeak: float
+    snrDb: float
+    evmAlignedMse: float
+    evmDb: float
+    evmPercent: float
+    aclrLowerDb: float
+    aclrUpperDb: float
+    aclrWorstDb: float
+
+    def ToDict(self) -> Dict[str, float]:
+        """Convert one analyzed iteration to serialization-ready scalars.
+
+        Processing details:
+            Algorithm: Flatten the immutable dataclass without recalculating
+            either the ILC-native diagnostics or RF performance metrics.
+
+        Returns:
+            result: Dictionary preserving every per-iteration scalar.
+        """
+
+        return {
+            fieldName: float(fieldValue)
+            for fieldName, fieldValue in asdict(self).items()
+        }
+
+
+@dataclass(frozen=True)
+class ILCAnalysisResult:
+    """Store post-ILC performance history and the EVM-best measured candidate."""
+
+    history: Tuple[ILCPerformanceIteration, ...]
+    bestIteration: int
+    bestInputSignal: np.ndarray
+    bestOutputSignal: np.ndarray
+    bestMetrics: SignalMetrics
+
+
 def AveragePeriodogram(
     inputSignal: np.ndarray,
     sampleRateHz: float,
@@ -1377,18 +1426,318 @@ class Analysis:
                 csvWriter.writerow(rowData)
         return jsonPath, csvPath
 
+    def AnalyzeIlcHistory(
+        self, ilcHistory: Sequence[Any]
+    ) -> ILCAnalysisResult:
+        """Analyze every stored SISO ILC output after learning has finished.
+
+        Processing details:
+            Algorithm: Validate native iteration records, feed each stored PA
+            output through the ordinary ``Analyze`` path, combine RF metrics
+            with algorithm diagnostics, and select the measured candidate with
+            minimum strict Wi-Fi EVM outside the ILC algorithm.
+
+        Args:
+            ilcHistory: Native ``DpdIlc.ILCIteration`` records containing each
+                measured input/output pair and algorithm MSE diagnostics.
+
+        Returns:
+            result: Independent performance history plus the EVM-best measured
+                input, output, and complete signal metrics.
+        """
+
+        historyRecords = tuple(ilcHistory)
+        if not historyRecords:
+            raise ValueError("ilcHistory cannot be empty")
+        performanceRecords = []
+        inputSignals = []
+        outputSignals = []
+        previousIteration = 0
+        for iterationRecord in historyRecords:
+            iteration = int(iterationRecord.iteration)
+            if iteration <= previousIteration:
+                raise ValueError(
+                    "ILC iterations must be strictly increasing"
+                )
+            previousIteration = iteration
+            inputSignal = np.asarray(
+                iterationRecord.inputSignal, dtype=np.complex128
+            )
+            outputSignal = np.asarray(
+                iterationRecord.outputSignal, dtype=np.complex128
+            )
+            if (
+                inputSignal.shape != self.referenceSignal.shape
+                or outputSignal.shape != self.referenceSignal.shape
+            ):
+                raise ValueError(
+                    "ILC iteration signals must match the analysis reference"
+                )
+            if not np.all(np.isfinite(inputSignal)) or not np.all(
+                np.isfinite(outputSignal)
+            ):
+                raise ValueError(
+                    "ILC iteration signals must contain finite samples"
+                )
+            signalMetrics = self.Analyze(outputSignal)
+            evmAlignedMse = float(
+                (signalMetrics.evmPercent / 100.0) ** 2
+            )
+            performanceRecords.append(
+                ILCPerformanceIteration(
+                    iteration=iteration,
+                    mse=float(iterationRecord.mse),
+                    errorRms=float(iterationRecord.errorRms),
+                    nmseDb=float(iterationRecord.nmseDb),
+                    linearCompensatedMse=float(
+                        iterationRecord.linearCompensatedMse
+                    ),
+                    linearCompensatedNmseDb=float(
+                        iterationRecord.linearCompensatedNmseDb
+                    ),
+                    complexGainMagnitudeDb=float(
+                        iterationRecord.complexGainMagnitudeDb
+                    ),
+                    complexGainPhaseDegrees=float(
+                        iterationRecord.complexGainPhaseDegrees
+                    ),
+                    inputPeak=float(iterationRecord.inputPeak),
+                    snrDb=signalMetrics.snrDb,
+                    evmAlignedMse=evmAlignedMse,
+                    evmDb=signalMetrics.evmDb,
+                    evmPercent=signalMetrics.evmPercent,
+                    aclrLowerDb=signalMetrics.aclrLowerDb,
+                    aclrUpperDb=signalMetrics.aclrUpperDb,
+                    aclrWorstDb=signalMetrics.aclrWorstDb,
+                )
+            )
+            inputSignals.append(inputSignal.copy())
+            outputSignals.append(outputSignal.copy())
+
+        performanceTuple = tuple(performanceRecords)
+        bestIndex = int(
+            np.argmin(
+                [record.evmAlignedMse for record in performanceTuple]
+            )
+        )
+        bestOutputSignal = outputSignals[bestIndex].copy()
+        bestMetrics = self.Analyze(bestOutputSignal)
+        return ILCAnalysisResult(
+            history=performanceTuple,
+            bestIteration=performanceTuple[bestIndex].iteration,
+            bestInputSignal=inputSignals[bestIndex].copy(),
+            bestOutputSignal=bestOutputSignal,
+            bestMetrics=bestMetrics,
+        )
+
+    def AnalyzeMimoIlcHistory(
+        self, chainHistories: Sequence[Sequence[Any]]
+    ) -> ILCAnalysisResult:
+        """Analyze synchronized MIMO candidates assembled from per-PA ILC.
+
+        Processing details:
+            Algorithm: Require one equal-length history per transmit chain,
+            column-stack the input and PA output stored at each common round,
+            aggregate native per-chain MSE diagnostics, evaluate the complete
+            matrix through MIMO ``Analysis``, and select the minimum-EVM round.
+
+        Args:
+            chainHistories: Ordered native ILC histories, one sequence for each
+                physical PA chain in transmit-chain order.
+
+        Returns:
+            result: Full-spatial-stream performance history and EVM-best MIMO
+                input/output matrices selected outside ``DpdIlc``.
+        """
+
+        selectedHistories = tuple(
+            tuple(chainHistory) for chainHistory in chainHistories
+        )
+        if (
+            len(selectedHistories)
+            != self.waveform.numTransmitAntennas
+        ):
+            raise ValueError(
+                "chainHistories must contain one history per transmit antenna"
+            )
+        if not selectedHistories or not selectedHistories[0]:
+            raise ValueError("chainHistories cannot be empty")
+        iterationCount = len(selectedHistories[0])
+        if any(
+            len(chainHistory) != iterationCount
+            for chainHistory in selectedHistories
+        ):
+            raise ValueError(
+                "all MIMO chain histories must have equal iteration counts"
+            )
+
+        numericFloor = np.finfo(float).tiny
+        targetPower = max(
+            float(np.mean(np.abs(self.referenceSignal) ** 2)),
+            numericFloor,
+        )
+        performanceRecords = []
+        inputMatrices = []
+        outputMatrices = []
+        for iterationIndex in range(iterationCount):
+            chainRecords = tuple(
+                chainHistory[iterationIndex]
+                for chainHistory in selectedHistories
+            )
+            iterationValues = {
+                int(chainRecord.iteration)
+                for chainRecord in chainRecords
+            }
+            if len(iterationValues) != 1:
+                raise ValueError(
+                    "MIMO chain histories must align by iteration number"
+                )
+            iteration = iterationValues.pop()
+            if iteration != iterationIndex + 1:
+                raise ValueError(
+                    "MIMO ILC iterations must be contiguous and one-based"
+                )
+            inputMatrix = np.column_stack(
+                [
+                    np.asarray(
+                        chainRecord.inputSignal, dtype=np.complex128
+                    ).reshape(-1)
+                    for chainRecord in chainRecords
+                ]
+            )
+            outputMatrix = np.column_stack(
+                [
+                    np.asarray(
+                        chainRecord.outputSignal, dtype=np.complex128
+                    ).reshape(-1)
+                    for chainRecord in chainRecords
+                ]
+            )
+            if (
+                inputMatrix.shape != self.referenceSignal.shape
+                or outputMatrix.shape != self.referenceSignal.shape
+            ):
+                raise ValueError(
+                    "MIMO iteration matrices must match the analysis reference"
+                )
+            signalMetrics = self.Analyze(outputMatrix)
+            rawMse = float(
+                np.mean(
+                    [
+                        float(chainRecord.mse)
+                        for chainRecord in chainRecords
+                    ]
+                )
+            )
+            linearCompensatedMse = float(
+                np.mean(
+                    [
+                        float(chainRecord.linearCompensatedMse)
+                        for chainRecord in chainRecords
+                    ]
+                )
+            )
+            gainPhasors = np.asarray(
+                [
+                    10.0
+                    ** (
+                        float(chainRecord.complexGainMagnitudeDb)
+                        / 20.0
+                    )
+                    * np.exp(
+                        1j
+                        * np.radians(
+                            float(
+                                chainRecord.complexGainPhaseDegrees
+                            )
+                        )
+                    )
+                    for chainRecord in chainRecords
+                ],
+                dtype=np.complex128,
+            )
+            averageGain = np.mean(gainPhasors)
+            evmAlignedMse = float(
+                (signalMetrics.evmPercent / 100.0) ** 2
+            )
+            performanceRecords.append(
+                ILCPerformanceIteration(
+                    iteration=iteration,
+                    mse=rawMse,
+                    errorRms=float(np.sqrt(rawMse)),
+                    nmseDb=float(
+                        10.0
+                        * np.log10(
+                            max(rawMse, numericFloor) / targetPower
+                        )
+                    ),
+                    linearCompensatedMse=linearCompensatedMse,
+                    linearCompensatedNmseDb=float(
+                        10.0
+                        * np.log10(
+                            max(
+                                linearCompensatedMse,
+                                numericFloor,
+                            )
+                            / targetPower
+                        )
+                    ),
+                    complexGainMagnitudeDb=float(
+                        20.0
+                        * np.log10(
+                            max(float(np.abs(averageGain)), numericFloor)
+                        )
+                    ),
+                    complexGainPhaseDegrees=float(
+                        np.degrees(np.angle(averageGain))
+                    ),
+                    inputPeak=float(
+                        max(
+                            float(chainRecord.inputPeak)
+                            for chainRecord in chainRecords
+                        )
+                    ),
+                    snrDb=signalMetrics.snrDb,
+                    evmAlignedMse=evmAlignedMse,
+                    evmDb=signalMetrics.evmDb,
+                    evmPercent=signalMetrics.evmPercent,
+                    aclrLowerDb=signalMetrics.aclrLowerDb,
+                    aclrUpperDb=signalMetrics.aclrUpperDb,
+                    aclrWorstDb=signalMetrics.aclrWorstDb,
+                )
+            )
+            inputMatrices.append(inputMatrix.copy())
+            outputMatrices.append(outputMatrix.copy())
+
+        performanceTuple = tuple(performanceRecords)
+        bestIndex = int(
+            np.argmin(
+                [record.evmAlignedMse for record in performanceTuple]
+            )
+        )
+        bestOutputSignal = outputMatrices[bestIndex].copy()
+        bestMetrics = self.Analyze(bestOutputSignal)
+        return ILCAnalysisResult(
+            history=performanceTuple,
+            bestIteration=performanceTuple[bestIndex].iteration,
+            bestInputSignal=inputMatrices[bestIndex].copy(),
+            bestOutputSignal=bestOutputSignal,
+            bestMetrics=bestMetrics,
+        )
+
     def SaveConvergence(
         self,
-        ilcHistory: Sequence[Any],
+        ilcHistory: Sequence[ILCPerformanceIteration],
         outputDirectory: Path,
     ) -> Path:
-        """Save the per-iteration ILC convergence history as a CSV file.
+        """Save independently analyzed per-iteration performance as CSV.
 
         Processing details:
             Algorithm: Convert validated in-memory results into a stable reporting format without altering later numerical calculations.
 
         Args:
-            ilcHistory: Ordered per-iteration convergence records to serialize.
+            ilcHistory: Records returned by ``AnalyzeIlcHistory`` or its MIMO
+                counterpart, with algorithm and RF metrics already combined.
             outputDirectory: Directory in which result artifacts are written.
 
         Returns:
@@ -1405,8 +1754,13 @@ class Analysis:
             "nmseDb",
             "linearCompensatedMse",
             "linearCompensatedNmseDb",
+            "snrDb",
             "evmAlignedMse",
             "evmDb",
+            "evmPercent",
+            "aclrLowerDb",
+            "aclrUpperDb",
+            "aclrWorstDb",
             "complexGainMagnitudeDb",
             "complexGainPhaseDegrees",
             "inputPeak",
@@ -1429,8 +1783,13 @@ class Analysis:
                         "linearCompensatedNmseDb": (
                             iterationRecord.linearCompensatedNmseDb
                         ),
+                        "snrDb": iterationRecord.snrDb,
                         "evmAlignedMse": iterationRecord.evmAlignedMse,
                         "evmDb": iterationRecord.evmDb,
+                        "evmPercent": iterationRecord.evmPercent,
+                        "aclrLowerDb": iterationRecord.aclrLowerDb,
+                        "aclrUpperDb": iterationRecord.aclrUpperDb,
+                        "aclrWorstDb": iterationRecord.aclrWorstDb,
                         "complexGainMagnitudeDb": (
                             iterationRecord.complexGainMagnitudeDb
                         ),
@@ -1444,10 +1803,10 @@ class Analysis:
 
     def PrintConvergence(
         self,
-        ilcHistory: Sequence[Any],
+        ilcHistory: Sequence[ILCPerformanceIteration],
         historyName: str = "ILC convergence",
     ) -> None:
-        """Print every ILC iteration with raw and EVM-oriented MSE values.
+        """Print every iteration after independent RF performance analysis.
 
         Processing details:
             Algorithm: Format each immutable history record into aligned
@@ -1455,7 +1814,8 @@ class Analysis:
             normalized decibel forms for direct engineering diagnosis.
 
         Args:
-            ilcHistory: Ordered per-iteration convergence records.
+            ilcHistory: Records returned by ``AnalyzeIlcHistory`` or its MIMO
+                counterpart.
             historyName: Human-readable heading for the selected PA or method.
 
         Returns:
@@ -1469,29 +1829,23 @@ class Analysis:
         header = (
             f"{'Iter':>4} {'Raw MSE':>12} {'Raw NMSE':>10} "
             f"{'LC-MSE':>12} {'LC-NMSE':>10} {'EVM-MSE':>12} "
-            f"{'EVM(dB)':>9} {'Gain(dB)':>9} {'Phase(deg)':>11} "
+            f"{'EVM(dB)':>9} {'SNR(dB)':>9} {'ACLR(dB)':>10} "
+            f"{'Gain(dB)':>9} {'Phase(deg)':>11} "
             f"{'Peak':>9}"
         )
         print(header)
         print("-" * len(header))
         for iterationRecord in historyRecords:
-            evmMseText = (
-                "n/a"
-                if iterationRecord.evmAlignedMse is None
-                else f"{iterationRecord.evmAlignedMse:.5e}"
-            )
-            evmDbText = (
-                "n/a"
-                if iterationRecord.evmDb is None
-                else f"{iterationRecord.evmDb:.2f}"
-            )
             print(
                 f"{iterationRecord.iteration:>4d} "
                 f"{iterationRecord.mse:>12.5e} "
                 f"{iterationRecord.nmseDb:>10.2f} "
                 f"{iterationRecord.linearCompensatedMse:>12.5e} "
                 f"{iterationRecord.linearCompensatedNmseDb:>10.2f} "
-                f"{evmMseText:>12} {evmDbText:>9} "
+                f"{iterationRecord.evmAlignedMse:>12.5e} "
+                f"{iterationRecord.evmDb:>9.2f} "
+                f"{iterationRecord.snrDb:>9.2f} "
+                f"{iterationRecord.aclrWorstDb:>10.2f} "
                 f"{iterationRecord.complexGainMagnitudeDb:>9.2f} "
                 f"{iterationRecord.complexGainPhaseDegrees:>11.2f} "
                 f"{iterationRecord.inputPeak:>9.4f}"

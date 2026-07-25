@@ -34,15 +34,18 @@ flowchart LR
     pa["PaModel或MimoPaModel"] --> baseline
     pa --> ilc
     config["ILCConfig<br/>仅含算法和反馈参数"] --> ilc
-    analysis["Analysis.CalculateEvmAlignedMse<br/>独立逐轮评估器"] --> ilc
-    ilc --> learned["ILCResult.learnedInput<br/>最佳已测轮的PA输入"]
-    ilc --> output["ILCResult.outputSignal<br/>最佳输入对应的PA输出"]
-    ilc --> history["ILCResult.history<br/>每轮MSE与峰值"]
-    learned --> fit["FitGmp / FitVolterra / FitLut / FitNeural"]
+    ilc --> learned["ILCResult.learnedInput<br/>LC-NMSE最佳轮输入"]
+    ilc --> output["ILCResult.outputSignal<br/>LC-NMSE最佳轮干净输出"]
+    ilc --> history["ILCResult.history<br/>原生MSE及每轮输入/PA输出"]
+    history --> analysis["Analysis.AnalyzeIlcHistory<br/>逐轮SNR/EVM/ACLR"]
+    analysis --> analyzedHistory["ILCAnalysisResult.history<br/>完整性能历史"]
+    analysis --> evmBest["bestInputSignal<br/>严格EVM最佳轮输入"]
+    evmBest --> cleanOutput["PaModel.Process<br/>重新测量干净输出"]
+    evmBest --> fit["FitGmp / FitVolterra / FitLut / FitNeural"]
     reference --> fit
     fit --> deploy["Predistorter.Process<br/>处理独立Wi-Fi帧"]
     baseline --> metrics["resultAnalysis.Analyze或AnalyzeStages<br/>SNR、EVM、ACLR"]
-    output --> metrics
+    cleanOutput --> metrics
     deploy --> metrics
 ```
 
@@ -52,8 +55,9 @@ flowchart LR
 - `PaModel` 或 `MimoPaModel` 是ILC反复测量的plant。
 - `DpdIlc.py` 只负责算法，不负责选择benchmark场景或保存整套测试报告。
 - `ILCConfig` 不保存任何EVM、SNR或ACLR计算器；它只控制学习更新、幅度约束和反馈采集。
-- `Analysis` 的EVM-MSE方法可以作为独立参数传给ILC入口；ILC结束后，再把PA输出交给 `resultAnalysis.Analyze` 或 `AnalyzeStages` 计算SNR、EVM和ACLR。
-- 波形ILC得到的 `learnedInput` 只对当前重复波形直接有效；拟合部署模型后，才能处理独立的新Wi-Fi帧。
+- `DpdIlc.py` 不接收任何EVM、SNR或ACLR回调；每轮只计算算法原生MSE并保存对应输入和PA输出。
+- ILC返回后，`Analysis.AnalyzeIlcHistory` 才逐轮计算SNR、EVM和ACLR，并在分析层按严格EVM选择最佳实测轮。
+- `ILCAnalysisResult.bestInputSignal` 只对当前重复波形直接有效；拟合部署模型后，才能处理独立的新Wi-Fi帧。
 
 ---
 
@@ -231,25 +235,27 @@ ilcResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     ilcConfig,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
+ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
+selectedIlcInput = ilcAnalysisResult.bestInputSignal
+selectedIlcOutput = paModel.Process(selectedIlcInput)
 
 stageMetrics = resultAnalysis.AnalyzeStages(
     {
         "PA baseline": baselineOutput,
-        "Frequency-domain ILC": ilcResult.outputSignal,
+        "Frequency-domain ILC": selectedIlcOutput,
     }
 )
 resultAnalysis.Print()
 resultAnalysis.PrintConvergence(
-    ilcResult.history,
+    ilcAnalysisResult.history,
     historyName="Frequency-domain ILC",
 )
 
 outputDirectory = Path("results/dpd_ilc_usage")
-resultAnalysis.SaveConvergence(ilcResult.history, outputDirectory)
+resultAnalysis.SaveConvergence(ilcAnalysisResult.history, outputDirectory)
 Draw().SaveConvergenceCurve(
-    ilcResult.history,
+    ilcAnalysisResult.history,
     outputDirectory,
     fileStem="frequency_domain_ilc",
 )
@@ -260,7 +266,7 @@ print(f"Configured PA input power: {paInputPowerDbm:.2f} dBm")
 print(f"Equivalent PA input RMS voltage: {paInputRms:.6f} V")
 print(f"Measured PA output power: {baselineOutputPowerDbm:.2f} dBm")
 print(f"Measured PA output RMS voltage: {baselineOutputRms:.6f} V")
-print(ilcResult.learnedInput.shape)
+print(selectedIlcInput.shape)
 ```
 
 这个示例中，`paInputPowerDbm` 是需要显式设置的模拟功率参数。`WaveGenWifi` 已把SISO整包波形归一化到单位RMS。dBm先换算成瓦特，再通过端口电阻换算成复包络 RMS 电压：
@@ -289,13 +295,7 @@ P_{\mathrm{dBm}}
 
 `baselineOutputRms` 和 `baselineOutputPowerDbm` 是 PA 处理后的实测值，不是另一个输入配置。它们同时包含小信号增益、记忆效应和非线性压缩。若只在 PA 之后乘一个常数，只会改变线性输出标尺，不会改变 PA 内部非线性工作点。
 
-除了上述功率工作点，ILC最佳轮选择使用的独立评估参数是：
-
-```python
-evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse
-```
-
-该参数直接传给 `RunFrequencyDomainIlc`，不属于 `ILCConfig`。提供后，每轮都会计算严格的数据子载波EVM-MSE，并按照EVM-MSE保留最佳已测轮。若不提供，算法使用线性补偿NMSE选择最佳轮。最终SNR、EVM和ACLR仍通过 `resultAnalysis.Analyze(ilcResult.outputSignal)` 或 `AnalyzeStages` 独立计算。
+ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和PA输出。运行结束后，`resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 才计算每轮严格的数据子载波EVM、SNR和ACLR，并返回分析层选择的 `bestInputSignal`。若反馈链加入了噪声，应像示例一样把最佳输入重新送入PA，得到用于最终性能报告的干净输出。
 
 ---
 
@@ -324,9 +324,7 @@ ilcConfig = ILCConfig(
 | `responseFloorDb` | `-45.0` | 当前不单独限幅 | 低激励FFT频点的响应置信度门限 | 频谱零点不稳定时提高门限 |
 | `randomSeed` | `19` | 整数语义 | 反馈噪声随机种子 | 公平比较时每次实验固定 |
 
-`evmMseEvaluator` 不在上表中，因为它不是算法配置。它是各SISO `Run...Ilc` 入口的独立可选参数，由 `Analysis` 提供。
-
-旧写法 `ILCConfig(evmMseEvaluator=...)` 已不再支持。迁移时保留原 `ILCConfig`，把同一个回调移动到 `Run...Ilc(..., evmMseEvaluator=...)` 即可。
+所有 `Run...Ilc` 入口均不再接收性能评估回调。旧代码必须删除这类回调参数，并在ILC返回后调用 `Analysis.AnalyzeIlcHistory(...)`。
 
 ### 6.1 验证配置
 
@@ -379,9 +377,9 @@ ILCResult(
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `learnedInput` | 一维复数数组 | 最佳已测轮的PA输入，不一定是最后一次更新后的输入 |
-| `outputSignal` | 一维复数数组 | `paModel.Process(learnedInput)` 的干净最终输出 |
-| `history` | `List[ILCIteration]` | 每个已测轮的完整诊断记录 |
+| `learnedInput` | 一维复数数组 | `DpdIlc` 按LC-NMSE选择的算法原生候选 |
+| `outputSignal` | 一维复数数组 | `paModel.Process(learnedInput)` 的干净输出 |
+| `history` | `List[ILCIteration]` | 每个已测轮的原生诊断、输入和PA反馈输出 |
 
 ### 7.1 `numIterations` 的准确含义
 
@@ -389,8 +387,8 @@ ILCResult(
 
 ```text
 Measure current input
-Calculate and store metrics
-Remember current input if it is the best measured candidate
+Calculate and store native MSE diagnostics plus input/output
+Remember current input if it has the best LC-NMSE
 Calculate update
 Generate next input
 ```
@@ -399,15 +397,15 @@ Generate next input
 
 ### 7.2 为什么返回结果不一定对应最后一行
 
-若向ILC入口独立提供 `evmMseEvaluator`，最佳轮满足：
+`DpdIlc` 内部候选只按线性补偿NMSE选择：
 
 ```math
 k^\star
 =\arg\min_k
-\mathrm{MSE}_{\mathrm{EVM},k}.
+\mathrm{NMSE}_{\mathrm{LC},k}.
 ```
 
-若未提供回调，则使用线性补偿NMSE选择。后期因噪声或步长过大导致指标回退时，`learnedInput` 仍保留更好的早期输入。
+严格EVM最佳轮由 `Analysis.AnalyzeIlcHistory` 在算法返回后另行选择，并保存在 `ILCAnalysisResult.bestIteration`、`bestInputSignal` 和 `bestOutputSignal` 中。两个最佳轮可能不同，这是算法收敛准则与RF性能准则分离后的正常现象。
 
 ### 7.3 `ILCIteration` 字段
 
@@ -418,19 +416,14 @@ k^\star
 | `errorRms` | Raw MSE平方根 | 与Raw MSE表达同一误差 |
 | `nmseDb` | Raw MSE相对参考功率归一化 | 越负越好 |
 | `linearCompensatedMse` | 去除公共复增益后并折回参考尺度的残差功率 | 比Raw MSE更接近波形形状误差 |
-| `linearCompensatedNmseDb` | 线性补偿MSE归一化结果 | 未提供Wi-Fi元数据时用于最佳轮选择 |
-| `evmAlignedMse` | 数据子载波归一化MSE | 等于RMS EVM的平方 |
-| `evmDb` | `10*log10(evmAlignedMse)` | 数值越负越好 |
+| `linearCompensatedNmseDb` | 线性补偿MSE归一化结果 | DpdIlc内部最佳轮选择依据 |
 | `complexGainMagnitudeDb` | 当前PA输出相对参考的公共增益 | 用于区分线性增益漂移 |
 | `complexGainPhaseDegrees` | 当前公共相位 | 用于区分线性相位项 |
 | `inputPeak` | 当前PA输入最大幅度 | 用于检查峰值约束是否激活 |
+| `inputSignal` | 当前轮PA输入复数组 | 供后续外部选择与复测 |
+| `outputSignal` | 当前轮实测PA反馈复数组 | 供Analysis统一计算RF性能 |
 
-EVM百分比可由 `evmAlignedMse` 换算：
-
-```math
-\mathrm{EVM}_{\%}
-=100\sqrt{\mathrm{MSE}_{\mathrm{EVM}}}.
-```
+`Analysis.AnalyzeIlcHistory` 返回的 `ILCPerformanceIteration` 在上述原生字段之外增加 `snrDb`、`evmAlignedMse`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。
 
 ---
 
@@ -467,7 +460,6 @@ ilcResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     ilcConfig,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -486,26 +478,21 @@ commonConfig = ILCConfig(
     numIterations=8,
     maxAmplitude=2.0,
 )
-iterationEvaluator = resultAnalysis.CalculateEvmAlignedMse
-
 scalarResult = RunScalarPIlc(
     referenceSignal,
     paModel,
     commonConfig,
-    evmMseEvaluator=iterationEvaluator,
 )
 complexResult = RunComplexGainIlc(
     referenceSignal,
     paModel,
     commonConfig,
-    evmMseEvaluator=iterationEvaluator,
 )
 firResult = RunFirIlc(
     referenceSignal,
     paModel,
     commonConfig,
     firLength=17,
-    evmMseEvaluator=iterationEvaluator,
 )
 frequencyResult = RunFrequencyDomainIlc(
     referenceSignal,
@@ -513,11 +500,17 @@ frequencyResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     commonConfig,
-    evmMseEvaluator=iterationEvaluator,
+)
+
+scalarAnalysis = resultAnalysis.AnalyzeIlcHistory(scalarResult.history)
+complexAnalysis = resultAnalysis.AnalyzeIlcHistory(complexResult.history)
+firAnalysis = resultAnalysis.AnalyzeIlcHistory(firResult.history)
+frequencyAnalysis = resultAnalysis.AnalyzeIlcHistory(
+    frequencyResult.history
 )
 ```
 
-公平比较时应保持参考波形、PA、迭代数、峰值限制和独立指标回调一致。不同算法的更新方向尺度不同，因此“所有方法强制使用相同学习率”不一定公平；应记录每种方法的实际学习率。
+公平比较时应保持参考波形、PA、迭代数、峰值限制和同一个 `Analysis` 指标定义一致。不同算法的更新方向尺度不同，因此“所有方法强制使用相同学习率”不一定公平；应记录每种方法的实际学习率。
 
 ---
 
@@ -624,7 +617,9 @@ noiseAwareResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     noiseAwareConfig,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
+)
+noiseAwareAnalysis = resultAnalysis.AnalyzeIlcHistory(
+    noiseAwareResult.history
 )
 ```
 
@@ -649,7 +644,7 @@ noiseAwareResult = RunFrequencyDomainIlc(
 
 ---
 
-## 11. 独立的ILC性能评估
+## 11. ILC完成后的独立性能评估
 
 ### 11.1 推荐写法
 
@@ -662,23 +657,26 @@ ilcResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     ilcConfig,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
-ilcMetrics = resultAnalysis.Analyze(ilcResult.outputSignal)
+ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
+selectedInput = ilcAnalysisResult.bestInputSignal
+selectedOutput = paModel.Process(selectedInput)
+ilcMetrics = resultAnalysis.Analyze(selectedOutput)
 
 print(ilcMetrics.snrDb)
 print(ilcMetrics.evmDb)
 print(ilcMetrics.aclrWorstDb)
 ```
 
-这里有两个明确分离的步骤：
+这里有三个明确分离的步骤：
 
-1. `evmMseEvaluator` 是ILC入口的独立可选参数，只负责逐轮EVM-MSE和最佳轮选择；
-2. `resultAnalysis.Analyze(ilcResult.outputSignal)` 接收最终PA输出，独立完成同步补偿以及SNR、EVM、ACLR计算，并返回 `SignalMetrics`。
+1. `RunFrequencyDomainIlc` 只执行学习并保存每轮输入、PA输出和原生MSE；
+2. `resultAnalysis.AnalyzeIlcHistory` 在ILC返回后逐轮计算SNR、EVM和ACLR，并在分析层选择EVM最佳轮；
+3. 最佳输入重新送入PA后，`resultAnalysis.Analyze` 对干净最终输出生成 `SignalMetrics`。
 
-`ILCConfig` 不参与性能指标计算，也不保存任何 `Analysis` 回调。
+`ILCConfig` 和所有 `Run...Ilc` 函数都不持有、接收或调用任何 `Analysis` 回调。
 
-### 11.2 不能混用其他参考波形的回调
+### 11.2 每个参考波形使用自己的Analysis上下文
 
 功率扫描中每个功率点都应创建与当前参考匹配的 `Analysis`：
 
@@ -691,16 +689,17 @@ pointResult = RunFrequencyDomainIlc(
     waveform.sampleRateHz,
     waveform.bandwidthHz,
     ilcConfig,
-    evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
 )
-pointMetrics = pointAnalysis.Analyze(pointResult.outputSignal)
+pointIlcAnalysis = pointAnalysis.AnalyzeIlcHistory(pointResult.history)
+pointOutput = paModel.Process(pointIlcAnalysis.bestInputSignal)
+pointMetrics = pointAnalysis.Analyze(pointOutput)
 ```
 
-不要用标称功率参考构造的回调去评价另一个功率点，否则最佳轮选择会与当前参考不一致。
+不要用标称功率参考构造的 `Analysis` 去评价另一个功率点，否则同步、归一化和最佳轮选择会与当前参考不一致。
 
 ### 11.3 没有Wi-Fi元数据时
 
-如果输入不是 `WaveGenWifi` 生成的帧，可以不设置回调：
+如果输入不是 `WaveGenWifi` 生成的帧，ILC仍可独立运行：
 
 ```python
 ilcResult = RunScalarPIlc(
@@ -710,7 +709,7 @@ ilcResult = RunScalarPIlc(
 )
 ```
 
-此时算法根据线性补偿NMSE保留最佳轮。它能去除公共复增益影响，但不能替代PHY数据子载波EVM。
+此时算法根据线性补偿NMSE保留原生最佳轮。没有Wi-Fi帧元数据时不能调用严格的Wi-Fi逐轮EVM分析，但仍可由通用分析器计算适合该波形定义的性能。
 
 ---
 
@@ -726,7 +725,6 @@ firResult = RunFirIlc(
     paModel,
     ilcConfig,
     firLength=17,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -748,7 +746,6 @@ gaussNewtonResult = RunDirectionalGaussNewtonIlc(
     paModel,
     gaussNewtonConfig,
     finiteDifferenceRms=1e-3,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -770,7 +767,6 @@ parameterResult = RunParameterDomainIlc(
     ),
     nonlinearOrders=(1, 3, 5, 7),
     memoryDepth=3,
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -794,7 +790,6 @@ augmentedResult = RunAugmentedIqIlc(
         regularization=1e-3,
         maxAmplitude=2.0,
     ),
-    evmMseEvaluator=resultAnalysis.CalculateEvmAlignedMse,
 )
 ```
 
@@ -872,12 +867,14 @@ trainingResult = RunFrequencyDomainIlc(
     trainingWaveform.sampleRateHz,
     trainingWaveform.bandwidthHz,
     trainingConfig,
-    evmMseEvaluator=trainingAnalysis.CalculateEvmAlignedMse,
+)
+trainingIlcAnalysis = trainingAnalysis.AnalyzeIlcHistory(
+    trainingResult.history
 )
 
 gmpPredistorter = FitGmpPredistorter(
     trainingReference,
-    trainingResult.learnedInput,
+    trainingIlcAnalysis.bestInputSignal,
     nonlinearOrders=(1, 3, 5, 7),
     memoryDepth=3,
     crossMemoryDepth=2,
@@ -923,13 +920,13 @@ validationAnalysis.Print()
 ```python
 mpPredistorter = FitGmpPredistorter(
     trainingReference,
-    trainingResult.learnedInput,
+    trainingIlcAnalysis.bestInputSignal,
     crossMemoryDepth=0,
 )
 
 gmpPredistorter = FitGmpPredistorter(
     trainingReference,
-    trainingResult.learnedInput,
+    trainingIlcAnalysis.bestInputSignal,
     crossMemoryDepth=2,
 )
 ```
@@ -948,19 +945,19 @@ from inc.DpdIlc import (
 
 volterraPredistorter = FitVolterraPredistorter(
     trainingReference,
-    trainingResult.learnedInput,
+    trainingIlcAnalysis.bestInputSignal,
     memoryDepth=3,
     ridgeFactor=1e-6,
 )
 lutPredistorter = FitLutPredistorter(
     trainingReference,
-    trainingResult.learnedInput,
+    trainingIlcAnalysis.bestInputSignal,
     binCount=64,
     ridgeFactor=1e-8,
 )
 neuralPredistorter = FitNeuralPredistorter(
     trainingReference,
-    trainingResult.learnedInput,
+    trainingIlcAnalysis.bestInputSignal,
     memoryDepth=4,
     hiddenUnitCount=32,
     ridgeFactor=1e-5,
@@ -1076,10 +1073,17 @@ mimoResult = RunMimoFrequencyDomainIlc(
     waveform.bandwidthHz,
     mimoConfig,
 )
+resultAnalysis = Analysis(referenceSignal, waveform)
+mimoIlcAnalysis = resultAnalysis.AnalyzeMimoIlcHistory(
+    tuple(chainResult.history for chainResult in mimoResult.chainResults)
+)
+selectedMimoOutput = mimoPaModel.Process(
+    mimoIlcAnalysis.bestInputSignal
+)
 
 mimoPredistorter = FitMimoGmpPredistorter(
     referenceSignal,
-    mimoResult.learnedInput,
+    mimoIlcAnalysis.bestInputSignal,
     nonlinearOrders=(1, 3, 5, 7),
     memoryDepth=3,
     crossMemoryDepth=2,
@@ -1088,11 +1092,10 @@ mimoPredistorter = FitMimoGmpPredistorter(
 deployedInput = mimoPredistorter.Process(referenceSignal)
 deployedOutput = mimoPaModel.Process(deployedInput)
 
-resultAnalysis = Analysis(referenceSignal, waveform)
 resultAnalysis.AnalyzeStages(
     {
         "MIMO PA baseline": mimoPaModel.Process(referenceSignal),
-        "MIMO ILC": mimoResult.outputSignal,
+        "MIMO ILC": selectedMimoOutput,
         "MIMO GMP deployment": deployedOutput,
     }
 )
@@ -1175,14 +1178,17 @@ def RunPointIlc(
 
     del inputPowerDbm
     pointAnalysis = Analysis(pointReference, waveform)
-    return RunFrequencyDomainIlc(
+    pointResult = RunFrequencyDomainIlc(
         pointReference,
         paModel,
         waveform.sampleRateHz,
         waveform.bandwidthHz,
         ilcConfig,
-        evmMseEvaluator=pointAnalysis.CalculateEvmAlignedMse,
-    ).outputSignal
+    )
+    pointIlcAnalysis = pointAnalysis.AnalyzeIlcHistory(
+        pointResult.history
+    )
+    return paModel.Process(pointIlcAnalysis.bestInputSignal)
 
 powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
     inputPowerDbmValues=inputPowerDbmValues,
@@ -1222,11 +1228,11 @@ from inc.Draw import Draw
 outputDirectory = Path("results/custom_ilc")
 
 csvPath = resultAnalysis.SaveConvergence(
-    ilcResult.history,
+    ilcAnalysisResult.history,
     outputDirectory,
 )
 pngPath = Draw().SaveConvergenceCurve(
-    ilcResult.history,
+    ilcAnalysisResult.history,
     outputDirectory,
     fileStem="custom_ilc_convergence",
 )
@@ -1239,7 +1245,7 @@ print(pngPath)
 
 ```python
 resultAnalysis.PrintConvergence(
-    ilcResult.history,
+    ilcAnalysisResult.history,
     historyName="Custom ILC",
 )
 ```
@@ -1255,9 +1261,11 @@ resultAnalysis.PrintConvergence(
 | 名称 | 用途 |
 |---|---|
 | `ILCConfig` | 所有ILC共享的迭代、正则化、峰值和反馈配置 |
-| `ILCIteration` | 一轮Raw、LC、EVM三类误差和输入峰值 |
-| `ILCResult` | SISO最佳输入、最终输出和逐轮历史 |
+| `ILCIteration` | 一轮Raw/LC误差、输入峰值以及该轮输入/PA输出 |
+| `ILCResult` | SISO的LC-NMSE候选和全部原生逐轮历史 |
 | `MimoIlcResult` | MIMO矩阵结果和逐链SISO结果 |
+| `ILCPerformanceIteration` | Analysis计算的逐轮SNR、EVM、ACLR与原生MSE |
+| `ILCAnalysisResult` | Analysis选择的EVM最佳轮、输入、输出和完整历史 |
 
 ### 17.2 完整ILC入口
 
@@ -1266,20 +1274,17 @@ RunScalarPIlc(
     referenceSignal,
     paModel,
     config=ILCConfig(),
-    evmMseEvaluator=None,
 )
 RunComplexGainIlc(
     referenceSignal,
     paModel,
     config=ILCConfig(),
-    evmMseEvaluator=None,
 )
 RunFirIlc(
     referenceSignal,
     paModel,
     config=ILCConfig(),
     firLength=17,
-    evmMseEvaluator=None,
 )
 RunFrequencyDomainIlc(
     referenceSignal,
@@ -1287,14 +1292,12 @@ RunFrequencyDomainIlc(
     sampleRateHz,
     channelBandwidthHz,
     config=ILCConfig(),
-    evmMseEvaluator=None,
 )
 RunDirectionalGaussNewtonIlc(
     referenceSignal,
     paModel,
     config=ILCConfig(),
     finiteDifferenceRms=1e-3,
-    evmMseEvaluator=None,
 )
 RunParameterDomainIlc(
     referenceSignal,
@@ -1302,13 +1305,11 @@ RunParameterDomainIlc(
     config=ILCConfig(),
     nonlinearOrders=(1, 3, 5, 7),
     memoryDepth=3,
-    evmMseEvaluator=None,
 )
 RunAugmentedIqIlc(
     referenceSignal,
     paModel,
     config=ILCConfig(),
-    evmMseEvaluator=None,
 )
 RunMimoFrequencyDomainIlc(
     referenceSignal,
@@ -1319,7 +1320,7 @@ RunMimoFrequencyDomainIlc(
 )
 ```
 
-上述SISO入口的 `evmMseEvaluator` 都是与 `config` 平级的独立参数。将 `resultAnalysis.CalculateEvmAlignedMse` 传入可记录逐轮严格EVM-MSE；最终性能仍使用 `resultAnalysis.Analyze(ilcResult.outputSignal)` 计算。MIMO入口按物理PA链独立学习，完整空间解映射后的EVM应在矩阵输出产生后由MIMO `Analysis` 统一计算。
+上述所有ILC入口都不接受RF性能计算器。SISO完成后调用 `Analysis.AnalyzeIlcHistory(ilcResult.history)`；MIMO完成后把各 `chainResult.history` 传给 `Analysis.AnalyzeMimoIlcHistory(...)`。完整空间解映射后的EVM只在 `Analysis` 中计算。
 
 ### 17.3 部署模型拟合
 
@@ -1383,7 +1384,7 @@ FitMimoGmpPredistorter(
 
 | 函数 | 作用 | 典型调用者 |
 |---|---|---|
-| `CalculateIterationMetrics` | 构造单轮Raw、LC和EVM诊断 | 所有ILC循环 |
+| `CalculateIterationMetrics` | 构造单轮Raw/LC原生诊断并保存该轮输入和PA输出，不计算RF性能 | 所有ILC循环 |
 | `NextPowerOfTwo` | 计算不小于输入长度的2次幂FFT长度 | 频域ILC和FIR ILC |
 | `LimitAmplitude` | 对每个复样点执行峰值圆盘投影 | 所有完整ILC入口和部署输出 |
 | `MeasurePaOutput` | 频域ILC的反馈测量与平均 | `RunFrequencyDomainIlc` |
@@ -1461,7 +1462,7 @@ nextInput = LimitAmplitude(inputSignal + updateSignal)
 Raw MSE还包含公共增益、公共相位、前导字段和带外分量。应同时查看：
 
 1. `linearCompensatedNmseDb`；
-2. `evmAlignedMse`；
+2. `ilcAnalysisResult.history` 中的 `evmAlignedMse`；
 3. `complexGainMagnitudeDb`；
 4. `complexGainPhaseDegrees`。
 
@@ -1469,20 +1470,11 @@ Wi-Fi性能判断以严格EVM-MSE和最终 `Analysis.Analyze` 结果为主。
 
 ### 19.4 最终输出不像最后一轮
 
-这是最佳已测轮保留机制，不是结果错位。用以下代码定位：
+`DpdIlc` 的LC-NMSE候选和 `Analysis` 的严格EVM候选可能不是同一轮。用以下代码定位最终采用的EVM最佳轮：
 
 ```python
-bestIteration = min(
-    ilcResult.history,
-    key=lambda record: (
-        record.evmAlignedMse
-        if record.evmAlignedMse is not None
-        else 10.0 ** (
-            record.linearCompensatedNmseDb / 10.0
-        )
-    ),
-)
-print(bestIteration.iteration)
+ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
+print(ilcAnalysisResult.bestIteration)
 ```
 
 ### 19.5 输入峰值一直等于 `maxAmplitude`
@@ -1557,8 +1549,8 @@ referenceSignal.shape[1] == mimoPaModel.numTransmitChains
 
 1. 使用固定种子生成一个过采样Wi-Fi帧；
 2. 计算PA baseline；
-3. 向ILC入口独立传入 `evmMseEvaluator`，运行6至10轮；
-4. 检查Raw、LC和EVM三种MSE；
+3. 运行ILC 6至10轮，不传入任何性能回调；
+4. 用 `Analysis.AnalyzeIlcHistory` 计算并检查Raw、LC和EVM三种MSE；
 5. 检查每轮输入峰值；
 6. 与同场景baseline和至少一种更简单方法比较；
 7. 再加入反馈噪声、IQ失衡或峰值约束。
@@ -1626,7 +1618,7 @@ python tests/BenchMark.py --format EHT --bandwidth 20 --mcs 7 --iterations 6
 - [ ] 频域ILC采样率至少为信道带宽的2倍；
 - [ ] ACLR分析时采样率不小于3倍信道带宽；
 - [ ] `ILCConfig.Validate()` 通过；
-- [ ] Wi-Fi信号已向ILC入口传入匹配的独立 `evmMseEvaluator`；
+- [ ] ILC返回后已用匹配参考构造的 `Analysis` 分析全部逐轮输出；
 - [ ] `maxAmplitude` 对应真实可实现峰值；
 - [ ] 带噪比较固定了随机种子；
 - [ ] 每种特殊场景使用自己的baseline；
