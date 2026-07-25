@@ -29,11 +29,11 @@ main.py                 命令行主程序
 inc/lib/Analysis.py         SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
 inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
 inc/lib/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
+inc/lib/ParseWifi.py        接收帧描述解析、包起点检测与参考波形恢复
 inc/lib/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
 inc/utils/ConfigUtils.py    ChainMap未知配置警告、过滤与外部活动映射视图
 inc/utils/Draw.py           功率-EVM 多方法同图绘制与 PNG 输出
 inc/utils/FrameProcess.py   Wi-Fi 去 CP、FFT、CSD 撤销与空间流解映射
-inc/utils/ParseWifi.py      接收帧描述解析、包起点检测与参考波形恢复
 inc/utils/SigProc.py        SigProc 同步补偿、SignalProcessingResult 与 PowerCalibration
 inc/utils/WifiMetadata.py   MCSInfo 与 WifiWaveform 纯数据契约
 inc/__init__.py         公共接口汇总
@@ -219,7 +219,7 @@ flowchart TD
 - `WaveGenWifi` 负责创建 `WifiWaveform`；`FrameProcess` 和 `Analysis` 只消费这份稳定的数据契约，因此不需要导入波形生成算法。
 - `WifiWaveform` 保存时域样点、采样率、FFT/GI 参数、数据字段起点、音调索引、空间映射矩阵、CSD、确定性生成种子和参考空间流星座。
 
-### `inc/utils/ParseWifi.py`
+### `inc/lib/ParseWifi.py`
 
 ```mermaid
 flowchart TD

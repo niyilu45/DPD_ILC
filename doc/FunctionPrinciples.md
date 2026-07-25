@@ -5,7 +5,7 @@
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `main.py` 和 `inc/**/*.py` 中 235 个函数/方法定义位置。核心业务类位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
+本次审计共检查 `main.py` 和 `inc/**/*.py` 中 235 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis和DPD-ILC核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
 
 ## 1. 分类规则
 
@@ -80,7 +80,7 @@ flowchart LR
 | `WaveGenWifi.MapCommonFieldToAntennas` | P/E | 把公共前导复制到物理链并施加链级 CSD，保持公共字段含义 | WaveGenWifi §8.8、§8.10 |
 | `WaveGenWifi.AppendField` | E | 内部闭包：顺序拼接字段并记录切片，不改变字段采样值 | WaveGenWifi §8.2–§8.5 |
 
-### 3.1 `ParseWifi.py`：接收帧解析与参考恢复
+### 3.1 `inc/lib/ParseWifi.py`：接收帧解析与参考恢复
 
 详细原理、限制和调用方法见 [ParseWifi.md](./ParseWifi.md)。
 

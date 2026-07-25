@@ -2,7 +2,7 @@
 
 ## 1. 模块目标
 
-`inc/utils/ParseWifi.py` 用于从接收到的VHT、HE或EHT复基带波形中恢复 `Analysis` 所需的参考信号和帧元数据。
+`inc/lib/ParseWifi.py` 用于从接收到的VHT、HE或EHT复基带波形中恢复 `Analysis` 所需的参考信号和帧元数据。
 
 工程现在保留两条Analysis入口：
 
@@ -599,7 +599,7 @@ metrics = resultAnalysis.Analyze(receivedSignal)
 ### 8.5 独立使用ParseWifi
 
 ```python
-from inc.utils.ParseWifi import ParseWifi
+from inc.lib.ParseWifi import ParseWifi
 
 parser = ParseWifi(
     sampleRateHz=80.0e6,

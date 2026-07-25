@@ -40,7 +40,7 @@ from inc.lib.DpdIlc import (
 )
 from inc.utils.Draw import Draw
 from inc.lib.PaModel import MimoPaModel, PaModel
-from inc.utils.ParseWifi import ParseWifi
+from inc.lib.ParseWifi import ParseWifi
 from inc.utils.SigProc import PowerCalibration, SigProc
 from inc.lib.WaveGenWifi import (
     NormalizeFrameFormat,
@@ -277,6 +277,9 @@ def CheckModuleResponsibilityBoundaries() -> None:
     waveGeneratorSource = (
         projectRoot / "inc" / "lib" / "WaveGenWifi.py"
     ).read_text(encoding="utf-8")
+    parserSource = (
+        projectRoot / "inc" / "lib" / "ParseWifi.py"
+    ).read_text(encoding="utf-8")
     signalProcessorSource = (
         projectRoot / "inc" / "utils" / "SigProc.py"
     ).read_text(encoding="utf-8")
@@ -291,6 +294,9 @@ def CheckModuleResponsibilityBoundaries() -> None:
     )
 
     assert not (projectRoot / "inc" / "SigProcess.py").exists()
+    assert not (
+        projectRoot / "inc" / "utils" / "ParseWifi.py"
+    ).exists()
     for movedModuleName in (
         "Analysis.py",
         "DpdIlc.py",
@@ -311,6 +317,12 @@ def CheckModuleResponsibilityBoundaries() -> None:
     assert "def BuildCsdPhaseMatrix(" not in waveGeneratorSource
     assert "class MCSInfo:" in metadataSource
     assert "class WifiWaveform:" in metadataSource
+    assert "class ParseWifi:" in parserSource
+    assert "from .ParseWifi import" in analysisSource
+    assert (
+        "from .ParseWifi import BuildWifiDescriptorField"
+        in waveGeneratorSource
+    )
     assert "from ..utils.SigProc import" in analysisSource
     assert "from ..utils.FrameProcess import FrameProcess" in analysisSource
     assert "from ..utils.WifiMetadata import WifiWaveform" in analysisSource

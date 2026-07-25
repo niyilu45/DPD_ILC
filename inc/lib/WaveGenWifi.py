@@ -24,7 +24,7 @@ from ..utils.ConfigUtils import (
     RecognizedParameterView,
 )
 from ..utils.FrameProcess import BuildCsdPhaseMatrix
-from ..utils.ParseWifi import BuildWifiDescriptorField
+from .ParseWifi import BuildWifiDescriptorField
 from ..utils.WifiMetadata import MCSInfo, WifiWaveform
 
 

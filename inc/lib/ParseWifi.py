@@ -26,11 +26,11 @@ from typing import (
 
 import numpy as np
 
-from .ConfigUtils import (
+from ..utils.ConfigUtils import (
     FilterRecognizedParameters,
     RecognizedParameterView,
 )
-from .WifiMetadata import WifiWaveform
+from ..utils.WifiMetadata import WifiWaveform
 
 
 @dataclass(frozen=True)
@@ -955,7 +955,7 @@ class ParseWifi:
 
         # Import locally because WaveGenWifi reuses the descriptor writer from
         # this module during normal packet construction.
-        from ..lib.WaveGenWifi import WaveGenWifi
+        from .WaveGenWifi import WaveGenWifi
 
         try:
             candidateWaveform = WaveGenWifi(
@@ -1711,7 +1711,7 @@ class ParseWifi:
 
         # Import locally to keep the receive-parser module free of a module-load
         # cycle while allowing the transmitter to reuse the descriptor writer.
-        from ..lib.WaveGenWifi import WaveGenWifi
+        from .WaveGenWifi import WaveGenWifi
 
         referenceWaveform = WaveGenWifi(
             parameters=generatorParameters

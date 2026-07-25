@@ -1,1 +1,1 @@
-"""Shared configuration, drawing, frame, parsing, and signal utilities."""
+"""Shared configuration, drawing, frame, metadata, and signal utilities."""

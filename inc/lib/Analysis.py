@@ -25,7 +25,7 @@ from ..utils.ConfigUtils import (
     RecognizedParameterView,
 )
 from ..utils.FrameProcess import FrameProcess
-from ..utils.ParseWifi import ParsedWifiFrame, ParseWifi
+from .ParseWifi import ParsedWifiFrame, ParseWifi
 from ..utils.SigProc import PowerCalibration, SigProc, SignalProcessingResult
 from ..utils.WifiMetadata import WifiWaveform
 
