@@ -2,6 +2,7 @@
 
 import ast
 from dataclasses import replace
+import inspect
 import json
 from pathlib import Path
 import re
@@ -577,6 +578,167 @@ def CheckDocumentationMathCompatibility() -> None:
             assert braceDepth == 0, (
                 f"unbalanced braces in {documentPath}, math block {blockIndex}"
             )
+
+
+def CheckDocumentationApiConsistency() -> None:
+    """Verify runnable Markdown snippets and documented Analysis arguments.
+
+    Processing details:
+        Algorithm: Compile every fenced Python example, compare the public
+        ``Analysis`` constructor parameter order with its documented
+        signature, require synchronization examples to use the explicit
+        ``signalProcessingParameters`` argument, and retain one documented
+        compatibility note for the legacy nested mapping form.
+
+    Returns:
+        result: None. A stale example or signature fails with its document
+            path and code-block index.
+    """
+
+    projectRoot = GetProjectRoot()
+    documentPaths = [projectRoot / "README.md"]
+    documentPaths.extend(sorted((projectRoot / "doc").glob("*.md")))
+    pythonBlockPattern = re.compile(
+        r"```python[ \t]*\r?\n(.*?)```",
+        flags=re.DOTALL,
+    )
+    for documentPath in documentPaths:
+        markdownText = documentPath.read_text(encoding="utf-8")
+        for blockIndex, pythonBlock in enumerate(
+            re.findall(pythonBlockPattern, markdownText),
+            start=1,
+        ):
+            try:
+                compile(
+                    pythonBlock,
+                    f"{documentPath}#python-block-{blockIndex}",
+                    "exec",
+                )
+            except SyntaxError as error:
+                raise AssertionError(
+                    "invalid Python documentation example at "
+                    f"{documentPath} block {blockIndex}: {error}"
+                ) from error
+
+    expectedAnalysisParameters = (
+        "referenceSignal",
+        "waveform",
+        "parameters",
+        "parseParameters",
+        "transmittedSignal",
+        "signalProcessingParameters",
+        "parameterOverrides",
+    )
+    actualAnalysisParameters = tuple(
+        inspect.signature(Analysis).parameters
+    )
+    assert actualAnalysisParameters == expectedAnalysisParameters
+
+    expectedSignatureText = (
+        "Analysis(referenceSignal, waveform=None, parameters=None, "
+        "parseParameters=None, transmittedSignal=None, "
+        "signalProcessingParameters=None, **parameterOverrides)"
+    )
+    readmeText = (projectRoot / "README.md").read_text(encoding="utf-8")
+    analysisDocumentText = (
+        projectRoot / "doc" / "Analysis.md"
+    ).read_text(encoding="utf-8")
+    signalDocumentText = (
+        projectRoot / "doc" / "SigProc.md"
+    ).read_text(encoding="utf-8")
+    assert expectedSignatureText in readmeText
+    documentedParameterExpectations = (
+        (
+            WaveGenWifi,
+            (
+                "parameters",
+                "parameterOverrides",
+            ),
+            "WaveGenWifi(parameters=None, **parameterOverrides)",
+        ),
+        (
+            PowerCalibration,
+            (
+                "loadResistanceOhm",
+                "maximumOutputPowerDbm",
+                "parameters",
+                "parameterOverrides",
+            ),
+            (
+                "PowerCalibration(loadResistanceOhm=None, "
+                "maximumOutputPowerDbm=None, parameters=None, "
+                "**parameterOverrides)"
+            ),
+        ),
+        (
+            PaModel,
+            (
+                "modelName",
+                "wienerConfig",
+                "gmpConfig",
+                "parameters",
+                "parameterOverrides",
+            ),
+            (
+                "PaModel(modelName=None, wienerConfig=None, "
+                "gmpConfig=None, parameters=None, "
+                "**parameterOverrides)"
+            ),
+        ),
+    )
+    for (
+        documentedObject,
+        expectedParameterNames,
+        documentedSignature,
+    ) in documentedParameterExpectations:
+        assert tuple(
+            inspect.signature(documentedObject).parameters
+        ) == expectedParameterNames
+        assert documentedSignature in readmeText
+    assert tuple(
+        inspect.signature(ParseWifi.FindDescriptor).parameters
+    ) == (
+        "self",
+        "receivedSignal",
+        "preferredSampleRateHz",
+    )
+    assert (
+        "FindDescriptor(receivedSignal, preferredSampleRateHz=None)"
+        in readmeText
+    )
+    assert tuple(
+        inspect.signature(MimoPaModel.ProcessChain).parameters
+    ) == ("self", "inputSignal", "chainIndex")
+    assert "ProcessChain(inputSignal, chainIndex)" in readmeText
+    assert (
+        "chunkSize"
+        not in inspect.signature(
+            FitMimoGmpPredistorter
+        ).parameters
+    )
+    assert "该接口不包含 `chunkSize`" in readmeText
+    assert "signalProcessingParameters=None," in analysisDocumentText
+    assert (
+        'parameters={"signalProcessingParameters": {...}}'
+        in analysisDocumentText
+    )
+    for documentationText in (
+        readmeText,
+        analysisDocumentText,
+        signalDocumentText,
+    ):
+        pythonBlocks = re.findall(
+            pythonBlockPattern,
+            documentationText,
+        )
+        synchronizationBlocks = [
+            pythonBlock
+            for pythonBlock in pythonBlocks
+            if "signalProcessingParameters" in pythonBlock
+        ]
+        assert synchronizationBlocks
+        for synchronizationBlock in synchronizationBlocks:
+            assert "signalProcessingParameters=" in synchronizationBlock
 
 
 def CheckInternalDefaultConfiguration() -> None:
@@ -1173,13 +1335,29 @@ def CheckSignalProcessingCompensation() -> None:
     resultAnalysis = Analysis(
         referenceSignal,
         waveform,
-        parameters={
-            "signalProcessingParameters": signalProcessingParameters
-        },
+        signalProcessingParameters=signalProcessingParameters,
     )
     metrics = resultAnalysis.Analyze(measuredSignal)
     assert metrics["evmDb"] < -30.0
     assert resultAnalysis.GetLastSignalProcessingResult() is not None
+    assert (
+        resultAnalysis.GetParameters()["signalProcessingParameters"]
+        is signalProcessingParameters
+    )
+    legacyAnalysis = Analysis(
+        referenceSignal,
+        waveform,
+        parameters={
+            "signalProcessingParameters": signalProcessingParameters
+        },
+    )
+    legacyMetrics = legacyAnalysis.Analyze(measuredSignal)
+    assert np.isclose(
+        legacyMetrics["evmDb"],
+        metrics["evmDb"],
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
     resultAnalysis.AnalyzeStages({"Impaired": measuredSignal})
     assert "Impaired" in resultAnalysis.GetStageSignalProcessingResults()
     with TemporaryDirectory() as temporaryDirectory:
@@ -1529,6 +1707,33 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
                     atol=1.0e-10,
                 )
 
+        typicalDriveScale = 10.0 ** (-5.0 / 20.0)
+        gmpMeasuredSignal = PaModel(modelName="gmp").Process(
+            typicalDriveScale * waveform.samples
+        )
+        gmpReferenceMetrics = Analysis(
+            waveform.samples,
+            waveform,
+        ).Analyze(gmpMeasuredSignal)
+        gmpReceiveAnalysis = Analysis(gmpMeasuredSignal)
+        gmpReceiveMetrics = gmpReceiveAnalysis.Analyze()
+        gmpParsedFrame = gmpReceiveAnalysis.GetParsedWifiFrame()
+        assert gmpParsedFrame is not None
+        assert (
+            gmpParsedFrame.detectedParameters["frameFormat"]
+            == frameFormat
+        )
+        assert gmpParsedFrame.detectedParameters["mcs"] == maximumMcs
+        assert gmpParsedFrame.detectedParameters["seed"] == (
+            501 + formatIndex
+        )
+        assert np.allclose(
+            np.asarray(tuple(gmpReferenceMetrics.values())),
+            np.asarray(tuple(gmpReceiveMetrics.values())),
+            rtol=1.0e-10,
+            atol=1.0e-10,
+        )
+
     autoWaveform = WaveGenWifi(
         frameFormat="EHT",
         bandwidthMhz=40,
@@ -1543,6 +1748,76 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
     assert np.array_equal(
         autoParsedFrame.referenceSignal, autoWaveform.samples
     )
+    overlapParser = ParseWifi()
+    assert (
+        overlapParser.GetParameters()["maximumPacketOffsetSamples"]
+        == 2000
+    )
+    cropStartSample = 37
+    cropStopSample = autoWaveform.samples.shape[0] - 29
+    croppedReceive = (
+        1.7
+        * autoWaveform.samples[cropStartSample:cropStopSample]
+    )
+    (
+        receiveOverlapStart,
+        transmitOverlapStart,
+        overlapLength,
+        overlapConfidence,
+    ) = overlapParser.EstimateSignalOverlap(
+        croppedReceive,
+        autoWaveform.samples,
+    )
+    assert receiveOverlapStart == 0
+    assert transmitOverlapStart == cropStartSample
+    assert overlapLength == croppedReceive.shape[0]
+    assert overlapConfidence > 0.999
+    croppedAnalysis = Analysis(
+        croppedReceive,
+        transmittedSignal=autoWaveform,
+    )
+    croppedMetrics = croppedAnalysis.Analyze()
+    assert np.isfinite(croppedMetrics["evmPercent"])
+    croppedPaReceive = PaModel(modelName="gmp").Process(
+        0.25
+        * autoWaveform.samples[
+            cropStartSample:cropStopSample
+        ]
+    )
+    croppedPaAnalysis = Analysis(
+        croppedPaReceive,
+        transmittedSignal=autoWaveform,
+    )
+    croppedPaMetrics = croppedPaAnalysis.Analyze()
+    croppedPaFrame = croppedPaAnalysis.GetParsedWifiFrame()
+    assert croppedPaFrame is not None
+    assert croppedPaFrame.packetStartSample == 0
+    assert croppedPaFrame.parseConfidence > 0.99
+    assert np.isfinite(croppedPaMetrics["evmPercent"])
+
+    transmitPaddingBefore = 41
+    paddedTransmit = np.r_[
+        np.zeros(
+            transmitPaddingBefore,
+            dtype=np.complex128,
+        ),
+        autoWaveform.samples,
+        np.zeros(53, dtype=np.complex128),
+    ]
+    effectiveReceive = 1.7 * autoWaveform.samples
+    paddedTransmitAnalysis = Analysis(
+        effectiveReceive,
+        transmittedSignal=paddedTransmit,
+    )
+    paddedTransmitFrame = (
+        paddedTransmitAnalysis.GetParsedWifiFrame()
+    )
+    paddedTransmitMetrics = paddedTransmitAnalysis.Analyze()
+    assert paddedTransmitFrame is not None
+    assert paddedTransmitFrame.packetStartSample == 0
+    assert paddedTransmitFrame.parseConfidence > 0.999
+    assert paddedTransmitMetrics["evmPercent"] < 1.0e-8
+
     objectReceivedAnalysis = Analysis(autoWaveform)
     objectReceivedMetrics = objectReceivedAnalysis.Analyze()
     objectReceivedFrame = objectReceivedAnalysis.GetParsedWifiFrame()
@@ -1825,6 +2100,7 @@ def RunTests() -> None:
     CheckBenchmarkSeparation()
     CheckFunctionPrincipleCoverage()
     CheckDocumentationMathCompatibility()
+    CheckDocumentationApiConsistency()
     CheckInternalDefaultConfiguration()
     CheckUnknownConfigurationWarnings()
     CheckWifiFormats()

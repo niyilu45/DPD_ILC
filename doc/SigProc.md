@@ -267,7 +267,7 @@ classDiagram
         +Process(measuredSignal, estimationSlice)
         +EstimateIntegerDelay(measuredSignal)
         +EstimateCarrierFrequencyOffset(integerAlignedSignal)
-        +EstimateTimingOffsets(signal, integerDelay)
+        +EstimateTimingOffsets(frequencyCorrectedSignal, integerDelaySamples)
         +InterpolateSignal(inputSignal, samplePositions)
         +EstimateComplexGain(referenceSignal, measuredSignal)
         +GetParameters()
@@ -339,11 +339,9 @@ from inc.lib.Analysis import Analysis
 resultAnalysis = Analysis(
     referenceSignal,
     wifiWaveform,
-    parameters={
-        "signalProcessingParameters": {
-            "maxIntegerDelaySamples": 256,
-            "maxSamplingFrequencyOffsetPpm": 100.0,
-        }
+    signalProcessingParameters={
+        "maxIntegerDelaySamples": 256,
+        "maxSamplingFrequencyOffsetPpm": 100.0,
     },
 )
 metrics = resultAnalysis.Analyze(measuredSignal)

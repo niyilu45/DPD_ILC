@@ -115,7 +115,10 @@ print(f"EVM: {metrics['evmPercent']:.3f} %")
 - SISO：形状为 `numSamples`；
 - MIMO：形状为 `numSamples × numReceiveChains`；
 - 数组中必须包含完整的本工程VHT、HE或EHT帧描述字段；
-- 包前可以带有零样值、静默区或采集时延，默认最大搜索范围由 `maximumPacketOffsetSamples` 控制。
+- 包前可以带有零样值、静默区或采集时延，默认最多搜索2000个前置样点，由 `maximumPacketOffsetSamples` 控制；
+- 提供可选发送波形时，发送和接收长度可以不同。发送端前后补零、只把完整有效帧送入PA、或接收捕获更短都不会触发长度错误，Parser会在公共有效区间内完成对齐。
+
+这里的“不要求等长”不等于“任意缺失样点都能恢复”。若裁剪只移除完整Wi-Fi帧外的补零，指标不受影响；若裁剪切入帧内OFDM符号，缺失信息会在同步到参考网格时保留为缺失误差，因此EVM会合理变差。
 
 下面是一个不依赖外部采集文件、可以在本工程中直接运行的完整示例。虽然代码用PA模型产生接收波形，但送给Analysis的仍然只有 `receivedSignal`，没有提供发送参考：
 
@@ -1511,16 +1514,16 @@ from inc.utils.Draw import Draw
 analysisOverrides = {
     "maxSegmentLength": 8192,
     "powerEvmFileStem": "comparison_curve",
-    "signalProcessingParameters": {
-        "maxIntegerDelaySamples": 256,
-        "maxCarrierFrequencyOffsetHz": 200000.0,
-        "maxSamplingFrequencyOffsetPpm": 100.0,
-    },
 }
 resultAnalysis = Analysis(
     referenceSignal,
     wifiWaveform,
     parameters=analysisOverrides,
+    signalProcessingParameters={
+        "maxIntegerDelaySamples": 256,
+        "maxCarrierFrequencyOffsetHz": 200000.0,
+        "maxSamplingFrequencyOffsetPpm": 100.0,
+    },
 )
 resultDraw = Draw(
     parameters={"powerEvmFileStem": "comparison_curve"}
@@ -1576,7 +1579,21 @@ if wifiWaveform.numTransmitAntennas > 1:
     print(mimoMetrics)
 ```
 
-`Analysis`、`Draw` 和 `SigProc` 都在各自构造函数内部定义只读默认参数并建立 `ChainMap`；调用方只传需要修改的普通字典。`signalProcessingParameters` 是传给 `SigProc` 的嵌套覆盖字典。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。任何层出现未知键时，代码会发出 `UserWarning`、忽略该键并继续；已识别键的类型、单位和物理范围仍严格校验。
+`Analysis`、`Draw` 和 `SigProc` 都在各自构造函数内部定义只读默认参数并建立 `ChainMap`；调用方只传需要修改的普通字典。`Analysis` 的当前公开构造签名为：
+
+```python
+Analysis(
+    referenceSignal,
+    waveform=None,
+    parameters=None,
+    parseParameters=None,
+    transmittedSignal=None,
+    signalProcessingParameters=None,
+    **parameterOverrides,
+)
+```
+
+`signalProcessingParameters` 是显式构造参数，其映射内容直接传给 `SigProc`。为兼容旧程序，`parameters={"signalProcessingParameters": {...}}` 仍然有效；新代码应优先使用显式参数，避免把同步配置误认为普通Analysis指标配置。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。任何层出现未知键时，代码会发出 `UserWarning`、忽略该键并继续；已识别键的类型、单位和物理范围仍严格校验。
 
 功率–EVM 扫描的评估器接口为：
 

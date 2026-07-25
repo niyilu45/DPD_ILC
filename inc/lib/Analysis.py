@@ -224,6 +224,9 @@ class Analysis:
         transmittedSignal: Optional[
             Union[np.ndarray, WifiWaveform]
         ] = None,
+        signalProcessingParameters: Optional[
+            Mapping[str, object]
+        ] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize a reference-aided or receive-only analysis context.
@@ -247,6 +250,10 @@ class Analysis:
             transmittedSignal: Optional known transmit input. ``ParseWifi``
                 automatically accepts either a metadata-rich ``WifiWaveform``
                 or a NumPy waveform containing samples only.
+            signalProcessingParameters: Optional explicit ``SigProc``
+                configuration mapping. This named argument is preferred over
+                nesting the same key inside ``parameters``; the nested form
+                remains supported for backward compatibility.
             parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
 
         Returns:
@@ -328,6 +335,10 @@ class Analysis:
             self.defaultParameters,
             "Analysis",
         )
+        if signalProcessingParameters is not None:
+            recognizedOverrides["signalProcessingParameters"] = (
+                signalProcessingParameters
+            )
         self.parameters: ChainMap[str, object] = ChainMap(
             recognizedOverrides,
             externalParameters,

@@ -234,7 +234,7 @@ flowchart TD
     find --> decode["DecodeDescriptorAt<br/>去CP / FFT / magic去相位 / CRC"]
     decode --> parameters["格式 / 带宽 / MCS / GI / 空间流 / seed"]
     parameters --> regenerate["WaveGenWifi确定性重生成参考与元数据"]
-    objectPath --> correlate["EstimatePacketStartFromReference"]
+    objectPath --> correlate["EstimateSignalOverlap"]
     regenerate --> correlate
     correlate --> parsed["ParsedWifiFrame"]
     parsed --> analysis["Analysis(receivedInput).Analyze()"]
@@ -245,7 +245,7 @@ flowchart TD
 - 接收输入和可选发送输入都使用统一参数名，并且都支持NumPy数组或 `WifiWaveform`；调用方不需要选择不同函数。
 - 没有发送参考时，Parser联合搜索采样率、包起点和格式信令位置，只有magic、版本、CRC、链数和置信度全部通过才接受候选。
 - 可选发送输入为NumPy数组时，Parser从发送样值解码元数据并保留原数组作为参考；输入为 `WifiWaveform` 时直接读取完整元数据。
-- 发送辅助路径使用逐链能量归一化互相关细化接收包起点，对低SNR、PA压缩和MIMO链间相位差更稳健。
+- 发送辅助路径使用逐链能量归一化互相关细化接收包起点，对低SNR、PA压缩和MIMO链间相位差更稳健；相关只处理发送与接收的有效重叠区间，不要求两者长度相等。
 - 详细字段布局、相关公式、参数表、适用边界和完整调用示例见[ParseWifi说明文档](doc/ParseWifi.md)。
 
 ### `inc/utils/FrameProcess.py`
@@ -631,7 +631,9 @@ flowchart LR
 
 ### `WaveGenWifi` 参数
 
-调用方先构造 `WaveGenWifi(...)`，再调用 `Generate()`。
+当前构造函数签名为
+`WaveGenWifi(parameters=None, **parameterOverrides)`。
+调用方先构造实例，再调用 `Generate()`；帧格式、MCS、采样率等受支持配置既可直接使用关键字传入，也可放入 `parameters` 映射。
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -673,7 +675,9 @@ assert waveform.oversampling == 2.5
 
 ### `PowerCalibration` 参数与方法（位于 `inc/utils/SigProc.py`）
 
-`PowerCalibration(parameters=None, **parameterOverrides)` 负责绝对功率标定。工程约定复包络的 RMS 幅度等于电阻端口上的 RF RMS 电压，因此
+当前构造函数签名为
+`PowerCalibration(loadResistanceOhm=None, maximumOutputPowerDbm=None, parameters=None, **parameterOverrides)`。
+该类负责绝对功率标定。工程约定复包络的 RMS 幅度等于电阻端口上的 RF RMS 电压，因此
 
 ```text
 P(W) = Vrms² / R
@@ -698,6 +702,10 @@ P(dBm) = 10 log10(P(W) / 0.001)
 例如在 50 Ω 端口上，`0 dBm = 1 mW` 对应约 `0.223607 V RMS`。因此 dBm 不是给归一化幅度换一个标签；端口阻抗是完成物理换算所必需的标定量。
 
 ### `PaModel` 参数
+
+当前构造函数签名为
+`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, parameters=None, **parameterOverrides)`。
+三个常用模型参数既可以直接传入，也可以放入 `parameters` 映射；直接参数优先级更高。
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -742,7 +750,7 @@ P(dBm) = 10 log10(P(W) / 0.001)
 | `maximumOutputPowerDbm` | `25.0` | 每路允许的最高目标输出功率。 |
 | `targetOutputRmsPerChain` | `None` | 旧接口：每路复包络输出 RMS 电压或 `None`；同一链不能同时设置 RMS 与 dBm 目标。 |
 
-`Process(matrix)` 逐列处理；`ProcessChain(vector, chainIndex)` 供单路测量或 ILC 使用；`SetOutputPowerDb`、`SetTargetOutputPowerDbm` 可在运行时只修改一路；`GetOutputPowerDbmPerChain` 返回最近一次矩阵处理测得的各路绝对功率。`SetTargetOutputRms` 和 `GetOutputRmsPerChain` 仅作为旧接口保留。
+`Process(inputSignal)` 对输入矩阵逐列处理；`ProcessChain(inputSignal, chainIndex)` 供单路测量或 ILC 使用；`SetOutputPowerDb`、`SetTargetOutputPowerDbm` 可在运行时只修改一路；`GetOutputPowerDbmPerChain` 返回最近一次矩阵处理测得的各路绝对功率。`SetTargetOutputRms` 和 `GetOutputRmsPerChain` 仅作为旧接口保留。
 
 PA 辅助接口还包括：
 
@@ -776,7 +784,7 @@ PA 辅助接口还包括：
 | `Process(measuredSignal, estimationSlice=None)` | 测量信号、可选增益估计区间 | 返回 `SignalProcessingResult`。 |
 | `EstimateIntegerDelay(measuredSignal)` | 测量信号 | 返回有符号整数时延。 |
 | `EstimateCarrierFrequencyOffset(integerAlignedSignal)` | 粗对齐信号 | 返回 CFO，单位 Hz。 |
-| `EstimateTimingOffsets(signal, integerDelay)` | CFO 校正信号、粗时延 | 返回整数时延、分数时延和 SFO ppm。 |
+| `EstimateTimingOffsets(frequencyCorrectedSignal, integerDelaySamples)` | CFO 校正信号、粗时延 | 返回整数时延、分数时延和 SFO ppm。 |
 | `InterpolateSignal(inputSignal, samplePositions)` | 输入信号、浮点采样位置 | 返回 Lanczos-sinc 重采样信号。 |
 | `EstimateComplexGain(referenceSignal, measuredSignal)` | 等长对齐信号 | 返回最小二乘复增益。 |
 | `GetParameters()` | 无 | 返回当前解析后的参数快照。 |
@@ -807,7 +815,7 @@ PA 辅助接口还包括：
 | --- | --- | --- |
 | `sampleRateHz` | `None` | 显式接收采样率；`None`时自动尝试候选采样率。 |
 | `sampleRateCandidatesHz` | 20至640 MHz常见速率 | 自动解析时按顺序尝试的复基带采样率。 |
-| `maximumPacketOffsetSamples` | `4096` | 捕获开头允许的最大前置样点数。 |
+| `maximumPacketOffsetSamples` | `2000` | 捕获开头允许的最大前置样点数；不限制发送侧裁剪位置。 |
 | `minimumParseConfidence` | `0.80` | 描述magic或发送接收互相关的最低置信度。 |
 | `referenceSearchSamples` | `4096` | 发送辅助归一化互相关使用的参考样点数。 |
 | `spatialMappingMatrix` | `None` | 无 `WifiWaveform` 元数据时为custom MIMO映射补充矩阵。 |
@@ -817,14 +825,49 @@ PA 辅助接口还包括：
 | `Parse(receivedSignal, transmittedSignal=None)` | 接收输入、可选发送输入 | 返回 `ParsedWifiFrame`；两项输入都自动支持NumPy或 `WifiWaveform`。 |
 | `GetParameters()` | 无 | 返回当前解析后的Parser参数。 |
 | `UpdateParameters(**parameterOverrides)` | 任意受支持Parser参数 | 事务式更新最高优先级层。 |
-| `FindDescriptor(receivedSignal)` | 已验证样值 | 联合搜索采样率、包起点和VHT/HE/EHT描述字段。 |
+| `FindDescriptor(receivedSignal, preferredSampleRateHz=None)` | 已验证样值、可选优先采样率 | 联合搜索采样率、包起点和VHT/HE/EHT描述字段。 |
 | `EstimatePacketStartFromReference(receivedSignal, transmittedSignal)` | 接收和发送NumPy样值 | 返回归一化互相关最佳包起点及置信度。 |
+| `EstimateSignalOverlap(receivedSignal, transmittedSignal)` | 可不等长的接收和发送NumPy样值 | 返回接收起点、发送起点、公共区间长度和归一化置信度。 |
 
 `ParsedWifiFrame` 包含 `receivedSignal`、`referenceSignal`、`waveform`、`packetStartSample`、`parseConfidence` 和 `detectedParameters`。详细原理和用法见[ParseWifi说明文档](doc/ParseWifi.md)。
 
+发送参考可以包含帧外前后补零，也可以长于实际PA输入或接收捕获。Parser不会把发送长度大于接收长度视为错误，而是在公共有效区间内估计有符号时延。若裁剪删除的只是帧外补零，性能指标保持不变；若裁剪切入OFDM帧内部，缺失样点无法恢复并会反映到EVM中。
+
+当接收数组是 `PaModel.Process(...)` 的输出时，Parser会先做magic相关和公共复增益补偿，再利用位置信度、固定描述字段及CRC进行有限软判决纠错。因此典型20 dBm输出回退下的Wiener和GMP输出可以直接使用 `Analysis(paOutput).Analyze()`。若PA已进入严重饱和、描述字段相关度低于门限，任何无参考解析都不能可靠恢复随机种子；此时应使用 `Analysis(paOutput, transmittedSignal=transmitSamples)`，其中 `transmitSamples` 可以是原始NumPy发送数组或 `WifiWaveform`。
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+transmitWaveform = WaveGenWifi(
+    frameFormat="EHT",
+    bandwidthMhz=20,
+    mcs=7,
+    sampleRateHz=80.0e6,
+).Generate()
+driveScale = 10.0 ** ((20.0 - 25.0) / 20.0)
+paOutput = PaModel(modelName="gmp").Process(
+    driveScale * transmitWaveform.samples
+)
+
+# The receive-only path now tolerates bounded PA-induced descriptor errors.
+metrics = Analysis(paOutput).Analyze()
+print(metrics["evmDb"])
+
+# Use this assisted form when deep saturation destroys the descriptor.
+assistedMetrics = Analysis(
+    paOutput,
+    transmittedSignal=transmitWaveform,
+).Analyze()
+print(assistedMetrics["evmDb"])
+```
+
 ### `Analysis` 参数与方法
 
-构造函数保留显式参考方式 `Analysis(referenceSignal, waveform, ...)`，同时支持仅接收方式 `Analysis(receivedInput, parseParameters=None, transmittedSignal=None, ...)`。接收输入和可选发送输入都可以是NumPy数组或 `WifiWaveform`；MIMO采用 `samples × transmitChains`，Parser内部完成类型分派。
+当前构造函数签名为
+`Analysis(referenceSignal, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, **parameterOverrides)`。
+显式参考方式使用 `Analysis(referenceSignal, waveform, ...)`；仅接收方式省略 `waveform`。接收输入和可选发送输入都可以是NumPy数组或 `WifiWaveform`；MIMO采用 `samples × transmitChains`，Parser内部完成类型分派。
 
 | 配置参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -834,7 +877,7 @@ PA 辅助接口还包括：
 | `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
 | `loadResistanceOhm` | `50.0` | 功率扫描中 dBm 与参考波形 RMS 电压换算所用的端口电阻。 |
 | `maximumOutputPowerDbm` | `25.0` | 功率扫描的每路PA极限输出，也是0 dB输出回退参考。 |
-| `signalProcessingParameters` | `None` | 传给 `SigProc` 的普通覆盖字典；`None` 使用其内部默认值。 |
+| `signalProcessingParameters` | `None` | 显式构造参数；作为普通覆盖字典传给 `SigProc`，`None` 使用其内部默认值。旧版 `parameters={"signalProcessingParameters": {...}}` 写法仍兼容。 |
 | `parseParameters` | `None` | 仅接收路径传给 `ParseWifi` 的普通覆盖字典。 |
 | `transmittedSignal` | `None` | 可选发送NumPy数组或 `WifiWaveform`，用于提高描述恢复、包起点和参考准确度。 |
 
@@ -933,7 +976,7 @@ PA 辅助接口还包括：
 | --- | --- |
 | `FitGmpPredistorter` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`、`crossMemoryDepth=2`、`ridgeFactor=1e-6`、`chunkSize=8192`。 |
 | `RunMimoFrequencyDomainIlc` | 接收矩阵与 `MimoPaModel`，其余参数同 `RunFrequencyDomainIlc`；逐 PA 返回独立历史。 |
-| `FitMimoGmpPredistorter` | GMP 参数同 `FitGmpPredistorter`；逐列拟合并返回 `MimoGmpPredistorter`。 |
+| `FitMimoGmpPredistorter` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`、`crossMemoryDepth=2`、`ridgeFactor=1e-6`；逐列拟合并返回 `MimoGmpPredistorter`。该接口不包含 `chunkSize`。 |
 | `FitVolterraPredistorter` | `memoryDepth=3`、`ridgeFactor=1e-6`。 |
 | `FitLutPredistorter` | `binCount=64`、`ridgeFactor=1e-8`。 |
 | `FitNeuralPredistorter` | `memoryDepth=4`、`hiddenUnitCount=32`、`ridgeFactor=1e-5`、`randomSeed=71`。 |
@@ -1183,11 +1226,9 @@ paOutput = paModel.Process(referenceSignal)
 resultAnalysis = Analysis(
     referenceSignal,
     waveform,
-    parameters={
-        "signalProcessingParameters": {
-            "maxIntegerDelaySamples": 256,
-            "maxSamplingFrequencyOffsetPpm": 100.0,
-        }
+    signalProcessingParameters={
+        "maxIntegerDelaySamples": 256,
+        "maxSamplingFrequencyOffsetPpm": 100.0,
     },
 )
 metrics = resultAnalysis.Analyze(paOutput)

@@ -281,6 +281,46 @@ magic word对应的理想BPSK序列记为 $p_i$，接收值为 $z_i$。公共复
 \end{cases}
 ```
 
+PA非线性可能使少量描述音调越过BPSK判决边界。Parser不会因为一次硬判决CRC失败就立即放弃，而是先计算每一位到判决边界的距离：
+
+```math
+r_i
+=
+\left|
+\Re\left\{
+\frac{z_i}{\hat g}
+\right\}
+\right|.
+```
+
+$r_i$ 越小，该位越不可靠。magic、版本号和保留位是协议内已知值，Parser先恢复这些固定字段；随后只在可靠度最低的有限候选位中搜索少量翻转组合。CRC-16的综合值用于meet-in-the-middle搜索，候选仍必须同时通过：
+
+- magic和版本检查；
+- CRC-16检查；
+- 保留位检查；
+- 帧格式、带宽、GI和空间映射枚举检查。
+
+因此这是“CRC辅助的有限软判决纠错”，不是忽略CRC或猜测任意参数。它主要解决Wiener/GMP PA压缩引起的少量描述位错误。若PA严重饱和导致magic相关度低于 `minimumParseConfidence`，Parser不会启动纠错，以避免在无可信帧头时产生误解析。
+
+CRC长度有限，多个低可靠度翻转组合仍可能偶然产生不同的CRC有效参数。Parser只对最低代价的少量候选重新生成完整确定性帧。第 $c$ 个候选在第 $m$ 条物理链上的整帧一致性为：
+
+```math
+\gamma_{c,m}
+=
+\frac{
+\left|
+\mathbf{x}_{c,m}^{H}\mathbf{y}_{m}
+\right|
+}{
+\sqrt{
+\left(\mathbf{x}_{c,m}^{H}\mathbf{x}_{c,m}\right)
+\left(\mathbf{y}_{m}^{H}\mathbf{y}_{m}\right)
+}
+}.
+```
+
+其中 $\mathbf{x}_{c,m}$ 是由候选格式、MCS、符号数和随机种子重生成的发送帧，$\mathbf{y}_{m}$ 是接收端仍然可用的重叠样值。二者不要求总长度相等；相关只使用公共有效区间，并用“实际参与相关的样点数/候选帧样点数”的平方根降低不完整候选的评分。逐链相关幅度平均后，Parser选择整帧一致性最高的候选。错误随机种子即使碰巧通过CRC，也无法同时匹配随机载荷，因此会被排除。采样率低于候选带宽或空间结构不一致时仍直接判为无效。
+
 magic相关置信度为：
 
 ```math
@@ -303,6 +343,27 @@ magic相关置信度为：
 CP会使相邻少量采样偏移仍可能得到可判决的FFT结果。Parser找到第一个CRC有效候选后，不立即返回，而是在一个传统CP范围内重新搜索，并选择magic相关值最大的采样位置。
 
 这一步避免把真实包起点前一个采样误判为包起点。
+
+对于本工程生成的PA输出，典型的仅接收调用为：
+
+```python
+driveScale = 10.0 ** ((20.0 - 25.0) / 20.0)
+paOutput = paModel.Process(driveScale * transmitWaveform.samples)
+resultAnalysis = Analysis(paOutput)
+metrics = resultAnalysis.Analyze()
+```
+
+若PA驱动很深、描述字段已经无法可靠恢复，应提供可选发送样值：
+
+```python
+resultAnalysis = Analysis(
+    paOutput,
+    transmittedSignal=transmitWaveform,
+)
+metrics = resultAnalysis.Analyze()
+```
+
+`transmittedSignal` 也可以直接使用 `transmitWaveform.samples`。这条辅助路径从发送波形取得描述信息，并用发送/接收互相关估计包起点，因而不依赖失真后的接收描述字段。
 
 ### 5.5 参考重生成
 
@@ -345,6 +406,39 @@ parsedFrame = ParseWifi().Parse(
 3. 保留用户发送样值作为精确参考；
 4. 对发送与接收样值执行逐链归一化互相关；
 5. 根据相关峰裁剪接收包。
+
+发送和接收总长度不参与相等性判断。Parser使用有符号相关时延寻找两者的最佳公共区间：
+
+```math
+n_{\mathrm{tx},0}
+=
+\max(0,-d),
+\qquad
+n_{\mathrm{rx},0}
+=
+\max(0,d),
+```
+
+```math
+L_{\mathrm{ov}}
+=
+\min
+\left(
+L_{\mathrm{tx}}-n_{\mathrm{tx},0},
+L_{\mathrm{rx}}-n_{\mathrm{rx},0}
+\right).
+```
+
+当 $d<0$ 时，接收波形从较长发送波形的中间开始；当 $d>0$ 时，接收捕获在包前带有 $d$ 个前置样点。每一路物理链在长度为 $L_{\mathrm{ov}}$ 的公共区间上分别计算归一化相关，再对各链相关功率求平均。这样支持以下实际流程：
+
+- 原发送数组前后补零，但只提取完整Wi-Fi帧送入PA；
+- PA输出或仪表捕获比原发送数组短；
+- 发送或接收数组在外部被前后裁剪；
+- 接收捕获在包前带有静默区或采集时延。
+
+`EstimateSignalOverlap` 返回接收起点、发送起点、公共区间长度和相关置信度；兼容接口 `EstimatePacketStartFromReference` 仍只返回接收起点和置信度。`maximumPacketOffsetSamples` 只限制接收端包前最多搜索多少样点，不限制发送侧裁剪位置，也不用于比较两个数组的长度。
+
+如果裁剪只删除帧外补零，EVM、SNR和ACLR不受影响。如果裁剪切掉了Wi-Fi帧内部的OFDM样点，Parser仍可利用剩余重叠区间完成对齐，但缺失的帧内信息不能由相关算法恢复，最终EVM会把这些缺失样点体现为误差。
 
 这种方式特别适用于：
 
@@ -405,7 +499,7 @@ Parser通过运行时数据类型自动分派。
 |---|---|---|
 | `sampleRateHz` | `None` | 已知接收采样率；`None`表示自动尝试候选值 |
 | `sampleRateCandidatesHz` | 20、40、80、160、320、640 MHz | 自动采样率候选 |
-| `maximumPacketOffsetSamples` | `4096` | 接收捕获前允许搜索的最大前置样点数 |
+| `maximumPacketOffsetSamples` | `2000` | 接收捕获前允许搜索的最大前置样点数；不限制发送侧裁剪位置 |
 | `minimumParseConfidence` | `0.80` | 描述magic或发送接收相关的最低置信度 |
 | `referenceSearchSamples` | `4096` | 发送辅助互相关使用的最大参考样点数 |
 | `spatialMappingMatrix` | `None` | custom MIMO映射时由用户补充的矩阵 |
@@ -535,7 +629,7 @@ metrics = resultAnalysis.Analyze(
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `receivedSignal` | `numpy.ndarray` | 已裁剪并与参考包边界一致的接收波形 |
+| `receivedSignal` | `numpy.ndarray` | 从接收包起点提取的可用重叠波形；允许短于发送参考 |
 | `referenceSignal` | `numpy.ndarray` | 重生成或用户提供的发送参考 |
 | `waveform` | `WifiWaveform` | Analysis和FrameProcess需要的完整元数据 |
 | `packetStartSample` | `int` | 原始接收捕获中的包起点 |

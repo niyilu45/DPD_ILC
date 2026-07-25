@@ -13,7 +13,16 @@ post-FEC payload symbols instead of a complete MAC/FEC/PHY protocol stack.
 from collections import ChainMap
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Dict, Mapping, Optional, Sequence, Tuple, Union, cast
+from typing import (
+    Callable,
+    Dict,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import numpy as np
 
@@ -276,18 +285,300 @@ def DecodeWifiDescriptorBits(descriptorBits: np.ndarray) -> Dict[str, object]:
     )
     if fieldValues[2] not in formats or fieldValues[9] not in mappings:
         raise ValueError("Wi-Fi descriptor enum code is invalid")
+    frameFormat = formats[fieldValues[2]]
+    guardIntervalUs = guardIntervals[fieldValues[5]]
+    mcs = fieldValues[4]
+    numDataSymbols = fieldValues[6]
+    numTransmitAntennas = fieldValues[7] + 1
+    numSpatialStreams = fieldValues[8] + 1
+    maximumMcsByFormat: Mapping[str, int] = MappingProxyType(
+        {"VHT": 9, "HE": 11, "EHT": 13}
+    )
+    supportedGuardIntervals: Mapping[str, Tuple[float, ...]] = (
+        MappingProxyType(
+            {
+                "VHT": (0.4, 0.8),
+                "HE": (0.8, 1.6, 3.2),
+                "EHT": (0.8, 1.6, 3.2),
+            }
+        )
+    )
+    if mcs > maximumMcsByFormat[frameFormat]:
+        raise ValueError("Wi-Fi descriptor MCS is invalid for its format")
+    if guardIntervalUs not in supportedGuardIntervals[frameFormat]:
+        raise ValueError(
+            "Wi-Fi descriptor guard interval is invalid for its format"
+        )
+    if numDataSymbols < 1:
+        raise ValueError(
+            "Wi-Fi descriptor data-symbol count must be positive"
+        )
+    if numSpatialStreams > numTransmitAntennas:
+        raise ValueError(
+            "Wi-Fi descriptor spatial streams exceed transmit antennas"
+        )
     return {
-        "frameFormat": formats[fieldValues[2]],
+        "frameFormat": frameFormat,
         "bandwidthMhz": bandwidths[fieldValues[3]],
-        "mcs": fieldValues[4],
-        "guardIntervalUs": guardIntervals[fieldValues[5]],
-        "numDataSymbols": fieldValues[6],
-        "numTransmitAntennas": fieldValues[7] + 1,
-        "numSpatialStreams": fieldValues[8] + 1,
+        "mcs": mcs,
+        "guardIntervalUs": guardIntervalUs,
+        "numDataSymbols": numDataSymbols,
+        "numTransmitAntennas": numTransmitAntennas,
+        "numSpatialStreams": numSpatialStreams,
         "spatialMapping": mappings[fieldValues[9]],
         "cyclicShiftEnabled": bool(fieldValues[10]),
         "seed": fieldValues[11],
     }
+
+
+def DecodeWifiDescriptorBitsWithCorrection(
+    descriptorBits: np.ndarray,
+    bitReliabilities: np.ndarray,
+    maximumCorrectedBits: int = 8,
+    candidateBitCount: int = 24,
+    candidateEvaluator: Optional[
+        Callable[[Mapping[str, object]], float]
+    ] = None,
+    maximumEvaluatedCandidates: int = 32,
+) -> Dict[str, object]:
+    """Decode a high-confidence descriptor with bounded CRC-aided correction.
+
+    Processing details:
+        Algorithm: Restore the known magic, version, and reserved fields,
+        attempt a normal CRC-valid decode, then use a meet-in-the-middle CRC
+        syndrome search across the least reliable unknown payload or CRC
+        decisions. Every accepted candidate must still pass the complete
+        descriptor CRC and semantic validation. The bounded search corrects
+        occasional PA-induced BPSK decision errors without turning CRC failure
+        into an unrestricted metadata guess.
+
+    Args:
+        descriptorBits: Hard BPSK decisions for all 104 descriptor bits.
+        bitReliabilities: Absolute in-phase decision distances after common
+            complex-gain compensation; smaller values are less reliable.
+        maximumCorrectedBits: Maximum number of uncertain decisions to flip.
+        candidateBitCount: Number of least reliable unknown positions admitted
+            to the bounded combination search.
+        candidateEvaluator: Optional full-waveform consistency score used to
+            disambiguate multiple CRC-valid correction candidates.
+        maximumEvaluatedCandidates: Maximum number of lowest-cost semantic
+            candidates passed to ``candidateEvaluator``.
+
+    Returns:
+        result: Generator-compatible descriptor parameters that pass all
+            magic, version, reserved-bit, enum, and CRC checks.
+    """
+
+    hardBits = np.asarray(descriptorBits, dtype=np.uint8).reshape(-1)
+    reliabilityValues = np.asarray(
+        bitReliabilities, dtype=float
+    ).reshape(-1)
+    if (
+        hardBits.size != 104
+        or reliabilityValues.size != 104
+        or np.any(hardBits > 1)
+    ):
+        raise ValueError(
+            "descriptorBits and bitReliabilities must contain 104 values"
+        )
+    if (
+        not np.all(np.isfinite(reliabilityValues))
+        or np.any(reliabilityValues < 0.0)
+    ):
+        raise ValueError(
+            "bitReliabilities must be finite and nonnegative"
+        )
+    if (
+        not isinstance(maximumCorrectedBits, int)
+        or isinstance(maximumCorrectedBits, bool)
+        or maximumCorrectedBits < 0
+    ):
+        raise ValueError(
+            "maximumCorrectedBits must be a nonnegative integer"
+        )
+    if (
+        not isinstance(candidateBitCount, int)
+        or isinstance(candidateBitCount, bool)
+        or candidateBitCount < 1
+    ):
+        raise ValueError("candidateBitCount must be a positive integer")
+    if candidateEvaluator is not None and not callable(candidateEvaluator):
+        raise TypeError("candidateEvaluator must be callable or None")
+    if (
+        not isinstance(maximumEvaluatedCandidates, int)
+        or isinstance(maximumEvaluatedCandidates, bool)
+        or maximumEvaluatedCandidates < 1
+    ):
+        raise ValueError(
+            "maximumEvaluatedCandidates must be a positive integer"
+        )
+
+    correctedBits = hardBits.copy()
+    correctedBits[:12] = IntegerToBits(0xD5B, 12)
+    correctedBits[12:14] = IntegerToBits(1, 2)
+    correctedBits[93:] = 0
+    try:
+        return DecodeWifiDescriptorBits(correctedBits)
+    except ValueError:
+        pass
+
+    searchableIndices = np.arange(14, 93, dtype=int)
+    rankedIndices = searchableIndices[
+        np.argsort(
+            reliabilityValues[searchableIndices],
+            kind="stable",
+        )
+    ]
+    selectedIndices = rankedIndices[
+        : min(candidateBitCount, rankedIndices.size)
+    ]
+    maximumFlipCount = min(maximumCorrectedBits, selectedIndices.size)
+    payloadStop = 77
+    crcStop = 93
+    baseSyndrome = (
+        CalculateDescriptorCrc(correctedBits[:payloadStop])
+        ^ BitsToInteger(correctedBits[payloadStop:crcStop])
+    )
+    syndromeContributions = []
+    for selectedIndex in selectedIndices:
+        trialBits = correctedBits.copy()
+        trialBits[selectedIndex] ^= 1
+        trialSyndrome = (
+            CalculateDescriptorCrc(trialBits[:payloadStop])
+            ^ BitsToInteger(trialBits[payloadStop:crcStop])
+        )
+        syndromeContributions.append(
+            int(baseSyndrome ^ trialSyndrome)
+        )
+
+    splitIndex = selectedIndices.size // 2
+    indexHalves = (
+        selectedIndices[:splitIndex],
+        selectedIndices[splitIndex:],
+    )
+    syndromeHalves = (
+        syndromeContributions[:splitIndex],
+        syndromeContributions[splitIndex:],
+    )
+    subsetRecords = []
+    for halfIndices, halfContributions in zip(
+        indexHalves,
+        syndromeHalves,
+    ):
+        halfRecords = []
+        for subsetMask in range(1 << halfIndices.size):
+            flipCount = bin(subsetMask).count("1")
+            if flipCount > maximumFlipCount:
+                continue
+            subsetSyndrome = 0
+            correctionCost = 0.0
+            flippedIndices = []
+            for localIndex, descriptorIndex in enumerate(halfIndices):
+                if not (subsetMask & (1 << localIndex)):
+                    continue
+                subsetSyndrome ^= halfContributions[localIndex]
+                correctionCost += float(
+                    reliabilityValues[descriptorIndex]
+                )
+                flippedIndices.append(int(descriptorIndex))
+            halfRecords.append(
+                (
+                    int(subsetSyndrome),
+                    flipCount,
+                    correctionCost,
+                    tuple(flippedIndices),
+                )
+            )
+        subsetRecords.append(halfRecords)
+
+    rightCandidates = {}
+    for (
+        subsetSyndrome,
+        flipCount,
+        correctionCost,
+        flippedIndices,
+    ) in subsetRecords[1]:
+        candidateKey = (subsetSyndrome, flipCount)
+        previousCandidate = rightCandidates.get(candidateKey)
+        if (
+            previousCandidate is None
+            or correctionCost < previousCandidate[0]
+        ):
+            rightCandidates[candidateKey] = (
+                correctionCost,
+                flippedIndices,
+            )
+
+    correctionCandidates = []
+    for (
+        leftSyndrome,
+        leftFlipCount,
+        leftCost,
+        leftIndices,
+    ) in subsetRecords[0]:
+        requiredRightSyndrome = int(baseSyndrome ^ leftSyndrome)
+        for rightFlipCount in range(
+            0,
+            maximumFlipCount - leftFlipCount + 1,
+        ):
+            rightCandidate = rightCandidates.get(
+                (requiredRightSyndrome, rightFlipCount)
+            )
+            if rightCandidate is None:
+                continue
+            rightCost, rightIndices = rightCandidate
+            allFlippedIndices = leftIndices + rightIndices
+            if not allFlippedIndices:
+                continue
+            correctionCandidates.append(
+                (
+                    leftCost + rightCost,
+                    len(allFlippedIndices),
+                    allFlippedIndices,
+                )
+            )
+
+    decodedCandidates = []
+    for correctionCost, _, flippedIndices in sorted(correctionCandidates):
+        candidateBits = correctedBits.copy()
+        candidateBits[list(flippedIndices)] ^= 1
+        try:
+            decodedParameters = DecodeWifiDescriptorBits(candidateBits)
+        except ValueError:
+            continue
+        if candidateEvaluator is None:
+            return decodedParameters
+        decodedCandidates.append(
+            (correctionCost, decodedParameters)
+        )
+        if len(decodedCandidates) >= maximumEvaluatedCandidates:
+            break
+    if decodedCandidates and candidateEvaluator is not None:
+        evaluatedCandidates = []
+        for correctionCost, decodedParameters in decodedCandidates:
+            consistencyScore = float(
+                candidateEvaluator(decodedParameters)
+            )
+            if not np.isfinite(consistencyScore):
+                continue
+            evaluatedCandidates.append(
+                (
+                    consistencyScore,
+                    -correctionCost,
+                    decodedParameters,
+                )
+            )
+        if evaluatedCandidates:
+            return max(
+                evaluatedCandidates,
+                key=lambda candidate: (
+                    candidate[0],
+                    candidate[1],
+                ),
+            )[2]
+    raise ValueError(
+        "no CRC-valid Wi-Fi descriptor was found within the correction limit"
+    )
 
 
 def BuildWifiDescriptorField(
@@ -415,7 +706,7 @@ class ParseWifi:
                     320.0e6,
                     640.0e6,
                 ),
-                "maximumPacketOffsetSamples": 4096,
+                "maximumPacketOffsetSamples": 2000,
                 "minimumParseConfidence": 0.80,
                 "referenceSearchSamples": 4096,
                 "spatialMappingMatrix": None,
@@ -622,12 +913,118 @@ class ParseWifi:
             raise ValueError("receivedSignal must contain at least one chain")
         return complexReceived
 
+    def ScoreDescriptorCandidate(
+        self,
+        decodedParameters: Mapping[str, object],
+        receivedSignal: np.ndarray,
+        packetStartSample: int,
+        sampleRateHz: float,
+    ) -> float:
+        """Score one CRC-valid descriptor against the complete receive packet.
+
+        Processing details:
+            Algorithm: Regenerate the candidate deterministic Wi-Fi waveform,
+            align it at the proposed packet boundary, calculate normalized
+            magnitude correlation independently per physical chain, average
+            the chain scores, and mildly penalize candidates that explain only
+            a short prefix of the available capture. The full packet score
+            resolves CRC collisions that cannot be distinguished from the
+            two descriptor OFDM symbols alone.
+
+        Args:
+            decodedParameters: Semantically valid descriptor parameter map.
+            receivedSignal: Validated receive vector or matrix.
+            packetStartSample: Proposed first packet sample.
+            sampleRateHz: Proposed receiver sample rate in hertz.
+
+        Returns:
+            result: Finite normalized consistency score, or negative infinity
+                when the candidate cannot describe the available capture.
+        """
+
+        candidateParameters = dict(decodedParameters)
+        candidateParameters["sampleRateHz"] = float(sampleRateHz)
+        if candidateParameters.get("spatialMapping") == "custom":
+            customMatrix = self.parameters["spatialMappingMatrix"]
+            if customMatrix is None:
+                return float("-inf")
+            candidateParameters["spatialMappingMatrix"] = np.asarray(
+                customMatrix,
+                dtype=np.complex128,
+            ).copy()
+
+        # Import locally because WaveGenWifi reuses the descriptor writer from
+        # this module during normal packet construction.
+        from ..lib.WaveGenWifi import WaveGenWifi
+
+        try:
+            candidateWaveform = WaveGenWifi(
+                parameters=candidateParameters
+            ).Generate()
+        except (TypeError, ValueError):
+            return float("-inf")
+        referenceArray = np.asarray(
+            candidateWaveform.samples,
+            dtype=np.complex128,
+        )
+        if packetStartSample < 0:
+            return float("-inf")
+        availableSampleCount = (
+            receivedSignal.shape[0] - packetStartSample
+        )
+        scoredSampleCount = min(
+            referenceArray.shape[0],
+            availableSampleCount,
+        )
+        if scoredSampleCount <= 0:
+            return float("-inf")
+        packetStopSample = packetStartSample + scoredSampleCount
+        receiveSegment = receivedSignal[
+            packetStartSample:packetStopSample
+        ]
+        referenceSegment = referenceArray[:scoredSampleCount]
+        referenceMatrix = (
+            referenceSegment.reshape(-1, 1)
+            if referenceSegment.ndim == 1
+            else referenceSegment
+        )
+        receiveMatrix = (
+            receiveSegment.reshape(-1, 1)
+            if receiveSegment.ndim == 1
+            else receiveSegment
+        )
+        if referenceMatrix.shape != receiveMatrix.shape:
+            return float("-inf")
+        chainScores = []
+        for chainIndex in range(referenceMatrix.shape[1]):
+            referenceColumn = referenceMatrix[:, chainIndex]
+            receiveColumn = receiveMatrix[:, chainIndex]
+            denominator = np.sqrt(
+                np.vdot(referenceColumn, referenceColumn).real
+                * np.vdot(receiveColumn, receiveColumn).real
+            )
+            if denominator <= np.finfo(float).tiny:
+                return float("-inf")
+            chainScores.append(
+                float(
+                    np.abs(
+                        np.vdot(referenceColumn, receiveColumn)
+                    )
+                    / denominator
+                )
+            )
+        completenessWeight = np.sqrt(
+            scoredSampleCount / referenceArray.shape[0]
+        )
+        return float(np.mean(chainScores) * completenessWeight)
+
     def DecodeDescriptorAt(
         self,
         receivedSignal: np.ndarray,
         packetStartSample: int,
         sampleRateHz: float,
         descriptorOffsetSymbols: int,
+        evaluateCorrectionCandidates: bool = True,
     ) -> Tuple[Dict[str, object], float]:
         """Decode one descriptor at a proposed packet start and sample rate.
 
@@ -642,6 +1039,8 @@ class ParseWifi:
             packetStartSample: Proposed first packet sample.
             sampleRateHz: Proposed receiver sample rate in hertz.
             descriptorOffsetSymbols: Five for VHT or six for HE/EHT.
+            evaluateCorrectionCandidates: Whether multiple CRC-valid soft
+                decisions are disambiguated with full-packet correlation.
 
         Returns:
             result: Pair containing decoded parameters and correlation score.
@@ -719,12 +1118,6 @@ class ParseWifi:
                     continue
                 normalizedValues = receivedValues / complexGain
                 decidedBits = (normalizedValues.real < 0.0).astype(np.uint8)
-                try:
-                    descriptorParameters = DecodeWifiDescriptorBits(
-                        decidedBits
-                    )
-                except ValueError:
-                    continue
                 correlation = float(
                     np.abs(
                         np.vdot(expectedMagicSymbols, receivedMagic)
@@ -736,6 +1129,33 @@ class ParseWifi:
                         * magicEnergy
                     )
                 )
+                if correlation < float(
+                    self.parameters["minimumParseConfidence"]
+                ):
+                    continue
+                try:
+                    descriptorParameters = (
+                        DecodeWifiDescriptorBitsWithCorrection(
+                            decidedBits,
+                            np.abs(normalizedValues.real),
+                            candidateEvaluator=(
+                                None
+                                if not evaluateCorrectionCandidates
+                                else (
+                                    lambda candidateParameters: (
+                                        self.ScoreDescriptorCandidate(
+                                            candidateParameters,
+                                            receivedSignal,
+                                            packetStartSample,
+                                            sampleRateHz,
+                                        )
+                                    )
+                                )
+                            ),
+                        )
+                    )
+                except ValueError:
+                    continue
                 descriptorCopies.append(descriptorParameters)
                 correlationScores.append(correlation)
         if not descriptorCopies:
@@ -806,6 +1226,7 @@ class ParseWifi:
                                 packetStartSample,
                                 sampleRateHz,
                                 descriptorOffsetSymbols,
+                                False,
                             )
                         )
                     except ValueError:
@@ -820,6 +1241,10 @@ class ParseWifi:
                     if (
                         int(decodedParameters["numTransmitAntennas"])
                         != receiveChainCount
+                    ):
+                        continue
+                    if sampleRateHz < (
+                        float(decodedParameters["bandwidthMhz"]) * 1.0e6
                     ):
                         continue
                     if confidence < float(
@@ -852,16 +1277,41 @@ class ParseWifi:
                                     refinedStart,
                                     sampleRateHz,
                                     descriptorOffsetSymbols,
+                                    False,
                                 )
                             )
                         except ValueError:
                             continue
-                        if refinedParameters != decodedParameters:
+                        refinedExpectedOffset = (
+                            5
+                            if refinedParameters["frameFormat"] == "VHT"
+                            else 6
+                        )
+                        if descriptorOffsetSymbols != refinedExpectedOffset:
+                            continue
+                        if (
+                            int(
+                                refinedParameters[
+                                    "numTransmitAntennas"
+                                ]
+                            )
+                            != receiveChainCount
+                        ):
+                            continue
+                        if sampleRateHz < (
+                            float(refinedParameters["bandwidthMhz"])
+                            * 1.0e6
+                        ):
+                            continue
+                        if refinedConfidence < float(
+                            self.parameters["minimumParseConfidence"]
+                        ):
                             continue
                         refinedCandidates.append(
                             (
                                 refinedConfidence,
                                 refinedStart,
+                                refinedParameters,
                             )
                         )
                     if not refinedCandidates:
@@ -869,9 +1319,41 @@ class ParseWifi:
                     (
                         bestConfidence,
                         bestPacketStart,
-                    ) = max(refinedCandidates)
+                        _,
+                    ) = max(
+                        refinedCandidates,
+                        key=lambda candidate: candidate[0],
+                    )
+                    try:
+                        bestParameters, bestConfidence = (
+                            self.DecodeDescriptorAt(
+                                receivedSignal,
+                                bestPacketStart,
+                                sampleRateHz,
+                                descriptorOffsetSymbols,
+                                True,
+                            )
+                        )
+                    except ValueError:
+                        continue
+                    bestExpectedOffset = (
+                        5
+                        if bestParameters["frameFormat"] == "VHT"
+                        else 6
+                    )
+                    if descriptorOffsetSymbols != bestExpectedOffset:
+                        continue
+                    if (
+                        int(bestParameters["numTransmitAntennas"])
+                        != receiveChainCount
+                    ):
+                        continue
+                    if sampleRateHz < (
+                        float(bestParameters["bandwidthMhz"]) * 1.0e6
+                    ):
+                        continue
                     return (
-                        decodedParameters,
+                        bestParameters,
                         bestPacketStart,
                         sampleRateHz,
                         bestConfidence,
@@ -879,7 +1361,9 @@ class ParseWifi:
         raise ValueError(
             "unable to parse the Wi-Fi frame descriptor; verify that the "
             "capture was generated by this project, includes the signaling "
-            "field, and uses one of the configured sample rates"
+            "field, and uses one of the configured sample rates; if severe "
+            "PA or channel distortion corrupts that field, pass the original "
+            "NumPy transmit waveform or WifiWaveform as transmittedSignal"
         )
 
     def EstimatePacketStartFromReference(
@@ -890,10 +1374,9 @@ class ParseWifi:
         """Estimate packet start using an optional known transmit waveform.
 
         Processing details:
-            Algorithm: Correlate a configurable leading reference segment with
-            every allowed capture offset, normalize each physical chain by its
-            own reference and receive energy, combine chain scores without
-            phase cancellation, and select the highest normalized correlation.
+            Algorithm: Delegate to ``EstimateSignalOverlap`` so the public
+            compatibility interface still returns only the receive-side packet
+            start and confidence while accepting unequal waveform lengths.
 
         Args:
             receivedSignal: Validated receive vector or matrix.
@@ -904,11 +1387,52 @@ class ParseWifi:
             result: Detected packet-start sample and normalized confidence.
         """
 
+        (
+            receiveStartSample,
+            _,
+            _,
+            confidence,
+        ) = self.EstimateSignalOverlap(
+            receivedSignal,
+            transmittedSignal,
+        )
+        return receiveStartSample, confidence
+
+    def EstimateSignalOverlap(
+        self,
+        receivedSignal: np.ndarray,
+        transmittedSignal: np.ndarray,
+    ) -> Tuple[int, int, int, float]:
+        """Estimate the best valid overlap between transmit and receive data.
+
+        Processing details:
+            Algorithm: Remove only negligible outer zero padding from the
+            transmit reference, enumerate signed lags that retain a useful
+            overlap, and calculate energy-normalized correlation independently
+            on every physical chain. A negative lag represents a receive
+            waveform that starts inside a longer or cropped transmit waveform.
+            The comparison therefore never assumes that receive length is at
+            least transmit length. The configurable reference-search length
+            bounds the work per candidate, while the packet-offset limit
+            constrains only leading samples on the receive side.
+
+        Args:
+            receivedSignal: Validated receive vector or samples-by-chains
+                matrix. It may be shorter or longer than ``transmittedSignal``.
+            transmittedSignal: Known transmit vector or matrix. Leading and
+                trailing zero padding and transmit-side cropping are allowed.
+
+        Returns:
+            result: Receive start, transmit start, full available overlap
+                length, and normalized multi-chain correlation confidence.
+        """
+
         referenceSignal = self.ValidateReceivedSignal(transmittedSignal)
+        validatedReceived = self.ValidateReceivedSignal(receivedSignal)
         receivedMatrix = (
-            receivedSignal.reshape(-1, 1)
-            if receivedSignal.ndim == 1
-            else receivedSignal
+            validatedReceived.reshape(-1, 1)
+            if validatedReceived.ndim == 1
+            else validatedReceived
         )
         referenceMatrix = (
             referenceSignal.reshape(-1, 1)
@@ -920,52 +1444,108 @@ class ParseWifi:
                 "receivedSignal and transmittedSignal must have the same "
                 "number of physical chains"
             )
-        maximumValidOffset = receivedMatrix.shape[0] - referenceMatrix.shape[0]
-        if maximumValidOffset < 0:
+
+        referencePower = np.sum(
+            np.abs(referenceMatrix) ** 2,
+            axis=1,
+        )
+        peakReferencePower = float(np.max(referencePower))
+        if peakReferencePower <= np.finfo(float).tiny:
             raise ValueError(
-                "receivedSignal is shorter than transmittedSignal"
+                "transmittedSignal must contain nonzero finite samples"
             )
-        searchStop = min(
+        activeReferenceIndices = np.flatnonzero(
+            referencePower
+            > peakReferencePower * np.finfo(float).eps
+        )
+        activeReferenceStart = int(activeReferenceIndices[0])
+        activeReferenceStop = int(activeReferenceIndices[-1]) + 1
+        activeReference = referenceMatrix[
+            activeReferenceStart:activeReferenceStop
+        ]
+
+        receiveLength = int(receivedMatrix.shape[0])
+        referenceLength = int(activeReference.shape[0])
+        shorterLength = min(receiveLength, referenceLength)
+        minimumOverlap = min(
+            shorterLength,
+            max(16, min(64, shorterLength // 4)),
+        )
+        minimumLag = -(referenceLength - minimumOverlap)
+        maximumLag = min(
             int(self.parameters["maximumPacketOffsetSamples"]),
-            maximumValidOffset,
+            receiveLength - minimumOverlap,
         )
-        probeLength = min(
-            referenceMatrix.shape[0],
-            int(self.parameters["referenceSearchSamples"]),
+        maximumProbeLength = int(
+            self.parameters["referenceSearchSamples"]
         )
-        candidateScores = np.zeros(searchStop + 1, dtype=float)
         numericFloor = np.finfo(float).tiny
-        for chainIndex in range(referenceMatrix.shape[1]):
-            referenceProbe = referenceMatrix[:probeLength, chainIndex]
-            captureProbe = receivedMatrix[
-                : searchStop + probeLength, chainIndex
-            ]
-            correlation = np.correlate(
-                captureProbe, referenceProbe, mode="valid"
+        bestScore = float("-inf")
+        bestReceiveStart = 0
+        bestTransmitStart = activeReferenceStart
+        bestOverlapLength = 0
+        bestTieBreak = (float("-inf"), -1, 0)
+        for candidateLag in range(minimumLag, maximumLag + 1):
+            activeTransmitStart = max(0, -candidateLag)
+            receiveStart = max(0, candidateLag)
+            overlapLength = min(
+                referenceLength - activeTransmitStart,
+                receiveLength - receiveStart,
             )
-            referenceEnergy = max(
-                float(np.vdot(referenceProbe, referenceProbe).real),
-                numericFloor,
-            )
-            samplePower = np.abs(captureProbe) ** 2
-            cumulativeEnergy = np.r_[
-                0.0, np.cumsum(samplePower, dtype=float)
-            ]
-            windowEnergy = (
-                cumulativeEnergy[probeLength:]
-                - cumulativeEnergy[:-probeLength]
-            )
-            normalizedPower = (
-                np.abs(correlation) ** 2
-                / np.maximum(
-                    referenceEnergy * windowEnergy,
-                    numericFloor,
+            if overlapLength < minimumOverlap:
+                continue
+            probeLength = min(overlapLength, maximumProbeLength)
+            chainPowers = []
+            for chainIndex in range(referenceMatrix.shape[1]):
+                referenceProbe = activeReference[
+                    activeTransmitStart:
+                    activeTransmitStart + probeLength,
+                    chainIndex,
+                ]
+                receiveProbe = receivedMatrix[
+                    receiveStart:receiveStart + probeLength,
+                    chainIndex,
+                ]
+                referenceEnergy = float(
+                    np.vdot(referenceProbe, referenceProbe).real
                 )
+                receiveEnergy = float(
+                    np.vdot(receiveProbe, receiveProbe).real
+                )
+                correlationPower = float(
+                    np.abs(
+                        np.vdot(referenceProbe, receiveProbe)
+                    )
+                    ** 2
+                )
+                chainPowers.append(
+                    correlationPower
+                    / max(
+                        referenceEnergy * receiveEnergy,
+                        numericFloor,
+                    )
+                )
+            candidateScore = float(np.mean(chainPowers))
+            candidateTieBreak = (
+                candidateScore,
+                overlapLength,
+                -receiveStart,
             )
-            candidateScores += normalizedPower
-        candidateScores /= float(referenceMatrix.shape[1])
-        bestOffset = int(np.argmax(candidateScores))
-        bestConfidence = float(np.sqrt(candidateScores[bestOffset]))
+            if candidateTieBreak > bestTieBreak:
+                bestTieBreak = candidateTieBreak
+                bestScore = candidateScore
+                bestReceiveStart = receiveStart
+                bestTransmitStart = (
+                    activeReferenceStart + activeTransmitStart
+                )
+                bestOverlapLength = overlapLength
+
+        if not np.isfinite(bestScore):
+            raise ValueError(
+                "transmittedSignal and receivedSignal do not have a "
+                "nonempty searchable overlap"
+            )
+        bestConfidence = float(np.sqrt(max(bestScore, 0.0)))
         if bestConfidence < float(
             self.parameters["minimumParseConfidence"]
         ):
@@ -973,7 +1553,12 @@ class ParseWifi:
                 "transmit/receive waveform correlation is below "
                 "minimumParseConfidence"
             )
-        return bestOffset, bestConfidence
+        return (
+            bestReceiveStart,
+            bestTransmitStart,
+            bestOverlapLength,
+            bestConfidence,
+        )
 
     def BuildDetectedParameters(
         self, transmittedWaveform: WifiWaveform
@@ -1059,14 +1644,16 @@ class ParseWifi:
             referenceSignal = self.ValidateReceivedSignal(
                 transmittedSignal.samples
             )
-            packetStartSample, confidence = (
-                self.EstimatePacketStartFromReference(
-                    complexReceived, referenceSignal
-                )
+            (
+                packetStartSample,
+                _,
+                overlapLength,
+                confidence,
+            ) = self.EstimateSignalOverlap(
+                complexReceived,
+                referenceSignal,
             )
-            packetStopSample = (
-                packetStartSample + referenceSignal.shape[0]
-            )
+            packetStopSample = packetStartSample + overlapLength
             alignedReceived = complexReceived[
                 packetStartSample:packetStopSample
             ].copy()
@@ -1140,28 +1727,41 @@ class ParseWifi:
             transmitPacketStop = (
                 descriptorPacketStart + regeneratedReference.shape[0]
             )
-            if transmitPacketStop > validatedTransmit.shape[0]:
-                raise ValueError(
-                    "transmittedSignal ends before its decoded Wi-Fi packet"
-                )
-            referenceSignal = validatedTransmit[
-                descriptorPacketStart:transmitPacketStop
-            ].copy()
-            packetStartSample, correlationConfidence = (
-                self.EstimatePacketStartFromReference(
-                    complexReceived, referenceSignal
-                )
+            availableTransmitStop = min(
+                transmitPacketStop,
+                validatedTransmit.shape[0],
+            )
+            availableTransmit = validatedTransmit[
+                descriptorPacketStart:availableTransmitStop
+            ]
+            referenceSignal = regeneratedReference.copy()
+            referenceSignal[
+                :availableTransmit.shape[0]
+            ] = availableTransmit
+            (
+                packetStartSample,
+                _,
+                _,
+                correlationConfidence,
+            ) = self.EstimateSignalOverlap(
+                complexReceived,
+                referenceSignal,
             )
             confidence = min(
                 descriptorConfidence, correlationConfidence
             )
-        packetStopSample = (
-            packetStartSample + referenceSignal.shape[0]
+        availableReceiveLength = (
+            complexReceived.shape[0] - packetStartSample
         )
-        if packetStopSample > complexReceived.shape[0]:
+        alignedSampleCount = min(
+            referenceSignal.shape[0],
+            availableReceiveLength,
+        )
+        if alignedSampleCount <= 0:
             raise ValueError(
-                "receivedSignal ends before the decoded Wi-Fi packet"
+                "decoded Wi-Fi packet has no samples inside receivedSignal"
             )
+        packetStopSample = packetStartSample + alignedSampleCount
         alignedReceived = complexReceived[
             packetStartSample:packetStopSample
         ].copy()

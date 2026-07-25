@@ -5,7 +5,7 @@
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `main.py` 和 `inc/**/*.py` 中 232 个函数/方法定义位置。核心业务类位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
+本次审计共检查 `main.py` 和 `inc/**/*.py` 中 235 个函数/方法定义位置。核心业务类位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
 
 ## 1. 分类规则
 
@@ -29,7 +29,7 @@ flowchart LR
     pa --> sync
     sync --> analysis["Analysis.md：MSE/SNR/EVM/ACLR"]
     analysis --> report["打印/保存/绘图"]
-    audit["本文：232 个定义位置逐项索引"] -.-> wave
+    audit["本文：235 个定义位置逐项索引"] -.-> wave
     audit -.-> pa
     audit -.-> ilc
     audit -.-> sync
@@ -89,13 +89,16 @@ flowchart LR
 | `ParseWifi.IntegerToBits`, `ParseWifi.BitsToInteger` | N | 在固定宽度整数与MSB优先比特序列之间无损转换 | ParseWifi §3 |
 | `ParseWifi.CalculateDescriptorCrc` | N | 按CRC-16-CCITT多项式验证描述字段的时序、采样率和内容 | ParseWifi §3.3 |
 | `ParseWifi.BuildWifiDescriptorBits`, `ParseWifi.DecodeWifiDescriptorBits` | E/N | 打包或恢复格式、带宽、MCS、GI、空间流、映射和随机种子 | ParseWifi §3 |
+| `ParseWifi.DecodeWifiDescriptorBitsWithCorrection` | N | 用magic/版本/保留位先验、软判决可靠度和CRC综合值执行有限meet-in-the-middle位翻转搜索；仍要求完整CRC与字段语义合法 | ParseWifi §5.3 |
 | `ParseWifi.BuildWifiDescriptorField` | P/N | 把104个描述比特映射到两个重复发送的52音调BPSK传统OFDM符号 | ParseWifi §4 |
 | `ParseWifi.__init__`, `ParseWifi.GetParameters`, `ParseWifi.UpdateParameters`, `ParseWifi.ValidateParameters` | E | 在类内建立ChainMap默认参数，警告并忽略未知键，再验证接收时钟、搜索范围和自定义空间映射 | ParseWifi §7 |
 | `ParseWifi.ResolveSampleRates` | E | 使用显式接收时钟，或产生按顺序尝试的常见复基带采样率 | ParseWifi §5.2 |
 | `ParseWifi.ValidateReceivedSignal` | E/N | 自动从NumPy数组或 `WifiWaveform.samples` 取样，并检查SISO向量或samples×chains矩阵的形状与有限性 | ParseWifi §5.1 |
-| `ParseWifi.DecodeDescriptorAt` | P/N | 对候选时刻去CP、FFT、用magic word去公共相位、BPSK硬判决并验证CRC | ParseWifi §5.3 |
+| `ParseWifi.ScoreDescriptorCandidate` | P/N | 重生成CRC有效候选的完整确定性帧，以逐链归一化相关和捕获长度一致性排除错误随机种子或错误帧长 | ParseWifi §5.3 |
+| `ParseWifi.DecodeDescriptorAt` | P/N | 对候选时刻去CP、FFT、用magic word去公共相位，并在高相关候选上执行BPSK硬判决及CRC辅助有限软纠错 | ParseWifi §5.3 |
 | `ParseWifi.FindDescriptor` | P/N | 联合搜索采样率、包起点和VHT/HE/EHT描述字段位置，并用相关峰细化边界 | ParseWifi §5.4 |
-| `ParseWifi.EstimatePacketStartFromReference` | P/N | 有可选发送波形时执行逐链能量归一化互相关，避免链间相位抵消并选择精确接收包起点 | ParseWifi §6.1 |
+| `ParseWifi.EstimatePacketStartFromReference` | P/N | 兼容接口：调用不等长重叠估计后，只返回接收包起点和置信度 | ParseWifi §6.1 |
+| `ParseWifi.EstimateSignalOverlap` | P/N | 对发送端外部补零进行能量裁边，枚举允许发送或接收裁剪的有符号时延，并在逐链公共区间上计算能量归一化相关；发送与接收总长度不要求相等 | ParseWifi §6.1 |
 | `ParseWifi.BuildDetectedParameters` | E | 可选输入为 `WifiWaveform` 时直接读取中性元数据并转换为统一解析结果 | ParseWifi §6.2 |
 | `ParseWifi.Parse` | P/E | 自动区分 `WifiWaveform`、NumPy发送样值或无发送参考三种模式，统一返回对齐接收帧、参考和元数据 | ParseWifi §5–§6 |
 
