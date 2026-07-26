@@ -680,6 +680,8 @@ def CheckDocumentationApiConsistency() -> None:
         "parseParameters",
         "transmittedSignal",
         "signalProcessingParameters",
+        "sampleRateHz",
+        "channelBandwidthHz",
         "parameterOverrides",
     )
     actualAnalysisParameters = tuple(
@@ -690,7 +692,8 @@ def CheckDocumentationApiConsistency() -> None:
     expectedSignatureText = (
         "Analysis(referenceSignal, waveform=None, parameters=None, "
         "parseParameters=None, transmittedSignal=None, "
-        "signalProcessingParameters=None, **parameterOverrides)"
+        "signalProcessingParameters=None, sampleRateHz=None, "
+        "channelBandwidthHz=None, **parameterOverrides)"
     )
     readmeText = (projectRoot / "README.md").read_text(encoding="utf-8")
     analysisDocumentText = (
@@ -1889,6 +1892,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         )
         receiveMetrics = receiveAnalysis.Analyze()
         parsedFrame = receiveAnalysis.GetParsedWifiFrame()
+        assert receiveAnalysis.GetAnalysisMode() == "blind"
         assert parsedFrame is not None
         assert parsedFrame.packetStartSample == leadingSamples
         assert parsedFrame.detectedParameters["frameFormat"] == frameFormat
@@ -1904,18 +1908,20 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         assistedAnalysis = Analysis(
             receiveCapture,
             transmittedSignal=waveform.samples,
+            sampleRateHz=waveform.sampleRateHz,
+            channelBandwidthHz=waveform.bandwidthHz,
         )
         assistedMetrics = assistedAnalysis.Analyze()
         assistedFrame = assistedAnalysis.GetParsedWifiFrame()
-        assert assistedFrame is not None
-        assert assistedFrame.packetStartSample == leadingSamples
-        assert assistedFrame.parseConfidence > 0.90
-        assert np.allclose(
-            np.asarray(tuple(referenceMetrics.values())),
-            np.asarray(tuple(assistedMetrics.values())),
-            rtol=1.0e-10,
-            atol=1.0e-10,
-        )
+        assistedOverlap = assistedAnalysis.GetSignalOverlapResult()
+        assert assistedFrame is None
+        assert assistedAnalysis.GetAnalysisMode() == "transmitAssisted"
+        assert assistedOverlap is not None
+        assert assistedOverlap.receivedStartSample == leadingSamples
+        assert assistedOverlap.referenceStartSample == 0
+        assert assistedOverlap.confidence > 0.90
+        assert np.isfinite(assistedMetrics["evmDb"])
+        assert np.isfinite(assistedMetrics["aclrWorstDb"])
         if formatIndex == 0:
             objectAssistedAnalysis = Analysis(
                 receiveCapture,
@@ -1925,8 +1931,20 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
             objectAssistedFrame = (
                 objectAssistedAnalysis.GetParsedWifiFrame()
             )
-            assert objectAssistedFrame is not None
-            assert objectAssistedFrame.packetStartSample == leadingSamples
+            assert objectAssistedFrame is None
+            assert (
+                objectAssistedAnalysis.GetAnalysisMode()
+                == "transmitAssisted"
+            )
+            assert (
+                objectAssistedAnalysis.GetSignalOverlapResult()
+                is not None
+            )
+            assert (
+                objectAssistedAnalysis.GetSignalOverlapResult()
+                .receivedStartSample
+                == leadingSamples
+            )
             assert np.allclose(
                 np.asarray(tuple(referenceMetrics.values())),
                 np.asarray(tuple(objectAssistedMetrics.values())),
@@ -1940,6 +1958,8 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
             objectReceiveArrayTransmitAnalysis = Analysis(
                 receivedWaveform,
                 transmittedSignal=waveform.samples,
+                sampleRateHz=waveform.sampleRateHz,
+                channelBandwidthHz=waveform.bandwidthHz,
             )
             objectReceiveArrayTransmitMetrics = (
                 objectReceiveArrayTransmitAnalysis.Analyze()
@@ -1951,16 +1971,17 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
             objectReceiveObjectTransmitMetrics = (
                 objectReceiveObjectTransmitAnalysis.Analyze()
             )
-            for typeDispatchedMetrics in (
-                objectReceiveArrayTransmitMetrics,
-                objectReceiveObjectTransmitMetrics,
-            ):
-                assert np.allclose(
-                    np.asarray(tuple(referenceMetrics.values())),
-                    np.asarray(tuple(typeDispatchedMetrics.values())),
-                    rtol=1.0e-10,
-                    atol=1.0e-10,
-                )
+            assert np.isfinite(
+                objectReceiveArrayTransmitMetrics["evmDb"]
+            )
+            assert np.allclose(
+                np.asarray(tuple(referenceMetrics.values())),
+                np.asarray(
+                    tuple(objectReceiveObjectTransmitMetrics.values())
+                ),
+                rtol=1.0e-10,
+                atol=1.0e-10,
+            )
 
         typicalDriveScale = 10.0 ** (-5.0 / 20.0)
         gmpMeasuredSignal = PaModel(modelName="gmp").Process(
@@ -2077,9 +2098,8 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
     )
     croppedPaMetrics = croppedPaAnalysis.Analyze()
     croppedPaFrame = croppedPaAnalysis.GetParsedWifiFrame()
-    assert croppedPaFrame is not None
-    assert croppedPaFrame.packetStartSample == 0
-    assert croppedPaFrame.parseConfidence > 0.99
+    assert croppedPaFrame is None
+    assert croppedPaAnalysis.GetAnalysisMode() == "transmitAssisted"
     assert np.isfinite(croppedPaMetrics["evmPercent"])
 
     transmitPaddingBefore = 41
@@ -2095,15 +2115,67 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
     paddedTransmitAnalysis = Analysis(
         effectiveReceive,
         transmittedSignal=paddedTransmit,
+        sampleRateHz=autoWaveform.sampleRateHz,
+        channelBandwidthHz=autoWaveform.bandwidthHz,
     )
-    paddedTransmitFrame = (
-        paddedTransmitAnalysis.GetParsedWifiFrame()
+    paddedTransmitOverlap = (
+        paddedTransmitAnalysis.GetSignalOverlapResult()
     )
     paddedTransmitMetrics = paddedTransmitAnalysis.Analyze()
-    assert paddedTransmitFrame is not None
-    assert paddedTransmitFrame.packetStartSample == 0
-    assert paddedTransmitFrame.parseConfidence > 0.999
+    assert paddedTransmitAnalysis.GetParsedWifiFrame() is None
+    assert paddedTransmitOverlap is not None
+    assert paddedTransmitOverlap.receivedStartSample == 0
+    assert (
+        paddedTransmitOverlap.referenceStartSample
+        == transmitPaddingBefore
+    )
+    assert paddedTransmitOverlap.confidence > 0.999
     assert paddedTransmitMetrics["evmPercent"] < 1.0e-8
+
+    # Raw NumPy-assisted analysis must work even when the transmit reference
+    # no longer contains the protected descriptor or complete Wi-Fi fields.
+    dataOnlyTransmit = autoWaveform.samples[
+        autoWaveform.fieldSlices[autoWaveform.dataFieldName]
+    ]
+    transmitVariants = (
+        autoWaveform.samples[500:],
+        autoWaveform.samples[:-300],
+        np.r_[
+            np.zeros(800, dtype=np.complex128),
+            autoWaveform.samples,
+        ],
+        autoWaveform.samples[1000:9000],
+        dataOnlyTransmit,
+    )
+    for transmitVariant in transmitVariants:
+        assistedReceive = np.r_[
+            np.zeros(23, dtype=np.complex128),
+            0.73 * np.exp(1j * 0.31) * transmitVariant,
+            np.zeros(11, dtype=np.complex128),
+        ]
+        waveformAssistedAnalysis = Analysis(
+            assistedReceive,
+            transmittedSignal=transmitVariant,
+        )
+        waveformAssistedMetrics = waveformAssistedAnalysis.Analyze()
+        waveformOverlap = (
+            waveformAssistedAnalysis.GetSignalOverlapResult()
+        )
+        assert (
+            waveformAssistedAnalysis.GetAnalysisMode()
+            == "transmitAssisted"
+        )
+        assert waveformAssistedAnalysis.GetParsedWifiFrame() is None
+        assert waveformOverlap is not None
+        assert (
+            waveformOverlap.receivedStartSample
+            - waveformOverlap.referenceStartSample
+            == 23
+        )
+        assert waveformOverlap.confidence > 0.999
+        assert waveformAssistedMetrics["evmPercent"] < 1.0e-8
+        assert waveformAssistedMetrics["snrDb"] > 150.0
+        assert np.isnan(waveformAssistedMetrics["aclrWorstDb"])
 
     objectReceivedAnalysis = Analysis(autoWaveform)
     objectReceivedMetrics = objectReceivedAnalysis.Analyze()
@@ -2143,6 +2215,8 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
     assert mimoAnalysis.GetLastMimoMetrics() is not None
 
     explicitAnalysis = Analysis(autoWaveform.samples, autoWaveform)
+    assert explicitAnalysis.GetAnalysisMode() == "explicitReference"
+    assert explicitAnalysis.GetParsedWifiFrame() is None
     try:
         explicitAnalysis.Analyze()
     except ValueError as error:

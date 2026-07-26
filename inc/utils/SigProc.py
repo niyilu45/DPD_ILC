@@ -443,6 +443,34 @@ class SignalProcessingResult:
         }
 
 
+@dataclass(frozen=True)
+class SignalOverlapResult:
+    """Store the common sample interval found between two waveforms."""
+
+    receivedStartSample: int
+    referenceStartSample: int
+    overlapLength: int
+    confidence: float
+
+    def ToDict(self) -> Dict[str, float]:
+        """Return overlap coordinates in a serialization-ready dictionary.
+
+        Processing details:
+            Algorithm: Convert integer sample coordinates and normalized
+            correlation confidence without changing their physical meaning.
+
+        Returns:
+            result: Dictionary containing both starts, length, and confidence.
+        """
+
+        return {
+            "receivedStartSample": float(self.receivedStartSample),
+            "referenceStartSample": float(self.referenceStartSample),
+            "overlapLength": float(self.overlapLength),
+            "confidence": float(self.confidence),
+        }
+
+
 class SigProc:
     """Estimate and compensate deterministic baseband signal impairments.
 
@@ -553,6 +581,207 @@ class SigProc:
         if not np.all(np.isfinite(complexSignal)):
             raise ValueError(f"{signalName} contains NaN or infinite values")
         return complexSignal
+
+    @staticmethod
+    def EstimateSignalOverlap(
+        measuredSignal: np.ndarray,
+        referenceSignal: np.ndarray,
+        maximumMeasuredOffsetSamples: int,
+        maximumProbeLength: int,
+        minimumConfidence: float,
+    ) -> SignalOverlapResult:
+        """Find the strongest valid common interval of two waveforms.
+
+        Processing details:
+            Algorithm: Remove negligible zero padding from the reference,
+            enumerate signed lags with useful overlap, calculate normalized
+            correlation on every physical chain, and prefer the longest,
+            earliest interval when correlation scores tie. A negative lag
+            means that the measured record starts inside a cropped reference.
+
+        Args:
+            measuredSignal: Measured vector or samples-by-chains matrix.
+            referenceSignal: Known transmitted vector or matrix.
+            maximumMeasuredOffsetSamples: Largest searched leading offset on
+                the measured side.
+            maximumProbeLength: Maximum samples used for each correlation.
+            minimumConfidence: Minimum accepted normalized correlation.
+
+        Returns:
+            result: Common measured/reference starts, overlap length, and
+                normalized multi-chain confidence.
+        """
+
+        complexMeasured = np.asarray(
+            measuredSignal, dtype=np.complex128
+        )
+        complexReference = np.asarray(
+            referenceSignal, dtype=np.complex128
+        )
+        for signalName, complexSignal in (
+            ("measuredSignal", complexMeasured),
+            ("referenceSignal", complexReference),
+        ):
+            if complexSignal.ndim not in (1, 2):
+                raise ValueError(
+                    f"{signalName} must be a vector or matrix"
+                )
+            if complexSignal.shape[0] == 0:
+                raise ValueError(f"{signalName} cannot be empty")
+            if not np.all(np.isfinite(complexSignal)):
+                raise ValueError(
+                    f"{signalName} contains NaN or infinite values"
+                )
+        if (
+            not isinstance(maximumMeasuredOffsetSamples, int)
+            or isinstance(maximumMeasuredOffsetSamples, bool)
+            or maximumMeasuredOffsetSamples < 0
+        ):
+            raise ValueError(
+                "maximumMeasuredOffsetSamples must be a nonnegative integer"
+            )
+        if (
+            not isinstance(maximumProbeLength, int)
+            or isinstance(maximumProbeLength, bool)
+            or maximumProbeLength < 16
+        ):
+            raise ValueError(
+                "maximumProbeLength must be an integer of at least 16"
+            )
+        if (
+            not isinstance(minimumConfidence, (int, float))
+            or isinstance(minimumConfidence, bool)
+            or not np.isfinite(minimumConfidence)
+            or not 0.0 <= minimumConfidence <= 1.0
+        ):
+            raise ValueError(
+                "minimumConfidence must be finite and between zero and one"
+            )
+
+        measuredMatrix = (
+            complexMeasured.reshape(-1, 1)
+            if complexMeasured.ndim == 1
+            else complexMeasured
+        )
+        referenceMatrix = (
+            complexReference.reshape(-1, 1)
+            if complexReference.ndim == 1
+            else complexReference
+        )
+        if measuredMatrix.shape[1] != referenceMatrix.shape[1]:
+            raise ValueError(
+                "measuredSignal and referenceSignal must have the same "
+                "number of physical chains"
+            )
+
+        referencePower = np.sum(
+            np.abs(referenceMatrix) ** 2,
+            axis=1,
+        )
+        peakReferencePower = float(np.max(referencePower))
+        if peakReferencePower <= np.finfo(float).tiny:
+            raise ValueError(
+                "referenceSignal must contain nonzero finite samples"
+            )
+        activeReferenceIndices = np.flatnonzero(
+            referencePower
+            > peakReferencePower * np.finfo(float).eps
+        )
+        activeReferenceStart = int(activeReferenceIndices[0])
+        activeReferenceStop = int(activeReferenceIndices[-1]) + 1
+        activeReference = referenceMatrix[
+            activeReferenceStart:activeReferenceStop
+        ]
+
+        measuredLength = int(measuredMatrix.shape[0])
+        referenceLength = int(activeReference.shape[0])
+        shorterLength = min(measuredLength, referenceLength)
+        minimumOverlap = min(
+            shorterLength,
+            max(16, min(64, shorterLength // 4)),
+        )
+        minimumLag = -(referenceLength - minimumOverlap)
+        maximumLag = min(
+            maximumMeasuredOffsetSamples,
+            measuredLength - minimumOverlap,
+        )
+        numericFloor = np.finfo(float).tiny
+        bestScore = float("-inf")
+        bestMeasuredStart = 0
+        bestReferenceStart = activeReferenceStart
+        bestOverlapLength = 0
+        bestTieBreak = (float("-inf"), -1, 0)
+        for candidateLag in range(minimumLag, maximumLag + 1):
+            activeReferenceOffset = max(0, -candidateLag)
+            measuredStart = max(0, candidateLag)
+            overlapLength = min(
+                referenceLength - activeReferenceOffset,
+                measuredLength - measuredStart,
+            )
+            if overlapLength < minimumOverlap:
+                continue
+            probeLength = min(overlapLength, maximumProbeLength)
+            chainPowers = []
+            for chainIndex in range(referenceMatrix.shape[1]):
+                referenceProbe = activeReference[
+                    activeReferenceOffset:
+                    activeReferenceOffset + probeLength,
+                    chainIndex,
+                ]
+                measuredProbe = measuredMatrix[
+                    measuredStart:measuredStart + probeLength,
+                    chainIndex,
+                ]
+                referenceEnergy = float(
+                    np.vdot(referenceProbe, referenceProbe).real
+                )
+                measuredEnergy = float(
+                    np.vdot(measuredProbe, measuredProbe).real
+                )
+                correlationPower = float(
+                    np.abs(
+                        np.vdot(referenceProbe, measuredProbe)
+                    )
+                    ** 2
+                )
+                chainPowers.append(
+                    correlationPower
+                    / max(
+                        referenceEnergy * measuredEnergy,
+                        numericFloor,
+                    )
+                )
+            candidateScore = float(np.mean(chainPowers))
+            candidateTieBreak = (
+                candidateScore,
+                overlapLength,
+                -measuredStart,
+            )
+            if candidateTieBreak > bestTieBreak:
+                bestTieBreak = candidateTieBreak
+                bestScore = candidateScore
+                bestMeasuredStart = measuredStart
+                bestReferenceStart = (
+                    activeReferenceStart + activeReferenceOffset
+                )
+                bestOverlapLength = overlapLength
+
+        if not np.isfinite(bestScore):
+            raise ValueError(
+                "measuredSignal and referenceSignal do not have a "
+                "nonempty searchable overlap"
+            )
+        bestConfidence = float(np.sqrt(max(bestScore, 0.0)))
+        if bestConfidence < float(minimumConfidence):
+            raise ValueError(
+                "waveform correlation is below minimumConfidence"
+            )
+        return SignalOverlapResult(
+            receivedStartSample=bestMeasuredStart,
+            referenceStartSample=bestReferenceStart,
+            overlapLength=bestOverlapLength,
+            confidence=bestConfidence,
+        )
 
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened snapshot of effective processing parameters.

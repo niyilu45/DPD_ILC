@@ -8,7 +8,12 @@ from .utils.WifiMetadata import MCSInfo, WifiWaveform
 from .utils.FrameProcess import BuildCsdPhaseMatrix, FrameProcess
 from .lib.ParseWifi import ParsedWifiFrame, ParseWifi
 from .lib.PaModel import GMPPA, MimoPaModel, PaModel, WienerPA
-from .utils.SigProc import PowerCalibration, SigProc, SignalProcessingResult
+from .utils.SigProc import (
+    PowerCalibration,
+    SignalOverlapResult,
+    SignalProcessingResult,
+    SigProc,
+)
 from .lib.Analysis import (
     Analysis,
     ILCAnalysisResult,

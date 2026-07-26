@@ -98,6 +98,109 @@ O(N\log N).
 
 ---
 
+### 3.3 不等长发送与接收波形的公共区间估计
+
+`SigProc.EstimateSignalOverlap` 用于已知发送样值的辅助分析。它解决的问题不是“恢复Wi-Fi参数”，而是“两个可能被裁剪或补零的记录中，哪两段样值来自同一物理时间区间”。因此该函数不读取Descriptor、seed、MCS、GI或Data，也不调用波形生成器。
+
+设发送参考为 $x_m[n]$，接收记录为 $y_m[n]$，其中 $m$ 表示物理链。候选有符号时延为 $d$。当 $d\geq0$ 时，接收记录在发送参考之后开始；当 $d<0$ 时，接收记录从发送参考内部开始，说明发送参考的前部已被裁剪。每个候选的起点为：
+
+```math
+n_y(d)=\max(0,d),
+```
+
+```math
+n_x(d)=\max(0,-d).
+```
+
+对应公共长度为：
+
+```math
+L(d)=\min
+\left(
+N_y-n_y(d),
+N_x-n_x(d)
+\right).
+```
+
+算法先删除发送参考最外侧的纯零填充，再在允许的有符号时延范围内枚举候选。第 $m$ 条链的归一化相关功率为：
+
+```math
+C_m(d)=
+\frac{
+\left|
+\sum_{k=0}^{L_p-1}
+x_m^*[n_x(d)+k]y_m[n_y(d)+k]
+\right|^2
+}{
+\left(
+\sum_{k=0}^{L_p-1}|x_m[n_x(d)+k]|^2
+\right)
+\left(
+\sum_{k=0}^{L_p-1}|y_m[n_y(d)+k]|^2
+\right)
+},
+```
+
+其中 $L_p$ 不超过 `maximumProbeLength`。多链得分采用算术平均：
+
+```math
+C(d)=
+\frac{1}{M}
+\sum_{m=0}^{M-1}C_m(d).
+```
+
+返回置信度为：
+
+```math
+\rho(d)=\sqrt{C(d)}.
+```
+
+由于分子和分母具有相同的幅度平方量纲，公共复增益和每链固定功率缩放不会改变理想情况下的相关置信度。若多个候选得分相同，算法依次偏好更长公共区间和更早的接收起点。结果保存为 `SignalOverlapResult`：
+
+| 字段 | 含义 |
+|---|---|
+| `receivedStartSample` | 接收记录公共区间的首样点 |
+| `referenceStartSample` | 发送参考公共区间的首样点 |
+| `overlapLength` | 两路可直接对应的样点数 |
+| `confidence` | 0到1的归一化相关幅度 |
+
+```python
+from inc.utils.SigProc import SigProc
+
+overlap = SigProc.EstimateSignalOverlap(
+    measuredSignal=receivedSignal,
+    referenceSignal=transmitSignal,
+    maximumMeasuredOffsetSamples=2000,
+    maximumProbeLength=32768,
+    minimumConfidence=0.12,
+)
+
+referenceOverlap = transmitSignal[
+    overlap.referenceStartSample:
+    overlap.referenceStartSample + overlap.overlapLength
+]
+receivedOverlap = receivedSignal[
+    overlap.receivedStartSample:
+    overlap.receivedStartSample + overlap.overlapLength
+]
+print(overlap.ToDict())
+```
+
+**图示说明：**
+
+```mermaid
+flowchart LR
+    tx["发送记录<br/>可裁剪或补零"] --> trim["去除最外侧纯零"]
+    rx["接收记录<br/>可含触发延迟"] --> lag["枚举有符号时延"]
+    trim --> lag
+    lag --> correlation["逐链能量归一化互相关"]
+    correlation --> select["选择最高置信度公共区间"]
+    select --> coordinates["接收起点 / 参考起点 / 长度"]
+    coordinates --> sync["后续CFO / SFO / 复增益补偿"]
+```
+
+该图强调公共区间估计只决定“比较哪两段样值”。CFO、分数时延、SFO和公共复增益仍由后续 `SigProc.Process` 估计与补偿；重叠估计不能替代完整同步。
+
 ## 4. 载波频偏估计与补偿
 
 ### 4.1 为什么使用分块复增益相位
@@ -265,6 +368,7 @@ z[n]=\frac{z_0[n]}{\hat g}.
 classDiagram
     class SigProc {
         +Process(measuredSignal, estimationSlice)
+        +EstimateSignalOverlap(measuredSignal, referenceSignal, ...)
         +EstimateIntegerDelay(measuredSignal)
         +EstimateCarrierFrequencyOffset(integerAlignedSignal)
         +EstimateTimingOffsets(frequencyCorrectedSignal, integerDelaySamples)
@@ -282,11 +386,19 @@ classDiagram
         +complexGain
         +ToDict()
     }
+    class SignalOverlapResult {
+        +receivedStartSample
+        +referenceStartSample
+        +overlapLength
+        +confidence
+        +ToDict()
+    }
     SigProc --> SignalProcessingResult : Process returns
+    SigProc --> SignalOverlapResult : EstimateSignalOverlap returns
     Analysis --> SigProc : preprocessing
 ```
 
-**图 2 说明：**`SigProc` 持有参考信号、采样率和估计配置；`Process` 返回不可变的 `SignalProcessingResult`。样点数组用于后续指标计算，`ToDict()` 只输出适合 JSON/CSV 记录的标量估计。
+**图 2 说明：**`SigProc` 持有参考信号、采样率和估计配置；`Process` 返回不可变的 `SignalProcessingResult`。静态公共区间估计返回不可变的 `SignalOverlapResult`，因此Analysis和ParseWifi可以复用同一相关算法。样点数组用于后续指标计算，两个结果类的 `ToDict()` 都只输出适合 JSON/CSV 记录的标量。
 
 ---
 

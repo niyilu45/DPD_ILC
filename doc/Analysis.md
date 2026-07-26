@@ -1,6 +1,6 @@
 # 结果计算：SNR、EVM、ACLR 与功率–EVM 曲线原理
 
-本文解释 `inc/lib/Analysis.py` 中结果统计的物理含义和公式推导。分析器最终都以理想发送参考波形和 `WifiWaveform` 元数据为基准；这些信息既可以由调用方显式提供，也可以由 `ParseWifi` 从接收帧恢复。随后对 PA、ILC 或部署型 DPD 输出统一计算：
+本文解释 `inc/lib/Analysis.py` 中结果统计的物理含义和公式推导。分析器始终需要一段发送参考样值，但参考来源有三种：调用方显式提供理想参考、调用方提供实际发送波形，或者在完全盲分析时由 `ParseWifi` 从接收帧恢复。只有严格的Wi-Fi子载波EVM需要 `WifiWaveform` 元数据；已知发送NumPy样值时无需猜测MCS、GI或seed，也能直接计算波形域EVM和SNR。随后对 PA、ILC 或部署型 DPD 输出统一计算：
 
 - 数据字段时域 SNR；
 - Wi-Fi 数据子载波 RMS EVM；
@@ -15,11 +15,18 @@
 
 ```mermaid
 flowchart TB
-    receiveOnly["仅接收帧<br/>NumPy或WifiWaveform"] --> parser["ParseWifi"]
-    optionalTransmit["可选发送帧<br/>NumPy或WifiWaveform"] --> parser
+    explicit["显式Reference<br/>referenceSignal + WifiWaveform"] --> A["参考样值 x[n]"]
+    assistedReceive["发送辅助的接收波形 y[m]"] --> overlap["互相关搜索公共区间"]
+    assistedTransmit["transmittedSignal<br/>NumPy或WifiWaveform"] --> overlap
+    overlap --> A
+    blind["只有接收波形"] --> parser["ParseWifi<br/>恢复Descriptor与seed"]
     parser --> A
-    A["理想参考波形 x[n]"] --> B["字段边界与参考 QAM"]
-    C["PA/DPD/采集输出 y[m]"] --> D["SigProc 同步与补偿"]
+    A --> metadata{"是否具有WifiWaveform元数据"}
+    metadata -->|是| B["字段边界与参考 QAM"]
+    metadata -->|否| waveformMetric["公共区间波形域EVM/SNR"]
+    assistedReceive --> D["SigProc 同步与补偿"]
+    blind --> D
+    C["显式模式的PA/DPD/采集输出 y[m]"] --> D
     A --> D
     D --> corrected["统一校正信号 z[n]"]
     B --> E["数据字段时域拟合"]
@@ -33,46 +40,105 @@ flowchart TB
     K --> L["ACLR-L / ACLR-U / Worst"]
 ```
 
-**图 1 说明**：显式参考路径直接进入理想参考节点；仅接收路径先由ParseWifi恢复同样的参考和元数据。之后每个待测信号只执行一次 `SigProc.Process`，SNR、EVM、ACLR共用完全相同的校正样点。SNR在数据字段时域样点上计算；EVM由 `FrameProcess` 在去CP、FFT、撤销CSD和空间解映射后的数据子载波上计算；ACLR在数据字段功率谱上计算。三者观察的是不同维度，不能用单一指标替代全部结果。
+**图 1 说明**：显式Reference模式不调用Parser；发送辅助模式只对两路样值做公共区间搜索，也不调用Parser；只有盲模式先由 `ParseWifi` 恢复参考和元数据。之后每个待测信号只执行一次 `SigProc.Process`，SNR、EVM、ACLR共用同一份校正样点。具有 `WifiWaveform` 元数据时，EVM由 `FrameProcess` 在去CP、FFT、撤销CSD和空间解映射后的数据子载波上计算；纯NumPy发送辅助模式则在公共时域样值上计算归一化EVM。三者观察的是不同维度，不能用单一指标替代全部结果。
 
-### 1.1 两种Analysis构造方式
+### 1.1 三种Analysis构造方式
 
-原有方式保持不变：
+#### 模式一：显式Reference
 
 ```python
 resultAnalysis = Analysis(referenceSignal, wifiWaveform)
 metrics = resultAnalysis.Analyze(receivedSignal)
 ```
 
-仅接收帧方式为：
+此模式直接保存参考和元数据，完全不调用 `ParseWifi`。
 
-```python
-resultAnalysis = Analysis(receivedInput)
-metrics = resultAnalysis.Analyze()
-```
-
-`receivedInput` 可以是NumPy数组或 `WifiWaveform`。仅接收路径构造时已经保存了解析、裁剪后的接收包，所以 `Analyze()` 可以省略实参；显式参考路径仍必须把待测波形传给 `Analyze`。
-
-### 1.2 可选发送输入
-
-仅接收路径可以额外提供：
+#### 模式二：发送波形辅助
 
 ```python
 resultAnalysis = Analysis(
-    receivedInput,
-    transmittedSignal=optionalTransmitInput,
+    receivedSignal,
+    transmittedSignal=transmitSignal,
 )
 metrics = resultAnalysis.Analyze()
 ```
 
-接收输入和发送输入均自动支持两种类型：
+`transmitSignal` 与 `receivedSignal` 都可以是NumPy数组或 `WifiWaveform`。Analysis直接使用发送样值，不读取Descriptor，不恢复seed、MCS、GI或Data，也不调用 `WaveGenWifi.Generate()`。
 
-- NumPy一维SISO数组或 `samples × chains` MIMO矩阵；
-- `WifiWaveform` 对象。
+#### 模式三：盲分析
 
-发送输入为NumPy数组时，Parser从发送样值解码描述字段，并用发送与接收互相关恢复精确包起点；发送输入为 `WifiWaveform` 时，直接使用对象元数据。两种情况都保留发送样值作为Analysis参考。
+```python
+resultAnalysis = Analysis(receivedSignal)
+metrics = resultAnalysis.Analyze()
+```
 
-完整字段布局、CRC、归一化互相关公式、参数和适用边界见 [ParseWifi.md](./ParseWifi.md)。
+只有这个模式调用 `ParseWifi`，从接收帧Descriptor恢复参数、重建理想参考并保存裁剪后的接收包。
+
+三种模式可由程序检查：
+
+```python
+print(resultAnalysis.GetAnalysisMode())
+# "explicitReference", "transmitAssisted", or "blind"
+```
+
+发送辅助和盲分析在构造时保存了待测波形，所以 `Analyze()` 可以省略实参；显式Reference路径仍必须把待测波形传给 `Analyze`。
+
+### 1.2 发送辅助模式为何不解析Descriptor
+
+当发送样值已经存在时，它就是测量需要的真实参考。重新解析Descriptor再生成一份参考，会额外引入Descriptor判决、seed恢复和重生成一致性三类失败点，没有增加物理信息。发送辅助模式因此只做：
+
+1. 把NumPy数组或 `WifiWaveform.samples` 统一转换成复数样值；
+2. 用能量归一化互相关找出接收与发送记录的公共区间；
+3. 在公共区间上执行整数/分数时延、CFO、SFO和公共复增益补偿；
+4. 直接比较校正后的接收样值与发送样值。
+
+设相关搜索得到接收起点 $n_y$、发送起点 $n_x$ 和公共长度 $L$。送入后续同步的两段信号为：
+
+```math
+x_o[k]=x[n_x+k],\qquad
+y_o[k]=y[n_y+k],\qquad
+0\leq k<L.
+```
+
+相关置信度是逐链归一化相关幅度的平均结果，其范围为0到1。坐标可以通过以下方式查看：
+
+```python
+overlap = resultAnalysis.GetSignalOverlapResult()
+print(overlap.ToDict())
+```
+
+因此下列发送样值都可以直接使用，只要它们与接收记录仍有足够公共信号：
+
+```python
+Analysis(receivedSignal, transmittedSignal=tx[500:])
+Analysis(receivedSignal, transmittedSignal=tx[:-300])
+Analysis(
+    receivedSignal,
+    transmittedSignal=np.concatenate(
+        [np.zeros(800, dtype=np.complex128), tx]
+    ),
+)
+Analysis(receivedSignal, transmittedSignal=tx[1000:9000])
+```
+
+这些变形不会触发Descriptor恢复。相关器只关心两路波形是否存在可识别的公共区间。完整相关公式见 [SigProc.md](./SigProc.md)。
+
+如果 `transmittedSignal` 是 `WifiWaveform`，Analysis直接复用对象元数据，因此可以继续计算严格的Wi-Fi子载波EVM和默认ACLR。如果它只是NumPy样值，则：
+
+- EVM是同步后公共区间的归一化波形域RMS误差；
+- SNR是参考能量与波形残差能量之比；
+- 不提供频带定义时，三个ACLR字段返回 `NaN`；
+- 同时提供真实 `sampleRateHz` 与 `channelBandwidthHz` 后才计算具有物理频率意义的ACLR。
+
+```python
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=transmitSamples,
+    sampleRateHz=320.0e6,
+    channelBandwidthHz=80.0e6,
+)
+metrics = resultAnalysis.Analyze()
+```
 
 ### 1.3 直接输入接收波形估计EVM
 
@@ -116,7 +182,7 @@ print(f"EVM: {metrics['evmPercent']:.3f} %")
 - MIMO：形状为 `numSamples × numReceiveChains`；
 - 数组中必须包含完整的本工程VHT、HE或EHT帧描述字段；
 - 包前可以带有零样值、静默区或采集时延，默认最多搜索2000个前置样点，由 `maximumPacketOffsetSamples` 控制；
-- 提供可选发送波形时，发送和接收长度可以不同。发送端前后补零、只把完整有效帧送入PA、或接收捕获更短都不会触发长度错误，Parser会在公共有效区间内完成对齐。
+- 提供发送波形时，发送和接收长度可以不同。发送端前后补零、只把完整有效帧送入PA、或接收捕获更短都不会触发长度错误，`SigProc.EstimateSignalOverlap` 会在公共有效区间内完成对齐，不会调用Parser。
 
 这里的“不要求等长”不等于“任意缺失样点都能恢复”。若裁剪只移除完整Wi-Fi帧外的补零，指标不受影响；若裁剪切入帧内OFDM符号，缺失信息会在同步到参考网格时保留为缺失误差，因此EVM会合理变差。
 
@@ -1600,11 +1666,15 @@ Analysis(
     parseParameters=None,
     transmittedSignal=None,
     signalProcessingParameters=None,
+    sampleRateHz=None,
+    channelBandwidthHz=None,
     **parameterOverrides,
 )
 ```
 
 `signalProcessingParameters` 是显式构造参数，其映射内容直接传给 `SigProc`。为兼容旧程序，`parameters={"signalProcessingParameters": {...}}` 仍然有效；新代码应优先使用显式参数，避免把同步配置误认为普通Analysis指标配置。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。任何层出现未知键时，代码会发出 `UserWarning`、忽略该键并继续；已识别键的类型、单位和物理范围仍严格校验。
+
+`parseParameters` 只在盲模式使用。`sampleRateHz` 和 `channelBandwidthHz` 只需在纯NumPy发送辅助模式中补充：前者让CFO估计使用真实Hz单位，后者与采样率一起定义ACLR积分频带。发送辅助模式即使没有这两个物理量，也会继续完成时延、归一化CFO、SFO、复增益、EVM和SNR计算，只把无法定义的ACLR返回为 `NaN`。
 
 功率–EVM 扫描的评估器接口为：
 

@@ -4,7 +4,7 @@
 
 `inc/lib/ParseWifi.py` 用于从接收到的VHT、HE或EHT复基带波形中恢复 `Analysis` 所需的参考信号和帧元数据。
 
-工程现在保留两条Analysis入口：
+工程现在保留三条Analysis入口：
 
 1. 已知参考路径：
 
@@ -13,20 +13,34 @@ resultAnalysis = Analysis(referenceSignal, wifiWaveform)
 metrics = resultAnalysis.Analyze(receivedSignal)
 ```
 
-2. 仅接收帧路径：
+2. 发送波形辅助路径：
+
+```python
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=transmitSignal,
+)
+metrics = resultAnalysis.Analyze()
+```
+
+这条路径不调用 `ParseWifi`。Analysis直接把发送样值作为参考，由 `SigProc.EstimateSignalOverlap` 搜索公共区间。
+
+3. 仅接收帧盲分析路径：
 
 ```python
 resultAnalysis = Analysis(receivedSignal)
 metrics = resultAnalysis.Analyze()
 ```
 
-第二种路径在Analysis内部调用 `ParseWifi.Parse`。Parser恢复参考波形、FFT长度、GI、数据字段位置、活动音调、MCS、空间映射和CSD等信息，然后仍然调用原来的 `SigProc`、`FrameProcess` 和指标计算函数。也就是说，新增的是参考信息获取方式，SNR、EVM和ACLR公式没有被重新实现。
+只有第三种路径在Analysis内部调用 `ParseWifi.Parse`。Parser恢复参考波形、FFT长度、GI、数据字段位置、活动音调、MCS、空间映射和CSD等信息，然后仍然调用原来的 `SigProc`、`FrameProcess` 和指标计算函数。也就是说，ParseWifi的职责严格限制为“没有任何发送参考时恢复参考信息”；SNR、EVM和ACLR公式没有在Parser中实现。
 
 ---
 
-## 2. 三种解析模式
+## 2. ParseWifi独立接口的三种解析模式
 
 `ParseWifi.Parse` 的 `receivedSignal` 和可选的 `transmittedSignal` 都可以是 `numpy.ndarray` 或 `WifiWaveform`。调用方始终使用同一个函数和同一组参数名，Parser根据数据类型自动选择内部路径。
+
+> 本节描述的是调用方显式创建 `ParseWifi` 并直接调用 `ParseWifi.Parse(...)` 时的兼容能力，不是 `Analysis` 的发送辅助实现。`Analysis(receivedSignal, transmittedSignal=...)` 始终绕过本节三条Parser分支。
 
 | 模式 | `transmittedSignal` | 元数据来源 | 参考样值来源 | 适用场景 |
 |---|---|---|---|---|
@@ -452,7 +466,7 @@ resultAnalysis = Analysis(paOutput)
 metrics = resultAnalysis.Analyze()
 ```
 
-若PA驱动很深、描述字段已经无法可靠恢复，应提供可选发送样值：
+若PA驱动很深、描述字段已经无法可靠恢复，Analysis应提供发送样值并进入直接发送辅助模式：
 
 ```python
 resultAnalysis = Analysis(
@@ -462,7 +476,7 @@ resultAnalysis = Analysis(
 metrics = resultAnalysis.Analyze()
 ```
 
-`transmittedSignal` 也可以直接使用 `transmitWaveform.samples`。这条辅助路径从发送波形取得描述信息，并用发送/接收互相关估计包起点，因而不依赖失真后的接收描述字段。
+`transmittedSignal` 也可以直接使用 `transmitWaveform.samples`。这条Analysis辅助路径不进入Parser，不读取发送Descriptor，而是用发送/接收互相关找到公共区间并直接把发送样值作为参考。
 
 ### 5.5 参考重生成
 
@@ -486,6 +500,8 @@ referenceWaveform = WaveGenWifi(
 ---
 
 ## 6. 提供可选发送波形时
+
+本章仅说明调用方直接使用 `ParseWifi.Parse(receivedSignal, transmittedSignal=...)` 的历史兼容接口。新的 `Analysis` 发送辅助模式不会执行本章流程；其公共区间估计已下沉到 `SigProc.EstimateSignalOverlap`。
 
 ### 6.1 NumPy发送波形
 
@@ -652,7 +668,7 @@ resultAnalysis = Analysis(
 metrics = resultAnalysis.Analyze()
 ```
 
-### 8.2 NumPy发送样值辅助
+### 8.2 Analysis的NumPy发送样值辅助
 
 ```python
 resultAnalysis = Analysis(
@@ -664,7 +680,9 @@ metrics = resultAnalysis.Analyze()
 
 `transmitSamples` 可以是一维SISO数组，也可以是 `samples × chains` 的MIMO矩阵。
 
-### 8.3 WifiWaveform发送对象辅助
+这里Analysis不会调用 `ParseWifi.Parse`。它直接搜索两路波形公共区间，因此发送样值可以被裁剪、前后补零，也不要求包含Descriptor。纯NumPy输入没有帧元数据，结果采用波形域EVM/SNR；需要ACLR时同时传入 `sampleRateHz` 和 `channelBandwidthHz`。
+
+### 8.3 Analysis的WifiWaveform发送对象辅助
 
 ```python
 wifiGenerator = WaveGenWifi(
@@ -683,6 +701,8 @@ resultAnalysis = Analysis(
 metrics = resultAnalysis.Analyze()
 ```
 
+这里仍然不调用Parser。Analysis读取 `wifiWaveform.samples` 作为真实参考，并复用对象中已有的字段边界、FFT/GI和空间映射元数据计算严格Wi-Fi子载波EVM。
+
 ### 8.4 原有已知参考方式继续保留
 
 ```python
@@ -693,7 +713,7 @@ resultAnalysis = Analysis(
 metrics = resultAnalysis.Analyze(receivedSignal)
 ```
 
-显式参考路径的 `Analyze` 仍然要求传入 `measuredSignal`。只有Parser构造的接收路径可以使用零参数 `Analyze()`。
+显式参考路径的 `Analyze` 仍然要求传入 `measuredSignal`。发送辅助路径和Parser构造的盲接收路径都在构造时保存了测量样值，因此可以使用零参数 `Analyze()`。
 
 ### 8.5 独立使用ParseWifi
 

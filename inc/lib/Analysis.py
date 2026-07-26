@@ -32,6 +32,7 @@ if __package__ and "." in __package__:
     from ..utils.FrameProcess import FrameProcess
     from ..utils.SigProc import (
         PowerCalibration,
+        SignalOverlapResult,
         SignalProcessingResult,
         SigProc,
     )
@@ -44,6 +45,7 @@ else:
     from utils.FrameProcess import FrameProcess
     from utils.SigProc import (
         PowerCalibration,
+        SignalOverlapResult,
         SignalProcessingResult,
         SigProc,
     )
@@ -227,12 +229,13 @@ def AveragePeriodogram(
 
 
 class Analysis:
-    """Analyze PA/DPD results with a supplied or frame-parsed reference.
+    """Analyze PA/DPD results through three independent reference paths.
 
-    The original data-aided path constructs an instance from a transmitted
-    reference and ``WifiWaveform`` metadata. The receive-only path omits
-    ``waveform``; ``ParseWifi`` then restores the reference and metadata from
-    the received frame's protected project signaling descriptor.
+    Explicit-reference mode receives ideal samples plus ``WifiWaveform``
+    metadata. Transmit-assisted mode receives a measured waveform plus known
+    transmitted samples and directly correlates their common interval without
+    parsing a descriptor. Blind mode receives no transmitted reference, so
+    only that mode invokes ``ParseWifi`` to restore metadata and ideal samples.
 
     Example:
         ``resultAnalysis = Analysis(referenceSignal, waveform)``
@@ -253,33 +256,39 @@ class Analysis:
         signalProcessingParameters: Optional[
             Mapping[str, object]
         ] = None,
+        sampleRateHz: Optional[float] = None,
+        channelBandwidthHz: Optional[float] = None,
         **parameterOverrides: object,
     ) -> None:
-        """Initialize a reference-aided or receive-only analysis context.
+        """Initialize one of the three independent analysis contexts.
 
         Processing details:
-            Algorithm: When metadata is supplied, preserve the original
-            reference-aided construction. Otherwise parse ``referenceSignal``
-            as a received Wi-Fi frame, regenerate its ideal deterministic
-            reference, and retain the aligned received packet as the default
-            input for a later zero-argument ``Analyze`` call. Analysis defaults
-            remain inside this constructor and are resolved through ChainMap.
+            Algorithm: Select explicit-reference mode when ``waveform`` is
+            supplied, direct waveform-overlap mode when ``transmittedSignal``
+            is supplied, and blind descriptor parsing only when neither is
+            supplied. Analysis defaults remain inside this constructor and
+            are resolved through ChainMap.
 
         Args:
             referenceSignal: Ideal reference samples when ``waveform`` is
-                supplied; otherwise a received NumPy array or ``WifiWaveform``
-                parsed internally.
-            waveform: Optional Wi-Fi metadata for the original data-aided path.
+                supplied; otherwise a received NumPy array or ``WifiWaveform``.
+            waveform: Optional Wi-Fi metadata selecting explicit-reference
+                mode.
             parameters: Optional external mapping layered ahead of the built-in defaults.
             parseParameters: Optional ``ParseWifi`` parameter mapping used only
                 when ``waveform`` is omitted.
-            transmittedSignal: Optional known transmit input. ``ParseWifi``
-                automatically accepts either a metadata-rich ``WifiWaveform``
-                or a NumPy waveform containing samples only.
+            transmittedSignal: Optional known transmit input selecting direct
+                assisted mode. Either a metadata-rich ``WifiWaveform`` or a
+                NumPy waveform containing samples only is accepted without
+                invoking ``ParseWifi``.
             signalProcessingParameters: Optional explicit ``SigProc``
                 configuration mapping. This named argument is preferred over
                 nesting the same key inside ``parameters``; the nested form
                 remains supported for backward compatibility.
+            sampleRateHz: Optional physical sample rate for NumPy-assisted
+                waveform-domain analysis.
+            channelBandwidthHz: Optional occupied channel bandwidth used to
+                enable ACLR in NumPy-assisted waveform-domain analysis.
             parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
 
         Returns:
@@ -293,58 +302,13 @@ class Analysis:
                 "signalProcessingParameters": None,
                 "loadResistanceOhm": 50.0,
                 "maximumOutputPowerDbm": 25.0,
+                "sampleRateHz": None,
+                "channelBandwidthHz": None,
+                "assistedMaximumOffsetSamples": 2000,
+                "assistedReferenceSearchSamples": 32768,
+                "assistedMinimumCorrelation": 0.12,
             }
         )
-        self.parsedWifiFrame: Optional[ParsedWifiFrame] = None
-        self.defaultMeasuredSignal: Optional[np.ndarray] = None
-        selectedWaveform = waveform
-        selectedReference: Union[np.ndarray, WifiWaveform] = referenceSignal
-        if selectedWaveform is None:
-            self.parsedWifiFrame = ParseWifi(
-                parameters=parseParameters
-            ).Parse(
-                referenceSignal,
-                transmittedSignal=transmittedSignal,
-            )
-            selectedReference = self.parsedWifiFrame.referenceSignal
-            selectedWaveform = self.parsedWifiFrame.waveform
-            self.defaultMeasuredSignal = (
-                self.parsedWifiFrame.receivedSignal.copy()
-            )
-        elif parseParameters is not None or transmittedSignal is not None:
-            raise ValueError(
-                "parseParameters and transmittedSignal are only valid when "
-                "waveform is omitted"
-            )
-        if not isinstance(selectedWaveform, WifiWaveform):
-            raise TypeError("waveform must be a WifiWaveform or None")
-        if isinstance(selectedReference, WifiWaveform):
-            selectedReference = selectedReference.samples
-        complexReference = np.asarray(
-            selectedReference, dtype=np.complex128
-        )
-        if complexReference.size == 0:
-            raise ValueError("referenceSignal cannot be empty")
-        expectedShape = np.asarray(selectedWaveform.samples).shape
-        if complexReference.shape != expectedShape:
-            raise ValueError(
-                "referenceSignal shape must match the Wi-Fi waveform"
-            )
-        if complexReference.ndim not in (1, 2):
-            raise ValueError("referenceSignal must be a vector or matrix")
-        if (
-            complexReference.ndim == 2
-            and complexReference.shape[1]
-            != selectedWaveform.numTransmitAntennas
-        ):
-            raise ValueError(
-                "referenceSignal must contain one column per transmit chain"
-            )
-        if not np.all(np.isfinite(complexReference)):
-            raise ValueError("referenceSignal contains NaN or infinite values")
-        self.referenceSignal = complexReference
-        self.waveform = selectedWaveform
-        self.frameProcessor = FrameProcess(selectedWaveform)
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
         externalParameters: Mapping[str, object] = (
@@ -365,10 +329,161 @@ class Analysis:
             recognizedOverrides["signalProcessingParameters"] = (
                 signalProcessingParameters
             )
+        if sampleRateHz is not None:
+            recognizedOverrides["sampleRateHz"] = sampleRateHz
+        if channelBandwidthHz is not None:
+            recognizedOverrides["channelBandwidthHz"] = (
+                channelBandwidthHz
+            )
         self.parameters: ChainMap[str, object] = ChainMap(
             recognizedOverrides,
             externalParameters,
             self.defaultParameters,
+        )
+
+        self.parsedWifiFrame: Optional[ParsedWifiFrame] = None
+        self.signalOverlapResult: Optional[SignalOverlapResult] = None
+        self.defaultMeasuredSignal: Optional[np.ndarray] = None
+        self.analysisMode = "explicitReference"
+        selectedWaveform = waveform
+        selectedReference: Union[np.ndarray, WifiWaveform] = referenceSignal
+        if selectedWaveform is not None:
+            if parseParameters is not None or transmittedSignal is not None:
+                raise ValueError(
+                    "parseParameters and transmittedSignal are only valid "
+                    "when waveform is omitted"
+                )
+        elif transmittedSignal is not None:
+            if parseParameters is not None:
+                raise ValueError(
+                    "parseParameters is only valid in blind analysis mode"
+                )
+            self.analysisMode = "transmitAssisted"
+            measuredInput = (
+                referenceSignal.samples
+                if isinstance(referenceSignal, WifiWaveform)
+                else referenceSignal
+            )
+            measuredArray = np.asarray(
+                measuredInput, dtype=np.complex128
+            )
+            if isinstance(transmittedSignal, WifiWaveform):
+                selectedReference = transmittedSignal.samples
+                selectedWaveform = transmittedSignal
+                self.signalOverlapResult = SigProc.EstimateSignalOverlap(
+                    measuredArray,
+                    transmittedSignal.samples,
+                    self.parameters[
+                        "assistedMaximumOffsetSamples"
+                    ],
+                    self.parameters[
+                        "assistedReferenceSearchSamples"
+                    ],
+                    self.parameters[
+                        "assistedMinimumCorrelation"
+                    ],
+                )
+                coversCompleteReference = (
+                    self.signalOverlapResult.referenceStartSample == 0
+                    and self.signalOverlapResult.overlapLength
+                    == np.asarray(
+                        transmittedSignal.samples
+                    ).shape[0]
+                )
+                if coversCompleteReference:
+                    receivedStart = (
+                        self.signalOverlapResult.receivedStartSample
+                    )
+                    receivedStop = (
+                        receivedStart
+                        + self.signalOverlapResult.overlapLength
+                    )
+                    self.defaultMeasuredSignal = measuredArray[
+                        receivedStart:receivedStop
+                    ].copy()
+                else:
+                    self.defaultMeasuredSignal = measuredArray.copy()
+            else:
+                transmitArray = np.asarray(
+                    transmittedSignal, dtype=np.complex128
+                )
+                self.signalOverlapResult = SigProc.EstimateSignalOverlap(
+                    measuredArray,
+                    transmitArray,
+                    self.parameters[
+                        "assistedMaximumOffsetSamples"
+                    ],
+                    self.parameters[
+                        "assistedReferenceSearchSamples"
+                    ],
+                    self.parameters[
+                        "assistedMinimumCorrelation"
+                    ],
+                )
+                receivedStart = (
+                    self.signalOverlapResult.receivedStartSample
+                )
+                referenceStart = (
+                    self.signalOverlapResult.referenceStartSample
+                )
+                overlapStop = self.signalOverlapResult.overlapLength
+                self.defaultMeasuredSignal = measuredArray[
+                    receivedStart:receivedStart + overlapStop
+                ].copy()
+                selectedReference = transmitArray[
+                    referenceStart:referenceStart + overlapStop
+                ].copy()
+                selectedWaveform = None
+        else:
+            self.analysisMode = "blind"
+            self.parsedWifiFrame = ParseWifi(
+                parameters=parseParameters
+            ).Parse(
+                referenceSignal,
+            )
+            selectedReference = self.parsedWifiFrame.referenceSignal
+            selectedWaveform = self.parsedWifiFrame.waveform
+            self.defaultMeasuredSignal = (
+                self.parsedWifiFrame.receivedSignal.copy()
+            )
+        if selectedWaveform is not None and not isinstance(
+            selectedWaveform, WifiWaveform
+        ):
+            raise TypeError("waveform must be a WifiWaveform or None")
+        if isinstance(selectedReference, WifiWaveform):
+            selectedReference = selectedReference.samples
+        complexReference = np.asarray(
+            selectedReference, dtype=np.complex128
+        )
+        if complexReference.size == 0:
+            raise ValueError("referenceSignal cannot be empty")
+        if selectedWaveform is not None:
+            expectedShape = np.asarray(selectedWaveform.samples).shape
+            if complexReference.shape != expectedShape:
+                raise ValueError(
+                    "referenceSignal shape must match the Wi-Fi waveform"
+                )
+        if complexReference.ndim not in (1, 2):
+            raise ValueError("referenceSignal must be a vector or matrix")
+        if (
+            complexReference.ndim == 2
+            and selectedWaveform is not None
+            and complexReference.shape[1]
+            != selectedWaveform.numTransmitAntennas
+        ):
+            raise ValueError(
+                "referenceSignal must contain one column per transmit chain"
+            )
+        if not np.all(np.isfinite(complexReference)):
+            raise ValueError("referenceSignal contains NaN or infinite values")
+        self.referenceSignal = complexReference
+        self.waveform = selectedWaveform
+        self.sampleRateHz = 1.0
+        self.channelBandwidthHz: Optional[float] = None
+        self.frameProcessor: Optional[FrameProcess] = (
+            None
+            if selectedWaveform is None
+            else FrameProcess(selectedWaveform)
         )
         self.ValidateParameters()
         self.stageMetrics: Dict[str, SignalMetrics] = {}
@@ -386,18 +501,46 @@ class Analysis:
         self.powerEvmCurve: Optional[PowerEvmCurve] = None
 
     def GetParsedWifiFrame(self) -> Optional[ParsedWifiFrame]:
-        """Return receive-only parser output retained by the constructor.
+        """Return blind-mode parser output retained by the constructor.
 
         Processing details:
-            Algorithm: Preserve ``None`` for the original reference-aided path;
-            otherwise return the immutable parser result containing aligned
-            receive samples, recovered parameters, and parse diagnostics.
+            Algorithm: Return ``None`` for explicit-reference and
+            transmit-assisted modes because neither invokes ``ParseWifi``;
+            otherwise return the blind-mode immutable parser result.
 
         Returns:
-            result: Parsed frame or ``None`` when explicit metadata was used.
+            result: Parsed frame only when blind analysis was selected.
         """
 
         return self.parsedWifiFrame
+
+    def GetAnalysisMode(self) -> str:
+        """Return the constructor path selected for this analysis instance.
+
+        Processing details:
+            Algorithm: Expose the immutable mode label assigned before any
+            parser, overlap estimator, or metric calculation was executed.
+
+        Returns:
+            result: ``explicitReference``, ``transmitAssisted``, or ``blind``.
+        """
+
+        return self.analysisMode
+
+    def GetSignalOverlapResult(
+        self,
+    ) -> Optional[SignalOverlapResult]:
+        """Return transmit-assisted overlap coordinates.
+
+        Processing details:
+            Algorithm: Preserve ``None`` outside transmit-assisted mode and
+            otherwise return the immutable NumPy or ``WifiWaveform`` result.
+
+        Returns:
+            result: Overlap starts, common length, and confidence, or ``None``.
+        """
+
+        return self.signalOverlapResult
 
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened snapshot of all resolved analysis parameters.
@@ -480,6 +623,83 @@ class Analysis:
             raise TypeError(
                 "signalProcessingParameters must be a mapping or None"
             )
+        resolvedSampleRate = (
+            self.waveform.sampleRateHz
+            if self.waveform is not None
+            else (
+                1.0
+                if self.parameters["sampleRateHz"] is None
+                else self.parameters["sampleRateHz"]
+            )
+        )
+        if (
+            not isinstance(resolvedSampleRate, (int, float))
+            or isinstance(resolvedSampleRate, bool)
+            or not np.isfinite(resolvedSampleRate)
+            or resolvedSampleRate <= 0.0
+        ):
+            raise ValueError(
+                "sampleRateHz must be finite and positive when supplied"
+            )
+        resolvedBandwidth = (
+            self.waveform.bandwidthHz
+            if self.waveform is not None
+            else self.parameters["channelBandwidthHz"]
+        )
+        if (
+            resolvedBandwidth is not None
+            and (
+                not isinstance(resolvedBandwidth, (int, float))
+                or isinstance(resolvedBandwidth, bool)
+                or not np.isfinite(resolvedBandwidth)
+                or resolvedBandwidth <= 0.0
+            )
+        ):
+            raise ValueError(
+                "channelBandwidthHz must be finite and positive when supplied"
+            )
+        if (
+            resolvedBandwidth is not None
+            and float(resolvedSampleRate)
+            < 2.0 * float(resolvedBandwidth)
+        ):
+            raise ValueError(
+                "sampleRateHz must be at least twice channelBandwidthHz"
+            )
+        maximumOffsetSamples = self.parameters[
+            "assistedMaximumOffsetSamples"
+        ]
+        if (
+            not isinstance(maximumOffsetSamples, int)
+            or isinstance(maximumOffsetSamples, bool)
+            or maximumOffsetSamples < 0
+        ):
+            raise ValueError(
+                "assistedMaximumOffsetSamples must be a nonnegative integer"
+            )
+        referenceSearchSamples = self.parameters[
+            "assistedReferenceSearchSamples"
+        ]
+        if (
+            not isinstance(referenceSearchSamples, int)
+            or isinstance(referenceSearchSamples, bool)
+            or referenceSearchSamples < 16
+        ):
+            raise ValueError(
+                "assistedReferenceSearchSamples must be at least 16"
+            )
+        minimumCorrelation = self.parameters[
+            "assistedMinimumCorrelation"
+        ]
+        if (
+            not isinstance(minimumCorrelation, (int, float))
+            or isinstance(minimumCorrelation, bool)
+            or not np.isfinite(minimumCorrelation)
+            or not 0.0 <= minimumCorrelation <= 1.0
+        ):
+            raise ValueError(
+                "assistedMinimumCorrelation must be between zero and one"
+            )
         PowerCalibration(
             loadResistanceOhm=self.parameters["loadResistanceOhm"],
             maximumOutputPowerDbm=self.parameters[
@@ -496,9 +716,15 @@ class Analysis:
         for chainIndex in range(referenceMatrix.shape[1]):
             SigProc(
                 referenceMatrix[:, chainIndex],
-                self.waveform.sampleRateHz,
+                float(resolvedSampleRate),
                 parameters=signalProcessingParameters,
             )
+        self.sampleRateHz = float(resolvedSampleRate)
+        self.channelBandwidthHz = (
+            None
+            if resolvedBandwidth is None
+            else float(resolvedBandwidth)
+        )
 
     def PrepareMeasuredSignal(self, measuredSignal: np.ndarray) -> np.ndarray:
         """Synchronize and compensate one signal before metric processing.
@@ -543,13 +769,17 @@ class Analysis:
             np.isfinite(measuredMatrix)
         ):
             raise ValueError("measuredSignal must contain finite samples")
-        dataSlice = self.waveform.fieldSlices[self.waveform.dataFieldName]
+        dataSlice = (
+            slice(0, referenceMatrix.shape[0])
+            if self.waveform is None
+            else self.waveform.fieldSlices[self.waveform.dataFieldName]
+        )
         processingResults = []
         processedColumns = []
         for chainIndex in range(referenceMatrix.shape[1]):
             signalProcessor = SigProc(
                 referenceMatrix[:, chainIndex],
-                self.waveform.sampleRateHz,
+                self.sampleRateHz,
                 parameters=signalProcessingParameters,
             )
             processingResult = signalProcessor.Process(
@@ -649,7 +879,24 @@ class Analysis:
             result: Valid complex128 vector or samples-by-chains matrix.
         """
 
-        return self.frameProcessor.ValidatePreparedSignal(preparedSignal)
+        if self.frameProcessor is not None:
+            return self.frameProcessor.ValidatePreparedSignal(
+                preparedSignal
+            )
+        complexPrepared = np.asarray(
+            preparedSignal, dtype=np.complex128
+        )
+        if complexPrepared.shape != self.referenceSignal.shape:
+            raise ValueError(
+                "preparedSignal shape must match the assisted reference"
+            )
+        if complexPrepared.size == 0 or not np.all(
+            np.isfinite(complexPrepared)
+        ):
+            raise ValueError(
+                "preparedSignal must contain finite samples"
+            )
+        return complexPrepared
 
     def CalculateSnr(self, measuredSignal: np.ndarray) -> float:
         """Calculate data-field SNR after removing one complex gain and phase.
@@ -683,14 +930,13 @@ class Analysis:
         """
 
         complexMeasured = self.ValidatePreparedSignal(preparedSignal)
-        dataSlice = self.waveform.fieldSlices[self.waveform.dataFieldName]
+        dataSlice = (
+            slice(0, self.referenceSignal.shape[0])
+            if self.waveform is None
+            else self.waveform.fieldSlices[self.waveform.dataFieldName]
+        )
         referenceData = self.referenceSignal[dataSlice]
         measuredData = complexMeasured[dataSlice]
-        measuredMatrix = (
-            measuredData.reshape(-1, 1)
-            if measuredData.ndim == 1
-            else measuredData
-        )
         errorSignal = measuredData - referenceData
         signalPower = np.mean(np.abs(referenceData) ** 2)
         errorPower = np.mean(np.abs(errorSignal) ** 2)
@@ -735,6 +981,11 @@ class Analysis:
         """
 
         complexMeasured = self.ValidatePreparedSignal(preparedSignal)
+        if self.frameProcessor is None:
+            raise ValueError(
+                "Wi-Fi demodulation requires WifiWaveform metadata; "
+                "NumPy transmit-assisted mode provides waveform-domain EVM"
+            )
         return self.frameProcessor.DemodulatePreparedWifiData(
             complexMeasured
         )
@@ -792,6 +1043,21 @@ class Analysis:
             result: Dimensionless EVM-aligned normalized MSE.
         """
 
+        if self.frameProcessor is None:
+            complexMeasured = self.ValidatePreparedSignal(preparedSignal)
+            waveformError = (
+                complexMeasured.reshape(-1)
+                - self.referenceSignal.reshape(-1)
+            )
+            return float(
+                np.sum(np.abs(waveformError) ** 2)
+                / max(
+                    np.sum(
+                        np.abs(self.referenceSignal.reshape(-1)) ** 2
+                    ),
+                    np.finfo(float).tiny,
+                )
+            )
         measuredSymbols = self.DemodulatePreparedWifiData(preparedSignal)
         referenceSymbols = self.DemodulatePreparedWifiData(
             self.referenceSignal
@@ -857,7 +1123,11 @@ class Analysis:
             if complexMeasured.ndim == 1
             else complexMeasured
         )
-        dataSlice = self.waveform.fieldSlices[self.waveform.dataFieldName]
+        dataSlice = (
+            slice(0, referenceMatrix.shape[0])
+            if self.waveform is None
+            else self.waveform.fieldSlices[self.waveform.dataFieldName]
+        )
         snrValues = []
         for chainIndex in range(referenceMatrix.shape[1]):
             referenceData = referenceMatrix[dataSlice, chainIndex]
@@ -892,6 +1162,42 @@ class Analysis:
             result: Tuple of stream EVM-dB tuple and EVM-percent tuple.
         """
 
+        if self.frameProcessor is None:
+            complexMeasured = self.ValidatePreparedSignal(preparedSignal)
+            referenceMatrix = (
+                self.referenceSignal.reshape(-1, 1)
+                if self.referenceSignal.ndim == 1
+                else self.referenceSignal
+            )
+            measuredMatrix = (
+                complexMeasured.reshape(-1, 1)
+                if complexMeasured.ndim == 1
+                else complexMeasured
+            )
+            evmDbValues = []
+            evmPercentValues = []
+            for chainIndex in range(referenceMatrix.shape[1]):
+                referenceStream = referenceMatrix[:, chainIndex]
+                errorStream = (
+                    measuredMatrix[:, chainIndex] - referenceStream
+                )
+                evmRatio = np.sqrt(
+                    np.sum(np.abs(errorStream) ** 2)
+                    / max(
+                        np.sum(np.abs(referenceStream) ** 2),
+                        np.finfo(float).tiny,
+                    )
+                )
+                evmDbValues.append(
+                    float(
+                        20.0
+                        * np.log10(
+                            max(evmRatio, np.finfo(float).tiny)
+                        )
+                    )
+                )
+                evmPercentValues.append(float(100.0 * evmRatio))
+            return tuple(evmDbValues), tuple(evmPercentValues)
         measuredSymbols = self.DemodulatePreparedWifiData(preparedSignal)
         referenceSymbols = self.DemodulatePreparedWifiData(
             self.referenceSignal
@@ -937,7 +1243,11 @@ class Analysis:
             result: Lower, upper, and worst-case ACLR values in decibels.
         """
 
-        halfBandwidth = self.waveform.bandwidthHz / 2.0
+        if self.channelBandwidthHz is None:
+            raise ValueError(
+                "channelBandwidthHz is required for ACLR analysis"
+            )
+        halfBandwidth = self.channelBandwidthHz / 2.0
         mainMask = np.abs(frequencyBins) < halfBandwidth
         lowerMask = (frequencyBins >= -3.0 * halfBandwidth) & (
             frequencyBins < -halfBandwidth
@@ -998,15 +1308,21 @@ class Analysis:
 
         self.ValidateParameters()
         complexMeasured = self.ValidatePreparedSignal(preparedSignal)
-        dataSlice = self.waveform.fieldSlices[self.waveform.dataFieldName]
+        if self.channelBandwidthHz is None:
+            return float("nan"), float("nan"), float("nan")
+        dataSlice = (
+            slice(0, complexMeasured.shape[0])
+            if self.waveform is None
+            else self.waveform.fieldSlices[self.waveform.dataFieldName]
+        )
         measuredData = complexMeasured[dataSlice]
         measuredMatrix = (
             measuredData.reshape(-1, 1)
             if measuredData.ndim == 1
             else measuredData
         )
-        sampleRateHz = self.waveform.sampleRateHz
-        channelBandwidthHz = self.waveform.bandwidthHz
+        sampleRateHz = self.sampleRateHz
+        channelBandwidthHz = self.channelBandwidthHz
         minimumAclrOversampling = float(
             self.parameters["minimumAclrOversampling"]
         )
@@ -1055,26 +1371,36 @@ class Analysis:
             if complexMeasured.ndim == 1
             else complexMeasured
         )
+        if self.channelBandwidthHz is None:
+            missingValues = tuple(
+                float("nan")
+                for _ in range(measuredMatrix.shape[1])
+            )
+            return missingValues, missingValues, missingValues
         minimumAclrOversampling = float(
             self.parameters["minimumAclrOversampling"]
         )
         if (
-            self.waveform.sampleRateHz
-            < minimumAclrOversampling * self.waveform.bandwidthHz
+            self.sampleRateHz
+            < minimumAclrOversampling * self.channelBandwidthHz
         ):
             raise ValueError(
                 "sampleRateHz must be at least "
                 f"{minimumAclrOversampling:g} times bandwidthHz "
                 "for ACLR analysis"
             )
-        dataSlice = self.waveform.fieldSlices[self.waveform.dataFieldName]
+        dataSlice = (
+            slice(0, measuredMatrix.shape[0])
+            if self.waveform is None
+            else self.waveform.fieldSlices[self.waveform.dataFieldName]
+        )
         lowerValues = []
         upperValues = []
         worstValues = []
         for chainIndex in range(measuredMatrix.shape[1]):
             frequencyBins, powerSpectrum = AveragePeriodogram(
                 measuredMatrix[dataSlice, chainIndex],
-                self.waveform.sampleRateHz,
+                self.sampleRateHz,
                 int(self.parameters["maxSegmentLength"]),
             )
             lowerAclrDb, upperAclrDb, worstAclrDb = self.IntegrateAclr(
@@ -1088,18 +1414,17 @@ class Analysis:
     def Analyze(
         self, measuredSignal: Optional[np.ndarray] = None
     ) -> SignalMetrics:
-        """Calculate SNR, EVM, and ACLR for one received Wi-Fi waveform.
+        """Calculate SNR, EVM, and ACLR for one measured waveform.
 
         Processing details:
-            Algorithm: Use the explicit measured waveform in the original
-            reference-aided path, or the parsed and packet-aligned receive frame
-            when this instance was constructed without ``WifiWaveform``.
+            Algorithm: Use the explicit measured waveform in reference mode,
+            or the stored overlap-aligned waveform in assisted or blind mode.
             Synchronize once and feed the same corrected samples to every
-            metric so all results remain comparable.
+            available metric so all results remain comparable.
 
         Args:
             measuredSignal: Optional measured samples evaluated against the
-                stored reference. Omit only for a receive-only parsed instance.
+                stored reference. Omit in assisted and blind modes.
 
         Returns:
             result: Ordinary dictionary containing SNR, EVM, and ACLR values.
@@ -1110,7 +1435,7 @@ class Analysis:
             if self.defaultMeasuredSignal is None:
                 raise ValueError(
                     "measuredSignal is required when Analysis was constructed "
-                    "with an explicit reference and waveform"
+                    "in explicit-reference mode"
                 )
             selectedSignal = self.defaultMeasuredSignal
 
@@ -1124,7 +1449,12 @@ class Analysis:
             aclrUpperDb,
             aclrWorstDb,
         ) = self.CalculatePreparedAclr(complexMeasured)
-        if self.waveform.numTransmitAntennas > 1:
+        transmitChainCount = (
+            1
+            if self.referenceSignal.ndim == 1
+            else self.referenceSignal.shape[1]
+        )
+        if transmitChainCount > 1:
             perChainSnrDb = self.CalculatePreparedSnrPerChain(complexMeasured)
             (
                 perStreamEvmDb,
@@ -1209,6 +1539,10 @@ class Analysis:
                 scales, target RMS voltages, and per-method EVM arrays.
         """
 
+        if self.waveform is None:
+            raise ValueError(
+                "AnalyzePowerEvmCurve requires WifiWaveform metadata"
+            )
         powerDbmArray = np.asarray(
             outputPowerDbmValues, dtype=float
         ).reshape(-1)
@@ -1762,9 +2096,14 @@ class Analysis:
         selectedHistories = tuple(
             tuple(chainHistory) for chainHistory in chainHistories
         )
+        expectedChainCount = (
+            1
+            if self.referenceSignal.ndim == 1
+            else self.referenceSignal.shape[1]
+        )
         if (
             len(selectedHistories)
-            != self.waveform.numTransmitAntennas
+            != expectedChainCount
         ):
             raise ValueError(
                 "chainHistories must contain one history per transmit antenna"

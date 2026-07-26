@@ -37,12 +37,14 @@ if __package__ and "." in __package__:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
+    from ..utils.SigProc import SigProc
     from ..utils.WifiMetadata import WifiWaveform
 else:
     from utils.ConfigUtils import (
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
+    from utils.SigProc import SigProc
     from utils.WifiMetadata import WifiWaveform
 
 
@@ -1748,137 +1750,18 @@ class ParseWifi:
                 length, and normalized multi-chain correlation confidence.
         """
 
-        referenceSignal = self.ValidateReceivedSignal(transmittedSignal)
-        validatedReceived = self.ValidateReceivedSignal(receivedSignal)
-        receivedMatrix = (
-            validatedReceived.reshape(-1, 1)
-            if validatedReceived.ndim == 1
-            else validatedReceived
-        )
-        referenceMatrix = (
-            referenceSignal.reshape(-1, 1)
-            if referenceSignal.ndim == 1
-            else referenceSignal
-        )
-        if receivedMatrix.shape[1] != referenceMatrix.shape[1]:
-            raise ValueError(
-                "receivedSignal and transmittedSignal must have the same "
-                "number of physical chains"
-            )
-
-        referencePower = np.sum(
-            np.abs(referenceMatrix) ** 2,
-            axis=1,
-        )
-        peakReferencePower = float(np.max(referencePower))
-        if peakReferencePower <= np.finfo(float).tiny:
-            raise ValueError(
-                "transmittedSignal must contain nonzero finite samples"
-            )
-        activeReferenceIndices = np.flatnonzero(
-            referencePower
-            > peakReferencePower * np.finfo(float).eps
-        )
-        activeReferenceStart = int(activeReferenceIndices[0])
-        activeReferenceStop = int(activeReferenceIndices[-1]) + 1
-        activeReference = referenceMatrix[
-            activeReferenceStart:activeReferenceStop
-        ]
-
-        receiveLength = int(receivedMatrix.shape[0])
-        referenceLength = int(activeReference.shape[0])
-        shorterLength = min(receiveLength, referenceLength)
-        minimumOverlap = min(
-            shorterLength,
-            max(16, min(64, shorterLength // 4)),
-        )
-        minimumLag = -(referenceLength - minimumOverlap)
-        maximumLag = min(
+        overlapResult = SigProc.EstimateSignalOverlap(
+            receivedSignal,
+            transmittedSignal,
             int(self.parameters["maximumPacketOffsetSamples"]),
-            receiveLength - minimumOverlap,
+            int(self.parameters["referenceSearchSamples"]),
+            float(self.parameters["minimumParseConfidence"]),
         )
-        maximumProbeLength = int(
-            self.parameters["referenceSearchSamples"]
-        )
-        numericFloor = np.finfo(float).tiny
-        bestScore = float("-inf")
-        bestReceiveStart = 0
-        bestTransmitStart = activeReferenceStart
-        bestOverlapLength = 0
-        bestTieBreak = (float("-inf"), -1, 0)
-        for candidateLag in range(minimumLag, maximumLag + 1):
-            activeTransmitStart = max(0, -candidateLag)
-            receiveStart = max(0, candidateLag)
-            overlapLength = min(
-                referenceLength - activeTransmitStart,
-                receiveLength - receiveStart,
-            )
-            if overlapLength < minimumOverlap:
-                continue
-            probeLength = min(overlapLength, maximumProbeLength)
-            chainPowers = []
-            for chainIndex in range(referenceMatrix.shape[1]):
-                referenceProbe = activeReference[
-                    activeTransmitStart:
-                    activeTransmitStart + probeLength,
-                    chainIndex,
-                ]
-                receiveProbe = receivedMatrix[
-                    receiveStart:receiveStart + probeLength,
-                    chainIndex,
-                ]
-                referenceEnergy = float(
-                    np.vdot(referenceProbe, referenceProbe).real
-                )
-                receiveEnergy = float(
-                    np.vdot(receiveProbe, receiveProbe).real
-                )
-                correlationPower = float(
-                    np.abs(
-                        np.vdot(referenceProbe, receiveProbe)
-                    )
-                    ** 2
-                )
-                chainPowers.append(
-                    correlationPower
-                    / max(
-                        referenceEnergy * receiveEnergy,
-                        numericFloor,
-                    )
-                )
-            candidateScore = float(np.mean(chainPowers))
-            candidateTieBreak = (
-                candidateScore,
-                overlapLength,
-                -receiveStart,
-            )
-            if candidateTieBreak > bestTieBreak:
-                bestTieBreak = candidateTieBreak
-                bestScore = candidateScore
-                bestReceiveStart = receiveStart
-                bestTransmitStart = (
-                    activeReferenceStart + activeTransmitStart
-                )
-                bestOverlapLength = overlapLength
-
-        if not np.isfinite(bestScore):
-            raise ValueError(
-                "transmittedSignal and receivedSignal do not have a "
-                "nonempty searchable overlap"
-            )
-        bestConfidence = float(np.sqrt(max(bestScore, 0.0)))
-        if bestConfidence < float(
-            self.parameters["minimumParseConfidence"]
-        ):
-            raise ValueError(
-                "transmit/receive waveform correlation is below "
-                "minimumParseConfidence"
-            )
         return (
-            bestReceiveStart,
-            bestTransmitStart,
-            bestOverlapLength,
-            bestConfidence,
+            overlapResult.receivedStartSample,
+            overlapResult.referenceStartSample,
+            overlapResult.overlapLength,
+            overlapResult.confidence,
         )
 
     def BuildDetectedParameters(

@@ -217,9 +217,10 @@ flowchart LR
 | `PowerCalibration.DbmToRms`, `PowerCalibration.RmsToDbm` | P/N | 按 $P=V_{\mathrm{RMS}}^2/R$ 在绝对 dBm 功率与复包络 RMS 电压之间双向换算 | SigProc §13 |
 | `PowerCalibration.OutputPowerToDriveScale` | P | 按目标输出相对额定极限的输出回退量计算归一化PA驱动比例 | SigProc §13 |
 | `PowerCalibration.ScaleSignalToOutputPower`, `PowerCalibration.ScaleSignalToOutputPowers` | P/E | 以不改变EVM和ACLR比值的逐链常数增益，把PA输出标定到目标dBm | SigProc §13 |
-| `SignalProcessingResult.ToDict` | E | 只序列化估计标量，不重新计算同步 | SigProc §9 |
+| `SignalProcessingResult.ToDict`, `SignalOverlapResult.ToDict` | E | 只序列化估计标量或重叠坐标，不重新计算同步与相关 | SigProc §9 |
 | `SigProc.__init__`, `SigProc.ValidateSignal`, `SigProc.GetParameters`, `SigProc.UpdateParameters`, `SigProc.ValidateParameters` | E | 保存参考、解析ChainMap、警告并忽略未知键、检查已识别配置的单位和有限性 | SigProc §9–§10 |
 | `SigProc.ResolveMaximumIntegerDelay` | N/E | 把自动/外部时延边界转换为有限相关搜索半径 | SigProc §3、§12 |
+| `SigProc.EstimateSignalOverlap` | P/N | 对可能裁剪、补零或不等长的发送与接收波形搜索有符号时延，以逐链能量归一化互相关确定公共区间 | SigProc §3.3 |
 | `SigProc.EstimateIntegerDelay` | P/N | FFT 互相关并按重叠能量归一化，最大相关峰给出整数时延 | SigProc §3 |
 | `SigProc.ExtractIntegerAligned` | N | 按估计时延提取重叠样点并对缺失位置补零 | SigProc §3 |
 | `SigProc.EstimateCarrierFrequencyOffset` | P/N | 分块复增益相位随时间的斜率估计 CFO | SigProc §4.1 |
@@ -251,8 +252,8 @@ flowchart LR
 | `Analysis.Analyze`, `Analysis.GetLastMimoMetrics` | E | 直接返回普通指标字典，调用方使用固定键读取SNR、EVM、ACLR和MIMO明细 | Analysis §10 |
 | `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把曲线或逐轮记录转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann 窗、50% 重叠的 Welch PSD 平均 | Analysis §6.2 |
-| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 保留显式参考路径；省略 `waveform` 时调用ParseWifi恢复参考和元数据；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§2、§11、ParseWifi §8 |
-| `Analysis.GetParsedWifiFrame` | E | 返回仅接收帧构造路径保存的解析结果；显式参考路径返回 `None` | Analysis §1、ParseWifi §8 |
+| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考；发送辅助直接相关并截取公共区间；仅盲模式调用ParseWifi；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§2、§11、ParseWifi §8 |
+| `Analysis.GetParsedWifiFrame`, `Analysis.GetAnalysisMode`, `Analysis.GetSignalOverlapResult` | E | 返回盲模式解析结果、三态路径名或发送辅助重叠坐标；未产生对应结果时返回 `None` | Analysis §1、ParseWifi §8、SigProc §3.3 |
 | `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc` | Analysis §2、§9 |
 | `Analysis.GetLastSignalProcessingResult`, `Analysis.GetLastSignalProcessingResults`, `Analysis.GetLastMimoMetrics`, `Analysis.GetStageSignalProcessingResults`, `Analysis.GetStageMimoMetrics` | E | 返回缓存的不可变结果，不重新估计 | Analysis §9–§10 |
 | `Analysis.ValidatePreparedSignal` | E | 确保 prepared 数据与参考网格形状和有限性一致 | Analysis §2 |
