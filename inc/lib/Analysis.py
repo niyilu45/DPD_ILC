@@ -134,6 +134,12 @@ class ILCPerformanceIteration:
     complexGainMagnitudeDb: float
     complexGainPhaseDegrees: float
     inputPeak: float
+    feedbackIntegerDelaySamples: float
+    feedbackFractionalDelaySamples: float
+    feedbackCarrierFrequencyOffsetHz: float
+    feedbackSamplingFrequencyOffsetPpm: float
+    feedbackComplexGainMagnitudeDb: float
+    feedbackComplexGainPhaseDegrees: float
     snrDb: float
     evmAlignedMse: float
     evmDb: float
@@ -1649,6 +1655,62 @@ class Analysis:
                         iterationRecord.complexGainPhaseDegrees
                     ),
                     inputPeak=float(iterationRecord.inputPeak),
+                    feedbackIntegerDelaySamples=float(
+                        getattr(
+                            iterationRecord,
+                            "integerDelaySamples",
+                            0,
+                        )
+                    ),
+                    feedbackFractionalDelaySamples=float(
+                        getattr(
+                            iterationRecord,
+                            "fractionalDelaySamples",
+                            0.0,
+                        )
+                    ),
+                    feedbackCarrierFrequencyOffsetHz=float(
+                        getattr(
+                            iterationRecord,
+                            "carrierFrequencyOffsetHz",
+                            0.0,
+                        )
+                    ),
+                    feedbackSamplingFrequencyOffsetPpm=float(
+                        getattr(
+                            iterationRecord,
+                            "samplingFrequencyOffsetPpm",
+                            0.0,
+                        )
+                    ),
+                    feedbackComplexGainMagnitudeDb=float(
+                        20.0
+                        * np.log10(
+                            max(
+                                float(
+                                    np.abs(
+                                        getattr(
+                                            iterationRecord,
+                                            "feedbackComplexGain",
+                                            1.0 + 0.0j,
+                                        )
+                                    )
+                                ),
+                                np.finfo(float).tiny,
+                            )
+                        )
+                    ),
+                    feedbackComplexGainPhaseDegrees=float(
+                        np.degrees(
+                            np.angle(
+                                getattr(
+                                    iterationRecord,
+                                    "feedbackComplexGain",
+                                    1.0 + 0.0j,
+                                )
+                            )
+                        )
+                    ),
                     snrDb=signalMetrics["snrDb"],
                     evmAlignedMse=evmAlignedMse,
                     evmDb=signalMetrics["evmDb"],
@@ -1804,6 +1866,20 @@ class Analysis:
                 dtype=np.complex128,
             )
             averageGain = np.mean(gainPhasors)
+            feedbackGainPhasors = np.asarray(
+                [
+                    complex(
+                        getattr(
+                            chainRecord,
+                            "feedbackComplexGain",
+                            1.0 + 0.0j,
+                        )
+                    )
+                    for chainRecord in chainRecords
+                ],
+                dtype=np.complex128,
+            )
+            averageFeedbackGain = np.mean(feedbackGainPhasors)
             evmAlignedMse = float(
                 (signalMetrics["evmPercent"] / 100.0) ** 2
             )
@@ -1843,6 +1919,74 @@ class Analysis:
                             float(chainRecord.inputPeak)
                             for chainRecord in chainRecords
                         )
+                    ),
+                    feedbackIntegerDelaySamples=float(
+                        np.mean(
+                            [
+                                float(
+                                    getattr(
+                                        chainRecord,
+                                        "integerDelaySamples",
+                                        0,
+                                    )
+                                )
+                                for chainRecord in chainRecords
+                            ]
+                        )
+                    ),
+                    feedbackFractionalDelaySamples=float(
+                        np.mean(
+                            [
+                                float(
+                                    getattr(
+                                        chainRecord,
+                                        "fractionalDelaySamples",
+                                        0.0,
+                                    )
+                                )
+                                for chainRecord in chainRecords
+                            ]
+                        )
+                    ),
+                    feedbackCarrierFrequencyOffsetHz=float(
+                        np.mean(
+                            [
+                                float(
+                                    getattr(
+                                        chainRecord,
+                                        "carrierFrequencyOffsetHz",
+                                        0.0,
+                                    )
+                                )
+                                for chainRecord in chainRecords
+                            ]
+                        )
+                    ),
+                    feedbackSamplingFrequencyOffsetPpm=float(
+                        np.mean(
+                            [
+                                float(
+                                    getattr(
+                                        chainRecord,
+                                        "samplingFrequencyOffsetPpm",
+                                        0.0,
+                                    )
+                                )
+                                for chainRecord in chainRecords
+                            ]
+                        )
+                    ),
+                    feedbackComplexGainMagnitudeDb=float(
+                        20.0
+                        * np.log10(
+                            max(
+                                float(np.abs(averageFeedbackGain)),
+                                numericFloor,
+                            )
+                        )
+                    ),
+                    feedbackComplexGainPhaseDegrees=float(
+                        np.degrees(np.angle(averageFeedbackGain))
                     ),
                     snrDb=signalMetrics["snrDb"],
                     evmAlignedMse=evmAlignedMse,
@@ -1910,6 +2054,12 @@ class Analysis:
             "aclrWorstDb",
             "complexGainMagnitudeDb",
             "complexGainPhaseDegrees",
+            "feedbackIntegerDelaySamples",
+            "feedbackFractionalDelaySamples",
+            "feedbackCarrierFrequencyOffsetHz",
+            "feedbackSamplingFrequencyOffsetPpm",
+            "feedbackComplexGainMagnitudeDb",
+            "feedbackComplexGainPhaseDegrees",
             "inputPeak",
         ]
         with convergencePath.open(
@@ -1942,6 +2092,24 @@ class Analysis:
                         ),
                         "complexGainPhaseDegrees": (
                             iterationRecord.complexGainPhaseDegrees
+                        ),
+                        "feedbackIntegerDelaySamples": (
+                            iterationRecord.feedbackIntegerDelaySamples
+                        ),
+                        "feedbackFractionalDelaySamples": (
+                            iterationRecord.feedbackFractionalDelaySamples
+                        ),
+                        "feedbackCarrierFrequencyOffsetHz": (
+                            iterationRecord.feedbackCarrierFrequencyOffsetHz
+                        ),
+                        "feedbackSamplingFrequencyOffsetPpm": (
+                            iterationRecord.feedbackSamplingFrequencyOffsetPpm
+                        ),
+                        "feedbackComplexGainMagnitudeDb": (
+                            iterationRecord.feedbackComplexGainMagnitudeDb
+                        ),
+                        "feedbackComplexGainPhaseDegrees": (
+                            iterationRecord.feedbackComplexGainPhaseDegrees
                         ),
                         "inputPeak": iterationRecord.inputPeak,
                     }
@@ -1977,6 +2145,7 @@ class Analysis:
             f"{'Iter':>4} {'Raw MSE':>12} {'Raw NMSE':>10} "
             f"{'LC-MSE':>12} {'LC-NMSE':>10} {'EVM-MSE':>12} "
             f"{'EVM(dB)':>9} {'SNR(dB)':>9} {'ACLR(dB)':>10} "
+            f"{'Delay':>9} {'CFO(Hz)':>10} "
             f"{'Gain(dB)':>9} {'Phase(deg)':>11} "
             f"{'Peak':>9}"
         )
@@ -1993,7 +2162,9 @@ class Analysis:
                 f"{iterationRecord.evmDb:>9.2f} "
                 f"{iterationRecord.snrDb:>9.2f} "
                 f"{iterationRecord.aclrWorstDb:>10.2f} "
-                f"{iterationRecord.complexGainMagnitudeDb:>9.2f} "
-                f"{iterationRecord.complexGainPhaseDegrees:>11.2f} "
+                f"{iterationRecord.feedbackIntegerDelaySamples:>9.2f} "
+                f"{iterationRecord.feedbackCarrierFrequencyOffsetHz:>10.1f} "
+                f"{iterationRecord.feedbackComplexGainMagnitudeDb:>9.2f} "
+                f"{iterationRecord.feedbackComplexGainPhaseDegrees:>11.2f} "
                 f"{iterationRecord.inputPeak:>9.4f}"
             )

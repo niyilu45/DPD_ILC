@@ -151,12 +151,12 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `ILCConfig.Validate` | E | 只校验学习率、正则化、峰值、平均次数和投影带宽；不保存EVM、SNR或ACLR计算器 | DPD-ILC §3.3、§3.11–§3.12 |
-| `DpdIlc.CalculateIterationMetrics` | N/P | 只计算 Raw MSE、复增益正交残差和输入峰值，并保存该轮输入/PA输出；不计算任何RF性能指标 | DpdIlc §7、Analysis §5.5 |
+| `ILCConfig.Validate` | E | 校验学习率、正则化、峰值、平均次数、投影带宽和可选反馈同步映射；不保存EVM、SNR或ACLR计算器 | DpdIlc §6、DPD-ILC §3.3、§3.11–§3.12 |
+| `DpdIlc.CalculateIterationMetrics` | N/P | 计算参考域 Raw MSE、复增益正交残差和输入峰值，并保存该轮输入、同步归一化输出及反馈同步估计；不计算任何RF性能指标 | DpdIlc §6–§7、Analysis §5.5 |
 | `DpdIlc.NextPowerOfTwo` | N | 选择零填充 FFT 长度；提高采样密度/效率但不创造物理分辨率 | DPD-ILC §3.14 |
 | `DpdIlc.LimitAmplitude` | N/P | 把复样点投影到峰值圆盘，模拟 DAC/PA 输入约束 | DPD-ILC §3.11、§3.14 |
-| `DpdIlc.MeasurePaOutput` | P/N | 重复 PA 反馈、添加 AWGN 并平均，噪声方差降为 $1/R$ | DPD-ILC §3.12、§3.14 |
-| `DpdIlc.RunFrequencyDomainIlc` | P/N | 小信号频响探测、正则化逆、带宽投影、峰值投影和原生LC-NMSE候选保留 | DPD-ILC §3.4、§3.14 |
+| `DpdIlc.MeasurePaOutput` | P/N | 重复 PA 反馈、添加 AWGN 并平均，噪声方差降为 $1/R$；允许反馈长度不同于输入但同一轮各次捕获必须等长 | DpdIlc §4、DPD-ILC §3.12、§3.14 |
+| `DpdIlc.RunFrequencyDomainIlc` | P/N | 每轮先进行时延、CFO、SFO和公共复增益对齐，再在参考域执行小信号频响逆、带宽投影、峰值投影和LC-NMSE候选保留 | DpdIlc §6–§7、DPD-ILC §3.4、§3.14 |
 | `DpdIlc.BuildFeatureSpecs` | N | 枚举 GMP 主/滞后/超前包络基函数 | DPD-ILC §3.7、§3.14 |
 | `DpdIlc.DelayedSlice`, `DpdIlc.GetDelayed` | N | 因果零填充延迟和块内缓存；保持基函数时序一致 | DPD-ILC §3.14 |
 | `DpdIlc.BuildGmpBasisChunk` | N/P | 在有限块内计算 GMP 基矩阵 | DPD-ILC §3.7、§3.14 |
@@ -167,13 +167,13 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `DpdIlc.MeasureOutput` | P/N | 重复带噪反馈平均 | DPD-ILC §3.12、§3.14 |
+| `DpdIlc.MeasureOutput` | P/N | 复用支持变长采集的重复带噪反馈平均 | DpdIlc §4、DPD-ILC §3.12、§3.14 |
 | `DpdIlc.SelectionError` | N | 去除公共复增益后的归一化正交残差；是无帧元数据时的 EVM 代理 | Analysis §5.6–§5.7 |
-| `DpdIlc.RunWaveformUpdate` | E/N | 统一执行“测量→三级 MSE→最佳轮保留→更新→峰值投影” | Analysis §5.9、DPD-ILC §3 |
-| `DpdIlc.EstimateComplexGain` | P/N | 低功率探测下的最小二乘复增益 | Analysis §3、DPD-ILC §3.14 |
+| `DpdIlc.RunWaveformUpdate` | E/N | 统一执行“测量→时延/CFO/SFO/复增益对齐→参考域误差与MSE→最佳轮保留→更新→峰值投影” | DpdIlc §6–§7、Analysis §5.9、DPD-ILC §3 |
+| `DpdIlc.EstimateComplexGain` | P/N | 低功率探测反馈先同步，再恢复PA输出域并估计最小二乘复增益 | DpdIlc §6、Analysis §3、DPD-ILC §3.14 |
 | `DpdIlc.RunScalarPIlc` 及其 `DpdIlc.BuildUpdate` | P/N | $\Delta u=\mu e$ | DPD-ILC §3.1 |
-| `DpdIlc.RunComplexGainIlc` 及其 `DpdIlc.BuildUpdate` | P/N | $\Delta u=\mu h^*e/(|h|^2+\lambda)$ | DPD-ILC §3.2 |
-| `DpdIlc.NextPowerOfTwo`, `DpdIlc.EstimateFrequencyResponse` | N/P | FFT 长度及低功率逐频点/标量增益置信度融合 | DPD-ILC §3.3、§3.14 |
+| `DpdIlc.RunComplexGainIlc` 及其 `DpdIlc.BuildUpdate` | P/N | 公共复增益先由统一反馈链对齐为1，再按 $\Delta u=\mu e/(1+\lambda)$ 执行正则化标量逆 | DpdIlc §6、DPD-ILC §3.2 |
+| `DpdIlc.NextPowerOfTwo`, `DpdIlc.EstimateFrequencyResponse` | N/P | FFT 长度及同步、复增益归一化参考域中的低功率逐频点/标量响应置信度融合 | DpdIlc §6、DPD-ILC §3.3、§3.14 |
 | `DpdIlc.RunFirIlc` 及其 `DpdIlc.BuildUpdate` | P/N | 正则化逆频响 IFFT 后截成双边离线 FIR，卷积误差更新 | DPD-ILC §3.3 |
 | `DpdIlc.RunDirectionalGaussNewtonIlc` 及其 `DpdIlc.BuildUpdate` | P/N | 沿误差方向有限差分雅可比的一维正则化步长 | DPD-ILC §3.5、§3.14 |
 | `DpdIlc.MemoryPolynomialBasis`, `DpdIlc.RunParameterDomainIlc` | P/N | MP 基矩阵、归一化正规矩阵和直接系数迭代 | DPD-ILC §3.6–§3.7 |
@@ -265,7 +265,7 @@ flowchart LR
 | `Analysis.IntegrateAclr` | P/N | 等宽主/邻道 PSD 积分并取较差邻道 | Analysis §6.1、§6.3 |
 | `Analysis.CalculateAclr`, `Analysis.CalculatePreparedAclr`, `Analysis.CalculatePreparedAclrPerChain` | P/N | 数据字段 Welch PSD 的汇总/逐链 ACLR | Analysis §6、§9.3 |
 | `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让 SNR/EVM/ACLR 共用一次同步结果并保存阶段映射 | Analysis §1 |
-| `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO PA输出，并在Analysis中按严格EVM选择最佳实测轮 | Analysis §5.10 |
+| `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO对齐输出，复制反馈同步估计，并在Analysis中按严格EVM选择最佳实测轮 | DpdIlc §7、Analysis §5.10 |
 | `Analysis.AnalyzeMimoIlcHistory` | P/E | 按轮组合各PA链输出，以完整MIMO空间解映射统一计算性能并在Analysis中选择最佳轮 | Analysis §9 |
 | `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同的每路目标输出 dBm 点公平比较各方法EVM，按相对25 dBm额定极限的回退设置归一化驱动，并保存目标输出RMS电压 | Analysis §8 |
 | `Analysis.SavePowerEvmCurveData`, `Analysis.Print`, `Analysis.PrintMimo`, `Analysis.Save`, `Analysis.SaveConvergence`, `Analysis.PrintConvergence` | E | 展示/序列化既有结果，不改变物理指标 | Analysis §10–§11 |

@@ -346,6 +346,7 @@ def CheckModuleResponsibilityBoundaries() -> None:
     compatibilityImportCode = (
         "from lib.ParseWifi import ParseWifi; "
         "from lib.Analysis import Analysis; "
+        "from lib.DpdIlc import RunFrequencyDomainIlc; "
         "from lib.Fec import EncodeDescriptorLdpc; "
         "from lib.WaveGenWifi import WaveGenWifi; "
         "from lib.PaModel import PaModel; "
@@ -363,6 +364,7 @@ def CheckModuleResponsibilityBoundaries() -> None:
         f"{compatibilityImportResult.stderr}"
     )
     assert "from ..utils.SigProc import" in analysisSource
+    assert "from ..utils.SigProc import" in ilcSource
     assert "from ..utils.FrameProcess import FrameProcess" in analysisSource
     assert "from ..utils.WifiMetadata import WifiWaveform" in analysisSource
     assert "PaModel import" not in analysisSource
@@ -1643,6 +1645,153 @@ def CheckIlcImprovement() -> None:
         assert ilcMetrics["snrDb"] > baselineMetrics["snrDb"]
 
 
+def CheckIlcFeedbackSynchronization() -> None:
+    """Verify that ILC aligns feedback before metrics and waveform updates.
+
+    Processing details:
+        Algorithm: Pass an ideal Wi-Fi waveform through a synthetic capture
+        path with leading delay, carrier offset, common complex gain, and a
+        longer record; run frequency-domain ILC; then verify that every native
+        history record is in the synchronized gain-normalized reference domain
+        and exports the estimated impairment values through Analysis.
+
+    Returns:
+        result: None. Assertions prove synchronization is inside the ILC loop
+            rather than deferred to post-run performance reporting.
+    """
+
+    waveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=2,
+        numDataSymbols=8,
+        sampleRateHz=80.0e6,
+        seed=177,
+    ).Generate()
+    referenceSignal = waveform.samples
+    delaySamples = 19
+    carrierFrequencyOffsetHz = 5.0e3
+    complexGain = 0.61 * np.exp(1j * 0.42)
+
+    class ImpairedIdentityPa:
+        """Add deterministic capture impairments to an identity PA."""
+
+        def __init__(
+            self,
+            sampleRateHz: float,
+            delaySamples: int,
+            carrierFrequencyOffsetHz: float,
+            complexGain: complex,
+        ) -> None:
+            """Store deterministic impairment values for repeated captures.
+
+            Processing details:
+                Algorithm: Preserve the caller's physical sample rate, signed
+                phase-ramp frequency, leading zero count, and common gain.
+
+            Args:
+                sampleRateHz: Complex sample rate in samples per second.
+                delaySamples: Number of leading zero samples.
+                carrierFrequencyOffsetHz: Applied carrier offset in hertz.
+                complexGain: Applied common magnitude and phase.
+
+            Returns:
+                result: None. The repeatable identity test plant is ready.
+            """
+
+            self.sampleRateHz = sampleRateHz
+            self.delaySamples = delaySamples
+            self.carrierFrequencyOffsetHz = (
+                carrierFrequencyOffsetHz
+            )
+            self.complexGain = complexGain
+
+        def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+            """Return a longer delayed, frequency-shifted, gained capture.
+
+            Processing details:
+                Algorithm: Prefix zeros, preserve every input sample, and
+                apply the same absolute-index carrier phasor on every call.
+
+            Args:
+                inputSignal: One-dimensional complex identity-plant input.
+
+            Returns:
+                result: Impaired capture with ``delaySamples`` extra samples.
+            """
+
+            complexInput = np.asarray(
+                inputSignal, dtype=np.complex128
+            ).reshape(-1)
+            delayedSignal = np.r_[
+                np.zeros(
+                    self.delaySamples,
+                    dtype=np.complex128,
+                ),
+                complexInput,
+            ]
+            sampleIndices = np.arange(delayedSignal.size, dtype=float)
+            carrierPhasor = np.exp(
+                1j
+                * 2.0
+                * np.pi
+                * self.carrierFrequencyOffsetHz
+                * sampleIndices
+                / self.sampleRateHz
+            )
+            return self.complexGain * delayedSignal * carrierPhasor
+
+    impairedPa = ImpairedIdentityPa(
+        waveform.sampleRateHz,
+        delaySamples,
+        carrierFrequencyOffsetHz,
+        complexGain,
+    )
+    ilcResult = RunFrequencyDomainIlc(
+        referenceSignal,
+        impairedPa,
+        waveform.sampleRateHz,
+        waveform.bandwidthHz,
+        ILCConfig(
+            numIterations=2,
+            learningRate=0.2,
+            maxAmplitude=2.5,
+            feedbackSynchronizationParameters={
+                "maxIntegerDelaySamples": 100,
+            },
+        ),
+    )
+    assert ilcResult.outputSignal.size == (
+        referenceSignal.size + delaySamples
+    )
+    for iterationRecord in ilcResult.history:
+        assert iterationRecord.outputSignal.shape == referenceSignal.shape
+        assert iterationRecord.integerDelaySamples == delaySamples
+        assert abs(
+            iterationRecord.carrierFrequencyOffsetHz
+            - carrierFrequencyOffsetHz
+        ) < 100.0
+        assert abs(
+            iterationRecord.feedbackComplexGain - complexGain
+        ) < 0.02
+        assert iterationRecord.linearCompensatedNmseDb < -35.0
+
+    analyzedResult = Analysis(
+        referenceSignal,
+        waveform,
+    ).AnalyzeIlcHistory(ilcResult.history)
+    serializedIteration = analyzedResult.history[0].ToDict()
+    assert (
+        serializedIteration["feedbackIntegerDelaySamples"]
+        == delaySamples
+    )
+    assert abs(
+        serializedIteration["feedbackCarrierFrequencyOffsetHz"]
+        - carrierFrequencyOffsetHz
+    ) < 100.0
+    assert "feedbackComplexGainMagnitudeDb" in serializedIteration
+
+
 def CheckReceiveOnlyWifiAnalysis() -> None:
     """Verify frame parsing and zero-reference Analysis operation.
 
@@ -2090,6 +2239,9 @@ def CheckMseEvmConvergence() -> None:
         assert "evmAlignedMse" in csvText
         assert "snrDb" in csvText
         assert "aclrWorstDb" in csvText
+        assert "feedbackIntegerDelaySamples" in csvText
+        assert "feedbackCarrierFrequencyOffsetHz" in csvText
+        assert "feedbackComplexGainMagnitudeDb" in csvText
         assert figurePath.is_file()
 
 
@@ -2252,6 +2404,7 @@ def RunTests() -> None:
     CheckPowerEvmCurve()
     CheckGuardIntervals()
     CheckIlcImprovement()
+    CheckIlcFeedbackSynchronization()
     CheckReceiveOnlyWifiAnalysis()
     CheckMseEvmConvergence()
     print("All DPD-ILC project checks passed.")

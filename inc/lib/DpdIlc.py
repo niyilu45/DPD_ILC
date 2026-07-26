@@ -23,6 +23,7 @@ from typing import (
     Any,
     Callable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -31,6 +32,13 @@ from typing import (
 import numpy as np
 
 from .PaModel import AddAwgn, MimoPaModel
+
+# Cross-package imports support ``inc.lib`` from the repository root and
+# ``lib`` when the caller places the ``inc`` directory on sys.path.
+if __package__ and "." in __package__:
+    from ..utils.SigProc import SignalProcessingResult, SigProc
+else:
+    from utils.SigProc import SignalProcessingResult, SigProc
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,9 @@ class ILCConfig:
     projectionBandwidthFactor: float = 1.6
     responseFloorDb: float = -45.0
     randomSeed: int = 19
+    feedbackSynchronizationParameters: Optional[
+        Mapping[str, object]
+    ] = None
 
     def Validate(self) -> None:
         """Validate convergence, regularization, and feedback parameters.
@@ -74,6 +85,15 @@ class ILCConfig:
             raise ValueError("feedbackAverages must be positive")
         if self.projectionBandwidthFactor <= 1.0:
             raise ValueError("projectionBandwidthFactor must exceed 1")
+        if (
+            self.feedbackSynchronizationParameters is not None
+            and not isinstance(
+                self.feedbackSynchronizationParameters, Mapping
+            )
+        ):
+            raise TypeError(
+                "feedbackSynchronizationParameters must be a mapping or None"
+            )
 
 
 @dataclass(frozen=True)
@@ -91,6 +111,11 @@ class ILCIteration:
     inputPeak: float
     inputSignal: np.ndarray
     outputSignal: np.ndarray
+    integerDelaySamples: int = 0
+    fractionalDelaySamples: float = 0.0
+    carrierFrequencyOffsetHz: float = 0.0
+    samplingFrequencyOffsetPpm: float = 0.0
+    feedbackComplexGain: complex = 1.0 + 0.0j
 
 
 @dataclass
@@ -107,6 +132,7 @@ def CalculateIterationMetrics(
     targetSignal: np.ndarray,
     measuredOutput: np.ndarray,
     inputSignal: np.ndarray,
+    signalProcessingResult: Optional[SignalProcessingResult] = None,
 ) -> ILCIteration:
     """Calculate algorithm-native MSE diagnostics for one measured iteration.
 
@@ -121,6 +147,8 @@ def CalculateIterationMetrics(
         targetSignal: Ideal time-domain output target.
         measuredOutput: PA feedback captured for the current input waveform.
         inputSignal: PA input waveform used to produce ``measuredOutput``.
+        signalProcessingResult: Optional synchronization and common-gain
+            estimates applied before the learning-domain metrics.
 
     Returns:
         result: Complete immutable diagnostics for one ILC iteration.
@@ -143,6 +171,14 @@ def CalculateIterationMetrics(
         raise ValueError("iteration metric signals must contain finite samples")
     if not np.all(np.isfinite(complexInput)):
         raise ValueError("inputSignal must contain finite samples")
+    if (
+        signalProcessingResult is not None
+        and signalProcessingResult.processedSignal.shape
+        != complexMeasured.shape
+    ):
+        raise ValueError(
+            "signalProcessingResult must describe measuredOutput"
+        )
 
     numericFloor = np.finfo(float).tiny
     targetPower = max(
@@ -184,6 +220,35 @@ def CalculateIterationMetrics(
         inputPeak=float(np.max(np.abs(complexInput))),
         inputSignal=complexInput.copy(),
         outputSignal=complexMeasured.copy(),
+        integerDelaySamples=(
+            0
+            if signalProcessingResult is None
+            else int(signalProcessingResult.integerDelaySamples)
+        ),
+        fractionalDelaySamples=(
+            0.0
+            if signalProcessingResult is None
+            else float(signalProcessingResult.fractionalDelaySamples)
+        ),
+        carrierFrequencyOffsetHz=(
+            0.0
+            if signalProcessingResult is None
+            else float(
+                signalProcessingResult.carrierFrequencyOffsetHz
+            )
+        ),
+        samplingFrequencyOffsetPpm=(
+            0.0
+            if signalProcessingResult is None
+            else float(
+                signalProcessingResult.samplingFrequencyOffsetPpm
+            )
+        ),
+        feedbackComplexGain=(
+            1.0 + 0.0j
+            if signalProcessingResult is None
+            else complex(signalProcessingResult.complexGain)
+        ),
     )
 
 
@@ -246,12 +311,32 @@ def MeasurePaOutput(
         result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
-    accumulatedOutput = np.zeros_like(inputSignal, dtype=np.complex128)
-    for _ in range(config.feedbackAverages):
+    accumulatedOutput: Optional[np.ndarray] = None
+    expectedShape: Optional[Tuple[int, ...]] = None
+    for captureIndex in range(config.feedbackAverages):
         noiselessOutput = paModel.Process(inputSignal)
-        accumulatedOutput += AddAwgn(
-            noiselessOutput, config.feedbackSnrDb, randomGenerator
-        )
+        noisyOutput = np.asarray(
+            AddAwgn(
+                noiselessOutput,
+                config.feedbackSnrDb,
+                randomGenerator,
+            ),
+            dtype=np.complex128,
+        ).reshape(-1)
+        if captureIndex == 0:
+            expectedShape = noisyOutput.shape
+            accumulatedOutput = np.zeros_like(
+                noisyOutput, dtype=np.complex128
+            )
+        elif noisyOutput.shape != expectedShape:
+            raise ValueError(
+                "all repeated PA feedback captures must have equal length"
+            )
+        if accumulatedOutput is None:
+            raise RuntimeError("feedback accumulation was not initialized")
+        accumulatedOutput += noisyOutput
+    if accumulatedOutput is None:
+        raise RuntimeError("feedback acquisition produced no captures")
     return accumulatedOutput / float(config.feedbackAverages)
 
 
@@ -332,8 +417,19 @@ def RunFrequencyDomainIlc(
     probeRms = min(0.05, 0.25 * targetRms)
     probeSignal = targetSignal * (probeRms / targetRms)
     probeOutput = paModel.Process(probeSignal)
+    probeProcessor = SigProc(
+        probeSignal,
+        sampleRateHz,
+        parameters=config.feedbackSynchronizationParameters,
+    )
+    probeProcessingResult = probeProcessor.Process(probeOutput)
+    # The probe response is estimated in the same synchronized,
+    # gain-normalized reference domain used by every later ILC error. This
+    # remains well defined even when the PA test fixture applies absolute
+    # output-power calibration independently of the probe input amplitude.
+    alignedProbeOutput = probeProcessingResult.processedSignal
     probeSpectrum = np.fft.fft(probeSignal, fftLength)
-    probeOutputSpectrum = np.fft.fft(probeOutput, fftLength)
+    probeOutputSpectrum = np.fft.fft(alignedProbeOutput, fftLength)
     probeSpectrumPower = np.abs(probeSpectrum) ** 2
     responseFloor = max(probeSpectrumPower.max(), np.finfo(float).tiny) * (
         10.0 ** (config.responseFloorDb / 10.0)
@@ -341,7 +437,9 @@ def RunFrequencyDomainIlc(
     scalarDenominator = max(
         np.vdot(probeSignal, probeSignal).real, np.finfo(float).tiny
     )
-    scalarGain = np.vdot(probeSignal, probeOutput) / scalarDenominator
+    scalarGain = (
+        np.vdot(probeSignal, alignedProbeOutput) / scalarDenominator
+    )
     spectralResponse = (
         probeOutputSpectrum * np.conj(probeSpectrum)
     ) / (probeSpectrumPower + responseFloor)
@@ -364,18 +462,31 @@ def RunFrequencyDomainIlc(
 
     bestSelectionError = np.inf
     bestInput = inputSignal.copy()
+    feedbackProcessor = SigProc(
+        targetSignal,
+        sampleRateHz,
+        parameters=config.feedbackSynchronizationParameters,
+    )
     for iteration in range(config.numIterations):
         measuredOutput = MeasurePaOutput(
             paModel, inputSignal, config, randomGenerator
         )
-        errorSignal = targetSignal - measuredOutput
-        # Retain native MSE diagnostics and the exact measured candidate before
-        # updating. Wi-Fi performance evaluation occurs later in Analysis.
+        signalProcessingResult = feedbackProcessor.Process(measuredOutput)
+        alignedOutput = signalProcessingResult.processedSignal
+        # Dividing the synchronized PA output by its least-squares gain maps
+        # it back into reference units. Both operands therefore have the same
+        # amplitude convention, while delay, CFO, SFO, common magnitude, and
+        # common phase cannot contaminate the nonlinear learning residual.
+        errorSignal = targetSignal - alignedOutput
+        # Metrics retain the synchronized, gain-normalized waveform used to
+        # judge nonlinear shape. The returned final output remains the clean
+        # physical PA output at the selected input.
         iterationMetrics = CalculateIterationMetrics(
             iteration + 1,
             targetSignal,
-            measuredOutput,
+            signalProcessingResult.processedSignal,
             inputSignal,
+            signalProcessingResult,
         )
         selectionError = 10.0 ** (
             iterationMetrics.linearCompensatedNmseDb / 10.0
@@ -1036,13 +1147,12 @@ def MeasureOutput(
         result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
-    averagedOutput = np.zeros_like(inputSignal, dtype=np.complex128)
-    for _ in range(config.feedbackAverages):
-        paOutput = paModel.Process(inputSignal)
-        averagedOutput += AddAwgn(
-            paOutput, config.feedbackSnrDb, randomGenerator
-        )
-    return averagedOutput / float(config.feedbackAverages)
+    return MeasurePaOutput(
+        paModel,
+        inputSignal,
+        config,
+        randomGenerator,
+    )
 
 def SelectionError(
     targetSignal: np.ndarray, measuredOutput: np.ndarray
@@ -1079,6 +1189,7 @@ def RunWaveformUpdate(
         [np.ndarray, np.ndarray, np.ndarray, int],
         np.ndarray,
     ],
+    sampleRateHz: float = 1.0,
 ) -> ILCResult:
     """Run a generic waveform ILC loop with best-iteration retention.
 
@@ -1090,6 +1201,8 @@ def RunWaveformUpdate(
         paModel: PA object exposing Process and SmallSignalGain operations.
         config: Validated configuration object controlling this operation.
         updateFunction: Caller-supplied value consumed according to the function contract.
+        sampleRateHz: Complex sample rate in samples per second. The default
+            represents normalized discrete-time frequency for legacy callers.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1099,22 +1212,37 @@ def RunWaveformUpdate(
     targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
     if targetSignal.size == 0:
         raise ValueError("referenceSignal cannot be empty")
+    if (
+        not isinstance(sampleRateHz, (int, float))
+        or isinstance(sampleRateHz, bool)
+        or not np.isfinite(sampleRateHz)
+        or sampleRateHz <= 0.0
+    ):
+        raise ValueError("sampleRateHz must be finite and positive")
     randomGenerator = np.random.default_rng(config.randomSeed)
     inputSignal = LimitAmplitude(targetSignal, config.maxAmplitude)
     bestInput = inputSignal.copy()
     bestError = np.inf
     history: List[ILCIteration] = []
+    feedbackProcessor = SigProc(
+        targetSignal,
+        sampleRateHz,
+        parameters=config.feedbackSynchronizationParameters,
+    )
 
     for iteration in range(config.numIterations):
         measuredOutput = MeasureOutput(
             paModel, inputSignal, config, randomGenerator
         )
-        errorSignal = targetSignal - measuredOutput
+        signalProcessingResult = feedbackProcessor.Process(measuredOutput)
+        alignedOutput = signalProcessingResult.processedSignal
+        errorSignal = targetSignal - alignedOutput
         iterationMetrics = CalculateIterationMetrics(
             iteration + 1,
             targetSignal,
-            measuredOutput,
+            signalProcessingResult.processedSignal,
             inputSignal,
+            signalProcessingResult,
         )
         selectionError = 10.0 ** (
             iterationMetrics.linearCompensatedNmseDb / 10.0
@@ -1124,7 +1252,7 @@ def RunWaveformUpdate(
             bestInput = inputSignal.copy()
         history.append(iterationMetrics)
         updateSignal = updateFunction(
-            inputSignal, measuredOutput, errorSignal, iteration
+            inputSignal, alignedOutput, errorSignal, iteration
         )
         inputSignal = LimitAmplitude(
             inputSignal + updateSignal, config.maxAmplitude
@@ -1137,7 +1265,10 @@ def RunWaveformUpdate(
     )
 
 def EstimateComplexGain(
-    referenceSignal: np.ndarray, paModel: Any
+    referenceSignal: np.ndarray,
+    paModel: Any,
+    sampleRateHz: float = 1.0,
+    signalProcessingParameters: Optional[Mapping[str, object]] = None,
 ) -> complex:
     """Measure the low-power least-squares complex gain of a PA.
 
@@ -1147,6 +1278,9 @@ def EstimateComplexGain(
     Args:
         referenceSignal: Ideal complex baseband samples used as the target or regression input.
         paModel: PA object exposing Process and SmallSignalGain operations.
+        sampleRateHz: Complex sample rate in samples per second.
+        signalProcessingParameters: Optional SigProc synchronization
+            overrides applied to the low-power feedback capture.
 
     Returns:
         result: complex. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1158,15 +1292,25 @@ def EstimateComplexGain(
     )
     probeSignal = referenceSignal * (min(0.04, 0.2 * referenceRms) / referenceRms)
     probeOutput = paModel.Process(probeSignal)
+    probeProcessingResult = SigProc(
+        probeSignal,
+        sampleRateHz,
+        parameters=signalProcessingParameters,
+    ).Process(probeOutput)
+    alignedProbeOutput = (
+        probeProcessingResult.processedSignal
+        * probeProcessingResult.complexGain
+    )
     denominator = max(
         np.vdot(probeSignal, probeSignal).real, np.finfo(float).tiny
     )
-    return np.vdot(probeSignal, probeOutput) / denominator
+    return np.vdot(probeSignal, alignedProbeOutput) / denominator
 
 def RunScalarPIlc(
     referenceSignal: np.ndarray,
     paModel: Any,
     config: ILCConfig = ILCConfig(),
+    sampleRateHz: float = 1.0,
 ) -> ILCResult:
     """Run scalar P-type ILC using the nominal target gain of one.
 
@@ -1177,6 +1321,7 @@ def RunScalarPIlc(
         referenceSignal: Ideal complex baseband samples used as the target or regression input.
         paModel: PA object exposing Process and SmallSignalGain operations.
         config: Validated configuration object controlling this operation.
+        sampleRateHz: Complex sample rate in samples per second.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1210,12 +1355,14 @@ def RunScalarPIlc(
         paModel,
         config,
         BuildUpdate,
+        sampleRateHz,
     )
 
 def RunComplexGainIlc(
     referenceSignal: np.ndarray,
     paModel: Any,
     config: ILCConfig = ILCConfig(),
+    sampleRateHz: float = 1.0,
 ) -> ILCResult:
     """Run regularized complex-gain-normalized ILC.
 
@@ -1226,17 +1373,17 @@ def RunComplexGainIlc(
         referenceSignal: Ideal complex baseband samples used as the target or regression input.
         paModel: PA object exposing Process and SmallSignalGain operations.
         config: Validated configuration object controlling this operation.
+        sampleRateHz: Complex sample rate in samples per second.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
-    complexGain = EstimateComplexGain(referenceSignal, paModel)
-    gainScale = max(np.abs(complexGain) ** 2, np.finfo(float).tiny)
+    # The common complex plant gain has already been removed from every
+    # feedback capture by RunWaveformUpdate. Its aligned scalar response is
+    # therefore unity, and regularization only attenuates the inverse step.
     learningGain = (
-        config.learningRate
-        * np.conj(complexGain)
-        / (gainScale + config.regularization * gainScale)
+        config.learningRate / (1.0 + config.regularization)
     )
 
     def BuildUpdate(
@@ -1267,6 +1414,7 @@ def RunComplexGainIlc(
         paModel,
         config,
         BuildUpdate,
+        sampleRateHz,
     )
 
 def EstimateFrequencyResponse(
@@ -1274,6 +1422,8 @@ def EstimateFrequencyResponse(
     paModel: Any,
     fftLength: int,
     responseFloorDb: float,
+    sampleRateHz: float = 1.0,
+    signalProcessingParameters: Optional[Mapping[str, object]] = None,
 ) -> np.ndarray:
     """Estimate a regularized small-signal PA frequency response.
 
@@ -1285,6 +1435,9 @@ def EstimateFrequencyResponse(
         paModel: PA object exposing Process and SmallSignalGain operations.
         fftLength: Number of time samples and frequency bins in the OFDM transform.
         responseFloorDb: Caller-supplied value consumed according to the function contract.
+        sampleRateHz: Complex sample rate in samples per second.
+        signalProcessingParameters: Optional SigProc synchronization
+            overrides applied to the low-power feedback capture.
 
     Returns:
         result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1296,13 +1449,25 @@ def EstimateFrequencyResponse(
     )
     probeSignal = referenceSignal * (min(0.04, 0.2 * referenceRms) / referenceRms)
     probeOutput = paModel.Process(probeSignal)
+    probeProcessingResult = SigProc(
+        probeSignal,
+        sampleRateHz,
+        parameters=signalProcessingParameters,
+    ).Process(probeOutput)
+    alignedProbeOutput = probeProcessingResult.processedSignal
     probeSpectrum = np.fft.fft(probeSignal, fftLength)
-    outputSpectrum = np.fft.fft(probeOutput, fftLength)
+    outputSpectrum = np.fft.fft(alignedProbeOutput, fftLength)
     probePower = np.abs(probeSpectrum) ** 2
     powerFloor = max(probePower.max(), np.finfo(float).tiny) * (
         10.0 ** (responseFloorDb / 10.0)
     )
-    complexGain = EstimateComplexGain(referenceSignal, paModel)
+    scalarDenominator = max(
+        np.vdot(probeSignal, probeSignal).real,
+        np.finfo(float).tiny,
+    )
+    complexGain = (
+        np.vdot(probeSignal, alignedProbeOutput) / scalarDenominator
+    )
     confidence = probePower / (probePower + powerFloor)
     spectralRatio = outputSpectrum * np.conj(probeSpectrum) / (
         probePower + powerFloor
@@ -1314,6 +1479,7 @@ def RunFirIlc(
     paModel: Any,
     config: ILCConfig = ILCConfig(),
     firLength: int = 17,
+    sampleRateHz: float = 1.0,
 ) -> ILCResult:
     """Run FIR-filtered ILC using a truncated regularized inverse response.
 
@@ -1325,6 +1491,7 @@ def RunFirIlc(
         paModel: PA object exposing Process and SmallSignalGain operations.
         config: Validated configuration object controlling this operation.
         firLength: Number of taps in the learned FIR update filter.
+        sampleRateHz: Complex sample rate in samples per second.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1333,7 +1500,12 @@ def RunFirIlc(
     targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
     fftLength = NextPowerOfTwo(targetSignal.size)
     frequencyResponse = EstimateFrequencyResponse(
-        targetSignal, paModel, fftLength, config.responseFloorDb
+        targetSignal,
+        paModel,
+        fftLength,
+        config.responseFloorDb,
+        sampleRateHz,
+        config.feedbackSynchronizationParameters,
     )
     responseScale = max(
         np.median(np.abs(frequencyResponse) ** 2), np.finfo(float).tiny
@@ -1385,6 +1557,7 @@ def RunFirIlc(
         paModel,
         config,
         BuildUpdate,
+        sampleRateHz,
     )
 
 def RunDirectionalGaussNewtonIlc(
@@ -1392,6 +1565,7 @@ def RunDirectionalGaussNewtonIlc(
     paModel: Any,
     config: ILCConfig = ILCConfig(),
     finiteDifferenceRms: float = 1e-3,
+    sampleRateHz: float = 1.0,
 ) -> ILCResult:
     """Run a model-aware Gauss-Newton step projected onto the error direction.
 
@@ -1404,11 +1578,21 @@ def RunDirectionalGaussNewtonIlc(
         paModel: Repeatable PA object exposing ``Process``.
         config: Algorithm, constraint, and feedback-measurement settings.
         finiteDifferenceRms: RMS size of the Jacobian-direction probe.
+        sampleRateHz: Complex sample rate in samples per second.
 
     Returns:
         result: Best measured PA input, its clean PA output, and iteration
         diagnostics.
     """
+
+    targetSignal = np.asarray(
+        referenceSignal, dtype=np.complex128
+    ).reshape(-1)
+    directionalProcessor = SigProc(
+        targetSignal,
+        sampleRateHz,
+        parameters=config.feedbackSynchronizationParameters,
+    )
 
     def BuildUpdate(
         inputSignal: np.ndarray,
@@ -1440,7 +1624,13 @@ def RunDirectionalGaussNewtonIlc(
             inputSignal + differenceScale * errorSignal
         )
         cleanOutput = paModel.Process(inputSignal)
-        jacobianDirection = (trialOutput - cleanOutput) / differenceScale
+        trialProcessingResult = directionalProcessor.Process(trialOutput)
+        cleanProcessingResult = directionalProcessor.Process(cleanOutput)
+        alignedTrialOutput = trialProcessingResult.processedSignal
+        alignedCleanOutput = cleanProcessingResult.processedSignal
+        jacobianDirection = (
+            alignedTrialOutput - alignedCleanOutput
+        ) / differenceScale
         jacobianPower = max(
             np.vdot(jacobianDirection, jacobianDirection).real,
             np.finfo(float).tiny,
@@ -1455,6 +1645,7 @@ def RunDirectionalGaussNewtonIlc(
         paModel,
         config,
         BuildUpdate,
+        sampleRateHz,
     )
 
 def MemoryPolynomialBasis(
@@ -1496,6 +1687,7 @@ def RunParameterDomainIlc(
     config: ILCConfig = ILCConfig(),
     nonlinearOrders: tuple = (1, 3, 5, 7),
     memoryDepth: int = 3,
+    sampleRateHz: float = 1.0,
 ) -> ILCResult:
     """Update memory-polynomial DPD coefficients directly in each ILC round.
 
@@ -1508,6 +1700,7 @@ def RunParameterDomainIlc(
         config: Validated configuration object controlling this operation.
         nonlinearOrders: Positive odd polynomial orders included in the model.
         memoryDepth: Number of causal sample delays included in the model.
+        sampleRateHz: Complex sample rate in samples per second.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1538,23 +1731,30 @@ def RunParameterDomainIlc(
         normalizedBasis.shape[1], dtype=np.complex128
     )
     normalizedCoefficients[0] = featureScale[0]
-    complexGain = EstimateComplexGain(targetSignal, paModel)
     bestInput = targetSignal.copy()
     bestError = np.inf
     history: List[ILCIteration] = []
     randomGenerator = np.random.default_rng(config.randomSeed)
+    feedbackProcessor = SigProc(
+        targetSignal,
+        sampleRateHz,
+        parameters=config.feedbackSynchronizationParameters,
+    )
     for iteration in range(config.numIterations):
         inputSignal = normalizedBasis @ normalizedCoefficients
         inputSignal = LimitAmplitude(inputSignal, config.maxAmplitude)
         measuredOutput = MeasureOutput(
             paModel, inputSignal, config, randomGenerator
         )
-        errorSignal = targetSignal - measuredOutput
+        signalProcessingResult = feedbackProcessor.Process(measuredOutput)
+        alignedOutput = signalProcessingResult.processedSignal
+        errorSignal = targetSignal - alignedOutput
         iterationMetrics = CalculateIterationMetrics(
             iteration + 1,
             targetSignal,
-            measuredOutput,
+            signalProcessingResult.processedSignal,
             inputSignal,
+            signalProcessingResult,
         )
         selectionError = 10.0 ** (
             iterationMetrics.linearCompensatedNmseDb / 10.0
@@ -1566,9 +1766,7 @@ def RunParameterDomainIlc(
         coefficientUpdate = inverseNormal @ (
             normalizedBasis.conj().T @ errorSignal
         )
-        normalizedCoefficients += (
-            config.learningRate * coefficientUpdate / complexGain
-        )
+        normalizedCoefficients += config.learningRate * coefficientUpdate
 
     return ILCResult(
         learnedInput=bestInput,
@@ -1580,6 +1778,7 @@ def RunAugmentedIqIlc(
     referenceSignal: np.ndarray,
     paModel: Any,
     config: ILCConfig = ILCConfig(),
+    sampleRateHz: float = 1.0,
 ) -> ILCResult:
     """Run widely-linear augmented ILC with error and conjugate-error paths.
 
@@ -1590,6 +1789,7 @@ def RunAugmentedIqIlc(
         referenceSignal: Ideal complex baseband samples used as the target or regression input.
         paModel: PA object exposing Process and SmallSignalGain operations.
         config: Validated configuration object controlling this operation.
+        sampleRateHz: Complex sample rate in samples per second.
 
     Returns:
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
@@ -1602,9 +1802,15 @@ def RunAugmentedIqIlc(
     )
     probeSignal = targetSignal * (min(0.04, 0.2 * referenceRms) / referenceRms)
     probeOutput = paModel.Process(probeSignal)
+    probeProcessingResult = SigProc(
+        probeSignal,
+        sampleRateHz,
+        parameters=config.feedbackSynchronizationParameters,
+    ).Process(probeOutput)
+    alignedProbeOutput = probeProcessingResult.processedSignal
     regressionMatrix = np.column_stack((probeSignal, np.conj(probeSignal)))
     forwardCoefficients = np.linalg.lstsq(
-        regressionMatrix, probeOutput, rcond=None
+        regressionMatrix, alignedProbeOutput, rcond=None
     )[0]
     directGain, imageGain = forwardCoefficients
     augmentedMatrix = np.array(
@@ -1650,6 +1856,7 @@ def RunAugmentedIqIlc(
         paModel,
         config,
         BuildUpdate,
+        sampleRateHz,
     )
 
 

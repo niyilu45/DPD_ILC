@@ -385,9 +385,11 @@ flowchart TD
     config["ILCConfig.Validate"] --> frequency["RunFrequencyDomainIlc"]
     frequency --> fft["NextPowerOfTwo"]
     frequency --> measure["MeasurePaOutput / AddAwgn"]
-    frequency --> metrics["CalculateIterationMetrics"]
+    measure --> sync["SigProc.Process<br/>时延 / CFO / SFO / 复增益对齐"]
+    sync --> metrics["CalculateIterationMetrics"]
+    sync --> frequency
     frequency --> limit["LimitAmplitude"]
-    metrics --> history["ILCIteration：原生MSE + 输入/输出"]
+    metrics --> history["ILCIteration：原生MSE + 输入/对齐输出 + 同步估计"]
     history --> result["ILCResult"]
 
     scalar["RunScalarPIlc"] --> waveformCore["RunWaveformUpdate"]
@@ -425,7 +427,7 @@ flowchart TD
 **图示说明：**
 
 - `DpdIlc.py` 是工程中唯一的可复用 ILC 算法文件，集中保存公共配置和收敛记录、全部更新律、SISO/MIMO执行及ILC标签部署模型。
-- 频域 ILC 和其他波形更新律共享 `ILCConfig`、`CalculateIterationMetrics`、`LimitAmplitude` 与 `ILCResult`。`ILCConfig` 只保存算法和反馈参数；`CalculateIterationMetrics` 只记录Raw/LC误差、输入峰值以及该轮输入/PA输出，不调用任何RF性能评估器。
+- 频域 ILC 和其他波形更新律共享 `ILCConfig`、`CalculateIterationMetrics`、`LimitAmplitude` 与 `ILCResult`。每轮反馈先由 `SigProc` 完成整数/分数时延、CFO、SFO和公共复增益对齐，再构造学习误差；`CalculateIterationMetrics` 记录参考域Raw/LC误差、输入峰值、对齐输出和同步估计，不调用任何RF性能评估器。
 - 标量 P、复增益、FIR、方向 Gauss-Newton 和增广 IQ 路线通过 `RunWaveformUpdate` 复用测量与迭代骨架；参数域 ILC 使用 `MemoryPolynomialBasis` 直接更新可部署系数。
 - GMP、Volterra、LUT 和神经网络拟合都消费收敛标签 `u*`。各 `Fit...` 函数负责训练，相应 `...Predistorter.Process` 方法负责在独立验证帧上推理。
 - MIMO 路线用 `MimoPaChain` 将每个物理 PA 暴露给同一频域 ILC，再按链保存历史并分别拟合 GMP；当前模型假设 PA 之间没有隐藏耦合。
@@ -1011,20 +1013,38 @@ print(assistedMetrics["evmDb"])
 | `projectionBandwidthFactor` | `1.6` | 大于 1；频域 ILC 更新投影带宽相对信道带宽的倍率。 |
 | `responseFloorDb` | `-45.0` | 频率响应估计的低激励置信度门限。 |
 | `randomSeed` | `19` | 反馈噪声及算法随机过程种子。 |
+| `feedbackSynchronizationParameters` | `None` | 可选映射；覆盖ILC内部 `SigProc` 的最大时延、最大CFO、最大SFO、时间窗和补偿开关。 |
 
 `ILCConfig` 只包含学习算法、约束和反馈测量参数，不包含 EVM、SNR 或 ACLR 计算器。所有SISO和MIMO ILC入口都完全独立于 `Analysis`：它们只返回原生历史。调用方随后使用 `resultAnalysis.AnalyzeIlcHistory(...)` 或 `AnalyzeMimoIlcHistory(...)` 计算每轮RF性能并选择严格EVM最佳轮；最终干净PA输出仍通过 `resultAnalysis.Analyze(paOutputSignal)` 计算。
+
+ILC内部对同步后的反馈 $\bar y_k$ 估计公共复增益 $\hat g_k$，再在与参考相同的幅度域构造误差：
+
+```math
+\hat g_k
+=
+\frac{\sum_n x^*[n]\bar y_k[n]}
+     {\sum_n |x[n]|^2},
+```
+
+```math
+e_k[n]
+=
+x[n]-\frac{\bar y_k[n]}{\hat g_k}.
+```
+
+因此公共增益、公共相位和同步误差不会被学习器错误地当作PA非线性。`ILCIteration.outputSignal` 保存与参考等长的同步、复增益归一化反馈；`ILCResult.outputSignal` 仍是最佳输入对应的原始干净PA输出。完整推导和配置示例见 [DpdIlc.py 程序使用手册](doc/DpdIlc.md#6-ilcconfig-完整参数)。
 
 所有 ILC 入口都接收 `referenceSignal`、`paModel` 和 `ILCConfig`。附加参数如下：
 
 | 算法入口 | 附加参数及默认值 |
 | --- | --- |
 | `RunFrequencyDomainIlc` | `sampleRateHz`、`channelBandwidthHz`。 |
-| `RunScalarPIlc` | 无额外参数。 |
-| `RunComplexGainIlc` | 无额外参数。 |
-| `RunFirIlc` | `firLength=17`。 |
-| `RunDirectionalGaussNewtonIlc` | `finiteDifferenceRms=1e-3`。 |
-| `RunParameterDomainIlc` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`。 |
-| `RunAugmentedIqIlc` | 无额外参数。 |
+| `RunScalarPIlc` | `sampleRateHz=1.0`；真实反馈应传实际采样率。 |
+| `RunComplexGainIlc` | `sampleRateHz=1.0`；真实反馈应传实际采样率。 |
+| `RunFirIlc` | `firLength=17`、`sampleRateHz=1.0`。 |
+| `RunDirectionalGaussNewtonIlc` | `finiteDifferenceRms=1e-3`、`sampleRateHz=1.0`。 |
+| `RunParameterDomainIlc` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`、`sampleRateHz=1.0`。 |
+| `RunAugmentedIqIlc` | `sampleRateHz=1.0`。 |
 
 部署模型拟合入口支持：
 

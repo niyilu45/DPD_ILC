@@ -170,7 +170,8 @@ outputSignal = paModel.Process(inputSignal)
 
 `Process` 必须满足：
 
-- 输入和输出样点数量一致；
+- 输入必须是一维复数组；输出允许比输入更长或更短，ILC会先同步并提取到参考网格；
+- 同一轮启用 `feedbackAverages` 时，各次反馈采集的长度必须一致；
 - 对相同输入可重复测量；
 - 输出为有限复数；
 - SISO时输入输出均为一维；
@@ -334,8 +335,72 @@ ilcConfig = ILCConfig(
 | `projectionBandwidthFactor` | `1.6` | 大于1 | 频域更新相对信道带宽的允许范围 | 过小会限制带外抵消，过大可能增加峰值 |
 | `responseFloorDb` | `-45.0` | 当前不单独限幅 | 低激励FFT频点的响应置信度门限 | 频谱零点不稳定时提高门限 |
 | `randomSeed` | `19` | 整数语义 | 反馈噪声随机种子 | 公平比较时每次实验固定 |
+| `feedbackSynchronizationParameters` | `None` | `None`或映射 | 覆盖ILC内部 `SigProc` 的同步参数 | 通常只需限制最大时延或CFO搜索范围 |
 
 所有 `Run...Ilc` 入口均不再接收性能评估回调。旧代码必须删除这类回调参数，并在ILC返回后调用 `Analysis.AnalyzeIlcHistory(...)`。
+
+#### ILC内部同步与复增益对齐
+
+所有波形ILC入口、参数域ILC以及逐PA的MIMO频域ILC都会在每一轮更新之前执行同一条反馈预处理链：
+
+```text
+PA feedback capture
+  -> integer delay alignment
+  -> carrier frequency offset compensation
+  -> fractional delay and sampling offset compensation
+  -> interpolation onto the reference grid
+  -> least-squares complex-gain alignment
+  -> ILC error and update
+```
+
+令参考波形为 $x[n]$，第 $k$ 轮原始采集为 $y_k[n]$。完成时延、CFO和SFO补偿后得到 $\bar y_k[n]$。公共复增益按最小二乘估计：
+
+```math
+\hat g_k
+=
+\frac{\sum_n x^*[n]\bar y_k[n]}
+     {\sum_n |x[n]|^2}.
+```
+
+ILC不会把未同步的原始采集直接与参考相减，而是先把反馈映射回参考幅度域：
+
+```math
+\tilde y_k[n]
+=
+\frac{\bar y_k[n]}{\hat g_k}.
+```
+
+因此实际学习误差为：
+
+```math
+e_k[n]
+=
+x[n]-\tilde y_k[n].
+```
+
+这里不存在“除去增益后幅度单位不一致”的问题：$\hat g_k$ 的单位就是“PA输出幅度除以参考幅度”，所以 $\bar y_k/\hat g_k$ 与 $x$ 处在相同参考尺度。等价的PA输出域残差为：
+
+```math
+\hat g_k e_k[n]
+=
+\hat g_k x[n]-\bar y_k[n].
+```
+
+代码在参考域构造误差，并且低功率频响探测也使用相同的同步、复增益归一化域。这样公共线性增益、公共相位、整数或分数时延、CFO和SFO不会被误认为PA非线性；ILC主要学习无法被一个公共复增益解释的波形形状误差。若需要限制实际仪表捕获的搜索范围，可配置：
+
+```python
+ilcConfig = ILCConfig(
+    feedbackSynchronizationParameters={
+        "maxIntegerDelaySamples": 2000,
+        "maxCarrierFrequencyOffsetHz": 200.0e3,
+        "maxSamplingFrequencyOffsetPpm": 100.0,
+        "timingWindowCount": 9,
+        "timingWindowLength": 2048,
+    },
+)
+```
+
+该映射未写出的字段继续使用 `SigProc` 的函数内部默认值；未知字段只发出警告并被忽略。`enableIntegerDelayCompensation`、`enableFractionalDelayCompensation`、`enableCarrierFrequencyOffsetCompensation`、`enableSamplingFrequencyOffsetCompensation` 和 `enableComplexGainCompensation` 默认均为 `True`。实际反馈链建议保持这些开关开启。
 
 ### 6.1 验证配置
 
@@ -398,7 +463,9 @@ ILCResult(
 
 ```text
 Measure current input
-Calculate and store native MSE diagnostics plus input/output
+Synchronize delay/CFO/SFO and align common complex gain
+Calculate the reference-domain ILC error
+Store native MSE diagnostics, input, aligned output, and sync estimates
 Remember current input if it has the best LC-NMSE
 Calculate update
 Generate next input
@@ -432,9 +499,14 @@ k^\star
 | `complexGainPhaseDegrees` | 当前公共相位 | 用于区分线性相位项 |
 | `inputPeak` | 当前PA输入最大幅度 | 用于检查峰值约束是否激活 |
 | `inputSignal` | 当前轮PA输入复数组 | 供后续外部选择与复测 |
-| `outputSignal` | 当前轮实测PA反馈复数组 | 供Analysis统一计算RF性能 |
+| `outputSignal` | 当前轮已同步并去公共复增益的参考域反馈 | 与参考等长，供Analysis统一计算RF性能 |
+| `integerDelaySamples` | ILC内部估计的整数时延 | 正值表示反馈晚于参考 |
+| `fractionalDelaySamples` | ILC内部估计的分数时延 | 与整数时延共同决定重采样位置 |
+| `carrierFrequencyOffsetHz` | ILC内部估计的载波频偏 | 单位Hz |
+| `samplingFrequencyOffsetPpm` | ILC内部估计的采样频偏 | 单位ppm |
+| `feedbackComplexGain` | 同步后参考到反馈的最小二乘复增益 | 保留原始幅度和相位关系供审计 |
 
-`Analysis.AnalyzeIlcHistory` 返回的 `ILCPerformanceIteration` 在上述原生字段之外增加 `snrDb`、`evmAlignedMse`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。
+`Analysis.AnalyzeIlcHistory` 返回的 `ILCPerformanceIteration` 在上述原生字段之外增加 `snrDb`、`evmAlignedMse`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`，并把同步估计展开为 `feedbackIntegerDelaySamples`、`feedbackFractionalDelaySamples`、`feedbackCarrierFrequencyOffsetHz`、`feedbackSamplingFrequencyOffsetPpm`、`feedbackComplexGainMagnitudeDb` 和 `feedbackComplexGainPhaseDegrees`。这些字段也会写入收敛CSV。
 
 ---
 
@@ -442,8 +514,8 @@ k^\star
 
 | 算法入口 | 额外参数 | 主要补偿能力 | 优点 | 局限 |
 |---|---|---|---|---|
-| `RunScalarPIlc` | 无 | 标量误差比例更新 | 最简单，适合流程验证 | 不显式补偿公共复增益和频率选择性记忆 |
-| `RunComplexGainIlc` | 无 | 平均复增益逆 | 可校正平均增益和相位 | 不能完整补偿频率选择性记忆 |
+| `RunScalarPIlc` | `sampleRateHz=1.0` | 对统一同步、复增益对齐后的误差做标量比例更新 | 最简单，适合流程验证 | 不补偿频率选择性记忆 |
+| `RunComplexGainIlc` | `sampleRateHz=1.0` | 在公共复增益已对齐为1的参考域使用正则化标量逆 | 可抑制过激标量步长 | 与Scalar方法的差异主要来自正则化，不能补偿频率选择性记忆 |
 | `RunFirIlc` | `firLength=17` | 有限长时域逆滤波 | 适合线性记忆明显的PA | FIR长度和截断影响效果 |
 | `RunFrequencyDomainIlc` | 采样率、信道带宽 | 正则化逐频点逆和带宽投影 | 宽带Wi-Fi的推荐通用入口 | 采样率至少为2倍信道带宽，并执行低功率响应探测 |
 | `RunDirectionalGaussNewtonIlc` | `finiteDifferenceRms=1e-3` | 当前误差方向上的局部雅可比 | 确定性plant上收敛快 | 每轮额外调用PA，对噪声和漂移敏感 |
@@ -459,8 +531,11 @@ ilcResult = RunComplexGainIlc(
     referenceSignal,
     paModel,
     ilcConfig,
+    sampleRateHz=waveform.sampleRateHz,
 )
 ```
+
+`RunScalarPIlc`、`RunComplexGainIlc`、`RunFirIlc`、`RunDirectionalGaussNewtonIlc`、`RunParameterDomainIlc` 和 `RunAugmentedIqIlc` 都接受可选的 `sampleRateHz`。默认值 `1.0` 表示归一化离散时间，仅用于兼容没有物理采样率的旧仿真。存在CFO或真实采集反馈时，应像上例一样传入实际采样率，保证频偏估计以Hz解释。
 
 频域ILC额外要求采样率和带宽：
 
@@ -1320,17 +1395,20 @@ RunScalarPIlc(
     referenceSignal,
     paModel,
     config=ILCConfig(),
+    sampleRateHz=1.0,
 )
 RunComplexGainIlc(
     referenceSignal,
     paModel,
     config=ILCConfig(),
+    sampleRateHz=1.0,
 )
 RunFirIlc(
     referenceSignal,
     paModel,
     config=ILCConfig(),
     firLength=17,
+    sampleRateHz=1.0,
 )
 RunFrequencyDomainIlc(
     referenceSignal,
@@ -1344,6 +1422,7 @@ RunDirectionalGaussNewtonIlc(
     paModel,
     config=ILCConfig(),
     finiteDifferenceRms=1e-3,
+    sampleRateHz=1.0,
 )
 RunParameterDomainIlc(
     referenceSignal,
@@ -1351,11 +1430,13 @@ RunParameterDomainIlc(
     config=ILCConfig(),
     nonlinearOrders=(1, 3, 5, 7),
     memoryDepth=3,
+    sampleRateHz=1.0,
 )
 RunAugmentedIqIlc(
     referenceSignal,
     paModel,
     config=ILCConfig(),
+    sampleRateHz=1.0,
 )
 RunMimoFrequencyDomainIlc(
     referenceSignal,
@@ -1478,6 +1559,7 @@ customResult = RunWaveformUpdate(
     paModel,
     ilcConfig,
     BuildUpdate,
+    sampleRateHz=waveform.sampleRateHz,
 )
 ```
 

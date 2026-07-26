@@ -976,13 +976,15 @@ P_{\mathrm{NL},k}
 =20\log_{10}(\mathrm{EVM}_{\mathrm{rms}}).
 ```
 
-代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子。`DpdIlc` 在迭代期间完全不调用该方法：`ILCIteration` 只保存原生MSE诊断以及该轮的输入、PA输出。ILC结束后，`Analysis.AnalyzeIlcHistory` 对每轮输出调用普通 `Analyze`，把SNR、EVM、ACLR和原生MSE合并为 `ILCPerformanceIteration`，并在分析层按严格EVM选择最佳轮。MIMO对应使用 `AnalyzeMimoIlcHistory`，它先按轮组合全部PA链，再执行完整空间解映射。
+代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子。`DpdIlc` 在迭代期间完全不调用该方法，但会先调用独立的 `SigProc`，把每轮反馈同步并除去公共复增益，再使用该参考域波形计算原生MSE和ILC更新。`ILCIteration` 保存原生MSE、当前输入、参考域对齐输出以及本轮同步估计。ILC结束后，`Analysis.AnalyzeIlcHistory` 对每轮对齐输出调用普通 `Analyze`，把SNR、EVM、ACLR和原生MSE合并为 `ILCPerformanceIteration`，并在分析层按严格EVM选择最佳轮。MIMO对应使用 `AnalyzeMimoIlcHistory`，它先按轮组合全部PA链，再执行完整空间解映射。
 
 ```mermaid
 flowchart LR
-    ilc["DpdIlc：完成全部迭代"] --> history["ILCIteration：输入、输出、原生MSE"]
+    capture["第 k 轮原始反馈"] --> ilcSync["DpdIlc内部SigProc<br/>时延 / CFO / SFO / 复增益"]
+    ilcSync --> ilc["DpdIlc：参考域误差与全部迭代"]
+    ilc --> history["ILCIteration：输入、对齐输出、原生MSE、同步估计"]
     history --> postAnalysis["Analysis.AnalyzeIlcHistory"]
-    history --> feedback["第 k 轮已保存输出 y_k"]
+    history --> feedback["第 k 轮已保存参考域输出"]
     reference["目标 x"] --> postAnalysis
     postAnalysis --> raw["Raw MSE"]
     feedback --> raw
@@ -997,7 +999,7 @@ flowchart LR
     evmMse --> best["Analysis层选择EVM最佳轮"]
 ```
 
-**图 5-2 说明**：算法层先完成学习并保存每轮波形，分析层随后统一计算RF指标。Raw MSE 用来判断绝对波形是否跟踪目标；LC-MSE 用来快速观察去除公共线性项后的波形形状；EVM-MSE 通过与最终 EVM 完全相同的接收链得到，因此是判断调制质量是否继续改善和选择最终轮次的首选指标。
+**图 5-2 说明**：算法层先完成反馈同步、复增益对齐和学习，再保存每轮参考域波形；分析层随后统一计算RF指标。此处Raw MSE已经不含原始采集的公共增益、公共相位和主要同步误差，用来判断参考域整帧波形是否跟踪目标；LC-MSE继续去除残余的微小公共线性项；EVM-MSE通过与最终EVM完全相同的Wi-Fi接收链得到，因此仍是判断调制质量和选择最终轮次的首选指标。物理PA输出幅度没有丢失：它保存在 `feedbackComplexGain` 中，而 `ILCResult.outputSignal` 仍返回最佳输入对应的原始干净PA输出。
 
 ### 5.9 三种 MSE 应当怎样联合阅读
 
@@ -1023,18 +1025,21 @@ flowchart LR
 
 | 字段 | 数学含义 | 单位/趋势 |
 |---|---|---|
-| `mse` | 整帧绝对时域 MSE | 线性值，越小越好 |
-| `errorRms` | 原始 MSE 的平方根 | 参考幅度单位，越小越好 |
-| `nmseDb` | 原始 MSE/参考功率 | dB，越负越好 |
+| `mse` | 同步、复增益对齐后的整帧参考域 MSE | 线性值，越小越好 |
+| `errorRms` | 参考域 MSE 的平方根 | 参考幅度单位，越小越好 |
+| `nmseDb` | 参考域 MSE/参考功率 | dB，越负越好 |
 | `linearCompensatedMse` | 删除最佳公共复增益后的输入折算 MSE | 线性值，越小越好 |
 | `linearCompensatedNmseDb` | LC-MSE/参考功率 | dB，EVM 代理，越负越好 |
-| `evmAlignedMse` | 数据子载波归一化误差，即 RMS EVM 的平方 | 无量纲，越小越好 |
-| `evmDb` | EVM 对齐 MSE 的 dB 值 | dB，越负越好 |
-| `complexGainMagnitudeDb` | 最佳公共复增益幅度 | dB，用于诊断线性项 |
-| `complexGainPhaseDegrees` | 最佳公共相位 | 度，用于诊断线性项 |
+| `complexGainMagnitudeDb` | 对齐输出的残余公共复增益幅度 | 通常接近0 dB |
+| `complexGainPhaseDegrees` | 对齐输出的残余公共相位 | 通常接近0度 |
 | `inputPeak` | 当前 ILC 输入峰值 | 参考幅度单位，防止削顶 |
 | `inputSignal` | 当前轮进入PA的复波形 | 供外部复测或标签拟合 |
-| `outputSignal` | 当前轮采集到的PA反馈波形 | 供Analysis逐轮计算RF性能 |
+| `outputSignal` | 当前轮同步、复增益归一化后的参考域反馈 | 与参考等长，供Analysis逐轮计算RF性能 |
+| `integerDelaySamples` | 原始反馈的整数时延估计 | 样点 |
+| `fractionalDelaySamples` | 原始反馈的分数时延估计 | 样点 |
+| `carrierFrequencyOffsetHz` | 原始反馈的载波频偏估计 | Hz |
+| `samplingFrequencyOffsetPpm` | 原始反馈的采样频偏估计 | ppm |
+| `feedbackComplexGain` | 原始反馈相对参考的公共复增益 | 复数，保留物理幅度和相位 |
 
 `Analysis.AnalyzeIlcHistory` 或 `AnalyzeMimoIlcHistory` 生成的 `ILCPerformanceIteration` 复制上述标量诊断，并增加：
 
@@ -1047,6 +1052,12 @@ flowchart LR
 | `aclrLowerDb` | 主信道相对下邻道功率比 | dB，越大越好 |
 | `aclrUpperDb` | 主信道相对上邻道功率比 | dB，越大越好 |
 | `aclrWorstDb` | 两侧ACLR中的较小值 | dB，越大越好 |
+| `feedbackIntegerDelaySamples` | ILC内部整数时延估计 | SISO为原值，MIMO为逐链平均 |
+| `feedbackFractionalDelaySamples` | ILC内部分数时延估计 | 样点 |
+| `feedbackCarrierFrequencyOffsetHz` | ILC内部载波频偏估计 | Hz |
+| `feedbackSamplingFrequencyOffsetPpm` | ILC内部采样频偏估计 | ppm |
+| `feedbackComplexGainMagnitudeDb` | 原始反馈公共增益幅度 | dB |
+| `feedbackComplexGainPhaseDegrees` | 原始反馈公共相位 | 度 |
 
 `Analysis.PrintConvergence`、`Analysis.SaveConvergence` 和 `Draw.SaveConvergenceCurve` 只接收这组已经完成RF分析的性能历史。当前 MIMO ILC 按每个物理 PA 独立学习；单独一条 PA 链无法完成跨链空间解映射，所以 `AnalyzeMimoIlcHistory` 会在同一轮组合全部链的输入和输出，再计算严格逐空间流EVM。这里故意不把单链LC-MSE误标成空间流EVM。
 

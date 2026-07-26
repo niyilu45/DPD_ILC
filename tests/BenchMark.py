@@ -289,6 +289,12 @@ def SaveHistory(
                 "aclrWorstDb",
                 "complexGainMagnitudeDb",
                 "complexGainPhaseDegrees",
+                "feedbackIntegerDelaySamples",
+                "feedbackFractionalDelaySamples",
+                "feedbackCarrierFrequencyOffsetHz",
+                "feedbackSamplingFrequencyOffsetPpm",
+                "feedbackComplexGainMagnitudeDb",
+                "feedbackComplexGainPhaseDegrees",
                 "inputPeak",
             ),
         )
