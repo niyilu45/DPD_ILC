@@ -1155,6 +1155,19 @@ def CheckMimoSpatialStructure() -> None:
             len(mimoMetrics["evmDbPerSpatialStream"])
             == streamCount
         )
+        assert (
+            len(mimoMetrics["outputPowerDbmPerChain"])
+            == transmitCount
+        )
+        aggregatePowerMilliwatt = sum(
+            10.0 ** (powerDbm / 10.0)
+            for powerDbm in mimoMetrics["outputPowerDbmPerChain"]
+        )
+        assert np.isclose(
+            idealMetrics["outputPowerDbm"],
+            10.0 * np.log10(aggregatePowerMilliwatt),
+            atol=1.0e-10,
+        )
 
     # Standard-generation stream limits are enforced independently from the
     # number of physical antennas available to the caller.
@@ -1342,11 +1355,24 @@ def CheckIdealMetrics() -> None:
             "aclrLowerDb",
             "aclrUpperDb",
             "aclrWorstDb",
+            "outputPowerDbm",
         }
         assert not hasattr(metrics, "ToDict")
         assert metrics["snrDb"] > 250.0
         assert metrics["evmDb"] < -250.0
         assert metrics["evmPercent"] < 1e-10
+        normalizedReferenceRms = float(
+            np.sqrt(np.mean(np.abs(resultAnalysis.referenceSignal) ** 2))
+        )
+        expectedOutputPowerDbm = (
+            resultAnalysis.GetParameters()["maximumOutputPowerDbm"]
+            + 20.0 * np.log10(normalizedReferenceRms)
+        )
+        assert np.isclose(
+            metrics["outputPowerDbm"],
+            expectedOutputPowerDbm,
+            atol=1.0e-10,
+        )
 
 
 def CheckSignalProcessingCompensation() -> None:
@@ -1438,6 +1464,19 @@ def CheckSignalProcessingCompensation() -> None:
     )
     metrics = resultAnalysis.Analyze(measuredSignal)
     assert metrics["evmDb"] < -30.0
+    expectedOutputPowerDbm = (
+        25.0
+        + 20.0
+        * np.log10(
+            abs(expectedComplexGain)
+            * np.sqrt(
+                np.mean(np.abs(resultAnalysis.referenceSignal) ** 2)
+            )
+        )
+    )
+    assert abs(
+        metrics["outputPowerDbm"] - expectedOutputPowerDbm
+    ) < 0.25
     assert resultAnalysis.GetLastSignalProcessingResult() is not None
     assert (
         resultAnalysis.GetParameters()["signalProcessingParameters"]

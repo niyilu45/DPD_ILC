@@ -69,7 +69,7 @@ python tests/BenchMark.py --format EHT --bandwidth 20 --sample-rate-hz 60000000 
 
 - `all_ilc_metrics.csv`：所有场景和方法的统一指标；
 - `all_ilc_metrics.json`：带完整配置元数据的结构化结果；
-- `convergence_*.csv`：每个 ILC 每一轮的 Raw MSE、LC-MSE 和 EVM-MSE；
+- `convergence_*.csv`：每个 ILC 每一轮的 Raw MSE、LC-MSE、EVM-MSE和模拟输出功率；
 - `convergence_*.png`：每个方法的迭代收敛曲线；
 - `all_ilc_power_evm_curve.csv/json/png`：所有方法同图比较的功率-EVM结果。
 
@@ -529,7 +529,7 @@ benchmarkRows = RunAllIlcBenchmark(benchmarkConfig)
 | `BenchmarkConfig.Validate` | 配置对象自身 | 无；非法时抛出异常 | 在长时间仿真开始前检查符号数、采样率、统一I/Q位宽、功率范围和迭代数 |
 | `BenchmarkRow.ToDict` | 单行结果 | 扁平字典 | 让CSV和JSON使用完全相同的数值 |
 | `AddRow` | 方法指标、同场景baseline指标 | 向结果列表追加一行 | 统一SNR、EVM、ACLR改善量的正负方向 |
-| `SaveHistory` | 方法名、`ILCResult`、目录 | 每种方法一个CSV和PNG | 保存每一轮Raw MSE、LC-MSE、EVM-MSE和输入峰值 |
+| `SaveHistory` | 方法名、`ILCResult`、目录 | 每种方法一个CSV和PNG | 保存每一轮Raw MSE、LC-MSE、EVM-MSE、模拟输出功率和输入峰值 |
 | `ReportHistory` | 方法结果、`Analysis` | 控制台表格并调用 `SaveHistory` | 保证控制台和文件使用同一份不可变迭代记录 |
 | `EvaluateDeployment` | 拟合DPD、验证帧、PA、幅度上限 | 普通指标字典 | 在独立帧上执行DPD、限幅、PA和统一分析 |
 | `RunIlcCurvePoint` | 当前功率点参考、算法和配置 | 当前功率点PA输出 | 为功率扫描重新绑定EVM-MSE并重新运行波形ILC |

@@ -258,11 +258,13 @@ flowchart LR
     A["采集输入/输出"] --> B["FFT 互相关粗整数时延"]
     B --> C["分块复增益相位斜率 CFO"]
     C --> D["局部相关峰：分数时延与 SFO"]
-    D --> E["Lanczos-sinc 重采样与公共复增益"]
-    E --> F["SNR/EVM/ACLR"]
+    D --> E["Lanczos-sinc 重采样与公共复增益估计"]
+    E --> power["恢复增益前幅度并计算输出功率"]
+    E --> compensate["除以公共复增益"]
+    compensate --> F["SNR/EVM/ACLR"]
 ```
 
-**图 2 说明**：同步误差必须在非线性评价之前处理，否则分析器会把“没有对齐”误判为 PA 或 DPD 失真。待测数组在同步前可以与参考长度不同；重采样结果固定映射到参考网格。完整估计公式、参数和边界见 [SigProc.md](./SigProc.md)。
+**图 2 说明**：同步误差必须在非线性评价之前处理，否则分析器会把“没有对齐”误判为 PA 或 DPD 失真。待测数组在同步前可以与参考长度不同；重采样结果固定映射到参考网格。输出功率保留公共复增益所代表的真实幅度，SNR、EVM和ACLR则继续使用去除公共复增益后的波形。完整估计公式、参数和边界见 [SigProc.md](./SigProc.md)。
 
 ---
 
@@ -324,6 +326,75 @@ J(g)
 ```
 
 因此一个统一的线性增益差和固定相位差不会被计作误差。这样比较 PA 与 DPD 时，指标更关注波形形状失真，而不是无关的标量增益。
+
+### 3.1 模拟输出功率为何必须在复增益补偿前计算
+
+设完成整数/分数时延、CFO和SFO校正后的第 $m$ 路 PA 输出为 $y_m[n]$。`SigProc.Process` 保存公共复增益 $\hat g_m$，并把补偿后的波形返回为
+
+```math
+z_m[n]=\frac{y_m[n]}{\hat g_m}.
+```
+
+如果直接对 $z_m[n]$ 求功率，公共幅度增益已经被除掉，PA压缩、线性增益以及测试链路增益都会被错误地隐藏。因此 `Analysis.CalculateOutputPower` 先用缓存结果恢复同步后、增益补偿前的幅度：
+
+```math
+\tilde y_m[n]=\hat g_m z_m[n].
+```
+
+只恢复幅度不会撤销同步。$\tilde y_m[n]$ 仍位于参考采样网格上，其长度等于有效参考区间，所以发送端或接收端在帧外增加的前后补零不会拉低平均功率。第 $m$ 路归一化复包络 RMS 为
+
+```math
+a_m=
+\sqrt{
+\frac{1}{N}
+\sum_{n=0}^{N-1}
+\left|\tilde y_m[n]\right|^2
+}.
+```
+
+本工程采用明确的满量程标定约定：归一化 RMS 等于 1 时，对应 `maximumOutputPowerDbm`。设该额定值为 $P_{\mathrm{max,dBm}}$，端口电阻为 $R$，则满量程 RMS 电压为
+
+```math
+V_{\mathrm{FS}}=
+\sqrt{
+R\cdot 10^{-3}\cdot
+10^{P_{\mathrm{max,dBm}}/10}
+}.
+```
+
+实际第 $m$ 路 RMS 电压和输出功率分别为
+
+```math
+V_m=a_m V_{\mathrm{FS}},
+```
+
+```math
+\begin{aligned}
+P_{m,\mathrm{dBm}}
+&=10\log_{10}
+\left(
+\frac{V_m^2/R}{10^{-3}}
+\right)\\
+&=P_{\mathrm{max,dBm}}+20\log_{10}(a_m).
+\end{aligned}
+```
+
+默认值是 $R=50\ \Omega$、$P_{\mathrm{max,dBm}}=25\ \mathrm{dBm}$。定点模式先把公开整数 I/Q 码按位宽解码成归一化复包络，再使用同一公式，所以浮点和定点入口具有相同的功率定义。若外部系统使用不同的满量程功率，必须通过 `maximumOutputPowerDbm` 传入实际标定值；它不是由EVM或复增益自动猜测出来的。
+
+MIMO 的每路 PA 是独立传导端口，不能把复电压直接相加。总输出功率应先在线性功率域相加：
+
+```math
+P_{\mathrm{all,mW}}
+=\sum_{m=1}^{N_{\mathrm{TX}}}
+10^{P_{m,\mathrm{dBm}}/10},
+```
+
+```math
+P_{\mathrm{all,dBm}}
+=10\log_{10}\left(P_{\mathrm{all,mW}}\right).
+```
+
+因此 `metrics["outputPowerDbm"]` 在SISO时等于单路功率，在MIMO时表示全部独立PA端口的功率和；`GetLastMimoMetrics()["outputPowerDbmPerChain"]` 则保留每一路结果。该汇总不表示某个远场方向的相干阵列功率，后者还需要天线阵列与无线信道模型。
 
 ---
 
@@ -1509,6 +1580,7 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 | `aclrLowerDbPerChain` | 物理 PA 链 | 每链下邻道 ACLR |
 | `aclrUpperDbPerChain` | 物理 PA 链 | 每链上邻道 ACLR |
 | `aclrWorstDbPerChain` | 物理 PA 链 | 每链较差邻道 ACLR |
+| `outputPowerDbmPerChain` | 物理 PA 链 | 同步后、公共复增益补偿前的每链模拟输出功率 |
 | `evmDbPerSpatialStream` | 空间流 | 解映射后每流 RMS EVM dB |
 | `evmPercentPerSpatialStream` | 空间流 | 解映射后每流 RMS EVM 百分比 |
 
@@ -1528,6 +1600,7 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 | `aclrLowerDb` | 主信道/下邻道功率比 | 越大越好 |
 | `aclrUpperDb` | 主信道/上邻道功率比 | 越大越好 |
 | `aclrWorstDb` | 上下邻道较差者 | 越大越好 |
+| `outputPowerDbm` | SISO单端口功率，或MIMO全部独立PA端口的功率和 | 工作点量，不按越大或越小判优 |
 
 `SignalProcessingResult` 保存校正后的 `processedSignal`，以及整数时延、分数时延、CFO Hz、SFO ppm 和复增益。`ToDict()` 仅输出标量估计；`Analysis.Save` 会把各阶段、各物理链估计写入 `metrics.json` 的 `signalProcessing` 数组，并以 `chain1.*`、`chain2.*` 等列追加到 `metrics.csv`。
 
@@ -1546,7 +1619,7 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 
 ILC 每轮收敛结果另外输出：
 
-- `ilc_convergence.csv`：每轮 Raw MSE、Raw NMSE、LC-MSE、LC-NMSE、EVM-MSE、EVM dB、公共复增益和输入峰值；
+- `ilc_convergence.csv`：每轮 Raw MSE、Raw NMSE、LC-MSE、LC-NMSE、EVM-MSE、模拟输出功率、EVM dB、公共复增益和输入峰值；
 - `ilc_convergence.png`：把 Raw NMSE、LC-NMSE 和 EVM-MSE/EVM dB 画在同一个 dB 坐标系中；
 - MIMO时 `AnalyzeMimoIlcHistory` 按轮组合全部PA链，再输出包含完整空间流EVM的统一收敛历史。
 
@@ -1565,6 +1638,7 @@ ILC 每轮收敛结果另外输出：
 | 最佳复增益 | `SigProc.EstimateComplexGain` |
 | Wi-Fi 数据字段处理 | `FrameProcess.DemodulatePreparedWifiData` |
 | 数据字段 SNR | `Analysis.CalculateSnr` |
+| 模拟输出功率 | `Analysis.CalculateOutputPower` |
 | OFDM 数据解调 | `Analysis.DemodulateWifiData` |
 | EVM 对齐 MSE | `Analysis.CalculateEvmAlignedMse` |
 | RMS EVM | `Analysis.CalculateEvm` |
@@ -1612,6 +1686,7 @@ metrics = resultAnalysis.Analyze(paOutput)
 processingResult = resultAnalysis.GetLastSignalProcessingResult()
 print(processingResult.ToDict())
 print(metrics)
+print(metrics["outputPowerDbm"])
 print(metrics["snrDb"])
 print(metrics["evmDb"], metrics["evmPercent"])
 print(

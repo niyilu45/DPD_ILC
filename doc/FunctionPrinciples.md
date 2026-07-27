@@ -257,7 +257,7 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `Analysis.Analyze`, `Analysis.GetLastMimoMetrics` | E | 直接返回普通指标字典，调用方使用固定键读取SNR、EVM、ACLR和MIMO明细 | Analysis §10 |
+| `Analysis.Analyze`, `Analysis.GetLastMimoMetrics` | E | 直接返回普通指标字典，调用方使用固定键读取模拟输出功率、SNR、EVM、ACLR和MIMO明细 | Analysis §3.1、§10 |
 | `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把曲线或逐轮记录转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann 窗、50% 重叠的 Welch PSD 平均 | Analysis §6.2 |
 | `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考；发送辅助直接相关并截取公共区间；仅盲模式调用ParseWifi；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§2、§11、ParseWifi §8 |
@@ -265,6 +265,7 @@ flowchart LR
 | `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc` | Analysis §2、§9 |
 | `Analysis.GetLastSignalProcessingResult`, `Analysis.GetLastSignalProcessingResults`, `Analysis.GetLastMimoMetrics`, `Analysis.GetStageSignalProcessingResults`, `Analysis.GetStageMimoMetrics` | E | 返回缓存的不可变结果，不重新估计 | Analysis §9–§10 |
 | `Analysis.ValidatePreparedSignal` | E | 确保 prepared 数据与参考网格形状和有限性一致 | Analysis §2 |
+| `Analysis.CalculateOutputPower` | P/N | 恢复同步后、公共复增益补偿前的幅度，以额定满量程dBm标定每链RMS，并在线性功率域汇总MIMO端口 | Analysis §3.1、§9.4 |
 | `Analysis.CalculateSnr`, `Analysis.CalculatePreparedSnr` | P/N | 数据字段参考功率/校正残差功率 | Analysis §4 |
 | `Analysis.DemodulateWifiData`, `Analysis.DemodulatePreparedWifiData` | E/P | 把校正信号委托给 `FrameProcess` 完成 Wi-Fi OFDM 与空间解映射 | Analysis §5.1、FrameProcess §3–§4 |
 | `Analysis.CalculateEvm`, `Analysis.CalculatePreparedEvm` | P/N | 数据星座 RMS EVM 及 dB/% 换算 | Analysis §5.2 |
@@ -273,7 +274,7 @@ flowchart LR
 | `Analysis.CalculatePreparedEvmPerSpatialStream` | P/N | 空间解映射后逐流星座误差能量比 | Analysis §9.1 |
 | `Analysis.IntegrateAclr` | P/N | 等宽主/邻道 PSD 积分并取较差邻道 | Analysis §6.1、§6.3 |
 | `Analysis.CalculateAclr`, `Analysis.CalculatePreparedAclr`, `Analysis.CalculatePreparedAclrPerChain` | P/N | 数据字段 Welch PSD 的汇总/逐链 ACLR | Analysis §6、§9.3 |
-| `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让 SNR/EVM/ACLR 共用一次同步结果并保存阶段映射 | Analysis §1 |
+| `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让输出功率/SNR/EVM/ACLR共用一次同步结果并保存阶段映射 | Analysis §1、§3.1 |
 | `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO对齐输出，复制反馈同步估计，并在Analysis中按严格EVM选择最佳实测轮 | DpdIlc §7、Analysis §5.10 |
 | `Analysis.AnalyzeMimoIlcHistory` | P/E | 按轮组合各PA链输出，以完整MIMO空间解映射统一计算性能并在Analysis中选择最佳轮 | Analysis §9 |
 | `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同的每路目标输出 dBm 点公平比较各方法EVM，按相对25 dBm额定极限的回退设置归一化驱动，并保存目标输出RMS电压 | Analysis §8 |

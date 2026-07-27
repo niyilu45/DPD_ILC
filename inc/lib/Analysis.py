@@ -69,6 +69,7 @@ class SignalMetrics(TypedDict):
     aclrLowerDb: float
     aclrUpperDb: float
     aclrWorstDb: float
+    outputPowerDbm: float
 
 
 class MimoSignalMetrics(TypedDict):
@@ -80,6 +81,7 @@ class MimoSignalMetrics(TypedDict):
     aclrLowerDbPerChain: Tuple[float, ...]
     aclrUpperDbPerChain: Tuple[float, ...]
     aclrWorstDbPerChain: Tuple[float, ...]
+    outputPowerDbmPerChain: Tuple[float, ...]
 
 
 @dataclass
@@ -145,6 +147,7 @@ class ILCPerformanceIteration:
     feedbackSamplingFrequencyOffsetPpm: float
     feedbackComplexGainMagnitudeDb: float
     feedbackComplexGainPhaseDegrees: float
+    outputPowerDbm: float
     snrDb: float
     evmAlignedMse: float
     evmDb: float
@@ -967,6 +970,83 @@ class Analysis:
             )
         return complexPrepared
 
+    def CalculateOutputPower(
+        self, preparedSignal: np.ndarray
+    ) -> Tuple[float, Tuple[float, ...]]:
+        """Calculate simulated output power before complex-gain removal.
+
+        Processing details:
+            Algorithm: Reconstruct each synchronized measured PA output by
+            multiplying the compensated signal by the complex gain retained
+            by ``SigProc``. Compute one normalized RMS value per conducted
+            chain, map normalized RMS equal to one onto
+            ``maximumOutputPowerDbm``, and sum independent chain powers for
+            the aggregate MIMO result.
+
+        Args:
+            preparedSignal: Signal returned by ``PrepareMeasuredSignal``.
+
+        Returns:
+            result: Aggregate output power in dBm followed by a chain-ordered
+                tuple of conducted output powers in dBm.
+        """
+
+        complexPrepared = self.ValidatePreparedSignal(preparedSignal)
+        preparedMatrix = (
+            complexPrepared.reshape(-1, 1)
+            if complexPrepared.ndim == 1
+            else complexPrepared
+        )
+        if len(self.lastSignalProcessingResults) != preparedMatrix.shape[1]:
+            raise RuntimeError(
+                "PrepareMeasuredSignal must run before output-power analysis"
+            )
+
+        # ``processedSignal`` is the aligned measured waveform divided by the
+        # estimated common complex gain. Restoring that gain preserves the PA
+        # output amplitude while retaining timing/CFO/SFO alignment and the
+        # reference-length valid interval.
+        alignedMeasuredMatrix = np.column_stack(
+            [
+                preparedMatrix[:, chainIndex]
+                * self.lastSignalProcessingResults[
+                    chainIndex
+                ].complexGain
+                for chainIndex in range(preparedMatrix.shape[1])
+            ]
+        )
+        normalizedRmsPerChain = np.sqrt(
+            np.mean(np.abs(alignedMeasuredMatrix) ** 2, axis=0)
+        )
+        powerCalibration = PowerCalibration(
+            loadResistanceOhm=self.parameters["loadResistanceOhm"],
+            maximumOutputPowerDbm=self.parameters[
+                "maximumOutputPowerDbm"
+            ],
+        )
+        fullScaleRmsVoltage = powerCalibration.DbmToRms(
+            powerCalibration.maximumOutputPowerDbm
+        )
+        outputRmsVoltagePerChain = (
+            normalizedRmsPerChain * fullScaleRmsVoltage
+        )
+        minimumPositive = np.finfo(float).tiny
+        outputPowerDbmPerChain = tuple(
+            float("-inf")
+            if outputRmsVoltage <= minimumPositive
+            else powerCalibration.RmsToDbm(float(outputRmsVoltage))
+            for outputRmsVoltage in outputRmsVoltagePerChain
+        )
+        aggregateRmsVoltage = float(
+            np.sqrt(np.sum(outputRmsVoltagePerChain**2))
+        )
+        aggregateOutputPowerDbm = (
+            float("-inf")
+            if aggregateRmsVoltage <= minimumPositive
+            else powerCalibration.RmsToDbm(aggregateRmsVoltage)
+        )
+        return aggregateOutputPowerDbm, outputPowerDbmPerChain
+
     def CalculateSnr(self, measuredSignal: np.ndarray) -> float:
         """Calculate data-field SNR after removing one complex gain and phase.
 
@@ -1483,7 +1563,7 @@ class Analysis:
     def Analyze(
         self, measuredSignal: Optional[np.ndarray] = None
     ) -> SignalMetrics:
-        """Calculate SNR, EVM, and ACLR for one measured waveform.
+        """Calculate power, SNR, EVM, and ACLR for one measured waveform.
 
         Processing details:
             Algorithm: Use the explicit measured waveform in reference mode,
@@ -1496,7 +1576,8 @@ class Analysis:
                 stored reference. Omit in assisted and blind modes.
 
         Returns:
-            result: Ordinary dictionary containing SNR, EVM, and ACLR values.
+            result: Ordinary dictionary containing output power, SNR, EVM,
+                and ACLR values.
         """
 
         selectedSignal = measuredSignal
@@ -1511,6 +1592,10 @@ class Analysis:
         # Synchronization is intentionally executed once. The same corrected
         # samples feed all metrics so SNR, EVM, and ACLR remain comparable.
         complexMeasured = self.PrepareMeasuredSignal(selectedSignal)
+        (
+            outputPowerDbm,
+            outputPowerDbmPerChain,
+        ) = self.CalculateOutputPower(complexMeasured)
         snrDb = self.CalculatePreparedSnr(complexMeasured)
         evmDb, evmPercent = self.CalculatePreparedEvm(complexMeasured)
         (
@@ -1541,6 +1626,7 @@ class Analysis:
                 "aclrLowerDbPerChain": perChainAclrLowerDb,
                 "aclrUpperDbPerChain": perChainAclrUpperDb,
                 "aclrWorstDbPerChain": perChainAclrWorstDb,
+                "outputPowerDbmPerChain": outputPowerDbmPerChain,
             }
         else:
             self.lastMimoMetrics = None
@@ -1551,6 +1637,7 @@ class Analysis:
             "aclrLowerDb": float(aclrLowerDb),
             "aclrUpperDb": float(aclrUpperDb),
             "aclrWorstDb": float(aclrWorstDb),
+            "outputPowerDbm": float(outputPowerDbm),
         }
 
     def AnalyzeStages(
@@ -1808,14 +1895,16 @@ class Analysis:
         if not selectedMetrics:
             raise ValueError("no stage metrics are available to print")
         header = (
-            f"{'Stage':<16} {'SNR(dB)':>10} {'EVM(dB)':>10} "
+            f"{'Stage':<16} {'Pout(dBm)':>10} {'SNR(dB)':>10} "
+            f"{'EVM(dB)':>10} "
             f"{'EVM(%)':>10} {'ACLR-L':>10} {'ACLR-U':>10} {'ACLR-W':>10}"
         )
         print(header)
         print("-" * len(header))
         for stageName, metrics in selectedMetrics.items():
             print(
-                f"{stageName:<16} {metrics['snrDb']:>10.2f} "
+                f"{stageName:<16} {metrics['outputPowerDbm']:>10.2f} "
+                f"{metrics['snrDb']:>10.2f} "
                 f"{metrics['evmDb']:>10.2f} "
                 f"{metrics['evmPercent']:>10.3f} "
                 f"{metrics['aclrLowerDb']:>10.2f} "
@@ -1853,14 +1942,17 @@ class Analysis:
         for stageName, metrics in selectedMetrics.items():
             print(f"\n{stageName} - conducted PA-chain metrics")
             print(
-                f"{'PA':<8} {'SNR(dB)':>10} {'ACLR-L':>10} "
+                f"{'PA':<8} {'Pout(dBm)':>10} {'SNR(dB)':>10} "
+                f"{'ACLR-L':>10} "
                 f"{'ACLR-U':>10} {'ACLR-W':>10}"
             )
             for chainIndex, snrDb in enumerate(
                 metrics["snrDbPerChain"]
             ):
                 print(
-                    f"PA {chainIndex + 1:<5} {snrDb:>10.2f} "
+                    f"PA {chainIndex + 1:<5} "
+                    f"{metrics['outputPowerDbmPerChain'][chainIndex]:>10.2f} "
+                    f"{snrDb:>10.2f} "
                     f"{metrics['aclrLowerDbPerChain'][chainIndex]:>10.2f} "
                     f"{metrics['aclrUpperDbPerChain'][chainIndex]:>10.2f} "
                     f"{metrics['aclrWorstDbPerChain'][chainIndex]:>10.2f}"
@@ -1940,6 +2032,7 @@ class Analysis:
             "aclrLowerDb",
             "aclrUpperDb",
             "aclrWorstDb",
+            "outputPowerDbm",
         ]
         processingFieldNames = []
         for processingChains in serializableProcessingResults.values():
@@ -2114,6 +2207,7 @@ class Analysis:
                             )
                         )
                     ),
+                    outputPowerDbm=signalMetrics["outputPowerDbm"],
                     snrDb=signalMetrics["snrDb"],
                     evmAlignedMse=evmAlignedMse,
                     evmDb=signalMetrics["evmDb"],
@@ -2396,6 +2490,7 @@ class Analysis:
                     feedbackComplexGainPhaseDegrees=float(
                         np.degrees(np.angle(averageFeedbackGain))
                     ),
+                    outputPowerDbm=signalMetrics["outputPowerDbm"],
                     snrDb=signalMetrics["snrDb"],
                     evmAlignedMse=evmAlignedMse,
                     evmDb=signalMetrics["evmDb"],
@@ -2453,6 +2548,7 @@ class Analysis:
             "nmseDb",
             "linearCompensatedMse",
             "linearCompensatedNmseDb",
+            "outputPowerDbm",
             "snrDb",
             "evmAlignedMse",
             "evmDb",
@@ -2487,6 +2583,9 @@ class Analysis:
                         ),
                         "linearCompensatedNmseDb": (
                             iterationRecord.linearCompensatedNmseDb
+                        ),
+                        "outputPowerDbm": (
+                            iterationRecord.outputPowerDbm
                         ),
                         "snrDb": iterationRecord.snrDb,
                         "evmAlignedMse": iterationRecord.evmAlignedMse,
@@ -2552,7 +2651,8 @@ class Analysis:
         header = (
             f"{'Iter':>4} {'Raw MSE':>12} {'Raw NMSE':>10} "
             f"{'LC-MSE':>12} {'LC-NMSE':>10} {'EVM-MSE':>12} "
-            f"{'EVM(dB)':>9} {'SNR(dB)':>9} {'ACLR(dB)':>10} "
+            f"{'Pout':>9} {'EVM(dB)':>9} {'SNR(dB)':>9} "
+            f"{'ACLR(dB)':>10} "
             f"{'Delay':>9} {'CFO(Hz)':>10} "
             f"{'Gain(dB)':>9} {'Phase(deg)':>11} "
             f"{'Peak':>9}"
@@ -2567,6 +2667,7 @@ class Analysis:
                 f"{iterationRecord.linearCompensatedMse:>12.5e} "
                 f"{iterationRecord.linearCompensatedNmseDb:>10.2f} "
                 f"{iterationRecord.evmAlignedMse:>12.5e} "
+                f"{iterationRecord.outputPowerDbm:>9.2f} "
                 f"{iterationRecord.evmDb:>9.2f} "
                 f"{iterationRecord.snrDb:>9.2f} "
                 f"{iterationRecord.aclrWorstDb:>10.2f} "

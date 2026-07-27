@@ -289,6 +289,7 @@ def SaveHistory(
                 "nmseDb",
                 "linearCompensatedMse",
                 "linearCompensatedNmseDb",
+                "outputPowerDbm",
                 "snrDb",
                 "evmAlignedMse",
                 "evmDb",

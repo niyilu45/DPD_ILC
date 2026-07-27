@@ -1,6 +1,6 @@
 # DPD-ILC VHT/HE/EHT Wi-Fi 仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `WaveGenWifi` 实例生成 802.11ac/VHT、802.11ax/HE 或 802.11be/EHT Wi-Fi 复基带训练波形，支持 1–8 条空间流及物理发射链，经每路独立的 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以每路 GMP 拟合可复用的 DPD，并输出汇总及逐 PA/逐空间流 SNR、EVM、ACLR，以及多方法功率-EVM 对比曲线。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `WaveGenWifi` 实例生成 802.11ac/VHT、802.11ax/HE 或 802.11be/EHT Wi-Fi 复基带训练波形，支持 1–8 条空间流及物理发射链，经每路独立的 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以每路 GMP 拟合可复用的 DPD，并输出汇总及逐 PA/逐空间流模拟功率、SNR、EVM、ACLR，以及多方法功率-EVM 对比曲线。
 
 ## 理论文档
 
@@ -32,7 +32,7 @@ python -m pip install -r requirements.txt
 ```text
 main.py                 命令行主程序
 SmallestSISO.py         浮点与16位定点SISO EHT/GMP/ILC对比示例
-inc/lib/Analysis.py         SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
+inc/lib/Analysis.py         模拟功率、SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
 inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
 inc/lib/Fec.py              55/90短块LDPC矩阵构造、系统编码和软输入译码
 inc/lib/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
@@ -184,8 +184,8 @@ flowchart TD
     sigProc --> analysisMethod["Analysis.Analyze / AnalyzeStages"]
     frameProcess --> analysisMethod
     analysis --> analysisMethod
-    analysisMethod --> metrics["汇总 SNR / EVM / ACLR"]
-    analysisMethod --> mimoMetrics["逐 PA SNR/ACLR + 逐空间流 EVM"]
+    analysisMethod --> metrics["汇总输出功率 / SNR / EVM / ACLR"]
+    analysisMethod --> mimoMetrics["逐 PA 功率/SNR/ACLR + 逐空间流 EVM"]
     analysisMethod --> powerCurve["多方法功率-EVM 扫描"]
     metrics --> console["控制台表格"]
     metrics --> files["CSV / JSON / 收敛历史"]
@@ -611,14 +611,14 @@ flowchart TD
 - 原有显式参考路径保持不变：构造时保存参考信号和 `WifiWaveform`，待测输出传给 `Analyze(measuredSignal)`。
 - 传入 `transmittedSignal` 时进入发送辅助路径。发送和接收都可为NumPy数组或 `WifiWaveform`；内部直接取得样值、搜索公共重叠区并将发送样值作为Reference，不调用 `ParseWifi`，也不恢复Descriptor、seed、MCS或GI。发送波形可以被裁剪或前后补零。
 - 仅当既没有 `waveform`、也没有 `transmittedSignal` 时进入盲分析路径，第一个输入作为接收帧交给 `ParseWifi`，恢复上下文后允许零参数 `Analyze()`。
-- `AnalyzeIlcHistory` 在ILC完成后读取每轮保存的输入和PA输出，用普通 `Analyze` 逐轮计算SNR、EVM和ACLR；`AnalyzeMimoIlcHistory` 先按轮组合各PA链，再使用完整空间流接收结构分析。两者都在Analysis层按严格EVM返回最佳轮。
+- `AnalyzeIlcHistory` 在ILC完成后读取每轮保存的输入和PA输出，用普通 `Analyze` 逐轮计算模拟输出功率、SNR、EVM和ACLR；`AnalyzeMimoIlcHistory` 先按轮组合各PA链，再使用完整空间流接收结构分析。两者都在Analysis层按严格EVM返回最佳轮。
 - 每次 `Analyze` 只调用一次 `SigProc.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
 - SNR 直接计算校正后数据字段与参考的残差功率；EVM 由 `FrameProcess` 根据 `WifiWaveform` 的数据字段位置去循环前缀、FFT、撤销 CSD 和空间解映射，再与采用相同接收路径得到的参考星座比较。
 - ACLR 通过 `AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
-- `Analyze` 直接返回包含SNR、EVM和ACLR的普通Python字典；调用方用 `metrics["evmDb"]` 读取结果。字典也可以直接交给 `Print`，或由 `Save` 写入JSON/CSV。
+- `Analyze` 直接返回包含模拟输出功率、SNR、EVM和ACLR的普通Python字典；调用方用 `metrics["outputPowerDbm"]` 和 `metrics["evmDb"]` 读取结果。功率在同步后、公共复增益补偿前计算，帧外补零不参与RMS；字典也可以直接交给 `Print`，或由 `Save` 写入JSON/CSV。
 - `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
-- `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、公共复增益幅相和输入峰值。
-- MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
+- `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、模拟输出功率、公共复增益幅相和输入峰值。
+- MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA 输出功率/SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
 - `AnalyzePowerEvmCurve` 接收一组严格递增的每路PA输出功率点和多个方法求值器，以25 dBm默认极限为0 dB输出回退确定归一化驱动。EVM直接分析公开PA码值，目标RMS电压单独保存用于功率审计，避免把物理伏特误当成定点码；`SavePowerEvmCurveData` 只保存原始CSV/JSON数据，不导入或调用任何绘图库。
 
 ### `inc/utils/Draw.py`
@@ -1011,8 +1011,8 @@ print(assistedMetrics["evmDb"])
 | `maxSegmentLength` | `16384` | Welch PSD 的最大分段长度，必须是不小于 16 的整数。 |
 | `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
 | `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
-| `loadResistanceOhm` | `50.0` | 功率扫描中 dBm 与参考波形 RMS 电压换算所用的端口电阻。 |
-| `maximumOutputPowerDbm` | `25.0` | 功率扫描的每路PA极限输出，也是0 dB输出回退参考。 |
+| `loadResistanceOhm` | `50.0` | 模拟输出功率和功率扫描中 dBm 与复包络 RMS 电压换算所用的端口电阻。 |
+| `maximumOutputPowerDbm` | `25.0` | 归一化RMS等于1时的每路PA满量程功率，也是功率扫描的0 dB输出回退参考。 |
 | `signalProcessingParameters` | `None` | 显式构造参数；作为普通覆盖字典传给 `SigProc`，`None` 使用其内部默认值。旧版 `parameters={"signalProcessingParameters": {...}}` 写法仍兼容。 |
 | `parseParameters` | `None` | 仅盲分析路径传给 `ParseWifi` 的普通覆盖字典；其他路径不接受该参数。 |
 | `transmittedSignal` | `None` | 可选发送NumPy数组或 `WifiWaveform`；一旦提供就直接作为Reference并彻底绕过 `ParseWifi`。 |
@@ -1054,22 +1054,23 @@ assert resultAnalysis.width == 16
 | `GetLastMimoMetrics()` | 无 | 返回最近一次逐PA/逐空间流明细字典。 |
 | `GetStageSignalProcessingResults()` | 无 | 返回 `AnalyzeStages` 保存的各阶段逐链同步估计。 |
 | `GetStageMimoMetrics()` | 无 | 返回各阶段详细 MIMO 指标。 |
+| `CalculateOutputPower(preparedSignal)` | `PrepareMeasuredSignal` 的输出 | 恢复公共复增益前的幅度，返回 `(汇总dBm, 逐链dBm元组)`；通常由 `Analyze` 内部调用。 |
 | `CalculateSnr(measuredSignal)` | 待测输出 | 返回数据字段 SNR，单位 dB。 |
 | `CalculateEvmAlignedMse(measuredSignal)` | 待测输出 | 返回与 EVM 接收链完全一致的归一化 MSE；该值等于 RMS EVM 的平方。 |
 | `CalculateEvm(measuredSignal)` | 待测输出 | 返回 `(evmDb, evmPercent)`。 |
 | `CalculateAclr(measuredSignal)` | 待测输出 | 返回 `(aclrLowerDb, aclrUpperDb, aclrWorstDb)`。 |
 | `DemodulateWifiData(measuredSignal)` | 待测输出 | 返回 VHT/HE/EHT 数据子载波星座。 |
-| `AnalyzeIlcHistory(ilcHistory)` | SISO原生ILC历史 | 逐轮计算SNR/EVM/ACLR，并返回EVM最佳轮及完整 `ILCPerformanceIteration` 历史。 |
+| `AnalyzeIlcHistory(ilcHistory)` | SISO原生ILC历史 | 逐轮计算输出功率/SNR/EVM/ACLR，并返回EVM最佳轮及完整 `ILCPerformanceIteration` 历史。 |
 | `AnalyzeMimoIlcHistory(chainHistories)` | 每条PA链的原生ILC历史 | 按轮组合MIMO矩阵、执行空间流性能分析并返回EVM最佳轮。 |
 | `Print(stageMetrics=None)` | 可选指标映射 | 打印指标表；省略时使用最近一次 `AnalyzeStages` 的结果。 |
-| `PrintMimo(stageMimoMetrics=None)` | 可选详细指标映射 | 打印逐 PA SNR/ACLR 与逐空间流 EVM。 |
-| `PrintConvergence(ilcHistory, historyName="ILC convergence")` | Analysis生成的性能历史、可选标题 | 逐轮打印 Raw MSE、LC-MSE、SNR、EVM、ACLR、复增益幅相和输入峰值。 |
+| `PrintMimo(stageMimoMetrics=None)` | 可选详细指标映射 | 打印逐 PA 输出功率/SNR/ACLR 与逐空间流 EVM。 |
+| `PrintConvergence(ilcHistory, historyName="ILC convergence")` | Analysis生成的性能历史、可选标题 | 逐轮打印 Raw MSE、LC-MSE、输出功率、SNR、EVM、ACLR、复增益幅相和输入峰值。 |
 | `Save(outputDirectory, runMetadata, stageMetrics=None)` | 输出路径、元数据、可选指标映射 | 写入 `metrics.json` 和 `metrics.csv`，并附带可用的各阶段同步估计。 |
-| `SaveConvergence(ilcHistory, outputDirectory)` | Analysis生成的性能历史、输出路径 | 写入包含三级MSE、SNR、EVM、ACLR和线性项诊断的 `ilc_convergence.csv`。 |
+| `SaveConvergence(ilcHistory, outputDirectory)` | Analysis生成的性能历史、输出路径 | 写入包含三级MSE、输出功率、SNR、EVM、ACLR和线性项诊断的 `ilc_convergence.csv`。 |
 | `AnalyzePowerEvmCurve(outputPowerDbmValues, methodEvaluators)` | 递增输出dBm点、`{方法名: 求值器}` 映射 | 按输出回退驱动PA，把每种方法标定到相同输出功率后计算EVM。 |
 | `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取实例解析后的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
 
-`Analyze` 返回字典的固定键包括 `snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。`ILCPerformanceIteration` 把这些RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存相同结构的普通字典。`PowerEvmCurve` 保存 `outputPowerDbmValues`、`driveScaleValues`、`targetOutputRmsValues` 以及各方法的EVM数组。
+`Analyze` 返回字典的固定键包括 `outputPowerDbm`、`snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。SISO的 `outputPowerDbm` 是单端口功率；MIMO的该字段是所有独立PA端口在线性功率域求和后的结果，每路值位于 `GetLastMimoMetrics()["outputPowerDbmPerChain"]`。`ILCPerformanceIteration` 把RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存同一普通指标字典。`PowerEvmCurve` 保存 `outputPowerDbmValues`、`driveScaleValues`、`targetOutputRmsValues` 以及各方法的EVM数组。
 
 ### `Draw` 参数与方法
 
@@ -1418,6 +1419,7 @@ resultAnalysis = Analysis(
 )
 metrics = resultAnalysis.Analyze(paOutput)
 print(metrics)
+print(f"Simulated output power: {metrics['outputPowerDbm']:.2f} dBm")
 print(metrics["evmDb"])
 print(resultAnalysis.GetLastSignalProcessingResult().ToDict())
 ```
@@ -1623,6 +1625,7 @@ parsedFrame = resultAnalysis.GetParsedWifiFrame()
 
 print(parsedFrame.detectedParameters)
 print(metrics)
+print(f"Simulated output power: {metrics['outputPowerDbm']:.2f} dBm")
 print(metrics["evmDb"], metrics["evmPercent"])
 ```
 
@@ -1655,7 +1658,7 @@ Analysis会在内部自动提取NumPy样值或 `WifiWaveform.samples`，无需�
 
 - `metrics.json`：运行配置及各阶段指标；
 - `metrics.csv`：便于 Excel 或脚本统计的指标表；
-- `ilc_convergence.csv`：每轮 ILC 的 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、公共复增益幅相和输入峰值；
+- `ilc_convergence.csv`：每轮 ILC 的 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、模拟输出功率、公共复增益幅相和输入峰值；
 - `ilc_convergence.png`：在同一 dB 坐标中比较 Raw NMSE、LC-NMSE 与 EVM-MSE/EVM dB；
 - `waveforms.npz`：仅在指定 `--save-waveforms` 时输出。
 - `power_evm_curve.png`：PA 基线、频域 ILC、拟合 GMP DPD 的同图功率-EVM 曲线；

@@ -37,14 +37,14 @@ flowchart LR
     ilc --> learned["ILCResult.learnedInput<br/>LC-NMSE最佳轮输入"]
     ilc --> output["ILCResult.outputSignal<br/>LC-NMSE最佳轮干净输出"]
     ilc --> history["ILCResult.history<br/>原生MSE及每轮输入/PA输出"]
-    history --> analysis["Analysis.AnalyzeIlcHistory<br/>逐轮SNR/EVM/ACLR"]
+    history --> analysis["Analysis.AnalyzeIlcHistory<br/>逐轮功率/SNR/EVM/ACLR"]
     analysis --> analyzedHistory["ILCAnalysisResult.history<br/>完整性能历史"]
     analysis --> evmBest["bestInputSignal<br/>严格EVM最佳轮输入"]
     evmBest --> cleanOutput["PaModel.Process<br/>重新测量干净输出"]
     evmBest --> fit["FitGmp / FitVolterra / FitLut / FitNeural"]
     reference --> fit
     fit --> deploy["Predistorter.Process<br/>处理独立Wi-Fi帧"]
-    baseline --> metrics["resultAnalysis.Analyze或AnalyzeStages<br/>SNR、EVM、ACLR"]
+    baseline --> metrics["resultAnalysis.Analyze或AnalyzeStages<br/>功率、SNR、EVM、ACLR"]
     cleanOutput --> metrics
     deploy --> metrics
 ```
@@ -56,7 +56,7 @@ flowchart LR
 - `DpdIlc.py` 只负责算法，不负责选择benchmark场景或保存整套测试报告。
 - `ILCConfig` 不保存任何EVM、SNR或ACLR计算器；它只控制学习更新、幅度约束和反馈采集。
 - `DpdIlc.py` 不接收任何EVM、SNR或ACLR回调；每轮只计算算法原生MSE并保存对应输入和PA输出。
-- ILC返回后，`Analysis.AnalyzeIlcHistory` 才逐轮计算SNR、EVM和ACLR，并在分析层按严格EVM选择最佳实测轮。
+- ILC返回后，`Analysis.AnalyzeIlcHistory` 才逐轮计算模拟输出功率、SNR、EVM和ACLR，并在分析层按严格EVM选择最佳实测轮。
 - `ILCAnalysisResult.bestInputSignal` 只对当前重复波形直接有效；拟合部署模型后，才能处理独立的新Wi-Fi帧。
 
 ---
@@ -432,7 +432,7 @@ k^\star
 | `samplingFrequencyOffsetPpm` | ILC内部估计的采样频偏 | 单位ppm |
 | `feedbackComplexGain` | 同步后参考到反馈的最小二乘复增益 | 保留原始幅度和相位关系供审计 |
 
-`Analysis.AnalyzeIlcHistory` 返回的 `ILCPerformanceIteration` 在上述原生字段之外增加 `snrDb`、`evmAlignedMse`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`，并把同步估计展开为 `feedbackIntegerDelaySamples`、`feedbackFractionalDelaySamples`、`feedbackCarrierFrequencyOffsetHz`、`feedbackSamplingFrequencyOffsetPpm`、`feedbackComplexGainMagnitudeDb` 和 `feedbackComplexGainPhaseDegrees`。这些字段也会写入收敛CSV。
+`Analysis.AnalyzeIlcHistory` 返回的 `ILCPerformanceIteration` 在上述原生字段之外增加 `outputPowerDbm`、`snrDb`、`evmAlignedMse`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`，并把同步估计展开为 `feedbackIntegerDelaySamples`、`feedbackFractionalDelaySamples`、`feedbackCarrierFrequencyOffsetHz`、`feedbackSamplingFrequencyOffsetPpm`、`feedbackComplexGainMagnitudeDb` 和 `feedbackComplexGainPhaseDegrees`。这些字段也会写入收敛CSV。
 
 ---
 
