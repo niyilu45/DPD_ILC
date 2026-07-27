@@ -1,5 +1,6 @@
 """Run the smallest SISO ILC example in floating and fixed-point modes."""
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict
 
@@ -74,8 +75,11 @@ def RunSisoMode(
     # those codes and decodes them before normalized floating processing.
     loadResistanceOhm = 50.0
     powerCalibration = PowerCalibration(
-        loadResistanceOhm=loadResistanceOhm,
-        maximumOutputPowerDbm=maximumOutputPowerDbm,
+        parameters={
+            "loadResistanceOhm": loadResistanceOhm,
+            "maximumOutputPowerDbm": maximumOutputPowerDbm,
+            "width": width,
+        },
     )
     driveScale = powerCalibration.OutputPowerToDriveScale(
         paOutputPowerDbm
@@ -91,12 +95,17 @@ def RunSisoMode(
             "width": width,
         },
     )
-    baselineOutput = paModel.Process(referenceSignal)
+    baselineOutputRaw = paModel.Process(referenceSignal)
+    baselineOutput = powerCalibration.CalibrateWaveformToOutputPower(
+        baselineOutputRaw,
+        paOutputPowerDbm,
+    )
     resultAnalysis = Analysis(
         referenceSignal,
         waveform,
         parameters={
             "loadResistanceOhm": loadResistanceOhm,
+            "maximumOutputPowerDbm": maximumOutputPowerDbm,
             "width": width,
         },
     )
@@ -117,13 +126,33 @@ def RunSisoMode(
         ilcConfig,
     )
 
-    # Analysis remains independent from the ILC update rule. It evaluates
-    # every recorded PA output and selects the iteration with the best EVM.
+    # Analysis remains independent from the ILC update rule. ILC learns from
+    # the native PA response, while each saved output is regenerated at the
+    # configured conducted power before RF metrics are calculated. Replacing
+    # only outputSignal preserves the native MSE and learned candidate input.
+    calibratedIlcHistory = tuple(
+        replace(
+            iterationRecord,
+            outputSignal=(
+                powerCalibration.CalibrateWaveformToOutputPower(
+                    iterationRecord.outputSignal,
+                    paOutputPowerDbm,
+                )
+            ),
+        )
+        for iterationRecord in ilcResult.history
+    )
     ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(
-        ilcResult.history
+        calibratedIlcHistory
     )
     selectedIlcInput = ilcAnalysisResult.bestInputSignal
-    selectedIlcOutput = paModel.Process(selectedIlcInput)
+    selectedIlcOutputRaw = paModel.Process(selectedIlcInput)
+    selectedIlcOutput = (
+        powerCalibration.CalibrateWaveformToOutputPower(
+            selectedIlcOutputRaw,
+            paOutputPowerDbm,
+        )
+    )
     selectedMetrics = resultAnalysis.Analyze(selectedIlcOutput)
     resultAnalysis.AnalyzeStages(
         {
@@ -147,16 +176,10 @@ def RunSisoMode(
         fileStem="frequency_domain_ilc",
     )
 
-    # Convert a copy of the PA code output to the requested physical reporting
-    # level without feeding voltage-scaled values back into the code interface.
-    calibratedOutput = powerCalibration.ScaleSignalToOutputPower(
-        baselineOutput,
-        paOutputPowerDbm,
-    )
-    outputRms = float(
-        np.sqrt(np.mean(np.abs(calibratedOutput) ** 2))
-    )
-    measuredOutputPowerDbm = powerCalibration.RmsToDbm(outputRms)
+    # Analysis and calibration share the same active-burst RMS convention, so
+    # leading/trailing padding and long internal off intervals do not reduce
+    # the reported PA output power.
+    measuredOutputPowerDbm = baselineMetrics["outputPowerDbm"]
     result = {
         "mode": modeName,
         "width": width,

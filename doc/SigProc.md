@@ -540,7 +540,182 @@ P_{\max}=25\ \mathrm{dBm}.
 a=10^{-\mathrm{OBO}/20}.
 ```
 
-默认20 dBm工作点对应5 dB回退和 $a\approx0.5623$。`ScaleSignalToOutputPower` 或 `ScaleSignalToOutputPowers` 在PA处理后按整段RMS施加常数增益，使每路达到目标dBm。常数增益不改变归一化EVM和ACLR功率比；压缩深度由标定前的 $a$ 决定。
+默认20 dBm工作点对应5 dB回退和 $a\approx0.5623$。这里必须区分两个动作：
+
+1. `OutputPowerToDriveScale` 在PA之前设置归一化驱动，从而决定压缩深度；
+2. `CalibrateWaveformToOutputPower` 在PA之后重新生成达到目标dBm的公开波形，从而决定Analysis看到的绝对输出功率。
+
+第二步只施加逐链常数比例，浮点模式下不会改变归一化EVM和ACLR功率比。定点模式还要重新量化，若达到目标功率需要削顶，会发出警告，因为此时量化或削顶可能改变EVM。
+
+### 13.1 有效信号区间与占空比
+
+不能直接使用整个采集记录的样点数作为RMS分母。假设真正的Wi-Fi突发只有 $N_{\mathrm{on}}$ 个样点，但采集前后带有 $N_{\mathrm{off}}$ 个零样点，则整段RMS为
+
+```math
+A_{\mathrm{capture}}
+=
+\sqrt{
+\frac{
+\sum_{n\in\mathcal A}|x[n]|^2
+}{
+N_{\mathrm{on}}+N_{\mathrm{off}}
+}
+}.
+```
+
+它比突发有效区RMS
+
+```math
+A_{\mathrm{active}}
+=
+\sqrt{
+\frac{
+\sum_{n\in\mathcal A}|x[n]|^2
+}{
+N_{\mathrm{on}}
+}
+}
+```
+
+低
+
+```math
+\Delta P
+=
+10\log_{10}
+\left(
+\frac{N_{\mathrm{on}}}
+{N_{\mathrm{on}}+N_{\mathrm{off}}}
+\right)
+\ \mathrm{dB}.
+```
+
+例如占空比为 $D=N_{\mathrm{on}}/(N_{\mathrm{on}}+N_{\mathrm{off}})=0.5$ 时，整段平均功率比有效突发功率低约3.01 dB。这两个数都可能有物理意义，但本工程的PA工作点和Wi-Fi EVM需要使用“突发开启期间的平均功率”，因此校准和Analysis均采用 $A_{\mathrm{active}}$。
+
+第 $m$ 路的瞬时功率和峰值为
+
+```math
+p_m[n]=|x_m[n]|^2,
+\qquad
+p_{m,\max}=\max_n p_m[n].
+```
+
+以 `activePowerThresholdDb` 为相对峰值门限，初始有效掩码定义为
+
+```math
+M_m[n]
+=
+\begin{cases}
+1, &
+p_m[n]>
+p_{m,\max}
+10^{T_{\mathrm{active}}/10},
+\\
+0, & \mathrm{otherwise}.
+\end{cases}
+```
+
+默认 $T_{\mathrm{active}}=-60\ \mathrm{dB}$。OFDM样值会正常穿过零点，因此不能把每一个低幅样点都视为关断。`activeGapToleranceSamples=16` 会填充长度不超过16个样点的内部空洞；前置补零、后置补零以及更长的内部静默区仍保持无效。每一路MIMO信号独立建立掩码。
+
+真实仪表捕获的静默区可能含有噪声而不是精确零。如果静默噪声高于默认峰值下60 dB门限，应把 `activePowerThresholdDb` 调高到略高于静默噪声底，例如 `-40.0`；门限仍必须低于有效Wi-Fi突发的正常包络。门限过低会把噪声占空区计入，门限过高则会删掉真实低包络样点。
+
+```mermaid
+flowchart LR
+    capture["任意幅度采集：前置零 + 突发1 + 长静默 + 突发2 + 后置零"] --> power["逐链计算瞬时功率与峰值"]
+    power --> threshold["相对峰值门限 activePowerThresholdDb"]
+    threshold --> close["仅填充不超过 activeGapToleranceSamples 的短空洞"]
+    close --> mask["有效样点集合 A"]
+    mask --> activeRms["按有效样点数计算RMS"]
+    activeRms --> calibration["重标定到目标dBm"]
+```
+
+**图 4 说明：**短空洞通常是OFDM过零或瞬时低包络，仍属于有效突发；长空洞表示占空比关断，不进入功率分母。缩放仍作用于整条波形，所以原来的零样点继续为零，时间位置和占空比均不改变。
+
+### 13.2 任意初始幅度到目标dBm
+
+输入波形不需要事先归一化。对第 $m$ 路先按有效集合 $\mathcal A_m$ 计算
+
+```math
+A_m
+=
+\sqrt{
+\frac{
+\sum_n M_m[n]|x_m[n]|^2
+}{
+\sum_n M_m[n]
+}
+}.
+```
+
+目标dBm相对额定满量程的归一化RMS为
+
+```math
+A_{m,\mathrm{target}}
+=
+10^{
+\left(
+P_{m,\mathrm{target}}-P_{\max}
+\right)/20
+}.
+```
+
+重新生成的波形为
+
+```math
+x_{m,\mathrm{cal}}[n]
+=
+\frac{
+A_{m,\mathrm{target}}
+}{
+A_m
+}
+x_m[n].
+```
+
+因此原波形的RMS可以是0.03、1、2.7或任意其他有限正数；校准结果只由波形形状、有效区掩码、目标dBm和额定满量程决定。`NormalizedRmsToOutputPowerDbm` 使用反向关系
+
+```math
+P_{m,\mathrm{out}}
+=
+P_{\max}
++20\log_{10}
+\left(
+A_{m,\mathrm{active}}
+\right).
+```
+
+### 13.3 定点接口
+
+`width=0` 时输入输出均为浮点复包络。`width>0` 时输入和输出均为公开整数I/Q码，容器类型仍为 `numpy.complex128`；模块内部先解码为归一化浮点，再做有效区检测和校准，最后重新编码。
+
+定点取整使“缩放后再量化”的RMS成为分段常数函数。`CalibrateFixedColumn` 因此使用二分搜索寻找量化前比例 $c$：
+
+```math
+\widehat c
+=
+\underset{c\geq0}{\mathop{\mathrm{arg\,min}}}
+\left|
+\sqrt{
+\frac{
+\sum_n M[n]
+\left|
+Q_w(c\,x[n])
+\right|^2
+}{
+\sum_n M[n]
+}
+}
+-A_{\mathrm{target}}
+\right|.
+```
+
+其中 $Q_w$ 表示按位宽 $w$ 取整、饱和并重新解码的算子。实现要求量化后的功率误差不大于0.01 dB；目标不可达到时抛出异常，使用码值边界时发出削顶警告。
+
+### 13.4 归一化满量程与物理电压两种接口
+
+`CalibrateWaveformToOutputPower` 和 `CalibrateWaveformToOutputPowers` 用于本工程的归一化公开波形：归一化有效区RMS等于1对应 `maximumOutputPowerDbm`。
+
+`ScaleSignalToOutputPower` 和 `ScaleSignalToOutputPowers` 用于已经采用物理伏特单位的复包络：它们按端口阻抗把目标dBm转换为RMS电压。两组接口都使用相同的有效区掩码，但不能混淆数值尺度。
 
 50 Ω 端口上，0 dBm 等于 1 mW，对应
 
@@ -550,23 +725,47 @@ V_{\mathrm{RMS}}
 \approx0.223607\ \mathrm{V}.
 ```
 
-典型调用：
+归一化公开波形的典型调用：
 
 ```python
 import numpy as np
 
+from inc.utils.FixedPoint import FixedPoint
 from inc.utils.SigProc import PowerCalibration
 
 powerCalibration = PowerCalibration(
-    loadResistanceOhm=50.0,
-    maximumOutputPowerDbm=25.0,
+    parameters={
+        "loadResistanceOhm": 50.0,
+        "maximumOutputPowerDbm": 25.0,
+        "activePowerThresholdDb": -60.0,
+        "activeGapToleranceSamples": 16,
+        "width": 16,
+    },
 )
 driveScale = powerCalibration.OutputPowerToDriveScale(20.0)
 rawOutput = paModel.Process(driveScale * waveform.samples)
-calibratedOutput = powerCalibration.ScaleSignalToOutputPower(
+calibratedOutput = powerCalibration.CalibrateWaveformToOutputPower(
     rawOutput,
-    20.0,
+    outputPowerDbm=20.0,
 )
-measuredRms = np.sqrt(np.mean(np.abs(calibratedOutput) ** 2))
-measuredPowerDbm = powerCalibration.RmsToDbm(measuredRms)
+decodedOutput = FixedPoint(16).DecodeComplex(calibratedOutput)
+measuredRms = powerCalibration.CalculateActiveRmsPerChain(
+    decodedOutput
+)[0]
+measuredPowerDbm = (
+    powerCalibration.NormalizedRmsToOutputPowerDbm(measuredRms)
+)
+```
+
+如果输入是物理电压，则改用：
+
+```python
+physicalOutput = powerCalibration.ScaleSignalToOutputPower(
+    voltageWaveform,
+    outputPowerDbm=20.0,
+)
+activeVoltageRms = powerCalibration.CalculateActiveRmsPerChain(
+    physicalOutput
+)[0]
+measuredPowerDbm = powerCalibration.RmsToDbm(activeVoltageRms)
 ```

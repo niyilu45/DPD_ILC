@@ -102,7 +102,7 @@ EVM dB 定义为：
 
 ### 5.1 场景构造
 
-训练帧使用 `outputPowerDbm=20` 和 `maximumOutputPowerDbm=25`。输出回退量为 5 dB，对应归一化驱动比例约 0.5623。波形直接进入 Wiener PA，不使用 DPD 或 ILC；PA 原始输出随后用每路常数增益校准到 20 dBm。该输出是标称波形更新律、峰值约束和噪声反馈场景的物理基准。
+训练帧使用 `outputPowerDbm=20` 和 `maximumOutputPowerDbm=25`。输出回退量为 5 dB，对应归一化驱动比例约 0.5623。波形直接进入 Wiener PA，不使用 DPD 或 ILC；PA 原始输出不要求预先归一化，随后按Wi-Fi有效突发RMS重新生成到20 dBm。前后补零和长占空比静默不进入RMS，短暂OFDM过零仍保留。该输出是标称波形更新律、峰值约束和噪声反馈场景的功率基准。
 
 ### 5.2 控制变量
 
@@ -530,9 +530,9 @@ benchmarkRows = RunAllIlcBenchmark(benchmarkConfig)
 | `BenchmarkRow.ToDict` | 单行结果 | 扁平字典 | 让CSV和JSON使用完全相同的数值 |
 | `AddRow` | 方法指标、同场景baseline指标 | 向结果列表追加一行 | 统一SNR、EVM、ACLR改善量的正负方向 |
 | `SaveHistory` | 方法名、`ILCResult`、目录 | 每种方法一个CSV和PNG | 保存每一轮Raw MSE、LC-MSE、EVM-MSE、模拟输出功率和输入峰值 |
-| `ReportHistory` | 方法结果、`Analysis` | 控制台表格并调用 `SaveHistory` | 保证控制台和文件使用同一份不可变迭代记录 |
-| `EvaluateDeployment` | 拟合DPD、验证帧、PA、幅度上限 | 普通指标字典 | 在独立帧上执行DPD、限幅、PA和统一分析 |
-| `RunIlcCurvePoint` | 当前功率点参考、算法和配置 | 当前功率点PA输出 | 为功率扫描重新绑定EVM-MSE并重新运行波形ILC |
+| `ReportHistory` | 方法结果、`Analysis`、功率标定器、目标dBm | 控制台表格并调用 `SaveHistory` | 保留原生MSE和候选输入，只替换每轮输出为有效突发目标功率版本，保证控制台和文件功率口径一致 |
+| `EvaluateDeployment` | 拟合DPD、验证帧、PA、幅度上限、功率标定器 | 普通指标字典 | 在独立帧上执行DPD、限幅、PA、有效区目标dBm重标定和统一分析 |
+| `RunIlcCurvePoint` | 当前功率点参考、额定极限、算法和配置 | 当前功率点PA输出 | 为功率扫描创建当前参考的Analysis，按有效突发校准逐轮输出并重新运行波形ILC |
 | `RunAllIlcBenchmark` | 可选 `BenchmarkConfig` | 22行 `BenchmarkRow` | 按固定顺序构造A–F类场景并汇总全部结果 |
 | `SaveBenchmarkResults` | 结果行、目录、元数据 | 汇总CSV和JSON | 保存绝对指标、改善量及复现配置 |
 | `PrintBenchmarkResults` | 全部结果行 | 控制台汇总表 | 快速查看不同场景的SNR、EVM和ACLR |
@@ -548,6 +548,7 @@ sequenceDiagram
     participant WG as "WaveGenWifi"
     participant PA as "PaModel / IQImbalancePA"
     participant ILC as "DpdIlc算法"
+    participant PC as "PowerCalibration"
     participant AN as "Analysis"
     participant DR as "Draw"
 
@@ -556,12 +557,14 @@ sequenceDiagram
     BM->>WG: 训练种子生成训练帧
     BM->>WG: 验证种子生成独立帧
     BM->>PA: 创建固定PA
+    BM->>PC: 按有效突发重标定baseline到目标dBm
     BM->>AN: 计算各场景baseline
 
     loop 标称更新律
         BM->>ILC: 相同训练帧和迭代预算
         ILC->>PA: 每轮反馈测量
         ILC-->>BM: ILCResult与逐轮历史
+        BM->>PC: 仅重标定每轮outputSignal
         BM->>AN: SNR / EVM / ACLR
         BM->>DR: 收敛曲线
     end
@@ -594,6 +597,7 @@ Create one deterministic PA
 
 Measure nominal PA baseline and calibrate each PA output to outputPowerDbm
 Run six nominal ILC update laws
+Calibrate every saved iteration output to the same active-burst target power
 Compare unconstrained and peak-constrained frequency-domain ILC
 Compare single-sample and averaged noisy-feedback ILC
 Wrap the PA with IQ imbalance
@@ -1242,7 +1246,7 @@ i=0,1,\ldots,N-1.
 | 3 | 20 | 5 | 0.562341 | 2.236068 |
 | 4 | 25 | 0 | 1.000000 | 3.976354 |
 
-等 dBm 间隔对应几何驱动比例和几何 RMS 电压间隔，更适合观察 PA 输出回退量变化。CSV 同时保存目标输出 dBm、归一化驱动比例和目标输出 RMS 电压，使物理功率配置与数值模型工作点均可审计。
+等 dBm 间隔对应几何驱动比例和几何 RMS 电压间隔，更适合观察 PA 输出回退量变化。CSV 同时保存目标输出 dBm、归一化驱动比例和目标输出 RMS 电压，使物理功率配置与数值模型工作点均可审计。每个evaluator产生PA输出后，`AnalyzePowerEvmCurve` 还会按有效突发RMS重新生成到该横轴dBm；因此补零长度、占空比关断时间和方法本身的公共增益不会改变横坐标。
 
 ### 20.2 三类功率 evaluator行为不同
 
@@ -1256,13 +1260,14 @@ i=0,1,\ldots,N-1.
 
 ### 20.3 为什么必须重新绑定EVM-MSE
 
-`RunIlcCurvePoint` 为当前缩放参考创建新的 `Analysis`，并把它的 `CalculateEvmAlignedMse` 作为独立参数传给当前ILC入口，而不是放入 `ILCConfig`。否则最佳轮可能仍按标称功率参考选择，造成功率点与EVM目标不一致。
+`RunIlcCurvePoint` 为当前缩放参考创建新的 `Analysis`。ILC仍只产生原生MSE与输出历史；运行结束后，Benchmark保留每轮原生MSE、同步估计和候选输入，只把 `outputSignal` 替换为当前有效突发目标dBm版本，再交给 `AnalyzeIlcHistory` 按严格EVM选择最佳轮。这样不会把EVM计算嵌回 `ILCConfig`，也不会让不同占空比或公共输出增益影响功率点比较。
 
 ### 20.4 功率曲线验收
 
 - `outputPowerDbmValues` 必须严格递增并等间隔，且不得超过25 dBm额定极限；
 - `driveScaleValues` 必须与相对额定极限的输出回退换算一致；
 - `targetOutputRmsValues` 必须与目标输出 dBm 和端口电阻换算结果一致；
+- 每个evaluator送入Analysis前的有效突发功率必须与当前横轴dBm一致；
 - 每个方法必须在全部功率点都有EVM dB和EVM百分比；
 - EVM百分比必须为正且有限；
 - EVM dB与EVM百分比必须满足幅度比换算；
@@ -1308,7 +1313,7 @@ Directional Gauss-Newton每轮还需要有限差分的额外PA调用，频域ILC
 
 不能直接回答：
 
-- 真实dBm输出功率，因为模型使用归一化幅度；
+- 未经外部标定的真实硬件dBm；本曲线给出的是由 `maximumOutputPowerDbm` 满量程约定得到的仿真传导功率；
 - PA效率、漏极效率或EVM与效率联合最优点；
 - OTA波束方向上的EVM；
 - 不同算法在相同计算时间或相同PA调用次数下的效率。

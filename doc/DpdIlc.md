@@ -158,7 +158,7 @@ driveScale = powerCalibration.OutputPowerToDriveScale(
 referenceSignal = driveScale * waveform.samples
 ```
 
-对调用方公开的工作点是 `paOutputPowerDbm`。默认额定极限为25 dBm，20 dBm对应5 dB输出回退和约0.5623的归一化驱动比例。PA非线性处理后，再用常数增益把输出标定到20 dBm；该标定不会改变EVM或ACLR比值。
+对调用方公开的工作点是 `paOutputPowerDbm`。默认额定极限为25 dBm，20 dBm对应5 dB输出回退和约0.5623的归一化驱动比例。PA非线性处理后，`CalibrateWaveformToOutputPower` 自动识别Wi-Fi有效突发，排除前后补零和长占空比静默，再用常数比例重新生成20 dBm输出；原始PA输出不要求预先归一化。浮点常数标定不会改变EVM或ACLR比值，定点模式重新量化，发生削顶时会警告。
 
 ### 4.4 PA对象接口要求
 
@@ -231,9 +231,9 @@ V_{\mathrm{out,RMS}}
 =\sqrt{R\,10^{-3}10^{P_{\mathrm{out,dBm}}/10}}.
 ```
 
-20 dBm相对25 dBm极限具有5 dB输出回退。提高目标输出功率会提高归一化驱动，把PA推向更深压缩；降低目标输出功率则增加回退量。最终常数功率标定只改变输出标尺，不改变PA内部非线性工作点。
+20 dBm相对25 dBm极限具有5 dB输出回退。提高目标输出功率会提高归一化驱动，把PA推向更深压缩；降低目标输出功率则增加回退量。最终功率标定按有效突发RMS改变输出标尺，不改变PA内部非线性工作点；50%占空比的长关断区不会让报告功率额外降低3.01 dB。
 
-ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和PA输出。运行结束后，`resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 才计算每轮严格的数据子载波EVM、SNR和ACLR，并返回分析层选择的 `bestInputSignal`。若反馈链加入了噪声，应像示例一样把最佳输入重新送入PA，得到用于最终性能报告的干净输出。
+ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和PA输出。运行结束后，示例先仅替换每轮记录的 `outputSignal` 为目标dBm校准波形，保留原生MSE、同步估计和候选输入，再调用 `resultAnalysis.AnalyzeIlcHistory(calibratedIlcHistory)` 计算每轮严格的数据子载波EVM、SNR和ACLR。若反馈链加入了噪声，应像示例一样把最佳输入重新送入PA，并再次执行相同的有效区功率校准，得到用于最终性能报告的干净输出。
 
 ---
 
@@ -1019,6 +1019,8 @@ flowchart LR
 ### 14.2 完整4×2示例
 
 ```python
+from dataclasses import replace
+
 from inc.lib.Analysis import Analysis
 from inc.lib.DpdIlc import (
     FitMimoGmpPredistorter,
@@ -1091,8 +1093,23 @@ mimoResult = RunMimoFrequencyDomainIlc(
     mimoConfig,
 )
 resultAnalysis = Analysis(referenceSignal, waveform)
+calibratedChainHistories = tuple(
+    tuple(
+        replace(
+            iterationRecord,
+            outputSignal=(
+                powerCalibration.CalibrateWaveformToOutputPower(
+                    iterationRecord.outputSignal,
+                    targetOutputPowerDbmPerChain[chainIndex],
+                )
+            ),
+        )
+        for iterationRecord in chainResult.history
+    )
+    for chainIndex, chainResult in enumerate(mimoResult.chainResults)
+)
 mimoIlcAnalysis = resultAnalysis.AnalyzeMimoIlcHistory(
-    tuple(chainResult.history for chainResult in mimoResult.chainResults)
+    calibratedChainHistories
 )
 selectedMimoRawOutput = mimoPaModel.Process(
     mimoIlcAnalysis.bestInputSignal
@@ -1109,23 +1126,19 @@ mimoPredistorter = FitMimoGmpPredistorter(
 deployedInput = mimoPredistorter.Process(referenceSignal)
 deployedRawOutput = mimoPaModel.Process(deployedInput)
 
-calibratedReference = powerCalibration.ScaleSignalToOutputPowers(
-    referenceSignal,
-    targetOutputPowerDbmPerChain,
-)
-baselineOutput = powerCalibration.ScaleSignalToOutputPowers(
+baselineOutput = powerCalibration.CalibrateWaveformToOutputPowers(
     mimoPaModel.Process(referenceSignal),
     targetOutputPowerDbmPerChain,
 )
-selectedMimoOutput = powerCalibration.ScaleSignalToOutputPowers(
+selectedMimoOutput = powerCalibration.CalibrateWaveformToOutputPowers(
     selectedMimoRawOutput,
     targetOutputPowerDbmPerChain,
 )
-deployedOutput = powerCalibration.ScaleSignalToOutputPowers(
+deployedOutput = powerCalibration.CalibrateWaveformToOutputPowers(
     deployedRawOutput,
     targetOutputPowerDbmPerChain,
 )
-physicalAnalysis = Analysis(calibratedReference, waveform)
+physicalAnalysis = Analysis(referenceSignal, waveform)
 physicalAnalysis.AnalyzeStages(
     {
         "MIMO PA baseline": baselineOutput,
@@ -1194,7 +1207,7 @@ mimoPaModel.SetTargetOutputPowerDbm(
 )
 ```
 
-学习 PA 非线性时，推荐把 `targetOutputPowerDbmPerChain` 保持为 `None`：先用输出回退量得到固定驱动比例，ILC 在未归一化的原始 PA 映射上学习，结束后再用 `ScaleSignalToOutputPowers` 校准物理输出电平。直接在每次 PA 调用内部强制绝对 dBm 会根据整包当前输出反复缩放，可能掩盖部分 AM-AM 幅度变化；它更适合完成 PA 处理后的系统级功率对齐。
+学习 PA 非线性时，推荐把 `targetOutputPowerDbmPerChain` 保持为 `None`：先用输出回退量得到固定驱动比例，ILC 在未归一化的原始 PA 映射上学习，结束后再用 `CalibrateWaveformToOutputPowers` 按有效突发校准归一化公开输出。直接在每次 PA 调用内部强制绝对 dBm 会根据当前输出反复缩放，可能掩盖部分 AM-AM 幅度变化；目标功率重标定应位于一次PA处理之后、RF指标分析之前。
 
 ### 14.5 读取每路实际输出功率
 

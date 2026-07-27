@@ -9,7 +9,7 @@ multi-method power-EVM curve. Production ILC algorithms remain in
 import argparse
 import csv
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional
@@ -138,8 +138,11 @@ class BenchmarkConfig:
                 "bandwidth for ACLR analysis"
             )
         powerCalibration = PowerCalibration(
-            loadResistanceOhm=self.loadResistanceOhm,
-            maximumOutputPowerDbm=self.maximumOutputPowerDbm,
+            parameters={
+                "loadResistanceOhm": self.loadResistanceOhm,
+                "maximumOutputPowerDbm": self.maximumOutputPowerDbm,
+                "width": self.width,
+            },
         )
         powerCalibration.OutputPowerToDriveScale(
             self.outputPowerDbm
@@ -320,25 +323,44 @@ def ReportHistory(
     ilcResult: ILCResult,
     resultAnalysis: Analysis,
     outputDirectory: Path,
+    powerCalibration: PowerCalibration,
+    outputPowerDbm: float,
 ) -> ILCAnalysisResult:
     """Print and save one method's complete per-iteration MSE history.
 
     Processing details:
-        Algorithm: Feed every PA output stored by ILC into ``Analysis``, select
-        the EVM-best measured candidate outside the algorithm, then print,
-        serialize, and render the same immutable performance records.
+        Algorithm: Regenerate every stored PA output at the scenario's
+        active-burst target power without changing native MSE diagnostics,
+        feed those records into ``Analysis``, select the EVM-best measured
+        candidate outside the algorithm, then print, serialize, and render.
 
     Args:
         methodName: Human-readable ILC method label.
         ilcResult: Completed ILC result containing ordered history records.
         resultAnalysis: Analysis instance used for consistent presentation.
         outputDirectory: Destination for CSV and PNG result artifacts.
+        powerCalibration: Shared floating/fixed active-burst calibrator.
+        outputPowerDbm: Scenario conducted output-power target.
 
     Returns:
         result: Post-ILC history and the EVM-best measured candidate.
     """
 
-    analysisResult = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
+    calibratedHistory = tuple(
+        replace(
+            iterationRecord,
+            outputSignal=(
+                powerCalibration.CalibrateWaveformToOutputPower(
+                    iterationRecord.outputSignal,
+                    outputPowerDbm,
+                )
+            ),
+        )
+        for iterationRecord in ilcResult.history
+    )
+    analysisResult = resultAnalysis.AnalyzeIlcHistory(
+        calibratedHistory
+    )
     resultAnalysis.PrintConvergence(
         analysisResult.history, f"{methodName} iteration metrics"
     )
@@ -351,14 +373,17 @@ def EvaluateDeployment(
     paModel: Any,
     resultAnalysis: Analysis,
     maxAmplitude: float,
+    powerCalibration: PowerCalibration,
+    outputPowerDbm: float,
 ) -> SignalMetrics:
     """Evaluate one fitted DPD on a held-out Wi-Fi packet.
 
     Processing details:
         Algorithm: Run the fitted predistorter on a packet generated with an
         independent seed, project the complex envelope onto the configured
-        amplitude disk, pass it through the unchanged PA, and analyze the
-        resulting signal with validation-frame metadata.
+        amplitude disk, pass it through the unchanged PA, regenerate the
+        output at the active-burst target dBm, and analyze it with validation
+        metadata.
 
     Args:
         predistorter: Fitted model exposing a ``Process`` method.
@@ -366,6 +391,8 @@ def EvaluateDeployment(
         paModel: PA object exposing Process and SmallSignalGain operations.
         resultAnalysis: Analyzer bound to the independent validation packet.
         maxAmplitude: Maximum allowed complex-envelope magnitude.
+        powerCalibration: Shared floating/fixed active-burst calibrator.
+        outputPowerDbm: Scenario conducted output-power target.
 
     Returns:
         result: SNR, EVM, and ACLR of the held-out PA output.
@@ -381,7 +408,10 @@ def EvaluateDeployment(
     predistortedInput = interfaceFormat.EncodeComplex(
         floatingPredistortedInput
     )
-    paOutput = paModel.Process(predistortedInput)
+    paOutput = powerCalibration.CalibrateWaveformToOutputPower(
+        paModel.Process(predistortedInput),
+        outputPowerDbm,
+    )
     return resultAnalysis.Analyze(paOutput)
 
 def RunIlcCurvePoint(
@@ -390,6 +420,7 @@ def RunIlcCurvePoint(
     paModel: Any,
     waveform: WifiWaveform,
     width: int,
+    maximumOutputPowerDbm: float,
     methodName: str,
     methodFunction: Optional[Callable[..., ILCResult]],
     methodConfig: ILCConfig,
@@ -407,6 +438,7 @@ def RunIlcCurvePoint(
         paModel: PA object exposing Process and SmallSignalGain operations.
         waveform: Wi-Fi metadata defining field locations, FFT sizes, and subcarriers.
         width: External I/Q component width shared by all benchmark modules.
+        maximumOutputPowerDbm: Rated normalized full-scale output power.
         methodName: Human-readable algorithm or deployment-model label.
         methodFunction: Selected ILC update-law callable. ``None`` selects
             the dedicated frequency-domain call path, which also needs the
@@ -417,11 +449,19 @@ def RunIlcCurvePoint(
         result: Complex PA output learned specifically for this power point.
     """
 
-    del outputPowerDbm
     pointAnalysis = Analysis(
         referenceSignal,
         waveform,
-        parameters={"width": width},
+        parameters={
+            "maximumOutputPowerDbm": maximumOutputPowerDbm,
+            "width": width,
+        },
+    )
+    powerCalibration = PowerCalibration(
+        parameters={
+            "maximumOutputPowerDbm": maximumOutputPowerDbm,
+            "width": width,
+        },
     )
     if methodName == "Frequency-domain ILC":
         methodResult = RunFrequencyDomainIlc(
@@ -441,8 +481,20 @@ def RunIlcCurvePoint(
             paModel,
             methodConfig,
         )
+    calibratedHistory = tuple(
+        replace(
+            iterationRecord,
+            outputSignal=(
+                powerCalibration.CalibrateWaveformToOutputPower(
+                    iterationRecord.outputSignal,
+                    outputPowerDbm,
+                )
+            ),
+        )
+        for iterationRecord in methodResult.history
+    )
     analysisResult = pointAnalysis.AnalyzeIlcHistory(
-        methodResult.history
+        calibratedHistory
     )
     return paModel.Process(analysisResult.bestInputSignal)
 
@@ -496,8 +548,11 @@ def RunAllIlcBenchmark(
     trainingWaveform = trainingGenerator.Generate()
     validationWaveform = validationGenerator.Generate()
     powerCalibration = PowerCalibration(
-        loadResistanceOhm=config.loadResistanceOhm,
-        maximumOutputPowerDbm=config.maximumOutputPowerDbm,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "width": config.width,
+        },
     )
     driveScale = powerCalibration.OutputPowerToDriveScale(
         config.outputPowerDbm
@@ -516,6 +571,7 @@ def RunAllIlcBenchmark(
         trainingWaveform,
         parameters={
             "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
             "width": config.width,
         },
     )
@@ -524,6 +580,7 @@ def RunAllIlcBenchmark(
         validationWaveform,
         parameters={
             "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
             "width": config.width,
         },
     )
@@ -531,7 +588,10 @@ def RunAllIlcBenchmark(
         2.0, 1.6 * np.max(np.abs(floatingTrainingSignal))
     )
 
-    baselineOutput = paModel.Process(trainingSignal)
+    baselineOutput = powerCalibration.CalibrateWaveformToOutputPower(
+        paModel.Process(trainingSignal),
+        config.outputPowerDbm,
+    )
     baselineMetrics = trainingAnalysis.Analyze(baselineOutput)
     powerEvaluators = {
         "PA baseline": lambda pointReference, _: paModel.Process(
@@ -622,10 +682,14 @@ def RunAllIlcBenchmark(
             methodResult,
             trainingAnalysis,
             outputDirectory,
+            powerCalibration,
+            config.outputPowerDbm,
         )
-        methodMetrics = trainingAnalysis.Analyze(
-            paModel.Process(methodAnalysisResult.bestInputSignal)
+        methodOutput = powerCalibration.CalibrateWaveformToOutputPower(
+            paModel.Process(methodAnalysisResult.bestInputSignal),
+            config.outputPowerDbm,
         )
+        methodMetrics = trainingAnalysis.Analyze(methodOutput)
         if methodName == "Frequency-domain ILC":
             frequencyAnalysisResult = methodAnalysisResult
         AddRow(
@@ -647,6 +711,7 @@ def RunAllIlcBenchmark(
                 paModel,
                 trainingWaveform,
                 config.width,
+                config.maximumOutputPowerDbm,
                 selectedName,
                 selectedFunction,
                 selectedConfig,
@@ -659,9 +724,11 @@ def RunAllIlcBenchmark(
     # Repeat the physically identical baseline and unconstrained result under
     # the peak scenario label so scenario-filtered reports contain the full
     # baseline-versus-performance-versus-feasibility comparison.
-    frequencyMetrics = trainingAnalysis.Analyze(
-        paModel.Process(frequencyAnalysisResult.bestInputSignal)
+    frequencyOutput = powerCalibration.CalibrateWaveformToOutputPower(
+        paModel.Process(frequencyAnalysisResult.bestInputSignal),
+        config.outputPowerDbm,
     )
+    frequencyMetrics = trainingAnalysis.Analyze(frequencyOutput)
     AddRow(
         rows,
         "Peak-constrained baseline",
@@ -700,10 +767,14 @@ def RunAllIlcBenchmark(
         constrainedResult,
         trainingAnalysis,
         outputDirectory,
+        powerCalibration,
+        config.outputPowerDbm,
     )
-    constrainedMetrics = trainingAnalysis.Analyze(
-        paModel.Process(constrainedAnalysisResult.bestInputSignal)
+    constrainedOutput = powerCalibration.CalibrateWaveformToOutputPower(
+        paModel.Process(constrainedAnalysisResult.bestInputSignal),
+        config.outputPowerDbm,
     )
+    constrainedMetrics = trainingAnalysis.Analyze(constrainedOutput)
     AddRow(
         rows,
         "Constrained CFR-ILC",
@@ -719,6 +790,7 @@ def RunAllIlcBenchmark(
             paModel,
             trainingWaveform,
             config.width,
+            config.maximumOutputPowerDbm,
             "Frequency-domain ILC",
             None,
             ILCConfig(
@@ -766,10 +838,14 @@ def RunAllIlcBenchmark(
         naiveNoisyResult,
         trainingAnalysis,
         outputDirectory,
+        powerCalibration,
+        config.outputPowerDbm,
     )
-    naiveNoisyMetrics = trainingAnalysis.Analyze(
-        paModel.Process(naiveNoisyAnalysisResult.bestInputSignal)
+    naiveNoisyOutput = powerCalibration.CalibrateWaveformToOutputPower(
+        paModel.Process(naiveNoisyAnalysisResult.bestInputSignal),
+        config.outputPowerDbm,
     )
+    naiveNoisyMetrics = trainingAnalysis.Analyze(naiveNoisyOutput)
     AddRow(
         rows,
         "Naive noisy-feedback ILC",
@@ -798,10 +874,14 @@ def RunAllIlcBenchmark(
         noiseAwareResult,
         trainingAnalysis,
         outputDirectory,
+        powerCalibration,
+        config.outputPowerDbm,
     )
-    noiseAwareMetrics = trainingAnalysis.Analyze(
-        paModel.Process(noiseAwareAnalysisResult.bestInputSignal)
+    noiseAwareOutput = powerCalibration.CalibrateWaveformToOutputPower(
+        paModel.Process(noiseAwareAnalysisResult.bestInputSignal),
+        config.outputPowerDbm,
     )
+    noiseAwareMetrics = trainingAnalysis.Analyze(noiseAwareOutput)
     AddRow(
         rows,
         "Noise-aware ILC",
@@ -817,6 +897,7 @@ def RunAllIlcBenchmark(
             paModel,
             trainingWaveform,
             config.width,
+            config.maximumOutputPowerDbm,
             "Frequency-domain ILC",
             None,
             ILCConfig(
@@ -837,6 +918,7 @@ def RunAllIlcBenchmark(
             paModel,
             trainingWaveform,
             config.width,
+            config.maximumOutputPowerDbm,
             "Frequency-domain ILC",
             None,
             ILCConfig(
@@ -854,7 +936,10 @@ def RunAllIlcBenchmark(
     # The IQ scenario compares an ordinary frequency-domain update against the
     # augmented direct-plus-conjugate inverse on exactly the same IQ plant.
     iqPaModel = IQImbalancePA(PaModel(parameters=paParameters))
-    iqBaselineOutput = iqPaModel.Process(trainingSignal)
+    iqBaselineOutput = powerCalibration.CalibrateWaveformToOutputPower(
+        iqPaModel.Process(trainingSignal),
+        config.outputPowerDbm,
+    )
     iqBaselineMetrics = trainingAnalysis.Analyze(iqBaselineOutput)
     AddRow(
         rows,
@@ -881,10 +966,14 @@ def RunAllIlcBenchmark(
         ordinaryIqResult,
         trainingAnalysis,
         outputDirectory,
+        powerCalibration,
+        config.outputPowerDbm,
     )
-    ordinaryIqMetrics = trainingAnalysis.Analyze(
-        iqPaModel.Process(ordinaryIqAnalysisResult.bestInputSignal)
+    ordinaryIqOutput = powerCalibration.CalibrateWaveformToOutputPower(
+        iqPaModel.Process(ordinaryIqAnalysisResult.bestInputSignal),
+        config.outputPowerDbm,
     )
+    ordinaryIqMetrics = trainingAnalysis.Analyze(ordinaryIqOutput)
     AddRow(
         rows,
         "Frequency-domain ILC on IQ plant",
@@ -908,10 +997,14 @@ def RunAllIlcBenchmark(
         augmentedResult,
         trainingAnalysis,
         outputDirectory,
+        powerCalibration,
+        config.outputPowerDbm,
     )
-    augmentedMetrics = trainingAnalysis.Analyze(
-        iqPaModel.Process(augmentedAnalysisResult.bestInputSignal)
+    augmentedOutput = powerCalibration.CalibrateWaveformToOutputPower(
+        iqPaModel.Process(augmentedAnalysisResult.bestInputSignal),
+        config.outputPowerDbm,
     )
+    augmentedMetrics = trainingAnalysis.Analyze(augmentedOutput)
     AddRow(
         rows,
         "Augmented IQ ILC",
@@ -930,6 +1023,7 @@ def RunAllIlcBenchmark(
             iqPaModel,
             trainingWaveform,
             config.width,
+            config.maximumOutputPowerDbm,
             "Frequency-domain ILC",
             None,
             ILCConfig(
@@ -947,6 +1041,7 @@ def RunAllIlcBenchmark(
             iqPaModel,
             trainingWaveform,
             config.width,
+            config.maximumOutputPowerDbm,
             "Augmented IQ ILC",
             RunAugmentedIqIlc,
             ILCConfig(
@@ -960,7 +1055,12 @@ def RunAllIlcBenchmark(
 
     # Fit every deployable model to the same converged ILC labels, then test
     # on a held-out Wi-Fi payload to measure generalization rather than recall.
-    validationBaselineOutput = paModel.Process(validationSignal)
+    validationBaselineOutput = (
+        powerCalibration.CalibrateWaveformToOutputPower(
+            paModel.Process(validationSignal),
+            config.outputPowerDbm,
+        )
+    )
     validationBaselineMetrics = validationAnalysis.Analyze(
         validationBaselineOutput
     )
@@ -1037,6 +1137,8 @@ def RunAllIlcBenchmark(
             paModel,
             validationAnalysis,
             maxAmplitude,
+            powerCalibration,
+            config.outputPowerDbm,
         )
         AddRow(
             rows,

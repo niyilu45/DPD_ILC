@@ -315,6 +315,8 @@ class Analysis:
                 "signalProcessingParameters": None,
                 "loadResistanceOhm": 50.0,
                 "maximumOutputPowerDbm": 25.0,
+                "activePowerThresholdDb": -60.0,
+                "activeGapToleranceSamples": 16,
                 "sampleRateHz": None,
                 "channelBandwidthHz": None,
                 "assistedMaximumOffsetSamples": 2000,
@@ -802,10 +804,21 @@ class Analysis:
                 "assistedMinimumCorrelation must be between zero and one"
             )
         PowerCalibration(
-            loadResistanceOhm=self.parameters["loadResistanceOhm"],
-            maximumOutputPowerDbm=self.parameters[
-                "maximumOutputPowerDbm"
-            ],
+            parameters={
+                "loadResistanceOhm": self.parameters[
+                    "loadResistanceOhm"
+                ],
+                "maximumOutputPowerDbm": self.parameters[
+                    "maximumOutputPowerDbm"
+                ],
+                "activePowerThresholdDb": self.parameters[
+                    "activePowerThresholdDb"
+                ],
+                "activeGapToleranceSamples": self.parameters[
+                    "activeGapToleranceSamples"
+                ],
+                "width": self.width,
+            },
         )
         # Constructing one temporary processor per conducted chain validates
         # nested settings without duplicating synchronization constraints.
@@ -1046,35 +1059,47 @@ class Analysis:
                 for chainIndex in range(preparedMatrix.shape[1])
             ]
         )
-        normalizedRmsPerChain = np.sqrt(
-            np.mean(np.abs(alignedMeasuredMatrix) ** 2, axis=0)
-        )
         powerCalibration = PowerCalibration(
-            loadResistanceOhm=self.parameters["loadResistanceOhm"],
-            maximumOutputPowerDbm=self.parameters[
-                "maximumOutputPowerDbm"
-            ],
+            parameters={
+                "loadResistanceOhm": self.parameters[
+                    "loadResistanceOhm"
+                ],
+                "maximumOutputPowerDbm": self.parameters[
+                    "maximumOutputPowerDbm"
+                ],
+                "activePowerThresholdDb": self.parameters[
+                    "activePowerThresholdDb"
+                ],
+                "activeGapToleranceSamples": self.parameters[
+                    "activeGapToleranceSamples"
+                ],
+                "width": 0,
+            },
         )
-        fullScaleRmsVoltage = powerCalibration.DbmToRms(
-            powerCalibration.maximumOutputPowerDbm
-        )
-        outputRmsVoltagePerChain = (
-            normalizedRmsPerChain * fullScaleRmsVoltage
+        normalizedRmsPerChain = np.asarray(
+            powerCalibration.CalculateActiveRmsPerChain(
+                alignedMeasuredMatrix
+            ),
+            dtype=float,
         )
         minimumPositive = np.finfo(float).tiny
         outputPowerDbmPerChain = tuple(
             float("-inf")
-            if outputRmsVoltage <= minimumPositive
-            else powerCalibration.RmsToDbm(float(outputRmsVoltage))
-            for outputRmsVoltage in outputRmsVoltagePerChain
+            if normalizedRms <= minimumPositive
+            else powerCalibration.NormalizedRmsToOutputPowerDbm(
+                float(normalizedRms)
+            )
+            for normalizedRms in normalizedRmsPerChain
         )
-        aggregateRmsVoltage = float(
-            np.sqrt(np.sum(outputRmsVoltagePerChain**2))
+        aggregateNormalizedRms = float(
+            np.sqrt(np.sum(normalizedRmsPerChain**2))
         )
         aggregateOutputPowerDbm = (
             float("-inf")
-            if aggregateRmsVoltage <= minimumPositive
-            else powerCalibration.RmsToDbm(aggregateRmsVoltage)
+            if aggregateNormalizedRms <= minimumPositive
+            else powerCalibration.NormalizedRmsToOutputPowerDbm(
+                aggregateNormalizedRms
+            )
         )
         return aggregateOutputPowerDbm, outputPowerDbmPerChain
 
@@ -1749,10 +1774,21 @@ class Analysis:
         if not methodEvaluators:
             raise ValueError("methodEvaluators cannot be empty")
         powerCalibration = PowerCalibration(
-            loadResistanceOhm=self.parameters["loadResistanceOhm"],
-            maximumOutputPowerDbm=self.parameters[
-                "maximumOutputPowerDbm"
-            ],
+            parameters={
+                "loadResistanceOhm": self.parameters[
+                    "loadResistanceOhm"
+                ],
+                "maximumOutputPowerDbm": self.parameters[
+                    "maximumOutputPowerDbm"
+                ],
+                "activePowerThresholdDb": self.parameters[
+                    "activePowerThresholdDb"
+                ],
+                "activeGapToleranceSamples": self.parameters[
+                    "activeGapToleranceSamples"
+                ],
+                "width": self.width,
+            },
         )
         driveScaleArray = np.asarray(
             [
@@ -1792,11 +1828,16 @@ class Analysis:
                 rawMeasuredSignal = methodEvaluator(
                     pointReference, float(outputPowerDbm)
                 )
-                # EVM is invariant to the physical reporting gain removed by
-                # complex-gain compensation. Keep raw public fixed-point codes
-                # here; voltage calibration would no longer be an I/Q code
-                # and therefore must not be fed back into Analysis.
-                measuredSignal = rawMeasuredSignal
+                # Every method is regenerated at the same active-burst output
+                # power before analysis. The normalized calibrator preserves
+                # the public floating/fixed interface and excludes padding or
+                # long duty-cycle off intervals from its RMS denominator.
+                measuredSignal = (
+                    powerCalibration.CalibrateWaveformToOutputPower(
+                        rawMeasuredSignal,
+                        float(outputPowerDbm),
+                    )
+                )
                 pointAnalysis = Analysis(
                     pointReference,
                     self.waveform,

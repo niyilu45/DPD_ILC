@@ -724,12 +724,13 @@ def CheckDocumentationApiConsistency() -> None:
                 "loadResistanceOhm",
                 "maximumOutputPowerDbm",
                 "parameters",
+                "width",
                 "parameterOverrides",
             ),
             (
                 "PowerCalibration(loadResistanceOhm=None, "
                 "maximumOutputPowerDbm=None, parameters=None, "
-                "**parameterOverrides)"
+                "width=None, **parameterOverrides)"
             ),
         ),
         (
@@ -1605,6 +1606,148 @@ def CheckPowerEvmCurve() -> None:
     assert np.isclose(
         powerCalibration.RmsToDbm(calibratedRms),
         20.0,
+    )
+
+    # Power calibration must ignore leading/trailing padding and a long
+    # internal off interval. The active bursts deliberately start from an
+    # arbitrary 2.7 RMS scale rather than a normalized waveform.
+    firstBurst = 2.7 * np.exp(
+        1j * 2.0 * np.pi * np.arange(160) / 29.0
+    )
+    # An eight-sample internal zero crossing is shorter than the configured
+    # gap tolerance and must remain inside the active-burst RMS denominator.
+    firstBurst[70:78] = 0.0
+    secondBurst = 2.7 * np.exp(
+        1j * 2.0 * np.pi * np.arange(192) / 31.0
+    )
+    paddedBurst = np.r_[
+        np.zeros(47, dtype=np.complex128),
+        firstBurst,
+        np.zeros(80, dtype=np.complex128),
+        secondBurst,
+        np.zeros(53, dtype=np.complex128),
+    ]
+    floatingCalibration = PowerCalibration(
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "activePowerThresholdDb": -60.0,
+            "activeGapToleranceSamples": 16,
+            "width": 0,
+        }
+    )
+    floatingCalibratedBurst = (
+        floatingCalibration.CalibrateWaveformToOutputPower(
+            paddedBurst,
+            22.0,
+        )
+    )
+    floatingActiveMask = floatingCalibration.FindActiveSampleMask(
+        floatingCalibratedBurst
+    )
+    assert np.count_nonzero(floatingActiveMask) == 352
+    floatingActiveRms = (
+        floatingCalibration.CalculateActiveRmsPerChain(
+            floatingCalibratedBurst
+        )[0]
+    )
+    assert np.isclose(
+        floatingCalibration.NormalizedRmsToOutputPowerDbm(
+            floatingActiveRms
+        ),
+        22.0,
+        atol=1.0e-10,
+    )
+    assert (
+        np.sqrt(np.mean(np.abs(floatingCalibratedBurst) ** 2))
+        < floatingActiveRms
+    )
+
+    mimoCalibratedBurst = (
+        floatingCalibration.CalibrateWaveformToOutputPowers(
+            np.column_stack((paddedBurst, 0.17 * paddedBurst)),
+            (18.0, 22.0),
+        )
+    )
+    mimoActiveRms = (
+        floatingCalibration.CalculateActiveRmsPerChain(
+            mimoCalibratedBurst
+        )
+    )
+    assert np.allclose(
+        tuple(
+            floatingCalibration.NormalizedRmsToOutputPowerDbm(
+                chainRms
+            )
+            for chainRms in mimoActiveRms
+        ),
+        (18.0, 22.0),
+        atol=1.0e-10,
+    )
+
+    fixedCalibration = PowerCalibration(
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "activePowerThresholdDb": -60.0,
+            "activeGapToleranceSamples": 16,
+            "width": 16,
+        }
+    )
+    fixedInputBurst = FixedPoint(16).EncodeComplex(
+        paddedBurst / 3.0
+    )
+    fixedCalibratedBurst = (
+        fixedCalibration.CalibrateWaveformToOutputPower(
+            fixedInputBurst,
+            22.0,
+        )
+    )
+    assert np.allclose(
+        fixedCalibratedBurst.real,
+        np.rint(fixedCalibratedBurst.real),
+    )
+    assert np.allclose(
+        fixedCalibratedBurst.imag,
+        np.rint(fixedCalibratedBurst.imag),
+    )
+    decodedFixedBurst = FixedPoint(16).DecodeComplex(
+        fixedCalibratedBurst
+    )
+    fixedActiveRms = fixedCalibration.CalculateActiveRmsPerChain(
+        decodedFixedBurst
+    )[0]
+    assert abs(
+        fixedCalibration.NormalizedRmsToOutputPowerDbm(
+            fixedActiveRms
+        )
+        - 22.0
+    ) < 0.01
+    fixedBurstMetrics = Analysis(
+        fixedCalibratedBurst,
+        transmittedSignal=fixedCalibratedBurst,
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "activePowerThresholdDb": -60.0,
+            "activeGapToleranceSamples": 16,
+            "width": 16,
+        },
+    ).Analyze()
+    assert abs(fixedBurstMetrics["outputPowerDbm"] - 22.0) < 0.01
+
+    voltageCalibratedBurst = (
+        floatingCalibration.ScaleSignalToOutputPower(
+            paddedBurst,
+            22.0,
+        )
+    )
+    voltageActiveRms = (
+        floatingCalibration.CalculateActiveRmsPerChain(
+            voltageCalibratedBurst
+        )[0]
+    )
+    assert np.isclose(
+        floatingCalibration.RmsToDbm(voltageActiveRms),
+        22.0,
+        atol=1.0e-10,
     )
     try:
         powerCalibration.OutputPowerToDriveScale(25.1)

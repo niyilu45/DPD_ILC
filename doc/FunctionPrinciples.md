@@ -221,10 +221,12 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.MaximumOutputPowerDbm`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate` | E | 用ChainMap保存50 Ω端口与默认25 dBm额定输出极限；未知键警告后忽略，已识别值继续严格验证 | SigProc §13 |
+| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.MaximumOutputPowerDbm`, `PowerCalibration.Width`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate` | E | 用ChainMap保存50 Ω端口、默认25 dBm额定输出极限、有效区检测阈值和公开I/Q位宽；未知键警告后忽略，已识别值继续严格验证 | SigProc §13 |
 | `PowerCalibration.DbmToRms`, `PowerCalibration.RmsToDbm` | P/N | 按 $P=V_{\mathrm{RMS}}^2/R$ 在绝对 dBm 功率与复包络 RMS 电压之间双向换算 | SigProc §13 |
-| `PowerCalibration.OutputPowerToDriveScale` | P | 按目标输出相对额定极限的输出回退量计算归一化PA驱动比例 | SigProc §13 |
-| `PowerCalibration.ScaleSignalToOutputPower`, `PowerCalibration.ScaleSignalToOutputPowers` | P/E | 以不改变EVM和ACLR比值的逐链常数增益，把PA输出标定到目标dBm | SigProc §13 |
+| `PowerCalibration.OutputPowerToDriveScale`, `PowerCalibration.NormalizedRmsToOutputPowerDbm` | P | 在目标dBm与相对额定满量程的归一化RMS之间双向换算 | SigProc §13 |
+| `PowerCalibration.FindActiveSampleMask`, `PowerCalibration.CalculateActiveRmsPerChain` | P/N | 以逐链峰值相对门限识别突发有效样点，闭合短过零间隙，但排除前后补零和长占空比静默区，再按有效样点能量计算RMS | SigProc §13.1 |
+| `PowerCalibration.CalibrateFixedColumn`, `PowerCalibration.CalibrateWaveformToOutputPower`, `PowerCalibration.CalibrateWaveformToOutputPowers` | P/N/E | 消除任意初始RMS归一化，以有效区RMS重建目标dBm波形；定点模式通过量化后RMS搜索补偿取整并维持公开整数I/Q码接口 | SigProc §13.2–§13.3 |
+| `PowerCalibration.ScaleSignalToOutputPower`, `PowerCalibration.ScaleSignalToOutputPowers` | P/E | 按有效区RMS施加逐链常数增益，把物理电压波形标定到目标dBm且不把补零或长静默计入平均 | SigProc §13.4 |
 | `SignalProcessingResult.ToDict`, `SignalOverlapResult.ToDict` | E | 只序列化估计标量或重叠坐标，不重新计算同步与相关 | SigProc §9 |
 | `SigProc.__init__`, `SigProc.ValidateSignal`, `SigProc.GetParameters`, `SigProc.UpdateParameters`, `SigProc.ValidateParameters` | E | 保存参考、解析ChainMap、警告并忽略未知键、检查已识别配置的单位和有限性 | SigProc §9–§10 |
 | `SigProc.ResolveMaximumIntegerDelay` | N/E | 把自动/外部时延边界转换为有限相关搜索半径 | SigProc §3、§12 |
@@ -277,7 +279,7 @@ flowchart LR
 | `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让输出功率/SNR/EVM/ACLR共用一次同步结果并保存阶段映射 | Analysis §1、§3.1 |
 | `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO对齐输出，复制反馈同步估计，并在Analysis中按严格EVM选择最佳实测轮 | DpdIlc §7、Analysis §5.10 |
 | `Analysis.AnalyzeMimoIlcHistory` | P/E | 按轮组合各PA链输出，以完整MIMO空间解映射统一计算性能并在Analysis中选择最佳轮 | Analysis §9 |
-| `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同的每路目标输出 dBm 点公平比较各方法EVM，按相对25 dBm额定极限的回退设置归一化驱动，并保存目标输出RMS电压 | Analysis §8 |
+| `Analysis.AnalyzePowerEvmCurve` | P/E | 在共同的每路目标输出 dBm 点公平比较各方法EVM，按相对25 dBm额定极限的回退设置归一化驱动，再把各方法输出按有效突发RMS重标定到横轴功率并保持浮点/定点公开接口 | Analysis §8 |
 | `Analysis.SavePowerEvmCurveData`, `Analysis.Print`, `Analysis.PrintMimo`, `Analysis.Save`, `Analysis.SaveConvergence`, `Analysis.PrintConvergence` | E | 展示/序列化既有结果，不改变物理指标 | Analysis §10–§11 |
 
 ## 9. `Draw.py`：图形函数
@@ -302,9 +304,9 @@ flowchart LR
 |---|---|---|---|
 | `BenchMark.BenchmarkRow.ToDict` | E | 序列化一个方法的指标和相对改善量 | BenchMark §4 |
 | `BenchMark.AddRow` | E | 相对同场景baseline计算SNR/EVM/ACLR改善 | BenchMark §4–§9 |
-| `BenchMark.SaveHistory`, `BenchMark.ReportHistory` | E | 打印并保存每种ILC的同一组三级MSE和图 | BenchMark §6 |
-| `BenchMark.EvaluateDeployment` | E/P | 固定DPD→峰值投影→PA→统一Analysis，使用独立验证帧 | BenchMark §9 |
-| `BenchMark.RunIlcCurvePoint` | E | 在当前功率点重新构造正确参考和EVM-MSE evaluator | BenchMark §10 |
+| `BenchMark.SaveHistory`, `BenchMark.ReportHistory` | E | 保留原生MSE与候选输入，只把逐轮PA输出按有效突发目标dBm重标定后打印并保存每种ILC的同一组三级MSE和图 | BenchMark §6 |
+| `BenchMark.EvaluateDeployment` | E/P | 固定DPD→峰值投影→PA→有效突发功率重标定→统一Analysis，使用独立验证帧 | BenchMark §9 |
+| `BenchMark.RunIlcCurvePoint` | E | 在当前功率点重新构造正确参考、有效区目标dBm输出和EVM-MSE分析上下文 | BenchMark §10 |
 | `BenchMark.RunAllIlcBenchmark` | E | 固定波形、PA、迭代预算和指标定义；按类别构造全部场景 | BenchMark §2–§10 |
 | `BenchMark.SaveBenchmarkResults`, `BenchMark.PrintBenchmarkResults` | E | 输出统一表格/文件，不重新计算指标 | BenchMark §3–§4 |
 

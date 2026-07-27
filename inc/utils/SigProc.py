@@ -1,5 +1,6 @@
 """Shared synchronization, compensation, and RF-power utilities."""
 
+import warnings
 from collections import ChainMap
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -11,16 +12,18 @@ from .ConfigUtils import (
     FilterRecognizedParameters,
     RecognizedParameterView,
 )
+from .FixedPoint import FixedPoint
 
 
 class PowerCalibration:
-    """Convert complex-envelope RMS voltage and absolute dBm power.
+    """Calibrate physical-voltage and normalized public waveforms in dBm.
 
     The project uses the explicit convention that the RMS magnitude of a
     complex baseband waveform is the RMS voltage delivered to the configured
-    resistive port. Under this convention ``P = Vrms**2 / R``. Keeping the
-    resistance beside the signal-processing utilities gives PA models,
-    analysis, benchmarks, and command-line code one independent power scale.
+    resistive port for the physical-voltage methods. Under this convention
+    ``P = Vrms**2 / R``. Normalized public waveforms instead map active-region
+    RMS equal to one onto ``maximumOutputPowerDbm``. Both paths exclude
+    leading/trailing padding and long off intervals from the RMS denominator.
     """
 
     def __init__(
@@ -28,6 +31,7 @@ class PowerCalibration:
         loadResistanceOhm: Optional[float] = None,
         maximumOutputPowerDbm: Optional[float] = None,
         parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize a live ChainMap-backed RF power calibration.
@@ -35,12 +39,15 @@ class PowerCalibration:
         Processing details:
             Algorithm: Define the standard 50-ohm default inside this
             constructor, layer caller values ahead of it, and validate the
-            resolved resistance before any logarithmic conversion.
+            resolved resistance, active-region detector, full-scale power,
+            and public width before any logarithmic conversion.
 
         Args:
             loadResistanceOhm: Optional resistive port value in ohms.
             maximumOutputPowerDbm: Optional rated PA output-power ceiling.
             parameters: Optional caller-owned mapping of calibration values.
+            width: Optional public I/Q width used by normalized waveform
+                calibration. None selects the internal 16-bit default.
             parameterOverrides: Highest-priority local calibration overrides.
 
         Returns:
@@ -51,6 +58,9 @@ class PowerCalibration:
             {
                 "loadResistanceOhm": 50.0,
                 "maximumOutputPowerDbm": 25.0,
+                "activePowerThresholdDb": -60.0,
+                "activeGapToleranceSamples": 16,
+                "width": 16,
             }
         )
         directOverrides = dict(parameterOverrides)
@@ -60,6 +70,8 @@ class PowerCalibration:
             directOverrides["maximumOutputPowerDbm"] = (
                 maximumOutputPowerDbm
             )
+        if width is not None:
+            directOverrides["width"] = width
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
         externalParameters: Mapping[str, object] = (
@@ -117,6 +129,22 @@ class PowerCalibration:
 
     maximumOutputPowerDbm = MaximumOutputPowerDbm
 
+    @property
+    def Width(self) -> int:
+        """Return the public I/Q component width used for calibration.
+
+        Processing details:
+            Algorithm: Read the validated ChainMap value without changing the
+            caller-owned parameter mapping.
+
+        Returns:
+            result: Zero for floating mode or a positive signed-code width.
+        """
+
+        return cast(int, self.parameters["width"])
+
+    width = Width
+
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened calibration parameter snapshot.
 
@@ -125,7 +153,7 @@ class PowerCalibration:
             caller-owned mapping.
 
         Returns:
-            result: Ordinary dictionary containing the resolved resistance.
+            result: Ordinary dictionary containing every resolved setting.
         """
 
         return dict(self.parameters)
@@ -159,11 +187,12 @@ class PowerCalibration:
             raise
 
     def Validate(self) -> None:
-        """Validate the resolved resistance and output-power limit.
+        """Validate power, active-region, and public-interface settings.
 
         Processing details:
-            Algorithm: Check numeric type, finiteness, and positive physical
-            domain after unknown keys have been warned about and filtered.
+            Algorithm: Check numeric type, finiteness, physical domains,
+            active threshold and gap tolerance, then construct ``FixedPoint``
+            to validate the requested public I/Q width.
 
         Returns:
             result: None. Invalid calibration raises an exception.
@@ -190,6 +219,30 @@ class PowerCalibration:
             raise ValueError(
                 "maximumOutputPowerDbm must be finite"
             )
+        activePowerThresholdDb = self.parameters[
+            "activePowerThresholdDb"
+        ]
+        if (
+            not isinstance(activePowerThresholdDb, (int, float))
+            or isinstance(activePowerThresholdDb, bool)
+            or not np.isfinite(activePowerThresholdDb)
+            or float(activePowerThresholdDb) >= 0.0
+        ):
+            raise ValueError(
+                "activePowerThresholdDb must be finite and negative"
+            )
+        activeGapToleranceSamples = self.parameters[
+            "activeGapToleranceSamples"
+        ]
+        if (
+            not isinstance(activeGapToleranceSamples, int)
+            or isinstance(activeGapToleranceSamples, bool)
+            or activeGapToleranceSamples < 0
+        ):
+            raise ValueError(
+                "activeGapToleranceSamples must be a nonnegative integer"
+            )
+        FixedPoint(self.width)
 
     def DbmToRms(self, powerDbm: float) -> float:
         """Convert absolute port power in dBm to complex-envelope RMS volts.
@@ -291,6 +344,435 @@ class PowerCalibration:
             )
         )
 
+    def NormalizedRmsToOutputPowerDbm(
+        self, normalizedRms: float
+    ) -> float:
+        """Convert normalized full-scale RMS into output power in dBm.
+
+        Processing details:
+            Algorithm: Treat normalized RMS equal to one as
+            ``maximumOutputPowerDbm`` and apply the amplitude-ratio
+            twenty-log conversion.
+
+        Args:
+            normalizedRms: Positive normalized complex-envelope RMS.
+
+        Returns:
+            result: Absolute output power under the configured full-scale
+                calibration.
+        """
+
+        if (
+            not isinstance(normalizedRms, (int, float))
+            or isinstance(normalizedRms, bool)
+            or not np.isfinite(normalizedRms)
+            or normalizedRms <= 0.0
+        ):
+            raise ValueError(
+                "normalizedRms must be finite and positive"
+            )
+        return float(
+            self.maximumOutputPowerDbm
+            + 20.0 * np.log10(float(normalizedRms))
+        )
+
+    def FindActiveSampleMask(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Detect burst-active samples while excluding padding and off time.
+
+        Processing details:
+            Algorithm: Compare instantaneous power with a configurable level
+            below each chain's peak, exclude leading/trailing padding and
+            long internal inactive runs, and fill only short inactive gaps so
+            ordinary OFDM zero crossings remain part of the active burst.
+
+        Args:
+            inputSignal: Finite complex vector or samples-by-chain matrix in
+                any consistent linear amplitude scale.
+
+        Returns:
+            result: Boolean mask with the same vector or matrix orientation.
+        """
+
+        complexSignal = np.asarray(inputSignal, dtype=np.complex128)
+        if (
+            complexSignal.ndim not in (1, 2)
+            or complexSignal.size == 0
+            or complexSignal.shape[0] == 0
+            or not np.all(np.isfinite(complexSignal))
+        ):
+            raise ValueError(
+                "inputSignal must be a finite nonempty vector or matrix"
+            )
+        inputWasVector = complexSignal.ndim == 1
+        signalMatrix = (
+            complexSignal.reshape(-1, 1)
+            if inputWasVector
+            else complexSignal
+        )
+        instantaneousPower = np.abs(signalMatrix) ** 2
+        peakPowerPerChain = np.max(instantaneousPower, axis=0)
+        if np.any(peakPowerPerChain <= np.finfo(float).tiny):
+            raise ValueError(
+                "cannot detect an active interval in a zero-power signal"
+            )
+        relativePowerThreshold = 10.0 ** (
+            float(self.parameters["activePowerThresholdDb"]) / 10.0
+        )
+        activeMask = (
+            instantaneousPower
+            > peakPowerPerChain.reshape(1, -1)
+            * relativePowerThreshold
+        )
+        gapTolerance = cast(
+            int, self.parameters["activeGapToleranceSamples"]
+        )
+        if gapTolerance > 0:
+            for chainIndex in range(signalMatrix.shape[1]):
+                activeIndices = np.flatnonzero(
+                    activeMask[:, chainIndex]
+                )
+                if activeIndices.size == 0:
+                    raise ValueError(
+                        "unable to identify active signal samples"
+                    )
+                for leftIndex, rightIndex in zip(
+                    activeIndices[:-1], activeIndices[1:]
+                ):
+                    inactiveLength = int(
+                        rightIndex - leftIndex - 1
+                    )
+                    if 0 < inactiveLength <= gapTolerance:
+                        activeMask[
+                            leftIndex:rightIndex + 1,
+                            chainIndex,
+                        ] = True
+        if np.any(np.sum(activeMask, axis=0) == 0):
+            raise ValueError(
+                "unable to identify active signal samples"
+            )
+        return activeMask[:, 0] if inputWasVector else activeMask
+
+    def CalculateActiveRmsPerChain(
+        self, inputSignal: np.ndarray
+    ) -> Tuple[float, ...]:
+        """Measure RMS only over each chain's detected active samples.
+
+        Processing details:
+            Algorithm: Build a scale-invariant burst mask with
+            ``FindActiveSampleMask`` and divide active sample energy by active
+            sample count rather than total capture length.
+
+        Args:
+            inputSignal: Finite complex vector or samples-by-chain matrix.
+
+        Returns:
+            result: Chain-ordered active-region RMS values.
+        """
+
+        complexSignal = np.asarray(inputSignal, dtype=np.complex128)
+        inputWasVector = complexSignal.ndim == 1
+        signalMatrix = (
+            complexSignal.reshape(-1, 1)
+            if inputWasVector
+            else complexSignal
+        )
+        activeMask = self.FindActiveSampleMask(complexSignal)
+        maskMatrix = (
+            activeMask.reshape(-1, 1)
+            if activeMask.ndim == 1
+            else activeMask
+        )
+        activeEnergy = np.sum(
+            np.abs(signalMatrix) ** 2 * maskMatrix,
+            axis=0,
+        )
+        activeSampleCount = np.sum(maskMatrix, axis=0)
+        activeRms = np.sqrt(activeEnergy / activeSampleCount)
+        return tuple(float(rmsValue) for rmsValue in activeRms)
+
+    def CalibrateFixedColumn(
+        self,
+        normalizedColumn: np.ndarray,
+        activeMask: np.ndarray,
+        targetNormalizedRms: float,
+    ) -> np.ndarray:
+        """Quantize one normalized column while meeting its target RMS.
+
+        Processing details:
+            Algorithm: Search one nonnegative pre-quantization scale because
+            signed-code rounding and saturation make achieved RMS piecewise
+            constant. Retain the closest encoded candidate and warn when
+            component clipping was required to attain the requested power.
+
+        Args:
+            normalizedColumn: Floating column whose active-region RMS is one.
+            activeMask: Boolean active-sample mask for the same column.
+            targetNormalizedRms: Desired post-quantization active RMS.
+
+        Returns:
+            result: Public fixed-point integer I/Q codes in complex128.
+        """
+
+        interfaceFormat = FixedPoint(self.width)
+        if interfaceFormat.IsFloatingPoint():
+            return (
+                targetNormalizedRms * normalizedColumn
+            ).astype(np.complex128, copy=False)
+        columnArray = np.asarray(
+            normalizedColumn, dtype=np.complex128
+        ).reshape(-1)
+        maskArray = np.asarray(activeMask, dtype=bool).reshape(-1)
+        if (
+            columnArray.size == 0
+            or maskArray.shape != columnArray.shape
+            or not np.any(maskArray)
+        ):
+            raise ValueError(
+                "normalizedColumn and activeMask must be aligned and nonempty"
+            )
+
+        scaleLower = 0.0
+        scaleUpper = float(targetNormalizedRms)
+        bestCodes = interfaceFormat.EncodeComplex(
+            scaleUpper * columnArray
+        )
+        bestDecoded = interfaceFormat.DecodeComplex(bestCodes)
+        bestRms = float(
+            np.sqrt(np.mean(np.abs(bestDecoded[maskArray]) ** 2))
+        )
+        bestError = abs(bestRms - targetNormalizedRms)
+        upperRms = bestRms
+
+        # Expand the search until quantized RMS brackets the target. If every
+        # active I/Q component is saturated, further scale increases no longer
+        # change RMS and the target is physically unreachable at this width.
+        previousUpperRms = -1.0
+        expansionCount = 0
+        while (
+            upperRms < targetNormalizedRms
+            and expansionCount < 60
+            and abs(upperRms - previousUpperRms)
+            > np.finfo(float).eps
+        ):
+            previousUpperRms = upperRms
+            scaleUpper *= 2.0
+            candidateCodes = interfaceFormat.EncodeComplex(
+                scaleUpper * columnArray
+            )
+            candidateDecoded = interfaceFormat.DecodeComplex(
+                candidateCodes
+            )
+            candidateRms = float(
+                np.sqrt(
+                    np.mean(
+                        np.abs(candidateDecoded[maskArray]) ** 2
+                    )
+                )
+            )
+            upperRms = candidateRms
+            candidateError = abs(
+                candidateRms - targetNormalizedRms
+            )
+            if candidateError < bestError:
+                bestCodes = candidateCodes
+                bestRms = candidateRms
+                bestError = candidateError
+            expansionCount += 1
+        if upperRms < targetNormalizedRms:
+            raise ValueError(
+                "target output power is unreachable at the configured width"
+            )
+
+        for _ in range(64):
+            scaleMiddle = 0.5 * (scaleLower + scaleUpper)
+            candidateCodes = interfaceFormat.EncodeComplex(
+                scaleMiddle * columnArray
+            )
+            candidateDecoded = interfaceFormat.DecodeComplex(
+                candidateCodes
+            )
+            candidateRms = float(
+                np.sqrt(
+                    np.mean(
+                        np.abs(candidateDecoded[maskArray]) ** 2
+                    )
+                )
+            )
+            candidateError = abs(
+                candidateRms - targetNormalizedRms
+            )
+            if candidateError < bestError:
+                bestCodes = candidateCodes
+                bestRms = candidateRms
+                bestError = candidateError
+            if candidateRms < targetNormalizedRms:
+                scaleLower = scaleMiddle
+            else:
+                scaleUpper = scaleMiddle
+
+        achievedPowerDbm = self.NormalizedRmsToOutputPowerDbm(
+            bestRms
+        )
+        targetPowerDbm = self.NormalizedRmsToOutputPowerDbm(
+            targetNormalizedRms
+        )
+        if abs(achievedPowerDbm - targetPowerDbm) > 0.01:
+            raise ValueError(
+                "fixed-point quantization cannot meet target power within "
+                "0.01 dB"
+            )
+        formatInfo = interfaceFormat.GetFormatInfo()
+        if np.any(
+            bestCodes.real
+            >= cast(float, formatInfo["maximumCode"])
+        ) or np.any(
+            bestCodes.real
+            <= cast(float, formatInfo["minimumCode"])
+        ) or np.any(
+            bestCodes.imag
+            >= cast(float, formatInfo["maximumCode"])
+        ) or np.any(
+            bestCodes.imag
+            <= cast(float, formatInfo["minimumCode"])
+        ):
+            warnings.warn(
+                (
+                    "PowerCalibration met the requested fixed-point power "
+                    "using component clipping; EVM may change"
+                ),
+                UserWarning,
+                stacklevel=3,
+            )
+        return bestCodes
+
+    def CalibrateWaveformToOutputPower(
+        self,
+        inputSignal: np.ndarray,
+        outputPowerDbm: float,
+    ) -> np.ndarray:
+        """Regenerate every waveform chain at one requested output power.
+
+        Processing details:
+            Algorithm: Detect effective burst samples, remove arbitrary input
+            RMS normalization, apply the target normalized RMS implied by the
+            rated full-scale output power, and return floating samples or
+            fixed integer codes according to ``width``.
+
+        Args:
+            inputSignal: Arbitrarily scaled public waveform vector or matrix.
+            outputPowerDbm: Requested active-region output power per chain.
+
+        Returns:
+            result: Newly calibrated waveform with unchanged shape.
+        """
+
+        complexSignal = np.asarray(inputSignal, dtype=np.complex128)
+        if complexSignal.ndim not in (1, 2):
+            raise ValueError(
+                "inputSignal must be a vector or samples-by-chain matrix"
+            )
+        chainCount = 1 if complexSignal.ndim == 1 else complexSignal.shape[1]
+        return self.CalibrateWaveformToOutputPowers(
+            complexSignal,
+            tuple(float(outputPowerDbm) for _ in range(chainCount)),
+        )
+
+    def CalibrateWaveformToOutputPowers(
+        self,
+        inputSignal: np.ndarray,
+        outputPowerDbmPerChain: Sequence[float],
+    ) -> np.ndarray:
+        """Regenerate waveform chains at independent requested powers.
+
+        Processing details:
+            Algorithm: Decode the public interface, detect each chain's
+            effective burst mask, normalize active RMS independently, scale
+            to each dBm-derived normalized target, and encode back through the
+            same floating or signed-code interface.
+
+        Args:
+            inputSignal: Arbitrarily scaled public vector or matrix.
+            outputPowerDbmPerChain: One target dBm value per waveform chain.
+
+        Returns:
+            result: Power-calibrated public waveform preserving orientation.
+        """
+
+        interfaceFormat = FixedPoint(self.width)
+        floatingSignal = interfaceFormat.DecodeComplex(inputSignal)
+        if (
+            floatingSignal.ndim not in (1, 2)
+            or floatingSignal.size == 0
+            or floatingSignal.shape[0] == 0
+            or not np.all(np.isfinite(floatingSignal))
+        ):
+            raise ValueError(
+                "inputSignal must be a finite nonempty vector or matrix"
+            )
+        inputWasVector = floatingSignal.ndim == 1
+        signalMatrix = (
+            floatingSignal.reshape(-1, 1)
+            if inputWasVector
+            else floatingSignal
+        )
+        targetPowers = tuple(outputPowerDbmPerChain)
+        if len(targetPowers) != signalMatrix.shape[1]:
+            raise ValueError(
+                "outputPowerDbmPerChain must contain one value per chain"
+            )
+        activeMask = self.FindActiveSampleMask(signalMatrix)
+        maskMatrix = (
+            activeMask.reshape(-1, 1)
+            if activeMask.ndim == 1
+            else activeMask
+        )
+        calibratedColumns = []
+        for chainIndex, outputPowerDbm in enumerate(targetPowers):
+            targetNormalizedRms = self.OutputPowerToDriveScale(
+                outputPowerDbm
+            )
+            if targetNormalizedRms <= np.finfo(float).tiny:
+                raise ValueError(
+                    "outputPowerDbm is outside the numeric range"
+                )
+            chainMask = maskMatrix[:, chainIndex]
+            currentRms = float(
+                np.sqrt(
+                    np.mean(
+                        np.abs(signalMatrix[chainMask, chainIndex]) ** 2
+                    )
+                )
+            )
+            if currentRms <= np.finfo(float).tiny:
+                raise ValueError(
+                    "cannot calibrate a zero-power active waveform"
+                )
+            normalizedColumn = (
+                signalMatrix[:, chainIndex] / currentRms
+            )
+            if interfaceFormat.IsFloatingPoint():
+                calibratedColumns.append(
+                    targetNormalizedRms * normalizedColumn
+                )
+            else:
+                calibratedColumns.append(
+                    self.CalibrateFixedColumn(
+                        normalizedColumn,
+                        chainMask,
+                        targetNormalizedRms,
+                    )
+                )
+        calibratedMatrix = np.column_stack(calibratedColumns)
+        if interfaceFormat.IsFloatingPoint():
+            calibratedMatrix = interfaceFormat.EncodeComplex(
+                calibratedMatrix
+            )
+        if inputWasVector:
+            return calibratedMatrix[:, 0]
+        return calibratedMatrix
+
     def ScaleSignalToOutputPower(
         self,
         signal: np.ndarray,
@@ -300,9 +782,10 @@ class PowerCalibration:
 
         Processing details:
             Algorithm: Validate a complex vector or samples-by-chain matrix,
-            calculate each chain RMS independently, convert the requested
-            per-chain dBm value to RMS voltage, and apply one constant gain
-            per chain. Constant post-PA gain preserves EVM and ACLR ratios.
+            calculate each chain active-region RMS independently, convert the
+            requested per-chain dBm value to RMS voltage, and apply one
+            constant gain per chain. Constant post-PA gain preserves EVM and
+            ACLR ratios.
 
         Args:
             signal: One PA output vector or a samples-by-PA matrix.
@@ -347,8 +830,8 @@ class PowerCalibration:
 
         Processing details:
             Algorithm: Validate one target per matrix column, measure each
-            current RMS, convert every dBm target through the common port
-            resistance, and apply independent constant gains.
+            current active-region RMS, convert every dBm target through the
+            common port resistance, and apply independent constant gains.
 
         Args:
             signal: Samples-by-PA complex matrix.
@@ -386,8 +869,9 @@ class PowerCalibration:
                 self.DbmToRms(float(targetPowerDbm))
             )
         targetRmsValues = np.asarray(targetRmsList, dtype=float)
-        currentRms = np.sqrt(
-            np.mean(np.abs(signalMatrix) ** 2, axis=0)
+        currentRms = np.asarray(
+            self.CalculateActiveRmsPerChain(signalMatrix),
+            dtype=float,
         )
         if np.any(currentRms <= np.finfo(float).tiny):
             raise ValueError(

@@ -1,6 +1,7 @@
 """Command-line entry point for the VHT/HE/EHT DPD-ILC simulation project."""
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -386,9 +387,14 @@ def Main() -> int:
     arguments = argumentParser.parse_args()
 
     try:
+        powerCalibrationParameters = {
+            "loadResistanceOhm": arguments.loadResistanceOhm,
+            "maximumOutputPowerDbm": arguments.maximumOutputPowerDbm,
+        }
+        if arguments.width is not None:
+            powerCalibrationParameters["width"] = arguments.width
         powerCalibration = PowerCalibration(
-            loadResistanceOhm=arguments.loadResistanceOhm,
-            maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
+            parameters=powerCalibrationParameters
         )
         outputPowerDbm = (
             20.0
@@ -572,25 +578,41 @@ def Main() -> int:
     # The first pass establishes the unlinearized baseline at the requested
     # operating point. The same PA instance is reused for every comparison.
     baselineOutputRaw = paModel.Process(referenceSignal)
-    baselineOutput = powerCalibration.ScaleSignalToOutputPowers(
-        baselineOutputRaw,
-        outputPowerDbmPerChain,
+    baselineOutput = (
+        powerCalibration.CalibrateWaveformToOutputPowers(
+            baselineOutputRaw,
+            outputPowerDbmPerChain,
+        )
+    )
+    floatingBaselineOutput = interfaceFormat.DecodeComplex(
+        baselineOutput
     )
     baselineOutputMatrix = (
-        baselineOutput.reshape(-1, 1)
-        if baselineOutput.ndim == 1
-        else baselineOutput
+        floatingBaselineOutput.reshape(-1, 1)
+        if floatingBaselineOutput.ndim == 1
+        else floatingBaselineOutput
     )
     baselineOutputRms = float(
         np.sqrt(
-            np.mean(np.sum(np.abs(baselineOutputMatrix) ** 2, axis=1))
+            np.sum(
+                np.asarray(
+                    powerCalibration.CalculateActiveRmsPerChain(
+                        baselineOutputMatrix
+                    )
+                )
+                ** 2
+            )
         )
     )
-    baselineOutputRmsPerChain = np.sqrt(
-        np.mean(np.abs(baselineOutputMatrix) ** 2, axis=0)
+    baselineOutputRmsPerChain = np.asarray(
+        powerCalibration.CalculateActiveRmsPerChain(
+            baselineOutputMatrix
+        )
     )
     baselineOutputPowerDbmPerChain = [
-        powerCalibration.RmsToDbm(float(chainOutputRms))
+        powerCalibration.NormalizedRmsToOutputPowerDbm(
+            float(chainOutputRms)
+        )
         for chainOutputRms in baselineOutputRmsPerChain
     ]
     ilcConfig = ILCConfig(
@@ -610,8 +632,24 @@ def Main() -> int:
             waveform.bandwidthHz,
             ilcConfig,
         )
+        # ILC must learn from the native PA response, but RF reporting must
+        # evaluate the regenerated waveform at the requested conducted power.
+        # Replacing only the stored output preserves every learning-domain MSE,
+        # synchronization estimate, and candidate input in the native record.
+        calibratedIlcHistory = tuple(
+            replace(
+                iterationRecord,
+                outputSignal=(
+                    powerCalibration.CalibrateWaveformToOutputPower(
+                        iterationRecord.outputSignal,
+                        outputPowerDbmPerChain[0],
+                    )
+                ),
+            )
+            for iterationRecord in ilcResult.history
+        )
         ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(
-            ilcResult.history
+            calibratedIlcHistory
         )
     else:
         ilcResult = RunMimoFrequencyDomainIlc(
@@ -621,19 +659,37 @@ def Main() -> int:
             waveform.bandwidthHz,
             ilcConfig,
         )
-        ilcAnalysisResult = resultAnalysis.AnalyzeMimoIlcHistory(
+        # Calibrate every stored PA column independently so each MIMO round
+        # uses the same per-chain power convention as the final clean replay.
+        calibratedChainHistories = tuple(
             tuple(
-                chainResult.history
-                for chainResult in ilcResult.chainResults
+                replace(
+                    iterationRecord,
+                    outputSignal=(
+                        powerCalibration.CalibrateWaveformToOutputPower(
+                            iterationRecord.outputSignal,
+                            outputPowerDbmPerChain[chainIndex],
+                        )
+                    ),
+                )
+                for iterationRecord in chainResult.history
             )
+            for chainIndex, chainResult in enumerate(
+                ilcResult.chainResults
+            )
+        )
+        ilcAnalysisResult = resultAnalysis.AnalyzeMimoIlcHistory(
+            calibratedChainHistories
         )
     selectedIlcInput = ilcAnalysisResult.bestInputSignal
     # Analysis selects the best measured round. Re-run that input through the
     # plant once so final reported performance excludes optional feedback noise.
     selectedIlcOutputRaw = paModel.Process(selectedIlcInput)
-    selectedIlcOutput = powerCalibration.ScaleSignalToOutputPowers(
-        selectedIlcOutputRaw,
-        outputPowerDbmPerChain,
+    selectedIlcOutput = (
+        powerCalibration.CalibrateWaveformToOutputPowers(
+            selectedIlcOutputRaw,
+            outputPowerDbmPerChain,
+        )
     )
 
     # ILC labels are waveform-specific. Ridge-regression fitting converts them
@@ -673,16 +729,18 @@ def Main() -> int:
         floatingDeployedDpdInput
     )
     deployedDpdOutputRaw = paModel.Process(deployedDpdInput)
-    deployedDpdOutput = powerCalibration.ScaleSignalToOutputPowers(
-        deployedDpdOutputRaw,
-        outputPowerDbmPerChain,
+    deployedDpdOutput = (
+        powerCalibration.CalibrateWaveformToOutputPowers(
+            deployedDpdOutputRaw,
+            outputPowerDbmPerChain,
+        )
     )
 
     resultAnalysis.AnalyzeStages(
         {
-            "PA baseline": baselineOutputRaw,
-            "Waveform ILC": selectedIlcOutputRaw,
-            "Fitted GMP DPD": deployedDpdOutputRaw,
+            "PA baseline": baselineOutput,
+            "Waveform ILC": selectedIlcOutput,
+            "Fitted GMP DPD": deployedDpdOutput,
         }
     )
     print(
@@ -788,11 +846,15 @@ def Main() -> int:
             powerCalibration.maximumOutputPowerDbm
         ),
         "loadResistanceOhm": powerCalibration.loadResistanceOhm,
-        "baselineOutputPowerDbm": powerCalibration.RmsToDbm(
-            baselineOutputRms
+        "baselineOutputPowerDbm": (
+            powerCalibration.NormalizedRmsToOutputPowerDbm(
+                baselineOutputRms
+            )
         ),
-        "baselineTotalOutputPowerDbm": powerCalibration.RmsToDbm(
-            baselineOutputRms
+        "baselineTotalOutputPowerDbm": (
+            powerCalibration.NormalizedRmsToOutputPowerDbm(
+                baselineOutputRms
+            )
         ),
         "baselineOutputPowerDbmPerChain": (
             baselineOutputPowerDbmPerChain

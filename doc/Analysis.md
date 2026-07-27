@@ -362,15 +362,36 @@ z_m[n]=\frac{y_m[n]}{\hat g_m}.
 \tilde y_m[n]=\hat g_m z_m[n].
 ```
 
-只恢复幅度不会撤销同步。$\tilde y_m[n]$ 仍位于参考采样网格上，其长度等于有效参考区间，所以发送端或接收端在帧外增加的前后补零不会拉低平均功率。第 $m$ 路归一化复包络 RMS 为
+只恢复幅度不会撤销同步。$\tilde y_m[n]$ 仍位于参考采样网格上。除此之外，功率计算还调用 `PowerCalibration.FindActiveSampleMask`：它以每一路峰值下 `activePowerThresholdDb` 为门限，填充不超过 `activeGapToleranceSamples` 的短暂低幅空洞，但排除前后补零和更长的内部静默区。令掩码为 $M_m[n]$，有效样点数为
+
+```math
+N_{m,\mathrm{active}}
+=
+\sum_n M_m[n].
+```
+
+第 $m$ 路归一化复包络有效区RMS为
 
 ```math
 a_m=
 \sqrt{
-\frac{1}{N}
-\sum_{n=0}^{N-1}
+\frac{
+\sum_n
+M_m[n]
 \left|\tilde y_m[n]\right|^2
+}{
+N_{m,\mathrm{active}}
+}
 }.
+```
+
+因此，发送端或接收端在帧外增加的前后补零不会拉低报告功率；周期发送波形中的长关断区也不进入分母。短暂OFDM过零仍属于有效突发。该指标表示“PA开启并发送Wi-Fi突发时的平均功率”，不是把关断时间包含在内的长期占空比平均功率。若需要后者，可另外乘占空比 $D$：
+
+```math
+P_{\mathrm{long,dBm}}
+=
+P_{\mathrm{active,dBm}}
++10\log_{10}(D).
 ```
 
 本工程采用明确的满量程标定约定：归一化 RMS 等于 1 时，对应 `maximumOutputPowerDbm`。设该额定值为 $P_{\mathrm{max,dBm}}$，端口电阻为 $R$，则满量程 RMS 电压为
@@ -400,7 +421,7 @@ P_{m,\mathrm{dBm}}
 \end{aligned}
 ```
 
-默认值是 $R=50\ \Omega$、$P_{\mathrm{max,dBm}}=25\ \mathrm{dBm}$。定点模式先把公开整数 I/Q 码按位宽解码成归一化复包络，再使用同一公式，所以浮点和定点入口具有相同的功率定义。若外部系统使用不同的满量程功率，必须通过 `maximumOutputPowerDbm` 传入实际标定值；它不是由EVM或复增益自动猜测出来的。
+默认值是 $R=50\ \Omega$、$P_{\mathrm{max,dBm}}=25\ \mathrm{dBm}$、`activePowerThresholdDb=-60.0`、`activeGapToleranceSamples=16`。定点模式先把公开整数 I/Q 码按位宽解码成归一化复包络，再使用同一公式，所以浮点和定点入口具有相同的功率定义。若外部系统使用不同的满量程功率，必须通过 `maximumOutputPowerDbm` 传入实际标定值；它不是由EVM或复增益自动猜测出来的。完整有效区检测与任意幅度重标定推导见 [SigProc.md](./SigProc.md#131-有效信号区间与占空比)。
 
 MIMO 的每路 PA 是独立传导端口，不能把复电压直接相加。总输出功率应先在线性功率域相加：
 
@@ -1410,7 +1431,7 @@ PA或DPD方法先产生归一化输出
 z_{i,m}[n]=\mathcal{F}_m(x_i[n]).
 ```
 
-目标输出功率换算成每路复包络RMS电压：
+目标输出功率一方面换算成每路物理RMS电压，用于结果审计：
 
 ```math
 P_i=10^{-3}10^{p_i/10}.
@@ -1420,21 +1441,39 @@ P_i=10^{-3}10^{p_i/10}.
 V_i=\sqrt{R P_i}.
 ```
 
-为了报告物理功率，可以为每种方法定义一个常数输出标定增益：
+另一方面，归一化公开波形的目标有效区RMS为：
+
+```math
+A_{i,\mathrm{target}}
+=
+10^{(p_i-p_{\max})/20}.
+```
+
+令 $M_{i,m}[n]$ 为有效突发掩码，则每种方法的输出标定增益为
 
 ```math
 g_{i,m}
-=\frac{V_i}
-{\sqrt{\frac{1}{N}\sum_n|z_{i,m}[n]|^2}},
+=
+\frac{
+A_{i,\mathrm{target}}
+}{
+\sqrt{
+\frac{
+\sum_n M_{i,m}[n]|z_{i,m}[n]|^2
+}{
+\sum_n M_{i,m}[n]
+}
+}
+},
 ```
 
 ```math
 y_{i,m}[n]=g_{i,m}z_{i,m}[n].
 ```
 
-因此每条曲线在横轴位置 $p_i$ 上都对应相同的目标平均输出功率。常数 $g_{i,m}$ 只改变整体幅度，不改变EVM、SNR残差比或ACLR功率比。
+因此每条曲线在横轴位置 $p_i$ 上都对应相同的有效突发目标平均输出功率。浮点模式下常数 $g_{i,m}$ 只改变整体幅度，不改变EVM、SNR残差比或ACLR功率比。
 
-定点模式还有一个重要实现边界：$z_{i,m}[n]$ 是公开整数码，而 $y_{i,m}[n]$ 是物理电压，不再是整数码。代码不会把 $y_{i,m}[n]$ 重新送入定点 `Analysis`，否则电压会被错误地当作码值再次除以 $2^{W-1}$。性能指标直接使用 $z_{i,m}[n]$；目标RMS电压 $V_i$ 单独保存在曲线结果中用于功率审计。由于公共复增益会被接收链补偿，这与先乘 $g_{i,m}$ 再计算EVM严格等价。
+定点模式不能把物理电压 $V_i$ 直接送回整数码接口。代码改用 `CalibrateWaveformToOutputPower`：先把 $z_{i,m}[n]$ 解码为归一化浮点，按有效区RMS缩放，再重新编码为相同位宽的公开整数I/Q码。这样Analysis收到的数据类型和数值尺度都正确。定点取整通常只产生很小差异；如果目标功率导致码值削顶，函数会警告，因为此时EVM可能发生变化。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
 
 `outputPowerDbmValues` 必须有限且严格递增，每一点都不得超过 `maximumOutputPowerDbm`。结果对象同时保存 `driveScaleValues` 和 `targetOutputRmsValues`，分别用于审计归一化压缩工作点和50 Ω物理输出标定。
 
@@ -1447,7 +1486,7 @@ y_{i,m}[n]=g_{i,m}z_{i,m}[n].
 10^{(p_i-p_{\max})/20}\mathbf x_{\mathrm{unit}}.
 ```
 
-所有输出都对应相同的 $p_i$ 驱动工作点，并调用相同的 `CalculateEvm`。物理电压标定作为独立报告量保存，不回灌定点分析接口。这样曲线差异来自补偿方法本身，而不是输出功率、输入帧、随机种子或指标定义不同。
+所有输出都对应相同的 $p_i$ 驱动工作点，随后按有效突发重新生成同一目标功率的公开波形，并调用相同的 `CalculateEvm`。物理电压标定作为独立报告量保存，不回灌定点分析接口。这样曲线差异来自补偿方法本身，而不是占空比、输出功率、输入帧、随机种子或指标定义不同。
 
 ```mermaid
 flowchart LR
@@ -1458,15 +1497,16 @@ flowchart LR
     B --> C2["Frequency ILC"]
     B --> C3["Time-domain ILC"]
     B --> C4["Fitted/Deployed DPD"]
-    C1 --> D["公开整数码直接进入<br/>统一 Analysis.CalculateEvm"]
-    C2 --> D
-    C3 --> D
-    C4 --> D
+    C1 --> calibration["有效突发RMS重标定<br/>保持浮点或定点公开接口"]
+    C2 --> calibration
+    C3 --> calibration
+    C4 --> calibration
+    calibration --> D["统一 Analysis.CalculateEvm"]
     K --> G["单独保存目标RMS电压<br/>用于功率审计"]
     D --> E["同图功率–EVM 曲线"]
 ```
 
-**图 7 说明**：每个方法看到相同的归一化输出回退驱动。EVM对公共输出增益不敏感，因此定点码直接进入Analysis，目标dBm对应的RMS电压单独保存，避免把伏特误当作整数码。学习型ILC可以在每个点重新迭代；部署型DPD可以固定标称点系数并跨功率测试。
+**图 7 说明**：每个方法看到相同的归一化输出回退驱动。方法输出再按有效突发RMS重标定到横轴dBm；定点数据重新量化为原位宽整数码，目标dBm对应的物理RMS电压单独保存，避免把伏特误当作整数码。学习型ILC可以在每个点重新迭代；部署型DPD可以固定标称点系数并跨功率测试。
 
 ### 8.4 曲线怎样阅读
 
