@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 import sys
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 
@@ -54,6 +54,12 @@ from inc.lib.DpdIlc import (
     RunScalarPIlc,
 )
 from inc.lib.PaModel import IQImbalancePA, PaModel
+from inc.lib.TwoToneAnalysis import (
+    TwoToneAnalysis,
+    TwoToneILCAnalysisResult,
+    TwoToneMetrics,
+)
+from inc.lib.WaveGenTwoTone import WaveGenTwoTone
 from inc.utils.FixedPoint import FixedPoint
 from inc.utils.SigProc import PowerCalibration
 from inc.lib.WaveGenWifi import WaveGenWifi
@@ -206,6 +212,107 @@ class BenchmarkRow:
         rowData.update(self.metrics)
         return rowData
 
+
+@dataclass(frozen=True)
+class TwoToneBenchmarkConfig:
+    """Configure a deterministic all-SISO-ILC two-tone comparison."""
+
+    sampleRateHz: float = 100.0e6
+    toneFrequenciesHz: tuple = (-2.0e6, 2.0e6)
+    toneAmplitudes: tuple = (1.0, 1.0)
+    tonePhasesDegrees: tuple = (0.0, 0.0)
+    numSamples: int = 32768
+    rmsLevel: float = 0.5
+    width: int = 16
+    outputPowerDbm: float = 20.0
+    maximumOutputPowerDbm: float = 25.0
+    loadResistanceOhm: float = 50.0
+    numIterations: int = 10
+    paModelName: str = "wiener"
+    seed: int = 211
+    outputDirectory: Path = Path("results/two_tone_ilc_benchmark")
+
+    def Validate(self) -> None:
+        """Validate two-tone generation, PA power, and iteration settings.
+
+        Processing details:
+            Algorithm: Delegate waveform-domain constraints to
+            ``WaveGenTwoTone``, validate the selected PA model and deterministic
+            iteration seed, and use ``PowerCalibration`` to reject output
+            targets above the configured normalized PA power ceiling.
+
+        Returns:
+            result: None. Invalid settings raise descriptive exceptions.
+        """
+
+        WaveGenTwoTone(
+            parameters={
+                "sampleRateHz": self.sampleRateHz,
+                "toneFrequenciesHz": self.toneFrequenciesHz,
+                "toneAmplitudes": self.toneAmplitudes,
+                "tonePhasesDegrees": self.tonePhasesDegrees,
+                "numSamples": self.numSamples,
+                "rmsLevel": self.rmsLevel,
+                "width": self.width,
+            }
+        )
+        if self.paModelName.lower() not in ("wiener", "gmp"):
+            raise ValueError("paModelName must be 'wiener' or 'gmp'")
+        if (
+            not isinstance(self.numIterations, int)
+            or isinstance(self.numIterations, bool)
+            or self.numIterations < 1
+        ):
+            raise ValueError("numIterations must be a positive integer")
+        if (
+            not isinstance(self.seed, int)
+            or isinstance(self.seed, bool)
+            or self.seed < 0
+        ):
+            raise ValueError("seed must be a nonnegative integer")
+        PowerCalibration(
+            parameters={
+                "loadResistanceOhm": self.loadResistanceOhm,
+                "maximumOutputPowerDbm": self.maximumOutputPowerDbm,
+                "outputPowerDbm": self.outputPowerDbm,
+                "width": self.width,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class TwoToneBenchmarkRow:
+    """Store one two-tone method result and IM improvement over baseline."""
+
+    methodName: str
+    category: str
+    metrics: TwoToneMetrics
+    im3ImprovementDb: float
+    im5ImprovementDb: float
+    im7ImprovementDb: float
+
+    def ToDict(self) -> Dict[str, object]:
+        """Flatten one two-tone benchmark result for CSV and JSON output.
+
+        Processing details:
+            Algorithm: Copy method identity and positive-is-better suppression
+            improvements, then merge the ordinary IM metric dictionary without
+            recalculating spectral values or changing their dBc convention.
+
+        Returns:
+            result: Flat serialization-ready benchmark dictionary.
+        """
+
+        rowData: Dict[str, object] = {
+            "methodName": self.methodName,
+            "category": self.category,
+            "im3ImprovementDb": self.im3ImprovementDb,
+            "im5ImprovementDb": self.im5ImprovementDb,
+            "im7ImprovementDb": self.im7ImprovementDb,
+        }
+        rowData.update(self.metrics)
+        return rowData
+
 def AddRow(
     rows: List[BenchmarkRow],
     methodName: str,
@@ -255,6 +362,53 @@ def AddRow(
             ),
         )
     )
+
+
+def AddTwoToneRow(
+    rows: List[TwoToneBenchmarkRow],
+    methodName: str,
+    category: str,
+    metrics: TwoToneMetrics,
+    baselineMetrics: TwoToneMetrics,
+) -> None:
+    """Append one consistently signed two-tone comparison result.
+
+    Processing details:
+        Algorithm: Subtract each method's worse-side dBc value from the
+        matching baseline value so stronger suppression is a positive
+        improvement, then append one immutable row with absolute metrics.
+
+    Args:
+        rows: Caller-owned list receiving the new comparison row.
+        methodName: Human-readable ILC or baseline label.
+        category: Classified benchmark group for reporting.
+        metrics: Independently measured two-tone output metrics.
+        baselineMetrics: Unlinearized PA metrics at equal output power.
+
+    Returns:
+        result: None. The supplied result list is extended by one row.
+    """
+
+    rows.append(
+        TwoToneBenchmarkRow(
+            methodName=methodName,
+            category=category,
+            metrics=metrics,
+            im3ImprovementDb=(
+                baselineMetrics["im3WorstDbc"]
+                - metrics["im3WorstDbc"]
+            ),
+            im5ImprovementDb=(
+                baselineMetrics["im5WorstDbc"]
+                - metrics["im5WorstDbc"]
+            ),
+            im7ImprovementDb=(
+                baselineMetrics["im7WorstDbc"]
+                - metrics["im7WorstDbc"]
+            ),
+        )
+    )
+
 
 def SaveHistory(
     methodName: str,
@@ -461,6 +615,347 @@ def RunIlcCurvePoint(
         methodResult.history
     )
     return paModel.Process(analysisResult.bestInputSignal)
+
+
+def RunTwoToneIlcBenchmark(
+    config: Optional[TwoToneBenchmarkConfig] = None,
+) -> List[TwoToneBenchmarkRow]:
+    """Compare every applicable SISO ILC method using IM3, IM5, and IM7.
+
+    Processing details:
+        Algorithm: Generate one deterministic complex two-tone record, close
+        the PA input-power loop to a common actual output dBm, run scalar,
+        complex-gain, FIR, frequency-domain, directional Gauss-Newton,
+        parameter-domain, and augmented-IQ ILC under a shared iteration budget,
+        independently select each method's best native iteration by the largest
+        remaining IM product, recalibrate that learned waveform to equal PA
+        output power, and save tabular plus graphical comparisons.
+
+    Args:
+        config: Optional two-tone scenario configuration. None creates defaults
+            inside this function.
+
+    Returns:
+        result: Ordered baseline and all-method two-tone benchmark rows.
+    """
+
+    if config is None:
+        config = TwoToneBenchmarkConfig()
+    config.Validate()
+    outputDirectory = Path(config.outputDirectory)
+    outputDirectory.mkdir(parents=True, exist_ok=True)
+    waveform = WaveGenTwoTone(
+        parameters={
+            "sampleRateHz": config.sampleRateHz,
+            "toneFrequenciesHz": config.toneFrequenciesHz,
+            "toneAmplitudes": config.toneAmplitudes,
+            "tonePhasesDegrees": config.tonePhasesDegrees,
+            "numSamples": config.numSamples,
+            "rmsLevel": config.rmsLevel,
+            "width": config.width,
+        }
+    ).Generate()
+    paModel = PaModel(
+        parameters={
+            "modelName": config.paModelName,
+            "width": config.width,
+        }
+    )
+    powerCalibration = PowerCalibration(
+        paModel=paModel,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "outputPowerDbm": config.outputPowerDbm,
+            "width": config.width,
+        },
+    )
+    referenceSignal = powerCalibration.Calibrate(waveform.samples)
+    baselineOutput = powerCalibration.GetLastPaOutput()
+    resultAnalysis = TwoToneAnalysis(
+        waveform,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "width": config.width,
+        },
+    )
+    baselineMetrics = resultAnalysis.Analyze(baselineOutput)
+    rows: List[TwoToneBenchmarkRow] = []
+    AddTwoToneRow(
+        rows,
+        "PA baseline",
+        "A: unlinearized baseline",
+        baselineMetrics,
+        baselineMetrics,
+    )
+    floatingReference = FixedPoint(config.width).DecodeComplex(
+        referenceSignal
+    )
+    maxAmplitude = max(
+        1.2,
+        1.8 * float(np.max(np.abs(floatingReference))),
+    )
+    scalarConfig = ILCConfig(
+        numIterations=config.numIterations,
+        learningRate=0.10,
+        maxAmplitude=maxAmplitude,
+        randomSeed=config.seed + 1,
+    )
+    complexConfig = ILCConfig(
+        numIterations=config.numIterations,
+        learningRate=0.15,
+        maxAmplitude=maxAmplitude,
+        randomSeed=config.seed + 2,
+    )
+    firConfig = ILCConfig(
+        numIterations=config.numIterations,
+        learningRate=0.15,
+        maxAmplitude=maxAmplitude,
+        randomSeed=config.seed + 3,
+    )
+    frequencyConfig = ILCConfig(
+        numIterations=config.numIterations,
+        learningRate=0.15,
+        maxAmplitude=maxAmplitude,
+        randomSeed=config.seed + 4,
+    )
+    gaussNewtonConfig = ILCConfig(
+        numIterations=config.numIterations,
+        learningRate=0.65,
+        maxAmplitude=maxAmplitude,
+        randomSeed=config.seed + 5,
+    )
+    parameterConfig = ILCConfig(
+        numIterations=config.numIterations,
+        learningRate=0.20,
+        maxAmplitude=maxAmplitude,
+        randomSeed=config.seed + 6,
+    )
+    augmentedConfig = ILCConfig(
+        numIterations=config.numIterations,
+        learningRate=0.15,
+        maxAmplitude=maxAmplitude,
+        randomSeed=config.seed + 7,
+    )
+    methodRuns: tuple = (
+        (
+            "Scalar P ILC",
+            lambda targetSignal, plant, selectedConfig: RunScalarPIlc(
+                targetSignal,
+                plant,
+                selectedConfig,
+                waveform.sampleRateHz,
+            ),
+            scalarConfig,
+        ),
+        (
+            "Complex-gain ILC",
+            lambda targetSignal, plant, selectedConfig: RunComplexGainIlc(
+                targetSignal,
+                plant,
+                selectedConfig,
+                waveform.sampleRateHz,
+            ),
+            complexConfig,
+        ),
+        (
+            "FIR ILC",
+            lambda targetSignal, plant, selectedConfig: RunFirIlc(
+                targetSignal,
+                plant,
+                selectedConfig,
+                17,
+                waveform.sampleRateHz,
+            ),
+            firConfig,
+        ),
+        (
+            "Frequency-domain ILC",
+            lambda targetSignal, plant, selectedConfig: RunFrequencyDomainIlc(
+                targetSignal,
+                plant,
+                waveform.sampleRateHz,
+                waveform.ilcBandwidthHz,
+                selectedConfig,
+            ),
+            frequencyConfig,
+        ),
+        (
+            "Directional Gauss-Newton ILC",
+            lambda targetSignal,
+            plant,
+            selectedConfig: RunDirectionalGaussNewtonIlc(
+                targetSignal,
+                plant,
+                selectedConfig,
+                1.0e-3,
+                waveform.sampleRateHz,
+            ),
+            gaussNewtonConfig,
+        ),
+        (
+            "Parameter-domain MP ILC",
+            lambda targetSignal, plant, selectedConfig: RunParameterDomainIlc(
+                targetSignal,
+                plant,
+                selectedConfig,
+                (1, 3, 5, 7),
+                3,
+                waveform.sampleRateHz,
+            ),
+            parameterConfig,
+        ),
+        (
+            "Augmented IQ ILC",
+            lambda targetSignal, plant, selectedConfig: RunAugmentedIqIlc(
+                targetSignal,
+                plant,
+                selectedConfig,
+                waveform.sampleRateHz,
+            ),
+            augmentedConfig,
+        ),
+    )
+    for methodName, methodRunner, methodConfig in methodRuns:
+        methodResult: ILCResult = methodRunner(
+            referenceSignal,
+            paModel,
+            methodConfig,
+        )
+        methodAnalysis: TwoToneILCAnalysisResult = (
+            resultAnalysis.AnalyzeIlcHistory(methodResult.history)
+        )
+        historyStem = (
+            methodName.lower()
+            .replace(" ", "_")
+            .replace("-", "_")
+        )
+        resultAnalysis.SaveIlcHistory(
+            methodAnalysis,
+            outputDirectory / "histories",
+            historyStem,
+        )
+        powerCalibration.Calibrate(methodAnalysis.bestInputSignal)
+        equalPowerOutput = powerCalibration.GetLastPaOutput()
+        methodMetrics = resultAnalysis.Analyze(equalPowerOutput)
+        AddTwoToneRow(
+            rows,
+            methodName,
+            "B: applicable SISO ILC methods",
+            methodMetrics,
+            baselineMetrics,
+        )
+    metadata = {
+        "sampleRateHz": waveform.sampleRateHz,
+        "toneFrequenciesHz": list(waveform.toneFrequenciesHz),
+        "toneAmplitudes": list(waveform.toneAmplitudes),
+        "tonePhasesDegrees": list(waveform.tonePhasesDegrees),
+        "numSamples": waveform.numSamples,
+        "rmsLevel": waveform.rmsLevel,
+        "width": waveform.width,
+        "ilcBandwidthHz": waveform.ilcBandwidthHz,
+        "outputPowerDbm": config.outputPowerDbm,
+        "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+        "loadResistanceOhm": config.loadResistanceOhm,
+        "numIterations": config.numIterations,
+        "paModel": config.paModelName,
+        "seed": config.seed,
+        "selectionMetric": "minimum worstIntermodulationDbc",
+        "powerCalibrationMode": "closedLoopInputDrive",
+    }
+    SaveTwoToneBenchmarkResults(rows, outputDirectory, metadata)
+    metricsByMethod = {
+        row.methodName: row.metrics
+        for row in rows
+    }
+    Draw().SaveTwoToneImdComparison(
+        metricsByMethod,
+        outputDirectory,
+        fileStem="all_ilc_two_tone_imd",
+    )
+    PrintTwoToneBenchmarkResults(rows)
+    return rows
+
+
+def SaveTwoToneBenchmarkResults(
+    rows: List[TwoToneBenchmarkRow],
+    outputDirectory: Path,
+    metadata: Mapping[str, object],
+) -> Tuple[Path, Path]:
+    """Save all-method two-tone results as matching CSV and JSON files.
+
+    Processing details:
+        Algorithm: Flatten each immutable row exactly once, create the output
+        directory, write a stable CSV table, and serialize identical rows with
+        reproducibility metadata in structured JSON.
+
+    Args:
+        rows: Nonempty ordered two-tone result rows.
+        outputDirectory: Destination directory for both summary files.
+        metadata: Exact waveform, PA, ILC, and calibration settings.
+
+    Returns:
+        result: CSV path followed by JSON path.
+    """
+
+    if not rows:
+        raise ValueError("rows cannot be empty")
+    outputPath = Path(outputDirectory)
+    outputPath.mkdir(parents=True, exist_ok=True)
+    csvPath = outputPath / "all_ilc_two_tone_metrics.csv"
+    jsonPath = outputPath / "all_ilc_two_tone_metrics.json"
+    flatRows = [row.ToDict() for row in rows]
+    with csvPath.open("w", newline="", encoding="utf-8-sig") as csvFile:
+        csvWriter = csv.DictWriter(
+            csvFile, fieldnames=list(flatRows[0].keys())
+        )
+        csvWriter.writeheader()
+        csvWriter.writerows(flatRows)
+    with jsonPath.open("w", encoding="utf-8") as jsonFile:
+        json.dump(
+            {"metadata": dict(metadata), "results": flatRows},
+            jsonFile,
+            ensure_ascii=False,
+            indent=2,
+        )
+    return csvPath, jsonPath
+
+
+def PrintTwoToneBenchmarkResults(
+    rows: List[TwoToneBenchmarkRow],
+) -> None:
+    """Print a compact all-method IM3, IM5, and IM7 comparison table.
+
+    Processing details:
+        Algorithm: Preserve benchmark row order and print worse-side absolute
+        dBc plus positive-is-better suppression improvements for each odd order
+        using fixed-width columns.
+
+    Args:
+        rows: Ordered baseline and ILC result rows.
+
+    Returns:
+        result: None. The comparison table is written to standard output.
+    """
+
+    header = (
+        f"{'Method':<32} {'IM3':>9} {'IM5':>9} {'IM7':>9} "
+        f"{'dIM3':>8} {'dIM5':>8} {'dIM7':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        print(
+            f"{row.methodName:<32} "
+            f"{row.metrics['im3WorstDbc']:>9.2f} "
+            f"{row.metrics['im5WorstDbc']:>9.2f} "
+            f"{row.metrics['im7WorstDbc']:>9.2f} "
+            f"{row.im3ImprovementDb:>8.2f} "
+            f"{row.im5ImprovementDb:>8.2f} "
+            f"{row.im7ImprovementDb:>8.2f}"
+        )
+
 
 def RunAllIlcBenchmark(
     config: Optional[BenchmarkConfig] = None,
@@ -1232,18 +1727,20 @@ def PrintBenchmarkResults(rows: List[BenchmarkRow]) -> None:
         )
 
 
-def ParseBenchmarkArguments() -> BenchmarkConfig:
-    """Parse standalone benchmark command-line options.
+def ParseBenchmarkArguments() -> Union[
+    BenchmarkConfig, TwoToneBenchmarkConfig
+]:
+    """Parse standalone Wi-Fi or two-tone benchmark command-line options.
 
     Processing details:
         Algorithm: Define only scenario-level controls, parse one command
         line, convert it into ``BenchmarkConfig``, and validate it before
         returning. Algorithm-internal learning constants remain fixed so
-        comparisons stay reproducible.
+            comparisons stay reproducible. The ``--two-tone`` switch selects
+            physical tone parameters and bypasses Wi-Fi frame construction.
 
     Returns:
-        result: Validated benchmark configuration ready for
-        ``RunAllIlcBenchmark``.
+        result: Validated configuration ready for the selected benchmark.
     """
 
     argumentParser = argparse.ArgumentParser(
@@ -1251,6 +1748,12 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
             "Run classified SISO ILC benchmark scenarios independently of "
             "the production main program."
         )
+    )
+    argumentParser.add_argument(
+        "--two-tone",
+        dest="twoTone",
+        action="store_true",
+        help="Run the IM3/IM5/IM7 two-tone benchmark instead of Wi-Fi",
     )
     argumentParser.add_argument(
         "--format",
@@ -1370,9 +1873,71 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
         "--output-dir",
         dest="outputDirectory",
         type=Path,
-        default=Path("results/all_ilc_benchmark"),
+        default=None,
+    )
+    argumentParser.add_argument(
+        "--tone-lower-hz",
+        dest="toneLowerHz",
+        type=float,
+        default=-2.0e6,
+        help="Lower complex-baseband two-tone frequency in Hz",
+    )
+    argumentParser.add_argument(
+        "--tone-upper-hz",
+        dest="toneUpperHz",
+        type=float,
+        default=2.0e6,
+        help="Upper complex-baseband two-tone frequency in Hz",
+    )
+    argumentParser.add_argument(
+        "--tone-samples",
+        dest="toneNumSamples",
+        type=int,
+        default=32768,
+        help="Number of samples in the repeated two-tone record",
+    )
+    argumentParser.add_argument(
+        "--tone-rms-level",
+        dest="toneRmsLevel",
+        type=float,
+        default=0.5,
+        help="Generated two-tone RMS before PA power calibration",
     )
     arguments = argumentParser.parse_args()
+    if arguments.twoTone:
+        twoToneOutputDirectory = (
+            Path("results/two_tone_ilc_benchmark")
+            if arguments.outputDirectory is None
+            else arguments.outputDirectory
+        )
+        twoToneConfig = TwoToneBenchmarkConfig(
+            sampleRateHz=(
+                100.0e6
+                if arguments.sampleRateHz is None
+                else arguments.sampleRateHz
+            ),
+            toneFrequenciesHz=(
+                arguments.toneLowerHz,
+                arguments.toneUpperHz,
+            ),
+            numSamples=arguments.toneNumSamples,
+            rmsLevel=arguments.toneRmsLevel,
+            width=arguments.width,
+            outputPowerDbm=arguments.outputPowerDbm,
+            maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
+            loadResistanceOhm=arguments.loadResistanceOhm,
+            numIterations=arguments.numIterations,
+            paModelName=arguments.paModelName,
+            seed=arguments.seed,
+            outputDirectory=twoToneOutputDirectory,
+        )
+        twoToneConfig.Validate()
+        return twoToneConfig
+    wifiOutputDirectory = (
+        Path("results/all_ilc_benchmark")
+        if arguments.outputDirectory is None
+        else arguments.outputDirectory
+    )
     config = BenchmarkConfig(
         frameFormat=arguments.frameFormat,
         bandwidthMhz=arguments.bandwidthMhz,
@@ -1392,7 +1957,7 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
         powerStopDbm=arguments.powerStopDbm,
         powerPointCount=arguments.powerPointCount,
         generatePowerEvmCurve=arguments.generatePowerEvmCurve,
-        outputDirectory=arguments.outputDirectory,
+        outputDirectory=wifiOutputDirectory,
     )
     config.Validate()
     return config
@@ -1403,15 +1968,18 @@ def Main() -> int:
 
     Processing details:
         Algorithm: Parse the requested scenario controls, execute the complete
-        benchmark suite, and print the absolute output path after every result
-        has been saved.
+            Wi-Fi or two-tone benchmark suite, and print the absolute output
+            path after every result has been saved.
 
     Returns:
         result: Process exit status zero after successful completion.
     """
 
     config = ParseBenchmarkArguments()
-    RunAllIlcBenchmark(config)
+    if isinstance(config, TwoToneBenchmarkConfig):
+        RunTwoToneIlcBenchmark(config)
+    else:
+        RunAllIlcBenchmark(config)
     print(f"\nBenchmark results: {config.outputDirectory.resolve()}")
     return 0
 

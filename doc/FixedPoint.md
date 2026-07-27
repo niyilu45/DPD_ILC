@@ -160,7 +160,7 @@ print(decodedSignal)
 3. 正满量程为 `8191`；
 4. 解码后的内部浮点量才小于或等于 1。
 
-## 7. WaveGenWifi、PaModel 和 Analysis 的边界
+## 7. WaveGenWifi、PaModel、Channel 和 Analysis 的边界
 
 ### 7.1 WaveGenWifi
 
@@ -198,7 +198,23 @@ flowchart LR
 
 **图 2 说明**：PA 内部幂次、记忆抽头和包络交叉项不直接对 `8191` 做运算，而是对解码后的约 `0.9999` 做运算；否则高阶项会产生完全错误的数量级。
 
-### 7.3 Analysis
+### 7.3 Channel
+
+`Channel.Process` 在公开边界把整数码解码一次，随后在归一化浮点域依次执行PA、固定移相和白噪声叠加，最后重新编码。`Channel.ProcessPaOutput` 用于已有PA输出，同样只解码和编码一次。
+
+```mermaid
+flowchart LR
+    publicInput["公开整数码"] --> decode["FixedPoint.DecodeComplex"]
+    decode --> pa["浮点PA"]
+    pa --> phase["浮点相位旋转"]
+    phase --> noise["物理mV/dBm换算后的浮点噪声"]
+    noise --> encode["FixedPoint.EncodeComplex"]
+    encode --> publicOutput["公开整数码"]
+```
+
+**图 3 说明**：例如16位接口中的10 mV噪声不是码值10。模块先用 `maximumOutputPowerDbm` 和 `loadResistanceOhm` 求出归一化RMS，再乘以32768并舍入成最终公开噪声码。浮点和定点模式因此代表相同物理噪声。
+
+### 7.4 Analysis
 
 `Analysis` 接收公开整数码后先解码，再执行：
 
@@ -303,7 +319,7 @@ python SmallestSISO.py
 
 ## 12. 使用检查表
 
-1. 同一条信号链的 `WaveGenWifi`、`PaModel`、`ParseWifi` 和 `Analysis` 必须使用相同 `width`。
+1. 同一条信号链的 `WaveGenWifi`、`PaModel`、`Channel`、`ParseWifi` 和 `Analysis` 必须使用相同 `width`。
 2. `width=0` 表示浮点模式；正值表示公开整数码模式。
 3. 不要通过 `dtype` 判断模式，应读取 `width` 或 `GetFormatInfo()`。
 4. 定点公开数据的实部和虚部都应等于各自的最近整数。

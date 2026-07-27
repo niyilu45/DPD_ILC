@@ -1,6 +1,6 @@
 # 结果计算：SNR、EVM、ACLR 与功率–EVM 曲线原理
 
-本文解释 `inc/lib/Analysis.py` 中结果统计的物理含义和公式推导。分析器始终需要一段发送参考样值，但参考来源有三种：调用方显式提供理想参考、调用方提供实际发送波形，或者在完全盲分析时由 `ParseWifi` 从接收帧恢复。只有严格的Wi-Fi子载波EVM需要 `WifiWaveform` 元数据；已知发送NumPy样值时无需猜测MCS、GI或seed，也能直接计算波形域EVM和SNR。随后对 PA、ILC 或部署型 DPD 输出统一计算：
+本文解释 `inc/lib/Analysis.py` 中结果统计的物理含义和公式推导。分析器始终需要一段发送参考样值，但参考来源有三种：调用方显式提供理想参考、调用方提供实际发送波形，或者在完全盲分析时由 `ParseWifi` 从接收帧恢复。只有严格的Wi-Fi子载波EVM需要 `WifiWaveform` 元数据；已知发送NumPy样值时无需猜测MCS、GI或seed，也能直接计算波形域EVM和SNR。待测信号可以来自PA模型、Channel、线缆、接收机、仪器抓包、普通算法输出、ILC或部署型DPD；Analysis对来源没有强制依赖，统一计算：
 
 - 数据字段时域 SNR；
 - Wi-Fi 数据子载波 RMS EVM；
@@ -1700,6 +1700,8 @@ ILC 每轮收敛结果另外输出：
 
 ## 11. 代码入口和典型调用
 
+`Analysis` 是独立的测量与结果统计类，不要求使用任何ILC算法。只要能够得到参考波形和待测波形，或者接收波形包含本工程可解析的Wi-Fi描述字段，就可以直接计算指标。下面所有示例都不导入 `DpdIlc`；表中的逐轮历史接口只是兼容迭代算法输出的可选扩展，不是使用Analysis的前提。
+
 | 计算步骤 | 方法 |
 |---|---|
 | 仅接收帧解析 | `ParseWifi.Parse` |
@@ -1717,7 +1719,7 @@ ILC 每轮收敛结果另外输出：
 | RMS EVM | `Analysis.CalculateEvm` |
 | Welch PSD | `AveragePeriodogram` |
 | ACLR | `Analysis.CalculateAclr` |
-| 三指标汇总 | `Analysis.Analyze` |
+| 指标字典汇总 | `Analysis.Analyze` |
 | 多阶段批量统计 | `Analysis.AnalyzeStages` |
 | SISO逐轮ILC性能与EVM最佳轮 | `Analysis.AnalyzeIlcHistory` |
 | MIMO逐轮ILC性能与EVM最佳轮 | `Analysis.AnalyzeMimoIlcHistory` |
@@ -1731,15 +1733,448 @@ ILC 每轮收敛结果另外输出：
 | 每轮 MSE CSV | `Analysis.SaveConvergence` |
 | 每轮 MSE 收敛图 | `Draw.SaveConvergenceCurve` |
 
+构造方式可以按输入条件直接选择：
+
+| 用户已有数据 | 推荐构造方式 | EVM类型 | 是否调用Parser |
+|---|---|---|---|
+| 理想Reference和 `WifiWaveform` 元数据 | `Analysis(referenceSignal, wifiWaveform)` | 严格Wi-Fi数据子载波EVM | 否 |
+| 接收波形和发送 `WifiWaveform` | `Analysis(receivedSignal, transmittedSignal=wifiWaveform)` | 严格Wi-Fi数据子载波EVM | 否 |
+| 接收与发送NumPy样值 | `Analysis(receivedSignal, transmittedSignal=transmittedSignal)` | 公共区间波形域EVM | 否 |
+| 只有本工程生成的完整Wi-Fi接收帧 | `Analysis(receivedSignal)` | Parser重建后的Wi-Fi数据子载波EVM | 是 |
+| 商业芯片或仪器帧，不含项目描述字段 | 必须提供发送样值，使用发送辅助模式 | 取决于是否提供 `WifiWaveform` 元数据 | 否 |
+| 任意非Wi-Fi波形及其发送参考 | NumPy发送辅助模式 | 公共区间波形域EVM | 否 |
+| 多个同Reference测试阶段 | 先构造显式Analysis，再调用 `AnalyzeStages` | 与构造模式相同 | 与构造模式相同 |
+| MIMO Wi-Fi参考与接收矩阵 | 显式Reference加 `WifiWaveform` | 汇总及逐空间流EVM | 否 |
+
+### 11.1 最短显式参考示例
+
+适用于仿真、回放测试或者发送端参考完全已知的场景。此路径不调用 `ParseWifi`，也不需要ILC：
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+
+wifiWaveform = WaveGenWifi(
+    parameters={
+        "frameFormat": "EHT",
+        "bandwidthMhz": 20,
+        "mcs": 7,
+        "numDataSymbols": 8,
+        "sampleRateHz": 80.0e6,
+        "seed": 101,
+        "width": 0,
+    }
+).Generate()
+
+# Use the actual waveform sent into the PA as the analysis reference.
+referenceSignal = 0.20 * wifiWaveform.samples
+paModel = PaModel(
+    parameters={"modelName": "gmp", "width": 0}
+)
+receivedSignal = paModel.Process(referenceSignal)
+
+resultAnalysis = Analysis(
+    referenceSignal,
+    wifiWaveform,
+    parameters={
+        "maximumOutputPowerDbm": 25.0,
+        "width": 0,
+    },
+)
+metrics = resultAnalysis.Analyze(receivedSignal)
+
+print(metrics)
+print(f"Output power: {metrics['outputPowerDbm']:.3f} dBm")
+print(f"SNR: {metrics['snrDb']:.3f} dB")
+print(f"EVM: {metrics['evmDb']:.3f} dB")
+print(f"ACLR: {metrics['aclrWorstDb']:.3f} dB")
+```
+
+这里的 `referenceSignal` 必须是实际送入被测对象的样值，而不一定等于未缩放的 `wifiWaveform.samples`。`wifiWaveform` 只提供FFT、GI、数据字段、空间映射和参考星座等元数据。
+
+### 11.2 仪器发送与接收NumPy文件
+
+如果信号发生器和示波器分别导出了发送、接收复数数组，优先使用发送辅助模式。两路文件可以长度不同，也可以各自带有前后补零：
+
+```python
+from pathlib import Path
+
+import numpy as np
+
+from inc.lib.Analysis import Analysis
+
+
+transmittedSignal = np.load(
+    Path("captures") / "transmitted.npy"
+)
+receivedSignal = np.load(
+    Path("captures") / "received.npy"
+)
+
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=transmittedSignal,
+    sampleRateHz=320.0e6,
+    channelBandwidthHz=80.0e6,
+    parameters={
+        "maximumOutputPowerDbm": 25.0,
+        "width": 0,
+    },
+    signalProcessingParameters={
+        "maxIntegerDelaySamples": 2000,
+        "maxCarrierFrequencyOffsetHz": 500000.0,
+        "maxSamplingFrequencyOffsetPpm": 100.0,
+    },
+)
+metrics = resultAnalysis.Analyze()
+overlap = resultAnalysis.GetSignalOverlapResult()
+
+print(metrics)
+print(overlap.ToDict())
+```
+
+真实仪器通常导出物理浮点I/Q，因此这里明确使用 `width=0`。这条路径直接把发送样值作为Reference，不解析Descriptor、不恢复seed，也不重新生成Wi-Fi帧。纯NumPy输入没有Wi-Fi元数据，所以EVM是同步后公共区间的波形域EVM；提供采样率和带宽后仍可计算具有物理频率定义的ACLR。
+
+### 11.3 PA、Channel和功率闭环的独立分析
+
+下面的完整示例只做Wi-Fi生成、PA功率校准、接收链路和Analysis，不运行ILC。PA输出功率闭环只绑定 `PaModel`；10 mV接收噪声在校准后由 `Channel` 加入：
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.Channel import Channel
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.utils.SigProc import PowerCalibration
+
+
+wifiWaveform = WaveGenWifi(
+    parameters={
+        "frameFormat": "HE",
+        "bandwidthMhz": 40,
+        "mcs": 5,
+        "numDataSymbols": 8,
+        "sampleRateHz": 160.0e6,
+        "seed": 207,
+        "width": 0,
+    }
+).Generate()
+paModel = PaModel(
+    parameters={"modelName": "wiener", "width": 0}
+)
+powerCalibration = PowerCalibration(
+    paModel=paModel,
+    parameters={
+        "outputPowerDbm": 20.0,
+        "maximumOutputPowerDbm": 25.0,
+        "loadResistanceOhm": 50.0,
+        "width": 0,
+    },
+)
+referenceSignal = powerCalibration.Calibrate(
+    wifiWaveform.samples
+)
+paOutputSignal = powerCalibration.GetLastPaOutput()
+
+channel = Channel(
+    paModel=paModel,
+    parameters={
+        "phaseDegrees": 90,
+        "noiseAmpMv": 10.0,
+        "noisePwrDbm": None,
+        "maximumOutputPowerDbm": 25.0,
+        "loadResistanceOhm": 50.0,
+        "randomSeed": 311,
+        "width": 0,
+    },
+)
+receivedSignal = channel.ProcessPaOutput(paOutputSignal)
+
+resultAnalysis = Analysis(
+    referenceSignal,
+    wifiWaveform,
+    parameters={
+        "maximumOutputPowerDbm": 25.0,
+        "loadResistanceOhm": 50.0,
+        "width": 0,
+    },
+)
+metrics = resultAnalysis.Analyze(receivedSignal)
+
+print(powerCalibration.GetLastCalibrationMetrics())
+print(metrics)
+```
+
+90度固定相位会由公共复增益补偿，不应单独恶化EVM；PA非线性和10 mV随机噪声仍保留在误差中。`metrics["outputPowerDbm"]` 表示接收波形的分析结果，而 `GetLastCalibrationMetrics()` 保留不含接收噪声的PA闭环实测功率。
+
+### 11.4 非Wi-Fi波形的发送辅助分析
+
+Analysis也可以对任意已知发送NumPy波形计算波形域SNR、EVM、输出功率和ACLR。下面使用双音作为例子，但不依赖ILC：
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenTwoTone import WaveGenTwoTone
+
+
+twoToneWaveform = WaveGenTwoTone(
+    parameters={
+        "sampleRateHz": 100.0e6,
+        "toneFrequenciesHz": (-2.0e6, 2.0e6),
+        "numSamples": 16384,
+        "width": 0,
+    }
+).Generate()
+transmittedSignal = 0.25 * twoToneWaveform.samples
+receivedSignal = PaModel(
+    parameters={"modelName": "wiener", "width": 0}
+).Process(transmittedSignal)
+
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=transmittedSignal,
+    sampleRateHz=twoToneWaveform.sampleRateHz,
+    channelBandwidthHz=twoToneWaveform.ilcBandwidthHz,
+    parameters={"width": 0},
+)
+metrics = resultAnalysis.Analyze()
+
+print(metrics)
+```
+
+这时没有 `WifiWaveform`，所以EVM是公共时域样值归一化误差，不是802.11数据子载波EVM。如果目标是读取双音IM3、IM5、IM7谱线，应改用 `TwoToneAnalysis`；两个分析类回答的是不同问题。
+
+### 11.5 多个测试阶段的横向比较与保存
+
+`AnalyzeStages` 接受任何“名称→波形”字典，不要求阶段来自ILC。它适合比较不同PA型号、线缆、接收增益、温度或噪声设置：
+
+```python
+from pathlib import Path
+
+import numpy as np
+
+from inc.lib.Analysis import Analysis
+
+
+resultAnalysis = Analysis(
+    referenceSignal,
+    wifiWaveform,
+    parameters={"width": 0},
+)
+stageMetrics = resultAnalysis.AnalyzeStages(
+    {
+        "PA model A": paModelAOutput,
+        "PA model B": paModelBOutput,
+        "PA A + receiver": receiverAOutput,
+    }
+)
+
+resultAnalysis.Print(stageMetrics)
+jsonPath, csvPath = resultAnalysis.Save(
+    Path("results") / "standalone_analysis",
+    runMetadata={
+        "description": "Three independent RF paths",
+        "sampleRateHz": wifiWaveform.sampleRateHz,
+        "bandwidthHz": wifiWaveform.bandwidthHz,
+    },
+    stageMetrics=stageMetrics,
+)
+
+print(jsonPath)
+print(csvPath)
+```
+
+每个阶段都使用相同Reference、同步配置和指标定义。`metrics.json` 同时保存运行元数据、各阶段指标、同步估计和MIMO明细；`metrics.csv` 适合直接导入表格工具。
+
+### 11.6 单独读取EVM、SNR、ACLR和同步估计
+
+如果用户只需要一个指标，可以调用对应方法。若四项指标都需要，优先调用一次 `Analyze`，避免重复执行同步：
+
+```python
+from inc.lib.Analysis import Analysis
+
+
+resultAnalysis = Analysis(
+    referenceSignal,
+    wifiWaveform,
+    parameters={"width": 0},
+)
+
+# Analyze synchronizes once and reuses the corrected waveform.
+metrics = resultAnalysis.Analyze(receivedSignal)
+processingResult = (
+    resultAnalysis.GetLastSignalProcessingResult()
+)
+
+print(metrics["snrDb"])
+print(metrics["evmDb"], metrics["evmPercent"])
+print(metrics["aclrLowerDb"], metrics["aclrUpperDb"])
+print(metrics["outputPowerDbm"])
+print(processingResult.ToDict())
+
+# These convenience calls are useful when only one metric is required.
+snrDb = resultAnalysis.CalculateSnr(receivedSignal)
+evmDb, evmPercent = resultAnalysis.CalculateEvm(
+    receivedSignal
+)
+aclrLowerDb, aclrUpperDb, aclrWorstDb = (
+    resultAnalysis.CalculateAclr(receivedSignal)
+)
+```
+
+`processingResult.ToDict()` 包含整数时延、分数时延、CFO、SFO和公共复增益估计，便于判断指标差是否来自被测对象，还是来自捕获与同步质量。
+
+### 11.7 浮点和定点入口
+
+浮点模式的样值是归一化小数；定点模式的公开I/Q分量是整数码。下面两个分析器互不混用数据：
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.utils.FixedPoint import FixedPoint
+
+
+floatingWaveform = WaveGenWifi(
+    parameters={
+        "frameFormat": "EHT",
+        "bandwidthMhz": 20,
+        "numDataSymbols": 4,
+        "sampleRateHz": 80.0e6,
+        "width": 0,
+    }
+).Generate()
+floatingReference = 0.20 * floatingWaveform.samples
+floatingReceived = PaModel(
+    parameters={"modelName": "wiener", "width": 0}
+).Process(floatingReference)
+floatingMetrics = Analysis(
+    floatingReference,
+    floatingWaveform,
+    parameters={"width": 0},
+).Analyze(floatingReceived)
+
+fixedWaveform = WaveGenWifi(
+    parameters={
+        "frameFormat": "EHT",
+        "bandwidthMhz": 20,
+        "numDataSymbols": 4,
+        "sampleRateHz": 80.0e6,
+        "width": 16,
+    }
+).Generate()
+fixedPoint = FixedPoint(16)
+fixedReference = fixedPoint.QuantizeCodes(
+    0.20 * fixedWaveform.samples
+)
+fixedReceived = PaModel(
+    parameters={"modelName": "wiener", "width": 16}
+).Process(fixedReference)
+fixedMetrics = Analysis(
+    fixedReference,
+    fixedWaveform,
+    parameters={"width": 16},
+).Analyze(fixedReceived)
+
+print(floatingMetrics)
+print(fixedMetrics)
+```
+
+不要把小于1的浮点归一化样值直接送给 `width=16` 的Analysis；它会被解释为接近零的公开整数码。反过来也不能把32767量级的整数码送给 `width=0` 的Analysis。
+
+### 11.8 MIMO波形的逐链和逐空间流结果
+
+MIMO时仍使用同一个 `Analyze` 接口。汇总结果直接返回字典，逐物理链和逐空间流结果通过 `GetLastMimoMetrics` 读取：
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import MimoPaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+
+wifiWaveform = WaveGenWifi(
+    parameters={
+        "frameFormat": "EHT",
+        "bandwidthMhz": 80,
+        "mcs": 9,
+        "numDataSymbols": 6,
+        "sampleRateHz": 320.0e6,
+        "numTransmitAntennas": 2,
+        "numSpatialStreams": 2,
+        "spatialMapping": "dft",
+        "width": 0,
+    }
+).Generate()
+referenceSignal = 0.15 * wifiWaveform.samples
+mimoPaModel = MimoPaModel(
+    parameters={
+        "numTransmitChains": 2,
+        "inputPowerDbPerChain": (0.0, -1.0),
+        "outputPowerDbPerChain": (0.0, -0.5),
+        "width": 0,
+    }
+)
+receivedSignal = mimoPaModel.Process(referenceSignal)
+
+resultAnalysis = Analysis(
+    referenceSignal,
+    wifiWaveform,
+    parameters={"width": 0},
+)
+metrics = resultAnalysis.Analyze(receivedSignal)
+mimoMetrics = resultAnalysis.GetLastMimoMetrics()
+
+print(metrics)
+print(mimoMetrics["outputPowerDbmPerChain"])
+print(mimoMetrics["snrDbPerChain"])
+print(mimoMetrics["evmDbPerSpatialStream"])
+print(mimoMetrics["aclrWorstDbPerChain"])
+```
+
+这里的 `outputPowerDbmPerChain`、`snrDbPerChain` 和 `aclrWorstDbPerChain` 按物理PA链索引；`evmDbPerSpatialStream` 在撤销CSD和空间映射后按空间流索引。
+
+### 11.9 只有接收文件的盲分析速查
+
+只要接收记录包含本工程生成的完整VHT、HE或EHT描述字段，就可以不提供发送文件：
+
+```python
+from pathlib import Path
+
+import numpy as np
+
+from inc.lib.Analysis import Analysis
+
+
+receivedSignal = np.load(
+    Path("captures") / "project_wifi_capture.npy"
+)
+resultAnalysis = Analysis(
+    receivedSignal,
+    parseParameters={
+        "sampleRateHz": 80.0e6,
+        "maximumPacketOffsetSamples": 2000,
+    },
+    parameters={"width": 0},
+)
+metrics = resultAnalysis.Analyze()
+parsedFrame = resultAnalysis.GetParsedWifiFrame()
+
+print(metrics)
+print(parsedFrame.detectedParameters)
+```
+
+商业芯片或仪器生成的帧通常不包含本工程私有描述字段，此时不要使用盲模式，应使用11.2节的发送NumPy辅助模式。
+
+### 11.10 通用配置、打印和阶段结果
+
 ```python
 import numpy as np
 
 from inc.lib.Analysis import Analysis
-from inc.utils.Draw import Draw
 
 analysisOverrides = {
     "maxSegmentLength": 8192,
-    "powerEvmFileStem": "comparison_curve",
 }
 resultAnalysis = Analysis(
     referenceSignal,
@@ -1750,9 +2185,6 @@ resultAnalysis = Analysis(
         "maxCarrierFrequencyOffsetHz": 200000.0,
         "maxSamplingFrequencyOffsetPpm": 100.0,
     },
-)
-resultDraw = Draw(
-    parameters={"powerEvmFileStem": "comparison_curve"}
 )
 
 metrics = resultAnalysis.Analyze(paOutput)
@@ -1770,33 +2202,20 @@ print(
 
 stageMetrics = resultAnalysis.AnalyzeStages(
     {
-        "Baseline": paOutput,
-        "ILC": ilcOutput,
-        "Deployed DPD": deployedDpdOutput,
+        "PA output": paOutput,
+        "PA + cable": cableOutput,
+        "PA + receiver": receiverOutput,
     }
 )
 resultAnalysis.Print(stageMetrics)
 
 # The exact normalized MSE below is squared RMS EVM.
-evmAlignedMse = resultAnalysis.CalculateEvmAlignedMse(ilcOutput)
+evmAlignedMse = resultAnalysis.CalculateEvmAlignedMse(
+    receiverOutput
+)
 assert np.isclose(
     10.0 * np.log10(evmAlignedMse),
-    resultAnalysis.CalculateEvm(ilcOutput)[0],
-)
-
-# DpdIlc returns native records; Analysis computes every RF metric afterward.
-ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
-resultAnalysis.PrintConvergence(
-    ilcAnalysisResult.history,
-    historyName="Waveform ILC iteration metrics",
-)
-resultAnalysis.SaveConvergence(
-    ilcAnalysisResult.history,
-    outputDirectory,
-)
-resultDraw.SaveConvergenceCurve(
-    ilcAnalysisResult.history,
-    outputDirectory,
+    resultAnalysis.CalculateEvm(receiverOutput)[0],
 )
 
 if wifiWaveform.numTransmitAntennas > 1:
@@ -1825,45 +2244,90 @@ Analysis(
 
 `signalProcessingParameters` 是显式构造参数，其映射内容直接传给 `SigProc`。为兼容旧程序，`parameters={"signalProcessingParameters": {...}}` 仍然有效；新代码应优先使用显式参数，避免把同步配置误认为普通Analysis指标配置。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。任何层出现未知键时，代码会发出 `UserWarning`、忽略该键并继续；已识别键的类型、单位和物理范围仍严格校验。
 
-`width` 配置参考和测量波形的统一I/Q接口。`width=0` 使用浮点旁路；默认 `width=16` 要求公开输入的 I、Q 分量是 `-32768…32767` 的整数码。`Analysis` 在入口先按 $2^{width-1}$ 解码成归一化 `numpy.complex128`，然后完成时延、CFO、SFO、复增益、OFDM解调和指标计算。显式参考、发送辅助和盲分析三条路径都只解码一次，盲模式还会把位宽传给Parser重建参考：
-
-```python
-from inc.lib.Analysis import Analysis
-
-floatingMetrics = Analysis(
-    referenceSignal,
-    wifiWaveform,
-    parameters={"width": 0},
-).Analyze(receivedSignal)
-
-fixedMetrics = Analysis(
-    referenceSignal,
-    wifiWaveform,
-    parameters={"width": 16},
-).Analyze(receivedSignal)
-
-print(floatingMetrics["evmDb"])
-print(fixedMetrics["evmDb"])
-```
+`width` 配置参考和测量波形的统一I/Q接口。`width=0` 使用浮点旁路；默认 `width=16` 要求公开输入的 I、Q 分量是 `-32768…32767` 的整数码。`Analysis` 在入口先按 $2^{width-1}$ 解码成归一化 `numpy.complex128`，然后完成时延、CFO、SFO、复增益、OFDM解调和指标计算。显式参考、发送辅助和盲分析三条路径都只解码一次，盲模式还会把位宽传给Parser重建参考。完整且数据互不混用的浮点/定点示例见11.7节。
 
 两种结果都是普通字典。定点调用中的 `referenceSignal` 和 `receivedSignal` 必须来自相同位宽的模块公开接口，不能把已解码的小于1浮点值或已经换算成伏特的功率标定副本冒充整数码。`width=` 直接参数仍可作为最高优先级便捷写法；放入 `parameters` 时则与其他Analysis配置共同进入 `ChainMap`。可以通过 `resultAnalysis.GetParameters()["width"]` 或 `resultAnalysis.width` 读取最终解析值。定点码值、舍入、饱和和EVM近似推导见 [FixedPoint.md](./FixedPoint.md)。
 
 盲模式会把完整 `parseParameters` 交给 `ParseWifi`。发送辅助模式不会调用Parser，但为兼容旧程序，可从该映射转交 `sampleRateHz` 和 `channelBandwidthHz`；直接Analysis参数仍具有更高优先级。纯NumPy发送辅助模式中，采样率让CFO估计使用真实Hz单位，带宽与采样率一起定义ACLR积分频带。发送辅助模式即使没有这两个物理量，也会继续完成时延、归一化CFO、SFO、复增益、EVM和SNR计算，只把无法定义的ACLR返回为 `NaN`。
 
-功率–EVM 扫描的评估器接口为：
+### 11.11 不依赖ILC的功率–EVM扫描
+
+评估器只需要接收Analysis闭环产生的候选输入并返回被测对象输出。下面直接比较Wiener与GMP两个PA模型，不运行任何ILC：
 
 ```python
-def EvaluateMethod(pointReference, outputPowerDbm):
+from pathlib import Path
+
+import numpy as np
+
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.utils.Draw import Draw
+
+
+wifiWaveform = WaveGenWifi(
+    parameters={
+        "frameFormat": "EHT",
+        "bandwidthMhz": 20,
+        "mcs": 5,
+        "numDataSymbols": 8,
+        "sampleRateHz": 80.0e6,
+        "width": 0,
+    }
+).Generate()
+wienerPa = PaModel(
+    parameters={"modelName": "wiener", "width": 0}
+)
+gmpPa = PaModel(
+    parameters={"modelName": "gmp", "width": 0}
+)
+resultAnalysis = Analysis(
+    wifiWaveform.samples,
+    wifiWaveform,
+    parameters={
+        "maximumOutputPowerDbm": 25.0,
+        "width": 0,
+    },
+)
+
+
+def EvaluateWiener(
+    pointReference: np.ndarray,
+    outputPowerDbm: float,
+) -> np.ndarray:
+    # PowerCalibration controls the requested power outside this evaluator.
     del outputPowerDbm
-    return paModel.Process(pointReference)
+    return wienerPa.Process(pointReference)
+
+
+def EvaluateGmp(
+    pointReference: np.ndarray,
+    outputPowerDbm: float,
+) -> np.ndarray:
+    # PowerCalibration controls the requested power outside this evaluator.
+    del outputPowerDbm
+    return gmpPa.Process(pointReference)
+
 
 powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
-    outputPowerDbmValues=(10.0, 15.0, 20.0, 23.0, 25.0),
-    methodEvaluators={"Baseline": EvaluateMethod},
+    outputPowerDbmValues=(10.0, 15.0, 18.0, 20.0),
+    methodEvaluators={
+        "Wiener PA": EvaluateWiener,
+        "GMP PA": EvaluateGmp,
+    },
 )
-resultAnalysis.SavePowerEvmCurveData(outputDirectory, powerEvmCurve)
-resultDraw.SavePowerEvmCurve(powerEvmCurve, outputDirectory)
+outputDirectory = Path("results") / "standalone_power_evm"
+resultAnalysis.SavePowerEvmCurveData(
+    outputDirectory,
+    powerEvmCurve,
+)
+Draw().SavePowerEvmCurve(
+    powerEvmCurve,
+    outputDirectory,
+)
 ```
+
+`AnalyzePowerEvmCurve` 会在每个功率点独立闭环调整被测对象输入，直到实测PA输出功率进入容限；评估器不应在PA输出端追加归一化增益。若某个模型在定点幅度范围内无法达到指定功率，该点应失败并提示工作点不可达，而不是放宽校准误差。
 
 ---
 

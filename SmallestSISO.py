@@ -6,8 +6,13 @@ from typing import Dict
 import numpy as np
 
 from inc.lib.Analysis import Analysis
+from inc.lib.Channel import Channel
 from inc.lib.DpdIlc import ILCConfig, RunFrequencyDomainIlc
-from inc.lib.PaModel import PaModel
+from inc.lib.PaModel import (
+    DefaultGmpCoefficients,
+    GMPConfig,
+    PaModel,
+)
 from inc.lib.WaveGenWifi import WaveGenWifi
 from inc.utils.Draw import Draw
 from inc.utils.SigProc import PowerCalibration
@@ -24,9 +29,10 @@ def RunSisoMode(
     Processing details:
         Algorithm: Construct all three external signal interfaces with the
         same width, generate an EHT waveform, drive a GMP PA at a normalized
-        level corresponding to 20 dBm output backoff, execute frequency-domain
-        ILC, independently analyze the baseline and selected ILC waveforms,
-        and save one convergence curve under a mode-specific directory.
+        level corresponding to 20 dBm output backoff, pass every observation
+        through a zero-degree channel with 10 mV RMS AWGN, execute
+        frequency-domain ILC, independently analyze the baseline and selected
+        ILC waveforms, and save one convergence curve.
 
     Args:
         width: Zero for floating point or a positive I/Q component word width.
@@ -61,9 +67,54 @@ def RunSisoMode(
     # WaveGenWifi, PaModel, and Analysis use the same public interface width.
     # Fixed-mode arrays contain integer-valued I/Q codes in a complex128
     # container, while PA and analysis internals use decoded floating values.
+    # The library default GMP is deliberately severe and requires PA input
+    # peaks beyond a signed Q1.(W-1) public converter to reach 20 dBm average
+    # output. This example retains all GMP branches but scales nonlinear
+    # coefficients to 25 percent, so floating and fixed modes represent the
+    # same reachable 20 dBm operating point without concealing saturation.
+    defaultMain, defaultLagging, defaultLeading = (
+        DefaultGmpCoefficients((1, 3, 5, 7), 3, 2)
+    )
+    exampleMain = {
+        coefficientKey: (
+            coefficientValue
+            if coefficientKey[0] == 1
+            else 0.25 * coefficientValue
+        )
+        for coefficientKey, coefficientValue in defaultMain.items()
+    }
+    exampleLagging = {
+        coefficientKey: 0.25 * coefficientValue
+        for coefficientKey, coefficientValue in defaultLagging.items()
+    }
+    exampleLeading = {
+        coefficientKey: 0.25 * coefficientValue
+        for coefficientKey, coefficientValue in defaultLeading.items()
+    }
+    exampleGmpConfig = GMPConfig(
+        nonlinearOrders=(1, 3, 5, 7),
+        memoryDepth=3,
+        crossMemoryDepth=2,
+        mainCoefficients=exampleMain,
+        laggingCoefficients=exampleLagging,
+        leadingCoefficients=exampleLeading,
+    )
     paModel = PaModel(
         parameters={
             "modelName": "gmp",
+            "gmpConfig": exampleGmpConfig,
+            "width": width,
+        },
+    )
+    channel = Channel(
+        paModel=paModel,
+        parameters={
+            "phaseDegrees": 0,
+            "noiseAmpMv": 10.0,
+            "noisePwrDbm": None,
+            "loadResistanceOhm": 50.0,
+            "maximumOutputPowerDbm": maximumOutputPowerDbm,
+            "randomSeed": 1019,
             "width": width,
         },
     )
@@ -82,7 +133,11 @@ def RunSisoMode(
         },
     )
     referenceSignal = powerCalibration.Calibrate(waveform.samples)
-    baselineOutput = powerCalibration.GetLastPaOutput()
+    baselinePaOutput = powerCalibration.GetLastPaOutput()
+    baselineCalibrationMetrics = (
+        powerCalibration.GetLastCalibrationMetrics()
+    )
+    baselineOutput = channel.ProcessPaOutput(baselinePaOutput)
     resultAnalysis = Analysis(
         referenceSignal,
         waveform,
@@ -103,7 +158,7 @@ def RunSisoMode(
     )
     ilcResult = RunFrequencyDomainIlc(
         referenceSignal,
-        paModel,
+        channel,
         waveform.sampleRateHz,
         waveform.bandwidthHz,
         ilcConfig,
@@ -117,12 +172,16 @@ def RunSisoMode(
     selectedIlcInput = powerCalibration.Calibrate(
         ilcAnalysisResult.bestInputSignal
     )
-    selectedIlcOutput = powerCalibration.GetLastPaOutput()
+    selectedPaOutput = powerCalibration.GetLastPaOutput()
+    selectedCalibrationMetrics = (
+        powerCalibration.GetLastCalibrationMetrics()
+    )
+    selectedIlcOutput = channel.ProcessPaOutput(selectedPaOutput)
     selectedMetrics = resultAnalysis.Analyze(selectedIlcOutput)
     resultAnalysis.AnalyzeStages(
         {
-            "PA baseline": baselineOutput,
-            "Frequency-domain ILC": selectedIlcOutput,
+            "PA + channel baseline": baselineOutput,
+            "Frequency-domain ILC + channel": selectedIlcOutput,
         }
     )
     resultAnalysis.PrintConvergence(
@@ -158,6 +217,9 @@ def RunSisoMode(
         "waveformMaximumQ": waveformMaximumQ,
         "configuredOutputPowerDbm": paOutputPowerDbm,
         "measuredOutputPowerDbm": measuredOutputPowerDbm,
+        "baselinePaCalibration": baselineCalibrationMetrics,
+        "selectedPaCalibration": selectedCalibrationMetrics,
+        "channelParameters": channel.GetParameters(),
     }
     print(result)
     return result

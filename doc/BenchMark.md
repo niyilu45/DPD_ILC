@@ -20,12 +20,14 @@
 ```mermaid
 flowchart TB
     entry["BenchMark.py 独立入口"] --> common["公共 Wi-Fi / PA / 指标配置"]
+    entry --> toneCommon["公共双音 / PA / IM指标配置"]
     common --> baseline["A. 基础对照"]
     common --> waveform["B. 标称波形更新律"]
     common --> robust["C. 约束与噪声鲁棒性"]
     common --> iq["D. IQ 失衡增广场景"]
     common --> deploy["E. ILC 标签部署泛化"]
     common --> power["F. 功率-EVM 扫描"]
+    toneCommon --> tone["G. 双音IM3/IM5/IM7"]
 
     baseline --> baselineResult["PA baseline"]
     waveform --> waveformResult["Scalar / Complex / FIR / FD / GN / MP"]
@@ -33,9 +35,10 @@ flowchart TB
     iq --> iqResult["IQ baseline / ordinary ILC / augmented ILC"]
     deploy --> deployResult["MP / GMP / Volterra / LUT / NN"]
     power --> powerResult["同图比较全部方法"]
+    tone --> toneResult["相同输出dBm下比较七种SISO ILC"]
 ```
 
-**图 1 说明：**六类测试不是把不同条件下的数字直接混合比较。每个特殊场景都有与自己匹配的baseline，而且至少包含两个可比较对象：标称更新律与标称PA baseline比较；峰值场景同时放入未补偿、无约束和受约束结果；噪声场景同时放入未补偿、单次反馈和噪声感知结果；IQ场景同时放入未补偿、普通频域ILC和增广IQ ILC；部署模型只与独立验证帧baseline比较。
+**图 1 说明：**七类测试不是把不同条件下的数字直接混合比较。A至F类使用Wi-Fi，G类使用双音。每个特殊场景都有与自己匹配的baseline，而且至少包含两个可比较对象：标称更新律与标称PA baseline比较；峰值场景同时放入未补偿、无约束和受约束结果；噪声场景同时放入未补偿、单次反馈和噪声感知结果；IQ场景同时放入未补偿、普通频域ILC和增广IQ ILC；部署模型只与独立验证帧baseline比较；双音场景只在相同实际PA输出dBm下比较IM3、IM5和IM7。
 
 ---
 
@@ -77,7 +80,7 @@ python tests/BenchMark.py --format EHT --bandwidth 20 --sample-rate-hz 60000000 
 
 ## 4. 指标与改善量的统一方向
 
-所有场景都通过 `Analysis` 计算 SNR、EVM 和 ACLR。EVM 使用数据子载波上的理想星座作为参考；ACLR 使用主信道功率与上下相邻信道功率比较。
+A至F类Wi-Fi场景通过 `Analysis` 计算 SNR、EVM 和 ACLR。EVM 使用数据子载波上的理想星座作为参考；ACLR 使用主信道功率与上下相邻信道功率比较。G类双音场景通过 `TwoToneAnalysis` 计算IM3、IM5和IM7，不把离散音调误解释为Wi-Fi星座。
 
 EVM dB 定义为：
 
@@ -1651,3 +1654,176 @@ MIMO场景的baseline必须使用相同空间映射、相同每链功率和相�
 8. 若EVM和ACLR趋势不一致，回到 `Analysis.md` 检查指标物理含义。
 
 只有当“配置、baseline、收敛、验证、功率曲线”五个层次都一致时，才应对某种ILC方法给出工程结论。
+
+---
+
+## 28. G类：双音IM3/IM5/IM7场景
+
+### 28.1 为什么单独分类
+
+G类不构造Wi-Fi帧，也不使用EVM、MCS、GI或Descriptor。它回答：
+
+> 在相同双音、相同PA、相同迭代预算和相同实际PA输出功率下，各种ILC对IM3、IM5和IM7的抑制能力有什么差异？
+
+双音场景仍放在唯一的 `tests/BenchMark.py` 中。生产文件 `inc/lib/DpdIlc.py` 不创建双音、不计算IM指标，也不决定比较哪些方法。
+
+### 28.2 默认配置
+
+| 参数 | 默认值 | 控制变量含义 |
+|---|---:|---|
+| `sampleRateHz` | `100e6` | 复基带采样率 |
+| `toneFrequenciesHz` | `(-2e6, 2e6)` | 对称双音频率 |
+| `toneAmplitudes` | `(1.0, 1.0)` | 等幅激励 |
+| `tonePhasesDegrees` | `(0.0, 0.0)` | 相同初相位 |
+| `numSamples` | `32768` | 重复记录长度 |
+| `rmsLevel` | `0.5` | 生成器编码前RMS |
+| `width` | `16` | 公开I/Q位宽；0为浮点 |
+| `outputPowerDbm` | `20.0` | 每种方法最终实际PA输出功率 |
+| `maximumOutputPowerDbm` | `25.0` | 归一化PA满量程功率 |
+| `numIterations` | `10` | 所有方法相同的迭代预算 |
+| `paModelName` | `"wiener"` | 默认PA；也支持GMP |
+| `seed` | `211` | ILC反馈随机过程种子基准 |
+
+默认频率对应：
+
+```text
+IM7-L  IM5-L  IM3-L   Tone-1   Tone-2   IM3-U  IM5-U  IM7-U
+-14     -10     -6       -2       +2       +6     +10    +14 MHz
+```
+
+### 28.3 执行流程
+
+```mermaid
+flowchart TD
+    config["TwoToneBenchmarkConfig.Validate"] --> generator["WaveGenTwoTone.Generate"]
+    generator --> raw["原始双音"]
+    raw --> calibration["PowerCalibration闭环"]
+    calibration --> pa["Wiener或GMP PA"]
+    pa --> baseline["20 dBm baseline"]
+    baseline --> analysis["TwoToneAnalysis：IM3/IM5/IM7"]
+    calibration --> methods["七种适用SISO ILC"]
+    methods --> histories["每轮原生输入和PA输出"]
+    histories --> historyAnalysis["AnalyzeIlcHistory"]
+    historyAnalysis --> selected["按最大剩余互调最小选择"]
+    selected --> equalPower["再次闭环到相同输出dBm"]
+    equalPower --> comparison["同功率IM3/IM5/IM7比较"]
+    comparison --> files["CSV / JSON / PNG / histories"]
+```
+
+**图示说明：**
+
+1. 第一次闭环只建立未线性化PA baseline工作点。
+2. 每一种ILC都从同一参考双音开始，并拥有相同迭代次数。
+3. `DpdIlc.py` 每轮只保存原生MSE、输入和PA输出。
+4. `TwoToneAnalysis.AnalyzeIlcHistory` 在算法结束后计算每轮IM3、IM5和IM7。
+5. 选择出的输入再次通过闭环输入驱动校准，使所有最终方法输出落在相同实际dBm。
+6. PA输出从不乘常数伪造目标功率，因此互调对应真实压缩深度。
+
+### 28.4 对比方法和预期
+
+| 方法 | 主要能力 | 双音场景预期优势 | 可能缺点 |
+|---|---|---|---|
+| PA baseline | 无ILC | 给出原始互调参考 | 不抑制非线性 |
+| Scalar P ILC | 样点比例误差更新 | 结构最简单 | 不显式处理记忆和频率选择性 |
+| Complex-gain ILC | 正则化公共复增益逆 | 对统一增益和相位更稳定 | 仍是标量学习器 |
+| FIR ILC | 截断频率逆响应 | 可处理线性记忆 | FIR长度过短会限制高阶抵消 |
+| Frequency-domain ILC | 逐频率正则化更新 | 可形成外侧互调抵消谱 | 依赖投影带宽和低激励频响 |
+| Directional Gauss-Newton ILC | 当前方向有限差分Jacobian | 能感知局部非线性斜率 | 每轮PA调用更多，方向是一维近似 |
+| Parameter-domain MP ILC | 直接更新1/3/5/7阶MP系数 | 与双音奇数阶结构匹配 | 正则化不合适时高阶互调可反弹 |
+| Augmented IQ ILC | 误差与共轭误差双路径 | 有IQ镜像时更有优势 | 标称无IQ失衡时额外自由度可能无收益 |
+
+### 28.5 指标和改善量
+
+每个阶次先取上下侧较差值。以IM3为例：
+
+```math
+\mathrm{IM3}_{\mathrm{worst}}
+=\max\left(
+\mathrm{IM3}_{\mathrm{L}},
+\mathrm{IM3}_{\mathrm{U}}
+\right).
+```
+
+方法相对baseline的改善定义为
+
+```math
+\Delta\mathrm{IM3}
+=\mathrm{IM3}_{\mathrm{baseline}}
+-\mathrm{IM3}_{\mathrm{method}}.
+```
+
+由于dBc越负越好，正的 $\Delta\mathrm{IM3}$ 表示改善。IM5和IM7使用相同定义。
+
+不能只看IM3。ILC可能把主要自由度用于抵消最强IM3，同时通过PA高阶项产生新的IM7。因此表格和PNG始终同时展示三种阶次。
+
+### 28.6 运行方式
+
+默认双音基准：
+
+```powershell
+python tests/BenchMark.py --two-tone
+```
+
+完整显式配置：
+
+```powershell
+python tests/BenchMark.py --two-tone --sample-rate-hz 100000000 --tone-lower-hz -2000000 --tone-upper-hz 2000000 --tone-samples 32768 --tone-rms-level 0.5 --width 16 --output-power-dbm 20 --maximum-output-power-dbm 25 --iterations 10 --pa wiener --seed 211 --output-dir results/two_tone_ilc_benchmark
+```
+
+Python调用：
+
+```python
+from tests.BenchMark import (
+    RunTwoToneIlcBenchmark,
+    TwoToneBenchmarkConfig,
+)
+
+rows = RunTwoToneIlcBenchmark(
+    TwoToneBenchmarkConfig(
+        sampleRateHz=100.0e6,
+        toneFrequenciesHz=(-2.0e6, 2.0e6),
+        numSamples=32768,
+        width=0,
+        outputPowerDbm=20.0,
+        numIterations=10,
+    )
+)
+```
+
+### 28.7 输出文件
+
+| 文件 | 内容 |
+|---|---|
+| `all_ilc_two_tone_metrics.csv` | baseline和七种ILC的绝对IM值、改善量和输出功率 |
+| `all_ilc_two_tone_metrics.json` | 相同结果加完整可复现元数据 |
+| `all_ilc_two_tone_imd.png` | 所有方法IM3、IM5、IM7较差侧分组柱状图 |
+| `histories/*.csv` | 每种方法逐轮NMSE、IM3、IM5、IM7和输出功率 |
+| `histories/*.json` | 每种方法最佳轮、最佳指标和完整逐轮记录 |
+
+### 28.8 快速仿真结果
+
+以下结果使用浮点、4096点、20 dBm、Wiener PA和每种方法2轮。该配置用于快速验证结构，不代替默认10轮正式结果。
+
+| 方法 | IM3/dBc | IM5/dBc | IM7/dBc | IM3改善/dB | IM5改善/dB | IM7改善/dB |
+|---|---:|---:|---:|---:|---:|---:|
+| PA baseline | -33.25 | -45.72 | -68.77 | 0.00 | 0.00 | 0.00 |
+| Scalar P ILC | -34.10 | -46.54 | -68.00 | 0.85 | 0.82 | -0.77 |
+| Complex-gain ILC | -34.56 | -46.98 | -67.61 | 1.31 | 1.26 | -1.16 |
+| FIR ILC | -34.59 | -46.95 | -67.62 | 1.34 | 1.23 | -1.15 |
+| Frequency-domain ILC | -34.56 | -46.98 | -67.60 | 1.32 | 1.26 | -1.17 |
+| Directional Gauss-Newton ILC | -33.30 | -45.77 | -68.72 | 0.06 | 0.05 | -0.05 |
+| Parameter-domain MP ILC | -34.82 | -47.35 | -66.09 | 1.57 | 1.63 | -2.67 |
+| Augmented IQ ILC | -33.77 | -46.60 | -67.56 | 0.53 | 0.88 | -1.21 |
+
+快速结果证明了必须分阶次比较：两轮内多数方法已经改善IM3和IM5，但IM7尚未同步改善。正式评估应使用默认10轮，并至少增加输出功率扫描或不同PA模型复测。
+
+### 28.9 G类验收清单
+
+- [ ] 两个基波、IM3、IM5和IM7都位于Nyquist内；
+- [ ] baseline和所有方法最终输出功率误差位于闭环容限内；
+- [ ] 每种方法使用相同双音、PA和迭代预算；
+- [ ] 每轮历史来自真实PA输出，没有PA后常数缩放；
+- [ ] IM3、IM5和IM7均同时报告上下侧和较差侧；
+- [ ] 改善量为正时代表互调更负；
+- [ ] CSV、JSON和PNG中的方法顺序一致；
+- [ ] 若IM3改善而IM7恶化，报告保留该事实而不是隐藏。

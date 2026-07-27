@@ -1,17 +1,20 @@
-# DPD-ILC VHT/HE/EHT Wi-Fi 仿真工程
+# DPD-ILC VHT/HE/EHT Wi-Fi与双音仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：通过 `WaveGenWifi` 实例生成 802.11ac/VHT、802.11ax/HE 或 802.11be/EHT Wi-Fi 复基带训练波形，支持 1–8 条空间流及物理发射链，经每路独立的 Wiener 或 GMP 功放模型后，使用正则化频域 ILC 学习理想 PA 输入，再以每路 GMP 拟合可复用的 DPD，并输出汇总及逐 PA/逐空间流模拟功率、SNR、EVM、ACLR，以及多方法功率-EVM 对比曲线。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Wiener/GMP PA、闭环输出功率校准和全部适用ILC更新律。Wi-Fi路径输出功率、SNR、EVM、ACLR和功率-EVM曲线；双音路径输出IM3、IM5、IM7及所有SISO ILC方法的同功率对比图。
 
 ## 理论文档
 
 - [Wi-Fi 帧生成物理原理与推导](doc/WaveGenWifi.md)：复基带、OFDM 正交性、QAM 归一化、MCS、循环前缀、VHT/HE/EHT 字段和 PAPR。
+- [双音信号生成物理原理与用法](doc/WaveGenTwoTone.md)：复基带双音、奇数阶互调频率、RMS/定点边界和ILC带宽。
 - [FEC编码译码原理与用法](doc/Fec.md)：55/90短块LDPC校验矩阵、系统编码、软输入normalized min-sum译码和调用示例。
 - [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、Rapp AM-AM、AM-PM、GMP、频谱再生、IQ 失衡和反馈噪声。
+- [PA到接收端Channel物理原理与用法](doc/Channel.md)：PA→移相→白噪声链路、毫伏/dBm换算、定点边界和ILC接线。
 - [信号同步、补偿与功率标定原理](doc/SigProc.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样、复增益补偿和 dBm/RMS 换算。
 - [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
 - [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：10 bit seed、短块LDPC、历史CRC兼容、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
 - [Wi-Fi 元数据契约](doc/WifiMetadata.md)：`MCSInfo` 与 `WifiWaveform` 的字段、数组形状和模块边界。
 - [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
+- [双音IM分析与ILC比较](doc/TwoToneAnalysis.md)：精确频率投影、IM3/IM5/IM7 dBc、逐轮选择和全方法Benchmark。
 - [定点接口原理与用法](doc/FixedPoint.md)：浮点旁路、公开整数码、内部缩放、舍入、饱和，以及 WaveGenWifi、PaModel、Analysis 的统一数据边界。
 - [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
 - [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、当前工作点局部Jacobian、公共复增益与20 dBm GMP发散案例。
@@ -33,13 +36,16 @@ python -m pip install -r requirements.txt
 main.py                 命令行主程序
 SmallestSISO.py         浮点与16位定点SISO EHT/GMP/ILC对比示例
 inc/lib/Analysis.py         模拟功率、SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
+inc/lib/Channel.py          PA到接收端的固定移相和物理幅度/功率白噪声链路
 inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
 inc/lib/Fec.py              55/90短块LDPC矩阵构造、系统编码和软输入译码
 inc/lib/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
 inc/lib/ParseWifi.py        接收帧描述解析、包起点检测与参考波形恢复
 inc/lib/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
+inc/lib/WaveGenTwoTone.py   WaveGenTwoTone 类、双音波形及IM3/IM5/IM7频率元数据
+inc/lib/TwoToneAnalysis.py  双音基波、IM3/IM5/IM7、逐轮ILC分析及结果保存
 inc/utils/ConfigUtils.py    ChainMap未知配置警告、过滤与外部活动映射视图
-inc/utils/Draw.py           功率-EVM 多方法同图绘制与 PNG 输出
+inc/utils/Draw.py           功率-EVM、ILC收敛和双音IMD多方法对比图
 inc/utils/FixedPoint.py     浮点旁路、公开有符号整数码与内部归一化转换
 inc/utils/FrameProcess.py   Wi-Fi 去 CP、FFT、CSD 撤销与空间流解映射
 inc/utils/SigProc.py        SigProc 同步补偿、SignalProcessingResult 与 PowerCalibration
@@ -61,25 +67,31 @@ doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整�
 
 ```python
 from inc.lib.Analysis import Analysis
+from inc.lib.Channel import Channel
 from inc.lib.Fec import EncodeDescriptorLdpc
 from inc.lib.ParseWifi import ParseWifi
 from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.lib.WaveGenTwoTone import WaveGenTwoTone
+from inc.lib.TwoToneAnalysis import TwoToneAnalysis
 ```
 
 为兼容把 `inc` 目录加入 `sys.path` 的既有工程，也支持：
 
 ```python
 from lib.Analysis import Analysis
+from lib.Channel import Channel
 from lib.Fec import EncodeDescriptorLdpc
 from lib.ParseWifi import ParseWifi
 from lib.WaveGenWifi import WaveGenWifi
+from lib.WaveGenTwoTone import WaveGenTwoTone
+from lib.TwoToneAnalysis import TwoToneAnalysis
 ```
 
 `lib` 与 `utils` 之间的跨包导入会根据当前包层级选择对应路径，因此第二种方式不会再触发 `attempted relative import beyond top-level package`。推荐方式仍是 `inc.lib.*`，因为它不需要调用方手动修改 `sys.path`。
 
 ## 浮点与定点接口
 
-`WaveGenWifi`、`PaModel`、`MimoPaModel`、`ParseWifi` 和 `Analysis` 都把 `width` 定义在各自的 `parameters` 配置中。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量使用有符号整数码。默认值为 `16`。为兼容已有代码，各主类仍保留直接 `width=` 便捷参数，但新代码统一推荐 `parameters={"width": ...}`。
+`WaveGenWifi`、`WaveGenTwoTone`、`PaModel`、`MimoPaModel`、`Channel`、`ParseWifi`、`Analysis` 和 `TwoToneAnalysis` 都把 `width` 定义在各自的 `parameters` 配置中。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量使用有符号整数码。默认值为 `16`。为兼容已有代码，各主类仍保留直接 `width=` 便捷参数，但新代码统一推荐 `parameters={"width": ...}`。
 
 ```math
 -2^{W-1}\leq q_{\mathrm{I}},q_{\mathrm{Q}}\leq 2^{W-1}-1
@@ -106,6 +118,7 @@ flowchart LR
 
 ```python
 from inc.lib.Analysis import Analysis
+from inc.lib.Channel import Channel
 from inc.lib.PaModel import MimoPaModel, PaModel
 from inc.lib.ParseWifi import ParseWifi
 from inc.lib.WaveGenWifi import WaveGenWifi
@@ -113,6 +126,10 @@ from inc.lib.WaveGenWifi import WaveGenWifi
 wifiGenerator = WaveGenWifi(parameters={"width": 16})
 paModel = PaModel(
     parameters={"modelName": "gmp", "width": 16}
+)
+channel = Channel(
+    paModel=paModel,
+    parameters={"noiseAmpMv": 10.0, "width": 16},
 )
 mimoPaModel = MimoPaModel(
     parameters={"numTransmitChains": 2, "width": 16}
@@ -125,13 +142,13 @@ resultAnalysis = Analysis(
 )
 ```
 
-顶层 [SmallestSISO.py](./SmallestSISO.py) 会用完全相同的 EHT、GMP PA 和 ILC 设置依次运行浮点与16位定点版本：
+顶层 [SmallestSISO.py](./SmallestSISO.py) 会用完全相同的 EHT、中等压缩GMP PA、Channel和ILC设置依次运行浮点与16位定点版本。示例把内置GMP的非线性支路系数缩放为25%，保留全部主项、滞后项和超前项，同时保证20 dBm工作点在有符号定点转换器范围内可达：
 
 ```powershell
 python SmallestSISO.py
 ```
 
-浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序最后打印两种模式的最佳ILC EVM及定点减浮点的EVM差值。PA的原始输出不要求预先归一化，脚本会按有效Wi-Fi突发区间把baseline、每轮ILC输出和最终复测输出统一重新标定到20 dBm；前后补零或长占空比静默不进入功率RMS。
+浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序最后打印两种模式的最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本按有效Wi-Fi突发区间把PA输出闭环标定到20 dBm；PA后的 `Channel` 使用0度移相和10 mV复包络总RMS白噪声，baseline、每轮ILC反馈和最终接收分析都经过该链路，但接收噪声不进入PA功率校准。前后补零或长占空比静默不进入功率RMS。
 脚本还打印两种波形的峰值以及 `waveformMinimumI/MaximumI/MinimumQ/MaximumQ`。定点版本的 I/Q 字段是公开码值，因此16位分量会位于 `-32768…32767`，并不是小于1的归一化数；复数幅度 `waveformPeakAmplitude` 最多可接近 $\sqrt{2}\,32768$。
 
 ## 工程工作流程图
@@ -151,10 +168,15 @@ flowchart TD
     paImplementation --> powerCalibration
     powerCalibration --> reference["收敛后的PA输入参考矩阵 S"]
     powerCalibration --> calibratedBaseline["容限内的实测PA基线输出"]
+    overrideMap --> channel["可选Channel：固定移相 + 物理白噪声"]
+    paModel --> channel
+    calibratedBaseline --> channel
+    channel --> receivedBaseline["接收端baseline"]
 
     start --> frequencyIlc["SISO 或逐 PA RunMimoFrequencyDomainIlc"]
     reference --> frequencyIlc
     paModel --> frequencyIlc
+    channel -. "需要含链路影响的反馈" .-> frequencyIlc
 
     frequencyIlc --> nativeHistory["保存每轮输入、PA输出和原生MSE"]
     nativeHistory --> ilcAnalysis["Analysis.AnalyzeIlcHistory<br/>分析每轮真实功率 / SNR / EVM / ACLR"]
@@ -181,6 +203,7 @@ flowchart TD
     reference --> analysis
     reference --> sigProc["SigProc：时延 / CFO / SFO / 复增益补偿"]
     calibratedBaseline --> sigProc
+    receivedBaseline --> sigProc
     frequencyIlc --> sigProc
     correctedOutput --> sigProc
     sigProc --> frameProcess["FrameProcess：去 CP / FFT / CSD / 空间解映射"]
@@ -208,10 +231,10 @@ flowchart TD
 
 **图示说明：**
 
-1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `WaveGenWifi`、`PaModel`、`Analysis` 和 `Draw`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
+1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `WaveGenWifi`、`PaModel`、`Analysis` 和 `Draw`；需要接收链路影响时再构造 `Channel`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
 2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
-3. `PowerCalibration` 把原始SISO/MIMO波形按隐藏驱动预设送入 `PaModel` 或仪表适配器，仅对PA实测输出的有效突发计算功率。若目标误差超出容限，它在dB域更新预设并重新生成PA输入；有上下括区后改用二分，直到所有链收敛。返回值是最终PA输入，最后一次实测PA输出由 `GetLastPaOutput()` 取得，调用方不需要读写内部预设。
-4. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮真实输入、PA反馈输出和原生MSE；不会在PA后把每轮输出缩放到目标dBm。ILC返回后，`Analysis.AnalyzeIlcHistory` 或 `AnalyzeMimoIlcHistory` 才逐轮计算RF性能，并按严格EVM选择 `u*`。该输入可在闭环功率校准后复测，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN。
+3. `PowerCalibration` 把原始SISO/MIMO波形按隐藏驱动预设送入 `PaModel` 或仪表适配器，仅对PA实测输出的有效突发计算功率。若目标误差超出容限，它在dB域更新预设并重新生成PA输入；有上下括区后改用二分，直到所有链收敛。返回值是最终PA输入，最后一次实测PA输出由 `GetLastPaOutput()` 取得。接收噪声必须在校准之后由 `Channel.ProcessPaOutput` 加入，不能参与PA功率闭环。
+4. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮真实输入、plant反馈输出和原生MSE；不会在PA后把每轮输出缩放到目标dBm。plant可以是纯PA，也可以是包含PA、移相与噪声的 `Channel`。ILC返回后，`Analysis.AnalyzeIlcHistory` 或 `AnalyzeMimoIlcHistory` 才逐轮计算RF性能，并按严格EVM选择 `u*`。该输入可在闭环功率校准后复测，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN。
 5. `Analysis` 使用三条互相独立的路径。显式参考模式直接保存 `referenceSignal` 与 `WifiWaveform`；发送波形辅助模式对NumPy数组或 `WifiWaveform.samples` 做互相关，直接截取公共区间，绝不解析Descriptor、恢复seed或重新生成参考；只有盲分析模式才调用 `ParseWifi` 恢复包起点、格式、MCS、FFT/GI、空间结构和参考样值。三条路径之后共用 `SigProc`；具备Wi-Fi元数据时再用 `FrameProcess` 计算严格子载波EVM。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
 6. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
 
@@ -297,6 +320,58 @@ flowchart TD
 - `BuildWifiDescriptorField` 在VHT-SIG-A、HE-SIG-A或U-SIG位置写入两个带导频、跨符号交织和短块LDPC保护的BPSK OFDM符号，使仅接收波形路径能够恢复本工程随机激励所需参数；Parser仍兼容历史CRC描述，但该字段是仿真解析描述，不是bit-exact标准SIG编码器。
 - LDPC校验矩阵、系统编码和软输入译码由独立的 `Fec.py` 提供；`WaveGenWifi.py` 与 `ParseWifi.py` 不再定义编译码算法。
 - `WaveGenWifi.Generate` 是面向调用方的波形入口，并由内部辅助函数 `GenerateWifiWaveform` 完成组帧，最终返回 `WifiWaveform`；其中既有时域样本，也有后续 EVM 解调所需的格式、字段切片和参考星座。
+
+### `inc/lib/WaveGenTwoTone.py`
+
+```mermaid
+flowchart TD
+    caller["调用方"] --> generator["WaveGenTwoTone"]
+    generator --> chainMap["类内默认值 + ChainMap覆盖"]
+    chainMap --> validate["ValidateParameters"]
+    validate --> pairs["ResolvePair"]
+    validate --> products["ResolveIntermodulationFrequencies<br/>IM3 / IM5 / IM7"]
+    products --> bandwidth["ResolveIlcBandwidthHz"]
+    generator --> generate["Generate"]
+    generate --> tones["两个复指数求和"]
+    tones --> rms["有限记录RMS缩放"]
+    rms --> fixed["FixedPoint.EncodeComplex"]
+    fixed --> waveform["TwoToneWaveform"]
+    waveform --> productsMethod["IntermodulationFrequencies"]
+```
+
+**图示说明：**
+
+- `WaveGenTwoTone` 与其他主类相同，默认参数写在构造函数内部；调用方只覆盖采样率、频率、幅相、长度、RMS和位宽。
+- `ValidateParameters` 不只检查两个基波，还检查IM3、IM5和IM7均未混叠。
+- `ResolveIlcBandwidthHz` 默认把频域ILC更新范围扩展到最外侧IM7，避免算法只能合成IM3抵消分量。
+- `Generate` 返回带元数据的 `TwoToneWaveform`，浮点和定点接口规则与Wi-Fi生成器一致。
+
+### `inc/lib/TwoToneAnalysis.py`
+
+```mermaid
+flowchart TD
+    waveform["TwoToneWaveform精确频率"] --> analysis["TwoToneAnalysis"]
+    measured["PA或ILC输出"] --> decode["FixedPoint.DecodeComplex"]
+    decode --> trim["去除首尾PA暂态"]
+    trim --> window["BuildAnalysisWindow"]
+    window --> projection["CalculateToneCoefficient"]
+    waveform --> projection
+    projection --> fundamentals["两个基波功率"]
+    projection --> products["IM3 / IM5 / IM7上下侧功率"]
+    fundamentals --> dbc["相对同侧基波计算dBc"]
+    products --> dbc
+    dbc --> metrics["Analyze：普通字典"]
+    history["ILCIteration历史"] --> historyAnalysis["AnalyzeIlcHistory"]
+    historyAnalysis --> metrics
+    historyAnalysis --> save["SaveIlcHistory"]
+```
+
+**图示说明：**
+
+- 分析器在精确物理频率做Hann窗复投影，不把非整数周期音调强制舍入到最近FFT格点。
+- 每种阶次同时保存下侧、上侧和较差侧；dBc越负表示互调越小。
+- `AnalyzeIlcHistory` 在ILC结束后独立读取每轮真实PA输出，不向 `DpdIlc.py` 注入指标计算。
+- 最佳轮按IM3、IM5、IM7中最大的剩余互调最小来选择，并保留对应输入供同输出功率复测。
 
 ### `inc/lib/Fec.py`
 
@@ -447,6 +522,28 @@ flowchart TD
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
 - `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。它反复改变PA输入并测量真实输出，直到目标误差进入容限，不在PA输出端追加常数增益。
 - `MimoPaModel` 不在链间引入隐含耦合：每一列进入独立 `PaModel`。`ProcessChain` 是单路 ILC 看到的真实 plant；相对 dB 与绝对 dBm 功率设置均在该路径中生效。
+
+### `inc/lib/Channel.py`
+
+```mermaid
+flowchart LR
+    input["公开PA输入"] --> decode["FixedPoint解码"]
+    decode --> pa["绑定的PaModel"]
+    pa --> phase["ApplyPhaseRotation<br/>-90° / 0° / +90°"]
+    phase --> noise["AddNoise<br/>noiseAmpMv或noisePwrDbm"]
+    noise --> encode["FixedPoint编码"]
+    encode --> receiver["公开接收波形"]
+    paOutput["已有公开PA输出"] --> paDecode["ProcessPaOutput解码"]
+    paDecode --> phase
+```
+
+**图示说明：**
+
+- `Process` 实现完整的PA→移相→AddNoise顺序；`ProcessPaOutput` 用于已经由功率闭环产生的PA输出，不会再次运行PA。
+- `noiseAmpMv` 定义复包络总RMS毫伏数；`noisePwrDbm` 定义端口噪声功率。两者默认都是 `None`，只能选择一个非 `None` 控制量。
+- 相位只允许 `-90`、`0`、`90` 度，默认0度不旋转。圆对称复噪声的I/Q分量各承担总方差的一半。
+- 浮点和定点公开数据类型都为 `numpy.complex128`；定点模式输出I/Q整数码，物理噪声的电压换算只发生在模块内部。
+- 完整公式、参数约束和功率校准接线见 [Channel.md](doc/Channel.md)。
 
 ### `inc/lib/DpdIlc.py`
 
@@ -939,6 +1036,26 @@ PA 辅助接口还包括：
 | `IQImbalancePA(paModel, directCoefficient, imageCoefficient)` | `paModel`、直通系数、镜像系数 | `directCoefficient=1+0j`，`imageCoefficient=0.045·exp(j·0.35)`。 |
 | `AddAwgn(inputSignal, snrDb, randomGenerator)` | 输入、反馈 SNR、NumPy 随机数生成器 | `snrDb=None` 时原样复制输入，否则加入复高斯白噪声。 |
 
+### `Channel` 参数与方法
+
+构造函数为：
+
+```python
+Channel(paModel=None, parameters=None, width=None, **parameterOverrides)
+```
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `phaseDegrees` | `0` | 固定相位旋转，仅允许 `-90`、`0` 或 `90` 度。 |
+| `noiseAmpMv` | `None` | 复包络总RMS噪声幅度，单位mV。 |
+| `noisePwrDbm` | `None` | 端口总噪声功率，单位dBm；不能与 `noiseAmpMv` 同时非 `None`。 |
+| `loadResistanceOhm` | `50.0` | 噪声功率与RMS电压换算使用的阻抗。 |
+| `maximumOutputPowerDbm` | `25.0` | 内部归一化PA输出RMS等于1所代表的功率。 |
+| `randomSeed` | `1701` | 固定非负整数使整次噪声序列可复现；`None` 使用系统熵。 |
+| `width` | `16` | 外部I/Q位宽；`0`为浮点，正值返回整数码。 |
+
+`Process(inputSignal)` 执行完整PA→移相→AddNoise链路；`ProcessPaOutput(paOutputSignal)` 只处理已有PA输出；`ResetRandomGenerator()` 从配置种子重新开始噪声序列。10 mV与50 Ω下约 `-26.99 dBm` 等效。完整物理定义见 [Channel.md](doc/Channel.md)。
+
 ### `SigProc` 参数与方法
 
 构造函数 `SigProc(referenceSignal, sampleRateHz, parameters=None, **parameterOverrides)` 保存已知参考和采样率；全部默认值定义在构造函数内部，调用方只传覆盖字典。
@@ -1151,6 +1268,7 @@ assert resultAnalysis.width == 16
 | `parameters` | `None` | 外部 `Mapping` 覆盖层；未提供的键使用 `Draw` 构造函数内部默认值。 |
 | `powerEvmFileStem` | `"power_evm_curve"` | PNG 默认文件名前缀。 |
 | `convergenceFileStem` | `"ilc_convergence"` | 每轮 MSE 收敛 PNG 的默认文件名前缀。 |
+| `imdFileStem` | `"two_tone_imd_comparison"` | 双音IM3/IM5/IM7多方法对比PNG前缀。 |
 | `figureWidthInches` | `10.5` | 图像宽度，单位英寸，必须为正数。 |
 | `figureHeightInches` | `6.2` | 图像高度，单位英寸，必须为正数。 |
 | `figureDpi` | `180` | PNG 分辨率，必须为正整数。 |
@@ -1159,10 +1277,12 @@ assert resultAnalysis.width == 16
 | `legendColumnThreshold` | `6` | 方法数超过该值时，将图例移到绘图区右侧。 |
 | `plotTitle` | `"Power-EVM comparison"` | 图标题。 |
 | `convergencePlotTitle` | `"ILC MSE convergence"` | 每轮 MSE 收敛图标题。 |
+| `imdPlotTitle` | `"Two-tone ILC intermodulation comparison"` | 双音IMD对比图标题。 |
 | `xAxisLabel` | `"PA output power per chain (dBm)"` | 横轴标题。 |
 | `yAxisLabel` | `"RMS EVM (dB, lower is better)"` | 纵轴标题。 |
 | `convergenceXAxisLabel` | `"ILC iteration"` | 收敛图横轴标题。 |
 | `convergenceYAxisLabel` | `"Normalized error / EVM (dB, lower is better)"` | 收敛图纵轴标题。 |
+| `imdYAxisLabel` | `"Worst-side intermodulation (dBc, lower is better)"` | 双音IMD图纵轴标题。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
@@ -1174,6 +1294,9 @@ assert resultAnalysis.width == 16
 | `ValidateConvergenceHistory(ilcHistory)` | 每轮历史 | 检查轮次顺序以及 Raw/LC/EVM 序列完整性。 |
 | `CreateConvergenceFigure(ilcHistory)` | 每轮历史 | 返回三级 MSE 同轴对比的 Matplotlib Figure。 |
 | `SaveConvergenceCurve(ilcHistory, outputDirectory, fileStem=None)` | 每轮历史、输出目录、可选文件名前缀 | 生成并返回每轮 MSE 收敛 PNG 路径。 |
+| `ValidateTwoToneMetrics(metricsByMethod)` | 方法名到IM指标字典的映射 | 检查每个方法的IM3/IM5/IM7较差侧有限性。 |
+| `CreateTwoToneImdFigure(metricsByMethod)` | 多方法IM指标 | 返回IM3/IM5/IM7分组柱状图。 |
+| `SaveTwoToneImdComparison(metricsByMethod, outputDirectory, fileStem=None)` | 多方法IM指标、目录、可选文件名 | 保存并返回双音多方法对比PNG路径。 |
 
 ### `ILCConfig` 与算法参数
 
@@ -1740,6 +1863,128 @@ Analysis会在内部自动提取NumPy样值或 `WifiWaveform.samples`，无需�
 - `power_evm_curve.csv`：每个PA输出功率dBm点、归一化驱动比例、目标输出RMS电压及各方法EVM；
 - `power_evm_curve.json`：与曲线对应的结构化数据。
 
+## 双音生成、IM分析和ILC对比
+
+### `WaveGenTwoTone` 参数
+
+构造函数为：
+
+```python
+WaveGenTwoTone(parameters=None, width=None, **parameterOverrides)
+```
+
+| 参数 | 默认值 | 可配置范围或作用 |
+|---|---:|---|
+| `sampleRateHz` | `100e6` | 正数，复基带采样率 |
+| `toneFrequenciesHz` | `(-2e6, 2e6)` | 两个不同频率；IM3/IM5/IM7必须位于Nyquist内 |
+| `toneAmplitudes` | `(1.0, 1.0)` | 两个正数，相对幅度 |
+| `tonePhasesDegrees` | `(0.0, 0.0)` | 两个有限初相位，单位度 |
+| `numSamples` | `32768` | 至少64点 |
+| `rmsLevel` | `0.5` | 编码前有限记录RMS，范围 `(0, 1]` |
+| `width` | `16` | 0为浮点，大于0为公开有符号I/Q码 |
+| `ilcBandwidthHz` | `None` | 频域ILC更新带宽；None自动覆盖到IM7并留保护 |
+
+`Generate()` 返回 `TwoToneWaveform`。该对象除了 `samples`，还保存精确基波频率、采样率、位宽和 `ilcBandwidthHz`；`IntermodulationFrequencies(3/5/7)` 返回对应的下侧、上侧互调频率。
+
+### `TwoToneAnalysis` 参数和结果
+
+构造函数为：
+
+```python
+TwoToneAnalysis(waveform, parameters=None, width=None, **parameterOverrides)
+```
+
+| 参数 | 默认值 | 作用 |
+|---|---:|---|
+| `windowName` | `"hann"` | 精确频率复投影窗；也支持 `rectangular` |
+| `settlingSamples` | `256` | 首尾各去掉的PA记忆暂态点数 |
+| `minimumSpectralPower` | `1e-30` | 对数功率下限 |
+| `maximumOutputPowerDbm` | `25.0` | 归一化PA输出RMS为1时的功率 |
+| `loadResistanceOhm` | `50.0` | 功率换算端口阻抗 |
+| `width` | 继承波形 | 必须与 `TwoToneWaveform.width` 一致 |
+
+`Analyze(measuredSignal)` 返回普通字典，主要键为：
+
+| 字典键 | 含义 |
+|---|---|
+| `fundamentalLowerDbfs`, `fundamentalUpperDbfs` | 两个基波的归一化电平 |
+| `im3LowerDbc`, `im3UpperDbc`, `im3WorstDbc` | IM3下侧、上侧和较差侧 |
+| `im5LowerDbc`, `im5UpperDbc`, `im5WorstDbc` | IM5下侧、上侧和较差侧 |
+| `im7LowerDbc`, `im7UpperDbc`, `im7WorstDbc` | IM7下侧、上侧和较差侧 |
+| `worstIntermodulationDbc` | IM3/IM5/IM7较差侧中的最大值 |
+| `outputPowerDbm` | 去除暂态后的实际PA平均输出功率 |
+
+### 典型的单方法ILC调用
+
+```python
+from inc.lib.DpdIlc import ILCConfig, RunFrequencyDomainIlc
+from inc.lib.PaModel import PaModel
+from inc.lib.TwoToneAnalysis import TwoToneAnalysis
+from inc.lib.WaveGenTwoTone import WaveGenTwoTone
+from inc.utils.SigProc import PowerCalibration
+
+toneWaveform = WaveGenTwoTone(
+    parameters={
+        "sampleRateHz": 100.0e6,
+        "toneFrequenciesHz": (-2.0e6, 2.0e6),
+        "numSamples": 32768,
+        "width": 0,
+    }
+).Generate()
+
+paModel = PaModel(parameters={"modelName": "wiener", "width": 0})
+powerCalibration = PowerCalibration(
+    paModel=paModel,
+    parameters={
+        "outputPowerDbm": 20.0,
+        "maximumOutputPowerDbm": 25.0,
+        "width": 0,
+    },
+)
+
+referenceSignal = powerCalibration.Calibrate(toneWaveform.samples)
+baselineOutput = powerCalibration.GetLastPaOutput()
+
+toneAnalysis = TwoToneAnalysis(
+    toneWaveform,
+    parameters={"maximumOutputPowerDbm": 25.0, "width": 0},
+)
+baselineMetrics = toneAnalysis.Analyze(baselineOutput)
+
+ilcResult = RunFrequencyDomainIlc(
+    referenceSignal,
+    paModel,
+    toneWaveform.sampleRateHz,
+    toneWaveform.ilcBandwidthHz,
+    ILCConfig(numIterations=8, learningRate=0.15, maxAmplitude=1.5),
+)
+analyzedIlc = toneAnalysis.AnalyzeIlcHistory(ilcResult.history)
+
+powerCalibration.Calibrate(analyzedIlc.bestInputSignal)
+selectedOutput = powerCalibration.GetLastPaOutput()
+selectedMetrics = toneAnalysis.Analyze(selectedOutput)
+
+print(baselineMetrics)
+print(selectedMetrics)
+```
+
+最终再次闭环校准，是为了让baseline和ILC在相同实际PA输出dBm下比较。校准器只调整PA输入，不缩放PA输出。
+
+### 全部ILC方法的双音Benchmark
+
+```powershell
+python tests\BenchMark.py --two-tone --sample-rate-hz 100000000 --tone-lower-hz -2000000 --tone-upper-hz 2000000 --tone-samples 32768 --output-power-dbm 20 --iterations 10 --pa wiener --output-dir results\two_tone_ilc_benchmark
+```
+
+该场景比较 Scalar P、Complex-gain、FIR、Frequency-domain、Directional Gauss-Newton、Parameter-domain MP 和 Augmented IQ 七种适用SISO ILC。输出：
+
+- `all_ilc_two_tone_metrics.csv`；
+- `all_ilc_two_tone_metrics.json`；
+- `all_ilc_two_tone_imd.png`；
+- `histories/` 中每种方法逐轮NMSE和IM3/IM5/IM7数据。
+
+完整物理推导见[双音生成文档](doc/WaveGenTwoTone.md)和[双音IM分析文档](doc/TwoToneAnalysis.md)。
+
 ## 指标定义
 
 - SNR：`SigProc` 完成时延、CFO、SFO 和公共复增益补偿后，数据字段参考功率与残差功率之比。
@@ -1747,6 +1992,7 @@ Analysis会在内部自动提取NumPy样值或 `WifiWaveform.samples`，无需�
 - 每轮 MSE：Raw MSE 保留绝对增益、相位及整帧误差；LC-MSE 删除最优公共复增益，是一般复基带的 EVM 代理；EVM-MSE 使用完整 Wi-Fi 接收链，并严格满足 `EVM-MSE = EVM_rms²` 与 `EVM(dB) = 10·log10(EVM-MSE)`。详细推导见 [结果计算物理原理与推导](doc/Analysis.md#55-为什么原始-mse-不能总是反映-evm)。
 - ACLR：主信道功率与上下相邻同带宽信道功率之比，输出上下邻道和较差值。为完整覆盖两个邻道，命令行采样倍率限制为 4 或 8。
 - 功率-EVM：横轴为每路PA绝对输出功率dBm，默认扫描10至25 dBm。`Analysis` 用相对25 dBm极限的输出回退量控制归一化PA驱动，并按端口阻抗记录目标RMS电压；定点PA码直接用于EVM，物理电压标定不回灌分析接口。纵轴为RMS EVM dB，数值越低表示性能越好。
+- 双音IMD：IM3、IM5、IM7分别在解析频率位置做Hann窗精确复投影，并相对同侧基波以dBc表示；越负越好。各方法最终在闭环相同PA输出功率下比较。
 
 ## 验证
 
@@ -1760,4 +2006,10 @@ python tests/TestProject.py
 python tests\BenchMark.py
 ```
 
-验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、每轮 CSV/PNG、两类 PA 的 ILC 改善，以及多方法功率-EVM 数据与 PNG/CSV/JSON 输出。
+双音全方法基准：
+
+```powershell
+python tests\BenchMark.py --two-tone
+```
+
+验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善，以及多方法功率-EVM和双音IMD数据与图形输出。

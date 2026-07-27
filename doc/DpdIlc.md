@@ -183,7 +183,7 @@ outputSignal = paModel.Process(inputSignal)
 
 ## 5. 最小可运行SISO示例
 
-工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
+工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。示例保留默认GMP的全部主项、滞后项和超前项，但把非线性系数缩放为25%，使20 dBm平均输出在有符号定点转换器范围内可达；这不是放宽功率误差。PA后接入0度移相和10 mV复包络总RMS白噪声的 `Channel`。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
 
 ```python
 from SmallestSISO import RunSisoMode
@@ -213,7 +213,7 @@ print(fixedResult["selectedIlcMetrics"])
 python SmallestSISO.py
 ```
 
-脚本的 `RunSisoMode(width=...)` 会把该值分别写入 `WaveGenWifi.parameters`、`PaModel.parameters` 和 `Analysis.parameters`。`width=0` 为浮点旁路；`width=16` 的公开 I/Q 分量是 `-32768…32767` 的整数码，`numpy.complex128` 只是统一容器。ILC在入口解码整数码，内部FFT、GMP、同步、学习更新和指标算法仍使用归一化浮点；返回的最佳输入、输出和逐轮波形再编码为公开整数码。两个结果目录分别是 `results/smallest_siso/floating` 和 `results/smallest_siso/fixed_16`，每个目录都包含逐轮MSE/EVM收敛数据和图片。定点公式见 [FixedPoint.md](./FixedPoint.md)。
+脚本的 `RunSisoMode(width=...)` 会把该值分别写入 `WaveGenWifi.parameters`、`PaModel.parameters`、`Channel.parameters` 和 `Analysis.parameters`。`width=0` 为浮点旁路；`width=16` 的公开 I/Q 分量是 `-32768…32767` 的整数码，`numpy.complex128` 只是统一容器。ILC在入口解码整数码，内部FFT、GMP、移相、加噪、同步、学习更新和指标算法仍使用归一化浮点；返回的最佳输入、输出和逐轮波形再编码为公开整数码。两个结果目录分别是 `results/smallest_siso/floating` 和 `results/smallest_siso/fixed_16`，每个目录都包含逐轮MSE/EVM收敛数据和图片。定点公式见 [FixedPoint.md](./FixedPoint.md)，Channel的噪声单位和流程见 [Channel.md](./Channel.md)。
 
 这个示例中，`paOutputPowerDbm` 是工作点，`maximumOutputPowerDbm` 是额定极限。输出回退和归一化驱动关系为：
 
@@ -233,9 +233,9 @@ V_{\mathrm{out,RMS}}
 =\sqrt{R\,10^{-3}10^{P_{\mathrm{out,dBm}}/10}}.
 ```
 
-20 dBm相对25 dBm极限具有5 dB输出回退。提高目标输出功率会提高归一化驱动，把PA推向更深压缩；降低目标输出功率则增加回退量。最终功率标定按有效突发RMS改变输出标尺，不改变PA内部非线性工作点；50%占空比的长关断区不会让报告功率额外降低3.01 dB。
+20 dBm相对25 dBm极限具有5 dB输出回退。提高目标输出功率会提高归一化驱动，把PA推向更深压缩；降低目标输出功率则增加回退量。功率闭环只观测PA有效突发，不观测Channel接收噪声；因此10 mV噪声不会反向改变PA隐藏驱动预设。50%占空比的长关断区不会让PA报告功率额外降低3.01 dB。
 
-ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和真实PA输出。运行结束后，直接调用 `resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 计算每轮严格的数据子载波EVM、SNR、ACLR和实际输出功率，禁止替换或缩放 `outputSignal`。若需要在规定dBm工作点复测最佳输入，应把该输入交给绑定PA的 `PowerCalibration.Calibrate`，再从 `GetLastPaOutput()` 取得闭环收敛的干净输出。
+ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和实际反馈输出。当plant为 `Channel` 时，该反馈就是经过PA、移相和独立白噪声后的接收波形。运行结束后，直接调用 `resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 计算每轮严格的数据子载波EVM、SNR、ACLR和实际接收功率，禁止替换或缩放 `outputSignal`。若需要在规定dBm工作点复测最佳输入，应先把该输入交给绑定PA的 `PowerCalibration.Calibrate`，从 `GetLastPaOutput()` 取得闭环收敛的干净PA输出，再调用 `Channel.ProcessPaOutput` 得到接收波形。
 
 ---
 
@@ -1677,3 +1677,106 @@ python tests/BenchMark.py --format EHT --bandwidth 20 --mcs 7 --iterations 6
 - [ ] MIMO链数与输入矩阵列数一致；
 - [ ] MIMO学习阶段已确认绝对RMS归一化是否合适；
 - [ ] 最终同时检查EVM、SNR、ACLR、收敛历史和输入峰值。
+
+---
+
+## 23. 双音信号使用ILC
+
+### 23.1 ILC核心为什么不依赖Wi-Fi
+
+所有SISO ILC入口最终只需要：
+
+```text
+referenceSignal
+paModel.Process(inputSignal)
+ILCConfig
+sampleRateHz
+```
+
+`RunWaveformUpdate` 和其他更新律不读取MCS、FFT长度、GI、空间映射或Wi-Fi字段。Wi-Fi依赖只存在于 `WaveGenWifi` 和 `Analysis` 的严格EVM路径。因此双音可以直接使用同一组ILC，不需要在 `DpdIlc.py` 增加信号类型分支。
+
+### 23.2 频域ILC带宽
+
+双音基波虽然只占两个离散频点，但抵消PA非线性需要在IM3、IM5和IM7位置形成预失真频谱。若频域投影只保留两个基波，更新信号中的互调抵消分量会被删除。
+
+`TwoToneWaveform.ilcBandwidthHz` 默认覆盖最外侧IM7并保留10%双边裕量。调用方式为：
+
+```python
+ilcResult = RunFrequencyDomainIlc(
+    referenceSignal,
+    paModel,
+    toneWaveform.sampleRateHz,
+    toneWaveform.ilcBandwidthHz,
+    ilcConfig,
+)
+```
+
+### 23.3 各更新律的双音入口
+
+```python
+scalarResult = RunScalarPIlc(
+    referenceSignal,
+    paModel,
+    ilcConfig,
+    toneWaveform.sampleRateHz,
+)
+
+complexResult = RunComplexGainIlc(
+    referenceSignal,
+    paModel,
+    ilcConfig,
+    toneWaveform.sampleRateHz,
+)
+
+firResult = RunFirIlc(
+    referenceSignal,
+    paModel,
+    ilcConfig,
+    17,
+    toneWaveform.sampleRateHz,
+)
+
+gaussNewtonResult = RunDirectionalGaussNewtonIlc(
+    referenceSignal,
+    paModel,
+    ilcConfig,
+    1.0e-3,
+    toneWaveform.sampleRateHz,
+)
+
+parameterResult = RunParameterDomainIlc(
+    referenceSignal,
+    paModel,
+    ilcConfig,
+    (1, 3, 5, 7),
+    3,
+    toneWaveform.sampleRateHz,
+)
+
+augmentedResult = RunAugmentedIqIlc(
+    referenceSignal,
+    paModel,
+    ilcConfig,
+    toneWaveform.sampleRateHz,
+)
+```
+
+### 23.4 指标仍然与ILC分离
+
+双音ILC运行期间只保存原生MSE和波形。完成后调用：
+
+```python
+analyzedResult = toneAnalysis.AnalyzeIlcHistory(ilcResult.history)
+```
+
+该函数逐轮计算IM3、IM5和IM7，并选择最大剩余互调最小的实测轮。为了公平比较不同方法，最佳输入还要重新通过输入端闭环功率校准：
+
+```python
+powerCalibration.Calibrate(analyzedResult.bestInputSignal)
+equalPowerOutput = powerCalibration.GetLastPaOutput()
+metrics = toneAnalysis.Analyze(equalPowerOutput)
+```
+
+这一过程保持预失真波形形状，只改变整体PA输入驱动，使最终实际输出功率回到共同目标；不会在PA输出后乘常数。
+
+完整双音频率推导见 [WaveGenTwoTone.md](./WaveGenTwoTone.md)，IM指标和多方法结果见 [TwoToneAnalysis.md](./TwoToneAnalysis.md) 与 [BenchMark.md](./BenchMark.md) 的G类场景。

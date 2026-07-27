@@ -12,8 +12,8 @@ The frequency-domain waveform ILC follows the regularized update:
 
 ``L[k] = mu * conj(H[k]) / (abs(H[k])**2 + lambda)``
 
-After convergence, a generalized memory polynomial is fitted to map the
-original Wi-Fi waveform onto the learned PA input. This converts waveform-
+After convergence, a generalized memory polynomial can map the original
+reference waveform onto the learned PA input. This converts waveform-
 specific ILC labels into reusable GMP, Volterra, LUT, or neural
 predistorters.
 """
@@ -49,7 +49,7 @@ class ILCConfig:
 
     Signal-quality evaluators are intentionally excluded. ILC produces every
     measured iteration output without calling ``Analysis``; callers pass those
-    outputs to the independent analysis layer for SNR, EVM, and ACLR.
+    outputs to independent Wi-Fi or two-tone analysis layers for RF metrics.
     """
 
     numIterations: int = 8
@@ -246,9 +246,10 @@ def CalculateIterationMetrics(
 
     The raw MSE preserves absolute amplitude and phase errors. The
     linear-compensated MSE removes the least-squares common complex gain and
-    is therefore a useful EVM proxy when Wi-Fi frame metadata is unavailable.
-    Exact Wi-Fi EVM, SNR, and ACLR are intentionally absent; ``Analysis``
-    evaluates the stored output after the ILC run has completed.
+    is therefore a useful modulation-error proxy when richer metadata is
+    unavailable. Exact Wi-Fi EVM/SNR/ACLR and two-tone IM3/IM5/IM7 are
+    intentionally absent; the matching analysis object evaluates stored
+    outputs after the ILC run has completed.
 
     Args:
         iteration: One-based ILC iteration index.
@@ -465,7 +466,7 @@ def RunFrequencyDomainIlc(
 
     Performance reporting is completely outside this function. Every measured
     input/output pair is retained in ``ILCIteration`` so ``Analysis`` can
-    calculate EVM, SNR, and ACLR after the algorithm has returned.
+    calculate Wi-Fi EVM/SNR/ACLR or two-tone IM3/IM5/IM7 after return.
 
     Args:
         referenceSignal: Ideal complex baseband PA output target.
@@ -2164,7 +2165,7 @@ def RunMimoFrequencyDomainIlc(
         referenceSignal: Complex samples-by-transmit-chains target matrix.
         mimoPaModel: Independent nonlinear PA bank and power settings.
         sampleRateHz: Complex sampling rate in samples per second.
-        channelBandwidthHz: Wanted Wi-Fi channel bandwidth in hertz.
+        channelBandwidthHz: Wanted two-sided update bandwidth in hertz.
         config: Shared ILC convergence and feedback configuration.
 
     Returns:

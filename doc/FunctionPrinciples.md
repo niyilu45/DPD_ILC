@@ -127,6 +127,27 @@ flowchart LR
 | `ParseWifi.BuildDetectedParameters` | E | 可选输入为 `WifiWaveform` 时直接读取中性元数据并转换为统一解析结果 | ParseWifi §6.2 |
 | `ParseWifi.Parse` | P/E | 自动区分 `WifiWaveform`、NumPy发送样值或无发送参考三种模式，统一返回对齐接收帧、参考和元数据 | ParseWifi §5–§6 |
 
+### 3.3 `WaveGenTwoTone.py` 与 `TwoToneAnalysis.py`：双音生成和互调分析
+
+完整公式、单位和边界见 [WaveGenTwoTone.md](./WaveGenTwoTone.md) 与 [TwoToneAnalysis.md](./TwoToneAnalysis.md)。
+
+| 函数/方法 | 类型 | 原理或职责 | 对应章节 |
+|---|---|---|---|
+| `TwoToneWaveform.IntermodulationFrequencies` | P | 按一般奇数阶双音组合公式返回下侧和上侧互调频率 | WaveGenTwoTone §3 |
+| `WaveGenTwoTone.__init__`, `WaveGenTwoTone.Width`, `WaveGenTwoTone.GetParameters`, `WaveGenTwoTone.UpdateParameters`, `WaveGenTwoTone.ValidateParameters` | E | 在类内建立ChainMap默认层，未知配置警告后忽略，并校验采样、双音、长度、RMS、位宽及IM7防混叠边界 | WaveGenTwoTone §6–§7 |
+| `WaveGenTwoTone.ResolvePair` | E/N | 把幅度、相位或频率配置解析为有限双元素浮点元组 | WaveGenTwoTone §7 |
+| `WaveGenTwoTone.ResolveIntermodulationFrequencies` | P | 在不生成样点时按奇数阶系数计算两个互调频率 | WaveGenTwoTone §3 |
+| `WaveGenTwoTone.ResolveIlcBandwidthHz` | P/E | 优先采用显式带宽，否则按最远IM7绝对频率构造带10%保护的双边ILC更新范围 | WaveGenTwoTone §6 |
+| `WaveGenTwoTone.Generate` | P/N/E | 叠加两个复指数、按有限记录RMS缩放、在公开边界定点编码并返回完整频率元数据 | WaveGenTwoTone §2、§4–§5 |
+| `TwoToneILCIteration.ToDict` | E | 把原生NMSE和独立IM指标合并为CSV/JSON标量记录 | TwoToneAnalysis §9 |
+| `TwoToneAnalysis.__init__`, `TwoToneAnalysis.Width`, `TwoToneAnalysis.GetParameters`, `TwoToneAnalysis.UpdateParameters`, `TwoToneAnalysis.ValidateParameters` | E | 保存双音元数据并以ChainMap管理窗、暂态、功率和位宽配置 | TwoToneAnalysis §3、§7 |
+| `TwoToneAnalysis.BuildAnalysisWindow` | N | 构造Hann或矩形窗并保证正相干增益 | TwoToneAnalysis §2 |
+| `TwoToneAnalysis.CalculateToneCoefficient` | P/N | 在已知物理频率执行加窗复投影并除以窗相干增益，避免最近FFT格点误差 | TwoToneAnalysis §2 |
+| `TwoToneAnalysis.CalculateOutputPowerDbm` | P/N | 去除PA首尾暂态后计算复包络RMS，并按额定归一化满量程换算输出dBm | TwoToneAnalysis §3、§5 |
+| `TwoToneAnalysis.Analyze` | P/N/E | 计算两个基波及IM3/IM5/IM7上下侧和较差侧dBc，以普通字典返回 | TwoToneAnalysis §1、§4 |
+| `TwoToneAnalysis.AnalyzeIlcHistory` | P/E | 对每轮原生PA输出独立计算互调，并选择IM3/IM5/IM7最大剩余值最小的实测轮 | TwoToneAnalysis §4、§6 |
+| `TwoToneAnalysis.Print`, `TwoToneAnalysis.SaveIlcHistory` | E | 打印或序列化已经计算的互调结果，不重新运行PA或ILC | TwoToneAnalysis §9–§10 |
+
 ## 4. `PaModel.py`：PA、噪声和多路功率函数
 
 详细物理推导统一见 [PaModel.md](./PaModel.md)。
@@ -152,6 +173,24 @@ flowchart LR
 | `PaModel.DelaySignal` | N | 因果整数延迟并对历史补零 | PaModel §4 |
 | `PaModel.DefaultGmpCoefficients` | E/N | 生成稳定的演示系数，不代表实测器件 | PaModel §11 |
 | `PaModel.AddAwgn` | P/N | 按目标复基带 SNR 设置圆对称复高斯噪声方差 | PaModel §8 |
+
+### 4.1 `Channel.py`：PA到接收端链路
+
+完整物理定义、单位换算和调用方式见 [Channel.md](./Channel.md)。
+
+| 函数/方法 | 类型 | 原理或职责 | 对应章节 |
+|---|---|---|---|
+| `Channel.__init__`, `Channel.Width`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层，未知配置警告后忽略，并校验相位、噪声互斥、阻抗、满量程功率、随机种子和位宽 | Channel §5 |
+| `Channel.SetPaModel` | E | 绑定必须提供公开Process入口的PA对象，并优先保留其浮点直通能力 | Channel §1、§6 |
+| `Channel.SynchronizeRandomGenerator`, `Channel.ResetRandomGenerator` | N/E | 在外部活动参数改变种子时同步随机状态，并支持从固定种子重放同一白噪声序列 | Channel §4–§5 |
+| `Channel.ValidateSignal` | N/E | 保留SISO向量或MIMO矩阵形状，并拒绝空、非有限或不支持维度的波形 | Channel §1、§6 |
+| `Channel.ResolveNoiseRmsVolts`, `Channel.ResolveNoiseRmsNormalized` | P/N | 把毫伏或dBm噪声换成复包络总RMS电压，再按PA满量程dBm映射到内部归一化单位 | Channel §3.2–§3.4 |
+| `Channel.ApplyPhaseRotation` | P/N | 计算PA输出乘以单位复指数，当前相位仅为-90、0或+90度 | Channel §2 |
+| `Channel.AddNoise` | P/N | 生成I/Q各占总方差一半的圆对称复白高斯噪声并叠加到旋转后波形 | Channel §3.1 |
+| `Channel.ApplyChannelEffects` | P/E | 严格按移相后加噪的次序处理已经归一化的PA输出 | Channel §1 |
+| `Channel.ProcessPaOutput` | E/N | 对已有公开PA输出执行一次解码、链路影响和一次编码，避免功率闭环包含接收噪声 | Channel §1、§6.2 |
+| `Channel.ProcessFloating`, `Channel.Process` | P/N/E | 优先调用PA浮点入口，执行PA到接收端完整链路，并在公开定点模式返回整数I/Q码 | Channel §1、§3.4、§6.1 |
+| `Channel.SmallSignalGain` | P/N | 把PA小信号复增益乘以固定相位因子；零均值噪声不计入确定性增益 | Channel §2、§4 |
 
 ## 5. `DpdIlc.py`：全部 ILC、部署模型和基准函数
 
@@ -294,6 +333,8 @@ flowchart LR
 | `Draw.CreatePowerEvmFigure`, `Draw.SavePowerEvmCurve` | 在同一坐标绘制/保存多方法 EVM；不重算 EVM | Analysis §8 |
 | `Draw.ValidateConvergenceHistory` | 检查轮次递增和 Raw/LC/EVM 序列完整性 | Analysis §5.10 |
 | `Draw.CreateConvergenceFigure`, `Draw.SaveConvergenceCurve` | 同轴绘制 Raw NMSE、LC-NMSE 和 EVM-MSE/EVM dB | Analysis §5.5–§5.10 |
+| `Draw.ValidateTwoToneMetrics` | 检查每个方法的IM3/IM5/IM7较差侧字段和有限性 | TwoToneAnalysis §10 |
+| `Draw.CreateTwoToneImdFigure`, `Draw.SaveTwoToneImdComparison` | 以分组柱状图绘制/保存全部方法的IM3、IM5和IM7，不重新计算互调 | TwoToneAnalysis §10 |
 
 图上的连线只帮助阅读离散采样点，不表示功率点或迭代轮次之间存在连续物理轨迹。
 
@@ -310,6 +351,10 @@ flowchart LR
 | `BenchMark.RunIlcCurvePoint` | E | 在当前功率点重新构造正确参考、有效区目标dBm输出和EVM-MSE分析上下文 | BenchMark §10 |
 | `BenchMark.RunAllIlcBenchmark` | E | 固定波形、PA、迭代预算和指标定义；按类别构造全部场景 | BenchMark §2–§10 |
 | `BenchMark.SaveBenchmarkResults`, `BenchMark.PrintBenchmarkResults` | E | 输出统一表格/文件，不重新计算指标 | BenchMark §3–§4 |
+| `BenchMark.TwoToneBenchmarkConfig.Validate` | E | 复用双音生成器、PA功率校准和迭代约束验证完整双音场景 | BenchMark 双音G类 |
+| `BenchMark.TwoToneBenchmarkRow.ToDict`, `BenchMark.AddTwoToneRow` | E | 序列化IM指标，并以baseline减方法dBc得到正向改善量 | BenchMark 双音G类 |
+| `BenchMark.RunTwoToneIlcBenchmark` | E/P | 在相同双音、PA、迭代预算和实际输出dBm下比较全部适用SISO ILC | BenchMark 双音G类 |
+| `BenchMark.SaveTwoToneBenchmarkResults`, `BenchMark.PrintTwoToneBenchmarkResults` | E | 保存和打印已计算的IM3/IM5/IM7比较，不修改数值 | BenchMark 双音G类 |
 
 ## 11. 审计结论与维护规则
 

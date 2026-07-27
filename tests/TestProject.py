@@ -32,10 +32,12 @@ if str(GetProjectRoot()) not in sys.path:
     sys.path.insert(0, str(GetProjectRoot()))
 
 from inc.lib.Analysis import Analysis
+from inc.lib.Channel import Channel
 from inc.lib.DpdIlc import (
     CalculateIterationMetrics,
     FitMimoGmpPredistorter,
     ILCConfig,
+    RunComplexGainIlc,
     RunFrequencyDomainIlc,
     RunMimoFrequencyDomainIlc,
 )
@@ -58,6 +60,8 @@ from inc.lib.WaveGenWifi import (
     NormalizeFrameFormat,
     WaveGenWifi,
 )
+from inc.lib.WaveGenTwoTone import WaveGenTwoTone
+from inc.lib.TwoToneAnalysis import TwoToneAnalysis
 
 
 def CheckMcsTables() -> None:
@@ -314,10 +318,13 @@ def CheckModuleResponsibilityBoundaries() -> None:
     ).exists()
     for movedModuleName in (
         "Analysis.py",
+        "Channel.py",
         "DpdIlc.py",
         "Fec.py",
         "PaModel.py",
         "WaveGenWifi.py",
+        "WaveGenTwoTone.py",
+        "TwoToneAnalysis.py",
         "Draw.py",
         "FrameProcess.py",
         "ParseWifi.py",
@@ -347,9 +354,12 @@ def CheckModuleResponsibilityBoundaries() -> None:
     compatibilityImportCode = (
         "from lib.ParseWifi import ParseWifi; "
         "from lib.Analysis import Analysis; "
+        "from lib.Channel import Channel; "
         "from lib.DpdIlc import RunFrequencyDomainIlc; "
         "from lib.Fec import EncodeDescriptorLdpc; "
         "from lib.WaveGenWifi import WaveGenWifi; "
+        "from lib.WaveGenTwoTone import WaveGenTwoTone; "
+        "from lib.TwoToneAnalysis import TwoToneAnalysis; "
         "from lib.PaModel import PaModel; "
         "from utils.Draw import Draw"
     )
@@ -403,6 +413,11 @@ def CheckBenchmarkSeparation() -> None:
         "RunAllIlcBenchmark",
         "SaveBenchmarkResults",
         "PrintBenchmarkResults",
+        "TwoToneBenchmarkConfig",
+        "TwoToneBenchmarkRow",
+        "RunTwoToneIlcBenchmark",
+        "SaveTwoToneBenchmarkResults",
+        "PrintTwoToneBenchmarkResults",
     )
     for forbiddenName in forbiddenProductionNames:
         assert forbiddenName not in ilcSource, (
@@ -418,6 +433,7 @@ def CheckBenchmarkSeparation() -> None:
         "32 dB feedback robustness",
         "IQ image impairment",
         "held-out Wi-Fi packet",
+        "B: applicable SISO ILC methods",
     )
     for scenarioLabel in requiredScenarioLabels:
         assert scenarioLabel in benchmarkSource, (
@@ -454,6 +470,7 @@ def CheckBenchmarkSeparation() -> None:
         "D类同场景选择结论",
         "同场景部署模型优缺点对比",
         "功率维度的优缺点对比",
+        "G类：双音IM3/IM5/IM7场景",
     )
     for sectionTitle in requiredDocumentSections:
         assert sectionTitle in benchmarkDocument, (
@@ -719,6 +736,31 @@ def CheckDocumentationApiConsistency() -> None:
             ),
         ),
         (
+            WaveGenTwoTone,
+            (
+                "parameters",
+                "width",
+                "parameterOverrides",
+            ),
+            (
+                "WaveGenTwoTone(parameters=None, width=None, "
+                "**parameterOverrides)"
+            ),
+        ),
+        (
+            TwoToneAnalysis,
+            (
+                "waveform",
+                "parameters",
+                "width",
+                "parameterOverrides",
+            ),
+            (
+                "TwoToneAnalysis(waveform, parameters=None, width=None, "
+                "**parameterOverrides)"
+            ),
+        ),
+        (
             PowerCalibration,
             (
                 "loadResistanceOhm",
@@ -747,6 +789,19 @@ def CheckDocumentationApiConsistency() -> None:
             (
                 "PaModel(modelName=None, wienerConfig=None, "
                 "gmpConfig=None, parameters=None, width=None, "
+                "**parameterOverrides)"
+            ),
+        ),
+        (
+            Channel,
+            (
+                "paModel",
+                "parameters",
+                "width",
+                "parameterOverrides",
+            ),
+            (
+                "Channel(paModel=None, parameters=None, width=None, "
                 "**parameterOverrides)"
             ),
         ),
@@ -2823,6 +2878,15 @@ def CheckUnknownConfigurationWarnings() -> None:
         )
         resultAnalysis.Analyze(waveform.samples)
 
+        channel = Channel(
+            parameters={
+                "width": 0,
+                "unknownChannelSetting": 1,
+            }
+        )
+        channel.UpdateParameters(unknownChannelUpdate=2)
+        channel.ProcessPaOutput(waveform.samples)
+
         resultDraw = Draw(
             parameters={"unknownDrawSetting": 1}
         )
@@ -2844,6 +2908,8 @@ def CheckUnknownConfigurationWarnings() -> None:
         "unknownSignalSetting",
         "unknownParserSetting",
         "unknownAnalysisSetting",
+        "unknownChannelSetting",
+        "unknownChannelUpdate",
         "unknownDrawSetting",
     )
     for unknownName in expectedUnknownNames:
@@ -2858,6 +2924,7 @@ def CheckUnknownConfigurationWarnings() -> None:
     assert "unknownSignalSetting" not in signalProcessor.GetParameters()
     assert "unknownParserSetting" not in wifiParser.GetParameters()
     assert "unknownAnalysisSetting" not in resultAnalysis.GetParameters()
+    assert "unknownChannelSetting" not in channel.GetParameters()
     assert "unknownDrawSetting" not in resultDraw.GetParameters()
 
     with warnings.catch_warnings():
@@ -3014,6 +3081,277 @@ def CheckFixedPointInterfaces() -> None:
             )
 
 
+def CheckChannelModel() -> None:
+    """Verify PA, phase, physical-noise, seed, and fixed-point behavior.
+
+    Processing details:
+        Algorithm: Exercise every supported phase, compare the two noise
+        control units through a 50-ohm conversion, estimate generated noise
+        RMS over a long record, require deterministic reset behavior, compare
+        bound-PA processing with a direct PA result, and validate error cases.
+
+    Returns:
+        result: None. Assertions enforce the documented channel contract.
+    """
+
+    testSignal = np.array(
+        [0.2 + 0.3j, -0.4 + 0.1j, 0.05 - 0.2j],
+        dtype=np.complex128,
+    )
+    for phaseDegrees, phaseFactor in (
+        (-90, -1j),
+        (0, 1.0 + 0.0j),
+        (90, 1j),
+    ):
+        phaseChannel = Channel(
+            parameters={
+                "phaseDegrees": phaseDegrees,
+                "width": 0,
+            }
+        )
+        phaseOutput = phaseChannel.ProcessPaOutput(testSignal)
+        assert np.allclose(phaseOutput, phaseFactor * testSignal)
+
+    noiseSampleCount = 200000
+    zeroSignal = np.zeros(noiseSampleCount, dtype=np.complex128)
+    amplitudeChannel = Channel(
+        parameters={
+            "noiseAmpMv": 10.0,
+            "maximumOutputPowerDbm": 25.0,
+            "loadResistanceOhm": 50.0,
+            "randomSeed": 73,
+            "width": 0,
+        }
+    )
+    amplitudeNoise = amplitudeChannel.ProcessPaOutput(zeroSignal)
+    fullScaleRmsVolts = (
+        np.sqrt(1.0e-3 * 50.0) * 10.0 ** (25.0 / 20.0)
+    )
+    measuredNoiseMv = (
+        np.sqrt(np.mean(np.abs(amplitudeNoise) ** 2))
+        * fullScaleRmsVolts
+        * 1.0e3
+    )
+    assert abs(measuredNoiseMv - 10.0) <= 0.10
+    amplitudeChannel.ResetRandomGenerator()
+    repeatedNoise = amplitudeChannel.ProcessPaOutput(zeroSignal)
+    assert np.array_equal(amplitudeNoise, repeatedNoise)
+
+    equivalentNoisePowerDbm = float(
+        20.0 * np.log10(10.0e-3)
+        - 10.0 * np.log10(50.0e-3)
+    )
+    powerChannel = Channel(
+        parameters={
+            "noisePwrDbm": equivalentNoisePowerDbm,
+            "maximumOutputPowerDbm": 25.0,
+            "loadResistanceOhm": 50.0,
+            "randomSeed": 73,
+            "width": 0,
+        }
+    )
+    assert np.isclose(
+        amplitudeChannel.ResolveNoiseRmsVolts(),
+        powerChannel.ResolveNoiseRmsVolts(),
+    )
+    assert np.isclose(
+        amplitudeChannel.ResolveNoiseRmsNormalized(),
+        powerChannel.ResolveNoiseRmsNormalized(),
+    )
+
+    paModel = PaModel(parameters={"modelName": "wiener", "width": 0})
+    paChannel = Channel(
+        paModel=paModel,
+        parameters={
+            "phaseDegrees": 90,
+            "width": 0,
+        },
+    )
+    expectedOutput = 1j * paModel.Process(testSignal)
+    assert np.allclose(paChannel.Process(testSignal), expectedOutput)
+    assert np.allclose(
+        paChannel.SmallSignalGain(),
+        1j * paModel.SmallSignalGain(),
+    )
+
+    fixedPa = PaModel(parameters={"modelName": "gmp", "width": 16})
+    fixedChannel = Channel(
+        paModel=fixedPa,
+        parameters={
+            "phaseDegrees": -90,
+            "noiseAmpMv": 10.0,
+            "randomSeed": 91,
+            "width": 16,
+        },
+    )
+    fixedInput = FixedPoint(16).EncodeComplex(testSignal)
+    fixedOutput = fixedChannel.Process(fixedInput)
+    assert fixedOutput.dtype == np.complex128
+    assert np.array_equal(fixedOutput.real, np.rint(fixedOutput.real))
+    assert np.array_equal(fixedOutput.imag, np.rint(fixedOutput.imag))
+
+    invalidConfigurations = (
+        {"phaseDegrees": 45},
+        {"noiseAmpMv": -1.0},
+        {"noiseAmpMv": 10.0, "noisePwrDbm": -27.0},
+    )
+    for invalidParameters in invalidConfigurations:
+        try:
+            Channel(parameters=invalidParameters)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"invalid channel configuration accepted: "
+                f"{invalidParameters!r}"
+            )
+
+
+def CheckTwoToneIlcAnalysis() -> None:
+    """Verify two-tone generation, IM analysis, ILC, and all-method reporting.
+
+    Processing details:
+        Algorithm: Check exact IM3/IM5/IM7 frequency construction, floating and
+        fixed public interfaces, a nearly product-free ideal waveform, visible
+        Wiener-PA intermodulation, equal-power complex-gain ILC suppression,
+        dictionary result keys, and a small complete benchmark with serialized
+        and graphical artifacts.
+
+    Returns:
+        result: None. Assertion failures identify two-tone regressions.
+    """
+
+    with warnings.catch_warnings(record=True) as capturedWarnings:
+        warnings.simplefilter("always")
+        warningGenerator = WaveGenTwoTone(
+            parameters={
+                "width": 0,
+                "unsupportedToneOption": 1,
+            }
+        )
+    assert warningGenerator.width == 0
+    assert any(
+        "unsupportedToneOption" in str(warningRecord.message)
+        for warningRecord in capturedWarnings
+    )
+
+    floatingWaveform = WaveGenTwoTone(
+        parameters={
+            "sampleRateHz": 100.0e6,
+            "toneFrequenciesHz": (-2.0e6, 2.0e6),
+            "numSamples": 4096,
+            "width": 0,
+        }
+    ).Generate()
+    assert floatingWaveform.IntermodulationFrequencies(3) == (
+        -6.0e6,
+        6.0e6,
+    )
+    assert floatingWaveform.IntermodulationFrequencies(5) == (
+        -10.0e6,
+        10.0e6,
+    )
+    assert floatingWaveform.IntermodulationFrequencies(7) == (
+        -14.0e6,
+        14.0e6,
+    )
+    fixedWaveform = WaveGenTwoTone(
+        parameters={
+            "sampleRateHz": 100.0e6,
+            "toneFrequenciesHz": (-2.0e6, 2.0e6),
+            "numSamples": 4096,
+            "width": 16,
+        }
+    ).Generate()
+    assert np.all(
+        fixedWaveform.samples.real
+        == np.rint(fixedWaveform.samples.real)
+    )
+    assert np.all(
+        fixedWaveform.samples.imag
+        == np.rint(fixedWaveform.samples.imag)
+    )
+    resultAnalysis = TwoToneAnalysis(
+        floatingWaveform,
+        parameters={
+            "settlingSamples": 64,
+            "width": 0,
+        },
+    )
+    idealMetrics = resultAnalysis.Analyze(floatingWaveform.samples)
+    assert isinstance(idealMetrics, dict)
+    assert idealMetrics["im3WorstDbc"] < -100.0
+    assert idealMetrics["im5WorstDbc"] < idealMetrics["im3WorstDbc"]
+    assert idealMetrics["im7WorstDbc"] < idealMetrics["im5WorstDbc"]
+
+    paModel = PaModel(parameters={"modelName": "wiener", "width": 0})
+    powerCalibration = PowerCalibration(
+        paModel=paModel,
+        parameters={
+            "outputPowerDbm": 20.0,
+            "maximumOutputPowerDbm": 25.0,
+            "width": 0,
+        },
+    )
+    referenceSignal = powerCalibration.Calibrate(
+        floatingWaveform.samples
+    )
+    baselineOutput = powerCalibration.GetLastPaOutput()
+    baselineMetrics = resultAnalysis.Analyze(baselineOutput)
+    assert -40.0 < baselineMetrics["im3WorstDbc"] < -20.0
+    ilcResult = RunComplexGainIlc(
+        referenceSignal,
+        paModel,
+        ILCConfig(
+            numIterations=5,
+            learningRate=0.15,
+            maxAmplitude=1.5,
+            randomSeed=313,
+        ),
+        floatingWaveform.sampleRateHz,
+    )
+    analyzedIlc = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
+    powerCalibration.Calibrate(analyzedIlc.bestInputSignal)
+    selectedMetrics = resultAnalysis.Analyze(
+        powerCalibration.GetLastPaOutput()
+    )
+    assert (
+        selectedMetrics["im3WorstDbc"]
+        < baselineMetrics["im3WorstDbc"] - 2.0
+    )
+    assert (
+        selectedMetrics["im5WorstDbc"]
+        < baselineMetrics["im5WorstDbc"] - 2.0
+    )
+    assert abs(selectedMetrics["outputPowerDbm"] - 20.0) <= 0.25
+
+    from tests.BenchMark import (
+        RunTwoToneIlcBenchmark,
+        TwoToneBenchmarkConfig,
+    )
+
+    with TemporaryDirectory() as temporaryDirectory:
+        outputDirectory = Path(temporaryDirectory)
+        benchmarkRows = RunTwoToneIlcBenchmark(
+            TwoToneBenchmarkConfig(
+                width=0,
+                numSamples=4096,
+                numIterations=2,
+                outputDirectory=outputDirectory,
+            )
+        )
+        assert len(benchmarkRows) == 8
+        assert (
+            outputDirectory / "all_ilc_two_tone_metrics.csv"
+        ).exists()
+        assert (
+            outputDirectory / "all_ilc_two_tone_metrics.json"
+        ).exists()
+        assert (
+            outputDirectory / "all_ilc_two_tone_imd.png"
+        ).exists()
+
+
 def RunTests() -> None:
     """Run all project checks and report a compact success message.
 
@@ -3036,6 +3374,7 @@ def RunTests() -> None:
     CheckInternalDefaultConfiguration()
     CheckUnknownConfigurationWarnings()
     CheckFixedPointInterfaces()
+    CheckChannelModel()
     CheckWifiFormats()
     CheckWifiBandwidths()
     CheckSampleRateConfiguration()
@@ -3050,6 +3389,7 @@ def RunTests() -> None:
     CheckIlcFeedbackSynchronization()
     CheckReceiveOnlyWifiAnalysis()
     CheckMseEvmConvergence()
+    CheckTwoToneIlcAnalysis()
     print("All DPD-ILC project checks passed.")
 
 

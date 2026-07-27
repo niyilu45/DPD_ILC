@@ -53,6 +53,7 @@ class Draw:
             {
                 "powerEvmFileStem": "power_evm_curve",
                 "convergenceFileStem": "ilc_convergence",
+                "imdFileStem": "two_tone_imd_comparison",
                 "figureWidthInches": 10.5,
                 "figureHeightInches": 6.2,
                 "figureDpi": 180,
@@ -61,11 +62,15 @@ class Draw:
                 "legendColumnThreshold": 6,
                 "plotTitle": "Power-EVM comparison",
                 "convergencePlotTitle": "ILC MSE convergence",
+                "imdPlotTitle": "Two-tone ILC intermodulation comparison",
                 "xAxisLabel": "PA output power per chain (dBm)",
                 "yAxisLabel": "RMS EVM (dB, lower is better)",
                 "convergenceXAxisLabel": "ILC iteration",
                 "convergenceYAxisLabel": (
                     "Normalized error / EVM (dB, lower is better)"
+                ),
+                "imdYAxisLabel": (
+                    "Worst-side intermodulation (dBc, lower is better)"
                 ),
             }
         )
@@ -146,7 +151,11 @@ class Draw:
             result: None. Invalid configuration raises a descriptive error.
         """
 
-        for parameterName in ("powerEvmFileStem", "convergenceFileStem"):
+        for parameterName in (
+            "powerEvmFileStem",
+            "convergenceFileStem",
+            "imdFileStem",
+        ):
             fileStem = self.parameters[parameterName]
             if not isinstance(fileStem, str):
                 raise TypeError(f"{parameterName} must be a string")
@@ -188,6 +197,8 @@ class Draw:
             "yAxisLabel",
             "convergenceXAxisLabel",
             "convergenceYAxisLabel",
+            "imdPlotTitle",
+            "imdYAxisLabel",
         ):
             parameterValue = self.parameters[parameterName]
             if not isinstance(parameterValue, str):
@@ -355,6 +366,160 @@ class Draw:
         outputPath.mkdir(parents=True, exist_ok=True)
         figurePath = outputPath / f"{selectedFileStem}.png"
         figure = self.CreatePowerEvmFigure(powerEvmCurve)
+        try:
+            figure.savefig(
+                figurePath,
+                dpi=int(self.parameters["figureDpi"]),
+                bbox_inches="tight",
+            )
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
+        return figurePath
+
+    def ValidateTwoToneMetrics(
+        self, metricsByMethod: Mapping[str, Mapping[str, float]]
+    ) -> None:
+        """Validate a multi-method IM3, IM5, and IM7 comparison mapping.
+
+        Processing details:
+            Algorithm: Require at least one nonempty method name and finite
+            worse-side dBc values for all three requested odd orders before any
+            visualization backend or output file is created.
+
+        Args:
+            metricsByMethod: Mapping from method labels to metric dictionaries.
+
+        Returns:
+            result: None. Missing or nonfinite comparison data raises an error.
+        """
+
+        if not isinstance(metricsByMethod, Mapping) or not metricsByMethod:
+            raise ValueError("metricsByMethod must be a nonempty mapping")
+        requiredMetricNames = (
+            "im3WorstDbc",
+            "im5WorstDbc",
+            "im7WorstDbc",
+        )
+        for methodName, methodMetrics in metricsByMethod.items():
+            if not isinstance(methodName, str) or not methodName:
+                raise ValueError("two-tone method names must be nonempty")
+            if not isinstance(methodMetrics, Mapping):
+                raise TypeError("every two-tone metric value must be a mapping")
+            for metricName in requiredMetricNames:
+                if metricName not in methodMetrics:
+                    raise ValueError(
+                        f"method '{methodName}' is missing {metricName}"
+                    )
+                metricValue = methodMetrics[metricName]
+                if (
+                    not isinstance(metricValue, (int, float))
+                    or isinstance(metricValue, bool)
+                    or not np.isfinite(metricValue)
+                ):
+                    raise ValueError(
+                        f"method '{methodName}' has invalid {metricName}"
+                    )
+
+    def CreateTwoToneImdFigure(
+        self, metricsByMethod: Mapping[str, Mapping[str, float]]
+    ) -> Any:
+        """Create one grouped-bar IM3, IM5, and IM7 comparison figure.
+
+        Processing details:
+            Algorithm: Preserve method insertion order, place three adjacent
+            order bars at each method, label values in dBc with the documented
+            more-negative-is-better convention, and rotate method labels for a
+            readable single-figure all-ILC comparison.
+
+        Args:
+            metricsByMethod: Mapping from method names to two-tone metrics.
+
+        Returns:
+            result: Matplotlib Figure ready for display or PNG output.
+        """
+
+        self.ValidateParameters()
+        self.ValidateTwoToneMetrics(metricsByMethod)
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "matplotlib is required to create the two-tone IMD figure"
+            ) from error
+        methodNames = list(metricsByMethod)
+        methodPositions = np.arange(len(methodNames), dtype=float)
+        barWidth = 0.24
+        figure, axes = plt.subplots(
+            figsize=(
+                float(self.parameters["figureWidthInches"]),
+                float(self.parameters["figureHeightInches"]),
+            )
+        )
+        for orderIndex, nonlinearOrder in enumerate((3, 5, 7)):
+            metricName = f"im{nonlinearOrder}WorstDbc"
+            orderValues = [
+                float(metricsByMethod[methodName][metricName])
+                for methodName in methodNames
+            ]
+            axes.bar(
+                methodPositions + (orderIndex - 1) * barWidth,
+                orderValues,
+                width=barWidth,
+                label=f"IM{nonlinearOrder}",
+            )
+        axes.set_xticks(methodPositions)
+        axes.set_xticklabels(methodNames, rotation=25, ha="right")
+        axes.set_ylabel(str(self.parameters["imdYAxisLabel"]))
+        axes.set_title(str(self.parameters["imdPlotTitle"]))
+        axes.grid(True, axis="y", linestyle=":", linewidth=0.7)
+        axes.legend(loc="best")
+        figure.tight_layout()
+        return figure
+
+    def SaveTwoToneImdComparison(
+        self,
+        metricsByMethod: Mapping[str, Mapping[str, float]],
+        outputDirectory: Path,
+        fileStem: Optional[str] = None,
+    ) -> Path:
+        """Render and save the all-method two-tone IMD comparison as PNG.
+
+        Processing details:
+            Algorithm: Resolve and validate the configured or per-call file
+            stem, create the destination directory, build the grouped-bar
+            figure, save it at configured DPI, and always close its resources.
+
+        Args:
+            metricsByMethod: Mapping from method labels to IM metric dictionaries.
+            outputDirectory: Destination directory for the PNG artifact.
+            fileStem: Optional simple filename overriding ``imdFileStem``.
+
+        Returns:
+            result: Path to the saved comparison figure.
+        """
+
+        selectedFileStem = (
+            str(self.parameters["imdFileStem"])
+            if fileStem is None
+            else fileStem
+        )
+        if (
+            not isinstance(selectedFileStem, str)
+            or not selectedFileStem
+            or any(
+                character in selectedFileStem for character in '<>:"/\\|?*'
+            )
+        ):
+            raise ValueError("fileStem must be a valid simple file name")
+        outputPath = Path(outputDirectory)
+        outputPath.mkdir(parents=True, exist_ok=True)
+        figurePath = outputPath / f"{selectedFileStem}.png"
+        figure = self.CreateTwoToneImdFigure(metricsByMethod)
         try:
             figure.savefig(
                 figurePath,

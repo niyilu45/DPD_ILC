@@ -1,1 +1,1 @@
-"""Core Wi-Fi, parsing, PA, analysis, and DPD-ILC implementation modules."""
+"""Core waveform, channel, parsing, PA, analysis, and ILC modules."""
