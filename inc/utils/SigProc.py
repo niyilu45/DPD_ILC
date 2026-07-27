@@ -58,6 +58,8 @@ class PowerCalibration:
             {
                 "loadResistanceOhm": 50.0,
                 "maximumOutputPowerDbm": 25.0,
+                "outputPowerDbm": 20.0,
+                "outputPowerDbmPerChain": None,
                 "activePowerThresholdDb": -60.0,
                 "activeGapToleranceSamples": 16,
                 "width": 16,
@@ -219,6 +221,52 @@ class PowerCalibration:
             raise ValueError(
                 "maximumOutputPowerDbm must be finite"
             )
+        outputPowerDbm = self.parameters["outputPowerDbm"]
+        if (
+            not isinstance(outputPowerDbm, (int, float))
+            or isinstance(outputPowerDbm, bool)
+            or not np.isfinite(outputPowerDbm)
+            or float(outputPowerDbm)
+            > float(maximumOutputPowerDbm)
+        ):
+            raise ValueError(
+                "outputPowerDbm must be finite and cannot exceed "
+                "maximumOutputPowerDbm"
+            )
+        outputPowerDbmPerChain = self.parameters[
+            "outputPowerDbmPerChain"
+        ]
+        if outputPowerDbmPerChain is not None:
+            if (
+                isinstance(outputPowerDbmPerChain, (str, bytes))
+                or not isinstance(
+                    outputPowerDbmPerChain,
+                    (list, tuple, np.ndarray),
+                )
+            ):
+                raise TypeError(
+                    "outputPowerDbmPerChain must be a sequence or None"
+                )
+            powerArray = np.asarray(
+                outputPowerDbmPerChain, dtype=object
+            )
+            if powerArray.ndim != 1 or powerArray.size == 0:
+                raise ValueError(
+                    "outputPowerDbmPerChain must be a nonempty "
+                    "one-dimensional sequence"
+                )
+            for targetPowerDbm in powerArray:
+                if (
+                    not isinstance(targetPowerDbm, (int, float))
+                    or isinstance(targetPowerDbm, bool)
+                    or not np.isfinite(targetPowerDbm)
+                    or float(targetPowerDbm)
+                    > float(maximumOutputPowerDbm)
+                ):
+                    raise ValueError(
+                        "every outputPowerDbmPerChain value must be "
+                        "finite and cannot exceed maximumOutputPowerDbm"
+                    )
         activePowerThresholdDb = self.parameters[
             "activePowerThresholdDb"
         ]
@@ -243,6 +291,36 @@ class PowerCalibration:
                 "activeGapToleranceSamples must be a nonnegative integer"
             )
         FixedPoint(self.width)
+
+    def Calibrate(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Calibrate a public waveform using the configured power target.
+
+        Processing details:
+            Algorithm: Read ``outputPowerDbmPerChain`` from the live
+            ChainMap when independent MIMO targets are configured; otherwise
+            use the common ``outputPowerDbm`` value. Delegate effective-burst
+            detection, arbitrary-RMS removal, floating/fixed conversion, and
+            per-chain scaling to the existing waveform calibration engine.
+
+        Args:
+            inputSignal: Arbitrarily scaled public waveform vector or
+                samples-by-chain matrix.
+
+        Returns:
+            result: A newly calibrated waveform with the same shape and
+                public floating/fixed interface convention as the input.
+        """
+
+        targetPowers = self.parameters["outputPowerDbmPerChain"]
+        if targetPowers is None:
+            return self.CalibrateWaveformToOutputPower(
+                inputSignal,
+                float(cast(float, self.parameters["outputPowerDbm"])),
+            )
+        return self.CalibrateWaveformToOutputPowers(
+            inputSignal,
+            tuple(float(powerDbm) for powerDbm in targetPowers),
+        )
 
     def DbmToRms(self, powerDbm: float) -> float:
         """Convert absolute port power in dBm to complex-envelope RMS volts.

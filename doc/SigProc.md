@@ -543,9 +543,11 @@ a=10^{-\mathrm{OBO}/20}.
 默认20 dBm工作点对应5 dB回退和 $a\approx0.5623$。这里必须区分两个动作：
 
 1. `OutputPowerToDriveScale` 在PA之前设置归一化驱动，从而决定压缩深度；
-2. `CalibrateWaveformToOutputPower` 在PA之后重新生成达到目标dBm的公开波形，从而决定Analysis看到的绝对输出功率。
+2. `Calibrate` 从类内 `outputPowerDbm` 或 `outputPowerDbmPerChain` 读取目标，在PA之后重新生成达到目标dBm的公开波形，从而决定Analysis看到的绝对输出功率。
 
 第二步只施加逐链常数比例，浮点模式下不会改变归一化EVM和ACLR功率比。定点模式还要重新量化，若达到目标功率需要削顶，会发出警告，因为此时量化或削顶可能改变EVM。
+
+`Calibrate(inputSignal)` 是推荐的统一公开入口。功率配置在构造 `PowerCalibration` 时通过 `parameters` 写入，因此处理时只向函数送入波形，不需要在每一次调用中重复传递目标dBm。`outputPowerDbmPerChain` 不为 `None` 时按矩阵列独立校准，否则所有链使用共同的 `outputPowerDbm`。
 
 ### 13.1 有效信号区间与占空比
 
@@ -713,7 +715,7 @@ Q_w(c\,x[n])
 
 ### 13.4 归一化满量程与物理电压两种接口
 
-`CalibrateWaveformToOutputPower` 和 `CalibrateWaveformToOutputPowers` 用于本工程的归一化公开波形：归一化有效区RMS等于1对应 `maximumOutputPowerDbm`。
+`Calibrate` 用于本工程的归一化公开波形：归一化有效区RMS等于1对应 `maximumOutputPowerDbm`。它内部根据配置调用 `CalibrateWaveformToOutputPower` 或 `CalibrateWaveformToOutputPowers`；后两者作为显式目标功率的兼容和高级接口保留。
 
 `ScaleSignalToOutputPower` 和 `ScaleSignalToOutputPowers` 用于已经采用物理伏特单位的复包络：它们按端口阻抗把目标dBm转换为RMS电压。两组接口都使用相同的有效区掩码，但不能混淆数值尺度。
 
@@ -737,6 +739,7 @@ powerCalibration = PowerCalibration(
     parameters={
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
+        "outputPowerDbm": 20.0,
         "activePowerThresholdDb": -60.0,
         "activeGapToleranceSamples": 16,
         "width": 16,
@@ -744,10 +747,7 @@ powerCalibration = PowerCalibration(
 )
 driveScale = powerCalibration.OutputPowerToDriveScale(20.0)
 rawOutput = paModel.Process(driveScale * waveform.samples)
-calibratedOutput = powerCalibration.CalibrateWaveformToOutputPower(
-    rawOutput,
-    outputPowerDbm=20.0,
-)
+calibratedOutput = powerCalibration.Calibrate(rawOutput)
 decodedOutput = FixedPoint(16).DecodeComplex(calibratedOutput)
 measuredRms = powerCalibration.CalculateActiveRmsPerChain(
     decodedOutput
@@ -755,6 +755,15 @@ measuredRms = powerCalibration.CalculateActiveRmsPerChain(
 measuredPowerDbm = (
     powerCalibration.NormalizedRmsToOutputPowerDbm(measuredRms)
 )
+```
+
+MIMO只需把类内目标改为逐链序列，函数调用不变：
+
+```python
+powerCalibration.UpdateParameters(
+    outputPowerDbmPerChain=(22.0, 21.0, 20.0, 19.0)
+)
+calibratedMimoOutput = powerCalibration.Calibrate(rawMimoOutput)
 ```
 
 如果输入是物理电压，则改用：

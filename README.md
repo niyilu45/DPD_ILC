@@ -821,12 +821,15 @@ P(dBm) = 10 log10(P(W) / 0.001)
 | --- | --- | --- |
 | `loadResistanceOhm` | `50.0` | PA 输入、输出端口的纯电阻负载，单位 Ω，必须为正数。 |
 | `maximumOutputPowerDbm` | `25.0` | 每路PA额定极限输出功率；请求的输出功率不得超过此值。 |
+| `outputPowerDbm` | `20.0` | `Calibrate(inputSignal)` 使用的SISO或各路共同目标输出功率。 |
+| `outputPowerDbmPerChain` | `None` | MIMO逐路目标dBm；配置后优先于共同的 `outputPowerDbm`。 |
 | `activePowerThresholdDb` | `-60.0` | 相对每路峰值的有效样点功率门限；前后补零和低于门限的关断区不进入RMS。 |
 | `activeGapToleranceSamples` | `16` | 填充有效区内部短低幅空洞的最大长度；更长静默区按占空比关断处理。 |
 | `width` | `16` | 归一化公开波形的I/Q位宽；`0`为浮点，正数输入输出整数I/Q码。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
+| `Calibrate(inputSignal)` | 任意初始幅度的SISO/MIMO公开波形 | 直接读取类内目标功率配置，识别有效区并返回校准后的同形状波形；调用时只需传入波形。 |
 | `DbmToRms(powerDbm)` | 任意有限 dBm 数值 | 返回该功率在所配置端口上的复包络 RMS 电压。 |
 | `RmsToDbm(signalRms)` | 正的有限 RMS 电压 | 返回对应的绝对功率 dBm。 |
 | `OutputPowerToDriveScale(outputPowerDbm)` | 不大于极限的输出dBm | 按输出回退量返回归一化PA驱动比例。 |
@@ -839,6 +842,21 @@ P(dBm) = 10 log10(P(W) / 0.001)
 | `ScaleSignalToOutputPowers(signal, outputPowerDbmPerChain)` | 物理电压波形、逐链目标 | 按端口阻抗分别标定每路物理电压输出。 |
 | `GetParameters()` | 无 | 返回当前解析参数。 |
 | `UpdateParameters(**parameterOverrides)` | 支持的任意配置 | 事务式更新覆盖层。 |
+
+典型调用只需把目标功率配置一次，之后向 `Calibrate` 送入波形：
+
+```python
+powerCalibration = PowerCalibration(
+    parameters={
+        "outputPowerDbm": 22.0,
+        "maximumOutputPowerDbm": 25.0,
+        "width": 0,
+    }
+)
+calibratedWaveform = powerCalibration.Calibrate(inputWaveform)
+```
+
+MIMO独立功率使用 `outputPowerDbmPerChain=(22.0, 21.0, 20.0, 19.0)`，调用方式仍然是同一个 `Calibrate(inputWaveform)`。
 
 例如在 50 Ω 端口上，`0 dBm = 1 mW` 对应约 `0.223607 V RMS`。对于带占空比的记录，本工程报告Wi-Fi突发开启期间的平均功率：若有效突发占整段采集的50%，整段平均会额外低3.01 dB，但该关断时间不会进入校准或Analysis的RMS分母。完整门限、短空洞闭合和定点搜索公式见 [SigProc.md](doc/SigProc.md#131-有效信号区间与占空比)。
 
@@ -1512,11 +1530,15 @@ wifiGenerator = WaveGenWifi(
 waveform = wifiGenerator.Generate()
 referenceSignal = 0.24 * waveform.samples
 paModel = PaModel(parameters={"modelName": "gmp"})
-powerCalibration = PowerCalibration(parameters={"width": 16})
 outputPowerDbm = 20.0
-baselineOutput = powerCalibration.CalibrateWaveformToOutputPower(
-    paModel.Process(referenceSignal),
-    outputPowerDbm,
+powerCalibration = PowerCalibration(
+    parameters={
+        "outputPowerDbm": outputPowerDbm,
+        "width": 16,
+    }
+)
+baselineOutput = powerCalibration.Calibrate(
+    paModel.Process(referenceSignal)
 )
 resultAnalysis = Analysis(referenceSignal, waveform)
 
@@ -1536,9 +1558,8 @@ ilcResult = RunFrequencyDomainIlc(
 calibratedIlcHistory = tuple(
     replace(
         iterationRecord,
-        outputSignal=powerCalibration.CalibrateWaveformToOutputPower(
-            iterationRecord.outputSignal,
-            outputPowerDbm,
+        outputSignal=powerCalibration.Calibrate(
+            iterationRecord.outputSignal
         ),
     )
     for iterationRecord in ilcResult.history
@@ -1546,9 +1567,8 @@ calibratedIlcHistory = tuple(
 ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(
     calibratedIlcHistory
 )
-selectedIlcOutput = powerCalibration.CalibrateWaveformToOutputPower(
-    paModel.Process(ilcAnalysisResult.bestInputSignal),
-    outputPowerDbm,
+selectedIlcOutput = powerCalibration.Calibrate(
+    paModel.Process(ilcAnalysisResult.bestInputSignal)
 )
 
 stageMetrics = resultAnalysis.AnalyzeStages(

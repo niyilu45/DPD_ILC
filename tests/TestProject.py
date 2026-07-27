@@ -774,6 +774,10 @@ def CheckDocumentationApiConsistency() -> None:
         inspect.signature(MimoPaModel.ProcessChain).parameters
     ) == ("self", "inputSignal", "chainIndex")
     assert "ProcessChain(inputSignal, chainIndex)" in readmeText
+    assert tuple(
+        inspect.signature(PowerCalibration.Calibrate).parameters
+    ) == ("self", "inputSignal")
+    assert "Calibrate(inputSignal)" in readmeText
     assert (
         "chunkSize"
         not in inspect.signature(
@@ -1630,16 +1634,14 @@ def CheckPowerEvmCurve() -> None:
     floatingCalibration = PowerCalibration(
         parameters={
             "maximumOutputPowerDbm": 25.0,
+            "outputPowerDbm": 22.0,
             "activePowerThresholdDb": -60.0,
             "activeGapToleranceSamples": 16,
             "width": 0,
         }
     )
-    floatingCalibratedBurst = (
-        floatingCalibration.CalibrateWaveformToOutputPower(
-            paddedBurst,
-            22.0,
-        )
+    floatingCalibratedBurst = floatingCalibration.Calibrate(
+        paddedBurst
     )
     floatingActiveMask = floatingCalibration.FindActiveSampleMask(
         floatingCalibratedBurst
@@ -1662,11 +1664,11 @@ def CheckPowerEvmCurve() -> None:
         < floatingActiveRms
     )
 
-    mimoCalibratedBurst = (
-        floatingCalibration.CalibrateWaveformToOutputPowers(
-            np.column_stack((paddedBurst, 0.17 * paddedBurst)),
-            (18.0, 22.0),
-        )
+    floatingCalibration.UpdateParameters(
+        outputPowerDbmPerChain=(18.0, 22.0)
+    )
+    mimoCalibratedBurst = floatingCalibration.Calibrate(
+        np.column_stack((paddedBurst, 0.17 * paddedBurst))
     )
     mimoActiveRms = (
         floatingCalibration.CalculateActiveRmsPerChain(
@@ -1687,6 +1689,7 @@ def CheckPowerEvmCurve() -> None:
     fixedCalibration = PowerCalibration(
         parameters={
             "maximumOutputPowerDbm": 25.0,
+            "outputPowerDbm": 22.0,
             "activePowerThresholdDb": -60.0,
             "activeGapToleranceSamples": 16,
             "width": 16,
@@ -1695,11 +1698,8 @@ def CheckPowerEvmCurve() -> None:
     fixedInputBurst = FixedPoint(16).EncodeComplex(
         paddedBurst / 3.0
     )
-    fixedCalibratedBurst = (
-        fixedCalibration.CalibrateWaveformToOutputPower(
-            fixedInputBurst,
-            22.0,
-        )
+    fixedCalibratedBurst = fixedCalibration.Calibrate(
+        fixedInputBurst
     )
     assert np.allclose(
         fixedCalibratedBurst.real,

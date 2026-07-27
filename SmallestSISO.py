@@ -78,6 +78,7 @@ def RunSisoMode(
         parameters={
             "loadResistanceOhm": loadResistanceOhm,
             "maximumOutputPowerDbm": maximumOutputPowerDbm,
+            "outputPowerDbm": paOutputPowerDbm,
             "width": width,
         },
     )
@@ -96,10 +97,7 @@ def RunSisoMode(
         },
     )
     baselineOutputRaw = paModel.Process(referenceSignal)
-    baselineOutput = powerCalibration.CalibrateWaveformToOutputPower(
-        baselineOutputRaw,
-        paOutputPowerDbm,
-    )
+    baselineOutput = powerCalibration.Calibrate(baselineOutputRaw)
     resultAnalysis = Analysis(
         referenceSignal,
         waveform,
@@ -134,10 +132,7 @@ def RunSisoMode(
         replace(
             iterationRecord,
             outputSignal=(
-                powerCalibration.CalibrateWaveformToOutputPower(
-                    iterationRecord.outputSignal,
-                    paOutputPowerDbm,
-                )
+                powerCalibration.Calibrate(iterationRecord.outputSignal)
             ),
         )
         for iterationRecord in ilcResult.history
@@ -148,10 +143,7 @@ def RunSisoMode(
     selectedIlcInput = ilcAnalysisResult.bestInputSignal
     selectedIlcOutputRaw = paModel.Process(selectedIlcInput)
     selectedIlcOutput = (
-        powerCalibration.CalibrateWaveformToOutputPower(
-            selectedIlcOutputRaw,
-            paOutputPowerDbm,
-        )
+        powerCalibration.Calibrate(selectedIlcOutputRaw)
     )
     selectedMetrics = resultAnalysis.Analyze(selectedIlcOutput)
     resultAnalysis.AnalyzeStages(

@@ -387,19 +387,20 @@ def Main() -> int:
     arguments = argumentParser.parse_args()
 
     try:
+        outputPowerDbm = (
+            20.0
+            if arguments.outputPowerDbm is None
+            else float(arguments.outputPowerDbm)
+        )
         powerCalibrationParameters = {
             "loadResistanceOhm": arguments.loadResistanceOhm,
             "maximumOutputPowerDbm": arguments.maximumOutputPowerDbm,
+            "outputPowerDbm": outputPowerDbm,
         }
         if arguments.width is not None:
             powerCalibrationParameters["width"] = arguments.width
         powerCalibration = PowerCalibration(
             parameters=powerCalibrationParameters
-        )
-        outputPowerDbm = (
-            20.0
-            if arguments.outputPowerDbm is None
-            else float(arguments.outputPowerDbm)
         )
         powerStartDbm = (
             10.0
@@ -489,6 +490,14 @@ def Main() -> int:
                 "per-chain output-power targets must contain one value "
                 "per transmit antenna"
             )
+        powerCalibration.UpdateParameters(
+            outputPowerDbm=outputPowerDbmPerChain[0],
+            outputPowerDbmPerChain=(
+                None
+                if len(outputPowerDbmPerChain) == 1
+                else outputPowerDbmPerChain
+            ),
+        )
         driveScalePerChain = np.asarray(
             [
                 powerCalibration.OutputPowerToDriveScale(
@@ -578,12 +587,7 @@ def Main() -> int:
     # The first pass establishes the unlinearized baseline at the requested
     # operating point. The same PA instance is reused for every comparison.
     baselineOutputRaw = paModel.Process(referenceSignal)
-    baselineOutput = (
-        powerCalibration.CalibrateWaveformToOutputPowers(
-            baselineOutputRaw,
-            outputPowerDbmPerChain,
-        )
-    )
+    baselineOutput = powerCalibration.Calibrate(baselineOutputRaw)
     floatingBaselineOutput = interfaceFormat.DecodeComplex(
         baselineOutput
     )
@@ -640,9 +644,8 @@ def Main() -> int:
             replace(
                 iterationRecord,
                 outputSignal=(
-                    powerCalibration.CalibrateWaveformToOutputPower(
-                        iterationRecord.outputSignal,
-                        outputPowerDbmPerChain[0],
+                    powerCalibration.Calibrate(
+                        iterationRecord.outputSignal
                     )
                 ),
             )
@@ -685,11 +688,8 @@ def Main() -> int:
     # Analysis selects the best measured round. Re-run that input through the
     # plant once so final reported performance excludes optional feedback noise.
     selectedIlcOutputRaw = paModel.Process(selectedIlcInput)
-    selectedIlcOutput = (
-        powerCalibration.CalibrateWaveformToOutputPowers(
-            selectedIlcOutputRaw,
-            outputPowerDbmPerChain,
-        )
+    selectedIlcOutput = powerCalibration.Calibrate(
+        selectedIlcOutputRaw
     )
 
     # ILC labels are waveform-specific. Ridge-regression fitting converts them
@@ -729,11 +729,8 @@ def Main() -> int:
         floatingDeployedDpdInput
     )
     deployedDpdOutputRaw = paModel.Process(deployedDpdInput)
-    deployedDpdOutput = (
-        powerCalibration.CalibrateWaveformToOutputPowers(
-            deployedDpdOutputRaw,
-            outputPowerDbmPerChain,
-        )
+    deployedDpdOutput = powerCalibration.Calibrate(
+        deployedDpdOutputRaw
     )
 
     resultAnalysis.AnalyzeStages(

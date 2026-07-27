@@ -147,18 +147,21 @@ chainSignal = referenceSignal[:, chainIndex]
 from inc.utils.SigProc import PowerCalibration
 
 waveform = wifiGenerator.Generate()
-powerCalibration = PowerCalibration(
-    loadResistanceOhm=50.0,
-    maximumOutputPowerDbm=25.0,
-)
 paOutputPowerDbm = 20.0
+powerCalibration = PowerCalibration(
+    parameters={
+        "loadResistanceOhm": 50.0,
+        "maximumOutputPowerDbm": 25.0,
+        "outputPowerDbm": paOutputPowerDbm,
+    }
+)
 driveScale = powerCalibration.OutputPowerToDriveScale(
     paOutputPowerDbm
 )
 referenceSignal = driveScale * waveform.samples
 ```
 
-对调用方公开的工作点是 `paOutputPowerDbm`。默认额定极限为25 dBm，20 dBm对应5 dB输出回退和约0.5623的归一化驱动比例。PA非线性处理后，`CalibrateWaveformToOutputPower` 自动识别Wi-Fi有效突发，排除前后补零和长占空比静默，再用常数比例重新生成20 dBm输出；原始PA输出不要求预先归一化。浮点常数标定不会改变EVM或ACLR比值，定点模式重新量化，发生削顶时会警告。
+对调用方公开的工作点是 `paOutputPowerDbm`。默认额定极限为25 dBm，20 dBm对应5 dB输出回退和约0.5623的归一化驱动比例。PA非线性处理后，只需调用 `powerCalibration.Calibrate(paOutput)`；该函数从类内参数读取目标功率，自动识别Wi-Fi有效突发，排除前后补零和长占空比静默，再用常数比例重新生成20 dBm输出。原始PA输出不要求预先归一化。浮点常数标定不会改变EVM或ACLR比值，定点模式重新量化，发生削顶时会警告。
 
 ### 4.4 PA对象接口要求
 
@@ -1050,8 +1053,13 @@ targetOutputPowerDbmPerChain = np.asarray(
     dtype=float,
 )
 powerCalibration = PowerCalibration(
-    loadResistanceOhm=50.0,
-    maximumOutputPowerDbm=25.0,
+    parameters={
+        "loadResistanceOhm": 50.0,
+        "maximumOutputPowerDbm": 25.0,
+        "outputPowerDbmPerChain": tuple(
+            targetOutputPowerDbmPerChain
+        ),
+    }
 )
 driveScalePerChain = np.asarray(
     [
@@ -1126,18 +1134,13 @@ mimoPredistorter = FitMimoGmpPredistorter(
 deployedInput = mimoPredistorter.Process(referenceSignal)
 deployedRawOutput = mimoPaModel.Process(deployedInput)
 
-baselineOutput = powerCalibration.CalibrateWaveformToOutputPowers(
-    mimoPaModel.Process(referenceSignal),
-    targetOutputPowerDbmPerChain,
+baselineOutput = powerCalibration.Calibrate(
+    mimoPaModel.Process(referenceSignal)
 )
-selectedMimoOutput = powerCalibration.CalibrateWaveformToOutputPowers(
-    selectedMimoRawOutput,
-    targetOutputPowerDbmPerChain,
+selectedMimoOutput = powerCalibration.Calibrate(
+    selectedMimoRawOutput
 )
-deployedOutput = powerCalibration.CalibrateWaveformToOutputPowers(
-    deployedRawOutput,
-    targetOutputPowerDbmPerChain,
-)
+deployedOutput = powerCalibration.Calibrate(deployedRawOutput)
 physicalAnalysis = Analysis(referenceSignal, waveform)
 physicalAnalysis.AnalyzeStages(
     {
