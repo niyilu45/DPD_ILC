@@ -1668,11 +1668,35 @@ Analysis(
     signalProcessingParameters=None,
     sampleRateHz=None,
     channelBandwidthHz=None,
+    width=None,
     **parameterOverrides,
 )
 ```
 
 `signalProcessingParameters` 是显式构造参数，其映射内容直接传给 `SigProc`。为兼容旧程序，`parameters={"signalProcessingParameters": {...}}` 仍然有效；新代码应优先使用显式参数，避免把同步配置误认为普通Analysis指标配置。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。任何层出现未知键时，代码会发出 `UserWarning`、忽略该键并继续；已识别键的类型、单位和物理范围仍严格校验。
+
+`width` 配置参考和测量波形的统一I/Q接口。`width=0` 使用浮点旁路，默认 `width=16` 使用Q1.15；量化后仍以 `numpy.complex128` 完成时延、CFO、SFO、复增益、OFDM解调和指标计算。显式参考、发送辅助和盲分析三条路径都遵守相同规则，盲模式还会把位宽传给Parser重建参考：
+
+```python
+from inc.lib.Analysis import Analysis
+
+floatingMetrics = Analysis(
+    referenceSignal,
+    wifiWaveform,
+    width=0,
+).Analyze(receivedSignal)
+
+fixedMetrics = Analysis(
+    referenceSignal,
+    wifiWaveform,
+    width=16,
+).Analyze(receivedSignal)
+
+print(floatingMetrics["evmDb"])
+print(fixedMetrics["evmDb"])
+```
+
+两种结果都是普通字典。定点边界的舍入、饱和和EVM近似推导见 [FixedPoint.md](./FixedPoint.md)。
 
 `parseParameters` 只在盲模式使用。`sampleRateHz` 和 `channelBandwidthHz` 只需在纯NumPy发送辅助模式中补充：前者让CFO估计使用真实Hz单位，后者与采样率一起定义ACLR积分频带。发送辅助模式即使没有这两个物理量，也会继续完成时延、归一化CFO、SFO、复增益、EVM和SNR计算，只把无法定义的ACLR返回为 `NaN`。
 

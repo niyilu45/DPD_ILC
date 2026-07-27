@@ -28,12 +28,14 @@ if __package__ and "." in __package__:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
+    from ..utils.FixedPoint import FixedPoint
     from ..utils.SigProc import PowerCalibration
 else:
     from utils.ConfigUtils import (
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
+    from utils.FixedPoint import FixedPoint
     from utils.SigProc import PowerCalibration
 
 
@@ -311,6 +313,7 @@ class PaModel:
         wienerConfig: Optional[WienerConfig] = None,
         gmpConfig: Optional[GMPConfig] = None,
         parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize the PA facade and select its active model family.
@@ -325,6 +328,9 @@ class PaModel:
             wienerConfig: Optional Wiener configuration; None selects built-in values.
             gmpConfig: Optional GMP configuration; None selects built-in values.
             parameters: Optional external mapping layered ahead of the built-in defaults.
+            width: Optional external I/Q width. None selects the internal
+                16-bit default, zero selects floating point, and a positive
+                value selects signed normalized fixed-point emulation.
             parameterOverrides: Additional keyword settings. Unsupported names
                 produce a warning and are ignored.
 
@@ -336,6 +342,7 @@ class PaModel:
                 "modelName": "wiener",
                 "wienerConfig": None,
                 "gmpConfig": None,
+                "width": 16,
             }
         )
         directOverrides = dict(parameterOverrides)
@@ -345,6 +352,8 @@ class PaModel:
             directOverrides["wienerConfig"] = wienerConfig
         if gmpConfig is not None:
             directOverrides["gmpConfig"] = gmpConfig
+        if width is not None:
+            directOverrides["width"] = width
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
         externalParameters: Mapping[str, object] = (
@@ -387,6 +396,22 @@ class PaModel:
         return normalizedName
 
     modelName = ModelName
+
+    @property
+    def Width(self) -> int:
+        """Return the external I/Q component width.
+
+        Processing details:
+            Algorithm: Resolve the current ChainMap value so updates affect
+            subsequent input and output boundary quantization.
+
+        Returns:
+            result: Zero for floating mode or a positive fixed-point width.
+        """
+
+        return cast(int, self.parameters["width"])
+
+    width = Width
 
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened snapshot of all resolved PA parameters.
@@ -457,6 +482,7 @@ class PaModel:
             rawGmpConfig, GMPConfig
         ):
             raise TypeError("gmpConfig must be a GMPConfig or None")
+        FixedPoint(self.width)
         return (
             normalizedName,
             cast(Optional[WienerConfig], rawWienerConfig),
@@ -502,7 +528,10 @@ class PaModel:
         """
 
         self.SynchronizeModel()
-        return self.model.Process(inputSignal)
+        interfaceFormat = FixedPoint(self.width)
+        quantizedInput = interfaceFormat.QuantizeComplex(inputSignal)
+        floatingOutput = self.model.Process(quantizedInput)
+        return interfaceFormat.QuantizeComplex(floatingOutput)
 
     def SmallSignalGain(self) -> complex:
         """Return the configured model's DC small-signal complex gain.
@@ -531,6 +560,7 @@ class MimoPaModel:
     def __init__(
         self,
         parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize all chain models with internal default parameters.
@@ -542,6 +572,8 @@ class MimoPaModel:
 
         Args:
             parameters: Optional caller-owned mapping containing overrides.
+            width: Optional matrix-interface I/Q width. None selects the
+                internal 16-bit default and zero selects floating point.
             parameterOverrides: Highest-priority MIMO PA settings.
 
         Returns:
@@ -558,6 +590,7 @@ class MimoPaModel:
                 "targetOutputPowerDbmPerChain": None,
                 "loadResistanceOhm": 50.0,
                 "maximumOutputPowerDbm": 25.0,
+                "width": 16,
             }
         )
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -576,6 +609,8 @@ class MimoPaModel:
             self.defaultParameters,
             "MimoPaModel",
         )
+        if width is not None:
+            recognizedOverrides["width"] = width
         self.parameters: ChainMap[str, object] = ChainMap(
             recognizedOverrides,
             externalParameters,
@@ -600,6 +635,22 @@ class MimoPaModel:
         return cast(int, self.parameters["numTransmitChains"])
 
     numTransmitChains = NumTransmitChains
+
+    @property
+    def Width(self) -> int:
+        """Return the MIMO external I/Q component width.
+
+        Processing details:
+            Algorithm: Resolve the live ChainMap setting used by both the
+            matrix and individual-chain public processing paths.
+
+        Returns:
+            result: Zero for floating mode or a positive fixed-point width.
+        """
+
+        return cast(int, self.parameters["width"])
+
+    width = Width
 
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened snapshot of effective MIMO PA parameters.
@@ -790,6 +841,7 @@ class MimoPaModel:
                 powerCalibration.OutputPowerToDriveScale(
                     targetPowerDbm
                 )
+        FixedPoint(self.width)
 
     def SynchronizeModels(self) -> None:
         """Rebuild per-chain PA objects after live configuration changes.
@@ -807,7 +859,10 @@ class MimoPaModel:
         if paParameterSnapshot == self._activePaParameterSnapshot:
             return
         self.paModels = [
-            PaModel(parameters=chainParameters)
+            # Each facade is an internal floating-point calculation block.
+            # MimoPaModel applies the selected fixed-point format only at its
+            # public Process and ProcessChain boundaries.
+            PaModel(parameters=chainParameters, width=0)
             for chainParameters in paParameterSnapshot
         ]
         self._activePaParameterSnapshot = paParameterSnapshot
@@ -938,7 +993,8 @@ class MimoPaModel:
         """
 
         self.SynchronizeModels()
-        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        interfaceFormat = FixedPoint(self.width)
+        complexInput = interfaceFormat.QuantizeComplex(inputSignal)
         inputWasVector = complexInput.ndim == 1
         if inputWasVector:
             complexInput = complexInput.reshape(-1, 1)
@@ -990,7 +1046,8 @@ class MimoPaModel:
             raise TypeError("chainIndex must be an integer")
         if chainIndex < 0 or chainIndex >= self.numTransmitChains:
             raise IndexError("chainIndex is outside the configured chain range")
-        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        interfaceFormat = FixedPoint(self.width)
+        complexInput = interfaceFormat.QuantizeComplex(inputSignal)
         if complexInput.ndim != 1 or complexInput.size == 0:
             raise ValueError("inputSignal must be a nonempty vector")
         if not np.all(np.isfinite(complexInput)):
@@ -1035,7 +1092,7 @@ class MimoPaModel:
                     "cannot set target RMS on a zero-power PA output"
                 )
             chainOutput = float(targetOutputRms) * chainOutput / currentRms
-        return chainOutput
+        return interfaceFormat.QuantizeComplex(chainOutput)
 
     def GetOutputRmsPerChain(self) -> Tuple[float, ...]:
         """Return legacy RMS output voltages measured by the most recent call.

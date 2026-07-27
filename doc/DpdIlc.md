@@ -181,111 +181,37 @@ outputSignal = paModel.Process(inputSignal)
 
 ## 5. 最小可运行SISO示例
 
-以下示例生成EHT 20 MHz信号，运行Wiener PA baseline和频域ILC，然后输出SNR、EVM、ACLR以及每轮收敛信息。
+工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
 
 ```python
-from pathlib import Path
+from SmallestSISO import RunSisoMode
 
-import numpy as np
-
-from inc.lib.Analysis import Analysis
-from inc.lib.DpdIlc import ILCConfig, RunFrequencyDomainIlc
-from inc.lib.PaModel import PaModel
-from inc.lib.WaveGenWifi import WaveGenWifi
-from inc.utils.Draw import Draw
-from inc.utils.SigProc import PowerCalibration
-
-wifiGenerator = WaveGenWifi(
-    parameters={
-        "frameFormat": "EHT",
-        "bandwidthMhz": 20,
-        "mcs": 7,
-        "numDataSymbols": 10,
-        "sampleRateHz": 80.0e6,
-        "seed": 101,
-    }
+floatingResult = RunSisoMode(
+    width=0,
+    modeName="floating",
+    paOutputPowerDbm=20.0,
+    maximumOutputPowerDbm=25.0,
 )
-waveform = wifiGenerator.Generate()
-
-# Convert the requested output power to normalized output-backoff drive.
-loadResistanceOhm = 50.0
-maximumOutputPowerDbm = 25.0
-paOutputPowerDbm = 20.0
-powerCalibration = PowerCalibration(
-    loadResistanceOhm=loadResistanceOhm,
-    maximumOutputPowerDbm=maximumOutputPowerDbm,
-)
-driveScale = powerCalibration.OutputPowerToDriveScale(
-    paOutputPowerDbm
-)
-referenceSignal = driveScale * waveform.samples
-
-paModel = PaModel(parameters={"modelName": "wiener"})
-baselineOutputRaw = paModel.Process(referenceSignal)
-baselineOutput = powerCalibration.ScaleSignalToOutputPower(
-    baselineOutputRaw,
-    paOutputPowerDbm,
-)
-baselineOutputRms = float(np.sqrt(np.mean(np.abs(baselineOutput) ** 2)))
-baselineOutputPowerDbm = powerCalibration.RmsToDbm(baselineOutputRms)
-
-resultAnalysis = Analysis(
-    referenceSignal,
-    waveform,
-    loadResistanceOhm=loadResistanceOhm,
-)
-ilcConfig = ILCConfig(
-    numIterations=8,
-    learningRate=0.15,
-    regularization=1e-3,
-    maxAmplitude=2.0,
-    randomSeed=1019,
+fixedResult = RunSisoMode(
+    width=16,
+    modeName="fixed_16",
+    paOutputPowerDbm=20.0,
+    maximumOutputPowerDbm=25.0,
 )
 
-ilcResult = RunFrequencyDomainIlc(
-    referenceSignal,
-    paModel,
-    waveform.sampleRateHz,
-    waveform.bandwidthHz,
-    ilcConfig,
-)
-ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(ilcResult.history)
-selectedIlcInput = ilcAnalysisResult.bestInputSignal
-selectedIlcOutputRaw = paModel.Process(selectedIlcInput)
-selectedIlcOutput = powerCalibration.ScaleSignalToOutputPower(
-    selectedIlcOutputRaw,
-    paOutputPowerDbm,
-)
-
-stageMetrics = resultAnalysis.AnalyzeStages(
-    {
-        "PA baseline": baselineOutput,
-        "Frequency-domain ILC": selectedIlcOutput,
-    }
-)
-resultAnalysis.Print()
-resultAnalysis.PrintConvergence(
-    ilcAnalysisResult.history,
-    historyName="Frequency-domain ILC",
-)
-
-outputDirectory = Path("results/dpd_ilc_usage")
-resultAnalysis.SaveConvergence(ilcAnalysisResult.history, outputDirectory)
-Draw().SaveConvergenceCurve(
-    ilcAnalysisResult.history,
-    outputDirectory,
-    fileStem="frequency_domain_ilc",
-)
-
-print(stageMetrics["PA baseline"])
-print(stageMetrics["Frequency-domain ILC"])
-print(f"Configured PA output power: {paOutputPowerDbm:.2f} dBm")
-print(f"Rated maximum PA output: {maximumOutputPowerDbm:.2f} dBm")
-print(f"Normalized PA drive scale: {driveScale:.6f}")
-print(f"Measured PA output power: {baselineOutputPowerDbm:.2f} dBm")
-print(f"Measured PA output RMS voltage: {baselineOutputRms:.6f} V")
-print(selectedIlcInput.shape)
+print(floatingResult["baselineMetrics"])
+print(floatingResult["selectedIlcMetrics"])
+print(fixedResult["baselineMetrics"])
+print(fixedResult["selectedIlcMetrics"])
 ```
+
+也可以直接运行：
+
+```powershell
+python SmallestSISO.py
+```
+
+脚本内部为 `WaveGenWifi`、`PaModel` 和 `Analysis` 传入同一个 `width`。`width=0` 为浮点旁路，`width=16` 为默认Q1.15边界；内部FFT、GMP、同步、ILC和指标算法仍使用浮点。两个结果目录分别是 `results/smallest_siso/floating` 和 `results/smallest_siso/fixed_16`，每个目录都包含逐轮MSE/EVM收敛数据和图片。定点公式见 [FixedPoint.md](./FixedPoint.md)。
 
 这个示例中，`paOutputPowerDbm` 是工作点，`maximumOutputPowerDbm` 是额定极限。输出回退和归一化驱动关系为：
 

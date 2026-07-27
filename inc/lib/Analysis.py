@@ -3,7 +3,7 @@
 import csv
 import json
 from collections import ChainMap
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import (
@@ -16,6 +16,7 @@ from typing import (
     Tuple,
     TypedDict,
     Union,
+    cast,
 )
 
 import numpy as np
@@ -29,6 +30,7 @@ if __package__ and "." in __package__:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
+    from ..utils.FixedPoint import FixedPoint
     from ..utils.FrameProcess import FrameProcess
     from ..utils.SigProc import (
         PowerCalibration,
@@ -42,6 +44,7 @@ else:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
+    from utils.FixedPoint import FixedPoint
     from utils.FrameProcess import FrameProcess
     from utils.SigProc import (
         PowerCalibration,
@@ -258,6 +261,7 @@ class Analysis:
         ] = None,
         sampleRateHz: Optional[float] = None,
         channelBandwidthHz: Optional[float] = None,
+        width: Optional[int] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize one of the three independent analysis contexts.
@@ -289,6 +293,9 @@ class Analysis:
                 waveform-domain analysis.
             channelBandwidthHz: Optional occupied channel bandwidth used to
                 enable ACLR in NumPy-assisted waveform-domain analysis.
+            width: Optional external I/Q width. None selects the internal
+                16-bit default, zero selects floating point, and a positive
+                value selects signed normalized fixed-point emulation.
             parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
 
         Returns:
@@ -307,6 +314,7 @@ class Analysis:
                 "assistedMaximumOffsetSamples": 2000,
                 "assistedReferenceSearchSamples": 32768,
                 "assistedMinimumCorrelation": 0.12,
+                "width": 16,
             }
         )
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -335,10 +343,15 @@ class Analysis:
             recognizedOverrides["channelBandwidthHz"] = (
                 channelBandwidthHz
             )
+        if width is not None:
+            recognizedOverrides["width"] = width
         self.parameters: ChainMap[str, object] = ChainMap(
             recognizedOverrides,
             externalParameters,
             self.defaultParameters,
+        )
+        self.interfaceFormat = FixedPoint(
+            cast(int, self.parameters["width"])
         )
 
         self.parsedWifiFrame: Optional[ParsedWifiFrame] = None
@@ -364,15 +377,19 @@ class Analysis:
                 if isinstance(referenceSignal, WifiWaveform)
                 else referenceSignal
             )
-            measuredArray = np.asarray(
-                measuredInput, dtype=np.complex128
+            measuredArray = self.interfaceFormat.QuantizeComplex(
+                measuredInput
             )
             if isinstance(transmittedSignal, WifiWaveform):
-                selectedReference = transmittedSignal.samples
+                selectedReference = (
+                    self.interfaceFormat.QuantizeComplex(
+                        transmittedSignal.samples
+                    )
+                )
                 selectedWaveform = transmittedSignal
                 self.signalOverlapResult = SigProc.EstimateSignalOverlap(
                     measuredArray,
-                    transmittedSignal.samples,
+                    selectedReference,
                     self.parameters[
                         "assistedMaximumOffsetSamples"
                     ],
@@ -405,7 +422,10 @@ class Analysis:
                     self.defaultMeasuredSignal = measuredArray.copy()
             else:
                 transmitArray = np.asarray(
-                    transmittedSignal, dtype=np.complex128
+                    self.interfaceFormat.QuantizeComplex(
+                        transmittedSignal
+                    ),
+                    dtype=np.complex128,
                 )
                 self.signalOverlapResult = SigProc.EstimateSignalOverlap(
                     measuredArray,
@@ -436,10 +456,28 @@ class Analysis:
                 selectedWaveform = None
         else:
             self.analysisMode = "blind"
+            parseConfiguration = (
+                {}
+                if parseParameters is None
+                else dict(parseParameters)
+            )
+            parseConfiguration["width"] = self.interfaceFormat.width
+            parseInput: Union[np.ndarray, WifiWaveform] = (
+                replace(
+                    referenceSignal,
+                    samples=self.interfaceFormat.QuantizeComplex(
+                        referenceSignal.samples
+                    ),
+                )
+                if isinstance(referenceSignal, WifiWaveform)
+                else self.interfaceFormat.QuantizeComplex(
+                    referenceSignal
+                )
+            )
             self.parsedWifiFrame = ParseWifi(
-                parameters=parseParameters
+                parameters=parseConfiguration
             ).Parse(
-                referenceSignal,
+                parseInput,
             )
             selectedReference = self.parsedWifiFrame.referenceSignal
             selectedWaveform = self.parsedWifiFrame.waveform
@@ -452,8 +490,8 @@ class Analysis:
             raise TypeError("waveform must be a WifiWaveform or None")
         if isinstance(selectedReference, WifiWaveform):
             selectedReference = selectedReference.samples
-        complexReference = np.asarray(
-            selectedReference, dtype=np.complex128
+        complexReference = self.interfaceFormat.QuantizeComplex(
+            selectedReference
         )
         if complexReference.size == 0:
             raise ValueError("referenceSignal cannot be empty")
@@ -527,6 +565,22 @@ class Analysis:
 
         return self.analysisMode
 
+    @property
+    def Width(self) -> int:
+        """Return the external I/Q component width.
+
+        Processing details:
+            Algorithm: Read the resolved construction-time ChainMap value used
+            to quantize every reference and measured signal boundary.
+
+        Returns:
+            result: Zero for floating mode or a positive fixed-point width.
+        """
+
+        return cast(int, self.parameters["width"])
+
+    width = Width
+
     def GetSignalOverlapResult(
         self,
     ) -> Optional[SignalOverlapResult]:
@@ -591,6 +645,7 @@ class Analysis:
             result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
         """
 
+        self.interfaceFormat = FixedPoint(self.width)
         maxSegmentLength = self.parameters["maxSegmentLength"]
         if (
             not isinstance(maxSegmentLength, int)
@@ -746,7 +801,9 @@ class Analysis:
         signalProcessingParameters = self.parameters[
             "signalProcessingParameters"
         ]
-        measuredArray = np.asarray(measuredSignal, dtype=np.complex128)
+        measuredArray = self.interfaceFormat.QuantizeComplex(
+            measuredSignal
+        )
         referenceMatrix = (
             self.referenceSignal.reshape(-1, 1)
             if self.referenceSignal.ndim == 1

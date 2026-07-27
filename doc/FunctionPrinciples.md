@@ -60,6 +60,14 @@ flowchart LR
 | `RecognizedParameterView.__init__`, `RecognizedParameterView.WarnForNewUnknownParameters` | E | 保留外部字典动态更新语义，并对运行期间新加入的未知键只警告一次 | [README 配置容错](../README.md) |
 | `RecognizedParameterView.__getitem__`, `RecognizedParameterView.__iter__`, `RecognizedParameterView.__len__` | E | 实现只暴露已识别键的实时只读映射视图，供各类内部 `ChainMap` 使用 | [README 配置容错](../README.md) |
 
+### 2.2 `FixedPoint.py`：统一I/Q位宽边界
+
+| 函数/方法 | 类型 | 原理或职责 | 详细依据 |
+|---|---|---|---|
+| `FixedPoint.__init__` | E | 校验0至53位接口配置；0为浮点旁路，正数为一个符号位加其余小数位 | [FixedPoint.md §2](./FixedPoint.md) |
+| `FixedPoint.IsFloatingPoint`, `FixedPoint.GetFormatInfo` | E | 返回当前模式、步长、小数位数和可表示范围，不改变信号 | [FixedPoint.md §2](./FixedPoint.md) |
+| `FixedPoint.QuantizeComplex` | N/P | 对I/Q独立执行最近值舍入、有符号饱和与反量化，并保持 `complex128` 数据类型 | [FixedPoint.md §3–§7](./FixedPoint.md) |
+
 ## 3. `WaveGenWifi.py`：Wi-Fi 波形函数
 
 详细物理推导统一见 [WaveGenWifi.md](./WaveGenWifi.md)。
@@ -68,9 +76,9 @@ flowchart LR
 |---|---|---|---|
 | `WaveGenWifi.NormalizeFrameFormat` | E | 把 11ac/11ax/11be 别名规范为 VHT/HE/EHT，不改变波形 | WaveGenWifi §8.1 |
 | `WaveGenWifi.__init__`, `WaveGenWifi.GetParameters`, `WaveGenWifi.UpdateParameters`, `WaveGenWifi.Validate` | E | ChainMap 配置、未知键警告后忽略、已识别值合法域校验；保证后续公式输入有效 | WaveGenWifi §12–14 |
-| `WaveGenWifi.FrameFormat`, `WaveGenWifi.BandwidthMhz`, `WaveGenWifi.Mcs`, `WaveGenWifi.NumDataSymbols`, `WaveGenWifi.GuardIntervalUs`, `WaveGenWifi.SampleRateHz`, `WaveGenWifi.Oversampling`, `WaveGenWifi.Seed`, `WaveGenWifi.NumTransmitAntennas`, `WaveGenWifi.NumSpatialStreams`, `WaveGenWifi.SpatialMapping`, `WaveGenWifi.SpatialMappingMatrix`, `WaveGenWifi.CyclicShiftEnabled` | E | 返回已验证配置；采样率由 `sampleRateHz` 直接决定，旧 `oversampling` 只在未配置采样率时用于兼容推导 | WaveGenWifi §12 |
+| `WaveGenWifi.Width`, `WaveGenWifi.FrameFormat`, `WaveGenWifi.BandwidthMhz`, `WaveGenWifi.Mcs`, `WaveGenWifi.NumDataSymbols`, `WaveGenWifi.GuardIntervalUs`, `WaveGenWifi.SampleRateHz`, `WaveGenWifi.Oversampling`, `WaveGenWifi.Seed`, `WaveGenWifi.NumTransmitAntennas`, `WaveGenWifi.NumSpatialStreams`, `WaveGenWifi.SpatialMapping`, `WaveGenWifi.SpatialMappingMatrix`, `WaveGenWifi.CyclicShiftEnabled` | E | 返回已验证配置；采样率由 `sampleRateHz` 直接决定，旧 `oversampling` 只在未配置采样率时用于兼容推导，位宽定义输出接口量化 | WaveGenWifi §12、FixedPoint §2 |
 | `WaveGenWifi.ResolveMcsTable`, `WaveGenWifi.GetMcsInfo` | P/E | 在方法内部构造不可变 MCS 表并返回调制阶数、名义码率和每音调比特数，不保留模块级查表变量 | WaveGenWifi §5 |
-| `WaveGenWifi.Generate`, `WaveGenWifi.GenerateWifiWaveform` | P/E | 组装完整 VHT/HE/EHT 复基带帧并保存解调元数据 | WaveGenWifi §2、§8、§10 |
+| `WaveGenWifi.Generate`, `WaveGenWifi.GenerateWifiWaveform` | P/E | 组装完整 VHT/HE/EHT 复基带帧、归一化浮点待输出波形、量化公开样值并保存解调元数据 | WaveGenWifi §2、§8、§10、FixedPoint §6 |
 | `WaveGenWifi.ActiveTones`, `WaveGenWifi.PilotTones` | P | 依据 FFT 网格选择活动、数据和导频子载波 | WaveGenWifi §4 |
 | `WaveGenWifi.GrayToBinary`, `WaveGenWifi.QamModulate` | P/N | Gray 标号转自然坐标，构造单位平均功率 BPSK/QAM | WaveGenWifi §6 |
 | `WaveGenWifi.PilotSequence` | P/N | 生成可复现 BPSK 导频符号；用于相位/信道参考，本仿真不执行接收端导频跟踪 | WaveGenWifi §4、§11 |
@@ -132,10 +140,10 @@ flowchart LR
 | `GMPPA.Process` | P/N | 计算主、滞后包络和超前包络 GMP 支路 | PaModel §4.2–§4.6 |
 | `GMPPA.SmallSignalGain` | P/N | 只保留一阶主支路得到小信号增益 | PaModel §4.7 |
 | `PaModel.__init__`, `PaModel.ResolveConfiguration`, `PaModel.SynchronizeModel` | E | ChainMap 覆盖解析、未知键警告后忽略，并构造选定 Wiener/GMP 内核 | PaModel §12 |
-| `PaModel.ModelName`, `PaModel.GetParameters`, `PaModel.UpdateParameters` | E | 查询或更新配置；更新后重建模型以保持状态一致 | PaModel §12 |
+| `PaModel.ModelName`, `PaModel.Width`, `PaModel.GetParameters`, `PaModel.UpdateParameters` | E | 查询或更新配置；更新后重建模型以保持状态一致 | PaModel §12、FixedPoint §6 |
 | `PaModel.Process`, `PaModel.SmallSignalGain` | E/P | 统一分派到选定物理 PA 的同名计算 | PaModel §9、§12 |
 | `MimoPaModel.__init__`, `MimoPaModel.ResolveNumericSequence`, `MimoPaModel.ResolvePaParametersPerChain`, `MimoPaModel.ValidateParameters`, `MimoPaModel.SynchronizeModels` | E | 警告并忽略未知键，把已识别标量/序列配置扩展到每条物理链并构造独立PA | PaModel §10 |
-| `MimoPaModel.NumTransmitChains`, `MimoPaModel.GetParameters`, `MimoPaModel.UpdateParameters` | E | 返回或更新多路配置，不改变功率定义 | PaModel §10、§12 |
+| `MimoPaModel.NumTransmitChains`, `MimoPaModel.Width`, `MimoPaModel.GetParameters`, `MimoPaModel.UpdateParameters` | E | 返回或更新多路配置，不改变功率定义 | PaModel §10、§12、FixedPoint §6 |
 | `MimoPaModel.SetOutputPowerDb`, `MimoPaModel.SetTargetOutputRms`, `MimoPaModel.SetTargetOutputPowerDbm` | P/E | 设置相对幅度比例、旧RMS目标或基于端口阻抗的绝对dBm目标；dB幅度比例为 $10^{P_{dB}/20}$ | PaModel §10 |
 | `MimoPaModel.Process`, `MimoPaModel.ProcessChain` | P/N | 每列通过独立 PA，再执行相对增益或经端口阻抗换算的绝对 dBm 校准 | PaModel §10、§10.2 |
 | `MimoPaModel.GetOutputRmsPerChain`, `MimoPaModel.GetOutputPowerDbmPerChain` | E/P | 返回最近一次实际链输出RMS，并可通过端口阻抗换算为dBm | PaModel §10 |
@@ -253,7 +261,7 @@ flowchart LR
 | `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把曲线或逐轮记录转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann 窗、50% 重叠的 Welch PSD 平均 | Analysis §6.2 |
 | `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考；发送辅助直接相关并截取公共区间；仅盲模式调用ParseWifi；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§2、§11、ParseWifi §8 |
-| `Analysis.GetParsedWifiFrame`, `Analysis.GetAnalysisMode`, `Analysis.GetSignalOverlapResult` | E | 返回盲模式解析结果、三态路径名或发送辅助重叠坐标；未产生对应结果时返回 `None` | Analysis §1、ParseWifi §8、SigProc §3.3 |
+| `Analysis.GetParsedWifiFrame`, `Analysis.GetAnalysisMode`, `Analysis.Width`, `Analysis.GetSignalOverlapResult` | E | 返回盲模式解析结果、三态路径名、位宽或发送辅助重叠坐标；未产生对应结果时返回 `None` | Analysis §1、§11、ParseWifi §8、SigProc §3.3、FixedPoint §6 |
 | `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc` | Analysis §2、§9 |
 | `Analysis.GetLastSignalProcessingResult`, `Analysis.GetLastSignalProcessingResults`, `Analysis.GetLastMimoMetrics`, `Analysis.GetStageSignalProcessingResults`, `Analysis.GetStageMimoMetrics` | E | 返回缓存的不可变结果，不重新估计 | Analysis §9–§10 |
 | `Analysis.ValidatePreparedSignal` | E | 确保 prepared 数据与参考网格形状和有限性一致 | Analysis §2 |

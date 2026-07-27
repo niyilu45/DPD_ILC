@@ -618,6 +618,7 @@ Parser通过运行时数据类型自动分派。
 | `minimumParseConfidence` | `0.80` | 新版描述导频、历史magic或发送接收相关的最低置信度 |
 | `referenceSearchSamples` | `4096` | 发送辅助互相关使用的最大参考样点数 |
 | `spatialMappingMatrix` | `None` | custom MIMO映射时由用户补充的矩阵 |
+| `width` | `16` | 接收样值与重建参考的I/Q接口位宽；0为浮点，正数为Q1.(width-1) |
 
 典型覆盖方式：
 
@@ -639,6 +640,8 @@ parser.UpdateParameters(
     maximumPacketOffsetSamples=16384
 )
 ```
+
+当Parser由 `Analysis` 的盲模式调用时，`Analysis.width` 会自动写入Parser参数，因此接收波形和 `WaveGenWifi` 重建参考使用相同量化网格。直接使用Parser时也可以在 `parseParameters` 中设置 `"width": 0` 或 `"width": 16`。量化算法与饱和边界见 [FixedPoint.md](./FixedPoint.md)。
 
 ---
 

@@ -37,6 +37,7 @@ if __package__ and "." in __package__:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
+    from ..utils.FixedPoint import FixedPoint
     from ..utils.SigProc import SigProc
     from ..utils.WifiMetadata import WifiWaveform
 else:
@@ -44,6 +45,7 @@ else:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
+    from utils.FixedPoint import FixedPoint
     from utils.SigProc import SigProc
     from utils.WifiMetadata import WifiWaveform
 
@@ -912,6 +914,7 @@ class ParseWifi:
                 "minimumParseConfidence": 0.80,
                 "referenceSearchSamples": 4096,
                 "spatialMappingMatrix": None,
+                "width": 16,
             }
         )
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -1051,6 +1054,7 @@ class ParseWifi:
                 raise ValueError(
                     "spatialMappingMatrix must contain finite values"
                 )
+        FixedPoint(cast(int, self.parameters["width"]))
 
     def ResolveSampleRates(self) -> Tuple[float, ...]:
         """Return explicit or automatically searched receiver sample rates.
@@ -1098,7 +1102,13 @@ class ParseWifi:
             if isinstance(receivedSignal, WifiWaveform)
             else receivedSignal
         )
-        complexReceived = np.asarray(rawSamples, dtype=np.complex128)
+        # The parser receives the same external representation as Analysis.
+        # Quantized values are immediately dequantized to complex128 so every
+        # synchronization and descriptor operation below remains floating
+        # point and the public array type is identical in both modes.
+        complexReceived = FixedPoint(
+            cast(int, self.parameters["width"])
+        ).QuantizeComplex(rawSamples)
         if complexReceived.ndim not in (1, 2):
             raise ValueError(
                 "receivedSignal must be a vector or samples-by-chain matrix"
@@ -1146,6 +1156,9 @@ class ParseWifi:
 
         candidateParameters = dict(decodedParameters)
         candidateParameters["sampleRateHz"] = float(sampleRateHz)
+        candidateParameters["width"] = cast(
+            int, self.parameters["width"]
+        )
         if candidateParameters.get("spatialMapping") == "custom":
             customMatrix = self.parameters["spatialMappingMatrix"]
             if customMatrix is None:
@@ -1898,6 +1911,9 @@ class ParseWifi:
         )
         generatorParameters = dict(detectedParameters)
         generatorParameters["sampleRateHz"] = sampleRateHz
+        generatorParameters["width"] = cast(
+            int, self.parameters["width"]
+        )
         if generatorParameters["spatialMapping"] == "custom":
             customMatrix = (
                 receivedWaveform.spatialMappingMatrix

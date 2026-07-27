@@ -12,6 +12,7 @@
 - [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：10 bit seed、短块LDPC、历史CRC兼容、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
 - [Wi-Fi 元数据契约](doc/WifiMetadata.md)：`MCSInfo` 与 `WifiWaveform` 的字段、数组形状和模块边界。
 - [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
+- [定点接口原理与用法](doc/FixedPoint.md)：浮点旁路、Q1.(width-1) 量化、舍入、饱和，以及 WaveGenWifi、PaModel、Analysis 的统一数据边界。
 - [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
 - [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、当前工作点局部Jacobian、公共复增益与20 dBm GMP发散案例。
 - [全工程函数与物理原理覆盖审计](doc/FunctionPrinciples.md)：逐项索引 `main.py` 与 `inc` 中全部函数，区分物理模型、数值实现和工程编排，并链接到对应推导。
@@ -30,6 +31,7 @@ python -m pip install -r requirements.txt
 
 ```text
 main.py                 命令行主程序
+SmallestSISO.py         浮点与16位定点SISO EHT/GMP/ILC对比示例
 inc/lib/Analysis.py         SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
 inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
 inc/lib/Fec.py              55/90短块LDPC矩阵构造、系统编码和软输入译码
@@ -38,6 +40,7 @@ inc/lib/ParseWifi.py        接收帧描述解析、包起点检测与参考波�
 inc/lib/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
 inc/utils/ConfigUtils.py    ChainMap未知配置警告、过滤与外部活动映射视图
 inc/utils/Draw.py           功率-EVM 多方法同图绘制与 PNG 输出
+inc/utils/FixedPoint.py     浮点旁路与有符号归一化定点接口量化
 inc/utils/FrameProcess.py   Wi-Fi 去 CP、FFT、CSD 撤销与空间流解映射
 inc/utils/SigProc.py        SigProc 同步补偿、SignalProcessingResult 与 PowerCalibration
 inc/utils/WifiMetadata.py   MCSInfo 与 WifiWaveform 纯数据契约
@@ -73,6 +76,40 @@ from lib.WaveGenWifi import WaveGenWifi
 ```
 
 `lib` 与 `utils` 之间的跨包导入会根据当前包层级选择对应路径，因此第二种方式不会再触发 `attempted relative import beyond top-level package`。推荐方式仍是 `inc.lib.*`，因为它不需要调用方手动修改 `sys.path`。
+
+## 浮点与定点接口
+
+`WaveGenWifi`、`PaModel` 和 `Analysis` 都接受构造参数 `width`。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量采用有符号归一化 Q1.(width-1) 接口。默认值为 `16`，即 Q1.15。量化步长和范围为：
+
+```math
+\Delta=2^{-(width-1)}
+```
+
+```math
+-1\leq I,Q\leq 1-\Delta
+```
+
+边界执行最接近值舍入和饱和，然后立即反量化为 `numpy.complex128`。因此浮点和定点模式的数组形状与数据类型完全相同，模块内部 FFT、PA 非线性、同步和指标计算始终使用浮点；`width` 只模拟模块接口的有限精度。
+
+```mermaid
+flowchart LR
+    input["外部 complex128 波形"] --> quantizer["I/Q独立舍入与饱和<br/>width=0时旁路"]
+    quantizer --> floating["反量化为 complex128"]
+    floating --> algorithm["模块内部浮点算法"]
+    algorithm --> outputQuantizer["需要时在输出边界再次量化"]
+    outputQuantizer --> output["外部 complex128 波形"]
+```
+
+**图说明**：位宽改变可表示的样值集合，但不改变 Python 数据类型。归一化接口超过 `[-1,1)` 的分量会饱和；物理 dBm 电压标定应在归一化 PA/DPD 运算之后用于报告，避免把数伏的物理量直接送入 Q1.15 接口。完整推导见 [FixedPoint.md](doc/FixedPoint.md)。
+
+顶层 [SmallestSISO.py](./SmallestSISO.py) 会用完全相同的 EHT、GMP PA 和 ILC 设置依次运行浮点与16位定点版本：
+
+```powershell
+python SmallestSISO.py
+```
+
+浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序最后打印两种模式的最佳ILC EVM及定点减浮点的EVM差值。
+脚本还打印两种波形的峰值和PAPR。若定点EVM反而更好，通常是Q1.15饱和顺带削掉了OFDM高峰、降低了PA非线性，并不表示量化精度优于浮点；纯精度对比需要先保证两条路径采用相同的峰值归一化或CFR。
 
 ## 工程工作流程图
 
@@ -700,12 +737,13 @@ flowchart LR
 ### `WaveGenWifi` 参数
 
 当前构造函数签名为
-`WaveGenWifi(parameters=None, **parameterOverrides)`。
+`WaveGenWifi(parameters=None, width=None, **parameterOverrides)`。
 调用方先构造实例，再调用 `Generate()`；帧格式、MCS、采样率等受支持配置既可直接使用关键字传入，也可放入 `parameters` 映射。
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `WaveGenWifi` 构造函数内部的不可变默认参数补齐。 |
+| `width` | 非负整数 | `16` | 每个I或Q分量的对外位宽；`0`为浮点旁路，正数采用一个符号位和 `width-1` 个小数位。 |
 | `frameFormat` | `"VHT"/"11ac"`、`"HE"/"11ax"`、`"EHT"/"11be"`，并接受带 `802.` 前缀的名称 | `"EHT"` | 不区分大小写；生成后规范化为 VHT、HE 或 EHT。 |
 | `bandwidthMhz` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
 | `mcs` | VHT：`0–9`；HE：`0–11`；EHT：`0–13` | `9` | MCS 索引；默认值对三种格式都有效。 |
@@ -772,12 +810,13 @@ P(dBm) = 10 log10(P(W) / 0.001)
 ### `PaModel` 参数
 
 当前构造函数签名为
-`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, parameters=None, **parameterOverrides)`。
+`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, parameters=None, width=None, **parameterOverrides)`。
 三个常用模型参数既可以直接传入，也可以放入 `parameters` 映射；直接参数优先级更高。
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `PaModel` 构造函数内部的不可变默认参数补齐。 |
+| `width` | 非负整数 | `16` | PA输入、输出I/Q接口位宽；`0`为浮点，正数在边界量化后仍返回 `complex128`。 |
 | `modelName` | `"wiener"`、`"gmp"`，不区分大小写 | `"wiener"` | 选择内部 PA 实现。 |
 | `wienerConfig` | `WienerConfig` 或 `None` | `None` | Wiener 模式的配置；`None` 使用默认配置。 |
 | `gmpConfig` | `GMPConfig` 或 `None` | `None` | GMP 模式的配置；`None` 使用默认配置。 |
@@ -805,11 +844,12 @@ P(dBm) = 10 log10(P(W) / 0.001)
 
 `PaModel.Process(inputSignal)` 返回 PA 复基带输出；`SmallSignalGain()` 返回当前模型的 DC 小信号复增益。
 
-`MimoPaModel(parameters=None, **parameterOverrides)` 在构造函数内部使用 `ChainMap` 管理以下参数：
+`MimoPaModel(parameters=None, width=None, **parameterOverrides)` 在构造函数内部使用 `ChainMap` 管理以下参数：
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `numTransmitChains` | `1` | 独立 PA 数，范围 1–16。 |
+| `width` | `16` | 整个输入矩阵和每路输出的I/Q接口位宽；内部每路PA仍用浮点计算。 |
 | `paParametersPerChain` | `None` | 每路一个普通 `PaModel` 覆盖字典；`None` 表示每路使用 `PaModel` 内部默认值。 |
 | `inputPowerDbPerChain` | `None` | 每路输入驱动 dB；`None` 展开为全 0。 |
 | `outputPowerDbPerChain` | `None` | 每路相对输出 dB；`None` 展开为全 0。 |
@@ -887,6 +927,7 @@ PA 辅助接口还包括：
 | `minimumParseConfidence` | `0.80` | 新版描述导频、历史magic或发送接收互相关的最低置信度。 |
 | `referenceSearchSamples` | `4096` | 发送辅助归一化互相关使用的参考样点数。 |
 | `spatialMappingMatrix` | `None` | 无 `WifiWaveform` 元数据时为custom MIMO映射补充矩阵。 |
+| `width` | `16` | 盲解析接收样值与重建参考的I/Q接口位宽；由 `Analysis.width` 自动传入。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
@@ -936,12 +977,13 @@ print(assistedMetrics["evmDb"])
 ### `Analysis` 参数与方法
 
 当前构造函数签名为
-`Analysis(referenceSignal, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, **parameterOverrides)`。
+`Analysis(referenceSignal, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, **parameterOverrides)`。
 显式参考方式使用 `Analysis(referenceSignal, waveform, ...)`；发送辅助方式使用 `Analysis(receivedSignal, transmittedSignal=txSignal, ...)`；盲分析方式使用 `Analysis(receivedSignal, ...)`。接收输入和发送输入都可以是NumPy数组或 `WifiWaveform`；MIMO采用 `samples × transmitChains`。发送辅助模式只做类型适配、公共区间搜索与同步，不调用Parser。
 
 | 配置参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `parameters` | `None` | 外部 `Mapping` 覆盖层；未提供的键使用 `Analysis` 构造函数内部默认值。 |
+| `width` | `16` | 参考和接收波形的I/Q接口位宽；`0`为浮点旁路，量化后继续用 `complex128` 做同步和指标计算。 |
 | `maxSegmentLength` | `16384` | Welch PSD 的最大分段长度，必须是不小于 16 的整数。 |
 | `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
 | `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |

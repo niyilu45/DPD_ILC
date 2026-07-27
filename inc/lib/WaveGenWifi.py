@@ -28,6 +28,7 @@ if __package__ and "." in __package__:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
+    from ..utils.FixedPoint import FixedPoint
     from ..utils.FrameProcess import BuildCsdPhaseMatrix
     from ..utils.WifiMetadata import MCSInfo, WifiWaveform
 else:
@@ -35,6 +36,7 @@ else:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
+    from utils.FixedPoint import FixedPoint
     from utils.FrameProcess import BuildCsdPhaseMatrix
     from utils.WifiMetadata import MCSInfo, WifiWaveform
 
@@ -93,6 +95,7 @@ class WaveGenWifi:
     def __init__(
         self,
         parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize a VHT/HE/EHT waveform generator with ChainMap defaults.
@@ -104,6 +107,9 @@ class WaveGenWifi:
 
         Args:
             parameters: Optional external mapping layered ahead of the built-in defaults.
+            width: Optional external I/Q width. None selects the internal
+                16-bit default, zero selects floating point, and a positive
+                value selects signed normalized fixed-point emulation.
             parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
 
         Returns:
@@ -124,6 +130,7 @@ class WaveGenWifi:
                 "spatialMapping": "direct",
                 "spatialMappingMatrix": None,
                 "cyclicShiftEnabled": True,
+                "width": 16,
             }
         )
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -142,12 +149,30 @@ class WaveGenWifi:
             self.defaultParameters,
             "WaveGenWifi",
         )
+        if width is not None:
+            recognizedOverrides["width"] = width
         self.parameters: ChainMap[str, object] = ChainMap(
             recognizedOverrides,
             externalParameters,
             self.defaultParameters,
         )
         self.Validate()
+
+    @property
+    def Width(self) -> int:
+        """Return the external I/Q component width.
+
+        Processing details:
+            Algorithm: Resolve the live ChainMap value so caller-owned
+            configuration updates affect the next generated waveform.
+
+        Returns:
+            result: Zero for floating mode or a positive fixed-point width.
+        """
+
+        return cast(int, self.parameters["width"])
+
+    width = Width
 
     def ResolveMcsTable(
         self, frameFormat: str
@@ -628,6 +653,7 @@ class WaveGenWifi:
             )
         if not isinstance(self.cyclicShiftEnabled, bool):
             raise TypeError("cyclicShiftEnabled must be boolean")
+        FixedPoint(self.width)
 
     def GetMcsInfo(self) -> MCSInfo:
         """Return the MCS record selected by this generator instance.
@@ -1573,6 +1599,10 @@ def GenerateWifiWaveform(config: WaveGenWifi) -> WifiWaveform:
         if config.numTransmitAntennas == 1
         else packetSamples
     )
+    # Quantization is deliberately applied only at the public waveform
+    # boundary. Every field, OFDM transform, and normalization calculation
+    # above remains floating point in both interface modes.
+    outputSamples = FixedPoint(config.width).QuantizeComplex(outputSamples)
     outputQamSymbols = (
         qamSymbols[:, :, 0]
         if config.numSpatialStreams == 1

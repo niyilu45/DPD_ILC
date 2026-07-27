@@ -45,6 +45,7 @@ from inc.lib.Fec import (
     EncodeDescriptorLdpc,
 )
 from inc.utils.Draw import Draw
+from inc.utils.FixedPoint import FixedPoint
 from inc.lib.PaModel import MimoPaModel, PaModel
 from inc.lib.ParseWifi import (
     BuildWifiDescriptorBits,
@@ -682,6 +683,7 @@ def CheckDocumentationApiConsistency() -> None:
         "signalProcessingParameters",
         "sampleRateHz",
         "channelBandwidthHz",
+        "width",
         "parameterOverrides",
     )
     actualAnalysisParameters = tuple(
@@ -693,7 +695,7 @@ def CheckDocumentationApiConsistency() -> None:
         "Analysis(referenceSignal, waveform=None, parameters=None, "
         "parseParameters=None, transmittedSignal=None, "
         "signalProcessingParameters=None, sampleRateHz=None, "
-        "channelBandwidthHz=None, **parameterOverrides)"
+        "channelBandwidthHz=None, width=None, **parameterOverrides)"
     )
     readmeText = (projectRoot / "README.md").read_text(encoding="utf-8")
     analysisDocumentText = (
@@ -708,9 +710,13 @@ def CheckDocumentationApiConsistency() -> None:
             WaveGenWifi,
             (
                 "parameters",
+                "width",
                 "parameterOverrides",
             ),
-            "WaveGenWifi(parameters=None, **parameterOverrides)",
+            (
+                "WaveGenWifi(parameters=None, width=None, "
+                "**parameterOverrides)"
+            ),
         ),
         (
             PowerCalibration,
@@ -733,11 +739,12 @@ def CheckDocumentationApiConsistency() -> None:
                 "wienerConfig",
                 "gmpConfig",
                 "parameters",
+                "width",
                 "parameterOverrides",
             ),
             (
                 "PaModel(modelName=None, wienerConfig=None, "
-                "gmpConfig=None, parameters=None, "
+                "gmpConfig=None, parameters=None, width=None, "
                 "**parameterOverrides)"
             ),
         ),
@@ -1092,6 +1099,7 @@ def CheckMimoSpatialStructure() -> None:
             numSpatialStreams=streamCount,
             spatialMapping="dft",
             seed=101,
+            width=0,
         ).Generate()
         assert waveform.samples.shape[1] == transmitCount
         assert waveform.referenceDataSymbols.shape[2] == streamCount
@@ -1103,7 +1111,11 @@ def CheckMimoSpatialStructure() -> None:
             np.eye(streamCount),
             atol=1e-12,
         )
-        resultAnalysis = Analysis(waveform.samples, waveform)
+        resultAnalysis = Analysis(
+            waveform.samples,
+            waveform,
+            width=0,
+        )
         recoveredSymbols = resultAnalysis.DemodulatePreparedWifiData(
             waveform.samples
         )
@@ -1163,6 +1175,7 @@ def CheckMimoPaAndDpd() -> None:
     mimoPaModel = MimoPaModel(
         numTransmitChains=2,
         outputPowerDbPerChain=(0.0, -6.0),
+        width=0,
     )
     relativeOutput = mimoPaModel.Process(testMatrix)
     relativeRms = mimoPaModel.GetOutputRmsPerChain()
@@ -1205,6 +1218,7 @@ def CheckMimoPaAndDpd() -> None:
         oversampling=4,
         numTransmitAntennas=2,
         numSpatialStreams=2,
+        width=0,
     ).Generate()
     referenceSignal = 0.18 * waveform.samples
     # Disable absolute normalization for a meaningful repeatable ILC plant.
@@ -1221,7 +1235,7 @@ def CheckMimoPaAndDpd() -> None:
     assert ilcResult.learnedInput.shape == referenceSignal.shape
     assert ilcResult.outputSignal.shape == referenceSignal.shape
     assert len(ilcResult.chainResults) == 2
-    resultAnalysis = Analysis(referenceSignal, waveform)
+    resultAnalysis = Analysis(referenceSignal, waveform, width=0)
     mimoAnalysisResult = resultAnalysis.AnalyzeMimoIlcHistory(
         tuple(
             chainResult.history
@@ -1462,6 +1476,7 @@ def CheckPowerEvmCurve() -> None:
         numDataSymbols=2,
         oversampling=4,
         seed=43,
+        width=0,
     )
     waveform = wifiGenerator.Generate()
     powerCalibration = PowerCalibration(loadResistanceOhm=50.0)
@@ -1482,11 +1497,12 @@ def CheckPowerEvmCurve() -> None:
         powerCalibration.OutputPowerToDriveScale(20.0)
         * waveform.samples
     )
-    paModel = PaModel(modelName="wiener")
+    paModel = PaModel(modelName="wiener", width=0)
     resultAnalysis = Analysis(
         nominalReference,
         waveform,
         loadResistanceOhm=powerCalibration.loadResistanceOhm,
+        width=0,
     )
     outputPowerDbmValues = (10.0, 20.0, 25.0)
     curve = resultAnalysis.AnalyzePowerEvmCurve(
@@ -1871,14 +1887,18 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
             numDataSymbols=2,
             sampleRateHz=80.0e6,
             seed=501 + formatIndex,
+            width=0,
         ).Generate()
         assert waveform.seed == 501 + formatIndex
         assert waveform.cyclicShiftEnabled
-        measuredSignal = PaModel(modelName="wiener").Process(
+        measuredSignal = PaModel(
+            modelName="wiener",
+            width=0,
+        ).Process(
             0.22 * waveform.samples
         )
         referenceMetrics = Analysis(
-            waveform.samples, waveform
+            waveform.samples, waveform, width=0
         ).Analyze(measuredSignal)
         leadingSamples = 13 + formatIndex
         receiveCapture = np.r_[
@@ -1889,6 +1909,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         receiveAnalysis = Analysis(
             receiveCapture,
             parseParameters={"sampleRateHz": 80.0e6},
+            width=0,
         )
         receiveMetrics = receiveAnalysis.Analyze()
         parsedFrame = receiveAnalysis.GetParsedWifiFrame()
@@ -1910,6 +1931,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
             transmittedSignal=waveform.samples,
             sampleRateHz=waveform.sampleRateHz,
             channelBandwidthHz=waveform.bandwidthHz,
+            width=0,
         )
         assistedMetrics = assistedAnalysis.Analyze()
         assistedFrame = assistedAnalysis.GetParsedWifiFrame()
@@ -1926,6 +1948,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
             objectAssistedAnalysis = Analysis(
                 receiveCapture,
                 transmittedSignal=waveform,
+                width=0,
             )
             objectAssistedMetrics = objectAssistedAnalysis.Analyze()
             objectAssistedFrame = (
@@ -1960,6 +1983,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
                 transmittedSignal=waveform.samples,
                 sampleRateHz=waveform.sampleRateHz,
                 channelBandwidthHz=waveform.bandwidthHz,
+                width=0,
             )
             objectReceiveArrayTransmitMetrics = (
                 objectReceiveArrayTransmitAnalysis.Analyze()
@@ -1967,6 +1991,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
             objectReceiveObjectTransmitAnalysis = Analysis(
                 receivedWaveform,
                 transmittedSignal=waveform,
+                width=0,
             )
             objectReceiveObjectTransmitMetrics = (
                 objectReceiveObjectTransmitAnalysis.Analyze()
@@ -1984,14 +2009,18 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
             )
 
         typicalDriveScale = 10.0 ** (-5.0 / 20.0)
-        gmpMeasuredSignal = PaModel(modelName="gmp").Process(
+        gmpMeasuredSignal = PaModel(
+            modelName="gmp",
+            width=0,
+        ).Process(
             typicalDriveScale * waveform.samples
         )
         gmpReferenceMetrics = Analysis(
             waveform.samples,
             waveform,
+            width=0,
         ).Analyze(gmpMeasuredSignal)
-        gmpReceiveAnalysis = Analysis(gmpMeasuredSignal)
+        gmpReceiveAnalysis = Analysis(gmpMeasuredSignal, width=0)
         gmpReceiveMetrics = gmpReceiveAnalysis.Analyze()
         gmpParsedFrame = gmpReceiveAnalysis.GetParsedWifiFrame()
         assert gmpParsedFrame is not None
@@ -2017,16 +2046,24 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         numDataSymbols=10,
         sampleRateHz=80.0e6,
         seed=101,
+        width=0,
     ).Generate()
     smallestSisoDriveScale = 10.0 ** (-5.0 / 20.0)
-    smallestSisoPaOutput = PaModel(modelName="gmp").Process(
+    smallestSisoPaOutput = PaModel(
+        modelName="gmp",
+        width=0,
+    ).Process(
         smallestSisoDriveScale * smallestSisoWaveform.samples
     )
     smallestSisoReferenceMetrics = Analysis(
         smallestSisoDriveScale * smallestSisoWaveform.samples,
         smallestSisoWaveform,
+        width=0,
     ).Analyze(smallestSisoPaOutput)
-    smallestSisoReceiveAnalysis = Analysis(smallestSisoPaOutput)
+    smallestSisoReceiveAnalysis = Analysis(
+        smallestSisoPaOutput,
+        width=0,
+    )
     smallestSisoReceiveMetrics = (
         smallestSisoReceiveAnalysis.Analyze()
     )
@@ -2049,14 +2086,17 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         numDataSymbols=1,
         sampleRateHz=160.0e6,
         seed=514,
+        width=0,
     ).Generate()
-    autoParsedFrame = ParseWifi().Parse(autoWaveform.samples)
+    autoParsedFrame = ParseWifi(
+        parameters={"width": 0}
+    ).Parse(autoWaveform.samples)
     assert autoParsedFrame.detectedParameters["bandwidthMhz"] == 40
     assert autoParsedFrame.detectedParameters["sampleRateHz"] == 160.0e6
     assert np.array_equal(
         autoParsedFrame.referenceSignal, autoWaveform.samples
     )
-    overlapParser = ParseWifi()
+    overlapParser = ParseWifi(parameters={"width": 0})
     assert (
         overlapParser.GetParameters()["maximumPacketOffsetSamples"]
         == 2000
@@ -2083,10 +2123,14 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
     croppedAnalysis = Analysis(
         croppedReceive,
         transmittedSignal=autoWaveform,
+        width=0,
     )
     croppedMetrics = croppedAnalysis.Analyze()
     assert np.isfinite(croppedMetrics["evmPercent"])
-    croppedPaReceive = PaModel(modelName="gmp").Process(
+    croppedPaReceive = PaModel(
+        modelName="gmp",
+        width=0,
+    ).Process(
         0.25
         * autoWaveform.samples[
             cropStartSample:cropStopSample
@@ -2095,6 +2139,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
     croppedPaAnalysis = Analysis(
         croppedPaReceive,
         transmittedSignal=autoWaveform,
+        width=0,
     )
     croppedPaMetrics = croppedPaAnalysis.Analyze()
     croppedPaFrame = croppedPaAnalysis.GetParsedWifiFrame()
@@ -2117,6 +2162,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         transmittedSignal=paddedTransmit,
         sampleRateHz=autoWaveform.sampleRateHz,
         channelBandwidthHz=autoWaveform.bandwidthHz,
+        width=0,
     )
     paddedTransmitOverlap = (
         paddedTransmitAnalysis.GetSignalOverlapResult()
@@ -2156,6 +2202,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         waveformAssistedAnalysis = Analysis(
             assistedReceive,
             transmittedSignal=transmitVariant,
+            width=0,
         )
         waveformAssistedMetrics = waveformAssistedAnalysis.Analyze()
         waveformOverlap = (
@@ -2177,7 +2224,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         assert waveformAssistedMetrics["snrDb"] > 150.0
         assert np.isnan(waveformAssistedMetrics["aclrWorstDb"])
 
-    objectReceivedAnalysis = Analysis(autoWaveform)
+    objectReceivedAnalysis = Analysis(autoWaveform, width=0)
     objectReceivedMetrics = objectReceivedAnalysis.Analyze()
     objectReceivedFrame = objectReceivedAnalysis.GetParsedWifiFrame()
     assert objectReceivedFrame is not None
@@ -2197,13 +2244,16 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         numTransmitAntennas=2,
         numSpatialStreams=2,
         spatialMapping="dft",
+        width=0,
     ).Generate()
     mimoReceived = MimoPaModel(
-        numTransmitChains=2
+        numTransmitChains=2,
+        width=0,
     ).Process(0.20 * mimoWaveform.samples)
     mimoAnalysis = Analysis(
         mimoReceived,
         parseParameters={"sampleRateHz": 80.0e6},
+        width=0,
     )
     mimoMetrics = mimoAnalysis.Analyze()
     mimoParsedFrame = mimoAnalysis.GetParsedWifiFrame()
@@ -2214,7 +2264,11 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
     assert np.isfinite(mimoMetrics["evmDb"])
     assert mimoAnalysis.GetLastMimoMetrics() is not None
 
-    explicitAnalysis = Analysis(autoWaveform.samples, autoWaveform)
+    explicitAnalysis = Analysis(
+        autoWaveform.samples,
+        autoWaveform,
+        width=0,
+    )
     assert explicitAnalysis.GetAnalysisMode() == "explicitReference"
     assert explicitAnalysis.GetParsedWifiFrame() is None
     try:
@@ -2446,6 +2500,103 @@ def CheckUnknownConfigurationWarnings() -> None:
             )
 
 
+def CheckFixedPointInterfaces() -> None:
+    """Verify shared float and fixed I/Q boundaries for the three main APIs.
+
+    Processing details:
+        Algorithm: Check exact Q1.2 rounding and saturation, require an
+        unchanged complex128 public type in both modes, exercise the default
+        16-bit generator, and pass one signal through PA and Analysis objects
+        constructed with explicit floating and fixed interface widths.
+
+    Returns:
+        result: None. Assertions identify interface-format regressions.
+    """
+
+    floatingFormat = FixedPoint(width=0)
+    fixedFormat = FixedPoint(width=3)
+    inputSignal = np.array(
+        [0.13 + 0.37j, 2.0 - 2.0j, -0.20 + 0.0j],
+        dtype=np.complex128,
+    )
+    floatingSignal = floatingFormat.QuantizeComplex(inputSignal)
+    fixedSignal = fixedFormat.QuantizeComplex(inputSignal)
+    expectedFixedSignal = np.array(
+        [0.25 + 0.25j, 0.75 - 1.0j, -0.25 + 0.0j],
+        dtype=np.complex128,
+    )
+    assert floatingFormat.IsFloatingPoint()
+    assert not fixedFormat.IsFloatingPoint()
+    assert floatingFormat.GetFormatInfo()["mode"] == "floating"
+    assert fixedFormat.GetFormatInfo()["fractionalBits"] == 2
+    assert floatingSignal.dtype == np.complex128
+    assert fixedSignal.dtype == np.complex128
+    assert floatingSignal.shape == fixedSignal.shape == inputSignal.shape
+    assert np.array_equal(floatingSignal, inputSignal)
+    assert np.array_equal(fixedSignal, expectedFixedSignal)
+
+    defaultGenerator = WaveGenWifi(
+        bandwidthMhz=20,
+        numDataSymbols=1,
+        sampleRateHz=80.0e6,
+    )
+    floatingGenerator = WaveGenWifi(
+        bandwidthMhz=20,
+        numDataSymbols=1,
+        sampleRateHz=80.0e6,
+        width=0,
+    )
+    defaultWaveform = defaultGenerator.Generate()
+    floatingWaveform = floatingGenerator.Generate()
+    assert defaultGenerator.width == 16
+    assert floatingGenerator.width == 0
+    assert defaultWaveform.samples.dtype == np.complex128
+    assert floatingWaveform.samples.dtype == np.complex128
+    assert defaultWaveform.samples.shape == floatingWaveform.samples.shape
+    fixedScale = float(2**15)
+    assert np.allclose(
+        defaultWaveform.samples.real * fixedScale,
+        np.rint(defaultWaveform.samples.real * fixedScale),
+    )
+    assert np.allclose(
+        defaultWaveform.samples.imag * fixedScale,
+        np.rint(defaultWaveform.samples.imag * fixedScale),
+    )
+
+    paInput = 0.5 * floatingWaveform.samples
+    floatingPaOutput = PaModel(width=0).Process(paInput)
+    fixedPaOutput = PaModel(width=16).Process(paInput)
+    assert floatingPaOutput.dtype == np.complex128
+    assert fixedPaOutput.dtype == np.complex128
+    assert floatingPaOutput.shape == fixedPaOutput.shape
+
+    floatingMetrics = Analysis(
+        floatingWaveform.samples,
+        floatingWaveform,
+        width=0,
+    ).Analyze(floatingWaveform.samples)
+    fixedMetrics = Analysis(
+        defaultWaveform.samples,
+        defaultWaveform,
+        width=16,
+    ).Analyze(defaultWaveform.samples)
+    assert set(floatingMetrics) == set(fixedMetrics)
+    assert isinstance(floatingMetrics, dict)
+    assert isinstance(fixedMetrics, dict)
+    assert np.isfinite(floatingMetrics["evmDb"])
+    assert np.isfinite(fixedMetrics["evmDb"])
+
+    for invalidWidth in (-1, 1.5, True, 54):
+        try:
+            FixedPoint(invalidWidth)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"invalid fixed-point width accepted: {invalidWidth!r}"
+            )
+
+
 def RunTests() -> None:
     """Run all project checks and report a compact success message.
 
@@ -2467,6 +2618,7 @@ def RunTests() -> None:
     CheckDocumentationApiConsistency()
     CheckInternalDefaultConfiguration()
     CheckUnknownConfigurationWarnings()
+    CheckFixedPointInterfaces()
     CheckWifiFormats()
     CheckWifiBandwidths()
     CheckSampleRateConfiguration()

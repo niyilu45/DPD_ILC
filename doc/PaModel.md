@@ -683,6 +683,7 @@ $\lambda>0$ 可以缓和高阶基函数相关造成的病态问题，但过大�
 classDiagram
     class PaModel {
         +modelName
+        +width
         +Process(inputSignal)
         +SmallSignalGain()
     }
@@ -709,6 +710,7 @@ classDiagram
         +Process(inputSignal)
     }
     class MimoPaModel {
+        +width
         +Process(inputMatrix)
         +ProcessChain(inputSignal, chainIndex)
         +SetOutputPowerDb(chainIndex, outputPowerDb)
@@ -760,12 +762,29 @@ paOverrides.update(
 gmpOutput = paModel.Process(inputSignal)
 ```
 
+`PaModel` 的公开构造签名为
+`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路量化；默认 `width=16`。`Process` 先量化输入，使用浮点Wiener或GMP模型计算，再量化输出，返回类型始终是 `numpy.complex128`：
+
+```python
+from inc.lib.PaModel import PaModel
+
+floatingPa = PaModel(modelName="gmp", width=0)
+fixedPa = PaModel(modelName="gmp", width=16)
+
+floatingOutput = floatingPa.Process(inputSignal)
+fixedOutput = fixedPa.Process(inputSignal)
+assert floatingOutput.dtype == fixedOutput.dtype
+```
+
+这种边界模型包含“输入量化误差经过非线性放大”和“PA输出再次量化”两部分，但PA内部幂次、记忆抽头与包络交叉项仍使用浮点。Q1.(width-1)的完整推导见 [FixedPoint.md](./FixedPoint.md)。
+
 多路调用只传需要修改的覆盖值，默认值仍在类内部：
 
 ```python
 from inc.lib.PaModel import MimoPaModel
 
 mimoPaModel = MimoPaModel(
+    width=16,
     numTransmitChains=4,
     paParametersPerChain=(
         {"modelName": "wiener"},
