@@ -140,6 +140,27 @@ resultAnalysis = Analysis(
 metrics = resultAnalysis.Analyze()
 ```
 
+为兼容早期把接收机采样率统一放在Parser配置中的调用，发送辅助模式也接受：
+
+```python
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=transmitSamples,
+    parseParameters={
+        "sampleRateHz": 320.0e6,
+        "channelBandwidthHz": 80.0e6,
+    },
+)
+metrics = resultAnalysis.Analyze()
+```
+
+这不改变分析路径：`GetAnalysisMode()` 仍返回
+`"transmitAssisted"`，`GetParsedWifiFrame()` 仍返回 `None`。
+Analysis只从该兼容映射读取 `sampleRateHz` 和
+`channelBandwidthHz`；其他Parser专用键发出 `UserWarning` 后忽略。
+若同一参数还通过 `sampleRateHz=`、`channelBandwidthHz=` 或
+Analysis的 `parameters` 显式提供，显式Analysis配置优先。
+
 ### 1.3 直接输入接收波形估计EVM
 
 如果接收波形已经保存为 NumPy 文件，Analysis不要求调用方同时提供理想参考波形。下面的代码只把接收采集送入Analysis，然后直接读取EVM：
@@ -1775,7 +1796,7 @@ print(fixedMetrics["evmDb"])
 
 两种结果都是普通字典。定点调用中的 `referenceSignal` 和 `receivedSignal` 必须来自相同位宽的模块公开接口，不能把已解码的小于1浮点值或已经换算成伏特的功率标定副本冒充整数码。`width=` 直接参数仍可作为最高优先级便捷写法；放入 `parameters` 时则与其他Analysis配置共同进入 `ChainMap`。可以通过 `resultAnalysis.GetParameters()["width"]` 或 `resultAnalysis.width` 读取最终解析值。定点码值、舍入、饱和和EVM近似推导见 [FixedPoint.md](./FixedPoint.md)。
 
-`parseParameters` 只在盲模式使用。`sampleRateHz` 和 `channelBandwidthHz` 只需在纯NumPy发送辅助模式中补充：前者让CFO估计使用真实Hz单位，后者与采样率一起定义ACLR积分频带。发送辅助模式即使没有这两个物理量，也会继续完成时延、归一化CFO、SFO、复增益、EVM和SNR计算，只把无法定义的ACLR返回为 `NaN`。
+盲模式会把完整 `parseParameters` 交给 `ParseWifi`。发送辅助模式不会调用Parser，但为兼容旧程序，可从该映射转交 `sampleRateHz` 和 `channelBandwidthHz`；直接Analysis参数仍具有更高优先级。纯NumPy发送辅助模式中，采样率让CFO估计使用真实Hz单位，带宽与采样率一起定义ACLR积分频带。发送辅助模式即使没有这两个物理量，也会继续完成时延、归一化CFO、SFO、复增益、EVM和SNR计算，只把无法定义的ACLR返回为 `NaN`。
 
 功率–EVM 扫描的评估器接口为：
 

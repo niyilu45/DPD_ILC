@@ -282,8 +282,11 @@ class Analysis:
             waveform: Optional Wi-Fi metadata selecting explicit-reference
                 mode.
             parameters: Optional external mapping layered ahead of the built-in defaults.
-            parseParameters: Optional ``ParseWifi`` parameter mapping used only
-                when ``waveform`` is omitted.
+            parseParameters: Optional ``ParseWifi`` parameter mapping. Blind
+                mode forwards the complete mapping to ``ParseWifi``.
+                Transmit-assisted mode accepts ``sampleRateHz`` and
+                ``channelBandwidthHz`` as compatibility aliases without
+                invoking the parser.
             transmittedSignal: Optional known transmit input selecting direct
                 assisted mode. Either a metadata-rich ``WifiWaveform`` or a
                 NumPy waveform containing samples only is accepted without
@@ -322,6 +325,10 @@ class Analysis:
         )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
+        if parseParameters is not None and not isinstance(
+            parseParameters, Mapping
+        ):
+            raise TypeError("parseParameters must be a mapping or None")
         externalParameters: Mapping[str, object] = (
             {}
             if parameters is None
@@ -371,8 +378,32 @@ class Analysis:
                 )
         elif transmittedSignal is not None:
             if parseParameters is not None:
-                raise ValueError(
-                    "parseParameters is only valid in blind analysis mode"
+                # Older callers often placed the known receiver clock in the
+                # parser mapping before the assisted path existed. Preserve
+                # that useful configuration without parsing the known
+                # transmit waveform. Explicit Analysis settings retain higher
+                # priority, and parser-only keys are warned about and ignored.
+                assistedParameterNames: Mapping[str, object] = (
+                    MappingProxyType(
+                        {
+                            "sampleRateHz": None,
+                            "channelBandwidthHz": None,
+                        }
+                    )
+                )
+                assistedCompatibilityParameters = (
+                    FilterRecognizedParameters(
+                        parseParameters,
+                        assistedParameterNames,
+                        "Analysis transmit-assisted parseParameters",
+                    )
+                )
+                # Insert the compatibility layer immediately before defaults.
+                # Direct arguments and the caller-owned Analysis mapping stay
+                # live and retain priority over these migrated parser values.
+                self.parameters.maps.insert(
+                    len(self.parameters.maps) - 1,
+                    assistedCompatibilityParameters,
                 )
             self.analysisMode = "transmitAssisted"
             measuredInput = (

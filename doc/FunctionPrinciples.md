@@ -260,7 +260,7 @@ flowchart LR
 | `Analysis.Analyze`, `Analysis.GetLastMimoMetrics` | E | 直接返回普通指标字典，调用方使用固定键读取模拟输出功率、SNR、EVM、ACLR和MIMO明细 | Analysis §3.1、§10 |
 | `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把曲线或逐轮记录转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann 窗、50% 重叠的 Welch PSD 平均 | Analysis §6.2 |
-| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考；发送辅助直接相关并截取公共区间；仅盲模式调用ParseWifi；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§2、§11、ParseWifi §8 |
+| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考；发送辅助直接相关并截取公共区间，可从兼容 `parseParameters` 转交采样率/带宽但不调用Parser；仅盲模式调用ParseWifi；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§2、§11、ParseWifi §8 |
 | `Analysis.GetParsedWifiFrame`, `Analysis.GetAnalysisMode`, `Analysis.Width`, `Analysis.GetSignalOverlapResult` | E | 返回盲模式解析结果、三态路径名、位宽或发送辅助重叠坐标；未产生对应结果时返回 `None` | Analysis §1、§11、ParseWifi §8、SigProc §3.3、FixedPoint §6 |
 | `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc` | Analysis §2、§9 |
 | `Analysis.GetLastSignalProcessingResult`, `Analysis.GetLastSignalProcessingResults`, `Analysis.GetLastMimoMetrics`, `Analysis.GetStageSignalProcessingResults`, `Analysis.GetStageMimoMetrics` | E | 返回缓存的不可变结果，不重新估计 | Analysis §9–§10 |

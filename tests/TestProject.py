@@ -2009,6 +2009,52 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         assert np.isfinite(assistedMetrics["evmDb"])
         assert np.isfinite(assistedMetrics["aclrWorstDb"])
         if formatIndex == 0:
+            with warnings.catch_warnings(record=True) as warningRecords:
+                warnings.simplefilter("always")
+                compatibleAssistedAnalysis = Analysis(
+                    receiveCapture,
+                    transmittedSignal=waveform.samples,
+                    parseParameters={
+                        "sampleRateHz": waveform.sampleRateHz,
+                        "channelBandwidthHz": waveform.bandwidthHz,
+                        "maximumPacketOffsetSamples": 128,
+                    },
+                    width=0,
+                )
+            compatibleAssistedMetrics = (
+                compatibleAssistedAnalysis.Analyze()
+            )
+            assert (
+                compatibleAssistedAnalysis.GetAnalysisMode()
+                == "transmitAssisted"
+            )
+            assert (
+                compatibleAssistedAnalysis.GetParsedWifiFrame() is None
+            )
+            assert (
+                compatibleAssistedAnalysis.sampleRateHz
+                == waveform.sampleRateHz
+            )
+            assert (
+                compatibleAssistedAnalysis.channelBandwidthHz
+                == waveform.bandwidthHz
+            )
+            assert np.isfinite(
+                compatibleAssistedMetrics["aclrWorstDb"]
+            )
+            assert any(
+                "maximumPacketOffsetSamples" in str(warningRecord.message)
+                for warningRecord in warningRecords
+            )
+            precedenceAnalysis = Analysis(
+                receiveCapture,
+                transmittedSignal=waveform.samples,
+                parseParameters={"sampleRateHz": 60.0e6},
+                sampleRateHz=waveform.sampleRateHz,
+                channelBandwidthHz=waveform.bandwidthHz,
+                width=0,
+            )
+            assert precedenceAnalysis.sampleRateHz == waveform.sampleRateHz
             objectAssistedAnalysis = Analysis(
                 receiveCapture,
                 transmittedSignal=waveform,

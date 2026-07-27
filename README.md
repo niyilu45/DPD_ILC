@@ -1014,13 +1014,33 @@ print(assistedMetrics["evmDb"])
 | `loadResistanceOhm` | `50.0` | 模拟输出功率和功率扫描中 dBm 与复包络 RMS 电压换算所用的端口电阻。 |
 | `maximumOutputPowerDbm` | `25.0` | 归一化RMS等于1时的每路PA满量程功率，也是功率扫描的0 dB输出回退参考。 |
 | `signalProcessingParameters` | `None` | 显式构造参数；作为普通覆盖字典传给 `SigProc`，`None` 使用其内部默认值。旧版 `parameters={"signalProcessingParameters": {...}}` 写法仍兼容。 |
-| `parseParameters` | `None` | 仅盲分析路径传给 `ParseWifi` 的普通覆盖字典；其他路径不接受该参数。 |
+| `parseParameters` | `None` | 盲分析路径把完整映射传给 `ParseWifi`；发送辅助路径为兼容旧调用接受其中的 `sampleRateHz` 和 `channelBandwidthHz`，但仍不调用Parser。其他Parser专用键警告后忽略。 |
 | `transmittedSignal` | `None` | 可选发送NumPy数组或 `WifiWaveform`；一旦提供就直接作为Reference并彻底绕过 `ParseWifi`。 |
 | `sampleRateHz` | `None` | 纯NumPy发送辅助模式的可选物理采样率；未提供时使用归一化采样率1，补偿仍有效，但CFO数值不具有实际Hz单位。 |
 | `channelBandwidthHz` | `None` | 纯NumPy发送辅助模式的可选信道带宽；与实际 `sampleRateHz` 同时提供后才计算ACLR，否则三个ACLR键返回 `NaN`。 |
 | `assistedMaximumOffsetSamples` | `2000` | 发送辅助相关允许搜索的接收端最大前置偏移样点数。 |
 | `assistedReferenceSearchSamples` | `32768` | 每个候选偏移最多参与归一化相关的样点数。 |
 | `assistedMinimumCorrelation` | `0.12` | 发送辅助公共区间的最低归一化相关幅度。 |
+
+发送辅助模式推荐直接使用 `sampleRateHz=` 和
+`channelBandwidthHz=`。已有程序若把采样率放在 `parseParameters` 中，
+也可以继续运行：
+
+```python
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=transmitSamples,
+    parseParameters={
+        "sampleRateHz": 320.0e6,
+        "channelBandwidthHz": 80.0e6,
+    },
+)
+metrics = resultAnalysis.Analyze()
+```
+
+该写法只转交两个物理频率参数，不会解析Descriptor，也不会恢复seed。
+如果同时给出 `sampleRateHz=` 或 `parameters["sampleRateHz"]`，显式
+Analysis配置优先于兼容值。
 
 `width` 既可以作为直接构造参数，也可以与其他配置一起写入 `parameters`。直接参数优先级更高：
 

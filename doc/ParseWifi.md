@@ -686,6 +686,24 @@ metrics = resultAnalysis.Analyze()
 
 这里Analysis不会调用 `ParseWifi.Parse`。它直接搜索两路波形公共区间，因此发送样值可以被裁剪、前后补零，也不要求包含Descriptor。纯NumPy输入没有帧元数据，结果采用波形域EVM/SNR；需要ACLR时同时传入 `sampleRateHz` 和 `channelBandwidthHz`。
 
+已有程序如果通过 `parseParameters` 提供接收机采样率，也不需要修改调用结构：
+
+```python
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=transmitSamples,
+    parseParameters={
+        "sampleRateHz": 320.0e6,
+        "channelBandwidthHz": 80.0e6,
+    },
+)
+metrics = resultAnalysis.Analyze()
+```
+
+此处 `parseParameters` 只是采样率/带宽的兼容入口，Analysis仍然不调用
+`ParseWifi.Parse`。Parser专用的其他键会警告后忽略；显式
+`sampleRateHz=` 和 `channelBandwidthHz=` 具有更高优先级。
+
 ### 8.3 Analysis的WifiWaveform发送对象辅助
 
 ```python
