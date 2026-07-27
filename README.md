@@ -132,7 +132,7 @@ python SmallestSISO.py
 ```
 
 浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序最后打印两种模式的最佳ILC EVM及定点减浮点的EVM差值。PA的原始输出不要求预先归一化，脚本会按有效Wi-Fi突发区间把baseline、每轮ILC输出和最终复测输出统一重新标定到20 dBm；前后补零或长占空比静默不进入功率RMS。
-脚本还打印两种波形的峰值、PAPR以及 `waveformMinimumI/MaximumI/MinimumQ/MaximumQ`。定点版本的 I/Q 字段是公开码值，因此16位分量会位于 `-32768…32767`，并不是小于1的归一化数；复数幅度 `waveformPeakAmplitude` 最多可接近 $\sqrt{2}\,32768$。
+脚本还打印两种波形的峰值以及 `waveformMinimumI/MaximumI/MinimumQ/MaximumQ`。定点版本的 I/Q 字段是公开码值，因此16位分量会位于 `-32768…32767`，并不是小于1的归一化数；复数幅度 `waveformPeakAmplitude` 最多可接近 $\sqrt{2}\,32768$。
 
 ## 工程工作流程图
 
@@ -143,22 +143,21 @@ flowchart TD
     wifiGenerator --> waveGenWifi["WaveGenWifi.Generate"]
     waveGenWifi --> streams["独立空间流：QAM / pilots / LTF"]
     streams --> spatialMap["空间映射 Q + 每链 CSD"]
-    spatialMap --> reference["samples × TX chains 参考矩阵 S 与帧元数据"]
+    spatialMap --> rawReference["原始 samples × TX chains 波形与帧元数据"]
 
     overrideMap --> paModel["创建 PaModel 或 MimoPaModel；类内追加默认参数层"]
     paModel --> paImplementation["每路 WienerPA 或 GMPPA + 独立功率设置"]
-    reference --> baseline["生成未校正 PA 基线输出"]
-    paImplementation --> baseline
-    baseline --> powerCalibration["PowerCalibration：识别有效突发并重标定目标dBm"]
-    powerCalibration --> calibratedBaseline["目标功率 PA 基线输出"]
+    rawReference --> powerCalibration["PowerCalibration闭环：隐藏驱动预设 → PA → 实测功率 → 更新预设"]
+    paImplementation --> powerCalibration
+    powerCalibration --> reference["收敛后的PA输入参考矩阵 S"]
+    powerCalibration --> calibratedBaseline["容限内的实测PA基线输出"]
 
     start --> frequencyIlc["SISO 或逐 PA RunMimoFrequencyDomainIlc"]
     reference --> frequencyIlc
     paModel --> frequencyIlc
 
     frequencyIlc --> nativeHistory["保存每轮输入、PA输出和原生MSE"]
-    nativeHistory --> historyCalibration["逐轮输出按有效区重标定目标dBm"]
-    historyCalibration --> ilcAnalysis["Analysis.AnalyzeIlcHistory<br/>逐轮计算功率 / SNR / EVM / ACLR"]
+    nativeHistory --> ilcAnalysis["Analysis.AnalyzeIlcHistory<br/>分析每轮真实功率 / SNR / EVM / ACLR"]
     ilcAnalysis --> learnedInput["按严格EVM选择的 PA 输入 u*"]
     learnedInput --> deployFit["拟合 MP / GMP / Volterra / LUT / NN"]
     deployFit --> deployedDpd["可复用 DPD 模型"]
@@ -166,8 +165,9 @@ flowchart TD
     waveGenWifi --> validation["生成独立验证 VHT/HE/EHT 帧"]
     validation --> deployedDpd
     deployedDpd --> predistortedInput["DPD 输出"]
-    predistortedInput --> paImplementation
-    paImplementation --> correctedOutput["PA 校正输出"]
+    predistortedInput --> deploymentCalibration["闭环校准部署输入功率"]
+    paImplementation --> deploymentCalibration
+    deploymentCalibration --> correctedOutput["目标工作点的PA校正输出"]
 
     receiveCapture["接收Wi-Fi波形<br/>NumPy或WifiWaveform"] --> analysisMode{"Analysis选择参考来源"}
     optionalTransmit["可选发送波形<br/>NumPy或WifiWaveform"] --> analysisMode
@@ -180,7 +180,7 @@ flowchart TD
     overrideMap --> analysis["创建 Analysis；类内追加默认参数层"]
     reference --> analysis
     reference --> sigProc["SigProc：时延 / CFO / SFO / 复增益补偿"]
-    baseline --> sigProc
+    calibratedBaseline --> sigProc
     frequencyIlc --> sigProc
     correctedOutput --> sigProc
     sigProc --> frameProcess["FrameProcess：去 CP / FFT / CSD / 空间解映射"]
@@ -210,8 +210,8 @@ flowchart TD
 
 1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `WaveGenWifi`、`PaModel`、`Analysis` 和 `Draw`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
 2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
-3. `MimoPaModel` 为每个矩阵列建立独立 PA，可分别设置输入驱动增益 dB、相对输出功率 dB 或绝对输出功率 dBm。`PowerCalibration` 按用户配置的端口电阻把 dBm 换算成 PA 模型使用的复包络 RMS 电压。单方案模式对每个 PA 独立执行正则化频域 ILC，再对各路 ILC 标签分别拟合 GMP；全方案基准当前仅用于 SISO。
-4. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮输入、PA反馈输出和原生MSE。ILC返回后，`Analysis.AnalyzeIlcHistory` 或 `AnalyzeMimoIlcHistory` 才逐轮计算RF性能，并按严格EVM选择 `u*`。该输入可直接用于重复波形复测，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN，从而形成可用于其他帧的部署模型。
+3. `PowerCalibration` 把原始SISO/MIMO波形按隐藏驱动预设送入 `PaModel` 或仪表适配器，仅对PA实测输出的有效突发计算功率。若目标误差超出容限，它在dB域更新预设并重新生成PA输入；有上下括区后改用二分，直到所有链收敛。返回值是最终PA输入，最后一次实测PA输出由 `GetLastPaOutput()` 取得，调用方不需要读写内部预设。
+4. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮真实输入、PA反馈输出和原生MSE；不会在PA后把每轮输出缩放到目标dBm。ILC返回后，`Analysis.AnalyzeIlcHistory` 或 `AnalyzeMimoIlcHistory` 才逐轮计算RF性能，并按严格EVM选择 `u*`。该输入可在闭环功率校准后复测，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN。
 5. `Analysis` 使用三条互相独立的路径。显式参考模式直接保存 `referenceSignal` 与 `WifiWaveform`；发送波形辅助模式对NumPy数组或 `WifiWaveform.samples` 做互相关，直接截取公共区间，绝不解析Descriptor、恢复seed或重新生成参考；只有盲分析模式才调用 `ParseWifi` 恢复包起点、格式、MCS、FFT/GI、空间结构和参考样值。三条路径之后共用 `SigProc`；具备Wi-Fi元数据时再用 `FrameProcess` 计算严格子载波EVM。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
 6. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
 
@@ -431,8 +431,10 @@ flowchart TD
     mimo --> matrix["MimoPaModel.Process：samples × chains"]
     matrix --> chain
     mimo --> relative["input/outputPowerDbPerChain"]
-    calibration["PowerCalibration：dBm 与 RMS 电压互换"] --> absolute["targetOutputPowerDbmPerChain"]
-    absolute --> mimo
+    targetPower["目标输出功率 dBm"] --> calibration["PowerCalibration：闭环更新隐藏输入预设"]
+    calibration --> mimo
+    mimo --> measuredPower["测量PA有效突发输出功率"]
+    measuredPower --> calibration
 ```
 
 **图示说明：**
@@ -443,7 +445,7 @@ flowchart TD
 - `GMPPA.Process` 使用 `DelaySignal` 构造主项、滞后包络项和超前包络项；未提供系数时由 `DefaultGmpCoefficients` 创建稳定的默认模型。
 - `IQImbalancePA` 在已有 PA 输出上增加共轭镜像，用于测试增广 ILC；`AddAwgn` 模拟反馈接收链噪声。
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
-- `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。
+- `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。它反复改变PA输入并测量真实输出，直到目标误差进入容限，不在PA输出端追加常数增益。
 - `MimoPaModel` 不在链间引入隐含耦合：每一列进入独立 `PaModel`。`ProcessChain` 是单路 ILC 看到的真实 plant；相对 dB 与绝对 dBm 功率设置均在该路径中生效。
 
 ### `inc/lib/DpdIlc.py`
@@ -540,9 +542,13 @@ flowchart TD
     gain --> result["SignalProcessingResult"]
     result --> corrected["processedSignal"]
     result --> estimates["时延 / CFO / SFO / 复增益估计"]
-    powerCaller["PA / 功率扫描调用方"] --> calibration["PowerCalibration"]
+    powerCaller["主程序 / 功率扫描调用方"] --> calibration["PowerCalibration"]
     calibration --> dbmToRms["DbmToRms"]
     calibration --> rmsToDbm["RmsToDbm"]
+    calibration --> trialInput["生成候选PA输入"]
+    trialInput --> paOrInstrument["PA模型或仪表适配器"]
+    paOrInstrument --> activePower["测量有效突发输出功率"]
+    activePower --> calibration
 ```
 
 **图示说明：**
@@ -552,7 +558,7 @@ flowchart TD
 - 多窗口局部相关峰的截距给出分数时延，随时间的斜率给出采样频偏 ppm。
 - `InterpolateSignal` 使用有限长度 Lanczos-sinc 核把测量记录重采样到参考网格，随后除去最小二乘公共复增益。
 - `SignalProcessingResult` 同时保存校正样点和所有标量估计，`ToDict()` 可用于记录估计结果。
-- `PowerCalibration` 在同一信号处理模块中集中完成复包络 RMS 电压与绝对功率 dBm 的双向换算，PA 与功率扫描共享相同端口阻抗约定。
+- `PowerCalibration` 在同一信号处理模块中集中完成复包络 RMS 电压与绝对功率 dBm 的双向换算，并闭环调整PA输入。返回值是收敛后的PA输入，最后一次实测PA输出通过 `GetLastPaOutput()` 取得；内部预设对调用方隐藏。
 
 ### `inc/lib/Analysis.py`
 
@@ -614,7 +620,7 @@ flowchart TD
 - 原有显式参考路径保持不变：构造时保存参考信号和 `WifiWaveform`，待测输出传给 `Analyze(measuredSignal)`。
 - 传入 `transmittedSignal` 时进入发送辅助路径。发送和接收都可为NumPy数组或 `WifiWaveform`；内部直接取得样值、搜索公共重叠区并将发送样值作为Reference，不调用 `ParseWifi`，也不恢复Descriptor、seed、MCS或GI。发送波形可以被裁剪或前后补零。
 - 仅当既没有 `waveform`、也没有 `transmittedSignal` 时进入盲分析路径，第一个输入作为接收帧交给 `ParseWifi`，恢复上下文后允许零参数 `Analyze()`。
-- `AnalyzeIlcHistory` 在ILC完成后读取每轮保存的输入和PA输出，用普通 `Analyze` 逐轮计算模拟输出功率、SNR、EVM和ACLR；`AnalyzeMimoIlcHistory` 先按轮组合各PA链，再使用完整空间流接收结构分析。主程序和 `SmallestSISO.py` 在调用它们之前，只替换每轮记录中的输出为有效区目标dBm校准版本，原生MSE、同步结果和候选输入保持不变。两者都在Analysis层按严格EVM返回最佳轮。
+- `AnalyzeIlcHistory` 在ILC完成后读取每轮保存的真实输入和PA输出，用普通 `Analyze` 逐轮计算模拟输出功率、SNR、EVM和ACLR；`AnalyzeMimoIlcHistory` 先按轮组合各PA链，再使用完整空间流接收结构分析。主程序和 `SmallestSISO.py` 不再替换或缩放每轮PA输出，因此功率、压缩和EVM变化保持物理一致。两者都在Analysis层按严格EVM返回最佳轮。
 - 每次 `Analyze` 只调用一次 `SigProc.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
 - SNR 直接计算校正后数据字段与参考的残差功率；EVM 由 `FrameProcess` 根据 `WifiWaveform` 的数据字段位置去循环前缀、FFT、撤销 CSD 和空间解映射，再与采用相同接收路径得到的参考星座比较。
 - ACLR 通过 `AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
@@ -622,7 +628,7 @@ flowchart TD
 - `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
 - `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、模拟输出功率、公共复增益幅相和输入峰值。
 - MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA 输出功率/SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
-- `AnalyzePowerEvmCurve` 接收一组严格递增的每路PA输出功率点和多个方法求值器，以25 dBm默认极限为0 dB输出回退确定归一化驱动。每种方法的输出按有效突发RMS重新生成到同一横轴dBm，并保持原浮点或定点公开接口；物理目标RMS电压另存用于功率审计，避免把伏特误当成定点码。`SavePowerEvmCurveData` 只保存原始CSV/JSON数据，不导入或调用任何绘图库。
+- 当前版本的功率-EVM扫描采用闭环输入功率校准：每个求值器作为完整“DPD+PA”被反复运行，输入驱动由 `PowerCalibration` 隐式调整，直到实测PA输出落入横轴目标容限；不对方法输出做PA后重标定。因此曲线EVM对应真实压缩工作点。
 
 ### `inc/utils/Draw.py`
 
@@ -809,7 +815,7 @@ assert waveform.oversampling == 2.5
 ### `PowerCalibration` 参数与方法（位于 `inc/utils/SigProc.py`）
 
 当前构造函数签名为
-`PowerCalibration(loadResistanceOhm=None, maximumOutputPowerDbm=None, parameters=None, width=None, **parameterOverrides)`。
+`PowerCalibration(loadResistanceOhm=None, maximumOutputPowerDbm=None, paModel=None, parameters=None, width=None, **parameterOverrides)`。
 该类同时支持归一化公开波形和物理电压波形。归一化模式把有效区RMS等于1映射为 `maximumOutputPowerDbm`；物理电压模式约定复包络的RMS幅度等于电阻端口上的RF RMS电压，因此
 
 ```text
@@ -823,21 +829,29 @@ P(dBm) = 10 log10(P(W) / 0.001)
 | `maximumOutputPowerDbm` | `25.0` | 每路PA额定极限输出功率；请求的输出功率不得超过此值。 |
 | `outputPowerDbm` | `20.0` | `Calibrate(inputSignal)` 使用的SISO或各路共同目标输出功率。 |
 | `outputPowerDbmPerChain` | `None` | MIMO逐路目标dBm；配置后优先于共同的 `outputPowerDbm`。 |
+| `calibrationToleranceDb` | `0.25` | 每路实测PA输出功率与目标值允许的最大绝对误差；用户可按仪表精度收紧。 |
+| `maximumCalibrationIterations` | `60` | 闭环功率校准最多允许的PA激励与测量次数。 |
+| `calibrationLearningRate` | `0.8` | 尚未括住目标时，dB域功率误差转换为驱动修正量的比例。 |
+| `maximumDriveAdjustmentDb` | `6.0` | 单轮隐藏驱动预设允许变化的最大dB值。 |
 | `activePowerThresholdDb` | `-60.0` | 相对每路峰值的有效样点功率门限；前后补零和低于门限的关断区不进入RMS。 |
 | `activeGapToleranceSamples` | `16` | 填充有效区内部短低幅空洞的最大长度；更长静默区按占空比关断处理。 |
 | `width` | `16` | 归一化公开波形的I/Q位宽；`0`为浮点，正数输入输出整数I/Q码。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
-| `Calibrate(inputSignal)` | 任意初始幅度的SISO/MIMO公开波形 | 直接读取类内目标功率配置，识别有效区并返回校准后的同形状波形；调用时只需传入波形。 |
+| `SetPaModel(paModel)` | 具有 `Process(inputSignal)` 的PA或测量适配器 | 绑定闭环被测对象并清除上一个PA的隐藏预设。 |
+| `Calibrate(inputSignal)` | 任意初始幅度的SISO/MIMO原始波形 | 反复生成PA输入、调用PA并测量有效突发输出功率；收敛后返回PA输入，而不是缩放PA输出。 |
+| `GetLastPaInput()` | 无 | 返回最后一次收敛并实际送入PA的公开波形副本。 |
+| `GetLastPaOutput()` | 无 | 返回闭环最后一次PA实测输出，无需重复激励PA。 |
+| `GetLastCalibrationMetrics()` | 无 | 返回目标、实测功率、误差和迭代次数；不公开内部驱动预设。 |
 | `DbmToRms(powerDbm)` | 任意有限 dBm 数值 | 返回该功率在所配置端口上的复包络 RMS 电压。 |
 | `RmsToDbm(signalRms)` | 正的有限 RMS 电压 | 返回对应的绝对功率 dBm。 |
 | `OutputPowerToDriveScale(outputPowerDbm)` | 不大于极限的输出dBm | 按输出回退量返回归一化PA驱动比例。 |
 | `NormalizedRmsToOutputPowerDbm(normalizedRms)` | 正的归一化有效区RMS | 按额定满量程功率返回对应输出dBm。 |
 | `FindActiveSampleMask(inputSignal)` | 任意一致线性尺度的波形 | 逐链返回有效突发布尔掩码，排除前后补零和长静默，保留短过零间隙。 |
 | `CalculateActiveRmsPerChain(inputSignal)` | 单路或多路波形 | 仅用每路有效样点能量与样点数计算RMS。 |
-| `CalibrateWaveformToOutputPower(inputSignal, outputPowerDbm)` | 任意初始幅度公开波形、共同目标 | 去除原始RMS尺度，重新生成每路达到相同目标dBm的浮点样值或定点码值。 |
-| `CalibrateWaveformToOutputPowers(inputSignal, outputPowerDbmPerChain)` | 任意初始幅度公开波形、逐链目标 | 对MIMO每路独立识别有效区并重标定；定点模式补偿量化后RMS误差。 |
+| `CalibrateWaveformToOutputPower(inputSignal, outputPowerDbm)` | 任意初始幅度公开波形、共同目标 | 兼容性数值接口：不经过PA测量，直接重标定波形；不能用于设定真实PA压缩工作点。 |
+| `CalibrateWaveformToOutputPowers(inputSignal, outputPowerDbmPerChain)` | 任意初始幅度公开波形、逐链目标 | 上述兼容接口的MIMO版本，不用于主流程或Benchmark。 |
 | `ScaleSignalToOutputPower(signal, outputPowerDbm)` | 物理电压波形、每路目标dBm | 按有效区RMS用常数增益把单路或全部链标定到相同目标输出功率。 |
 | `ScaleSignalToOutputPowers(signal, outputPowerDbmPerChain)` | 物理电压波形、逐链目标 | 按端口阻抗分别标定每路物理电压输出。 |
 | `GetParameters()` | 无 | 返回当前解析参数。 |
@@ -847,13 +861,16 @@ P(dBm) = 10 log10(P(W) / 0.001)
 
 ```python
 powerCalibration = PowerCalibration(
+    paModel=paModel,
     parameters={
         "outputPowerDbm": 22.0,
         "maximumOutputPowerDbm": 25.0,
         "width": 0,
     }
 )
-calibratedWaveform = powerCalibration.Calibrate(inputWaveform)
+paInputWaveform = powerCalibration.Calibrate(inputWaveform)
+paOutputWaveform = powerCalibration.GetLastPaOutput()
+calibrationMetrics = powerCalibration.GetLastCalibrationMetrics()
 ```
 
 MIMO独立功率使用 `outputPowerDbmPerChain=(22.0, 21.0, 20.0, 19.0)`，调用方式仍然是同一个 `Calibrate(inputWaveform)`。
@@ -1383,8 +1400,6 @@ python main.py --format EHT --bandwidth 20 --tx-antennas 4 --spatial-streams 2 -
 ### 示例六：Python API 构造 4×2 MIMO 和独立 PA
 
 ```python
-import numpy as np
-
 from inc.lib.Analysis import Analysis
 from inc.lib.PaModel import MimoPaModel
 from inc.lib.WaveGenWifi import WaveGenWifi
@@ -1399,20 +1414,7 @@ wifiGenerator = WaveGenWifi(
     spatialMapping="dft",
 )
 waveform = wifiGenerator.Generate()
-powerCalibration = PowerCalibration(
-    loadResistanceOhm=50.0,
-    maximumOutputPowerDbm=25.0,
-)
 outputPowerDbmPerChain = (22.0, 21.0, 20.0, 19.0)
-driveScalePerChain = np.asarray(
-    [
-        powerCalibration.OutputPowerToDriveScale(outputPowerDbm)
-        for outputPowerDbm in outputPowerDbmPerChain
-    ]
-)
-referenceSignal = (
-    waveform.samples * driveScalePerChain.reshape(1, -1)
-)
 
 mimoPaModel = MimoPaModel(
     numTransmitChains=4,
@@ -1425,11 +1427,16 @@ mimoPaModel = MimoPaModel(
     maximumOutputPowerDbm=25.0,
     loadResistanceOhm=50.0,
 )
-rawPaOutput = mimoPaModel.Process(referenceSignal)
-paOutput = powerCalibration.CalibrateWaveformToOutputPowers(
-    rawPaOutput,
-    outputPowerDbmPerChain,
+powerCalibration = PowerCalibration(
+    paModel=mimoPaModel,
+    parameters={
+        "loadResistanceOhm": 50.0,
+        "maximumOutputPowerDbm": 25.0,
+        "outputPowerDbmPerChain": outputPowerDbmPerChain,
+    },
 )
+referenceSignal = powerCalibration.Calibrate(waveform.samples)
+paOutput = powerCalibration.GetLastPaOutput()
 
 resultAnalysis = Analysis(referenceSignal, waveform)
 resultAnalysis.AnalyzeStages({"MIMO PA": paOutput})
@@ -1509,8 +1516,6 @@ paOutput = paModel.Process(referenceSignal)
 ### 示例九：程序化运行频域 ILC 并批量分析
 
 ```python
-from dataclasses import replace
-
 from inc.lib.Analysis import Analysis
 from inc.lib.DpdIlc import ILCConfig, RunFrequencyDomainIlc
 from inc.lib.PaModel import PaModel
@@ -1528,18 +1533,22 @@ wifiGenerator = WaveGenWifi(
     }
 )
 waveform = wifiGenerator.Generate()
-referenceSignal = 0.24 * waveform.samples
-paModel = PaModel(parameters={"modelName": "gmp"})
+paModel = PaModel(
+    parameters={
+        "modelName": "gmp",
+        "width": 16,
+    }
+)
 outputPowerDbm = 20.0
 powerCalibration = PowerCalibration(
+    paModel=paModel,
     parameters={
         "outputPowerDbm": outputPowerDbm,
         "width": 16,
     }
 )
-baselineOutput = powerCalibration.Calibrate(
-    paModel.Process(referenceSignal)
-)
+referenceSignal = powerCalibration.Calibrate(waveform.samples)
+baselineOutput = powerCalibration.GetLastPaOutput()
 resultAnalysis = Analysis(referenceSignal, waveform)
 
 ilcConfig = ILCConfig(
@@ -1555,21 +1564,13 @@ ilcResult = RunFrequencyDomainIlc(
     waveform.bandwidthHz,
     ilcConfig,
 )
-calibratedIlcHistory = tuple(
-    replace(
-        iterationRecord,
-        outputSignal=powerCalibration.Calibrate(
-            iterationRecord.outputSignal
-        ),
-    )
-    for iterationRecord in ilcResult.history
-)
 ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(
-    calibratedIlcHistory
+    ilcResult.history
 )
-selectedIlcOutput = powerCalibration.Calibrate(
-    paModel.Process(ilcAnalysisResult.bestInputSignal)
+selectedIlcInput = powerCalibration.Calibrate(
+    ilcAnalysisResult.bestInputSignal
 )
+selectedIlcOutput = powerCalibration.GetLastPaOutput()
 
 stageMetrics = resultAnalysis.AnalyzeStages(
     {

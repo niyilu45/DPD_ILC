@@ -1,7 +1,6 @@
 """Command-line entry point for the VHT/HE/EHT DPD-ILC simulation project."""
 
 import argparse
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -498,15 +497,6 @@ def Main() -> int:
                 else outputPowerDbmPerChain
             ),
         )
-        driveScalePerChain = np.asarray(
-            [
-                powerCalibration.OutputPowerToDriveScale(
-                    targetOutputPowerDbm
-                )
-                for targetOutputPowerDbm in outputPowerDbmPerChain
-            ],
-            dtype=float,
-        )
         useMimoPaFacade = wifiGenerator.numTransmitAntennas > 1 or any(
             value is not None
             for value in (
@@ -560,15 +550,11 @@ def Main() -> int:
 
     waveform = wifiGenerator.Generate()
     interfaceFormat = FixedPoint(wifiGenerator.width)
-    if waveform.samples.ndim == 1:
-        referenceSignal = (
-            float(driveScalePerChain[0]) * waveform.samples
-        )
-    else:
-        referenceSignal = (
-            waveform.samples
-            * driveScalePerChain.reshape(1, -1)
-        )
+    powerCalibration.SetPaModel(paModel)
+    # Closed-loop calibration regenerates the PA input, measures the actual
+    # active-burst output power, and hides every preset correction from the
+    # caller. The converged input becomes the ILC operating-point reference.
+    referenceSignal = powerCalibration.Calibrate(waveform.samples)
     analysisOverrides = {
         "loadResistanceOhm": powerCalibration.loadResistanceOhm,
         "maximumOutputPowerDbm": (
@@ -584,10 +570,13 @@ def Main() -> int:
     )
     resultDraw = Draw()
 
-    # The first pass establishes the unlinearized baseline at the requested
-    # operating point. The same PA instance is reused for every comparison.
-    baselineOutputRaw = paModel.Process(referenceSignal)
-    baselineOutput = powerCalibration.Calibrate(baselineOutputRaw)
+    # Reuse the accepted calibration capture as the unlinearized baseline.
+    # This avoids an unnecessary second PA transaction for instrument-backed
+    # adapters while preserving the exact converged operating point.
+    baselineOutput = powerCalibration.GetLastPaOutput()
+    baselineCalibrationMetrics = (
+        powerCalibration.GetLastCalibrationMetrics()
+    )
     floatingBaselineOutput = interfaceFormat.DecodeComplex(
         baselineOutput
     )
@@ -636,23 +625,8 @@ def Main() -> int:
             waveform.bandwidthHz,
             ilcConfig,
         )
-        # ILC must learn from the native PA response, but RF reporting must
-        # evaluate the regenerated waveform at the requested conducted power.
-        # Replacing only the stored output preserves every learning-domain MSE,
-        # synchronization estimate, and candidate input in the native record.
-        calibratedIlcHistory = tuple(
-            replace(
-                iterationRecord,
-                outputSignal=(
-                    powerCalibration.Calibrate(
-                        iterationRecord.outputSignal
-                    )
-                ),
-            )
-            for iterationRecord in ilcResult.history
-        )
         ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(
-            calibratedIlcHistory
+            ilcResult.history
         )
     else:
         ilcResult = RunMimoFrequencyDomainIlc(
@@ -662,35 +636,18 @@ def Main() -> int:
             waveform.bandwidthHz,
             ilcConfig,
         )
-        # Calibrate every stored PA column independently so each MIMO round
-        # uses the same per-chain power convention as the final clean replay.
-        calibratedChainHistories = tuple(
-            tuple(
-                replace(
-                    iterationRecord,
-                    outputSignal=(
-                        powerCalibration.CalibrateWaveformToOutputPower(
-                            iterationRecord.outputSignal,
-                            outputPowerDbmPerChain[chainIndex],
-                        )
-                    ),
-                )
-                for iterationRecord in chainResult.history
-            )
-            for chainIndex, chainResult in enumerate(
-                ilcResult.chainResults
-            )
-        )
         ilcAnalysisResult = resultAnalysis.AnalyzeMimoIlcHistory(
-            calibratedChainHistories
+            tuple(
+                chainResult.history
+                for chainResult in ilcResult.chainResults
+            )
         )
-    selectedIlcInput = ilcAnalysisResult.bestInputSignal
-    # Analysis selects the best measured round. Re-run that input through the
-    # plant once so final reported performance excludes optional feedback noise.
-    selectedIlcOutputRaw = paModel.Process(selectedIlcInput)
-    selectedIlcOutput = powerCalibration.Calibrate(
-        selectedIlcOutputRaw
+    # Scale the selected learned waveform at the PA input and close the loop
+    # on measured output power. The waveform shape remains the ILC solution.
+    selectedIlcInput = powerCalibration.Calibrate(
+        ilcAnalysisResult.bestInputSignal
     )
+    selectedIlcOutput = powerCalibration.GetLastPaOutput()
 
     # ILC labels are waveform-specific. Ridge-regression fitting converts them
     # into a causal GMP that can be evaluated on subsequent Wi-Fi packets.
@@ -725,13 +682,13 @@ def Main() -> int:
         floatingDeployedDpdInput[overLimit] *= (
             arguments.maxAmplitude / deployedMagnitude[overLimit]
         )
-    deployedDpdInput = interfaceFormat.EncodeComplex(
+    rawDeployedDpdInput = interfaceFormat.EncodeComplex(
         floatingDeployedDpdInput
     )
-    deployedDpdOutputRaw = paModel.Process(deployedDpdInput)
-    deployedDpdOutput = powerCalibration.Calibrate(
-        deployedDpdOutputRaw
+    deployedDpdInput = powerCalibration.Calibrate(
+        rawDeployedDpdInput
     )
+    deployedDpdOutput = powerCalibration.GetLastPaOutput()
 
     resultAnalysis.AnalyzeStages(
         {
@@ -760,14 +717,9 @@ def Main() -> int:
         )
     )
     print(
-        "Normalized output-backoff drive scales: "
-        + ", ".join(
-            f"PA {chainIndex + 1}={driveScale:.6f}"
-            for chainIndex, driveScale in enumerate(
-                driveScalePerChain
-            )
-        )
-        + "\n"
+        "Closed-loop baseline power calibration: "
+        f"{baselineCalibrationMetrics['iterationCount']} iteration(s), "
+        "hidden drive preset converged\n"
     )
     print(
         "Measured baseline PA output powers: "
@@ -836,8 +788,9 @@ def Main() -> int:
         "paTargetOutputPowerDbmPerChain": list(
             outputPowerDbmPerChain
         ),
-        "normalizedDriveScalePerChain": (
-            driveScalePerChain.tolist()
+        "baselinePowerCalibration": baselineCalibrationMetrics,
+        "deployedPowerCalibration": (
+            powerCalibration.GetLastCalibrationMetrics()
         ),
         "maximumOutputPowerDbm": (
             powerCalibration.maximumOutputPowerDbm

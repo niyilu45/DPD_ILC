@@ -4,7 +4,7 @@ import warnings
 from collections import ChainMap
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Dict, Mapping, Optional, Sequence, Tuple, cast
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -16,13 +16,15 @@ from .FixedPoint import FixedPoint
 
 
 class PowerCalibration:
-    """Calibrate physical-voltage and normalized public waveforms in dBm.
+    """Close the PA input-drive loop against measured output power in dBm.
 
     The project uses the explicit convention that the RMS magnitude of a
     complex baseband waveform is the RMS voltage delivered to the configured
     resistive port for the physical-voltage methods. Under this convention
     ``P = Vrms**2 / R``. Normalized public waveforms instead map active-region
-    RMS equal to one onto ``maximumOutputPowerDbm``. Both paths exclude
+    PA-output RMS equal to one onto ``maximumOutputPowerDbm``. Closed-loop
+    calibration changes only the PA input preset and observes the bound PA;
+    it never scales PA output to force a target. All measurements exclude
     leading/trailing padding and long off intervals from the RMS denominator.
     """
 
@@ -30,6 +32,7 @@ class PowerCalibration:
         self,
         loadResistanceOhm: Optional[float] = None,
         maximumOutputPowerDbm: Optional[float] = None,
+        paModel: Optional[Any] = None,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
         **parameterOverrides: object,
@@ -45,13 +48,16 @@ class PowerCalibration:
         Args:
             loadResistanceOhm: Optional resistive port value in ohms.
             maximumOutputPowerDbm: Optional rated PA output-power ceiling.
+            paModel: Optional PA or measurement adapter exposing
+                ``Process(inputSignal)``. It is required only by the
+                closed-loop ``Calibrate`` method.
             parameters: Optional caller-owned mapping of calibration values.
             width: Optional public I/Q width used by normalized waveform
                 calibration. None selects the internal 16-bit default.
             parameterOverrides: Highest-priority local calibration overrides.
 
         Returns:
-            result: None. The converter is ready for dBm/RMS transformations.
+            result: None. Conversion and optional closed-loop state are ready.
         """
 
         self.defaultParameters: Mapping[str, object] = MappingProxyType(
@@ -60,6 +66,10 @@ class PowerCalibration:
                 "maximumOutputPowerDbm": 25.0,
                 "outputPowerDbm": 20.0,
                 "outputPowerDbmPerChain": None,
+                "calibrationToleranceDb": 0.25,
+                "maximumCalibrationIterations": 60,
+                "calibrationLearningRate": 0.8,
+                "maximumDriveAdjustmentDb": 6.0,
                 "activePowerThresholdDb": -60.0,
                 "activeGapToleranceSamples": 16,
                 "width": 16,
@@ -95,7 +105,21 @@ class PowerCalibration:
             externalParameters,
             self.defaultParameters,
         )
+        self.paModel: Optional[Any] = None
+        self._paProcessMethod: Optional[Any] = None
+        self._calibrationDriveDbPerChain: Tuple[float, ...] = tuple()
+        self._calibrationTargetPowerDbmPerChain: Tuple[
+            float, ...
+        ] = tuple()
+        self._lastCalibratedPaInput: Optional[np.ndarray] = None
+        self._lastCalibratedPaOutput: Optional[np.ndarray] = None
+        self._lastMeasuredOutputPowerDbmPerChain: Tuple[
+            float, ...
+        ] = tuple()
+        self._lastCalibrationIterationCount = 0
         self.Validate()
+        if paModel is not None:
+            self.SetPaModel(paModel)
 
     @property
     def LoadResistanceOhm(self) -> float:
@@ -290,36 +314,356 @@ class PowerCalibration:
             raise ValueError(
                 "activeGapToleranceSamples must be a nonnegative integer"
             )
+        calibrationToleranceDb = self.parameters[
+            "calibrationToleranceDb"
+        ]
+        if (
+            not isinstance(calibrationToleranceDb, (int, float))
+            or isinstance(calibrationToleranceDb, bool)
+            or not np.isfinite(calibrationToleranceDb)
+            or float(calibrationToleranceDb) <= 0.0
+        ):
+            raise ValueError(
+                "calibrationToleranceDb must be finite and positive"
+            )
+        maximumCalibrationIterations = self.parameters[
+            "maximumCalibrationIterations"
+        ]
+        if (
+            not isinstance(maximumCalibrationIterations, int)
+            or isinstance(maximumCalibrationIterations, bool)
+            or maximumCalibrationIterations < 1
+        ):
+            raise ValueError(
+                "maximumCalibrationIterations must be a positive integer"
+            )
+        calibrationLearningRate = self.parameters[
+            "calibrationLearningRate"
+        ]
+        if (
+            not isinstance(calibrationLearningRate, (int, float))
+            or isinstance(calibrationLearningRate, bool)
+            or not np.isfinite(calibrationLearningRate)
+            or not 0.0 < float(calibrationLearningRate) <= 1.0
+        ):
+            raise ValueError(
+                "calibrationLearningRate must be in the interval (0, 1]"
+            )
+        maximumDriveAdjustmentDb = self.parameters[
+            "maximumDriveAdjustmentDb"
+        ]
+        if (
+            not isinstance(maximumDriveAdjustmentDb, (int, float))
+            or isinstance(maximumDriveAdjustmentDb, bool)
+            or not np.isfinite(maximumDriveAdjustmentDb)
+            or float(maximumDriveAdjustmentDb) <= 0.0
+        ):
+            raise ValueError(
+                "maximumDriveAdjustmentDb must be finite and positive"
+            )
         FixedPoint(self.width)
 
-    def Calibrate(self, inputSignal: np.ndarray) -> np.ndarray:
-        """Calibrate a public waveform using the configured power target.
+    def SetPaModel(self, paModel: Any) -> None:
+        """Bind the PA or measurement adapter used by closed-loop calibration.
 
         Processing details:
-            Algorithm: Read ``outputPowerDbmPerChain`` from the live
-            ChainMap when independent MIMO targets are configured; otherwise
-            use the common ``outputPowerDbm`` value. Delegate effective-burst
-            detection, arbitrary-RMS removal, floating/fixed conversion, and
-            per-chain scaling to the existing waveform calibration engine.
+            Algorithm: Require a callable object or a callable ``Process``
+            method and the same public fixed-point width as this calibrator.
+            Reset the hidden drive preset because a different PA has a
+            different AM-AM curve.
+
+        Args:
+            paModel: PA model, instrument adapter, or callback facade exposing
+                ``Process(inputSignal)`` and an optional ``width`` property.
+
+        Returns:
+            result: None. Subsequent ``Calibrate`` calls use this PA.
+        """
+
+        processMethod = getattr(paModel, "Process", None)
+        if processMethod is None and callable(paModel):
+            processMethod = paModel
+        if not callable(processMethod):
+            raise TypeError(
+                "paModel must expose Process(inputSignal) or be callable"
+            )
+        paWidth = getattr(paModel, "width", self.width)
+        FixedPoint(paWidth)
+        if int(paWidth) != self.width:
+            raise ValueError(
+                "PowerCalibration and paModel must use the same width"
+            )
+        self.paModel = paModel
+        self._paProcessMethod = processMethod
+        self._calibrationDriveDbPerChain = tuple()
+        self._calibrationTargetPowerDbmPerChain = tuple()
+        self._lastCalibratedPaInput = None
+        self._lastCalibratedPaOutput = None
+        self._lastMeasuredOutputPowerDbmPerChain = tuple()
+        self._lastCalibrationIterationCount = 0
+
+    def GetLastPaInput(self) -> np.ndarray:
+        """Return the last converged waveform sent to the PA.
+
+        Processing details:
+            Algorithm: Copy the cached public floating or fixed-point input so
+            callers cannot mutate the hidden calibration state.
+
+        Returns:
+            result: Last converged PA input waveform.
+        """
+
+        if self._lastCalibratedPaInput is None:
+            raise RuntimeError("Calibrate must run before GetLastPaInput")
+        return self._lastCalibratedPaInput.copy()
+
+    def GetLastPaOutput(self) -> np.ndarray:
+        """Return the PA observation from the converged calibration trial.
+
+        Processing details:
+            Algorithm: Copy the cached PA output produced at the accepted
+            hidden drive preset, avoiding an unnecessary extra PA capture.
+
+        Returns:
+            result: Last PA output waveform measured inside ``Calibrate``.
+        """
+
+        if self._lastCalibratedPaOutput is None:
+            raise RuntimeError("Calibrate must run before GetLastPaOutput")
+        return self._lastCalibratedPaOutput.copy()
+
+    def GetLastCalibrationMetrics(self) -> Dict[str, object]:
+        """Return convergence results without exposing the hidden preset.
+
+        Processing details:
+            Algorithm: Report target powers, measured powers, residual errors,
+            and iteration count while intentionally keeping the internally
+            updated PA drive preset private.
+
+        Returns:
+            result: Ordinary dictionary describing the accepted calibration.
+        """
+
+        if not self._lastMeasuredOutputPowerDbmPerChain:
+            raise RuntimeError(
+                "Calibrate must run before GetLastCalibrationMetrics"
+            )
+        targetPowers = self._calibrationTargetPowerDbmPerChain
+        measuredPowers = self._lastMeasuredOutputPowerDbmPerChain
+        return {
+            "targetOutputPowerDbmPerChain": targetPowers,
+            "measuredOutputPowerDbmPerChain": measuredPowers,
+            "errorDbPerChain": tuple(
+                targetPowerDbm - measuredPowerDbm
+                for targetPowerDbm, measuredPowerDbm in zip(
+                    targetPowers, measuredPowers
+                )
+            ),
+            "iterationCount": self._lastCalibrationIterationCount,
+            "converged": True,
+        }
+
+    def Calibrate(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Find the PA input waveform that meets configured output power.
+
+        Processing details:
+            Algorithm: Normalize only the original waveform's active-region
+            RMS, apply a hidden per-chain drive preset, send the regenerated
+            waveform through the bound PA, and measure the actual active PA
+            output power. Update the preset in the logarithmic amplitude
+            domain. Once measurements bracket a target, use bisection;
+            otherwise use a bounded proportional correction. Repeat until
+            every chain is within ``calibrationToleranceDb``.
 
         Args:
             inputSignal: Arbitrarily scaled public waveform vector or
                 samples-by-chain matrix.
 
         Returns:
-            result: A newly calibrated waveform with the same shape and
-                public floating/fixed interface convention as the input.
+            result: Converged PA input waveform with the same shape and public
+                floating/fixed interface convention as the original input.
         """
 
-        targetPowers = self.parameters["outputPowerDbmPerChain"]
-        if targetPowers is None:
-            return self.CalibrateWaveformToOutputPower(
-                inputSignal,
-                float(cast(float, self.parameters["outputPowerDbm"])),
+        if self._paProcessMethod is None:
+            raise RuntimeError(
+                "PowerCalibration.Calibrate requires a bound paModel"
             )
-        return self.CalibrateWaveformToOutputPowers(
-            inputSignal,
-            tuple(float(powerDbm) for powerDbm in targetPowers),
+        # A failed new calibration must never leave an older converged capture
+        # visible through the public getters.
+        self._lastCalibratedPaInput = None
+        self._lastCalibratedPaOutput = None
+        self._lastMeasuredOutputPowerDbmPerChain = tuple()
+        self._lastCalibrationIterationCount = 0
+        interfaceFormat = FixedPoint(self.width)
+        floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+        if (
+            floatingInput.ndim not in (1, 2)
+            or floatingInput.size == 0
+            or floatingInput.shape[0] == 0
+            or not np.all(np.isfinite(floatingInput))
+        ):
+            raise ValueError(
+                "inputSignal must be a finite nonempty vector or matrix"
+            )
+        inputWasVector = floatingInput.ndim == 1
+        inputMatrix = (
+            floatingInput.reshape(-1, 1)
+            if inputWasVector
+            else floatingInput
+        )
+        chainCount = inputMatrix.shape[1]
+        configuredTargetPowers = self.parameters[
+            "outputPowerDbmPerChain"
+        ]
+        if configuredTargetPowers is None:
+            targetPowers = tuple(
+                float(cast(float, self.parameters["outputPowerDbm"]))
+                for _ in range(chainCount)
+            )
+        else:
+            targetPowers = tuple(
+                float(powerDbm)
+                for powerDbm in configuredTargetPowers
+            )
+            if len(targetPowers) != chainCount:
+                raise ValueError(
+                    "outputPowerDbmPerChain must contain one value per "
+                    "waveform chain"
+                )
+
+        inputRmsPerChain = np.asarray(
+            self.CalculateActiveRmsPerChain(inputMatrix),
+            dtype=float,
+        )
+        normalizedInput = (
+            inputMatrix / inputRmsPerChain.reshape(1, -1)
+        )
+        targetPowerArray = np.asarray(targetPowers, dtype=float)
+        if (
+            self._calibrationTargetPowerDbmPerChain == targetPowers
+            and len(self._calibrationDriveDbPerChain) == chainCount
+        ):
+            driveDb = np.asarray(
+                self._calibrationDriveDbPerChain, dtype=float
+            )
+        else:
+            driveDb = (
+                targetPowerArray - self.maximumOutputPowerDbm
+            )
+
+        lowerDriveDb = np.full(chainCount, -np.inf, dtype=float)
+        upperDriveDb = np.full(chainCount, np.inf, dtype=float)
+        toleranceDb = float(
+            self.parameters["calibrationToleranceDb"]
+        )
+        learningRate = float(
+            self.parameters["calibrationLearningRate"]
+        )
+        maximumAdjustmentDb = float(
+            self.parameters["maximumDriveAdjustmentDb"]
+        )
+        maximumIterations = cast(
+            int, self.parameters["maximumCalibrationIterations"]
+        )
+        bestMaximumErrorDb = np.inf
+
+        for iterationIndex in range(maximumIterations):
+            driveScale = np.power(10.0, driveDb / 20.0)
+            trialInputMatrix = (
+                normalizedInput * driveScale.reshape(1, -1)
+            )
+            publicTrialInputMatrix = interfaceFormat.EncodeComplex(
+                trialInputMatrix
+            )
+            publicTrialInput = (
+                publicTrialInputMatrix[:, 0]
+                if inputWasVector
+                else publicTrialInputMatrix
+            )
+            publicPaOutput = np.asarray(
+                self._paProcessMethod(publicTrialInput),
+                dtype=np.complex128,
+            )
+            floatingPaOutput = interfaceFormat.DecodeComplex(
+                publicPaOutput
+            )
+            if floatingPaOutput.ndim == 1:
+                outputMatrix = floatingPaOutput.reshape(-1, 1)
+            elif floatingPaOutput.ndim == 2:
+                outputMatrix = floatingPaOutput
+            else:
+                raise ValueError(
+                    "paModel.Process must return a vector or matrix"
+                )
+            if (
+                outputMatrix.shape[0] == 0
+                or outputMatrix.shape[1] != chainCount
+                or not np.all(np.isfinite(outputMatrix))
+            ):
+                raise ValueError(
+                    "paModel.Process returned invalid chain dimensions "
+                    "or nonfinite samples"
+                )
+            outputRmsPerChain = self.CalculateActiveRmsPerChain(
+                outputMatrix
+            )
+            measuredPowerArray = np.asarray(
+                [
+                    self.NormalizedRmsToOutputPowerDbm(outputRms)
+                    for outputRms in outputRmsPerChain
+                ],
+                dtype=float,
+            )
+            errorDb = targetPowerArray - measuredPowerArray
+            maximumErrorDb = float(np.max(np.abs(errorDb)))
+            if maximumErrorDb < bestMaximumErrorDb:
+                bestMaximumErrorDb = maximumErrorDb
+            if maximumErrorDb <= toleranceDb:
+                self._calibrationDriveDbPerChain = tuple(
+                    float(value) for value in driveDb
+                )
+                self._calibrationTargetPowerDbmPerChain = (
+                    targetPowers
+                )
+                self._lastCalibratedPaInput = publicTrialInput.copy()
+                self._lastCalibratedPaOutput = publicPaOutput.copy()
+                self._lastMeasuredOutputPowerDbmPerChain = tuple(
+                    float(value) for value in measuredPowerArray
+                )
+                self._lastCalibrationIterationCount = (
+                    iterationIndex + 1
+                )
+                return publicTrialInput
+
+            measuredTooLow = errorDb > 0.0
+            lowerDriveDb = np.where(
+                measuredTooLow,
+                np.maximum(lowerDriveDb, driveDb),
+                lowerDriveDb,
+            )
+            upperDriveDb = np.where(
+                measuredTooLow,
+                upperDriveDb,
+                np.minimum(upperDriveDb, driveDb),
+            )
+            hasBracket = np.isfinite(lowerDriveDb) & np.isfinite(
+                upperDriveDb
+            )
+            proportionalAdjustmentDb = np.clip(
+                learningRate * errorDb,
+                -maximumAdjustmentDb,
+                maximumAdjustmentDb,
+            )
+            driveDb = np.where(
+                hasBracket,
+                0.5 * (lowerDriveDb + upperDriveDb),
+                driveDb + proportionalAdjustmentDb,
+            )
+
+        raise RuntimeError(
+            "closed-loop PA power calibration did not converge within "
+            f"{maximumIterations} iterations; best error was "
+            f"{bestMaximumErrorDb:.3f} dB"
         )
 
     def DbmToRms(self, powerDbm: float) -> float:

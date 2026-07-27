@@ -1425,28 +1425,53 @@ p_{\max}=25\ \mathrm{dBm}.
 \mathrm{OBO}_i=p_{\max}-p_i.
 ```
 
-归一化PA驱动比例取为
+名义初始驱动比例取为
 
 ```math
-a_i=10^{-\mathrm{OBO}_i/20}
+a_i^{(0)}
+=10^{-\mathrm{OBO}_i/20}
 =10^{(p_i-p_{\max})/20}.
 ```
 
-所以进入归一化PA模型的参考为
+它只是第一次闭环试探，不直接决定曲线横坐标。第 $k$ 次试探把隐藏驱动预设 $d_i^{(k)}$ 作用于单位有效RMS波形：
 
 ```math
-x_i[n]=a_i x_{\mathrm{unit}}[n].
+x_i^{(k)}[n]
+=
+10^{d_i^{(k)}/20}
+x_{\mathrm{unit}}[n].
 ```
 
-当 $p_i=p_{\max}$ 时，$a_i=1$；当输出回退5 dB时，$a_i\approx0.5623$。这个比例控制PA模型进入压缩区的深度，而不是把输出dBm误当成输入端电压。
-
-PA或DPD方法先产生归一化输出
+把整个补偿方法与PA视为一个可重复测量的被测对象：
 
 ```math
-z_{i,m}[n]=\mathcal{F}_m(x_i[n]).
+y_{i,m}^{(k)}[n]
+=
+\mathcal{F}_m
+\left(
+x_i^{(k)}[n]
+\right).
 ```
 
-目标输出功率一方面换算成每路物理RMS电压，用于结果审计：
+对 $y_{i,m}^{(k)}[n]$ 的有效突发计算实测功率 $p_{i,m}^{(k)}$。`PowerCalibration` 根据误差
+
+```math
+e_{i,m}^{(k)}
+=
+p_i-p_{i,m}^{(k)}
+```
+
+更新 $d_i^{(k)}$；获得上下界后用二分，直到
+
+```math
+\left|
+e_{i,m}^{(k)}
+\right|
+\leq
+\epsilon_P.
+```
+
+因此横坐标 $p_i$ 是PA实测输出功率目标，不是按名义比例推测出来的功率，也不是对PA输出做常数缩放得到的功率。目标功率仍换算成每路物理RMS电压，用于结果审计：
 
 ```math
 P_i=10^{-3}10^{p_i/10}.
@@ -1456,7 +1481,7 @@ P_i=10^{-3}10^{p_i/10}.
 V_i=\sqrt{R P_i}.
 ```
 
-另一方面，归一化公开波形的目标有效区RMS为：
+归一化输出有效区RMS与dBm之间的报告关系为：
 
 ```math
 A_{i,\mathrm{target}}
@@ -1464,64 +1489,36 @@ A_{i,\mathrm{target}}
 10^{(p_i-p_{\max})/20}.
 ```
 
-令 $M_{i,m}[n]$ 为有效突发掩码，则每种方法的输出标定增益为
+浮点模式把每轮试探输入直接送入方法求值器。定点模式先将试探输入编码为原位宽整数I/Q码，PA输出再按相同位宽解码后测功率；量化和削顶由此真实影响闭环与EVM。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
 
-```math
-g_{i,m}
-=
-\frac{
-A_{i,\mathrm{target}}
-}{
-\sqrt{
-\frac{
-\sum_n M_{i,m}[n]|z_{i,m}[n]|^2
-}{
-\sum_n M_{i,m}[n]
-}
-}
-},
-```
-
-```math
-y_{i,m}[n]=g_{i,m}z_{i,m}[n].
-```
-
-因此每条曲线在横轴位置 $p_i$ 上都对应相同的有效突发目标平均输出功率。浮点模式下常数 $g_{i,m}$ 只改变整体幅度，不改变EVM、SNR残差比或ACLR功率比。
-
-定点模式不能把物理电压 $V_i$ 直接送回整数码接口。代码改用 `CalibrateWaveformToOutputPower`：先把 $z_{i,m}[n]$ 解码为归一化浮点，按有效区RMS缩放，再重新编码为相同位宽的公开整数I/Q码。这样Analysis收到的数据类型和数值尺度都正确。定点取整通常只产生很小差异；如果目标功率导致码值削顶，函数会警告，因为此时EVM可能发生变化。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
-
-`outputPowerDbmValues` 必须有限且严格递增，每一点都不得超过 `maximumOutputPowerDbm`。结果对象同时保存 `driveScaleValues` 和 `targetOutputRmsValues`，分别用于审计归一化压缩工作点和50 Ω物理输出标定。
+`outputPowerDbmValues` 必须有限且严格递增，每一点都不得超过 `maximumOutputPowerDbm`。结果对象保留的 `driveScaleValues` 只是由额定极限计算的名义初始试探比例，不是闭环最终隐藏预设；`targetOutputRmsValues` 用于审计50 Ω物理输出标定。
 
 ### 8.3 公平比较原则
 
-对每个输出功率点和每种方法，分析器都使用同一个输出回退驱动：
-
-```math
-\mathbf x_i=
-10^{(p_i-p_{\max})/20}\mathbf x_{\mathrm{unit}}.
-```
-
-所有输出都对应相同的 $p_i$ 驱动工作点，随后按有效突发重新生成同一目标功率的公开波形，并调用相同的 `CalculateEvm`。物理电压标定作为独立报告量保存，不回灌定点分析接口。这样曲线差异来自补偿方法本身，而不是占空比、输出功率、输入帧、随机种子或指标定义不同。
+对每个输出功率点和每种方法，分析器都独立闭环到相同的PA实测输出功率。不同方法最终需要的输入预设可以不同，这正是非线性增益和DPD行为的一部分。闭环结束后直接把PA实测波形交给相同的 `CalculateEvm`，不做后级幅度重标定。这样曲线差异来自补偿方法在同一实际输出功率下的失真，而不是占空比、输入帧、随机种子或指标定义不同。
 
 ```mermaid
 flowchart LR
-    P["目标输出功率 p1,p2,... dBm"] --> K["相对25 dBm极限计算输出回退"]
-    A["归一化Wi-Fi波形"] --> B["乘归一化驱动比例 a1,a2,..."]
+    P["目标输出功率 p1,p2,... dBm"] --> K["初始化隐藏驱动预设"]
+    A["归一化Wi-Fi波形"] --> B["生成当前试探输入"]
     K --> B
     B --> C1["Baseline PA"]
-    B --> C2["Frequency ILC"]
-    B --> C3["Time-domain ILC"]
-    B --> C4["Fitted/Deployed DPD"]
-    C1 --> calibration["有效突发RMS重标定<br/>保持浮点或定点公开接口"]
+    B --> C2["Frequency ILC + PA"]
+    B --> C3["Time-domain ILC + PA"]
+    B --> C4["Fitted DPD + PA"]
+    C1 --> calibration["测量有效突发PA输出功率"]
     C2 --> calibration
     C3 --> calibration
     C4 --> calibration
-    calibration --> D["统一 Analysis.CalculateEvm"]
+    calibration --> decision{"误差进入容限？"}
+    decision -->|否| update["更新隐藏预设并重新运行方法"]
+    update --> B
+    decision -->|是| D["实测输出送入统一 CalculateEvm"]
     K --> G["单独保存目标RMS电压<br/>用于功率审计"]
     D --> E["同图功率–EVM 曲线"]
 ```
 
-**图 7 说明**：每个方法看到相同的归一化输出回退驱动。方法输出再按有效突发RMS重标定到横轴dBm；定点数据重新量化为原位宽整数码，目标dBm对应的物理RMS电压单独保存，避免把伏特误当作整数码。学习型ILC可以在每个点重新迭代；部署型DPD可以固定标称点系数并跨功率测试。
+**图 7 说明**：每个方法的隐藏输入驱动可以不同，但PA实测输出功率必须落在相同横轴目标的容限内。方法输出不再重标定；定点试探始终使用原位宽整数码。学习型ILC可以在每个闭环试探点重新迭代；部署型DPD可以固定标称点系数并跨功率测试。
 
 ### 8.4 曲线怎样阅读
 

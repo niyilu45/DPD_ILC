@@ -149,19 +149,18 @@ from inc.utils.SigProc import PowerCalibration
 waveform = wifiGenerator.Generate()
 paOutputPowerDbm = 20.0
 powerCalibration = PowerCalibration(
+    paModel=paModel,
     parameters={
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
         "outputPowerDbm": paOutputPowerDbm,
     }
 )
-driveScale = powerCalibration.OutputPowerToDriveScale(
-    paOutputPowerDbm
-)
-referenceSignal = driveScale * waveform.samples
+referenceSignal = powerCalibration.Calibrate(waveform.samples)
+baselineOutput = powerCalibration.GetLastPaOutput()
 ```
 
-对调用方公开的工作点是 `paOutputPowerDbm`。默认额定极限为25 dBm，20 dBm对应5 dB输出回退和约0.5623的归一化驱动比例。PA非线性处理后，只需调用 `powerCalibration.Calibrate(paOutput)`；该函数从类内参数读取目标功率，自动识别Wi-Fi有效突发，排除前后补零和长占空比静默，再用常数比例重新生成20 dBm输出。原始PA输出不要求预先归一化。浮点常数标定不会改变EVM或ACLR比值，定点模式重新量化，发生削顶时会警告。
+对调用方公开的工作点是 `paOutputPowerDbm`。20 dBm相对25 dBm额定极限的5 dB回退只作为第一次驱动预设。`Calibrate` 会把重新生成的输入真正送入 `paModel`，对PA输出的有效Wi-Fi突发测量功率，再在内部更新预设并重试；返回值是收敛后的PA输入，最后一次实测输出由 `GetLastPaOutput()` 取得。整个过程不对PA输出做后级常数缩放，因此EVM和ACLR反映实际压缩工作点。
 
 ### 4.4 PA对象接口要求
 
@@ -236,7 +235,7 @@ V_{\mathrm{out,RMS}}
 
 20 dBm相对25 dBm极限具有5 dB输出回退。提高目标输出功率会提高归一化驱动，把PA推向更深压缩；降低目标输出功率则增加回退量。最终功率标定按有效突发RMS改变输出标尺，不改变PA内部非线性工作点；50%占空比的长关断区不会让报告功率额外降低3.01 dB。
 
-ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和PA输出。运行结束后，示例先仅替换每轮记录的 `outputSignal` 为目标dBm校准波形，保留原生MSE、同步估计和候选输入，再调用 `resultAnalysis.AnalyzeIlcHistory(calibratedIlcHistory)` 计算每轮严格的数据子载波EVM、SNR和ACLR。若反馈链加入了噪声，应像示例一样把最佳输入重新送入PA，并再次执行相同的有效区功率校准，得到用于最终性能报告的干净输出。
+ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和真实PA输出。运行结束后，直接调用 `resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 计算每轮严格的数据子载波EVM、SNR、ACLR和实际输出功率，禁止替换或缩放 `outputSignal`。若需要在规定dBm工作点复测最佳输入，应把该输入交给绑定PA的 `PowerCalibration.Calibrate`，再从 `GetLastPaOutput()` 取得闭环收敛的干净输出。
 
 ---
 
@@ -1022,8 +1021,6 @@ flowchart LR
 ### 14.2 完整4×2示例
 
 ```python
-from dataclasses import replace
-
 from inc.lib.Analysis import Analysis
 from inc.lib.DpdIlc import (
     FitMimoGmpPredistorter,
@@ -1052,26 +1049,6 @@ targetOutputPowerDbmPerChain = np.asarray(
     (22.0, 21.0, 20.0, 19.0),
     dtype=float,
 )
-powerCalibration = PowerCalibration(
-    parameters={
-        "loadResistanceOhm": 50.0,
-        "maximumOutputPowerDbm": 25.0,
-        "outputPowerDbmPerChain": tuple(
-            targetOutputPowerDbmPerChain
-        ),
-    }
-)
-driveScalePerChain = np.asarray(
-    [
-        powerCalibration.OutputPowerToDriveScale(powerDbm)
-        for powerDbm in targetOutputPowerDbmPerChain
-    ],
-    dtype=float,
-)
-referenceSignal = (
-    waveform.samples * driveScalePerChain[np.newaxis, :]
-)
-
 mimoPaModel = MimoPaModel(
     parameters={
         "numTransmitChains": 4,
@@ -1085,6 +1062,18 @@ mimoPaModel = MimoPaModel(
         "maximumOutputPowerDbm": 25.0,
     }
 )
+powerCalibration = PowerCalibration(
+    paModel=mimoPaModel,
+    parameters={
+        "loadResistanceOhm": 50.0,
+        "maximumOutputPowerDbm": 25.0,
+        "outputPowerDbmPerChain": tuple(
+            targetOutputPowerDbmPerChain
+        ),
+    }
+)
+referenceSignal = powerCalibration.Calibrate(waveform.samples)
+baselineOutput = powerCalibration.GetLastPaOutput()
 
 mimoConfig = ILCConfig(
     numIterations=8,
@@ -1101,46 +1090,30 @@ mimoResult = RunMimoFrequencyDomainIlc(
     mimoConfig,
 )
 resultAnalysis = Analysis(referenceSignal, waveform)
-calibratedChainHistories = tuple(
-    tuple(
-        replace(
-            iterationRecord,
-            outputSignal=(
-                powerCalibration.CalibrateWaveformToOutputPower(
-                    iterationRecord.outputSignal,
-                    targetOutputPowerDbmPerChain[chainIndex],
-                )
-            ),
-        )
-        for iterationRecord in chainResult.history
-    )
-    for chainIndex, chainResult in enumerate(mimoResult.chainResults)
-)
 mimoIlcAnalysis = resultAnalysis.AnalyzeMimoIlcHistory(
-    calibratedChainHistories
+    tuple(
+        chainResult.history
+        for chainResult in mimoResult.chainResults
+    )
 )
-selectedMimoRawOutput = mimoPaModel.Process(
+selectedMimoInput = powerCalibration.Calibrate(
     mimoIlcAnalysis.bestInputSignal
 )
+selectedMimoOutput = powerCalibration.GetLastPaOutput()
 
 mimoPredistorter = FitMimoGmpPredistorter(
     referenceSignal,
-    mimoIlcAnalysis.bestInputSignal,
+    selectedMimoInput,
     nonlinearOrders=(1, 3, 5, 7),
     memoryDepth=3,
     crossMemoryDepth=2,
     ridgeFactor=1e-6,
 )
-deployedInput = mimoPredistorter.Process(referenceSignal)
-deployedRawOutput = mimoPaModel.Process(deployedInput)
-
-baselineOutput = powerCalibration.Calibrate(
-    mimoPaModel.Process(referenceSignal)
+rawDeployedInput = mimoPredistorter.Process(referenceSignal)
+deployedInput = powerCalibration.Calibrate(
+    rawDeployedInput
 )
-selectedMimoOutput = powerCalibration.Calibrate(
-    selectedMimoRawOutput
-)
-deployedOutput = powerCalibration.Calibrate(deployedRawOutput)
+deployedOutput = powerCalibration.GetLastPaOutput()
 physicalAnalysis = Analysis(referenceSignal, waveform)
 physicalAnalysis.AnalyzeStages(
     {
@@ -1170,21 +1143,29 @@ secondChainHistory = mimoResult.chainResults[chainIndex].history
 
 ### 14.4 每路独立输出功率
 
-推荐先配置每路目标输出功率和 25 dBm 额定极限，再由 `PowerCalibration` 分别计算每路驱动比例：
+推荐把每路目标输出功率、25 dBm额定极限和完整MIMO PA绑定到 `PowerCalibration`，随后只传原始矩阵：
 
 ```python
 powerCalibration = PowerCalibration(
-    loadResistanceOhm=50.0,
-    maximumOutputPowerDbm=25.0,
+    paModel=mimoPaModel,
+    parameters={
+        "loadResistanceOhm": 50.0,
+        "maximumOutputPowerDbm": 25.0,
+        "outputPowerDbmPerChain": (
+            22.0,
+            21.0,
+            20.0,
+            19.0,
+        ),
+    },
 )
-targetOutputPowerDbmPerChain = (22.0, 21.0, 20.0, 19.0)
-driveScalePerChain = tuple(
-    powerCalibration.OutputPowerToDriveScale(powerDbm)
-    for powerDbm in targetOutputPowerDbmPerChain
-)
+paInput = powerCalibration.Calibrate(waveform.samples)
+paOutput = powerCalibration.GetLastPaOutput()
 ```
 
-若只进行 PA 系统级功率对齐，也可直接给 `MimoPaModel` 设置绝对输出功率：
+`PowerCalibration` 会同时更新各列隐藏驱动预设，但必须等待所有PA链的实测输出误差都进入容限才返回。
+
+旧接口也允许直接给 `MimoPaModel` 设置绝对输出功率：
 
 ```python
 mimoPaModel = MimoPaModel(
@@ -1210,7 +1191,7 @@ mimoPaModel.SetTargetOutputPowerDbm(
 )
 ```
 
-学习 PA 非线性时，推荐把 `targetOutputPowerDbmPerChain` 保持为 `None`：先用输出回退量得到固定驱动比例，ILC 在未归一化的原始 PA 映射上学习，结束后再用 `CalibrateWaveformToOutputPowers` 按有效突发校准归一化公开输出。直接在每次 PA 调用内部强制绝对 dBm 会根据当前输出反复缩放，可能掩盖部分 AM-AM 幅度变化；目标功率重标定应位于一次PA处理之后、RF指标分析之前。
+学习 PA 非线性时，推荐把 `MimoPaModel.targetOutputPowerDbmPerChain` 保持为 `None`。该旧参数会在PA内部直接缩放输出，可能掩盖AM-AM变化。主流程应由外部 `PowerCalibration` 调整PA输入并观察真实输出：闭环只在建立或复测目标工作点时运行，ILC内部保存的每轮PA输出不做后级功率重标定。
 
 ### 14.5 读取每路实际输出功率
 

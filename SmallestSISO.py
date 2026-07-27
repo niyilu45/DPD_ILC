@@ -1,6 +1,5 @@
 """Run the smallest SISO ILC example in floating and fixed-point modes."""
 
-from dataclasses import replace
 from pathlib import Path
 from typing import Dict
 
@@ -51,7 +50,6 @@ def RunSisoMode(
         },
     )
     waveform = wifiGenerator.Generate()
-    waveformPower = np.abs(waveform.samples) ** 2
     waveformPeakAmplitude = float(
         np.max(np.abs(waveform.samples))
     )
@@ -59,33 +57,6 @@ def RunSisoMode(
     waveformMaximumI = float(np.max(waveform.samples.real))
     waveformMinimumQ = float(np.min(waveform.samples.imag))
     waveformMaximumQ = float(np.max(waveform.samples.imag))
-    waveformPaprDb = float(
-        10.0
-        * np.log10(
-            np.max(waveformPower)
-            / max(
-                float(np.mean(waveformPower)),
-                np.finfo(float).tiny,
-            )
-        )
-    )
-
-    # The requested 20 dBm operating point becomes a drive ratio. In fixed
-    # mode the multiplication acts on public integer codes; PaModel rounds
-    # those codes and decodes them before normalized floating processing.
-    loadResistanceOhm = 50.0
-    powerCalibration = PowerCalibration(
-        parameters={
-            "loadResistanceOhm": loadResistanceOhm,
-            "maximumOutputPowerDbm": maximumOutputPowerDbm,
-            "outputPowerDbm": paOutputPowerDbm,
-            "width": width,
-        },
-    )
-    driveScale = powerCalibration.OutputPowerToDriveScale(
-        paOutputPowerDbm
-    )
-    referenceSignal = driveScale * waveform.samples
 
     # WaveGenWifi, PaModel, and Analysis use the same public interface width.
     # Fixed-mode arrays contain integer-valued I/Q codes in a complex128
@@ -96,8 +67,22 @@ def RunSisoMode(
             "width": width,
         },
     )
-    baselineOutputRaw = paModel.Process(referenceSignal)
-    baselineOutput = powerCalibration.Calibrate(baselineOutputRaw)
+
+    # Closed-loop calibration owns the hidden drive preset. It repeatedly
+    # regenerates the original Wi-Fi waveform, measures the actual PA output,
+    # and returns the converged PA input without exposing preset corrections.
+    loadResistanceOhm = 50.0
+    powerCalibration = PowerCalibration(
+        paModel=paModel,
+        parameters={
+            "loadResistanceOhm": loadResistanceOhm,
+            "maximumOutputPowerDbm": maximumOutputPowerDbm,
+            "outputPowerDbm": paOutputPowerDbm,
+            "width": width,
+        },
+    )
+    referenceSignal = powerCalibration.Calibrate(waveform.samples)
+    baselineOutput = powerCalibration.GetLastPaOutput()
     resultAnalysis = Analysis(
         referenceSignal,
         waveform,
@@ -124,27 +109,15 @@ def RunSisoMode(
         ilcConfig,
     )
 
-    # Analysis remains independent from the ILC update rule. ILC learns from
-    # the native PA response, while each saved output is regenerated at the
-    # configured conducted power before RF metrics are calculated. Replacing
-    # only outputSignal preserves the native MSE and learned candidate input.
-    calibratedIlcHistory = tuple(
-        replace(
-            iterationRecord,
-            outputSignal=(
-                powerCalibration.Calibrate(iterationRecord.outputSignal)
-            ),
-        )
-        for iterationRecord in ilcResult.history
-    )
+    # Preserve native ILC measurements. Post-PA power normalization would hide
+    # the real compression point and is intentionally not applied.
     ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(
-        calibratedIlcHistory
+        ilcResult.history
     )
-    selectedIlcInput = ilcAnalysisResult.bestInputSignal
-    selectedIlcOutputRaw = paModel.Process(selectedIlcInput)
-    selectedIlcOutput = (
-        powerCalibration.Calibrate(selectedIlcOutputRaw)
+    selectedIlcInput = powerCalibration.Calibrate(
+        ilcAnalysisResult.bestInputSignal
     )
+    selectedIlcOutput = powerCalibration.GetLastPaOutput()
     selectedMetrics = resultAnalysis.Analyze(selectedIlcOutput)
     resultAnalysis.AnalyzeStages(
         {
@@ -183,7 +156,6 @@ def RunSisoMode(
         "waveformMaximumI": waveformMaximumI,
         "waveformMinimumQ": waveformMinimumQ,
         "waveformMaximumQ": waveformMaximumQ,
-        "waveformPaprDb": waveformPaprDb,
         "configuredOutputPowerDbm": paOutputPowerDbm,
         "measuredOutputPowerDbm": measuredOutputPowerDbm,
     }

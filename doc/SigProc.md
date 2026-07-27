@@ -475,7 +475,7 @@ processingResult = resultAnalysis.GetLastSignalProcessingResult()
 
 ## 13. PA输出dBm、输出回退与复包络标定
 
-`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它负责dBm/RMS换算、根据额定输出功率计算归一化输出回退驱动，并用常数增益标定PA输出；它不执行PA非线性。
+`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它负责dBm/RMS换算、根据额定输出功率产生第一次输入驱动预设，并闭环调整PA输入；PA非线性仍由绑定的PA模型或仪表实现。它不会在PA输出端乘常数增益来伪造目标功率。
 
 工程约定复包络 RMS 幅度等于纯电阻端口上的 RF RMS 电压。设端口电阻为 $R$，RMS 电压为 $V_{\mathrm{RMS}}$，则端口平均功率为
 
@@ -516,13 +516,16 @@ flowchart LR
     dbm["绝对功率 dBm"] --> watt["按1 mW参考换算瓦特"]
     resistance["loadResistanceOhm"] --> rms["计算RMS电压"]
     watt --> rms
-    rms --> signal["缩放单位RMS复包络"]
-    signal --> measured["测量RMS电压"]
-    measured --> dbmOutput["换算输出功率 dBm"]
+    rms --> preset["生成第一次输入驱动预设"]
+    preset --> pa["PA模型或仪表"]
+    pa --> measured["测量有效突发RMS电压"]
+    measured --> dbmOutput["换算实测输出功率 dBm"]
     resistance --> dbmOutput
+    dbmOutput --> error["与目标dBm比较"]
+    error --> preset
 ```
 
-**图 3 说明：**`PowerCalibration` 为主程序、`PaModel`、`Analysis` 和 Benchmark 提供同一个端口阻抗基准。它位于 `SigProc.py` 后，`Analysis` 不再需要为了功率换算而导入 `PaModel.py`。其 `ChainMap` 参数同样遵循“未知键警告并忽略、已识别非法值继续报错”的规则。
+**图 3 说明：**`PowerCalibration` 为主程序、`PaModel`、`Analysis` 和 Benchmark 提供同一个端口阻抗基准。箭头回路表示每次都重新生成PA输入并重新观测实际PA输出，而不是对已有输出做离线缩放。它位于 `SigProc.py` 后，`Analysis` 不再需要为了功率换算而导入 `PaModel.py`。其 `ChainMap` 参数同样遵循“未知键警告并忽略、已识别非法值继续报错”的规则。
 
 默认每路PA极限输出功率为
 
@@ -540,14 +543,11 @@ P_{\max}=25\ \mathrm{dBm}.
 a=10^{-\mathrm{OBO}/20}.
 ```
 
-默认20 dBm工作点对应5 dB回退和 $a\approx0.5623$。这里必须区分两个动作：
+默认20 dBm工作点对应5 dB名义回退和 $a\approx0.5623$。这个数只作为闭环第一次试探的驱动预设，不能假定经过非线性PA后一定正好得到20 dBm。
 
-1. `OutputPowerToDriveScale` 在PA之前设置归一化驱动，从而决定压缩深度；
-2. `Calibrate` 从类内 `outputPowerDbm` 或 `outputPowerDbmPerChain` 读取目标，在PA之后重新生成达到目标dBm的公开波形，从而决定Analysis看到的绝对输出功率。
+`Calibrate(inputSignal)` 是推荐的统一公开入口。构造 `PowerCalibration` 时绑定具有 `Process(inputSignal)` 接口的PA模型或仪表适配器，并把目标功率写入 `parameters`。函数内部重复执行“生成PA输入—实际激励PA—测量有效突发功率—更新隐藏预设”，直到每一路误差均不超过 `calibrationToleranceDb`。调用方只传原始波形，不需要读写每轮驱动预设。
 
-第二步只施加逐链常数比例，浮点模式下不会改变归一化EVM和ACLR功率比。定点模式还要重新量化，若达到目标功率需要削顶，会发出警告，因为此时量化或削顶可能改变EVM。
-
-`Calibrate(inputSignal)` 是推荐的统一公开入口。功率配置在构造 `PowerCalibration` 时通过 `parameters` 写入，因此处理时只向函数送入波形，不需要在每一次调用中重复传递目标dBm。`outputPowerDbmPerChain` 不为 `None` 时按矩阵列独立校准，否则所有链使用共同的 `outputPowerDbm`。
+闭环返回的是最终PA输入波形；`GetLastPaOutput()` 返回收敛判定所使用的最后一次PA实测输出。代码不会在PA后把输出乘常数来伪造目标dBm，因此AM-AM压缩、AM-PM、EVM和ACLR均对应真实驱动工作点。`outputPowerDbmPerChain` 不为 `None` 时逐列独立闭环，否则所有链使用共同的 `outputPowerDbm`。
 
 ### 13.1 有效信号区间与占空比
 
@@ -633,12 +633,12 @@ flowchart LR
 
 **图 4 说明：**短空洞通常是OFDM过零或瞬时低包络，仍属于有效突发；长空洞表示占空比关断，不进入功率分母。缩放仍作用于整条波形，所以原来的零样点继续为零，时间位置和占空比均不改变。
 
-### 13.2 任意初始幅度到目标dBm
+### 13.2 PA闭环输入功率校准
 
-输入波形不需要事先归一化。对第 $m$ 路先按有效集合 $\mathcal A_m$ 计算
+输入波形不需要事先归一化。对第 $m$ 路原始波形 $x_m[n]$，先按有效集合 $\mathcal A_m$ 计算
 
 ```math
-A_m
+A_{x,m}
 =
 \sqrt{
 \frac{
@@ -649,53 +649,116 @@ A_m
 }.
 ```
 
-目标dBm相对额定满量程的归一化RMS为
+保持波形形状不变的单位有效RMS波形为
 
 ```math
-A_{m,\mathrm{target}}
+\bar{x}_m[n]
 =
-10^{
-\left(
-P_{m,\mathrm{target}}-P_{\max}
-\right)/20
-}.
+\frac{x_m[n]}{A_{x,m}}.
 ```
 
-重新生成的波形为
+第 $k$ 次试探使用隐藏驱动预设 $d_m^{(k)}$，单位为dB：
 
 ```math
-x_{m,\mathrm{cal}}[n]
+u_m^{(k)}[n]
 =
+10^{d_m^{(k)}/20}\bar{x}_m[n].
+```
+
+把 $u_m^{(k)}[n]$ 真正送入PA或仪表适配器，得到
+
+```math
+y_m^{(k)}[n]
+=
+\mathcal{P}_m\left\{
+u_m^{(k)}[n]
+\right\}.
+```
+
+仅在输出有效集合上计算RMS，并映射为实测功率：
+
+```math
+A_{y,m}^{(k)}
+=
+\sqrt{
 \frac{
-A_{m,\mathrm{target}}
+\sum_n M_{y,m}^{(k)}[n]
+\left|y_m^{(k)}[n]\right|^2
 }{
-A_m
+\sum_n M_{y,m}^{(k)}[n]
 }
-x_m[n].
+},
 ```
 
-因此原波形的RMS可以是0.03、1、2.7或任意其他有限正数；校准结果只由波形形状、有效区掩码、目标dBm和额定满量程决定。`NormalizedRmsToOutputPowerDbm` 使用反向关系
-
 ```math
-P_{m,\mathrm{out}}
+P_{m,\mathrm{meas}}^{(k)}
 =
 P_{\max}
 +20\log_{10}
 \left(
-A_{m,\mathrm{active}}
+A_{y,m}^{(k)}
 \right).
 ```
 
+功率误差定义为
+
+```math
+e_m^{(k)}
+=
+P_{m,\mathrm{target}}
+-P_{m,\mathrm{meas}}^{(k)}.
+```
+
+尚未在目标两侧获得试探点时，采用有界比例更新：
+
+```math
+d_m^{(k+1)}
+=
+d_m^{(k)}
++\mathrm{clip}
+\left(
+\mu e_m^{(k)},
+-\Delta_{\max},
+\Delta_{\max}
+\right).
+```
+
+上式中的 `clip` 表示把修正量限制在正负 `maximumDriveAdjustmentDb` 之间。默认 $\mu=0.8$、$\Delta_{\max}=6$ dB。
+
+一旦已知一个“输出偏低”的下界 $d_{m,L}$ 和一个“输出偏高”的上界 $d_{m,U}$，后续改用二分：
+
+```math
+d_m^{(k+1)}
+=
+\frac{
+d_{m,L}+d_{m,U}
+}{2}.
+```
+
+收敛条件是所有PA链同时满足
+
+```math
+\left|
+e_m^{(k)}
+\right|
+\leq
+\epsilon_P,
+```
+
+其中默认 $\epsilon_P=0.25$ dB，最多试探60次；用户可按仪表重复性和目标精度收紧容限。收敛后的 $d_m$ 保存在类内部并作为下一次同目标校准的初值，但 `GetLastCalibrationMetrics()` 只返回目标、实测功率、残差和迭代次数，不把隐藏预设暴露给用户。若PA饱和、定点满量程或仪表限幅导致目标不可达，函数在达到迭代上限后明确报错，而不是对PA输出做后级缩放。
+
+该闭环假设目标附近的有效突发平均输出功率随输入驱动单调不减，这对正常AM-AM曲线成立。若真实仪表反馈噪声大于功率容限，应先增加仪表平均次数或放宽 `calibrationToleranceDb`；若PA存在热记忆或迟滞，应保证每轮测量使用相同等待时间和采集条件，否则二分上下界可能不再代表同一静态映射。
+
 ### 13.3 定点接口
 
-`width=0` 时输入输出均为浮点复包络。`width>0` 时输入和输出均为公开整数I/Q码，容器类型仍为 `numpy.complex128`；模块内部先解码为归一化浮点，再做有效区检测和校准，最后重新编码。
+`width=0` 时输入输出均为浮点复包络。`width>0` 时输入和输出均为公开整数I/Q码，容器类型仍为 `numpy.complex128`。闭环每一轮先把隐藏驱动预设作用于内部浮点波形，再编码为整数码送入PA；PA返回的整数码重新解码后才计算实测功率。因此量化、DAC满量程和削顶都真实进入反馈结果。若定点接口无法达到目标功率，闭环会在迭代上限后报错。
 
-定点取整使“缩放后再量化”的RMS成为分段常数函数。`CalibrateFixedColumn` 因此使用二分搜索寻找量化前比例 $c$：
+兼容接口 `CalibrateWaveformToOutputPower` 不经过PA闭环。它的定点取整使“缩放后再量化”的RMS成为分段常数函数，底层 `CalibrateFixedColumn` 因此使用二分搜索寻找量化前比例 $c$：
 
 ```math
 \widehat c
 =
-\underset{c\geq0}{\mathop{\mathrm{arg\,min}}}
+\underset{c\geq0}{\mathrm{arg\,min}}
 \left|
 \sqrt{
 \frac{
@@ -715,7 +778,9 @@ Q_w(c\,x[n])
 
 ### 13.4 归一化满量程与物理电压两种接口
 
-`Calibrate` 用于本工程的归一化公开波形：归一化有效区RMS等于1对应 `maximumOutputPowerDbm`。它内部根据配置调用 `CalibrateWaveformToOutputPower` 或 `CalibrateWaveformToOutputPowers`；后两者作为显式目标功率的兼容和高级接口保留。
+`Calibrate` 是本工程设置PA工作点的闭环接口：它绑定PA，调整PA输入，并用PA实测输出判断收敛。归一化输出有效区RMS等于1对应 `maximumOutputPowerDbm`。
+
+`CalibrateWaveformToOutputPower` 和 `CalibrateWaveformToOutputPowers` 仅作为兼容性数值接口保留。它们直接把给定数组缩放到目标归一化RMS，不调用PA，也不能用于验证真实AM-AM压缩点。主程序、`SmallestSISO.py`、Benchmark和功率-EVM扫描均不再使用这两个接口。
 
 `ScaleSignalToOutputPower` 和 `ScaleSignalToOutputPowers` 用于已经采用物理伏特单位的复包络：它们按端口阻抗把目标dBm转换为RMS电压。两组接口都使用相同的有效区掩码，但不能混淆数值尺度。
 
@@ -736,6 +801,7 @@ from inc.utils.FixedPoint import FixedPoint
 from inc.utils.SigProc import PowerCalibration
 
 powerCalibration = PowerCalibration(
+    paModel=paModel,
     parameters={
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
@@ -745,10 +811,10 @@ powerCalibration = PowerCalibration(
         "width": 16,
     },
 )
-driveScale = powerCalibration.OutputPowerToDriveScale(20.0)
-rawOutput = paModel.Process(driveScale * waveform.samples)
-calibratedOutput = powerCalibration.Calibrate(rawOutput)
-decodedOutput = FixedPoint(16).DecodeComplex(calibratedOutput)
+paInput = powerCalibration.Calibrate(waveform.samples)
+paOutput = powerCalibration.GetLastPaOutput()
+calibrationMetrics = powerCalibration.GetLastCalibrationMetrics()
+decodedOutput = FixedPoint(16).DecodeComplex(paOutput)
 measuredRms = powerCalibration.CalculateActiveRmsPerChain(
     decodedOutput
 )[0]
@@ -763,7 +829,8 @@ MIMO只需把类内目标改为逐链序列，函数调用不变：
 powerCalibration.UpdateParameters(
     outputPowerDbmPerChain=(22.0, 21.0, 20.0, 19.0)
 )
-calibratedMimoOutput = powerCalibration.Calibrate(rawMimoOutput)
+calibratedMimoInput = powerCalibration.Calibrate(rawMimoInput)
+measuredMimoOutput = powerCalibration.GetLastPaOutput()
 ```
 
 如果输入是物理电压，则改用：

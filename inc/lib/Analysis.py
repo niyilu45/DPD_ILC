@@ -1758,23 +1758,22 @@ class Analysis:
     ) -> PowerEvmCurve:
         """Evaluate multiple methods over one common absolute-power sweep.
 
-        Every evaluator receives a reference waveform driven according to the
-        requested output backoff and the numeric output dBm value. The rated
-        maximum output is zero backoff. Target RMS voltages are retained for
-        physical-power reporting, while raw public PA codes feed EVM directly.
-        A physical calibration gain would not alter EVM or ACLR ratios and
-        must not be reinterpreted as fixed-point I/Q codes.
+        Every evaluator is treated as a complete DPD-plus-PA plant. For each
+        requested dBm point, ``PowerCalibration`` iteratively changes the
+        plant input, observes actual active-burst output power, and stops only
+        inside the configured tolerance. No post-PA amplitude normalization
+        is applied, so EVM reflects the PA's true compression operating point.
 
         Args:
             outputPowerDbmValues: Strictly increasing absolute per-PA output
                 powers in dBm, no greater than ``maximumOutputPowerDbm``.
             methodEvaluators: Mapping from display name to a callable that
-                accepts the output-backoff-scaled reference and target output
-                dBm, and returns the corresponding PA output waveform.
+                accepts the trial reference and target output dBm, and returns
+                the corresponding measured PA output waveform.
 
         Returns:
-            result: Power-EVM curve containing output powers, normalized drive
-                scales, target RMS voltages, and per-method EVM arrays.
+            result: Power-EVM curve containing output powers, nominal initial
+                drive scales, target RMS voltages, and per-method EVM arrays.
         """
 
         if self.waveform is None:
@@ -1844,25 +1843,24 @@ class Analysis:
         for methodName, methodEvaluator in methodEvaluators.items():
             methodEvmDb = []
             methodEvmPercent = []
-            for outputPowerDbm, driveScale in zip(
-                powerDbmArray, driveScaleArray
-            ):
-                pointReference = (
-                    float(driveScale) * self.waveform.samples
+            currentOutputPowerDbm = [float(powerDbmArray[0])]
+            # The mutable one-element list lets one bound callable retain the
+            # calibrator's hidden preset while the requested sweep dBm changes.
+            powerCalibration.SetPaModel(
+                lambda trialInput: methodEvaluator(
+                    trialInput, currentOutputPowerDbm[0]
                 )
-                rawMeasuredSignal = methodEvaluator(
-                    pointReference, float(outputPowerDbm)
+            )
+            for outputPowerDbm in powerDbmArray:
+                currentOutputPowerDbm[0] = float(outputPowerDbm)
+                powerCalibration.UpdateParameters(
+                    outputPowerDbm=float(outputPowerDbm),
+                    outputPowerDbmPerChain=None,
                 )
-                # Every method is regenerated at the same active-burst output
-                # power before analysis. The normalized calibrator preserves
-                # the public floating/fixed interface and excludes padding or
-                # long duty-cycle off intervals from its RMS denominator.
-                measuredSignal = (
-                    powerCalibration.CalibrateWaveformToOutputPower(
-                        rawMeasuredSignal,
-                        float(outputPowerDbm),
-                    )
+                pointReference = powerCalibration.Calibrate(
+                    self.waveform.samples
                 )
+                measuredSignal = powerCalibration.GetLastPaOutput()
                 pointAnalysis = Analysis(
                     pointReference,
                     self.waveform,

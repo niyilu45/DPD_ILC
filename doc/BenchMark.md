@@ -102,7 +102,7 @@ EVM dB 定义为：
 
 ### 5.1 场景构造
 
-训练帧使用 `outputPowerDbm=20` 和 `maximumOutputPowerDbm=25`。输出回退量为 5 dB，对应归一化驱动比例约 0.5623。波形直接进入 Wiener PA，不使用 DPD 或 ILC；PA 原始输出不要求预先归一化，随后按Wi-Fi有效突发RMS重新生成到20 dBm。前后补零和长占空比静默不进入RMS，短暂OFDM过零仍保留。该输出是标称波形更新律、峰值约束和噪声反馈场景的功率基准。
+训练帧使用 `outputPowerDbm=20` 和 `maximumOutputPowerDbm=25`。5 dB回退对应的0.5623只作为闭环第一次驱动预设。`PowerCalibration` 把原始Wi-Fi波形送入Wiener PA，测量实际有效突发输出功率并在内部更新预设，直到误差进入容限。前后补零和长占空比静默不进入RMS，短暂OFDM过零仍保留。基线输出不做PA后幅度重标定，因此它代表真实20 dBm压缩工作点。
 
 ### 5.2 控制变量
 
@@ -372,7 +372,7 @@ IQ 失衡使 EVM 从标称 baseline 的 7.292% 恶化到 8.488%。普通频域 I
 
 ### 10.1 场景构造
 
-每路目标输出功率在 10 dBm 至 25 dBm 之间取 4 个等 dBm 间隔点。25 dBm 是归一化 PA 的额定极限输出，4 个点分别对应 15 dB、10 dB、5 dB 和 0 dB 输出回退。每个功率点都重新设置归一化驱动并为波形 ILC 重新运行学习，不能把 20 dBm 工作点学到的逐样点输入直接缩放后冒充其他功率点的最优解。
+每路目标输出功率在 10 dBm 至 25 dBm 之间取 4 个等 dBm 间隔点。25 dBm 是归一化PA的额定极限输出。每个功率点和每种方法都重新执行闭环输入功率校准；波形ILC求值器会在每次试探输入上重新学习，不能把20 dBm工作点学到的逐样点输入直接缩放后冒充其他功率点的最优解。
 
 第 $i$ 个目标输出功率为：
 
@@ -383,21 +383,21 @@ p_i
 \left(p_{\max}-p_{\min}\right).
 ```
 
-`PowerCalibration` 先根据额定极限输出功率计算归一化驱动比例：
+`PowerCalibration` 用额定极限计算第一次试探的名义驱动比例：
 
 ```math
 d_i
 =10^{(p_i-p_{\mathrm{max}})/20}.
 ```
 
-PA 处理完成后，再按
+每次试探实际运行“DPD+PA”，按有效突发输出RMS计算实测功率 $p_{i,\mathrm{meas}}^{(k)}$，误差为
 
 ```math
-v_{\mathrm{target},i}
-=\sqrt{R\,10^{-3}10^{p_i/10}}
+e_i^{(k)}
+=p_i-p_{i,\mathrm{meas}}^{(k)}.
 ```
 
-对每路原始输出施加常数增益，使其物理 RMS 电压与目标 dBm 一致。这里 $p_i$ 和 $p_{\mathrm{max}}$ 的单位都是 dBm，$R$ 是端口电阻。后置常数增益不改变 EVM、SNR 和 ACLR。
+隐藏输入预设按有界dB修正或括区后二分更新，直到绝对误差进入容限。PA输出不施加后置常数增益，所以EVM、SNR和ACLR均来自实际工作点。
 
 ### 10.2 结果预期
 
@@ -530,9 +530,9 @@ benchmarkRows = RunAllIlcBenchmark(benchmarkConfig)
 | `BenchmarkRow.ToDict` | 单行结果 | 扁平字典 | 让CSV和JSON使用完全相同的数值 |
 | `AddRow` | 方法指标、同场景baseline指标 | 向结果列表追加一行 | 统一SNR、EVM、ACLR改善量的正负方向 |
 | `SaveHistory` | 方法名、`ILCResult`、目录 | 每种方法一个CSV和PNG | 保存每一轮Raw MSE、LC-MSE、EVM-MSE、模拟输出功率和输入峰值 |
-| `ReportHistory` | 方法结果、`Analysis`、功率标定器、目标dBm | 控制台表格并调用 `SaveHistory` | 保留原生MSE和候选输入，只替换每轮输出为有效突发目标功率版本，保证控制台和文件功率口径一致 |
-| `EvaluateDeployment` | 拟合DPD、验证帧、PA、幅度上限、功率标定器 | 普通指标字典 | 在独立帧上执行DPD、限幅、PA、有效区目标dBm重标定和统一分析 |
-| `RunIlcCurvePoint` | 当前功率点参考、额定极限、算法和配置 | 当前功率点PA输出 | 为功率扫描创建当前参考的Analysis，按有效突发校准逐轮输出并重新运行波形ILC |
+| `ReportHistory` | 方法结果、`Analysis`、输出目录 | 控制台表格并调用 `SaveHistory` | 保留原生MSE、候选输入和每轮真实PA输出，不做PA后功率重标定 |
+| `EvaluateDeployment` | 拟合DPD、验证帧、PA、幅度上限、功率标定器 | 普通指标字典 | 在独立帧上执行DPD和限幅，再闭环调整PA输入直到实测输出达到目标dBm，最后统一分析 |
+| `RunIlcCurvePoint` | 当前功率点参考、额定极限、算法和配置 | 当前功率点PA输出 | 为功率扫描创建当前参考的Analysis，保留逐轮真实PA输出并重新运行波形ILC |
 | `RunAllIlcBenchmark` | 可选 `BenchmarkConfig` | 22行 `BenchmarkRow` | 按固定顺序构造A–F类场景并汇总全部结果 |
 | `SaveBenchmarkResults` | 结果行、目录、元数据 | 汇总CSV和JSON | 保存绝对指标、改善量及复现配置 |
 | `PrintBenchmarkResults` | 全部结果行 | 控制台汇总表 | 快速查看不同场景的SNR、EVM和ACLR |
@@ -557,15 +557,19 @@ sequenceDiagram
     BM->>WG: 训练种子生成训练帧
     BM->>WG: 验证种子生成独立帧
     BM->>PA: 创建固定PA
-    BM->>PC: 按有效突发重标定baseline到目标dBm
+    loop baseline闭环功率校准
+        BM->>PC: 生成当前隐藏预设对应的PA输入
+        PC->>PA: 激励PA
+        PA-->>PC: 实测输出波形
+        PC->>PC: 有效突发功率与目标误差
+    end
     BM->>AN: 计算各场景baseline
 
     loop 标称更新律
         BM->>ILC: 相同训练帧和迭代预算
         ILC->>PA: 每轮反馈测量
         ILC-->>BM: ILCResult与逐轮历史
-        BM->>PC: 仅重标定每轮outputSignal
-        BM->>AN: SNR / EVM / ACLR
+        BM->>AN: 直接分析逐轮真实PA输出
         BM->>DR: 收敛曲线
     end
 
@@ -748,19 +752,21 @@ A_{\max}
 
 ```mermaid
 flowchart LR
-    power["目标输出功率 20 dBm/路"] --> backoff["相对25 dBm极限回退5 dB"]
-    unit["单位RMS EHT帧"] --> scale["乘归一化驱动比例0.5623"]
+    power["目标输出功率 20 dBm/路"] --> backoff["初始化隐藏驱动预设"]
+    unit["原始EHT帧"] --> scale["生成当前试探PA输入"]
     backoff --> scale
-    scale --> target["目标与初始PA输入"]
+    scale --> target["实际送入PA"]
     target --> memory["Wiener线性记忆"]
     memory --> amam["Rapp AM-AM"]
     amam --> ampm["AM-PM"]
-    ampm --> outputCalibration["每路输出常数增益校准到20 dBm"]
-    outputCalibration --> analysis["同步补偿与SNR/EVM/ACLR"]
+    ampm --> outputCalibration["测量有效突发输出功率"]
+    outputCalibration --> decision{"误差进入容限？"}
+    decision -->|否| backoff
+    decision -->|是| analysis["同步补偿与SNR/EVM/ACLR"]
     analysis --> baseline["PA baseline"]
 ```
 
-**图 3 说明：**目标输出 dBm 同时决定归一化 PA 的驱动回退和最终物理电平。前者决定压缩程度，后者保证结果文件中的输出电平等于用户配置。后置常数增益不会改变 EVM、SNR 或 ACLR。这里没有单独的无线信道、接收噪声或频偏；`SigProc` 仍由 `Analysis` 调用，使 baseline 与其他场景走相同分析入口。
+**图 3 说明：**目标输出dBm用于初始化并约束闭环。隐藏预设控制PA压缩深度，最终物理电平由PA实测结果判定。不存在PA后常数增益，因此EVM、SNR和ACLR保留真实工作点特征。这里没有单独的无线信道、接收噪声或频偏；`SigProc` 仍由 `Analysis` 调用，使baseline与其他场景走相同分析入口。
 
 ### 15.2 baseline不是一个全局通用数字
 
@@ -1246,7 +1252,7 @@ i=0,1,\ldots,N-1.
 | 3 | 20 | 5 | 0.562341 | 2.236068 |
 | 4 | 25 | 0 | 1.000000 | 3.976354 |
 
-等 dBm 间隔对应几何驱动比例和几何 RMS 电压间隔，更适合观察 PA 输出回退量变化。CSV 同时保存目标输出 dBm、归一化驱动比例和目标输出 RMS 电压，使物理功率配置与数值模型工作点均可审计。每个evaluator产生PA输出后，`AnalyzePowerEvmCurve` 还会按有效突发RMS重新生成到该横轴dBm；因此补零长度、占空比关断时间和方法本身的公共增益不会改变横坐标。
+等 dBm 间隔对应几何名义初始驱动比例和几何 RMS 电压间隔，更适合观察 PA 输出回退量变化。CSV保存的归一化驱动比例仅是闭环初值，不是内部最终预设。`AnalyzePowerEvmCurve` 把每个evaluator当作完整“DPD+PA”被测对象，反复更新输入并重新运行，直到有效突发实测输出落在横轴dBm容限内；绝不对evaluator输出做后级重标定。
 
 ### 20.2 三类功率 evaluator行为不同
 
@@ -1398,7 +1404,7 @@ JSON顶层包括：
 
 这是宽表：
 
-- 前三列为 `outputPowerDbm`、`normalizedDriveScale` 和 `targetOutputRmsVoltage`；
+- 前三列为 `outputPowerDbm`、`normalizedDriveScale` 和 `targetOutputRmsVoltage`；其中 `normalizedDriveScale` 只是闭环初始试探值，最终隐藏预设不写入文件；
 - 每种方法占两列：`方法名 evmDb` 和 `方法名 evmPercent`；
 - 参考运行有4行功率点；
 - JSON保存相同曲线数据；

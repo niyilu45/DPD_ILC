@@ -723,14 +723,15 @@ def CheckDocumentationApiConsistency() -> None:
             (
                 "loadResistanceOhm",
                 "maximumOutputPowerDbm",
+                "paModel",
                 "parameters",
                 "width",
                 "parameterOverrides",
             ),
             (
                 "PowerCalibration(loadResistanceOhm=None, "
-                "maximumOutputPowerDbm=None, parameters=None, "
-                "width=None, **parameterOverrides)"
+                "maximumOutputPowerDbm=None, paModel=None, "
+                "parameters=None, width=None, **parameterOverrides)"
             ),
         ),
         (
@@ -1631,20 +1632,62 @@ def CheckPowerEvmCurve() -> None:
         secondBurst,
         np.zeros(53, dtype=np.complex128),
     ]
+    floatingPaModel = PaModel(modelName="wiener", width=0)
     floatingCalibration = PowerCalibration(
+        paModel=floatingPaModel,
         parameters={
             "maximumOutputPowerDbm": 25.0,
             "outputPowerDbm": 22.0,
+            "calibrationToleranceDb": 0.005,
             "activePowerThresholdDb": -60.0,
             "activeGapToleranceSamples": 16,
             "width": 0,
         }
     )
-    floatingCalibratedBurst = floatingCalibration.Calibrate(
+    floatingCalibratedInput = floatingCalibration.Calibrate(
         paddedBurst
     )
+    floatingCalibratedBurst = (
+        floatingCalibration.GetLastPaOutput()
+    )
+    floatingCalibrationMetrics = (
+        floatingCalibration.GetLastCalibrationMetrics()
+    )
+    assert (
+        max(
+            abs(errorDb)
+            for errorDb in floatingCalibrationMetrics[
+                "errorDbPerChain"
+            ]
+        )
+        <= floatingCalibration.GetParameters()[
+            "calibrationToleranceDb"
+        ]
+    )
+    assert "driveScale" not in floatingCalibrationMetrics
+    assert np.array_equal(
+        floatingCalibration.GetLastPaInput(),
+        floatingCalibratedInput,
+    )
+    firstCalibrationIterationCount = floatingCalibrationMetrics[
+        "iterationCount"
+    ]
+    repeatedCalibratedInput = floatingCalibration.Calibrate(
+        paddedBurst
+    )
+    repeatedCalibrationMetrics = (
+        floatingCalibration.GetLastCalibrationMetrics()
+    )
+    assert np.array_equal(
+        repeatedCalibratedInput,
+        floatingCalibration.GetLastPaInput(),
+    )
+    assert (
+        repeatedCalibrationMetrics["iterationCount"]
+        <= firstCalibrationIterationCount
+    )
     floatingActiveMask = floatingCalibration.FindActiveSampleMask(
-        floatingCalibratedBurst
+        floatingCalibratedInput
     )
     assert np.count_nonzero(floatingActiveMask) == 352
     floatingActiveRms = (
@@ -1657,39 +1700,57 @@ def CheckPowerEvmCurve() -> None:
             floatingActiveRms
         ),
         22.0,
-        atol=1.0e-10,
+        atol=0.005,
     )
     assert (
         np.sqrt(np.mean(np.abs(floatingCalibratedBurst) ** 2))
         < floatingActiveRms
     )
 
-    floatingCalibration.UpdateParameters(
-        outputPowerDbmPerChain=(18.0, 22.0)
+    mimoPaModel = MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "width": 0,
+        }
     )
-    mimoCalibratedBurst = floatingCalibration.Calibrate(
+    mimoCalibration = PowerCalibration(
+        paModel=mimoPaModel,
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "outputPowerDbmPerChain": (18.0, 22.0),
+            "calibrationToleranceDb": 0.005,
+            "activePowerThresholdDb": -60.0,
+            "activeGapToleranceSamples": 16,
+            "width": 0,
+        },
+    )
+    mimoCalibration.Calibrate(
         np.column_stack((paddedBurst, 0.17 * paddedBurst))
     )
+    mimoCalibratedBurst = mimoCalibration.GetLastPaOutput()
     mimoActiveRms = (
-        floatingCalibration.CalculateActiveRmsPerChain(
+        mimoCalibration.CalculateActiveRmsPerChain(
             mimoCalibratedBurst
         )
     )
     assert np.allclose(
         tuple(
-            floatingCalibration.NormalizedRmsToOutputPowerDbm(
+            mimoCalibration.NormalizedRmsToOutputPowerDbm(
                 chainRms
             )
             for chainRms in mimoActiveRms
         ),
         (18.0, 22.0),
-        atol=1.0e-10,
+        atol=0.005,
     )
 
+    fixedPaModel = PaModel(modelName="wiener", width=16)
     fixedCalibration = PowerCalibration(
+        paModel=fixedPaModel,
         parameters={
             "maximumOutputPowerDbm": 25.0,
             "outputPowerDbm": 22.0,
+            "calibrationToleranceDb": 0.005,
             "activePowerThresholdDb": -60.0,
             "activeGapToleranceSamples": 16,
             "width": 16,
@@ -1698,16 +1759,17 @@ def CheckPowerEvmCurve() -> None:
     fixedInputBurst = FixedPoint(16).EncodeComplex(
         paddedBurst / 3.0
     )
-    fixedCalibratedBurst = fixedCalibration.Calibrate(
+    fixedCalibratedInput = fixedCalibration.Calibrate(
         fixedInputBurst
     )
+    fixedCalibratedBurst = fixedCalibration.GetLastPaOutput()
     assert np.allclose(
-        fixedCalibratedBurst.real,
-        np.rint(fixedCalibratedBurst.real),
+        fixedCalibratedInput.real,
+        np.rint(fixedCalibratedInput.real),
     )
     assert np.allclose(
-        fixedCalibratedBurst.imag,
-        np.rint(fixedCalibratedBurst.imag),
+        fixedCalibratedInput.imag,
+        np.rint(fixedCalibratedInput.imag),
     )
     decodedFixedBurst = FixedPoint(16).DecodeComplex(
         fixedCalibratedBurst
