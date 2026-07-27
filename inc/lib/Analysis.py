@@ -245,6 +245,7 @@ class Analysis:
 
     Example:
         ``resultAnalysis = Analysis(referenceSignal, waveform)``
+        ``resultAnalysis = Analysis(None, waveform)``
         ``metrics = resultAnalysis.Analyze(paOutput)``
         ``receiveAnalysis = Analysis(receivedWifiFrame)``
         ``metrics = receiveAnalysis.Analyze()``
@@ -252,7 +253,9 @@ class Analysis:
 
     def __init__(
         self,
-        referenceSignal: Union[np.ndarray, WifiWaveform],
+        referenceSignal: Optional[
+            Union[np.ndarray, WifiWaveform]
+        ] = None,
         waveform: Optional[WifiWaveform] = None,
         parameters: Optional[Mapping[str, object]] = None,
         parseParameters: Optional[Mapping[str, object]] = None,
@@ -271,14 +274,17 @@ class Analysis:
 
         Processing details:
             Algorithm: Select explicit-reference mode when ``waveform`` is
-            supplied, direct waveform-overlap mode when ``transmittedSignal``
-            is supplied, and blind descriptor parsing only when neither is
-            supplied. Analysis defaults remain inside this constructor and
-            are resolved through ChainMap.
+            supplied, use ``waveform.samples`` when that mode receives a
+            ``None`` reference, select direct waveform-overlap mode when
+            ``transmittedSignal`` is supplied, and use blind descriptor
+            parsing only when neither is supplied. Analysis defaults remain
+            inside this constructor and are resolved through ChainMap.
 
         Args:
-            referenceSignal: Ideal reference samples when ``waveform`` is
-                supplied; otherwise a received NumPy array or ``WifiWaveform``.
+            referenceSignal: Optional ideal reference samples when
+                ``waveform`` is supplied. ``None`` reuses
+                ``waveform.samples``. Otherwise this argument is the received
+                NumPy array or ``WifiWaveform`` and cannot be ``None``.
             waveform: Optional Wi-Fi metadata selecting explicit-reference
                 mode.
             parameters: Optional external mapping layered ahead of the built-in defaults.
@@ -371,14 +377,29 @@ class Analysis:
         self.defaultMeasuredSignal: Optional[np.ndarray] = None
         self.analysisMode = "explicitReference"
         selectedWaveform = waveform
-        selectedReference: Union[np.ndarray, WifiWaveform] = referenceSignal
+        selectedReference: Optional[
+            Union[np.ndarray, WifiWaveform]
+        ] = referenceSignal
+        if selectedWaveform is not None and not isinstance(
+            selectedWaveform, WifiWaveform
+        ):
+            raise TypeError("waveform must be a WifiWaveform or None")
         if selectedWaveform is not None:
             if parseParameters is not None or transmittedSignal is not None:
                 raise ValueError(
                     "parseParameters and transmittedSignal are only valid "
                     "when waveform is omitted"
                 )
+            if selectedReference is None:
+                # WifiWaveform is both the metadata contract and the original
+                # generated transmit waveform, so callers do not need to pass
+                # the same sample array a second time.
+                selectedReference = selectedWaveform.samples
         elif transmittedSignal is not None:
+            if referenceSignal is None:
+                raise ValueError(
+                    "received signal cannot be None in transmit-assisted mode"
+                )
             if parseParameters is not None:
                 # Older callers often placed the known receiver clock in the
                 # parser mapping before the assisted path existed. Preserve
@@ -501,6 +522,10 @@ class Analysis:
                 selectedWaveform = None
         else:
             self.analysisMode = "blind"
+            if referenceSignal is None:
+                raise ValueError(
+                    "received signal cannot be None in blind analysis mode"
+                )
             parseConfiguration = (
                 {}
                 if parseParameters is None
@@ -529,12 +554,12 @@ class Analysis:
             self.defaultMeasuredSignal = (
                 self.parsedWifiFrame.receivedSignal.copy()
             )
-        if selectedWaveform is not None and not isinstance(
-            selectedWaveform, WifiWaveform
-        ):
-            raise TypeError("waveform must be a WifiWaveform or None")
         if isinstance(selectedReference, WifiWaveform):
             selectedReference = selectedReference.samples
+        if selectedReference is None:
+            raise RuntimeError(
+                "analysis reference resolution produced no signal"
+            )
         # Public fixed-point inputs contain raw integer codes. Decode exactly
         # once at the analysis boundary so synchronization and metrics always
         # operate in normalized physical units.

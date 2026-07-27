@@ -1012,8 +1012,10 @@ print(assistedMetrics["evmDb"])
 ### `Analysis` 参数与方法
 
 当前构造函数签名为
-`Analysis(referenceSignal, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, **parameterOverrides)`。
-显式参考方式使用 `Analysis(referenceSignal, waveform, ...)`；发送辅助方式使用 `Analysis(receivedSignal, transmittedSignal=txSignal, ...)`；盲分析方式使用 `Analysis(receivedSignal, ...)`。接收输入和发送输入都可以是NumPy数组或 `WifiWaveform`；MIMO采用 `samples × transmitChains`。发送辅助模式只做类型适配、公共区间搜索与同步，不调用Parser。
+`Analysis(referenceSignal=None, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, **parameterOverrides)`。
+显式参考方式使用 `Analysis(referenceSignal, waveform, ...)`；若 `WifiWaveform` 已包含原始发送样值，也可以使用 `Analysis(None, waveform, ...)` 或 `Analysis(waveform=waveform, ...)`，内部自动把 `waveform.samples` 作为Reference。发送辅助方式使用 `Analysis(receivedSignal, transmittedSignal=txSignal, ...)`；盲分析方式使用 `Analysis(receivedSignal, ...)`。接收输入和发送输入都可以是NumPy数组或 `WifiWaveform`；MIMO采用 `samples × transmitChains`。发送辅助模式只做类型适配、公共区间搜索与同步，不调用Parser。
+
+`referenceSignal=None` 只在同时提供 `waveform` 的显式参考模式下表示“复用 `waveform.samples`”。发送辅助和盲分析模式的第一个参数代表接收波形；该接收波形不能为 `None`。
 
 | 配置参数 | 默认值 | 说明 |
 | --- | --- | --- |

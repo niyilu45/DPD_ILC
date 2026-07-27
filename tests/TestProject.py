@@ -692,7 +692,7 @@ def CheckDocumentationApiConsistency() -> None:
     assert actualAnalysisParameters == expectedAnalysisParameters
 
     expectedSignatureText = (
-        "Analysis(referenceSignal, waveform=None, parameters=None, "
+        "Analysis(referenceSignal=None, waveform=None, parameters=None, "
         "parseParameters=None, transmittedSignal=None, "
         "signalProcessingParameters=None, sampleRateHz=None, "
         "channelBandwidthHz=None, width=None, **parameterOverrides)"
@@ -2107,6 +2107,61 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         referenceMetrics = Analysis(
             waveform.samples, waveform, width=0
         ).Analyze(measuredSignal)
+        nullReferenceAnalysis = Analysis(
+            referenceSignal=None,
+            waveform=waveform,
+            width=0,
+        )
+        nullReferenceMetrics = nullReferenceAnalysis.Analyze(
+            measuredSignal
+        )
+        omittedReferenceAnalysis = Analysis(
+            waveform=waveform,
+            width=0,
+        )
+        omittedReferenceMetrics = omittedReferenceAnalysis.Analyze(
+            measuredSignal
+        )
+        assert (
+            nullReferenceAnalysis.GetAnalysisMode()
+            == "explicitReference"
+        )
+        assert np.array_equal(
+            nullReferenceAnalysis.referenceSignal,
+            waveform.samples,
+        )
+        assert np.allclose(
+            np.asarray(tuple(referenceMetrics.values())),
+            np.asarray(tuple(nullReferenceMetrics.values())),
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        )
+        assert np.allclose(
+            np.asarray(tuple(referenceMetrics.values())),
+            np.asarray(tuple(omittedReferenceMetrics.values())),
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        )
+        try:
+            Analysis(
+                None,
+                transmittedSignal=waveform.samples,
+                width=0,
+            )
+        except ValueError as error:
+            assert "received signal cannot be None" in str(error)
+        else:
+            raise AssertionError(
+                "transmit-assisted mode requires a received signal"
+            )
+        try:
+            Analysis(None, width=0)
+        except ValueError as error:
+            assert "received signal cannot be None" in str(error)
+        else:
+            raise AssertionError(
+                "blind mode requires a received signal"
+            )
         leadingSamples = 13 + formatIndex
         receiveCapture = np.r_[
             np.zeros(leadingSamples, dtype=np.complex128),

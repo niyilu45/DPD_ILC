@@ -53,6 +53,21 @@ metrics = resultAnalysis.Analyze(receivedSignal)
 
 此模式直接保存参考和元数据，完全不调用 `ParseWifi`。
 
+`WifiWaveform` 本身已经保存原始发送样值时，Reference允许为 `None`，也可以直接省略：
+
+```python
+resultAnalysis = Analysis(
+    referenceSignal=None,
+    waveform=wifiWaveform,
+)
+sameResultAnalysis = Analysis(waveform=wifiWaveform)
+
+metrics = resultAnalysis.Analyze(receivedSignal)
+sameMetrics = sameResultAnalysis.Analyze(receivedSignal)
+```
+
+这两种写法都会在内部使用 `wifiWaveform.samples`，不会重新生成波形，也不会调用Parser。发送辅助和盲分析模式的第一个参数代表接收波形，因此这两种模式不能把它设为 `None`。
+
 #### 模式二：发送波形辅助
 
 ```python
@@ -1798,7 +1813,7 @@ if wifiWaveform.numTransmitAntennas > 1:
 
 ```python
 Analysis(
-    referenceSignal,
+    referenceSignal=None,
     waveform=None,
     parameters=None,
     parseParameters=None,
