@@ -13,6 +13,7 @@
 - [Wi-Fi 元数据契约](doc/WifiMetadata.md)：`MCSInfo` 与 `WifiWaveform` 的字段、数组形状和模块边界。
 - [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
 - [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
+- [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、当前工作点局部Jacobian、公共复增益与20 dBm GMP发散案例。
 - [全工程函数与物理原理覆盖审计](doc/FunctionPrinciples.md)：逐项索引 `main.py` 与 `inc` 中全部函数，区分物理模型、数值实现和工程编排，并链接到对应推导。
 
 安装依赖：
@@ -44,6 +45,7 @@ inc/__init__.py         公共接口汇总
 tests/TestProject.py    自包含验证脚本
 tests/BenchMark.py      分类场景 ILC 性能基准、结果保存和功率-EVM比较
 doc/BenchMark.md        各 benchmark 场景的构造、预期和参考仿真结果
+doc/FAQ.md              小信号逆响应、局部逆、公共增益和高功率GMP常见问题
 doc/Fec.md              FEC物理原理、数学推导、接口约束和调用示例
 doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整示例
 ```
