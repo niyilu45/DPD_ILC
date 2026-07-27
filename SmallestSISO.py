@@ -54,6 +54,10 @@ def RunSisoMode(
     waveformPeakAmplitude = float(
         np.max(np.abs(waveform.samples))
     )
+    waveformMinimumI = float(np.min(waveform.samples.real))
+    waveformMaximumI = float(np.max(waveform.samples.real))
+    waveformMinimumQ = float(np.min(waveform.samples.imag))
+    waveformMaximumQ = float(np.max(waveform.samples.imag))
     waveformPaprDb = float(
         10.0
         * np.log10(
@@ -65,9 +69,9 @@ def RunSisoMode(
         )
     )
 
-    # The requested 20 dBm operating point is converted to normalized PA
-    # drive. The PA interface itself carries normalized complex baseband data;
-    # voltage scaling is used only when reporting the physical output power.
+    # The requested 20 dBm operating point becomes a drive ratio. In fixed
+    # mode the multiplication acts on public integer codes; PaModel rounds
+    # those codes and decodes them before normalized floating processing.
     loadResistanceOhm = 50.0
     powerCalibration = PowerCalibration(
         loadResistanceOhm=loadResistanceOhm,
@@ -79,8 +83,8 @@ def RunSisoMode(
     referenceSignal = driveScale * waveform.samples
 
     # WaveGenWifi, PaModel, and Analysis use the same public interface width.
-    # PaModel and Analysis immediately convert those samples back to
-    # complex128 and therefore keep all internal algorithms floating point.
+    # Fixed-mode arrays contain integer-valued I/Q codes in a complex128
+    # container, while PA and analysis internals use decoded floating values.
     paModel = PaModel(
         parameters={
             "modelName": "gmp",
@@ -143,8 +147,8 @@ def RunSisoMode(
         fileStem="frequency_domain_ilc",
     )
 
-    # Convert the normalized PA output to the requested physical reporting
-    # level without feeding the voltage-scaled values back into the Q1 format.
+    # Convert a copy of the PA code output to the requested physical reporting
+    # level without feeding voltage-scaled values back into the code interface.
     calibratedOutput = powerCalibration.ScaleSignalToOutputPower(
         baselineOutput,
         paOutputPowerDbm,
@@ -160,6 +164,10 @@ def RunSisoMode(
         "selectedIlcMetrics": selectedMetrics,
         "bestIteration": ilcAnalysisResult.bestIteration,
         "waveformPeakAmplitude": waveformPeakAmplitude,
+        "waveformMinimumI": waveformMinimumI,
+        "waveformMaximumI": waveformMaximumI,
+        "waveformMinimumQ": waveformMinimumQ,
+        "waveformMaximumQ": waveformMaximumQ,
         "waveformPaprDb": waveformPaprDb,
         "configuredOutputPowerDbm": paOutputPowerDbm,
         "measuredOutputPowerDbm": measuredOutputPowerDbm,
@@ -173,8 +181,8 @@ def Main() -> None:
 
     Processing details:
         Algorithm: Execute the identical SISO scenario twice, first with the
-        floating bypass and then with Q1.15 public interfaces, before printing
-        the fixed-minus-floating EVM difference for direct comparison.
+        floating bypass and then with 16-bit public integer-code interfaces,
+        before printing the fixed-minus-floating EVM difference.
 
     Returns:
         result: None. Results are printed and mode-specific plots are saved.

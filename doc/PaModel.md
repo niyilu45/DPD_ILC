@@ -764,10 +764,11 @@ gmpOutput = paModel.Process(inputSignal)
 ```
 
 `PaModel` 的公开构造签名为
-`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路量化；默认 `width=16`。`Process` 先量化输入，使用浮点Wiener或GMP模型计算，再量化输出，返回类型始终是 `numpy.complex128`：
+`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收 I/Q 整数码，解码成归一化浮点后使用 Wiener 或 GMP 模型计算，最后把结果编码回整数码。公开返回容器始终是 `numpy.complex128`：
 
 ```python
 from inc.lib.PaModel import PaModel
+from inc.utils.FixedPoint import FixedPoint
 
 floatingPa = PaModel(
     parameters={"modelName": "gmp", "width": 0}
@@ -776,12 +777,20 @@ fixedPa = PaModel(
     parameters={"modelName": "gmp", "width": 16}
 )
 
+fixedFormat = FixedPoint(width=16)
+fixedInputCodes = fixedFormat.EncodeComplex(inputSignal)
+
 floatingOutput = floatingPa.Process(inputSignal)
-fixedOutput = fixedPa.Process(inputSignal)
-assert floatingOutput.dtype == fixedOutput.dtype
+fixedOutputCodes = fixedPa.Process(fixedInputCodes)
+fixedOutputForInspection = fixedFormat.DecodeComplex(fixedOutputCodes)
+
+assert fixedOutputCodes.real.max() <= 32767
+assert fixedOutputCodes.real.min() >= -32768
+assert floatingOutput.dtype == fixedOutputCodes.dtype
+assert fixedOutputForInspection.dtype == floatingOutput.dtype
 ```
 
-这种边界模型包含“输入量化误差经过非线性放大”和“PA输出再次量化”两部分，但PA内部幂次、记忆抽头与包络交叉项仍使用浮点。Q1.(width-1)的完整推导见 [FixedPoint.md](./FixedPoint.md)。
+这种边界模型包含“输入码值舍入误差经过非线性放大”和“PA输出再次编码量化”两部分，但PA内部幂次、记忆抽头与包络交叉项仍使用归一化浮点。公开16位最大正码是 `32767`；完整码值推导见 [FixedPoint.md](./FixedPoint.md)。
 
 多路调用只传需要修改的覆盖值，默认值仍在类内部：
 

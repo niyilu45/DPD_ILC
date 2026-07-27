@@ -12,7 +12,7 @@
 - [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：10 bit seed、短块LDPC、历史CRC兼容、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
 - [Wi-Fi 元数据契约](doc/WifiMetadata.md)：`MCSInfo` 与 `WifiWaveform` 的字段、数组形状和模块边界。
 - [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
-- [定点接口原理与用法](doc/FixedPoint.md)：浮点旁路、Q1.(width-1) 量化、舍入、饱和，以及 WaveGenWifi、PaModel、Analysis 的统一数据边界。
+- [定点接口原理与用法](doc/FixedPoint.md)：浮点旁路、公开整数码、内部缩放、舍入、饱和，以及 WaveGenWifi、PaModel、Analysis 的统一数据边界。
 - [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
 - [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、当前工作点局部Jacobian、公共复增益与20 dBm GMP发散案例。
 - [全工程函数与物理原理覆盖审计](doc/FunctionPrinciples.md)：逐项索引 `main.py` 与 `inc` 中全部函数，区分物理模型、数值实现和工程编排，并链接到对应推导。
@@ -40,7 +40,7 @@ inc/lib/ParseWifi.py        接收帧描述解析、包起点检测与参考波�
 inc/lib/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
 inc/utils/ConfigUtils.py    ChainMap未知配置警告、过滤与外部活动映射视图
 inc/utils/Draw.py           功率-EVM 多方法同图绘制与 PNG 输出
-inc/utils/FixedPoint.py     浮点旁路与有符号归一化定点接口量化
+inc/utils/FixedPoint.py     浮点旁路、公开有符号整数码与内部归一化转换
 inc/utils/FrameProcess.py   Wi-Fi 去 CP、FFT、CSD 撤销与空间流解映射
 inc/utils/SigProc.py        SigProc 同步补偿、SignalProcessingResult 与 PowerCalibration
 inc/utils/WifiMetadata.py   MCSInfo 与 WifiWaveform 纯数据契约
@@ -79,28 +79,28 @@ from lib.WaveGenWifi import WaveGenWifi
 
 ## 浮点与定点接口
 
-`WaveGenWifi`、`PaModel`、`MimoPaModel`、`ParseWifi` 和 `Analysis` 都把 `width` 定义在各自的 `parameters` 配置中。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量采用有符号归一化 Q1.(width-1) 接口。默认值为 `16`，即 Q1.15。为兼容已有代码，各主类仍保留直接 `width=` 便捷参数，但新代码统一推荐 `parameters={"width": ...}`。量化步长和范围为：
+`WaveGenWifi`、`PaModel`、`MimoPaModel`、`ParseWifi` 和 `Analysis` 都把 `width` 定义在各自的 `parameters` 配置中。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量使用有符号整数码。默认值为 `16`。为兼容已有代码，各主类仍保留直接 `width=` 便捷参数，但新代码统一推荐 `parameters={"width": ...}`。
 
 ```math
-\Delta=2^{-(width-1)}
+-2^{W-1}\leq q_{\mathrm{I}},q_{\mathrm{Q}}\leq 2^{W-1}-1
 ```
 
 ```math
--1\leq I,Q\leq 1-\Delta
+x_{\mathrm{internal}}=\frac{q}{2^{W-1}}
 ```
 
-边界执行最接近值舍入和饱和，然后立即反量化为 `numpy.complex128`。因此浮点和定点模式的数组形状与数据类型完全相同，模块内部 FFT、PA 非线性、同步和指标计算始终使用浮点；`width` 只模拟模块接口的有限精度。
+浮点和定点模式的数组形状与 `numpy.complex128` 类型相同，但数值含义不同。定点模式的实部和虚部是整数码：14 位范围为 `-8192…8191`，16 位范围为 `-32768…32767`。模块收到码值后才除以缩放因子，内部 FFT、PA 非线性、同步、ILC 和指标计算始终使用归一化浮点。
 
 ```mermaid
 flowchart LR
-    input["外部 complex128 波形"] --> quantizer["I/Q独立舍入与饱和<br/>width=0时旁路"]
-    quantizer --> floating["反量化为 complex128"]
+    input["外部 complex128<br/>I/Q为整数码"] --> quantizer["码值舍入与饱和"]
+    quantizer --> floating["除以 2^(W-1)<br/>内部归一化浮点"]
     floating --> algorithm["模块内部浮点算法"]
-    algorithm --> outputQuantizer["需要时在输出边界再次量化"]
-    outputQuantizer --> output["外部 complex128 波形"]
+    algorithm --> outputQuantizer["乘 2^(W-1)<br/>舍入与饱和"]
+    outputQuantizer --> output["外部 complex128<br/>I/Q为整数码"]
 ```
 
-**图说明**：位宽改变可表示的样值集合，但不改变 Python 数据类型。归一化接口超过 `[-1,1)` 的分量会饱和；物理 dBm 电压标定应在归一化 PA/DPD 运算之后用于报告，避免把数伏的物理量直接送入 Q1.15 接口。完整推导见 [FixedPoint.md](doc/FixedPoint.md)。
+**图说明**：`complex128` 只是统一的存储容器。以14位为例，正满量程公开值是 `8191`；约 `0.999878` 的归一化值只存在于模块内部。物理 dBm 电压标定副本只用于功率报告，不能伪装成整数码重新送进定点接口。完整推导见 [FixedPoint.md](doc/FixedPoint.md)。
 
 统一配置方式如下：
 
@@ -132,7 +132,7 @@ python SmallestSISO.py
 ```
 
 浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序最后打印两种模式的最佳ILC EVM及定点减浮点的EVM差值。
-脚本还打印两种波形的峰值和PAPR。若定点EVM反而更好，通常是Q1.15饱和顺带削掉了OFDM高峰、降低了PA非线性，并不表示量化精度优于浮点；纯精度对比需要先保证两条路径采用相同的峰值归一化或CFR。
+脚本还打印两种波形的峰值、PAPR以及 `waveformMinimumI/MaximumI/MinimumQ/MaximumQ`。定点版本的 I/Q 字段是公开码值，因此16位分量会位于 `-32768…32767`，并不是小于1的归一化数；复数幅度 `waveformPeakAmplitude` 最多可接近 $\sqrt{2}\,32768$。
 
 ## 工程工作流程图
 
@@ -619,7 +619,7 @@ flowchart TD
 - `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
 - `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、公共复增益幅相和输入峰值。
 - MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
-- `AnalyzePowerEvmCurve` 接收一组严格递增的每路PA输出功率点和多个方法求值器，以25 dBm默认极限为0 dB输出回退确定归一化驱动，并把各方法结果标定到相同输出功率后计算EVM；`SavePowerEvmCurveData` 只保存原始CSV/JSON数据，不导入或调用任何绘图库。
+- `AnalyzePowerEvmCurve` 接收一组严格递增的每路PA输出功率点和多个方法求值器，以25 dBm默认极限为0 dB输出回退确定归一化驱动。EVM直接分析公开PA码值，目标RMS电压单独保存用于功率审计，避免把物理伏特误当成定点码；`SavePowerEvmCurveData` 只保存原始CSV/JSON数据，不导入或调用任何绘图库。
 
 ### `inc/utils/Draw.py`
 
@@ -767,7 +767,7 @@ flowchart LR
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `WaveGenWifi` 构造函数内部的不可变默认参数补齐。 |
-| `width` | 非负整数 | `16` | 每个I或Q分量的对外位宽；`0`为浮点旁路，正数采用一个符号位和 `width-1` 个小数位。 |
+| `width` | 非负整数 | `16` | 每个I或Q分量的对外位宽；`0`为浮点旁路，正数返回有符号整数码并在内部按 `2^(width-1)` 缩放。 |
 | `frameFormat` | `"VHT"/"11ac"`、`"HE"/"11ax"`、`"EHT"/"11be"`，并接受带 `802.` 前缀的名称 | `"EHT"` | 不区分大小写；生成后规范化为 VHT、HE 或 EHT。 |
 | `bandwidthMhz` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
 | `mcs` | VHT：`0–9`；HE：`0–11`；EHT：`0–13` | `9` | MCS 索引；默认值对三种格式都有效。 |
@@ -840,7 +840,7 @@ P(dBm) = 10 log10(P(W) / 0.001)
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `PaModel` 构造函数内部的不可变默认参数补齐。 |
-| `width` | 非负整数 | `16` | PA输入、输出I/Q接口位宽；`0`为浮点，正数在边界量化后仍返回 `complex128`。 |
+| `width` | 非负整数 | `16` | PA输入、输出I/Q接口位宽；`0`为浮点，正数返回I/Q整数码，容器仍为 `complex128`。 |
 | `modelName` | `"wiener"`、`"gmp"`，不区分大小写 | `"wiener"` | 选择内部 PA 实现。 |
 | `wienerConfig` | `WienerConfig` 或 `None` | `None` | Wiener 模式的配置；`None` 使用默认配置。 |
 | `gmpConfig` | `GMPConfig` 或 `None` | `None` | GMP 模式的配置；`None` 使用默认配置。 |
@@ -873,7 +873,7 @@ P(dBm) = 10 log10(P(W) / 0.001)
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `numTransmitChains` | `1` | 独立 PA 数，范围 1–16。 |
-| `width` | `16` | 整个输入矩阵和每路输出的I/Q接口位宽；内部每路PA仍用浮点计算。 |
+| `width` | `16` | 整个输入矩阵和每路输出的I/Q整数码位宽；内部每路PA解码后仍用浮点计算。 |
 | `paParametersPerChain` | `None` | 每路一个普通 `PaModel` 覆盖字典；`None` 表示每路使用 `PaModel` 内部默认值。 |
 | `inputPowerDbPerChain` | `None` | 每路输入驱动 dB；`None` 展开为全 0。 |
 | `outputPowerDbPerChain` | `None` | 每路相对输出 dB；`None` 展开为全 0。 |
@@ -951,7 +951,7 @@ PA 辅助接口还包括：
 | `minimumParseConfidence` | `0.80` | 新版描述导频、历史magic或发送接收互相关的最低置信度。 |
 | `referenceSearchSamples` | `4096` | 发送辅助归一化互相关使用的参考样点数。 |
 | `spatialMappingMatrix` | `None` | 无 `WifiWaveform` 元数据时为custom MIMO映射补充矩阵。 |
-| `width` | `16` | 盲解析接收样值与重建参考的I/Q接口位宽；由 `Analysis.width` 自动传入。 |
+| `width` | `16` | 盲解析接收码值与重建参考的I/Q整数码位宽；由 `Analysis.width` 自动传入。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
@@ -1007,7 +1007,7 @@ print(assistedMetrics["evmDb"])
 | 配置参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `parameters` | `None` | 外部 `Mapping` 覆盖层；未提供的键使用 `Analysis` 构造函数内部默认值。 |
-| `width` | `16` | 参考和接收波形的I/Q接口位宽；`0`为浮点旁路，量化后继续用 `complex128` 做同步和指标计算。 |
+| `width` | `16` | 参考和接收波形的I/Q接口位宽；`0`为浮点，正数输入整数码，解码后用 `complex128` 浮点值做同步和指标计算。 |
 | `maxSegmentLength` | `16384` | Welch PSD 的最大分段长度，必须是不小于 16 的整数。 |
 | `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
 | `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
@@ -1668,7 +1668,7 @@ Analysis会在内部自动提取NumPy样值或 `WifiWaveform.samples`，无需�
 - EVM：使用同一份 `SigProc` 校正信号，由 `FrameProcess` 对当前格式的 `VHT-Data`、`HE-Data` 或 `EHT-Data` 去循环前缀、FFT、撤销 CSD 和空间解映射后，在数据子载波上相对同路径参考星座计算 RMS EVM，同时输出 dB 与百分比。
 - 每轮 MSE：Raw MSE 保留绝对增益、相位及整帧误差；LC-MSE 删除最优公共复增益，是一般复基带的 EVM 代理；EVM-MSE 使用完整 Wi-Fi 接收链，并严格满足 `EVM-MSE = EVM_rms²` 与 `EVM(dB) = 10·log10(EVM-MSE)`。详细推导见 [结果计算物理原理与推导](doc/Analysis.md#55-为什么原始-mse-不能总是反映-evm)。
 - ACLR：主信道功率与上下相邻同带宽信道功率之比，输出上下邻道和较差值。为完整覆盖两个邻道，命令行采样倍率限制为 4 或 8。
-- 功率-EVM：横轴为每路PA绝对输出功率dBm，默认扫描10至25 dBm。`Analysis` 用相对25 dBm极限的输出回退量控制归一化PA驱动，再按端口阻抗把输出标定到目标功率。纵轴为RMS EVM dB，数值越低表示性能越好。
+- 功率-EVM：横轴为每路PA绝对输出功率dBm，默认扫描10至25 dBm。`Analysis` 用相对25 dBm极限的输出回退量控制归一化PA驱动，并按端口阻抗记录目标RMS电压；定点PA码直接用于EVM，物理电压标定不回灌分析接口。纵轴为RMS EVM dB，数值越低表示性能越好。
 
 ## 验证
 

@@ -1,325 +1,312 @@
-# 定点接口物理原理、数学推导与使用方法
+# 定点 I/Q 接口的码值、缩放与模块边界
 
-本文说明 `inc/utils/FixedPoint.py` 以及 `WaveGenWifi`、`PaModel`、`Analysis` 的统一位宽接口。这里模拟的是模块边界上的有限精度，不是把FFT、PA模型或同步算法本身改写成整数运算。
+## 1. 最重要的接口约定
 
-## 1. 为什么只量化模块边界
+本工程的浮点模式和定点模式都返回 `numpy.complex128`，但二者的数值含义不同：
 
-真实数字发射机和接收机通常在DAC、ADC、FPGA或ASIC接口处使用有限位宽。有限位宽会引入量化误差和饱和，但算法验证阶段仍希望：
+| 模式 | `width` | `complex128` 中保存的数值 |
+|---|---:|---|
+| 浮点 | 0 | 归一化物理复包络，通常在单位幅度附近 |
+| 定点 | 大于0 | I、Q 两个分量的有符号整数码 |
 
-- 浮点和定点模式使用相同的 Python 调用方式；
-- 两种模式返回相同的数组形状和 `numpy.complex128` 类型；
-- 可以单独观察接口位宽造成的EVM变化；
-- 不把FFT、非线性PA和同步算法的定点实现误差混在一起。
+`complex128` 只是统一的复数数组容器，并不表示定点模式仍返回归一化小数。例如：
 
-因此工程采用以下边界模型：
-
-```mermaid
-flowchart LR
-    a["外部复基带输入"] --> b["I分量量化"]
-    a --> c["Q分量量化"]
-    b --> d["反量化为float64"]
-    c --> d
-    d --> e["内部complex128浮点算法"]
-    e --> f["需要时量化输出边界"]
-    f --> g["外部complex128输出"]
-```
-
-**图1说明**：I和Q分别通过同一个实数量化器。反量化只改变数值所在的网格，不把数组变成整数类型；内部算法始终收到 `complex128`。
-
-## 2. `width` 的定义
-
-设总位宽为 $W$。
-
-- $W=0$：浮点旁路，不做舍入和饱和；
-- $W>0$：每个I或Q分量使用一个符号位和 $F=W-1$ 个小数位；
-- 默认 $W=16$，即每个分量采用Q1.15；
-- 当前实现允许 $0\leq W\leq53$，因为更高位宽已不能由 `float64` 精确表达每一个整数码。
-
-小数位数与量化尺度为：
-
-```math
-F=W-1
-```
-
-```math
-S=2^F
-```
-
-量化步长为：
-
-```math
-\Delta=\frac{1}{S}=2^{-F}
-```
-
-有符号整数码范围是：
-
-```math
--S\leq k\leq S-1
-```
-
-所以反量化后的分量范围是：
-
-```math
--1\leq x_q\leq 1-\Delta
-```
-
-当 $W=16$ 时：
-
-```math
-\Delta=2^{-15}=0.000030517578125
-```
-
-最大正数是 $0.999969482421875$，最小负数是 $-1$。
-
-## 3. 舍入、饱和与反量化
-
-对一个实数输入 $x$，先缩放并取最接近整数：
-
-```math
-k_r={\rm round}(Sx)
-```
-
-然后把整数码限制在合法范围：
-
-```math
-k_q=\min\left(S-1,\max\left(-S,k_r\right)\right)
-```
-
-最后反量化：
-
-```math
-x_q=\frac{k_q}{S}
-```
-
-NumPy的 `rint` 在恰好位于两个整数中间时采用偶数舍入。例如缩放值为 $2.5$ 时取 $2$，缩放值为 $3.5$ 时取 $4$。这种规则可以避免大量半步样值始终向同一方向偏移。
-
-对于复样值：
-
-```math
-z=I+jQ
-```
-
-量化结果为：
-
-```math
-z_q=Q_W(I)+jQ_W(Q)
-```
-
-其中 $Q_W$ 表示上述实数量化器。I和Q独立饱和，因此复数幅度的最大值不是1，而是接近 $\sqrt{2}$；限制的是每个笛卡尔分量。
-
-## 4. 量化噪声为什么影响EVM
-
-没有饱和且输入跨越多个量化码时，常用均匀量化误差近似：
-
-```math
-e_q=x_q-x
-```
-
-```math
-E[e_q]\mathrel{\approx}0
-```
-
-```math
-E[e_q^2]\mathrel{\approx}\frac{\Delta^2}{12}
-```
-
-I和Q各自含有量化误差，所以复误差功率近似为：
-
-```math
-E[|e_{q,c}|^2]\mathrel{\approx}\frac{\Delta^2}{6}
-```
-
-若参考复信号功率为 $P_x$，只考虑一次理想量化边界，则归一化误差近似为：
-
-```math
-{\rm NMSE}_q\mathrel{\approx}\frac{\Delta^2}{6P_x}
-```
-
-对应EVM近似为：
-
-```math
-{\rm EVM}_{rms}\mathrel{\approx}\frac{\Delta}{\sqrt{6P_x}}
-```
-
-```math
-{\rm EVM}_{dB}\mathrel{\approx}20\log_{10}({\rm EVM}_{rms})
-```
-
-这是无饱和、误差近似白噪声时的估计。OFDM高峰超过范围后会发生削顶，误差不再均匀，也不再与信号独立；此时EVM和ACLR可能显著恶化。
-
-## 5. 量化和饱和是两种不同误差
-
-```mermaid
-flowchart TD
-    input["输入分量x"] --> range{"是否位于可表示范围"}
-    range -->|是| rounding["舍入到最近网格点"]
-    range -->|否| clipping["固定到-1或1-Delta"]
-    rounding --> smallError["误差通常不超过Delta/2"]
-    clipping --> largeError["误差随越界幅度继续增大"]
-```
-
-**图2说明**：增加位宽只会减小舍入步长；如果信号尺度没有先归一化，正负饱和界限仍接近 $\pm1$，仅增加位宽不能解决削顶。
-
-对OFDM波形尤其要关注峰均比。即使整包RMS等于1，瞬时I或Q分量仍可能超过1。因此默认16位模式既模拟细小量化噪声，也会如实模拟Q1.15接口范围不足造成的饱和。
-
-## 6. 三个主要类的边界位置
-
-### 6.1 `WaveGenWifi`
-
-`WaveGenWifi` 先用浮点完成比特生成、QAM、空间映射、IFFT、循环前缀和整包RMS归一化，最后只对 `WifiWaveform.samples` 量化。
-
-`referenceDataSymbols` 等理想接收元数据保持浮点，因为它们代表理想星座，而不是发送采样接口。
-
-### 6.2 `PaModel`
-
-`PaModel.Process` 的顺序为：
+- 14 位定点的 I/Q 码范围是 `-8192` 至 `8191`；
+- 16 位定点的 I/Q 码范围是 `-32768` 至 `32767`；
+- 14 位正满量程附近应看到 `8191`，而不是 `0.9998779`；
+- 只有模块内部计算时，`8191` 才会被解码为约 `0.9998779`。
 
 ```mermaid
 flowchart LR
-    input["PA输入"] --> qin["输入接口量化"]
-    qin --> pa["Wiener或GMP浮点模型"]
-    pa --> qout["输出接口量化"]
-    qout --> output["PA输出"]
+    physicalInput["内部归一化浮点 x"] --> encode["EncodeComplex<br/>乘 2^(W-1)、舍入、饱和"]
+    encode --> publicInput["公开 complex128<br/>I/Q 为整数码"]
+    publicInput --> decode["DecodeComplex<br/>除以 2^(W-1)"]
+    decode --> algorithm["内部浮点算法<br/>Wi-Fi / PA / 同步 / EVM / ILC"]
+    algorithm --> outputEncode["EncodeComplex"]
+    outputEncode --> publicOutput["公开 complex128<br/>I/Q 为整数码"]
 ```
 
-**图3说明**：输入量化误差会经过PA非线性，输出端再叠加一次有限精度。`MimoPaModel` 对整个输入矩阵采用相同位宽，每一路内部PA仍独立进行浮点运算。
+**图 1 说明**：定点码只存在于模块公开边界。模块内部仍采用浮点计算，但这不改变公开输入输出必须是整数码的约定。
 
-### 6.3 `Analysis`
+## 2. 位宽和码值范围
 
-`Analysis` 对参考和测量波形采用相同位宽，然后使用浮点完成：
-
-- 公共区间搜索；
-- 整数与分数时延补偿；
-- CFO、SFO和公共复增益补偿；
-- OFDM解调；
-- SNR、EVM和ACLR计算。
-
-盲分析模式会把同一位宽传给 `ParseWifi`，保证Parser重建的 `WaveGenWifi` 参考和接收输入位于同一个量化网格。
-
-## 7. 为什么对外数据类型保持一致
-
-定点模式返回整数数组会迫使调用方区分缩放、符号扩展和复数I/Q布局，也会破坏现有PA与分析接口。工程改为返回反量化后的 `complex128`：
+设每个 I 或 Q 分量的总位宽为 $W$，其中一位是符号位。整数码 $q$ 的范围为：
 
 ```math
-z_{\rm public}=\frac{k_I}{S}+j\frac{k_Q}{S}
+-2^{W-1} \le q \le 2^{W-1}-1
 ```
 
-调用方仍可直接使用NumPy、绘图、PA和Analysis函数。要检查一个数组是否位于 $W$ 位网格，只需验证：
+定义缩放因子：
 
 ```math
-S\mathop{\rm Re}(z)\in\mathbb Z
+S_W=2^{W-1}
 ```
+
+常见位宽如下：
+
+| 位宽 | 缩放因子 | 最小码 | 最大码 |
+|---:|---:|---:|---:|
+| 8 | 128 | -128 | 127 |
+| 12 | 2048 | -2048 | 2047 |
+| 14 | 8192 | -8192 | 8191 |
+| 16 | 32768 | -32768 | 32767 |
+
+正负范围不完全对称，是因为二进制补码包含一个额外的负数码。
+
+## 3. 从物理浮点量编码为整数码
+
+对归一化实分量 $x_{\mathrm{I}}$，编码公式为：
 
 ```math
-S\mathop{\rm Im}(z)\in\mathbb Z
+q_{\mathrm{I}}=
+\min\left(
+2^{W-1}-1,
+\max\left(
+-2^{W-1},
+\mathop{\mathrm{round}}\left(S_W x_{\mathrm{I}}\right)
+\right)
+\right)
 ```
 
-## 8. 典型调用
+Q 分量独立使用同一公式。复数公开样值为：
 
-### 8.1 浮点模式
+```math
+q=q_{\mathrm{I}}+j q_{\mathrm{Q}}
+```
+
+工程使用 NumPy 的最近整数舍入规则，并在超出范围时饱和。例如 14 位模式下：
+
+```math
+x_{\mathrm{I}}=1
+\quad\Longrightarrow\quad
+S_W x_{\mathrm{I}}=8192
+\quad\Longrightarrow\quad
+q_{\mathrm{I}}=8191
+```
+
+因此正的 `1.0` 会饱和为 `8191`，负的 `-1.0` 可以精确表示为 `-8192`。
+
+## 4. 从整数码解码到内部浮点量
+
+模块拿到公开码后，先舍入和饱和，再执行：
+
+```math
+\hat x_{\mathrm{I}}=\frac{q_{\mathrm{I}}}{S_W},
+\qquad
+\hat x_{\mathrm{Q}}=\frac{q_{\mathrm{Q}}}{S_W}
+```
+
+对应的复包络为：
+
+```math
+\hat x=\hat x_{\mathrm{I}}+j\hat x_{\mathrm{Q}}
+```
+
+14 位最大正码解码结果为：
+
+```math
+\frac{8191}{8192}=0.9998779296875
+```
+
+这个小于 1 的数只用于模块内部计算，不作为定点模式的公开输出。
+
+## 5. 三个转换函数不能混用
+
+| 函数 | 输入含义 | 输出含义 | 典型位置 |
+|---|---|---|---|
+| `EncodeComplex` | 归一化物理浮点量 | 公开整数码 | 模块输出边界 |
+| `QuantizeCodes` | 可能含小数或越界的码值 | 舍入并饱和后的整数码 | 模块输入校验 |
+| `DecodeComplex` | 公开整数码 | 归一化物理浮点量 | 模块输入边界 |
+| `QuantizeComplex` | 归一化物理浮点量 | 公开整数码 | `EncodeComplex` 的兼容别名 |
+
+如果调用者对公开定点波形乘一个驱动比例，例如：
 
 ```python
-from inc.lib.Analysis import Analysis
-from inc.lib.PaModel import PaModel
-from inc.lib.WaveGenWifi import WaveGenWifi
-
-wifiGenerator = WaveGenWifi(parameters={"width": 0})
-wifiWaveform = wifiGenerator.Generate()
-paModel = PaModel(
-    parameters={"modelName": "gmp", "width": 0}
-)
-paOutput = paModel.Process(0.5 * wifiWaveform.samples)
-metrics = Analysis(
-    0.5 * wifiWaveform.samples,
-    wifiWaveform,
-    parameters={"width": 0},
-).Analyze(paOutput)
-print(metrics)
+driveCodes = 0.5 * waveform.samples
 ```
 
-### 8.2 默认16位定点模式
+数组暂时可能出现半整数码。进入 `PaModel.Process` 或 `Analysis` 时，边界会先用 `QuantizeCodes` 的规则将其舍入成有效码，再解码到内部浮点域。
 
-```python
-from inc.lib.Analysis import Analysis
-from inc.lib.PaModel import PaModel
-from inc.lib.WaveGenWifi import WaveGenWifi
-
-wifiGenerator = WaveGenWifi(parameters={"width": 16})
-wifiWaveform = wifiGenerator.Generate()
-paModel = PaModel(
-    parameters={"modelName": "gmp", "width": 16}
-)
-paOutput = paModel.Process(0.5 * wifiWaveform.samples)
-metrics = Analysis(
-    0.5 * wifiWaveform.samples,
-    wifiWaveform,
-    parameters={"width": 16},
-).Analyze(paOutput)
-print(metrics)
-```
-
-所有主类都优先推荐把 `width` 写入 `parameters`。省略该键时与配置 `"width": 16` 等效；直接 `width=` 参数只作为兼容便捷入口保留。
-
-### 8.3 直接使用量化工具
+## 6. 可运行的 14 位示例
 
 ```python
 import numpy as np
 
 from inc.utils.FixedPoint import FixedPoint
 
-fixedFormat = FixedPoint(width=16)
-quantizedSignal = fixedFormat.QuantizeComplex(
-    np.array([0.1 + 0.2j, 1.2 - 1.4j])
+fixedFormat = FixedPoint(width=14)
+physicalSignal = np.array(
+    [1.0 + 0.5j, -1.0 - 0.25j],
+    dtype=np.complex128,
 )
-print(fixedFormat.GetFormatInfo())
-print(quantizedSignal.dtype)
+
+codeSignal = fixedFormat.EncodeComplex(physicalSignal)
+decodedSignal = fixedFormat.DecodeComplex(codeSignal)
+
+print(codeSignal)
+# [ 8191.+4096.j -8192.-2048.j]
+
+print(codeSignal.dtype)
+# complex128
+
+print(decodedSignal)
+# [ 0.99987793+0.5j -1.0-0.25j]
 ```
 
-## 9. 最小SISO浮点与定点对比
+这个例子同时证明：
 
-工程根目录的 `SmallestSISO.py` 使用相同帧、相同GMP PA、相同20 dBm目标工作点和相同ILC参数运行两次：
+1. 定点输出仍用 `complex128`；
+2. I/Q 数值是整数码；
+3. 正满量程为 `8191`；
+4. 解码后的内部浮点量才小于或等于 1。
+
+## 7. WaveGenWifi、PaModel 和 Analysis 的边界
+
+### 7.1 WaveGenWifi
+
+`WaveGenWifi` 在内部用浮点完成比特生成、QAM、空间映射、IFFT、循环前缀和整包归一化。`Generate()` 返回之前才调用 `EncodeComplex`。
+
+```python
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+waveform = WaveGenWifi(
+    parameters={
+        "frameFormat": "EHT",
+        "bandwidthMhz": 20,
+        "sampleRateHz": 80.0e6,
+        "numDataSymbols": 2,
+        "width": 14,
+    }
+).Generate()
+
+assert waveform.samples.dtype.name == "complex128"
+assert waveform.samples.real.max() <= 8191
+assert waveform.samples.real.min() >= -8192
+```
+
+### 7.2 PaModel
+
+`PaModel.Process` 的流程为：
+
+```mermaid
+flowchart LR
+    inputCodes["输入整数码"] --> decode["解码为归一化浮点"]
+    decode --> pa["Wiener或GMP浮点PA"]
+    pa --> encode["编码、舍入、饱和"]
+    encode --> outputCodes["输出整数码"]
+```
+
+**图 2 说明**：PA 内部幂次、记忆抽头和包络交叉项不直接对 `8191` 做运算，而是对解码后的约 `0.9999` 做运算；否则高阶项会产生完全错误的数量级。
+
+### 7.3 Analysis
+
+`Analysis` 接收公开整数码后先解码，再执行：
+
+- 整数和分数时延估计；
+- CFO、SFO 与复增益补偿；
+- OFDM 解调；
+- SNR、EVM 和 ACLR 计算。
+
+显式参考、发送辅助和盲解析三条路径都只解码一次。`ParseWifi` 的公开结果仍是整数码，交给 `Analysis` 后再统一解码。
+
+## 8. ILC 为什么也要隐藏码值
+
+ILC 的 `maxAmplitude=2.0`、误差 $e[n]$ 和学习率都定义在归一化物理域。如果直接把 `32767` 当成物理幅度，峰值限制会把整包错误地裁剪到 2，PA 高阶项也会失真。
+
+工程使用内部 PA 适配器：
+
+```mermaid
+flowchart LR
+    publicReference["公开整数码参考"] --> decode["解码"]
+    decode --> ilc["归一化浮点ILC"]
+    ilc --> floatPa["浮点PA调用"]
+    floatPa --> ilc
+    ilc --> encode["编码ILC结果与逐轮波形"]
+    encode --> publicResult["公开整数码结果"]
+```
+
+**图 3 说明**：MSE、NMSE 和学习更新都在物理归一化域计算；`ILCResult.learnedInput`、`ILCResult.outputSignal` 以及逐轮输入输出在返回调用方时重新编码为整数码。
+
+## 9. 量化误差与饱和
+
+忽略饱和时，一个分量的物理量化步长为：
+
+```math
+\Delta=\frac{1}{2^{W-1}}
+```
+
+在误差近似均匀且与信号不相关时，每个实分量的量化噪声方差近似为：
+
+```math
+\sigma_q^2\approx\frac{\Delta^2}{12}
+```
+
+复 I/Q 样值包含两个分量，因此复误差功率近似为：
+
+```math
+P_q\approx\frac{\Delta^2}{6}
+```
+
+饱和误差不同于小量化噪声。当内部物理分量超过范围时：
+
+```math
+x_{\mathrm{I}}>1-\Delta
+\quad\Longrightarrow\quad
+q_{\mathrm{I}}=2^{W-1}-1
+```
+
+OFDM 具有较高 PAPR，即使整包 RMS 已归一化，瞬时 I 或 Q 仍可能超过范围。增加位宽会减小 $\Delta$，但不会把归一化可表示范围扩展到远大于 1；需要更大动态范围时，应另行定义整数位和小数位分配，而不能只增加当前接口的总位宽。
+
+## 10. dBm 与整数码的关系
+
+定点码不是伏特，也不是 dBm。目标输出功率只决定 PA 的归一化驱动工作点和最终报告标定。
+
+50 Ω 端口的复包络 RMS 电压与 dBm 的关系为：
+
+```math
+P_{\mathrm{W}}=10^{(P_{\mathrm{dBm}}-30)/10}
+```
+
+```math
+V_{\mathrm{RMS}}=\sqrt{P_{\mathrm{W}}R}
+```
+
+推荐顺序为：
+
+1. 用输出回退量计算归一化驱动比例；
+2. 对公开整数码乘该比例；
+3. 在模块边界舍入码值并解码；
+4. 在归一化浮点域完成 PA、ILC 和 Analysis；
+5. 仅在功率报告阶段把 PA 输出按 RMS 标定为目标 dBm。
+
+物理电压标定后的数组不再是定点 I/Q 码，不能重新送入配置了正 `width` 的 `Analysis`。EVM 和 ACLR 对公共常数增益不敏感，因此性能分析使用未做物理电压标定的 PA 码值；功率报告单独使用标定副本。
+
+## 11. 浮点与定点最小 SISO 示例
+
+运行：
 
 ```powershell
 python SmallestSISO.py
 ```
 
-第一次使用 `width=0`，第二次使用 `width=16`。结果分别写入：
+脚本分别执行：
+
+- `width=0`：公开数值和内部数值均为浮点物理量；
+- `width=16`：公开数值为 `-32768` 至 `32767` 的整数码，内部仍为归一化浮点。
+
+输出目录为：
 
 - `results/smallest_siso/floating`
 - `results/smallest_siso/fixed_16`
 
-每个目录包含逐轮收敛CSV和PNG。程序最后输出：
+脚本会显示波形峰值、I/Q最小和最大码、PAPR、基线 EVM、ILC 最佳 EVM 和逐轮 MSE。定点模式下 `waveformMinimumI/MaximumI/MinimumQ/MaximumQ` 应落在16位码范围内；复数幅度 `waveformPeakAmplitude` 可以大于 `32767`，因为它等于 $\sqrt{I^2+Q^2}$。这些都是公开码值，不应再解释为小于 1 的归一化幅度。
 
-```text
-Fixed 16-bit minus floating selected EVM: ... dB
-```
+## 12. 使用检查表
 
-该差值同时包含接口量化、可能的饱和以及这些误差经过PA和ILC反馈后的影响。
-
-固定16位结果有时反而显示更好的EVM。这不表示有限精度优于浮点精度：Q1.15在波形发生器出口削掉OFDM高峰，可能像一个粗糙的峰值抑制器一样降低PAPR，使后面的PA进入较浅非线性区。脚本同时输出 `waveformPeakAmplitude` 和 `waveformPaprDb`，应结合这两个字段判断EVM改善是否来自削峰。要公平研究纯量化噪声，应先给浮点和定点路径设置相同的峰值归一化或CFR，再比较EVM。
-
-## 10. dBm与归一化定点值不能直接混用
-
-Q1.15的数值是归一化接口量，不自动表示伏特。20 dBm在50欧姆端口对应：
-
-```math
-P=0.1\ {\rm W}
-```
-
-```math
-V_{rms}=\sqrt{PR}=\sqrt{0.1\times50}\mathrel{\approx}2.236\ {\rm V}
-```
-
-若直接把以伏特表示、峰值大于1的波形送入Q1.15量化器，必然发生饱和。推荐流程是：
-
-1. 用 `PowerCalibration.OutputPowerToDriveScale` 把目标dBm转换为归一化PA驱动；
-2. 在归一化域完成WaveGenWifi、PA、ILC和Analysis；
-3. 仅在最终功率报告时用 `ScaleSignalToOutputPower` 转换到物理RMS电压。
-
-## 11. 使用边界
-
-1. 本实现是定点接口仿真，不是逐运算定点FFT或定点GMP实现。
-2. `width` 是每个I或Q分量的位宽，不是一个复样值合计的位宽。
-3. 位宽增加不会扩大Q1范围，只会减小量化步长。
-4. 默认16位可能削顶单位RMS OFDM高峰；这是当前归一化格式的预期行为。
-5. 浮点和定点返回值都是 `complex128`，不能通过 `dtype` 判断模式，应读取实例的 `width` 或 `GetFormatInfo()`。
+1. 同一条信号链的 `WaveGenWifi`、`PaModel`、`ParseWifi` 和 `Analysis` 必须使用相同 `width`。
+2. `width=0` 表示浮点模式；正值表示公开整数码模式。
+3. 不要通过 `dtype` 判断模式，应读取 `width` 或 `GetFormatInfo()`。
+4. 定点公开数据的实部和虚部都应等于各自的最近整数。
+5. 14 位最大正码是 `8191`，16 位最大正码是 `32767`。
+6. 只有内部算法或显式调用 `DecodeComplex` 后，样值才恢复到单位幅度附近。
+7. 物理电压标定数据不能伪装成定点码重新送入定点接口。

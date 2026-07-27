@@ -5,7 +5,7 @@
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `main.py` 和 `inc/**/*.py` 中 244 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis和DPD-ILC核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
+本次审计共检查 `main.py` 和 `inc/**/*.py` 中 268 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis和DPD-ILC核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
 
 ## 1. 分类规则
 
@@ -32,7 +32,7 @@ flowchart LR
     pa --> sync
     sync --> analysis["Analysis.md：MSE/SNR/EVM/ACLR"]
     analysis --> report["打印/保存/绘图"]
-    audit["本文：244 个定义位置逐项索引"] -.-> wave
+    audit["本文：268 个定义位置逐项索引"] -.-> wave
     audit -.-> pa
     audit -.-> ilc
     audit -.-> sync
@@ -66,7 +66,7 @@ flowchart LR
 |---|---|---|---|
 | `FixedPoint.__init__` | E | 校验0至53位接口配置；0为浮点旁路，正数为一个符号位加其余小数位 | [FixedPoint.md §2](./FixedPoint.md) |
 | `FixedPoint.IsFloatingPoint`, `FixedPoint.GetFormatInfo` | E | 返回当前模式、步长、小数位数和可表示范围，不改变信号 | [FixedPoint.md §2](./FixedPoint.md) |
-| `FixedPoint.QuantizeComplex` | N/P | 对I/Q独立执行最近值舍入、有符号饱和与反量化，并保持 `complex128` 数据类型 | [FixedPoint.md §3–§7](./FixedPoint.md) |
+| `FixedPoint.QuantizeComplex` | N/P | 兼容入口，调用编码逻辑把归一化I/Q映射为有符号整数码，并保持 `complex128` 容器类型 | [FixedPoint.md](./FixedPoint.md) |
 
 ## 3. `WaveGenWifi.py`：Wi-Fi 波形函数
 
@@ -324,3 +324,18 @@ flowchart LR
 3. 若只是工程编排，在本文标为 E 类并指向其数据来源。
 
 仅增加 docstring 不视为完成物理原理文档。
+
+## 12. Fixed-point public-code boundary audit
+
+| Function or method | Type | Principle or responsibility | Reference |
+|---|---|---|---|
+| `FixedPoint.QuantizeCodes` | N/E | Round and saturate public I/Q integer codes independently; `complex128` is only the common storage container. | [FixedPoint.md](./FixedPoint.md) |
+| `FixedPoint.EncodeComplex` | N | Multiply normalized physical components by $2^{W-1}$ and map them to signed integer codes. | [FixedPoint.md](./FixedPoint.md) |
+| `FixedPoint.DecodeComplex` | N | Divide public integer codes by $2^{W-1}$ only at an internal floating-processing boundary. | [FixedPoint.md](./FixedPoint.md) |
+| `PaModel.ProcessFloating` | P/E | Evaluate the Wiener or GMP PA after code decoding without applying a second interface conversion. | [PaModel.md](./PaModel.md) |
+| `MimoPaModel.ProcessChainFloating` | P/E | Apply one chain's input gain, nonlinear PA, output gain, and optional power calibration in normalized floating units. | [PaModel.md](./PaModel.md) |
+| `IQImbalancePA.Width`, `IQImbalancePA.ProcessFloating` | P/E | Inherit the wrapped PA width and evaluate direct plus conjugate image paths in floating units. | [PaModel.md](./PaModel.md) |
+| `DpdIlc.ResolvePaWidth` | E | Read the PA interface width and preserve width zero for third-party floating PA models. | [DpdIlc.md](./DpdIlc.md) |
+| `NormalizedPaAdapter.__init__`, `NormalizedPaAdapter.Process` | E/P | Hide integer-code transport from the ILC update law so learning always uses normalized physical amplitudes. | [DpdIlc.md](./DpdIlc.md) |
+| `DpdIlc.EncodeIlcResult` | E/N | Encode selected and per-iteration waveform fields as public integer codes without altering normalized-domain MSE values. | [DpdIlc.md](./DpdIlc.md) |
+| `MimoPaChain.Width` | E | Expose the parent MIMO PA width to the per-chain SISO ILC adapter. | [DpdIlc.md](./DpdIlc.md) |

@@ -54,6 +54,7 @@ from inc.lib.DpdIlc import (
     RunScalarPIlc,
 )
 from inc.lib.PaModel import IQImbalancePA, PaModel
+from inc.utils.FixedPoint import FixedPoint
 from inc.utils.SigProc import PowerCalibration
 from inc.lib.WaveGenWifi import WaveGenWifi
 from inc.utils.WifiMetadata import WifiWaveform
@@ -369,8 +370,15 @@ def EvaluateDeployment(
         result: SNR, EVM, and ACLR of the held-out PA output.
     """
 
-    predistortedInput = LimitAmplitude(
-        predistorter.Process(validationSignal), maxAmplitude
+    interfaceFormat = FixedPoint(int(getattr(paModel, "width", 0)))
+    floatingValidationSignal = interfaceFormat.DecodeComplex(
+        validationSignal
+    )
+    floatingPredistortedInput = LimitAmplitude(
+        predistorter.Process(floatingValidationSignal), maxAmplitude
+    )
+    predistortedInput = interfaceFormat.EncodeComplex(
+        floatingPredistortedInput
     )
     paOutput = paModel.Process(predistortedInput)
     return resultAnalysis.Analyze(paOutput)
@@ -495,6 +503,8 @@ def RunAllIlcBenchmark(
     )
     trainingSignal = driveScale * trainingWaveform.samples
     validationSignal = driveScale * validationWaveform.samples
+    interfaceFormat = FixedPoint(config.width)
+    floatingTrainingSignal = interfaceFormat.DecodeComplex(trainingSignal)
     paParameters = {
         "modelName": config.paModelName,
         "width": config.width,
@@ -516,7 +526,9 @@ def RunAllIlcBenchmark(
             "width": config.width,
         },
     )
-    maxAmplitude = max(2.0, 1.6 * np.max(np.abs(trainingSignal)))
+    maxAmplitude = max(
+        2.0, 1.6 * np.max(np.abs(floatingTrainingSignal))
+    )
 
     baselineOutput = paModel.Process(trainingSignal)
     baselineMetrics = trainingAnalysis.Analyze(baselineOutput)
@@ -667,7 +679,9 @@ def RunAllIlcBenchmark(
     )
 
     # Constrained ILC uses a peak only 5 percent above the original waveform.
-    constrainedPeak = 1.05 * np.max(np.abs(trainingSignal))
+    constrainedPeak = 1.05 * np.max(
+        np.abs(floatingTrainingSignal)
+    )
     constrainedResult = RunFrequencyDomainIlc(
         trainingSignal,
         paModel,
@@ -703,12 +717,18 @@ def RunAllIlcBenchmark(
             pointDrive,
             paModel,
             trainingWaveform,
+            config.width,
             "Frequency-domain ILC",
             None,
             ILCConfig(
                 numIterations=config.numIterations,
                 learningRate=0.12,
-                maxAmplitude=1.05 * np.max(np.abs(pointReference)),
+                maxAmplitude=1.05
+                * np.max(
+                    np.abs(
+                        interfaceFormat.DecodeComplex(pointReference)
+                    )
+                ),
                 randomSeed=config.seed + 7,
             ),
         )
@@ -795,6 +815,7 @@ def RunAllIlcBenchmark(
             pointDrive,
             paModel,
             trainingWaveform,
+            config.width,
             "Frequency-domain ILC",
             None,
             ILCConfig(
@@ -814,6 +835,7 @@ def RunAllIlcBenchmark(
             pointDrive,
             paModel,
             trainingWaveform,
+            config.width,
             "Frequency-domain ILC",
             None,
             ILCConfig(
@@ -906,6 +928,7 @@ def RunAllIlcBenchmark(
             pointDrive,
             iqPaModel,
             trainingWaveform,
+            config.width,
             "Frequency-domain ILC",
             None,
             ILCConfig(
@@ -922,6 +945,7 @@ def RunAllIlcBenchmark(
             pointDrive,
             iqPaModel,
             trainingWaveform,
+            config.width,
             "Augmented IQ ILC",
             RunAugmentedIqIlc,
             ILCConfig(
@@ -951,8 +975,10 @@ def RunAllIlcBenchmark(
         (
             "ILC label + MP",
             FitGmpPredistorter(
-                trainingSignal,
-                frequencyAnalysisResult.bestInputSignal,
+                floatingTrainingSignal,
+                interfaceFormat.DecodeComplex(
+                    frequencyAnalysisResult.bestInputSignal
+                ),
                 nonlinearOrders=(1, 3, 5, 7),
                 memoryDepth=3,
                 crossMemoryDepth=0,
@@ -961,8 +987,10 @@ def RunAllIlcBenchmark(
         (
             "ILC label + GMP",
             FitGmpPredistorter(
-                trainingSignal,
-                frequencyAnalysisResult.bestInputSignal,
+                floatingTrainingSignal,
+                interfaceFormat.DecodeComplex(
+                    frequencyAnalysisResult.bestInputSignal
+                ),
                 nonlinearOrders=(1, 3, 5, 7),
                 memoryDepth=3,
                 crossMemoryDepth=2,
@@ -971,24 +999,30 @@ def RunAllIlcBenchmark(
         (
             "ILC label + Volterra",
             FitVolterraPredistorter(
-                trainingSignal,
-                frequencyAnalysisResult.bestInputSignal,
+                floatingTrainingSignal,
+                interfaceFormat.DecodeComplex(
+                    frequencyAnalysisResult.bestInputSignal
+                ),
                 memoryDepth=3,
             ),
         ),
         (
             "ILC label + LUT",
             FitLutPredistorter(
-                trainingSignal,
-                frequencyAnalysisResult.bestInputSignal,
+                floatingTrainingSignal,
+                interfaceFormat.DecodeComplex(
+                    frequencyAnalysisResult.bestInputSignal
+                ),
                 binCount=64,
             ),
         ),
         (
             "ILC label + NN",
             FitNeuralPredistorter(
-                trainingSignal,
-                frequencyAnalysisResult.bestInputSignal,
+                floatingTrainingSignal,
+                interfaceFormat.DecodeComplex(
+                    frequencyAnalysisResult.bestInputSignal
+                ),
                 memoryDepth=4,
                 hiddenUnitCount=32,
                 randomSeed=config.seed + 10,
@@ -1015,9 +1049,15 @@ def RunAllIlcBenchmark(
             lambda pointReference,
             _,
             selectedPredistorter=predistorter: paModel.Process(
-                LimitAmplitude(
-                    selectedPredistorter.Process(pointReference),
-                    maxAmplitude,
+                interfaceFormat.EncodeComplex(
+                    LimitAmplitude(
+                        selectedPredistorter.Process(
+                            interfaceFormat.DecodeComplex(
+                                pointReference
+                            )
+                        ),
+                        maxAmplitude,
+                    )
                 )
             )
         )

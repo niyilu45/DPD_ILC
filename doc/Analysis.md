@@ -1328,7 +1328,7 @@ P_i=10^{-3}10^{p_i/10}.
 V_i=\sqrt{R P_i}.
 ```
 
-最后对每种方法施加一个常数输出标定增益：
+为了报告物理功率，可以为每种方法定义一个常数输出标定增益：
 
 ```math
 g_{i,m}
@@ -1340,7 +1340,9 @@ g_{i,m}
 y_{i,m}[n]=g_{i,m}z_{i,m}[n].
 ```
 
-因此每条曲线在横轴位置 $p_i$ 上都具有相同的实际平均输出功率。常数 $g_{i,m}$ 只改变整体幅度，不改变EVM、SNR残差比或ACLR功率比。
+因此每条曲线在横轴位置 $p_i$ 上都对应相同的目标平均输出功率。常数 $g_{i,m}$ 只改变整体幅度，不改变EVM、SNR残差比或ACLR功率比。
+
+定点模式还有一个重要实现边界：$z_{i,m}[n]$ 是公开整数码，而 $y_{i,m}[n]$ 是物理电压，不再是整数码。代码不会把 $y_{i,m}[n]$ 重新送入定点 `Analysis`，否则电压会被错误地当作码值再次除以 $2^{W-1}$。性能指标直接使用 $z_{i,m}[n]$；目标RMS电压 $V_i$ 单独保存在曲线结果中用于功率审计。由于公共复增益会被接收链补偿，这与先乘 $g_{i,m}$ 再计算EVM严格等价。
 
 `outputPowerDbmValues` 必须有限且严格递增，每一点都不得超过 `maximumOutputPowerDbm`。结果对象同时保存 `driveScaleValues` 和 `targetOutputRmsValues`，分别用于审计归一化压缩工作点和50 Ω物理输出标定。
 
@@ -1353,7 +1355,7 @@ y_{i,m}[n]=g_{i,m}z_{i,m}[n].
 10^{(p_i-p_{\max})/20}\mathbf x_{\mathrm{unit}}.
 ```
 
-所有输出都标定到相同的 $p_i$ 后调用相同的 `CalculateEvm`。这样曲线差异来自补偿方法本身，而不是输出功率、输入帧、随机种子或指标定义不同。
+所有输出都对应相同的 $p_i$ 驱动工作点，并调用相同的 `CalculateEvm`。物理电压标定作为独立报告量保存，不回灌定点分析接口。这样曲线差异来自补偿方法本身，而不是输出功率、输入帧、随机种子或指标定义不同。
 
 ```mermaid
 flowchart LR
@@ -1364,15 +1366,15 @@ flowchart LR
     B --> C2["Frequency ILC"]
     B --> C3["Time-domain ILC"]
     B --> C4["Fitted/Deployed DPD"]
-    C1 --> G["每路输出标定到目标dBm"]
-    C2 --> G
-    C3 --> G
-    C4 --> G
-    G --> D["统一 Analysis.CalculateEvm"]
+    C1 --> D["公开整数码直接进入<br/>统一 Analysis.CalculateEvm"]
+    C2 --> D
+    C3 --> D
+    C4 --> D
+    K --> G["单独保存目标RMS电压<br/>用于功率审计"]
     D --> E["同图功率–EVM 曲线"]
 ```
 
-**图 7 说明**：每个方法看到相同的归一化输出回退驱动，并在指标计算前达到相同的实际输出dBm。学习型ILC可以在每个点重新迭代；部署型DPD可以固定标称点系数并跨功率测试。
+**图 7 说明**：每个方法看到相同的归一化输出回退驱动。EVM对公共输出增益不敏感，因此定点码直接进入Analysis，目标dBm对应的RMS电压单独保存，避免把伏特误当作整数码。学习型ILC可以在每个点重新迭代；部署型DPD可以固定标称点系数并跨功率测试。
 
 ### 8.4 曲线怎样阅读
 
@@ -1675,7 +1677,7 @@ Analysis(
 
 `signalProcessingParameters` 是显式构造参数，其映射内容直接传给 `SigProc`。为兼容旧程序，`parameters={"signalProcessingParameters": {...}}` 仍然有效；新代码应优先使用显式参数，避免把同步配置误认为普通Analysis指标配置。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。任何层出现未知键时，代码会发出 `UserWarning`、忽略该键并继续；已识别键的类型、单位和物理范围仍严格校验。
 
-`width` 配置参考和测量波形的统一I/Q接口。`width=0` 使用浮点旁路，默认 `width=16` 使用Q1.15；量化后仍以 `numpy.complex128` 完成时延、CFO、SFO、复增益、OFDM解调和指标计算。显式参考、发送辅助和盲分析三条路径都遵守相同规则，盲模式还会把位宽传给Parser重建参考：
+`width` 配置参考和测量波形的统一I/Q接口。`width=0` 使用浮点旁路；默认 `width=16` 要求公开输入的 I、Q 分量是 `-32768…32767` 的整数码。`Analysis` 在入口先按 $2^{width-1}$ 解码成归一化 `numpy.complex128`，然后完成时延、CFO、SFO、复增益、OFDM解调和指标计算。显式参考、发送辅助和盲分析三条路径都只解码一次，盲模式还会把位宽传给Parser重建参考：
 
 ```python
 from inc.lib.Analysis import Analysis
@@ -1696,7 +1698,7 @@ print(floatingMetrics["evmDb"])
 print(fixedMetrics["evmDb"])
 ```
 
-两种结果都是普通字典。`width=` 直接参数仍可作为最高优先级便捷写法；放入 `parameters` 时则与其他Analysis配置共同进入 `ChainMap`。可以通过 `resultAnalysis.GetParameters()["width"]` 或 `resultAnalysis.width` 读取最终解析值。定点边界的舍入、饱和和EVM近似推导见 [FixedPoint.md](./FixedPoint.md)。
+两种结果都是普通字典。定点调用中的 `referenceSignal` 和 `receivedSignal` 必须来自相同位宽的模块公开接口，不能把已解码的小于1浮点值或已经换算成伏特的功率标定副本冒充整数码。`width=` 直接参数仍可作为最高优先级便捷写法；放入 `parameters` 时则与其他Analysis配置共同进入 `ChainMap`。可以通过 `resultAnalysis.GetParameters()["width"]` 或 `resultAnalysis.width` 读取最终解析值。定点码值、舍入、饱和和EVM近似推导见 [FixedPoint.md](./FixedPoint.md)。
 
 `parseParameters` 只在盲模式使用。`sampleRateHz` 和 `channelBandwidthHz` 只需在纯NumPy发送辅助模式中补充：前者让CFO估计使用真实Hz单位，后者与采样率一起定义ACLR积分频带。发送辅助模式即使没有这两个物理量，也会继续完成时延、归一化CFO、SFO、复增益、EVM和SNR计算，只把无法定义的ACLR返回为 `NaN`。
 

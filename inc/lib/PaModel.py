@@ -330,7 +330,7 @@ class PaModel:
             parameters: Optional external mapping layered ahead of the built-in defaults.
             width: Optional external I/Q width. None selects the internal
                 16-bit default, zero selects floating point, and a positive
-                value selects signed normalized fixed-point emulation.
+                value selects signed integer I/Q codes in complex128.
             parameterOverrides: Additional keyword settings. Unsupported names
                 produce a warning and are ignored.
 
@@ -518,20 +518,47 @@ class PaModel:
         """Pass a complex waveform through the configured PA model.
 
         Processing details:
-            Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+            Algorithm: Round and saturate the public fixed-point I/Q codes,
+            decode them to a normalized floating envelope, evaluate the PA,
+            and encode the floating result back to integer-valued public codes.
 
         Args:
             inputSignal: One-dimensional complex baseband samples supplied to the operation.
 
         Returns:
-            result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+            result: Complex128 samples containing raw I/Q codes in fixed mode
+                or physical floating samples when ``width`` equals zero.
         """
 
         self.SynchronizeModel()
         interfaceFormat = FixedPoint(self.width)
-        quantizedInput = interfaceFormat.QuantizeComplex(inputSignal)
-        floatingOutput = self.model.Process(quantizedInput)
-        return interfaceFormat.QuantizeComplex(floatingOutput)
+        floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+        floatingOutput = self.ProcessFloating(floatingInput)
+        return interfaceFormat.EncodeComplex(floatingOutput)
+
+    def ProcessFloating(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Evaluate the PA directly in its normalized floating-point domain.
+
+        Processing details:
+            Algorithm: Validate finite normalized complex samples and pass
+            them to the active Wiener or GMP calculation without applying the
+            public fixed-point encoding. This method is used by internal
+            algorithms such as ILC after they have crossed the public boundary.
+
+        Args:
+            inputSignal: Normalized physical complex samples of any shape.
+
+        Returns:
+            result: Floating complex PA output with the same shape.
+        """
+
+        self.SynchronizeModel()
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        if complexInput.size == 0 or not np.all(np.isfinite(complexInput)):
+            raise ValueError("inputSignal must contain finite samples")
+        return np.asarray(
+            self.model.Process(complexInput), dtype=np.complex128
+        )
 
     def SmallSignalGain(self) -> complex:
         """Return the configured model's DC small-signal complex gain.
@@ -984,22 +1011,23 @@ class MimoPaModel:
         """Process every transmit column through its independent PA chain.
 
         Processing details:
-            Algorithm: Apply per-chain input dB drive, nonlinear PA processing,
-            relative output dB calibration, and optional absolute dBm scaling
-            after conversion to an RMS voltage; stack outputs with the original
-            samples-by-chains orientation.
+            Algorithm: Decode the public matrix of fixed I/Q codes once,
+            process every normalized floating column through its PA and power
+            controls, encode every result column back to public integer codes,
+            and preserve the original vector or matrix orientation.
 
         Args:
             inputSignal: Complex vector for one chain or matrix shaped samples
                 by the configured number of transmit chains.
 
         Returns:
-            result: Processed complex array with the same dimensionality.
+            result: Processed complex array containing raw I/Q codes in fixed
+                mode and physical floating samples in floating mode.
         """
 
         self.SynchronizeModels()
         interfaceFormat = FixedPoint(self.width)
-        complexInput = interfaceFormat.QuantizeComplex(inputSignal)
+        complexInput = interfaceFormat.DecodeComplex(inputSignal)
         inputWasVector = complexInput.ndim == 1
         if inputWasVector:
             complexInput = complexInput.reshape(-1, 1)
@@ -1015,12 +1043,18 @@ class MimoPaModel:
         outputColumns = []
         outputRmsValues = []
         for chainIndex in range(self.numTransmitChains):
-            chainOutput = self.ProcessChain(
+            floatingChainOutput = self.ProcessChainFloating(
                 complexInput[:, chainIndex], chainIndex
             )
-            outputColumns.append(chainOutput)
+            outputColumns.append(
+                interfaceFormat.EncodeComplex(floatingChainOutput)
+            )
             outputRmsValues.append(
-                float(np.sqrt(np.mean(np.abs(chainOutput) ** 2)))
+                float(
+                    np.sqrt(
+                        np.mean(np.abs(floatingChainOutput) ** 2)
+                    )
+                )
             )
         outputMatrix = np.column_stack(outputColumns)
         self.lastOutputRmsPerChain = tuple(outputRmsValues)
@@ -1034,16 +1068,16 @@ class MimoPaModel:
         """Process a vector through one selected PA and power calibration.
 
         Processing details:
-            Algorithm: Apply this chain's input drive, nonlinear model,
-            relative output calibration, and optional absolute RMS target.
-            This method is also the independent plant used by per-chain ILC.
+            Algorithm: Decode raw external codes, apply the selected chain's
+            floating PA and power controls, then encode raw external codes.
 
         Args:
             inputSignal: One-dimensional complex samples for one RF chain.
             chainIndex: Zero-based physical PA index.
 
         Returns:
-            result: Processed one-dimensional complex samples.
+            result: Complex128 vector containing raw fixed I/Q codes or
+                floating samples according to the configured width.
         """
 
         self.SynchronizeModels()
@@ -1052,7 +1086,38 @@ class MimoPaModel:
         if chainIndex < 0 or chainIndex >= self.numTransmitChains:
             raise IndexError("chainIndex is outside the configured chain range")
         interfaceFormat = FixedPoint(self.width)
-        complexInput = interfaceFormat.QuantizeComplex(inputSignal)
+        complexInput = interfaceFormat.DecodeComplex(inputSignal)
+        if complexInput.ndim != 1 or complexInput.size == 0:
+            raise ValueError("inputSignal must be a nonempty vector")
+        if not np.all(np.isfinite(complexInput)):
+            raise ValueError("inputSignal must contain finite samples")
+        chainOutput = self.ProcessChainFloating(complexInput, chainIndex)
+        return interfaceFormat.EncodeComplex(chainOutput)
+
+    def ProcessChainFloating(
+        self, inputSignal: np.ndarray, chainIndex: int
+    ) -> np.ndarray:
+        """Evaluate one MIMO PA chain in normalized floating-point units.
+
+        Processing details:
+            Algorithm: Validate one normalized complex vector, apply its input
+            drive, internal floating PA model, relative output calibration,
+            and optional absolute RMS target without external code conversion.
+
+        Args:
+            inputSignal: Normalized physical complex samples for one chain.
+            chainIndex: Zero-based physical PA index.
+
+        Returns:
+            result: Floating complex output before public fixed-point encoding.
+        """
+
+        self.SynchronizeModels()
+        if not isinstance(chainIndex, int) or isinstance(chainIndex, bool):
+            raise TypeError("chainIndex must be an integer")
+        if chainIndex < 0 or chainIndex >= self.numTransmitChains:
+            raise IndexError("chainIndex is outside the configured chain range")
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
         if complexInput.ndim != 1 or complexInput.size == 0:
             raise ValueError("inputSignal must be a nonempty vector")
         if not np.all(np.isfinite(complexInput)):
@@ -1074,7 +1139,7 @@ class MimoPaModel:
         inputScale = 10.0 ** (
             float(inputPowerDbValues[chainIndex]) / 20.0
         )
-        chainOutput = self.paModels[chainIndex].Process(
+        chainOutput = self.paModels[chainIndex].ProcessFloating(
             inputScale * complexInput
         )
         outputScale = 10.0 ** (
@@ -1097,7 +1162,7 @@ class MimoPaModel:
                     "cannot set target RMS on a zero-power PA output"
                 )
             chainOutput = float(targetOutputRms) * chainOutput / currentRms
-        return interfaceFormat.QuantizeComplex(chainOutput)
+        return np.asarray(chainOutput, dtype=np.complex128)
 
     def GetOutputRmsPerChain(self) -> Tuple[float, ...]:
         """Return legacy RMS output voltages measured by the most recent call.
@@ -1162,6 +1227,22 @@ class IQImbalancePA:
         self.directCoefficient = complex(directCoefficient)
         self.imageCoefficient = complex(imageCoefficient)
 
+    @property
+    def Width(self) -> int:
+        """Return the wrapped PA public I/Q component width.
+
+        Processing details:
+            Algorithm: Forward the wrapped PA width and use zero for a
+            third-party floating PA that does not expose this setting.
+
+        Returns:
+            result: Nonnegative public fixed-point component width.
+        """
+
+        return int(getattr(self.paModel, "width", 0))
+
+    width = Width
+
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
         """Apply the base PA and then add its conjugate image component.
 
@@ -1175,10 +1256,36 @@ class IQImbalancePA:
             result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
         """
 
-        paOutput = self.paModel.Process(inputSignal)
-        return (
+        interfaceFormat = FixedPoint(self.width)
+        floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+        floatingOutput = self.ProcessFloating(floatingInput)
+        return interfaceFormat.EncodeComplex(floatingOutput)
+
+    def ProcessFloating(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Apply PA nonlinearity and IQ imbalance in floating-point units.
+
+        Processing details:
+            Algorithm: Evaluate the wrapped PA without its public code
+            conversion when supported, then combine direct and conjugated
+            image paths before the outer interface performs one encoding.
+
+        Args:
+            inputSignal: Normalized floating complex samples.
+
+        Returns:
+            result: Normalized floating samples including IQ imbalance.
+        """
+
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        floatingProcessor = getattr(self.paModel, "ProcessFloating", None)
+        if callable(floatingProcessor):
+            paOutput = floatingProcessor(complexInput)
+        else:
+            paOutput = self.paModel.Process(complexInput)
+        return np.asarray(
             self.directCoefficient * paOutput
-            + self.imageCoefficient * np.conj(paOutput)
+            + self.imageCoefficient * np.conj(paOutput),
+            dtype=np.complex128,
         )
 
     def SmallSignalGain(self) -> complex:

@@ -295,7 +295,7 @@ class Analysis:
                 enable ACLR in NumPy-assisted waveform-domain analysis.
             width: Optional external I/Q width. None selects the internal
                 16-bit default, zero selects floating point, and a positive
-                value selects signed normalized fixed-point emulation.
+                value selects signed integer I/Q codes in complex128.
             parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
 
         Returns:
@@ -377,19 +377,25 @@ class Analysis:
                 if isinstance(referenceSignal, WifiWaveform)
                 else referenceSignal
             )
-            measuredArray = self.interfaceFormat.QuantizeComplex(
+            measuredArray = self.interfaceFormat.QuantizeCodes(
                 measuredInput
+            )
+            floatingMeasuredArray = self.interfaceFormat.DecodeComplex(
+                measuredArray
             )
             if isinstance(transmittedSignal, WifiWaveform):
                 selectedReference = (
-                    self.interfaceFormat.QuantizeComplex(
+                    self.interfaceFormat.QuantizeCodes(
                         transmittedSignal.samples
                     )
                 )
+                floatingReference = self.interfaceFormat.DecodeComplex(
+                    selectedReference
+                )
                 selectedWaveform = transmittedSignal
                 self.signalOverlapResult = SigProc.EstimateSignalOverlap(
-                    measuredArray,
-                    selectedReference,
+                    floatingMeasuredArray,
+                    floatingReference,
                     self.parameters[
                         "assistedMaximumOffsetSamples"
                     ],
@@ -422,14 +428,17 @@ class Analysis:
                     self.defaultMeasuredSignal = measuredArray.copy()
             else:
                 transmitArray = np.asarray(
-                    self.interfaceFormat.QuantizeComplex(
+                    self.interfaceFormat.QuantizeCodes(
                         transmittedSignal
                     ),
                     dtype=np.complex128,
                 )
+                floatingTransmitArray = (
+                    self.interfaceFormat.DecodeComplex(transmitArray)
+                )
                 self.signalOverlapResult = SigProc.EstimateSignalOverlap(
-                    measuredArray,
-                    transmitArray,
+                    floatingMeasuredArray,
+                    floatingTransmitArray,
                     self.parameters[
                         "assistedMaximumOffsetSamples"
                     ],
@@ -465,12 +474,12 @@ class Analysis:
             parseInput: Union[np.ndarray, WifiWaveform] = (
                 replace(
                     referenceSignal,
-                    samples=self.interfaceFormat.QuantizeComplex(
+                    samples=self.interfaceFormat.QuantizeCodes(
                         referenceSignal.samples
                     ),
                 )
                 if isinstance(referenceSignal, WifiWaveform)
-                else self.interfaceFormat.QuantizeComplex(
+                else self.interfaceFormat.QuantizeCodes(
                     referenceSignal
                 )
             )
@@ -490,7 +499,10 @@ class Analysis:
             raise TypeError("waveform must be a WifiWaveform or None")
         if isinstance(selectedReference, WifiWaveform):
             selectedReference = selectedReference.samples
-        complexReference = self.interfaceFormat.QuantizeComplex(
+        # Public fixed-point inputs contain raw integer codes. Decode exactly
+        # once at the analysis boundary so synchronization and metrics always
+        # operate in normalized physical units.
+        complexReference = self.interfaceFormat.DecodeComplex(
             selectedReference
         )
         if complexReference.size == 0:
@@ -801,7 +813,7 @@ class Analysis:
         signalProcessingParameters = self.parameters[
             "signalProcessingParameters"
         ]
-        measuredArray = self.interfaceFormat.QuantizeComplex(
+        measuredArray = self.interfaceFormat.DecodeComplex(
             measuredSignal
         )
         referenceMatrix = (
@@ -1580,9 +1592,10 @@ class Analysis:
 
         Every evaluator receives a reference waveform driven according to the
         requested output backoff and the numeric output dBm value. The rated
-        maximum output is zero backoff. After nonlinear processing, one
-        constant per-chain gain calibrates every method to the requested
-        absolute output power. This gain does not alter EVM or ACLR ratios.
+        maximum output is zero backoff. Target RMS voltages are retained for
+        physical-power reporting, while raw public PA codes feed EVM directly.
+        A physical calibration gain would not alter EVM or ACLR ratios and
+        must not be reinterpreted as fixed-point I/Q codes.
 
         Args:
             outputPowerDbmValues: Strictly increasing absolute per-PA output
@@ -1661,12 +1674,11 @@ class Analysis:
                 rawMeasuredSignal = methodEvaluator(
                     pointReference, float(outputPowerDbm)
                 )
-                measuredSignal = (
-                    powerCalibration.ScaleSignalToOutputPower(
-                        rawMeasuredSignal,
-                        float(outputPowerDbm),
-                    )
-                )
+                # EVM is invariant to the physical reporting gain removed by
+                # complex-gain compensation. Keep raw public fixed-point codes
+                # here; voltage calibration would no longer be an I/Q code
+                # and therefore must not be fed back into Analysis.
+                measuredSignal = rawMeasuredSignal
                 pointAnalysis = Analysis(
                     pointReference,
                     self.waveform,

@@ -1102,13 +1102,12 @@ class ParseWifi:
             if isinstance(receivedSignal, WifiWaveform)
             else receivedSignal
         )
-        # The parser receives the same external representation as Analysis.
-        # Quantized values are immediately dequantized to complex128 so every
-        # synchronization and descriptor operation below remains floating
-        # point and the public array type is identical in both modes.
+        # The parser receives raw public fixed-point codes. Decode exactly
+        # once so synchronization, descriptor recovery, and correlation all
+        # operate on normalized physical floating-point values.
         complexReceived = FixedPoint(
             cast(int, self.parameters["width"])
-        ).QuantizeComplex(rawSamples)
+        ).DecodeComplex(rawSamples)
         if complexReceived.ndim not in (1, 2):
             raise ValueError(
                 "receivedSignal must be a vector or samples-by-chain matrix"
@@ -1178,9 +1177,10 @@ class ParseWifi:
             ).Generate()
         except (TypeError, ValueError):
             return float("-inf")
-        referenceArray = np.asarray(
-            candidateWaveform.samples,
-            dtype=np.complex128,
+        referenceArray = FixedPoint(
+            cast(int, self.parameters["width"])
+        ).DecodeComplex(
+            candidateWaveform.samples
         )
         if packetStartSample < 0:
             return float("-inf")
@@ -1857,6 +1857,9 @@ class ParseWifi:
             else None
         )
         complexReceived = self.ValidateReceivedSignal(receivedSignal)
+        interfaceFormat = FixedPoint(
+            cast(int, self.parameters["width"])
+        )
         if isinstance(transmittedSignal, WifiWaveform):
             referenceSignal = self.ValidateReceivedSignal(
                 transmittedSignal.samples
@@ -1875,8 +1878,12 @@ class ParseWifi:
                 packetStartSample:packetStopSample
             ].copy()
             return ParsedWifiFrame(
-                receivedSignal=alignedReceived,
-                referenceSignal=referenceSignal.copy(),
+                receivedSignal=interfaceFormat.EncodeComplex(
+                    alignedReceived
+                ),
+                referenceSignal=interfaceFormat.EncodeComplex(
+                    referenceSignal
+                ),
                 waveform=transmittedSignal,
                 packetStartSample=packetStartSample,
                 parseConfidence=confidence,
@@ -1936,8 +1943,8 @@ class ParseWifi:
         referenceWaveform = WaveGenWifi(
             parameters=generatorParameters
         ).Generate()
-        regeneratedReference = np.asarray(
-            referenceWaveform.samples, dtype=np.complex128
+        regeneratedReference = interfaceFormat.DecodeComplex(
+            referenceWaveform.samples
         )
         if validatedTransmit is None:
             referenceSignal = regeneratedReference.copy()
@@ -1988,8 +1995,8 @@ class ParseWifi:
         detectedOutput = dict(detectedParameters)
         detectedOutput["sampleRateHz"] = sampleRateHz
         return ParsedWifiFrame(
-            receivedSignal=alignedReceived,
-            referenceSignal=referenceSignal,
+            receivedSignal=interfaceFormat.EncodeComplex(alignedReceived),
+            referenceSignal=interfaceFormat.EncodeComplex(referenceSignal),
             waveform=referenceWaveform,
             packetStartSample=packetStartSample,
             parseConfidence=confidence,

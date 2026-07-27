@@ -598,7 +598,7 @@ x_{\mathrm{rms,total}}
 \sum_{m=1}^{N_{TX}}|x_m[n]|^2}.
 ```
 
-浮点归一化后的待输出波形总 RMS 为 1。这个数值归一化不代表真实端口上已经产生 1 W 或某个固定 dBm；它只提供统一的 PA 驱动基准。若 `width>0`，随后的Q1.(width-1)输出边界可能因舍入或OFDM峰值饱和改变实际 `samples` RMS；`width=0` 才严格保留上述单位RMS。
+浮点归一化后的待编码波形总 RMS 为 1。这个数值归一化不代表真实端口上已经产生 1 W 或某个固定 dBm；它只提供统一的 PA 驱动基准。若 `width>0`，`samples` 保存按 $2^{width-1}$ 缩放后的整数码，所以公开码值 RMS 不再是 1；把码值解码回内部物理量后，舍入或OFDM峰值饱和仍可能使实际归一化RMS偏离1。`width=0` 才直接公开上述单位RMS浮点波形。
 
 调用方配置每路 PA 的目标输出功率 `outputPowerDbm`，并配置额定极限输出功率 `maximumOutputPowerDbm`。默认额定极限为 25 dBm。`PowerCalibration` 先按输出回退量计算归一化驱动比例：
 
@@ -669,13 +669,16 @@ x_{\mathrm{norm}}[n]=\frac{x[n]}{x_{\mathrm{rms}}}.
 \mathrm{RMS}\{x_{\mathrm{norm}}\}=1.
 ```
 
-公开样值随后为：
+定点公开样值随后编码为整数码：
 
 ```math
-x_{\mathrm{public}}[n]=Q_W(x_{\mathrm{norm}}[n]).
+q[n]=
+Q_W\left(
+2^{W-1}x_{\mathrm{norm}}[n]
+\right).
 ```
 
-当 $W=0$ 时 $Q_W$ 是恒等映射；当 $W>0$ 时，舍入和饱和可能使实际RMS不再等于1。尤其是Q1.15会限制I、Q分别位于接近 $[-1,1)$ 的范围，单位RMS OFDM高峰可能被削掉。
+其中 $Q_W$ 对 I、Q 分量分别执行最近整数舍入和有符号饱和。当 $W=0$ 时不编码，直接返回浮点波形；当 $W>0$ 时公开数组仍为 `complex128`，但实部和虚部是整数码。14位码范围为 `-8192…8191`，16位码范围为 `-32768…32767`。
 
 调用方把每路 PA 的目标输出功率配置为 $p_{\mathrm{out,dBm}}$，并把额定极限输出功率配置为 $p_{\mathrm{max,dBm}}$。默认极限为 25 dBm。`PowerCalibration` 先计算输出回退量对应的归一化驱动比例：
 
@@ -684,13 +687,19 @@ d
 =10^{(p_{\mathrm{out,dBm}}-p_{\mathrm{max,dBm}})/20}.
 ```
 
-主程序用该比例缩放公开波形：
+主程序用该比例缩放公开码值：
 
 ```math
-x_d[n]=d\,x_{\mathrm{public}}[n].
+q_d[n]=d\,q[n].
 ```
 
-浮点模式下其RMS恰好等于 $d$。定点模式下若波形发生饱和，实际归一化驱动RMS可能低于 $d$，因此同时报告PAPR和接口饱和情况很重要。
+`PaModel` 输入边界先把 $q_d[n]$ 舍入成有效整数码，再按下式解码到内部归一化驱动：
+
+```math
+x_d[n]=\frac{Q_W(q_d[n])}{2^{W-1}}.
+```
+
+定点模式下若波形发生饱和，实际内部驱动RMS可能低于理想值 $d$，因此同时报告PAPR和接口饱和情况很重要。
 
 PA 处理后，对每路原始输出施加常数增益，使其目标输出 RMS 电压满足：
 
@@ -734,7 +743,7 @@ R\,10^{-3}10^{p_{\mathrm{out,dBm}}/10}
 | `spatialMapping` | 选择 direct、DFT 或 custom 正交映射 | 改变各空间流在 PA 之间的分布 |
 | `spatialMappingMatrix` | 提供自定义 $N_{TX}\times N_{SS}$ 复矩阵 | 列必须正交归一 |
 | `cyclicShiftEnabled` | 打开/关闭每链频率相关相位 | 不改变理想单音总功率 |
-| `width` | 配置发送I/Q接口位宽；0为浮点，正数为Q1.(width-1) | 默认16位；量化只发生在完整波形输出边界 |
+| `width` | 配置发送I/Q接口位宽；0为浮点，正数返回有符号整数码 | 默认16位；编码只发生在完整波形输出边界 |
 
 ---
 
@@ -755,7 +764,7 @@ R\,10^{-3}10^{p_{\mathrm{out,dBm}}/10}
 | 前导激励 | `TrainingField` | 4 µs 传统速率宽带字段 |
 | 帧拼接 | `GenerateWifiWaveform` | `fieldSlices`、数据起点、完整帧 |
 | RMS 归一化 | `GenerateWifiWaveform` 末尾 | 接口量化前的单位 RMS 浮点波形 |
-| 接口量化 | `FixedPoint.QuantizeComplex` | 与浮点模式同形状、同为 `complex128` 的网格化样值 |
+| 接口编码 | `FixedPoint.EncodeComplex` | 与浮点模式同形状、同为 `complex128`，但I/Q分量是整数码 |
 
 最典型的调用方式只提供需要修改的普通字典；默认值由 `WaveGenWifi` 构造函数在类内部补齐：
 
@@ -781,7 +790,7 @@ updatedWaveform = wifiGenerator.Generate()
 
 `WaveGenWifi` 在构造函数内部建立“构造函数直接覆盖 → 外部映射 → 类内只读默认值”的 `ChainMap`。调用方不需要导入默认参数表，也不需要显式创建 `ChainMap`。`UpdateParameters(...)` 可写入最高优先级层，`GetParameters()` 可取得当前解析结果的字典快照。无法识别的键会产生 `UserWarning` 并被忽略；其余已识别配置继续生效，已识别但取值非法的配置仍会报错。
 
-构造函数还支持 `width`。下面两个实例分别产生浮点接口波形和默认Q1.15接口波形；两者的 `samples` 都是 `numpy.complex128`：
+构造函数还支持 `width`。下面两个实例分别产生浮点接口波形和默认16位整数码接口波形；两者的 `samples` 都是 `numpy.complex128`：
 
 ```python
 from inc.lib.WaveGenWifi import WaveGenWifi
@@ -795,9 +804,11 @@ fixedWaveform = WaveGenWifi(
 
 assert floatingWaveform.samples.dtype == fixedWaveform.samples.dtype
 assert floatingWaveform.samples.shape == fixedWaveform.samples.shape
+assert fixedWaveform.samples.real.max() <= 32767
+assert fixedWaveform.samples.real.min() >= -32768
 ```
 
-比特、QAM、空间映射、IFFT和RMS归一化仍使用浮点，只在 `WifiWaveform.samples` 输出边界量化；理想 `referenceDataSymbols` 不量化。舍入、饱和、量化噪声和OFDM高峰的详细推导见 [FixedPoint.md](./FixedPoint.md)。
+比特、QAM、空间映射、IFFT和RMS归一化仍使用浮点，只在 `WifiWaveform.samples` 输出边界编码为整数码；理想 `referenceDataSymbols` 不编码。舍入、饱和、码值缩放和OFDM高峰的详细推导见 [FixedPoint.md](./FixedPoint.md)。
 
 ---
 

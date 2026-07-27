@@ -110,7 +110,7 @@ class WaveGenWifi:
             parameters: Optional external mapping layered ahead of the built-in defaults.
             width: Optional external I/Q width. None selects the internal
                 16-bit default, zero selects floating point, and a positive
-                value selects signed normalized fixed-point emulation.
+                value selects signed integer I/Q codes in complex128.
             parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
 
         Returns:
@@ -1603,7 +1603,9 @@ def GenerateWifiWaveform(config: WaveGenWifi) -> WifiWaveform:
     # Quantization is deliberately applied only at the public waveform
     # boundary. Every field, OFDM transform, and normalization calculation
     # above remains floating point in both interface modes.
-    outputSamples = FixedPoint(config.width).QuantizeComplex(outputSamples)
+    # Fixed-mode public samples are raw signed I/Q codes stored in complex128.
+    # The generated OFDM envelope above remains normalized floating point.
+    outputSamples = FixedPoint(config.width).EncodeComplex(outputSamples)
     outputQamSymbols = (
         qamSymbols[:, :, 0]
         if config.numSpatialStreams == 1

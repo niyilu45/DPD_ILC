@@ -1661,7 +1661,9 @@ def CheckIlcImprovement() -> None:
     )
     waveform = wifiGenerator.Generate()
     referenceSignal = 0.28 * waveform.samples
-    resultAnalysis = Analysis(referenceSignal, waveform)
+    resultAnalysis = Analysis(
+        referenceSignal, waveform, parameters={"width": 0}
+    )
     for modelName in ("wiener", "gmp"):
         paModel = PaModel(modelName=modelName)
         baselineOutput = paModel.Process(referenceSignal)
@@ -1707,6 +1709,7 @@ def CheckIlcFeedbackSynchronization() -> None:
         numDataSymbols=8,
         sampleRateHz=80.0e6,
         seed=177,
+        width=0,
     ).Generate()
     referenceSignal = waveform.samples
     delaySamples = 19
@@ -1819,6 +1822,7 @@ def CheckIlcFeedbackSynchronization() -> None:
     analyzedResult = Analysis(
         referenceSignal,
         waveform,
+        parameters={"width": 0},
     ).AnalyzeIlcHistory(ilcResult.history)
     serializedIteration = analyzedResult.history[0].ToDict()
     assert (
@@ -2321,6 +2325,7 @@ def CheckMseEvmConvergence() -> None:
         numDataSymbols=3,
         oversampling=4,
         seed=91,
+        width=0,
     ).Generate()
     referenceSignal = 0.20 * waveform.samples
     resultAnalysis = Analysis(referenceSignal, waveform)
@@ -2342,7 +2347,7 @@ def CheckMseEvmConvergence() -> None:
 
     ilcResult = RunFrequencyDomainIlc(
         referenceSignal,
-        PaModel(modelName="wiener"),
+        PaModel(modelName="wiener", width=0),
         waveform.sampleRateHz,
         waveform.bandwidthHz,
         ILCConfig(
@@ -2367,7 +2372,13 @@ def CheckMseEvmConvergence() -> None:
     for iterationRecord in analysisResult.history:
         assert np.isclose(
             iterationRecord.evmDb,
-            10.0 * np.log10(iterationRecord.evmAlignedMse),
+            10.0
+            * np.log10(
+                max(
+                    iterationRecord.evmAlignedMse,
+                    np.finfo(float).tiny,
+                )
+            ),
         )
         assert np.isclose(
             iterationRecord.evmAlignedMse,
@@ -2525,10 +2536,9 @@ def CheckFixedPointInterfaces() -> None:
     """Verify shared float and fixed I/Q boundaries for the three main APIs.
 
     Processing details:
-        Algorithm: Check exact Q1.2 rounding and saturation, require an
-        unchanged complex128 public type in both modes, exercise the default
-        16-bit generator, and pass one signal through PA and Analysis objects
-        constructed with explicit floating and fixed interface widths.
+        Algorithm: Check exact raw-code encoding, saturation, and decoding,
+        require an unchanged complex128 container type in both modes, exercise
+        14- and 16-bit generators, and pass raw codes through PA and Analysis.
 
     Returns:
         result: None. Assertions identify interface-format regressions.
@@ -2543,6 +2553,10 @@ def CheckFixedPointInterfaces() -> None:
     floatingSignal = floatingFormat.QuantizeComplex(inputSignal)
     fixedSignal = fixedFormat.QuantizeComplex(inputSignal)
     expectedFixedSignal = np.array(
+        [1.0 + 1.0j, 3.0 - 4.0j, -1.0 + 0.0j],
+        dtype=np.complex128,
+    )
+    expectedDecodedSignal = np.array(
         [0.25 + 0.25j, 0.75 - 1.0j, -0.25 + 0.0j],
         dtype=np.complex128,
     )
@@ -2555,6 +2569,18 @@ def CheckFixedPointInterfaces() -> None:
     assert floatingSignal.shape == fixedSignal.shape == inputSignal.shape
     assert np.array_equal(floatingSignal, inputSignal)
     assert np.array_equal(fixedSignal, expectedFixedSignal)
+    assert np.array_equal(
+        fixedFormat.DecodeComplex(fixedSignal),
+        expectedDecodedSignal,
+    )
+    assert np.array_equal(
+        fixedFormat.QuantizeCodes(
+            np.array([1.4 - 5.2j, -9.0 + 2.6j])
+        ),
+        np.array([1.0 - 4.0j, -4.0 + 3.0j]),
+    )
+    assert fixedFormat.GetFormatInfo()["minimumCode"] == -4.0
+    assert fixedFormat.GetFormatInfo()["maximumCode"] == 3.0
 
     defaultGenerator = WaveGenWifi(
         bandwidthMhz=20,
@@ -2569,31 +2595,49 @@ def CheckFixedPointInterfaces() -> None:
     )
     defaultWaveform = defaultGenerator.Generate()
     floatingWaveform = floatingGenerator.Generate()
+    fourteenBitWaveform = WaveGenWifi(
+        parameters={
+            "width": 14,
+            "bandwidthMhz": 20,
+            "numDataSymbols": 1,
+            "sampleRateHz": 80.0e6,
+        }
+    ).Generate()
     assert defaultGenerator.width == 16
     assert floatingGenerator.width == 0
     assert defaultWaveform.samples.dtype == np.complex128
     assert floatingWaveform.samples.dtype == np.complex128
     assert defaultWaveform.samples.shape == floatingWaveform.samples.shape
-    fixedScale = float(2**15)
-    assert np.allclose(
-        defaultWaveform.samples.real * fixedScale,
-        np.rint(defaultWaveform.samples.real * fixedScale),
+    assert np.array_equal(
+        defaultWaveform.samples.real,
+        np.rint(defaultWaveform.samples.real),
     )
-    assert np.allclose(
-        defaultWaveform.samples.imag * fixedScale,
-        np.rint(defaultWaveform.samples.imag * fixedScale),
+    assert np.array_equal(
+        defaultWaveform.samples.imag,
+        np.rint(defaultWaveform.samples.imag),
     )
+    assert np.max(defaultWaveform.samples.real) <= 32767.0
+    assert np.min(defaultWaveform.samples.real) >= -32768.0
+    assert np.max(fourteenBitWaveform.samples.real) <= 8191.0
+    assert np.min(fourteenBitWaveform.samples.real) >= -8192.0
 
     paInput = 0.5 * floatingWaveform.samples
+    fixedPaInput = 0.5 * defaultWaveform.samples
     floatingPaOutput = PaModel(
         parameters={"width": 0}
     ).Process(paInput)
     fixedPaOutput = PaModel(
         parameters={"width": 16}
-    ).Process(paInput)
+    ).Process(fixedPaInput)
     assert floatingPaOutput.dtype == np.complex128
     assert fixedPaOutput.dtype == np.complex128
     assert floatingPaOutput.shape == fixedPaOutput.shape
+    assert np.array_equal(
+        fixedPaOutput.real, np.rint(fixedPaOutput.real)
+    )
+    assert np.array_equal(
+        fixedPaOutput.imag, np.rint(fixedPaOutput.imag)
+    )
 
     floatingMetrics = Analysis(
         floatingWaveform.samples,

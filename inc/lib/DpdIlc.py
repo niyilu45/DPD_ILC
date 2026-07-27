@@ -36,8 +36,10 @@ from .PaModel import AddAwgn, MimoPaModel
 # Cross-package imports support ``inc.lib`` from the repository root and
 # ``lib`` when the caller places the ``inc`` directory on sys.path.
 if __package__ and "." in __package__:
+    from ..utils.FixedPoint import FixedPoint
     from ..utils.SigProc import SignalProcessingResult, SigProc
 else:
+    from utils.FixedPoint import FixedPoint
     from utils.SigProc import SignalProcessingResult, SigProc
 
 
@@ -125,6 +127,112 @@ class ILCResult:
     learnedInput: np.ndarray
     outputSignal: np.ndarray
     history: List[ILCIteration]
+
+
+def ResolvePaWidth(paModel: Any) -> int:
+    """Return the public fixed-point width exposed by a PA object.
+
+    Processing details:
+        Algorithm: Read an integer ``width`` attribute when available and
+        otherwise preserve compatibility with third-party floating PA objects
+        by selecting width zero.
+
+    Args:
+        paModel: PA object exposing a Process operation.
+
+    Returns:
+        result: Nonnegative public I/Q component width.
+    """
+
+    resolvedWidth = getattr(paModel, "width", 0)
+    FixedPoint(resolvedWidth)
+    return int(resolvedWidth)
+
+
+class NormalizedPaAdapter:
+    """Expose any public PA through a normalized floating-point ILC boundary."""
+
+    def __init__(self, paModel: Any) -> None:
+        """Store the PA and its public code converter.
+
+        Processing details:
+            Algorithm: Resolve the PA's external width once and retain both
+            objects so every ILC plant call uses one unambiguous conversion.
+
+        Args:
+            paModel: PA object exposing a Process operation.
+
+        Returns:
+            result: None. A normalized internal plant adapter is initialized.
+        """
+
+        self.paModel = paModel
+        self.interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
+        self.width = 0
+
+    def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Process normalized samples while hiding external integer codes.
+
+        Processing details:
+            Algorithm: Prefer a PA's direct floating calculation when it is
+            available. Otherwise encode normalized samples to public codes,
+            call the public PA, and decode its returned codes exactly once.
+
+        Args:
+            inputSignal: Normalized physical complex samples.
+
+        Returns:
+            result: Normalized floating PA output samples.
+        """
+
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        floatingProcessor = getattr(self.paModel, "ProcessFloating", None)
+        if callable(floatingProcessor):
+            return np.asarray(
+                floatingProcessor(complexInput), dtype=np.complex128
+            )
+        publicInput = self.interfaceFormat.EncodeComplex(complexInput)
+        publicOutput = self.paModel.Process(publicInput)
+        return self.interfaceFormat.DecodeComplex(publicOutput)
+
+
+def EncodeIlcResult(
+    result: ILCResult, interfaceFormat: FixedPoint
+) -> ILCResult:
+    """Encode all signal-valued ILC result fields for the public interface.
+
+    Processing details:
+        Algorithm: Encode the selected input, clean PA output, and every
+        iteration input/output pair while preserving already calculated
+        normalized-domain MSE and synchronization diagnostics.
+
+    Args:
+        result: Normalized floating-point ILC result.
+        interfaceFormat: Public fixed-point conversion convention.
+
+    Returns:
+        result: ILC result whose waveform arrays contain public I/Q codes.
+    """
+
+    if interfaceFormat.IsFloatingPoint():
+        return result
+    publicHistory = [
+        replace(
+            iterationRecord,
+            inputSignal=interfaceFormat.EncodeComplex(
+                iterationRecord.inputSignal
+            ),
+            outputSignal=interfaceFormat.EncodeComplex(
+                iterationRecord.outputSignal
+            ),
+        )
+        for iterationRecord in result.history
+    ]
+    return ILCResult(
+        learnedInput=interfaceFormat.EncodeComplex(result.learnedInput),
+        outputSignal=interfaceFormat.EncodeComplex(result.outputSignal),
+        history=publicHistory,
+    )
 
 
 def CalculateIterationMetrics(
@@ -372,7 +480,11 @@ def RunFrequencyDomainIlc(
     """
 
     config.Validate()
-    targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
+    interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
+    targetSignal = interfaceFormat.DecodeComplex(
+        referenceSignal
+    ).reshape(-1)
+    normalizedPaModel = NormalizedPaAdapter(paModel)
     if targetSignal.size == 0:
         raise ValueError("referenceSignal cannot be empty")
     if sampleRateHz <= 0.0 or channelBandwidthHz <= 0.0:
@@ -416,7 +528,7 @@ def RunFrequencyDomainIlc(
     targetRms = np.sqrt(targetPower)
     probeRms = min(0.05, 0.25 * targetRms)
     probeSignal = targetSignal * (probeRms / targetRms)
-    probeOutput = paModel.Process(probeSignal)
+    probeOutput = normalizedPaModel.Process(probeSignal)
     probeProcessor = SigProc(
         probeSignal,
         sampleRateHz,
@@ -469,7 +581,7 @@ def RunFrequencyDomainIlc(
     )
     for iteration in range(config.numIterations):
         measuredOutput = MeasurePaOutput(
-            paModel, inputSignal, config, randomGenerator
+            normalizedPaModel, inputSignal, config, randomGenerator
         )
         signalProcessingResult = feedbackProcessor.Process(measuredOutput)
         alignedOutput = signalProcessingResult.processedSignal
@@ -503,11 +615,14 @@ def RunFrequencyDomainIlc(
             inputSignal + updateSignal, config.maxAmplitude
         )
 
-    finalOutput = paModel.Process(bestInput)
-    return ILCResult(
-        learnedInput=bestInput,
-        outputSignal=finalOutput,
-        history=history,
+    finalOutput = normalizedPaModel.Process(bestInput)
+    return EncodeIlcResult(
+        ILCResult(
+            learnedInput=bestInput,
+            outputSignal=finalOutput,
+            history=history,
+        ),
+        interfaceFormat,
     )
 
 
@@ -1209,7 +1324,11 @@ def RunWaveformUpdate(
     """
 
     config.Validate()
-    targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
+    interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
+    targetSignal = interfaceFormat.DecodeComplex(
+        referenceSignal
+    ).reshape(-1)
+    normalizedPaModel = NormalizedPaAdapter(paModel)
     if targetSignal.size == 0:
         raise ValueError("referenceSignal cannot be empty")
     if (
@@ -1232,7 +1351,7 @@ def RunWaveformUpdate(
 
     for iteration in range(config.numIterations):
         measuredOutput = MeasureOutput(
-            paModel, inputSignal, config, randomGenerator
+            normalizedPaModel, inputSignal, config, randomGenerator
         )
         signalProcessingResult = feedbackProcessor.Process(measuredOutput)
         alignedOutput = signalProcessingResult.processedSignal
@@ -1258,10 +1377,13 @@ def RunWaveformUpdate(
             inputSignal + updateSignal, config.maxAmplitude
         )
 
-    return ILCResult(
-        learnedInput=bestInput,
-        outputSignal=paModel.Process(bestInput),
-        history=history,
+    return EncodeIlcResult(
+        ILCResult(
+            learnedInput=bestInput,
+            outputSignal=normalizedPaModel.Process(bestInput),
+            history=history,
+        ),
+        interfaceFormat,
     )
 
 def EstimateComplexGain(
@@ -1286,12 +1408,19 @@ def EstimateComplexGain(
         result: complex. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
+    interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
+    complexReference = interfaceFormat.DecodeComplex(
+        referenceSignal
+    ).reshape(-1)
+    normalizedPaModel = NormalizedPaAdapter(paModel)
     referenceRms = max(
-        np.sqrt(np.mean(np.abs(referenceSignal) ** 2)),
+        np.sqrt(np.mean(np.abs(complexReference) ** 2)),
         np.finfo(float).tiny,
     )
-    probeSignal = referenceSignal * (min(0.04, 0.2 * referenceRms) / referenceRms)
-    probeOutput = paModel.Process(probeSignal)
+    probeSignal = complexReference * (
+        min(0.04, 0.2 * referenceRms) / referenceRms
+    )
+    probeOutput = normalizedPaModel.Process(probeSignal)
     probeProcessingResult = SigProc(
         probeSignal,
         sampleRateHz,
@@ -1443,12 +1572,19 @@ def EstimateFrequencyResponse(
         result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
+    interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
+    complexReference = interfaceFormat.DecodeComplex(
+        referenceSignal
+    ).reshape(-1)
+    normalizedPaModel = NormalizedPaAdapter(paModel)
     referenceRms = max(
-        np.sqrt(np.mean(np.abs(referenceSignal) ** 2)),
+        np.sqrt(np.mean(np.abs(complexReference) ** 2)),
         np.finfo(float).tiny,
     )
-    probeSignal = referenceSignal * (min(0.04, 0.2 * referenceRms) / referenceRms)
-    probeOutput = paModel.Process(probeSignal)
+    probeSignal = complexReference * (
+        min(0.04, 0.2 * referenceRms) / referenceRms
+    )
+    probeOutput = normalizedPaModel.Process(probeSignal)
     probeProcessingResult = SigProc(
         probeSignal,
         sampleRateHz,
@@ -1497,11 +1633,15 @@ def RunFirIlc(
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
-    targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
+    interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
+    targetSignal = interfaceFormat.DecodeComplex(
+        referenceSignal
+    ).reshape(-1)
+    normalizedPaModel = NormalizedPaAdapter(paModel)
     fftLength = NextPowerOfTwo(targetSignal.size)
     frequencyResponse = EstimateFrequencyResponse(
         targetSignal,
-        paModel,
+        normalizedPaModel,
         fftLength,
         config.responseFloorDb,
         sampleRateHz,
@@ -1552,12 +1692,15 @@ def RunFirIlc(
         errorSpectrum = np.fft.fft(errorSignal, fftLength)
         return np.fft.ifft(firResponse * errorSpectrum)[: errorSignal.size]
 
-    return RunWaveformUpdate(
-        targetSignal,
-        paModel,
-        config,
-        BuildUpdate,
-        sampleRateHz,
+    return EncodeIlcResult(
+        RunWaveformUpdate(
+            targetSignal,
+            normalizedPaModel,
+            config,
+            BuildUpdate,
+            sampleRateHz,
+        ),
+        interfaceFormat,
     )
 
 def RunDirectionalGaussNewtonIlc(
@@ -1585,9 +1728,11 @@ def RunDirectionalGaussNewtonIlc(
         diagnostics.
     """
 
-    targetSignal = np.asarray(
-        referenceSignal, dtype=np.complex128
+    interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
+    targetSignal = interfaceFormat.DecodeComplex(
+        referenceSignal
     ).reshape(-1)
+    normalizedPaModel = NormalizedPaAdapter(paModel)
     directionalProcessor = SigProc(
         targetSignal,
         sampleRateHz,
@@ -1620,10 +1765,10 @@ def RunDirectionalGaussNewtonIlc(
             np.finfo(float).tiny,
         )
         differenceScale = finiteDifferenceRms / directionRms
-        trialOutput = paModel.Process(
+        trialOutput = normalizedPaModel.Process(
             inputSignal + differenceScale * errorSignal
         )
-        cleanOutput = paModel.Process(inputSignal)
+        cleanOutput = normalizedPaModel.Process(inputSignal)
         trialProcessingResult = directionalProcessor.Process(trialOutput)
         cleanProcessingResult = directionalProcessor.Process(cleanOutput)
         alignedTrialOutput = trialProcessingResult.processedSignal
@@ -1640,12 +1785,15 @@ def RunDirectionalGaussNewtonIlc(
         )
         return config.learningRate * stepGain * errorSignal
 
-    return RunWaveformUpdate(
-        referenceSignal,
-        paModel,
-        config,
-        BuildUpdate,
-        sampleRateHz,
+    return EncodeIlcResult(
+        RunWaveformUpdate(
+            targetSignal,
+            normalizedPaModel,
+            config,
+            BuildUpdate,
+            sampleRateHz,
+        ),
+        interfaceFormat,
     )
 
 def MemoryPolynomialBasis(
@@ -1707,7 +1855,11 @@ def RunParameterDomainIlc(
     """
 
     config.Validate()
-    targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
+    interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
+    targetSignal = interfaceFormat.DecodeComplex(
+        referenceSignal
+    ).reshape(-1)
+    normalizedPaModel = NormalizedPaAdapter(paModel)
     basisMatrix = MemoryPolynomialBasis(
         targetSignal, nonlinearOrders, memoryDepth
     )
@@ -1744,7 +1896,7 @@ def RunParameterDomainIlc(
         inputSignal = normalizedBasis @ normalizedCoefficients
         inputSignal = LimitAmplitude(inputSignal, config.maxAmplitude)
         measuredOutput = MeasureOutput(
-            paModel, inputSignal, config, randomGenerator
+            normalizedPaModel, inputSignal, config, randomGenerator
         )
         signalProcessingResult = feedbackProcessor.Process(measuredOutput)
         alignedOutput = signalProcessingResult.processedSignal
@@ -1768,10 +1920,13 @@ def RunParameterDomainIlc(
         )
         normalizedCoefficients += config.learningRate * coefficientUpdate
 
-    return ILCResult(
-        learnedInput=bestInput,
-        outputSignal=paModel.Process(bestInput),
-        history=history,
+    return EncodeIlcResult(
+        ILCResult(
+            learnedInput=bestInput,
+            outputSignal=normalizedPaModel.Process(bestInput),
+            history=history,
+        ),
+        interfaceFormat,
     )
 
 def RunAugmentedIqIlc(
@@ -1795,13 +1950,17 @@ def RunAugmentedIqIlc(
         result: ILCResult. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
-    targetSignal = np.asarray(referenceSignal, dtype=np.complex128).reshape(-1)
+    interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
+    targetSignal = interfaceFormat.DecodeComplex(
+        referenceSignal
+    ).reshape(-1)
+    normalizedPaModel = NormalizedPaAdapter(paModel)
     referenceRms = max(
         np.sqrt(np.mean(np.abs(targetSignal) ** 2)),
         np.finfo(float).tiny,
     )
     probeSignal = targetSignal * (min(0.04, 0.2 * referenceRms) / referenceRms)
-    probeOutput = paModel.Process(probeSignal)
+    probeOutput = normalizedPaModel.Process(probeSignal)
     probeProcessingResult = SigProc(
         probeSignal,
         sampleRateHz,
@@ -1851,12 +2010,15 @@ def RunAugmentedIqIlc(
 
         return directLearning * errorSignal + imageLearning * np.conj(errorSignal)
 
-    return RunWaveformUpdate(
-        targetSignal,
-        paModel,
-        config,
-        BuildUpdate,
-        sampleRateHz,
+    return EncodeIlcResult(
+        RunWaveformUpdate(
+            targetSignal,
+            normalizedPaModel,
+            config,
+            BuildUpdate,
+            sampleRateHz,
+        ),
+        interfaceFormat,
     )
 
 
@@ -1886,6 +2048,22 @@ class MimoPaChain:
             raise IndexError("chainIndex is outside the configured chain range")
         self.mimoPaModel = mimoPaModel
         self.chainIndex = chainIndex
+
+    @property
+    def Width(self) -> int:
+        """Return the parent MIMO PA public I/Q component width.
+
+        Processing details:
+            Algorithm: Forward the live parent width so a SISO ILC run can
+            decode and encode this selected chain with the same convention.
+
+        Returns:
+            result: Nonnegative fixed-point component width.
+        """
+
+        return self.mimoPaModel.width
+
+    width = Width
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
         """Process one vector through the selected physical PA path.

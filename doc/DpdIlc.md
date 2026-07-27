@@ -211,7 +211,7 @@ print(fixedResult["selectedIlcMetrics"])
 python SmallestSISO.py
 ```
 
-脚本的 `RunSisoMode(width=...)` 会把该值分别写入 `WaveGenWifi.parameters`、`PaModel.parameters` 和 `Analysis.parameters`。`width=0` 为浮点旁路，`width=16` 为默认Q1.15边界；内部FFT、GMP、同步、ILC和指标算法仍使用浮点。两个结果目录分别是 `results/smallest_siso/floating` 和 `results/smallest_siso/fixed_16`，每个目录都包含逐轮MSE/EVM收敛数据和图片。定点公式见 [FixedPoint.md](./FixedPoint.md)。
+脚本的 `RunSisoMode(width=...)` 会把该值分别写入 `WaveGenWifi.parameters`、`PaModel.parameters` 和 `Analysis.parameters`。`width=0` 为浮点旁路；`width=16` 的公开 I/Q 分量是 `-32768…32767` 的整数码，`numpy.complex128` 只是统一容器。ILC在入口解码整数码，内部FFT、GMP、同步、学习更新和指标算法仍使用归一化浮点；返回的最佳输入、输出和逐轮波形再编码为公开整数码。两个结果目录分别是 `results/smallest_siso/floating` 和 `results/smallest_siso/fixed_16`，每个目录都包含逐轮MSE/EVM收敛数据和图片。定点公式见 [FixedPoint.md](./FixedPoint.md)。
 
 这个示例中，`paOutputPowerDbm` 是工作点，`maximumOutputPowerDbm` 是额定极限。输出回退和归一化驱动关系为：
 

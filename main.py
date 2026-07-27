@@ -15,6 +15,7 @@ from inc.lib.DpdIlc import (
 )
 from inc.utils.Draw import Draw
 from inc.lib.PaModel import MimoPaModel, PaModel
+from inc.utils.FixedPoint import FixedPoint
 from inc.utils.SigProc import PowerCalibration
 from inc.lib.WaveGenWifi import (
     NormalizeFrameFormat,
@@ -543,6 +544,7 @@ def Main() -> int:
     )
 
     waveform = wifiGenerator.Generate()
+    interfaceFormat = FixedPoint(wifiGenerator.width)
     if waveform.samples.ndim == 1:
         referenceSignal = (
             float(driveScalePerChain[0]) * waveform.samples
@@ -636,10 +638,14 @@ def Main() -> int:
 
     # ILC labels are waveform-specific. Ridge-regression fitting converts them
     # into a causal GMP that can be evaluated on subsequent Wi-Fi packets.
+    floatingReferenceSignal = interfaceFormat.DecodeComplex(referenceSignal)
+    floatingSelectedIlcInput = interfaceFormat.DecodeComplex(
+        selectedIlcInput
+    )
     if waveform.numTransmitAntennas == 1:
         gmpPredistorter = FitGmpPredistorter(
-            referenceSignal,
-            selectedIlcInput,
+            floatingReferenceSignal,
+            floatingSelectedIlcInput,
             nonlinearOrders=(1, 3, 5, 7),
             memoryDepth=3,
             crossMemoryDepth=2,
@@ -647,20 +653,25 @@ def Main() -> int:
         )
     else:
         gmpPredistorter = FitMimoGmpPredistorter(
-            referenceSignal,
-            selectedIlcInput,
+            floatingReferenceSignal,
+            floatingSelectedIlcInput,
             nonlinearOrders=(1, 3, 5, 7),
             memoryDepth=3,
             crossMemoryDepth=2,
             ridgeFactor=1e-6,
         )
-    deployedDpdInput = gmpPredistorter.Process(referenceSignal)
-    deployedMagnitude = np.abs(deployedDpdInput)
+    floatingDeployedDpdInput = gmpPredistorter.Process(
+        floatingReferenceSignal
+    )
+    deployedMagnitude = np.abs(floatingDeployedDpdInput)
     overLimit = deployedMagnitude > arguments.maxAmplitude
     if np.any(overLimit):
-        deployedDpdInput[overLimit] *= (
+        floatingDeployedDpdInput[overLimit] *= (
             arguments.maxAmplitude / deployedMagnitude[overLimit]
         )
+    deployedDpdInput = interfaceFormat.EncodeComplex(
+        floatingDeployedDpdInput
+    )
     deployedDpdOutputRaw = paModel.Process(deployedDpdInput)
     deployedDpdOutput = powerCalibration.ScaleSignalToOutputPowers(
         deployedDpdOutputRaw,
@@ -669,9 +680,9 @@ def Main() -> int:
 
     resultAnalysis.AnalyzeStages(
         {
-            "PA baseline": baselineOutput,
-            "Waveform ILC": selectedIlcOutput,
-            "Fitted GMP DPD": deployedDpdOutput,
+            "PA baseline": baselineOutputRaw,
+            "Waveform ILC": selectedIlcOutputRaw,
+            "Fitted GMP DPD": deployedDpdOutputRaw,
         }
     )
     print(
@@ -825,7 +836,11 @@ def Main() -> int:
                 pointReference
             ),
             "Fitted GMP DPD": lambda pointReference, _: paModel.Process(
-                gmpPredistorter.Process(pointReference)
+                interfaceFormat.EncodeComplex(
+                    gmpPredistorter.Process(
+                        interfaceFormat.DecodeComplex(pointReference)
+                    )
+                )
             ),
         }
         if waveform.numTransmitAntennas == 1:
