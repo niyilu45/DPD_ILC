@@ -73,6 +73,7 @@ class BenchmarkConfig:
     numDataSymbols: int = 10
     sampleRateHz: Optional[float] = None
     oversampling: int = 4
+    width: int = 16
     guardIntervalUs: float = 0.8
     outputPowerDbm: float = 20.0
     maximumOutputPowerDbm: float = 25.0
@@ -117,6 +118,13 @@ class BenchmarkConfig:
             raise ValueError(
                 "sampleRateHz must be finite and positive or None"
             )
+        if (
+            not isinstance(self.width, int)
+            or isinstance(self.width, bool)
+            or self.width < 0
+            or self.width > 53
+        ):
+            raise ValueError("width must be an integer from zero through 53")
         bandwidthHz = float(self.bandwidthMhz) * 1.0e6
         effectiveSampleRateHz = (
             bandwidthHz * float(self.oversampling)
@@ -372,6 +380,7 @@ def RunIlcCurvePoint(
     outputPowerDbm: float,
     paModel: Any,
     waveform: WifiWaveform,
+    width: int,
     methodName: str,
     methodFunction: Optional[Callable[..., ILCResult]],
     methodConfig: ILCConfig,
@@ -388,6 +397,7 @@ def RunIlcCurvePoint(
         outputPowerDbm: Current absolute PA output power in dBm.
         paModel: PA object exposing Process and SmallSignalGain operations.
         waveform: Wi-Fi metadata defining field locations, FFT sizes, and subcarriers.
+        width: External I/Q component width shared by all benchmark modules.
         methodName: Human-readable algorithm or deployment-model label.
         methodFunction: Selected ILC update-law callable. ``None`` selects
             the dedicated frequency-domain call path, which also needs the
@@ -399,7 +409,11 @@ def RunIlcCurvePoint(
     """
 
     del outputPowerDbm
-    pointAnalysis = Analysis(referenceSignal, waveform)
+    pointAnalysis = Analysis(
+        referenceSignal,
+        waveform,
+        parameters={"width": width},
+    )
     if methodName == "Frequency-domain ILC":
         methodResult = RunFrequencyDomainIlc(
             referenceSignal,
@@ -458,6 +472,7 @@ def RunAllIlcBenchmark(
         "mcs": config.mcs,
         "numDataSymbols": config.numDataSymbols,
         "guardIntervalUs": config.guardIntervalUs,
+        "width": config.width,
     }
     if config.sampleRateHz is None:
         sharedWifiParameters["oversampling"] = config.oversampling
@@ -480,17 +495,26 @@ def RunAllIlcBenchmark(
     )
     trainingSignal = driveScale * trainingWaveform.samples
     validationSignal = driveScale * validationWaveform.samples
-    paParameters = {"modelName": config.paModelName}
+    paParameters = {
+        "modelName": config.paModelName,
+        "width": config.width,
+    }
     paModel = PaModel(parameters=paParameters)
     trainingAnalysis = Analysis(
         trainingSignal,
         trainingWaveform,
-        loadResistanceOhm=config.loadResistanceOhm,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "width": config.width,
+        },
     )
     validationAnalysis = Analysis(
         validationSignal,
         validationWaveform,
-        loadResistanceOhm=config.loadResistanceOhm,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "width": config.width,
+        },
     )
     maxAmplitude = max(2.0, 1.6 * np.max(np.abs(trainingSignal)))
 
@@ -609,6 +633,7 @@ def RunAllIlcBenchmark(
                 pointDrive,
                 paModel,
                 trainingWaveform,
+                config.width,
                 selectedName,
                 selectedFunction,
                 selectedConfig,
@@ -1175,6 +1200,12 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
         ),
     )
     argumentParser.add_argument(
+        "--width",
+        type=int,
+        default=16,
+        help="External I/Q component width; 0 selects floating point",
+    )
+    argumentParser.add_argument(
         "--guard-interval",
         dest="guardIntervalUs",
         type=float,
@@ -1257,6 +1288,7 @@ def ParseBenchmarkArguments() -> BenchmarkConfig:
         numDataSymbols=arguments.numDataSymbols,
         sampleRateHz=arguments.sampleRateHz,
         oversampling=arguments.oversampling,
+        width=arguments.width,
         guardIntervalUs=arguments.guardIntervalUs,
         outputPowerDbm=arguments.outputPowerDbm,
         maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,

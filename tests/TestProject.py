@@ -821,10 +821,12 @@ def CheckInternalDefaultConfiguration() -> None:
         "mcs": 0,
         "numDataSymbols": 1,
         "oversampling": 4,
+        "width": 0,
     }
     wifiGenerator = WaveGenWifi(parameters=externalWifiParameters)
     assert wifiGenerator.frameFormat == "EHT"
     assert wifiGenerator.seed == 7
+    assert wifiGenerator.GetParameters()["width"] == 0
 
     externalWifiParameters["frameFormat"] = "HE"
     externalWifiParameters["seed"] = 29
@@ -842,15 +844,33 @@ def CheckInternalDefaultConfiguration() -> None:
         raise AssertionError("invalid parameter overrides must be rejected")
     assert wifiGenerator.mcs == 0
 
-    externalPaParameters = {"modelName": "wiener"}
+    externalPaParameters = {
+        "modelName": "wiener",
+        "width": 0,
+    }
     paModel = PaModel(parameters=externalPaParameters)
     assert paModel.modelName == "wiener"
+    assert paModel.GetParameters()["width"] == 0
     externalPaParameters["modelName"] = "gmp"
     paModel.Process(np.array([0.1 + 0.0j], dtype=np.complex128))
     assert paModel.modelName == "gmp"
     assert paModel.model.__class__.__name__ == "GMPPA"
 
-    analysisParameters = {"maxSegmentLength": 1024}
+    mimoPaModel = MimoPaModel(
+        parameters={
+            "numTransmitChains": 1,
+            "width": 0,
+        }
+    )
+    assert mimoPaModel.GetParameters()["width"] == 0
+
+    wifiParser = ParseWifi(parameters={"width": 0})
+    assert wifiParser.GetParameters()["width"] == 0
+
+    analysisParameters = {
+        "maxSegmentLength": 1024,
+        "width": 0,
+    }
     analysisWaveform = WaveGenWifi(
         parameters={
             "bandwidthMhz": 20,
@@ -867,6 +887,7 @@ def CheckInternalDefaultConfiguration() -> None:
     assert resultAnalysis.GetParameters()["powerEvmFileStem"] == (
         "power_evm_curve"
     )
+    assert resultAnalysis.GetParameters()["width"] == 0
     analysisParameters["powerEvmFileStem"] = "external_curve"
     assert resultAnalysis.GetParameters()["powerEvmFileStem"] == (
         "external_curve"
@@ -2541,10 +2562,10 @@ def CheckFixedPointInterfaces() -> None:
         sampleRateHz=80.0e6,
     )
     floatingGenerator = WaveGenWifi(
+        parameters={"width": 0},
         bandwidthMhz=20,
         numDataSymbols=1,
         sampleRateHz=80.0e6,
-        width=0,
     )
     defaultWaveform = defaultGenerator.Generate()
     floatingWaveform = floatingGenerator.Generate()
@@ -2564,8 +2585,12 @@ def CheckFixedPointInterfaces() -> None:
     )
 
     paInput = 0.5 * floatingWaveform.samples
-    floatingPaOutput = PaModel(width=0).Process(paInput)
-    fixedPaOutput = PaModel(width=16).Process(paInput)
+    floatingPaOutput = PaModel(
+        parameters={"width": 0}
+    ).Process(paInput)
+    fixedPaOutput = PaModel(
+        parameters={"width": 16}
+    ).Process(paInput)
     assert floatingPaOutput.dtype == np.complex128
     assert fixedPaOutput.dtype == np.complex128
     assert floatingPaOutput.shape == fixedPaOutput.shape
@@ -2573,13 +2598,16 @@ def CheckFixedPointInterfaces() -> None:
     floatingMetrics = Analysis(
         floatingWaveform.samples,
         floatingWaveform,
-        width=0,
+        parameters={"width": 0},
     ).Analyze(floatingWaveform.samples)
-    fixedMetrics = Analysis(
+    fixedAnalysis = Analysis(
         defaultWaveform.samples,
         defaultWaveform,
-        width=16,
-    ).Analyze(defaultWaveform.samples)
+        parameters={"width": 16},
+    )
+    fixedMetrics = fixedAnalysis.Analyze(defaultWaveform.samples)
+    assert fixedAnalysis.GetParameters()["width"] == 16
+    assert fixedAnalysis.width == 16
     assert set(floatingMetrics) == set(fixedMetrics)
     assert isinstance(floatingMetrics, dict)
     assert isinstance(fixedMetrics, dict)

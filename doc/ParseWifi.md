@@ -628,6 +628,7 @@ parseParameters = {
     "maximumPacketOffsetSamples": 8192,
     "minimumParseConfidence": 0.75,
     "referenceSearchSamples": 8192,
+    "width": 16,
 }
 
 parser = ParseWifi(parameters=parseParameters)

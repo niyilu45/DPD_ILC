@@ -46,8 +46,8 @@ def RunSisoMode(
             "numDataSymbols": 10,
             "sampleRateHz": 80.0e6,
             "seed": 101,
+            "width": width,
         },
-        width=width,
     )
     waveform = wifiGenerator.Generate()
     waveformPower = np.abs(waveform.samples) ** 2
@@ -82,15 +82,19 @@ def RunSisoMode(
     # PaModel and Analysis immediately convert those samples back to
     # complex128 and therefore keep all internal algorithms floating point.
     paModel = PaModel(
-        parameters={"modelName": "gmp"},
-        width=width,
+        parameters={
+            "modelName": "gmp",
+            "width": width,
+        },
     )
     baselineOutput = paModel.Process(referenceSignal)
     resultAnalysis = Analysis(
         referenceSignal,
         waveform,
-        loadResistanceOhm=loadResistanceOhm,
-        width=width,
+        parameters={
+            "loadResistanceOhm": loadResistanceOhm,
+            "width": width,
+        },
     )
     baselineMetrics = resultAnalysis.Analyze(baselineOutput)
 

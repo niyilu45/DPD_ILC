@@ -739,6 +739,7 @@ from inc.lib.PaModel import (
 
 paOverrides = {
     "modelName": "wiener",
+    "width": 16,
     "wienerConfig": WienerConfig(
         saturationAmplitude=1.0,
         rappSmoothness=3.0,
@@ -768,8 +769,12 @@ gmpOutput = paModel.Process(inputSignal)
 ```python
 from inc.lib.PaModel import PaModel
 
-floatingPa = PaModel(modelName="gmp", width=0)
-fixedPa = PaModel(modelName="gmp", width=16)
+floatingPa = PaModel(
+    parameters={"modelName": "gmp", "width": 0}
+)
+fixedPa = PaModel(
+    parameters={"modelName": "gmp", "width": 16}
+)
 
 floatingOutput = floatingPa.Process(inputSignal)
 fixedOutput = fixedPa.Process(inputSignal)
@@ -784,7 +789,7 @@ assert floatingOutput.dtype == fixedOutput.dtype
 from inc.lib.PaModel import MimoPaModel
 
 mimoPaModel = MimoPaModel(
-    width=16,
+    parameters={"width": 16},
     numTransmitChains=4,
     paParametersPerChain=(
         {"modelName": "wiener"},

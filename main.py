@@ -266,6 +266,15 @@ def Main() -> int:
         ),
     )
     argumentParser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help=(
+            "External I/Q component width; 0 selects floating point and "
+            "positive values select fixed point (default: internal 16)"
+        ),
+    )
+    argumentParser.add_argument(
         "--output-power-dbm",
         dest="outputPowerDbm",
         type=float,
@@ -428,17 +437,18 @@ def Main() -> int:
         "numTransmitAntennas",
         "numSpatialStreams",
         "spatialMapping",
+        "width",
     )
     wifiOverrides = {
         argumentName: getattr(arguments, argumentName)
         for argumentName in wifiArgumentNames
         if getattr(arguments, argumentName) is not None
     }
-    paOverrides = (
-        {}
-        if arguments.paModelName is None
-        else {"modelName": arguments.paModelName}
-    )
+    paOverrides = {}
+    if arguments.paModelName is not None:
+        paOverrides["modelName"] = arguments.paModelName
+    if arguments.width is not None:
+        paOverrides["width"] = arguments.width
     try:
         wifiGenerator = WaveGenWifi(parameters=wifiOverrides)
         if arguments.paTargetOutputRmsPerChain is not None:
@@ -504,6 +514,8 @@ def Main() -> int:
                     for _ in range(wifiGenerator.numTransmitAntennas)
                 ),
             }
+            if arguments.width is not None:
+                mimoPaOverrides["width"] = arguments.width
             if arguments.paInputPowerDbPerChain is not None:
                 mimoPaOverrides["inputPowerDbPerChain"] = (
                     arguments.paInputPowerDbPerChain
@@ -540,13 +552,18 @@ def Main() -> int:
             waveform.samples
             * driveScalePerChain.reshape(1, -1)
         )
+    analysisOverrides = {
+        "loadResistanceOhm": powerCalibration.loadResistanceOhm,
+        "maximumOutputPowerDbm": (
+            powerCalibration.maximumOutputPowerDbm
+        ),
+    }
+    if arguments.width is not None:
+        analysisOverrides["width"] = arguments.width
     resultAnalysis = Analysis(
         referenceSignal,
         waveform,
-        loadResistanceOhm=powerCalibration.loadResistanceOhm,
-        maximumOutputPowerDbm=(
-            powerCalibration.maximumOutputPowerDbm
-        ),
+        parameters=analysisOverrides,
     )
     resultDraw = Draw()
 

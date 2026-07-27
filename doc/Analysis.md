@@ -1683,20 +1683,20 @@ from inc.lib.Analysis import Analysis
 floatingMetrics = Analysis(
     referenceSignal,
     wifiWaveform,
-    width=0,
+    parameters={"width": 0},
 ).Analyze(receivedSignal)
 
 fixedMetrics = Analysis(
     referenceSignal,
     wifiWaveform,
-    width=16,
+    parameters={"width": 16},
 ).Analyze(receivedSignal)
 
 print(floatingMetrics["evmDb"])
 print(fixedMetrics["evmDb"])
 ```
 
-两种结果都是普通字典。定点边界的舍入、饱和和EVM近似推导见 [FixedPoint.md](./FixedPoint.md)。
+两种结果都是普通字典。`width=` 直接参数仍可作为最高优先级便捷写法；放入 `parameters` 时则与其他Analysis配置共同进入 `ChainMap`。可以通过 `resultAnalysis.GetParameters()["width"]` 或 `resultAnalysis.width` 读取最终解析值。定点边界的舍入、饱和和EVM近似推导见 [FixedPoint.md](./FixedPoint.md)。
 
 `parseParameters` 只在盲模式使用。`sampleRateHz` 和 `channelBandwidthHz` 只需在纯NumPy发送辅助模式中补充：前者让CFO估计使用真实Hz单位，后者与采样率一起定义ACLR积分频带。发送辅助模式即使没有这两个物理量，也会继续完成时延、归一化CFO、SFO、复增益、EVM和SNR计算，只把无法定义的ACLR返回为 `NaN`。
 

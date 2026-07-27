@@ -768,6 +768,7 @@ wifiOverrides = {
     "mcs": 9,
     "numDataSymbols": 20,
     "guardIntervalUs": 0.4,
+    "width": 16,
 }
 wifiGenerator = WaveGenWifi(parameters=wifiOverrides)
 wifiWaveform = wifiGenerator.Generate()
@@ -785,8 +786,12 @@ updatedWaveform = wifiGenerator.Generate()
 ```python
 from inc.lib.WaveGenWifi import WaveGenWifi
 
-floatingWaveform = WaveGenWifi(width=0).Generate()
-fixedWaveform = WaveGenWifi(width=16).Generate()
+floatingWaveform = WaveGenWifi(
+    parameters={"width": 0}
+).Generate()
+fixedWaveform = WaveGenWifi(
+    parameters={"width": 16}
+).Generate()
 
 assert floatingWaveform.samples.dtype == fixedWaveform.samples.dtype
 assert floatingWaveform.samples.shape == fixedWaveform.samples.shape

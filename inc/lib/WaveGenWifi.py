@@ -88,7 +88,8 @@ class WaveGenWifi:
     higher-priority keyword override shadows the same key.
 
     Example:
-        ``wifiGenerator = WaveGenWifi(frameFormat="11be", bandwidthMhz=80, mcs=11)``
+        ``wifiGenerator = WaveGenWifi(parameters={"frameFormat": "11be",``
+        ``"bandwidthMhz": 80, "mcs": 11, "width": 16})``
         ``waveform = wifiGenerator.Generate()``
     """
 

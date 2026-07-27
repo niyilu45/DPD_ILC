@@ -223,14 +223,16 @@ from inc.lib.Analysis import Analysis
 from inc.lib.PaModel import PaModel
 from inc.lib.WaveGenWifi import WaveGenWifi
 
-wifiGenerator = WaveGenWifi(width=0)
+wifiGenerator = WaveGenWifi(parameters={"width": 0})
 wifiWaveform = wifiGenerator.Generate()
-paModel = PaModel(modelName="gmp", width=0)
+paModel = PaModel(
+    parameters={"modelName": "gmp", "width": 0}
+)
 paOutput = paModel.Process(0.5 * wifiWaveform.samples)
 metrics = Analysis(
     0.5 * wifiWaveform.samples,
     wifiWaveform,
-    width=0,
+    parameters={"width": 0},
 ).Analyze(paOutput)
 print(metrics)
 ```
@@ -242,19 +244,21 @@ from inc.lib.Analysis import Analysis
 from inc.lib.PaModel import PaModel
 from inc.lib.WaveGenWifi import WaveGenWifi
 
-wifiGenerator = WaveGenWifi(width=16)
+wifiGenerator = WaveGenWifi(parameters={"width": 16})
 wifiWaveform = wifiGenerator.Generate()
-paModel = PaModel(modelName="gmp", width=16)
+paModel = PaModel(
+    parameters={"modelName": "gmp", "width": 16}
+)
 paOutput = paModel.Process(0.5 * wifiWaveform.samples)
 metrics = Analysis(
     0.5 * wifiWaveform.samples,
     wifiWaveform,
-    width=16,
+    parameters={"width": 16},
 ).Analyze(paOutput)
 print(metrics)
 ```
 
-省略 `width` 与显式传入 `width=16` 等效。
+所有主类都优先推荐把 `width` 写入 `parameters`。省略该键时与配置 `"width": 16` 等效；直接 `width=` 参数只作为兼容便捷入口保留。
 
 ### 8.3 直接使用量化工具
 

@@ -486,6 +486,7 @@ benchmarkConfig = BenchmarkConfig(
     mcs=7,
     numDataSymbols=4,
     sampleRateHz=60.0e6,
+    width=16,
     numIterations=6,
     outputDirectory=Path("results/custom_benchmark"),
 )
@@ -525,7 +526,7 @@ benchmarkRows = RunAllIlcBenchmark(benchmarkConfig)
 | BenchMark.py入口 | 主要输入 | 返回值或副作用 | 在测试流程中的职责 |
 |---|---|---|---|
 | `GetProjectRoot` | 无 | 仓库绝对路径 | 让脚本从任意当前目录启动时都能导入 `inc` |
-| `BenchmarkConfig.Validate` | 配置对象自身 | 无；非法时抛出异常 | 在长时间仿真开始前检查符号数、采样率、功率范围和迭代数 |
+| `BenchmarkConfig.Validate` | 配置对象自身 | 无；非法时抛出异常 | 在长时间仿真开始前检查符号数、采样率、统一I/Q位宽、功率范围和迭代数 |
 | `BenchmarkRow.ToDict` | 单行结果 | 扁平字典 | 让CSV和JSON使用完全相同的数值 |
 | `AddRow` | 方法指标、同场景baseline指标 | 向结果列表追加一行 | 统一SNR、EVM、ACLR改善量的正负方向 |
 | `SaveHistory` | 方法名、`ILCResult`、目录 | 每种方法一个CSV和PNG | 保存每一轮Raw MSE、LC-MSE、EVM-MSE和输入峰值 |
@@ -623,6 +624,7 @@ Save convergence histories and power-EVM data
 | `numDataSymbols` | 10 | 4 | 波形长度和统计样本数 |
 | `sampleRateHz` | None，兼容解析为80 MHz | 60 MHz | 用户直接指定复基带采样率 |
 | `oversampling` | 4 | 未使用 | 仅在 `sampleRateHz=None` 时兼容推导采样率 |
+| `width` | 16 | 16 | 写入WaveGenWifi、PaModel和Analysis的 `parameters`；0为浮点模式 |
 | `guardIntervalUs` | 0.8 | 0.8 | 每个数据符号的CP长度 |
 | `outputPowerDbm` | 20 | 20 | 每路PA目标输出功率 |
 | `maximumOutputPowerDbm` | 25 | 25 | 每路PA额定极限输出功率和0 dB回退参考点 |
@@ -643,6 +645,7 @@ Save convergence histories and power-EVM data
 
 - `numDataSymbols` 必须大于0；
 - 实际 `sampleRateHz` 必须不小于3倍信道带宽，因为ACLR需要同时观察主信道和上下邻道；
+- `width` 必须为0至53的整数，0为浮点模式；
 - `outputPowerDbm` 和 `maximumOutputPowerDbm` 必须是有限数；
 - `outputPowerDbm`、`powerStartDbm` 和 `powerStopDbm` 均不得超过 `maximumOutputPowerDbm`；
 - `loadResistanceOhm` 必须大于0；

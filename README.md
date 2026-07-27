@@ -79,7 +79,7 @@ from lib.WaveGenWifi import WaveGenWifi
 
 ## 浮点与定点接口
 
-`WaveGenWifi`、`PaModel` 和 `Analysis` 都接受构造参数 `width`。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量采用有符号归一化 Q1.(width-1) 接口。默认值为 `16`，即 Q1.15。量化步长和范围为：
+`WaveGenWifi`、`PaModel`、`MimoPaModel`、`ParseWifi` 和 `Analysis` 都把 `width` 定义在各自的 `parameters` 配置中。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量采用有符号归一化 Q1.(width-1) 接口。默认值为 `16`，即 Q1.15。为兼容已有代码，各主类仍保留直接 `width=` 便捷参数，但新代码统一推荐 `parameters={"width": ...}`。量化步长和范围为：
 
 ```math
 \Delta=2^{-(width-1)}
@@ -101,6 +101,29 @@ flowchart LR
 ```
 
 **图说明**：位宽改变可表示的样值集合，但不改变 Python 数据类型。归一化接口超过 `[-1,1)` 的分量会饱和；物理 dBm 电压标定应在归一化 PA/DPD 运算之后用于报告，避免把数伏的物理量直接送入 Q1.15 接口。完整推导见 [FixedPoint.md](doc/FixedPoint.md)。
+
+统一配置方式如下：
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import MimoPaModel, PaModel
+from inc.lib.ParseWifi import ParseWifi
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+wifiGenerator = WaveGenWifi(parameters={"width": 16})
+paModel = PaModel(
+    parameters={"modelName": "gmp", "width": 16}
+)
+mimoPaModel = MimoPaModel(
+    parameters={"numTransmitChains": 2, "width": 16}
+)
+wifiParser = ParseWifi(parameters={"width": 16})
+resultAnalysis = Analysis(
+    referenceSignal,
+    wifiWaveform,
+    parameters={"width": 16},
+)
+```
 
 顶层 [SmallestSISO.py](./SmallestSISO.py) 会用完全相同的 EHT、GMP PA 和 ILC 设置依次运行浮点与16位定点版本：
 
@@ -717,6 +740,7 @@ flowchart LR
 | `--guard-interval` | `0.4`、`0.8`、`1.6`、`3.2` | `0.8` | VHT 使用 0.4/0.8 μs；HE/EHT 使用 0.8/1.6/3.2 μs。 |
 | `--sample-rate-hz` | 正浮点数 | 未显式设置时由兼容参数推导 | 用户指定的复基带采样率，单位 Hz；提供后优先于 `--oversampling`。采样率必须使所选PHY的FFT、GI和传统前导时长对应整数采样点。 |
 | `--oversampling` | `4`、`8` | `4` | 旧接口兼容项；仅在未提供 `--sample-rate-hz` 时按 `带宽×倍率` 推导采样率。 |
+| `--width` | 非负整数 | 类内部默认 `16` | 同时写入WaveGenWifi、PA和Analysis的 `parameters`；`0`为浮点接口，正数为定点接口。 |
 | `--output-power-dbm` | 不大于极限的有限浮点数 | `20 dBm` | 每路PA的目标平均输出功率。 |
 | `--maximum-output-power-dbm` | 有限浮点数 | `25 dBm` | 每路PA的额定极限输出功率，也是0 dB输出回退参考。 |
 | `--power-start-dbm` | 不大于极限的有限浮点数 | `10 dBm` | 功率-EVM扫描的起始PA输出功率。 |
@@ -998,6 +1022,25 @@ print(assistedMetrics["evmDb"])
 | `assistedReferenceSearchSamples` | `32768` | 每个候选偏移最多参与归一化相关的样点数。 |
 | `assistedMinimumCorrelation` | `0.12` | 发送辅助公共区间的最低归一化相关幅度。 |
 
+`width` 既可以作为直接构造参数，也可以与其他配置一起写入 `parameters`。直接参数优先级更高：
+
+```python
+from inc.lib.Analysis import Analysis
+
+analysisParameters = {
+    "width": 16,
+    "maxSegmentLength": 8192,
+}
+resultAnalysis = Analysis(
+    referenceSignal,
+    wifiWaveform,
+    parameters=analysisParameters,
+)
+
+assert resultAnalysis.GetParameters()["width"] == 16
+assert resultAnalysis.width == 16
+```
+
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
 | `Analyze(measuredSignal=None)` | 显式待测信号或内部保存的辅助/盲接收帧 | 显式参考路径必须传入波形；发送辅助与盲路径可零参数调用；返回普通指标字典。 |
@@ -1128,6 +1171,7 @@ x[n]-\frac{\bar y_k[n]}{\hat g_k}.
 | `numDataSymbols` | `10` | 数据 OFDM 符号数。 |
 | `sampleRateHz` | `None` | 用户指定采样率；`None` 时由兼容 `oversampling` 推导。benchmark要求实际采样率不低于3倍带宽。 |
 | `oversampling` | `4` | 旧接口兼容项；仅在 `sampleRateHz=None` 时生效。 |
+| `width` | `16` | 同时写入WaveGenWifi、PaModel和Analysis的 `parameters`；`0`为浮点模式。 |
 | `guardIntervalUs` | `0.8` | VHT 为 0.4/0.8；HE/EHT 为 0.8/1.6/3.2 μs。 |
 | `outputPowerDbm` | `20.0` | 标称每路PA输出功率，单位dBm。 |
 | `maximumOutputPowerDbm` | `25.0` | 每路PA额定极限输出功率。 |
@@ -1143,7 +1187,7 @@ x[n]-\frac{\bar y_k[n]}{\hat g_k}.
 
 ## 默认参数由类内部 ChainMap 管理
 
-`WaveGenWifi`、`PaModel`、`MimoPaModel`、`Analysis` 和 `Draw` 都在各自构造函数内部定义不可变默认参数，并在内部建立 `ChainMap`。调用方不导入默认参数表，也不显式构造 `ChainMap`，只传需要修改的普通字典。解析优先级为：
+`WaveGenWifi`、`PaModel`、`MimoPaModel`、`ParseWifi`、`Analysis` 和 `Draw` 都在各自构造函数内部定义不可变默认参数，并在内部建立 `ChainMap`。调用方不导入默认参数表，也不显式构造 `ChainMap`，只传需要修改的普通字典。解析优先级为：
 
 ```text
 构造函数关键字或 UpdateParameters 覆盖
@@ -1197,6 +1241,7 @@ wifiOverrides = {
     "bandwidthMhz": 40,
     "mcs": 9,
     "numDataSymbols": 12,
+    "width": 16,
 }
 wifiGenerator = WaveGenWifi(parameters=wifiOverrides)
 firstWaveform = wifiGenerator.Generate()
@@ -1205,7 +1250,10 @@ firstWaveform = wifiGenerator.Generate()
 wifiOverrides["mcs"] = 11
 secondWaveform = wifiGenerator.Generate()
 
-paOverrides = {"modelName": "gmp"}
+paOverrides = {
+    "modelName": "gmp",
+    "width": 16,
+}
 paModel = PaModel(parameters=paOverrides)
 
 analysisOverrides = {
@@ -1513,6 +1561,7 @@ benchmarkConfig = BenchmarkConfig(
     bandwidthMhz=20,
     mcs=7,
     numDataSymbols=10,
+    width=16,
     numIterations=10,
     paModelName="wiener",
     outputPowerDbm=20.0,

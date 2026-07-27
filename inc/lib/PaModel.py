@@ -862,7 +862,12 @@ class MimoPaModel:
             # Each facade is an internal floating-point calculation block.
             # MimoPaModel applies the selected fixed-point format only at its
             # public Process and ProcessChain boundaries.
-            PaModel(parameters=chainParameters, width=0)
+            PaModel(
+                parameters={
+                    **chainParameters,
+                    "width": 0,
+                }
+            )
             for chainParameters in paParameterSnapshot
         ]
         self._activePaParameterSnapshot = paParameterSnapshot
