@@ -1659,6 +1659,10 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 
 `Analysis.Analyze` 返回普通汇总字典；MIMO细节通过 `GetLastMimoMetrics()` 读取，返回值同样是普通字典。`AnalyzeStages` 同时保存 `stageMimoMetrics`，`PrintMimo()` 打印详情，`Save()` 将其写入 `metrics.json` 的 `mimoMetrics` 节点，并在CSV中使用 `mimo.*` 列。
 
+Analysis只根据输入矩阵的列解释“通道”，不依赖Channel或PA模型。若输入是各PA的独立传导端口，`outputPowerDbmPerChain` 就是逐PA功率；若输入已经经过 `Channel` 的 `postPaCouplingPaths`，每一列则是串扰叠加后的接收端口功率，不能再称为某个PA自身的输出功率。PA自身工作点应读取 `Channel.GetLastCalibrationMetrics()`，而接收端串扰后的EVM、SNR、ACLR和功率继续交给Analysis计算。
+
+已知发送参考时，PA前或PA后耦合不需要任何额外Analysis配置。逐链同步先消除各接收列的公共时延、频偏和复增益，无法由这些标量消除的跨链串扰会保留在残差中；随后空间解映射会把它反映为逐空间流EVM。因此，这组指标既可用于独立PA，也可用于耦合MIMO plant，但它不会把未知耦合矩阵反演成信道均衡器。
+
 ---
 
 ## 10. 输出数据结构和文件
@@ -1865,6 +1869,8 @@ paModel = PaModel(
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": wifiWaveform.sampleRateHz,
         "phaseDegrees": 90,
         "noiseAmpMv": 10.0,
         "noisePwrDbm": None,
@@ -1896,7 +1902,31 @@ print(channel.GetLastCalibrationMetrics())
 print(metrics)
 ```
 
-90度固定相位会由公共复增益补偿，不应单独恶化EVM；PA非线性和10 mV随机噪声仍保留在误差中。`metrics["outputPowerDbm"]` 表示接收波形的分析结果，而 `channel.GetLastCalibrationMetrics()` 保留不含接收噪声的PA闭环实测功率。
+90度固定相位会由公共复增益补偿，不应单独恶化EVM；PA非线性和10 mV随机噪声仍保留在误差中。`metrics["outputPowerDbm"]` 表示接收波形的分析结果，而 `channel.GetLastCalibrationMetrics()` 保留不含接收噪声的PA闭环实测功率。这里显式使用 `sampleMode="forward"`，所以全部反馈专用 `fb...` 参数都会被跳过，指标代表前向仪表对主路输出的独立评价。
+
+如果DPD或ILC使用 `sampleMode="fb"` 的板载反馈波形进行更新，不应把同一份反馈波形作为最终黄金结果。反馈接收机的FIR、CFO/SFO、I/Q镜像和ADC量化有一部分可以由同步或公共复增益补偿减弱，但反馈非线性、限幅、镜像与量化噪声不能被一个标量增益完全消除。推荐把同一个干净PA输出分别送入两个Channel：
+
+```python
+forwardCapture = forwardChannel.ProcessPaOutput(cleanPaOutput)
+feedbackCapture = feedbackChannel.ProcessPaOutput(cleanPaOutput)
+
+forwardMetrics = Analysis(
+    forwardCapture,
+    transmittedSignal=referenceSignal,
+    sampleRateHz=wifiWaveform.sampleRateHz,
+    channelBandwidthHz=wifiWaveform.bandwidthHz,
+    parameters={"width": 0},
+).Analyze()
+feedbackMetrics = Analysis(
+    feedbackCapture,
+    transmittedSignal=referenceSignal,
+    sampleRateHz=wifiWaveform.sampleRateHz,
+    channelBandwidthHz=wifiWaveform.bandwidthHz,
+    parameters={"width": 0},
+).Analyze()
+```
+
+`feedbackMetrics` 用来诊断板载观察链；`forwardMetrics` 用来验收真实主路EVM、ACLR和功率。两者的差值可以反映反馈链校准残差，但不能直接全部归因于PA。
 
 ### 11.4 非Wi-Fi波形的发送辅助分析
 

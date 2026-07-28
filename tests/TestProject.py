@@ -48,7 +48,14 @@ from inc.lib.Fec import (
 )
 from inc.utils.Draw import Draw
 from inc.utils.FixedPoint import FixedPoint
-from inc.lib.PaModel import MimoPaModel, PaModel
+from inc.lib.PaModel import (
+    DohertyConfig,
+    DohertyPA,
+    GMPConfig,
+    MimoPaModel,
+    PaModel,
+    WienerConfig,
+)
 from inc.lib.ParseWifi import (
     BuildWifiDescriptorBits,
     DecodeWifiDescriptorBits,
@@ -782,13 +789,15 @@ def CheckDocumentationApiConsistency() -> None:
                 "modelName",
                 "wienerConfig",
                 "gmpConfig",
+                "dohertyConfig",
                 "parameters",
                 "width",
                 "parameterOverrides",
             ),
             (
                 "PaModel(modelName=None, wienerConfig=None, "
-                "gmpConfig=None, parameters=None, width=None, "
+                "gmpConfig=None, dohertyConfig=None, "
+                "parameters=None, width=None, "
                 "**parameterOverrides)"
             ),
         ),
@@ -1992,6 +2001,133 @@ def CheckIlcImprovement() -> None:
         assert ilcMetrics["snrDb"] > baselineMetrics["snrDb"]
 
 
+def CheckDohertyPaModel() -> None:
+    """Verify branch turn-on, combining, facade selection, and validation.
+
+    Processing details:
+        Algorithm: Compare low-envelope output with the continuously active
+        carrier branch, require the peaking branch to alter high-envelope
+        samples, verify analytic small-signal gain against a numerical probe,
+        exercise mixed Doherty/GMP MIMO configuration, and reject invalid
+        branch, turn-on, transition, delay, and load-modulation settings.
+
+    Returns:
+        result: None. Assertions enforce the behavioral Doherty contract.
+    """
+
+    dohertyConfig = DohertyConfig(
+        carrierModelName="wiener",
+        peakingModelName="gmp",
+        carrierWienerConfig=WienerConfig(
+            linearTaps=(1.0 + 0.0j,),
+            linearGain=0.9,
+            saturationAmplitude=1.0,
+            rappSmoothness=3.0,
+            ampmCoefficient=0.0,
+        ),
+        peakingGmpConfig=GMPConfig(
+            nonlinearOrders=(1, 3),
+            memoryDepth=1,
+            crossMemoryDepth=0,
+        ),
+        carrierInputGain=1.0,
+        peakingInputGain=0.8,
+        peakingTurnOnAmplitude=0.40,
+        peakingTransitionWidth=0.20,
+        carrierCombineCoefficient=1.0 + 0.0j,
+        peakingCombineCoefficient=0.45 * np.exp(1j * 0.1),
+        peakingDelaySamples=2,
+        loadModulationStrength=0.12,
+    )
+    dohertyPa = DohertyPA(dohertyConfig)
+    lowInput = (
+        0.05
+        * np.exp(
+            1j
+            * 2.0
+            * np.pi
+            * np.arange(128, dtype=float)
+            / 17.0
+        )
+    )
+    lowOutput = dohertyPa.Process(lowInput)
+    expectedCarrierOnly = (
+        dohertyConfig.carrierCombineCoefficient
+        * dohertyPa.carrierModel.Process(
+            dohertyConfig.carrierInputGain * lowInput
+        )
+    )
+    assert np.allclose(lowOutput, expectedCarrierOnly)
+    highInput = 0.80 * lowInput / 0.05
+    highOutput = dohertyPa.Process(highInput)
+    carrierOnlyHigh = (
+        dohertyConfig.carrierCombineCoefficient
+        * dohertyPa.carrierModel.Process(
+            dohertyConfig.carrierInputGain * highInput
+        )
+    )
+    assert not np.allclose(highOutput, carrierOnlyHigh)
+    tinyInput = np.full(
+        64, 1.0e-7 + 0.0j, dtype=np.complex128
+    )
+    numericalSmallSignalGain = np.mean(
+        dohertyPa.Process(tinyInput) / tinyInput
+    )
+    assert abs(
+        numericalSmallSignalGain - dohertyPa.SmallSignalGain()
+    ) < 1.0e-8
+
+    facadePa = PaModel(
+        parameters={
+            "modelName": "doherty",
+            "dohertyConfig": dohertyConfig,
+            "width": 0,
+        }
+    )
+    assert facadePa.modelName == "doherty"
+    assert np.allclose(facadePa.Process(highInput), highOutput)
+    mixedMimoPa = MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "paParametersPerChain": (
+                {
+                    "modelName": "doherty",
+                    "dohertyConfig": dohertyConfig,
+                },
+                {"modelName": "gmp"},
+            ),
+            "width": 0,
+        }
+    )
+    mixedOutput = mixedMimoPa.Process(
+        np.column_stack((highInput, highInput))
+    )
+    assert mixedOutput.shape == (highInput.size, 2)
+    assert not np.allclose(
+        mixedOutput[:, 0], mixedOutput[:, 1]
+    )
+
+    invalidDohertyConfigs = (
+        {"carrierModelName": "memoryPolynomial"},
+        {"peakingInputGain": 0.0},
+        {"peakingTurnOnAmplitude": 0.0},
+        {"peakingTransitionWidth": 0.0},
+        {"carrierCombineCoefficient": 0.0 + 0.0j},
+        {"peakingDelaySamples": -1},
+        {"loadModulationStrength": -0.1},
+    )
+    for invalidOverrides in invalidDohertyConfigs:
+        try:
+            DohertyPA(DohertyConfig(**invalidOverrides))
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(
+                "invalid Doherty configuration accepted: "
+                f"{invalidOverrides!r}"
+            )
+
+
 def CheckIlcFeedbackSynchronization() -> None:
     """Verify that ILC aligns feedback before metrics and waveform updates.
 
@@ -3079,7 +3215,7 @@ def CheckFixedPointInterfaces() -> None:
     for invalidWidth in (-1, 1.5, True, 54):
         try:
             FixedPoint(invalidWidth)
-        except ValueError:
+        except (TypeError, ValueError):
             pass
         else:
             raise AssertionError(
@@ -3088,14 +3224,14 @@ def CheckFixedPointInterfaces() -> None:
 
 
 def CheckChannelModel() -> None:
-    """Verify PA, phase, physical-noise, seed, and fixed-point behavior.
+    """Verify both sample modes, feedback impairments, noise, and fixed point.
 
     Processing details:
-        Algorithm: Exercise every supported phase, compare amplitude and power
-        noise controls through a 50-ohm conversion, verify active-burst SNR
-        control for SISO and MIMO, estimate generated noise over long records,
-        require deterministic reset behavior, compare bound-PA processing
-        with a direct PA result, and validate mutual-exclusion error cases.
+        Algorithm: Prove forward sampling bypasses embedded receiver defects,
+        exercise deterministic feedback gain/FIR/delay/CFO and combined
+        nonlinear/IQ/ADC effects, compare amplitude and power noise controls,
+        verify active-burst SNR for SISO/MIMO, require repeatable random state,
+        validate hidden PA power calibration, and reject invalid settings.
 
     Returns:
         result: None. Assertions enforce the documented channel contract.
@@ -3118,6 +3254,229 @@ def CheckChannelModel() -> None:
         )
         phaseOutput = phaseChannel.ProcessPaOutput(testSignal)
         assert np.allclose(phaseOutput, phaseFactor * testSignal)
+
+    # Forward instrument sampling must ignore every embedded feedback-only
+    # defect, while ideal feedback mode must remain exactly transparent.
+    forwardChannel = Channel(
+        parameters={
+            "sampleMode": "forward",
+            "sampleRateHz": 20.0e6,
+            "fbGainDb": 8.0,
+            "fbPhaseDegrees": 37.0,
+            "fbFirTaps": (1.0 + 0.0j, 0.3 - 0.2j),
+            "fbIntegerDelaySamples": 2,
+            "fbFractionalDelaySamples": 0.2,
+            "fbCarrierFrequencyOffsetHz": 1500.0,
+            "fbSamplingFrequencyOffsetPpm": 25.0,
+            "fbIqGainImbalanceDb": 1.0,
+            "fbIqPhaseImbalanceDegrees": 4.0,
+            "fbDcOffset": 0.02 - 0.01j,
+            "fbThirdOrderCoefficient": -0.1 + 0.02j,
+            "fbClipAmplitude": 0.5,
+            "fbAdcWidth": 8,
+            "fbAdcFullScale": 0.6,
+            "width": 0,
+        }
+    )
+    assert forwardChannel.sampleMode == "forward"
+    assert np.array_equal(
+        forwardChannel.ProcessPaOutput(testSignal),
+        testSignal,
+    )
+    idealFeedbackChannel = Channel(
+        parameters={"sampleMode": "FB", "width": 0}
+    )
+    assert idealFeedbackChannel.sampleMode == "fb"
+    assert np.array_equal(
+        idealFeedbackChannel.ProcessPaOutput(testSignal),
+        testSignal,
+    )
+
+    linearFeedbackInput = np.asarray(
+        (1.0 + 0.0j, 0.4 - 0.2j, -0.1 + 0.3j, 0.0 + 0.0j),
+        dtype=np.complex128,
+    )
+    feedbackFirTaps = np.asarray(
+        (1.0 + 0.0j, 0.5j), dtype=np.complex128
+    )
+    linearFeedbackChannel = Channel(
+        parameters={
+            "sampleMode": "fb",
+            "fbGainDb": 20.0 * np.log10(2.0),
+            "fbPhaseDegrees": 90.0,
+            "fbFirTaps": tuple(feedbackFirTaps),
+            "fbIntegerDelaySamples": 1,
+            "width": 0,
+        }
+    )
+    expectedFilteredSignal = np.convolve(
+        linearFeedbackInput,
+        feedbackFirTaps,
+        mode="full",
+    )[: linearFeedbackInput.size]
+    expectedLinearFeedback = np.r_[
+        0.0 + 0.0j,
+        (2.0j * expectedFilteredSignal)[:-1],
+    ]
+    assert np.allclose(
+        linearFeedbackChannel.ProcessPaOutput(linearFeedbackInput),
+        expectedLinearFeedback,
+    )
+
+    carrierSampleRateHz = 10.0e6
+    carrierOffsetHz = 125.0e3
+    carrierInput = np.ones(128, dtype=np.complex128)
+    carrierChannel = Channel(
+        parameters={
+            "sampleMode": "fb",
+            "sampleRateHz": carrierSampleRateHz,
+            "fbCarrierFrequencyOffsetHz": carrierOffsetHz,
+            "width": 0,
+        }
+    )
+    expectedCarrierPhasor = np.exp(
+        1j
+        * 2.0
+        * np.pi
+        * carrierOffsetHz
+        * np.arange(carrierInput.size)
+        / carrierSampleRateHz
+    )
+    assert np.allclose(
+        carrierChannel.ProcessPaOutput(carrierInput),
+        expectedCarrierPhasor,
+    )
+
+    combinedFeedbackChannel = Channel(
+        parameters={
+            "sampleMode": "fb",
+            "sampleRateHz": 40.0e6,
+            "fbFractionalDelaySamples": 0.25,
+            "fbSamplingFrequencyOffsetPpm": 40.0,
+            "fbIqGainImbalanceDb": 1.5,
+            "fbIqPhaseImbalanceDegrees": 5.0,
+            "fbDcOffset": 0.02 - 0.01j,
+            "fbThirdOrderCoefficient": -0.15 + 0.03j,
+            "fbClipAmplitude": 0.5,
+            "fbAdcWidth": 8,
+            "fbAdcFullScale": 0.6,
+            "width": 0,
+        }
+    )
+    combinedFeedbackInput = np.tile(testSignal, 128)
+    combinedFeedbackOutput = (
+        combinedFeedbackChannel.ProcessPaOutput(
+            combinedFeedbackInput
+        )
+    )
+    adcStep = 0.6 / float(2 ** 7)
+    assert combinedFeedbackOutput.shape == combinedFeedbackInput.shape
+    assert not np.allclose(
+        combinedFeedbackOutput, combinedFeedbackInput
+    )
+    assert np.max(combinedFeedbackOutput.real) <= 0.6
+    assert np.max(combinedFeedbackOutput.imag) <= 0.6
+    assert np.allclose(
+        combinedFeedbackOutput.real / adcStep,
+        np.rint(combinedFeedbackOutput.real / adcStep),
+    )
+    assert np.allclose(
+        combinedFeedbackOutput.imag / adcStep,
+        np.rint(combinedFeedbackOutput.imag / adcStep),
+    )
+
+    # Post-PA coupling must preserve both direct paths and add the delayed
+    # complex leakage only to its configured destination column.
+    couplingSampleCount = 64
+    couplingSource0 = np.exp(
+        1j
+        * 2.0
+        * np.pi
+        * np.arange(couplingSampleCount, dtype=float)
+        / 13.0
+    )
+    couplingSource1 = 0.4 * np.exp(
+        1j
+        * 2.0
+        * np.pi
+        * np.arange(couplingSampleCount, dtype=float)
+        / 19.0
+    )
+    uncoupledPaMatrix = np.column_stack(
+        (couplingSource0, couplingSource1)
+    )
+    postCouplingTaps = np.asarray(
+        (1.0 + 0.0j, 0.25 - 0.10j),
+        dtype=np.complex128,
+    )
+    postCouplingChannel = Channel(
+        parameters={
+            "postPaCouplingPaths": (
+                {
+                    "sourceChain": 0,
+                    "destinationChain": 1,
+                    "gainDb": 20.0 * np.log10(0.2),
+                    "phaseDegrees": 90.0,
+                    "integerDelaySamples": 2,
+                    "fractionalDelaySamples": 0.0,
+                    "firTaps": tuple(postCouplingTaps),
+                },
+            ),
+            "width": 0,
+        }
+    )
+    filteredCoupling = np.convolve(
+        couplingSource0,
+        postCouplingTaps,
+        mode="full",
+    )[:couplingSampleCount]
+    expectedLeakage = np.r_[
+        np.zeros(2, dtype=np.complex128),
+        (0.2j * filteredCoupling)[:-2],
+    ]
+    expectedPostCoupling = uncoupledPaMatrix.copy()
+    expectedPostCoupling[:, 1] += expectedLeakage
+    actualPostCoupling = postCouplingChannel.ProcessPaOutput(
+        uncoupledPaMatrix
+    )
+    assert np.allclose(actualPostCoupling, expectedPostCoupling)
+    assert np.array_equal(
+        actualPostCoupling[:, 0], uncoupledPaMatrix[:, 0]
+    )
+
+    # Different pre-PA directions may use independent delays and amplitudes.
+    asymmetricPreChannel = Channel(
+        parameters={
+            "prePaCouplingPaths": (
+                {
+                    "sourceChain": 0,
+                    "destinationChain": 1,
+                    "gainDb": -20.0,
+                    "integerDelaySamples": 1,
+                },
+                {
+                    "sourceChain": 1,
+                    "destinationChain": 0,
+                    "gainDb": -26.0,
+                    "phaseDegrees": -35.0,
+                    "integerDelaySamples": 3,
+                    "fractionalDelaySamples": 0.20,
+                },
+            ),
+            "width": 0,
+        }
+    )
+    asymmetricPreOutput = asymmetricPreChannel.ApplyPrePaCoupling(
+        uncoupledPaMatrix
+    )
+    assert asymmetricPreOutput.shape == uncoupledPaMatrix.shape
+    assert not np.allclose(
+        asymmetricPreOutput[:, 0], uncoupledPaMatrix[:, 0]
+    )
+    assert not np.allclose(
+        asymmetricPreOutput[:, 1], uncoupledPaMatrix[:, 1]
+    )
+    assert asymmetricPreChannel.HasPrePaCoupling()
 
     noiseSampleCount = 200000
     zeroSignal = np.zeros(noiseSampleCount, dtype=np.complex128)
@@ -3237,6 +3596,19 @@ def CheckChannelModel() -> None:
         paChannel.SmallSignalGain(),
         1j * paModel.SmallSignalGain(),
     )
+    feedbackPaChannel = Channel(
+        paModel=paModel,
+        parameters={
+            "sampleMode": "fb",
+            "fbGainDb": 20.0 * np.log10(2.0),
+            "fbPhaseDegrees": 90.0,
+            "width": 0,
+        },
+    )
+    assert np.allclose(
+        feedbackPaChannel.SmallSignalGain(),
+        2.0j * paModel.SmallSignalGain(),
+    )
 
     # A user-facing calibrated call accepts an arbitrarily scaled burst and
     # target output power. Channel must hide all repeated PA evaluations,
@@ -3276,17 +3648,45 @@ def CheckChannelModel() -> None:
     )
     assert calibratedChannel.GetLastPaInput().shape == rawBurst.shape
 
-    # A target sequence calibrates each MIMO PA independently while the
-    # public caller still makes one Channel call.
+    # A target sequence jointly calibrates different PA families while weak
+    # pre-PA coupling makes every drive affect both measured output powers.
     mimoRawBurst = np.column_stack((rawBurst, 0.35 * rawBurst))
     mimoChannel = Channel(
         paModel=MimoPaModel(
             parameters={
                 "numTransmitChains": 2,
+                "paParametersPerChain": (
+                    {"modelName": "doherty"},
+                    {"modelName": "gmp"},
+                ),
                 "width": 0,
             }
         ),
         parameters={
+            "prePaCouplingPaths": (
+                {
+                    "sourceChain": 0,
+                    "destinationChain": 1,
+                    "gainDb": -20.0,
+                    "phaseDegrees": 15.0,
+                    "integerDelaySamples": 2,
+                },
+                {
+                    "sourceChain": 1,
+                    "destinationChain": 0,
+                    "gainDb": -24.0,
+                    "phaseDegrees": -20.0,
+                    "integerDelaySamples": 1,
+                },
+            ),
+            "postPaCouplingPaths": (
+                {
+                    "sourceChain": 0,
+                    "destinationChain": 1,
+                    "gainDb": -22.0,
+                    "integerDelaySamples": 1,
+                },
+            ),
             "maximumOutputPowerDbm": 25.0,
             "calibrationToleranceDb": 0.15,
             "width": 0,
@@ -3300,6 +3700,16 @@ def CheckChannelModel() -> None:
         mimoChannel.GetLastCalibrationMetrics()
     )
     assert mimoOutput.shape == mimoRawBurst.shape
+    assert (
+        mimoChannel.GetParameters()["jointPowerCalibration"]
+        is None
+    )
+    assert (
+        mimoChannel._powerCalibration.GetParameters()[
+            "enableJointCalibration"
+        ]
+        is True
+    )
     assert np.all(
         np.abs(
             np.asarray(
@@ -3329,6 +3739,8 @@ def CheckChannelModel() -> None:
     assert np.array_equal(fixedOutput.imag, np.rint(fixedOutput.imag))
 
     invalidConfigurations = (
+        {"sampleMode": "instrument"},
+        {"sampleRateHz": 0.0},
         {"phaseDegrees": 45},
         {"noiseAmpMv": -1.0},
         {"noiseAmpMv": 10.0, "noisePwrDbm": -27.0},
@@ -3340,11 +3752,40 @@ def CheckChannelModel() -> None:
             "noiseSnrDb": 30.0,
         },
         {"noiseSnrDb": np.nan},
+        {"fbIntegerDelaySamples": -1},
+        {"fbFractionalDelaySamples": 0.5},
+        {"fbSamplingFrequencyOffsetPpm": 1.0e6},
+        {"fbFirTaps": ()},
+        {"fbThirdOrderCoefficient": complex(np.nan, 0.0)},
+        {"fbClipAmplitude": 0.0},
+        {"fbAdcWidth": 1},
+        {"fbAdcFullScale": 0.0},
+        {"prePaCouplingPaths": "invalid"},
+        {
+            "prePaCouplingPaths": (
+                {
+                    "sourceChain": 0,
+                    "destinationChain": 0,
+                },
+            )
+        },
+        {
+            "postPaCouplingPaths": (
+                {
+                    "sourceChain": 0,
+                    "destinationChain": 1,
+                    "fractionalDelaySamples": 0.5,
+                },
+            )
+        },
+        {"jointPowerCalibration": "auto"},
+        {"calibrationProbeStepDb": 0.0},
+        {"calibrationRegularization": 0.0},
     )
     for invalidParameters in invalidConfigurations:
         try:
             Channel(parameters=invalidParameters)
-        except ValueError:
+        except (TypeError, ValueError):
             pass
         else:
             raise AssertionError(
@@ -3531,6 +3972,7 @@ def RunTests() -> None:
     CheckSignalProcessingCompensation()
     CheckPowerEvmCurve()
     CheckGuardIntervals()
+    CheckDohertyPaModel()
     CheckIlcImprovement()
     CheckIlcFeedbackSynchronization()
     CheckReceiveOnlyWifiAnalysis()

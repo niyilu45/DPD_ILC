@@ -1,9 +1,10 @@
-"""Model the receive link between a nonlinear PA and a measurement input.
+"""Model coupled PA inputs/outputs and forward or feedback sampling paths.
 
-The current channel is intentionally compact: it evaluates a bound PA,
-rotates the PA output by one supported constant phase, and optionally adds
-circular complex white Gaussian noise. Public fixed-point boundaries use raw
-integer I/Q codes while every physical operation remains floating point.
+The channel can apply causal complex coupling paths before a multi-chain PA
+bank and after its nonlinear outputs. It then selects either a forward
+instrument observation or a nonideal embedded feedback receiver. Public
+fixed-point boundaries use raw integer I/Q codes while every physical
+operation remains floating point.
 """
 
 from collections import ChainMap
@@ -82,16 +83,37 @@ class Channel:
 
         self.defaultParameters: Mapping[str, object] = MappingProxyType(
             {
+                "sampleMode": "forward",
+                "sampleRateHz": 1.0,
                 "phaseDegrees": 0,
                 "noiseAmpMv": None,
                 "noisePwrDbm": None,
                 "noiseSnrDb": None,
+                "fbGainDb": 0.0,
+                "fbPhaseDegrees": 0.0,
+                "fbFirTaps": None,
+                "fbIntegerDelaySamples": 0,
+                "fbFractionalDelaySamples": 0.0,
+                "fbCarrierFrequencyOffsetHz": 0.0,
+                "fbSamplingFrequencyOffsetPpm": 0.0,
+                "fbIqGainImbalanceDb": 0.0,
+                "fbIqPhaseImbalanceDegrees": 0.0,
+                "fbDcOffset": 0.0 + 0.0j,
+                "fbThirdOrderCoefficient": 0.0 + 0.0j,
+                "fbClipAmplitude": None,
+                "fbAdcWidth": None,
+                "fbAdcFullScale": 1.0,
+                "prePaCouplingPaths": None,
+                "postPaCouplingPaths": None,
                 "loadResistanceOhm": 50.0,
                 "maximumOutputPowerDbm": 25.0,
                 "calibrationToleranceDb": 0.25,
                 "maximumCalibrationIterations": 60,
                 "calibrationLearningRate": 0.8,
                 "maximumDriveAdjustmentDb": 6.0,
+                "jointPowerCalibration": None,
+                "calibrationProbeStepDb": 0.05,
+                "calibrationRegularization": 1.0e-6,
                 "activePowerThresholdDb": -60.0,
                 "activeGapToleranceSamples": 16,
                 "randomSeed": 1701,
@@ -147,6 +169,24 @@ class Channel:
         return cast(int, self.parameters["width"])
 
     width = Width
+
+    @property
+    def SampleMode(self) -> str:
+        """Return the normalized forward or embedded-feedback sample mode.
+
+        Processing details:
+            Algorithm: Strip surrounding whitespace, convert the configured
+            name to lowercase, and return the validated canonical value so
+            live caller-owned mapping changes affect the next capture.
+
+        Returns:
+            result: ``"forward"`` for instrument sampling or ``"fb"`` for
+                the nonideal embedded feedback receiver.
+        """
+
+        return str(self.parameters["sampleMode"]).strip().lower()
+
+    sampleMode = SampleMode
 
     def GetParameters(self) -> Dict[str, object]:
         """Return one flattened snapshot of all effective channel settings.
@@ -207,6 +247,25 @@ class Channel:
             result: None. Invalid recognized settings raise an exception.
         """
 
+        sampleMode = self.parameters["sampleMode"]
+        if (
+            not isinstance(sampleMode, str)
+            or sampleMode.strip().lower() not in ("forward", "fb")
+        ):
+            raise ValueError(
+                "sampleMode must be either 'forward' or 'fb'"
+            )
+        sampleRateHz = self.parameters["sampleRateHz"]
+        if (
+            not isinstance(sampleRateHz, (int, float))
+            or isinstance(sampleRateHz, bool)
+            or not np.isfinite(sampleRateHz)
+            or float(sampleRateHz) <= 0.0
+        ):
+            raise ValueError(
+                "sampleRateHz must be finite and positive"
+            )
+
         phaseDegrees = self.parameters["phaseDegrees"]
         if (
             not isinstance(phaseDegrees, (int, float))
@@ -255,6 +314,142 @@ class Channel:
             or not np.isfinite(noiseSnrDb)
         ):
             raise ValueError("noiseSnrDb must be finite or None")
+
+        for feedbackParameterName in (
+            "fbGainDb",
+            "fbPhaseDegrees",
+            "fbCarrierFrequencyOffsetHz",
+            "fbIqGainImbalanceDb",
+            "fbIqPhaseImbalanceDegrees",
+        ):
+            feedbackParameterValue = self.parameters[
+                feedbackParameterName
+            ]
+            if (
+                not isinstance(feedbackParameterValue, (int, float))
+                or isinstance(feedbackParameterValue, bool)
+                or not np.isfinite(feedbackParameterValue)
+            ):
+                raise ValueError(
+                    f"{feedbackParameterName} must be finite"
+                )
+        fbSamplingFrequencyOffsetPpm = self.parameters[
+            "fbSamplingFrequencyOffsetPpm"
+        ]
+        if (
+            not isinstance(
+                fbSamplingFrequencyOffsetPpm, (int, float)
+            )
+            or isinstance(fbSamplingFrequencyOffsetPpm, bool)
+            or not np.isfinite(fbSamplingFrequencyOffsetPpm)
+            or not -1.0e6
+            < float(fbSamplingFrequencyOffsetPpm)
+            < 1.0e6
+        ):
+            raise ValueError(
+                "fbSamplingFrequencyOffsetPpm must be finite and "
+                "strictly between -1000000 and 1000000"
+            )
+        fbIntegerDelaySamples = self.parameters[
+            "fbIntegerDelaySamples"
+        ]
+        if (
+            not isinstance(fbIntegerDelaySamples, int)
+            or isinstance(fbIntegerDelaySamples, bool)
+            or fbIntegerDelaySamples < 0
+        ):
+            raise ValueError(
+                "fbIntegerDelaySamples must be a nonnegative integer"
+            )
+        fbFractionalDelaySamples = self.parameters[
+            "fbFractionalDelaySamples"
+        ]
+        if (
+            not isinstance(fbFractionalDelaySamples, (int, float))
+            or isinstance(fbFractionalDelaySamples, bool)
+            or not np.isfinite(fbFractionalDelaySamples)
+            or not -0.5
+            <= float(fbFractionalDelaySamples)
+            < 0.5
+        ):
+            raise ValueError(
+                "fbFractionalDelaySamples must be in [-0.5, 0.5)"
+            )
+        fbFirTaps = self.parameters["fbFirTaps"]
+        if fbFirTaps is not None:
+            if isinstance(fbFirTaps, (str, bytes)):
+                raise TypeError(
+                    "fbFirTaps must be a numeric sequence or None"
+                )
+            firTapArray = np.asarray(
+                fbFirTaps, dtype=np.complex128
+            )
+            if (
+                firTapArray.ndim != 1
+                or firTapArray.size == 0
+                or not np.all(np.isfinite(firTapArray))
+            ):
+                raise ValueError(
+                    "fbFirTaps must be a finite nonempty "
+                    "one-dimensional sequence or None"
+                )
+        for complexParameterName in (
+            "fbDcOffset",
+            "fbThirdOrderCoefficient",
+        ):
+            complexParameterValue = self.parameters[
+                complexParameterName
+            ]
+            if (
+                not isinstance(
+                    complexParameterValue,
+                    (int, float, complex),
+                )
+                or isinstance(complexParameterValue, bool)
+            ):
+                raise TypeError(
+                    f"{complexParameterName} must be a finite complex "
+                    "scalar"
+                )
+            resolvedComplexValue = complex(complexParameterValue)
+            if not (
+                np.isfinite(resolvedComplexValue.real)
+                and np.isfinite(resolvedComplexValue.imag)
+            ):
+                raise ValueError(
+                    f"{complexParameterName} must be finite"
+                )
+        fbClipAmplitude = self.parameters["fbClipAmplitude"]
+        if fbClipAmplitude is not None and (
+            not isinstance(fbClipAmplitude, (int, float))
+            or isinstance(fbClipAmplitude, bool)
+            or not np.isfinite(fbClipAmplitude)
+            or float(fbClipAmplitude) <= 0.0
+        ):
+            raise ValueError(
+                "fbClipAmplitude must be finite, positive, or None"
+            )
+        fbAdcWidth = self.parameters["fbAdcWidth"]
+        if fbAdcWidth is not None and (
+            not isinstance(fbAdcWidth, int)
+            or isinstance(fbAdcWidth, bool)
+            or not 2 <= fbAdcWidth <= 32
+        ):
+            raise ValueError(
+                "fbAdcWidth must be an integer from 2 through 32 or None"
+            )
+        fbAdcFullScale = self.parameters["fbAdcFullScale"]
+        if (
+            not isinstance(fbAdcFullScale, (int, float))
+            or isinstance(fbAdcFullScale, bool)
+            or not np.isfinite(fbAdcFullScale)
+            or float(fbAdcFullScale) <= 0.0
+        ):
+            raise ValueError(
+                "fbAdcFullScale must be finite and positive"
+            )
+        self.ResolveCouplingPaths("prePaCouplingPaths")
+        self.ResolveCouplingPaths("postPaCouplingPaths")
 
         loadResistanceOhm = self.parameters["loadResistanceOhm"]
         if (
@@ -324,6 +519,40 @@ class Channel:
         ):
             raise ValueError(
                 "maximumDriveAdjustmentDb must be finite and positive"
+            )
+        jointPowerCalibration = self.parameters[
+            "jointPowerCalibration"
+        ]
+        if (
+            jointPowerCalibration is not None
+            and not isinstance(jointPowerCalibration, bool)
+        ):
+            raise TypeError(
+                "jointPowerCalibration must be a boolean or None"
+            )
+        calibrationProbeStepDb = self.parameters[
+            "calibrationProbeStepDb"
+        ]
+        if (
+            not isinstance(calibrationProbeStepDb, (int, float))
+            or isinstance(calibrationProbeStepDb, bool)
+            or not np.isfinite(calibrationProbeStepDb)
+            or float(calibrationProbeStepDb) <= 0.0
+        ):
+            raise ValueError(
+                "calibrationProbeStepDb must be finite and positive"
+            )
+        calibrationRegularization = self.parameters[
+            "calibrationRegularization"
+        ]
+        if (
+            not isinstance(calibrationRegularization, (int, float))
+            or isinstance(calibrationRegularization, bool)
+            or not np.isfinite(calibrationRegularization)
+            or float(calibrationRegularization) <= 0.0
+        ):
+            raise ValueError(
+                "calibrationRegularization must be finite and positive"
             )
         activePowerThresholdDb = self.parameters[
             "activePowerThresholdDb"
@@ -489,6 +718,19 @@ class Channel:
             "maximumDriveAdjustmentDb": self.parameters[
                 "maximumDriveAdjustmentDb"
             ],
+            "enableJointCalibration": (
+                self.HasPrePaCoupling()
+                if self.parameters["jointPowerCalibration"] is None
+                else bool(
+                    self.parameters["jointPowerCalibration"]
+                )
+            ),
+            "calibrationProbeStepDb": self.parameters[
+                "calibrationProbeStepDb"
+            ],
+            "calibrationRegularization": self.parameters[
+                "calibrationRegularization"
+            ],
             "activePowerThresholdDb": self.parameters[
                 "activePowerThresholdDb"
             ],
@@ -499,11 +741,10 @@ class Channel:
         }
         if (
             self._powerCalibration is None
-            or self._powerCalibration.paModel is not self.paModel
             or self._powerCalibration.width != self.width
         ):
             self._powerCalibration = PowerCalibration(
-                paModel=self.paModel,
+                paModel=self.ProcessPaBankForCalibration,
                 parameters=calibrationParameters,
             )
         else:
@@ -659,6 +900,363 @@ class Channel:
                 f"{signalName} contains NaN or infinite values"
             )
         return complexSignal
+
+    def ResolveCouplingPaths(
+        self,
+        parameterName: str,
+        chainCount: Optional[int] = None,
+    ) -> Tuple[Dict[str, object], ...]:
+        """Validate and canonicalize PA-side cross-coupling path mappings.
+
+        Processing details:
+            Algorithm: Accept only the pre- or post-PA path parameter, replace
+            None with no coupling, filter unknown nested keys with warnings,
+            validate source/destination indices, gain, phase, causal integer
+            delay, bounded fractional delay, and an optional finite complex
+            FIR, then return defensive ordinary dictionaries. The direct path
+            remains an implicit identity and every configured path is added
+            to its destination.
+
+        Args:
+            parameterName: ``prePaCouplingPaths`` or ``postPaCouplingPaths``.
+            chainCount: Optional matrix column count for index-range checks.
+
+        Returns:
+            result: Immutable-order tuple of canonical coupling path mappings.
+        """
+
+        if parameterName not in (
+            "prePaCouplingPaths",
+            "postPaCouplingPaths",
+        ):
+            raise ValueError(
+                "parameterName must select pre- or post-PA coupling paths"
+            )
+        rawPaths = self.parameters[parameterName]
+        if rawPaths is None:
+            return tuple()
+        if isinstance(rawPaths, (str, bytes)) or not isinstance(
+            rawPaths, Sequence
+        ):
+            raise TypeError(
+                f"{parameterName} must be a sequence of mappings or None"
+            )
+        pathDefaults: Mapping[str, object] = MappingProxyType(
+            {
+                "sourceChain": 0,
+                "destinationChain": 1,
+                "gainDb": -30.0,
+                "phaseDegrees": 0.0,
+                "integerDelaySamples": 0,
+                "fractionalDelaySamples": 0.0,
+                "firTaps": None,
+            }
+        )
+        resolvedPaths = []
+        for pathIndex, rawPath in enumerate(rawPaths):
+            if not isinstance(rawPath, Mapping):
+                raise TypeError(
+                    f"{parameterName}[{pathIndex}] must be a mapping"
+                )
+            recognizedPath = FilterRecognizedParameters(
+                rawPath,
+                pathDefaults,
+                f"Channel.{parameterName}[{pathIndex}]",
+            )
+            resolvedPath = {
+                **pathDefaults,
+                **recognizedPath,
+            }
+            sourceChain = resolvedPath["sourceChain"]
+            destinationChain = resolvedPath["destinationChain"]
+            for indexName, indexValue in (
+                ("sourceChain", sourceChain),
+                ("destinationChain", destinationChain),
+            ):
+                if (
+                    not isinstance(indexValue, (int, np.integer))
+                    or isinstance(indexValue, (bool, np.bool_))
+                    or int(indexValue) < 0
+                ):
+                    raise ValueError(
+                        f"{parameterName}[{pathIndex}].{indexName} "
+                        "must be a nonnegative integer"
+                    )
+                if (
+                    chainCount is not None
+                    and int(indexValue) >= chainCount
+                ):
+                    raise IndexError(
+                        f"{parameterName}[{pathIndex}].{indexName} "
+                        "is outside the waveform chain range"
+                    )
+            if int(sourceChain) == int(destinationChain):
+                raise ValueError(
+                    f"{parameterName}[{pathIndex}] must connect two "
+                    "different chains; direct paths are implicit identities"
+                )
+            for scalarName in ("gainDb", "phaseDegrees"):
+                scalarValue = resolvedPath[scalarName]
+                if (
+                    not isinstance(scalarValue, (int, float))
+                    or isinstance(scalarValue, bool)
+                    or not np.isfinite(scalarValue)
+                ):
+                    raise ValueError(
+                        f"{parameterName}[{pathIndex}].{scalarName} "
+                        "must be finite"
+                    )
+            integerDelay = resolvedPath["integerDelaySamples"]
+            if (
+                not isinstance(integerDelay, (int, np.integer))
+                or isinstance(integerDelay, (bool, np.bool_))
+                or int(integerDelay) < 0
+            ):
+                raise ValueError(
+                    f"{parameterName}[{pathIndex}]."
+                    "integerDelaySamples must be nonnegative"
+                )
+            fractionalDelay = resolvedPath[
+                "fractionalDelaySamples"
+            ]
+            if (
+                not isinstance(fractionalDelay, (int, float))
+                or isinstance(fractionalDelay, bool)
+                or not np.isfinite(fractionalDelay)
+                or not -0.5 <= float(fractionalDelay) < 0.5
+            ):
+                raise ValueError(
+                    f"{parameterName}[{pathIndex}]."
+                    "fractionalDelaySamples must be in [-0.5, 0.5)"
+                )
+            firTaps = resolvedPath["firTaps"]
+            if firTaps is not None:
+                if isinstance(firTaps, (str, bytes)):
+                    raise TypeError(
+                        f"{parameterName}[{pathIndex}].firTaps must "
+                        "be a numeric sequence or None"
+                    )
+                firArray = np.asarray(
+                    firTaps, dtype=np.complex128
+                )
+                if (
+                    firArray.ndim != 1
+                    or firArray.size == 0
+                    or not np.all(np.isfinite(firArray))
+                ):
+                    raise ValueError(
+                        f"{parameterName}[{pathIndex}].firTaps must "
+                        "be a finite nonempty vector or None"
+                    )
+                resolvedPath["firTaps"] = tuple(
+                    complex(value) for value in firArray
+                )
+            resolvedPath["sourceChain"] = int(sourceChain)
+            resolvedPath["destinationChain"] = int(
+                destinationChain
+            )
+            resolvedPath["gainDb"] = float(resolvedPath["gainDb"])
+            resolvedPath["phaseDegrees"] = float(
+                resolvedPath["phaseDegrees"]
+            )
+            resolvedPath["integerDelaySamples"] = int(
+                integerDelay
+            )
+            resolvedPath["fractionalDelaySamples"] = float(
+                fractionalDelay
+            )
+            resolvedPaths.append(resolvedPath)
+        return tuple(resolvedPaths)
+
+    def HasPrePaCoupling(self) -> bool:
+        """Return whether at least one PA-input cross-coupling path exists.
+
+        Processing details:
+            Algorithm: Resolve the live pre-PA path sequence without requiring
+            a waveform chain count and test whether the canonical tuple is
+            nonempty. This result selects joint power calibration by default.
+
+        Returns:
+            result: True when PA inputs are electrically cross-coupled.
+        """
+
+        return bool(self.ResolveCouplingPaths("prePaCouplingPaths"))
+
+    @staticmethod
+    def ApplyCouplingPath(
+        sourceSignal: np.ndarray,
+        couplingPath: Mapping[str, object],
+    ) -> np.ndarray:
+        """Apply one causal complex FIR, fractional delay, and path gain.
+
+        Processing details:
+            Algorithm: Convolve the source with the configured FIR or an
+            identity tap, retain the source record length, interpolate real
+            and imaginary components at ``n-fractionalDelay`` with zero
+            extrapolation, prefix the nonnegative integer delay, and multiply
+            by the voltage gain and phase coefficient.
+
+        Args:
+            sourceSignal: One normalized complex source-chain vector.
+            couplingPath: Canonical mapping returned by ResolveCouplingPaths.
+
+        Returns:
+            result: Same-length complex contribution at the destination.
+        """
+
+        sourceVector = np.asarray(
+            sourceSignal, dtype=np.complex128
+        ).reshape(-1)
+        firTapsValue = couplingPath["firTaps"]
+        firTaps = (
+            np.asarray((1.0 + 0.0j,), dtype=np.complex128)
+            if firTapsValue is None
+            else np.asarray(firTapsValue, dtype=np.complex128)
+        )
+        filteredSignal = np.convolve(
+            sourceVector, firTaps, mode="full"
+        )[: sourceVector.size]
+        fractionalDelay = float(
+            couplingPath["fractionalDelaySamples"]
+        )
+        if fractionalDelay != 0.0:
+            nominalPositions = np.arange(
+                sourceVector.size, dtype=float
+            )
+            sourcePositions = nominalPositions - fractionalDelay
+            filteredSignal = (
+                np.interp(
+                    sourcePositions,
+                    nominalPositions,
+                    filteredSignal.real,
+                    left=0.0,
+                    right=0.0,
+                )
+                + 1j
+                * np.interp(
+                    sourcePositions,
+                    nominalPositions,
+                    filteredSignal.imag,
+                    left=0.0,
+                    right=0.0,
+                )
+            )
+        integerDelay = int(
+            couplingPath["integerDelaySamples"]
+        )
+        if integerDelay > 0:
+            delayedSignal = np.zeros_like(filteredSignal)
+            if integerDelay < sourceVector.size:
+                delayedSignal[integerDelay:] = filteredSignal[
+                    : sourceVector.size - integerDelay
+                ]
+        else:
+            delayedSignal = filteredSignal
+        pathCoefficient = (
+            np.power(
+                10.0, float(couplingPath["gainDb"]) / 20.0
+            )
+            * np.exp(
+                1j
+                * np.deg2rad(
+                    float(couplingPath["phaseDegrees"])
+                )
+            )
+        )
+        pathOutput = pathCoefficient * delayedSignal
+        if not np.all(np.isfinite(pathOutput)):
+            raise ValueError(
+                "coupling path exceeded the numeric range"
+            )
+        return np.asarray(pathOutput, dtype=np.complex128)
+
+    def ApplyMimoCoupling(
+        self,
+        inputSignal: np.ndarray,
+        parameterName: str,
+    ) -> np.ndarray:
+        """Add every configured cross-coupling contribution to a matrix.
+
+        Processing details:
+            Algorithm: Preserve an identity direct path for every column,
+            resolve and range-check all configured paths against the current
+            matrix, evaluate each source path independently, and accumulate
+            its contribution into the selected destination. Paths may be
+            asymmetric and multiple paths may share a source/destination.
+
+        Args:
+            inputSignal: Normalized vector or samples-by-chains matrix.
+            parameterName: Pre- or post-PA path configuration name.
+
+        Returns:
+            result: Same-shape waveform after additive complex coupling.
+        """
+
+        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        inputWasVector = complexInput.ndim == 1
+        inputMatrix = (
+            complexInput.reshape(-1, 1)
+            if inputWasVector
+            else complexInput
+        )
+        couplingPaths = self.ResolveCouplingPaths(
+            parameterName, inputMatrix.shape[1]
+        )
+        outputMatrix = inputMatrix.copy()
+        for couplingPath in couplingPaths:
+            sourceChain = int(couplingPath["sourceChain"])
+            destinationChain = int(
+                couplingPath["destinationChain"]
+            )
+            outputMatrix[:, destinationChain] += (
+                self.ApplyCouplingPath(
+                    inputMatrix[:, sourceChain],
+                    couplingPath,
+                )
+            )
+        return outputMatrix[:, 0] if inputWasVector else outputMatrix
+
+    def ApplyPrePaCoupling(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply all configured coupling paths before nonlinear PA branches.
+
+        Processing details:
+            Algorithm: Delegate to ApplyMimoCoupling with the pre-PA path
+            sequence so every PA receives its own drive plus delayed complex
+            leakage from the other physical input chains.
+
+        Args:
+            inputSignal: Normalized PA-bank input vector or matrix.
+
+        Returns:
+            result: Same-shape actual drive presented to the PA bank.
+        """
+
+        return self.ApplyMimoCoupling(
+            inputSignal, "prePaCouplingPaths"
+        )
+
+    def ApplyPostPaCoupling(
+        self, paOutputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply all configured coupling paths after nonlinear PA branches.
+
+        Processing details:
+            Algorithm: Delegate to ApplyMimoCoupling with the post-PA path
+            sequence so independently generated nonlinear outputs leak into
+            other conducted output chains before forward or feedback sampling.
+
+        Args:
+            paOutputSignal: Normalized output vector or matrix from the PA bank.
+
+        Returns:
+            result: Same-shape coupled PA output presented to the sampler.
+        """
+
+        return self.ApplyMimoCoupling(
+            paOutputSignal, "postPaCouplingPaths"
+        )
 
     def ResolveNoiseRmsVolts(self) -> float:
         """Resolve the requested complex-envelope noise RMS in volts.
@@ -859,15 +1457,389 @@ class Channel:
             complexInput + complexNoise, dtype=np.complex128
         )
 
+    def ResolveFeedbackFirTaps(self) -> np.ndarray:
+        """Return the configured causal feedback-channel impulse response.
+
+        Processing details:
+            Algorithm: Replace a disabled setting with one identity tap and
+            otherwise convert the already validated caller sequence into a
+            defensive complex128 vector.
+
+        Returns:
+            result: Nonempty one-dimensional complex FIR tap vector.
+        """
+
+        self.ValidateParameters()
+        fbFirTaps = self.parameters["fbFirTaps"]
+        if fbFirTaps is None:
+            return np.asarray((1.0 + 0.0j,), dtype=np.complex128)
+        return np.asarray(
+            fbFirTaps, dtype=np.complex128
+        ).reshape(-1).copy()
+
+    def ApplyFeedbackLinearResponse(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply feedback coupling gain, phase, and causal FIR response.
+
+        Processing details:
+            Algorithm: Convolve each SISO or MIMO chain independently with
+            ``fbFirTaps``, retain the original record length, and multiply by
+            the configured logarithmic voltage gain and complex phase. The
+            forward instrument mode never calls this operation.
+
+        Args:
+            inputSignal: Normalized PA output after common phase rotation.
+
+        Returns:
+            result: Feedback analog signal after linear path distortion.
+        """
+
+        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        inputWasVector = complexInput.ndim == 1
+        inputMatrix = (
+            complexInput.reshape(-1, 1)
+            if inputWasVector
+            else complexInput
+        )
+        firTaps = self.ResolveFeedbackFirTaps()
+        filteredMatrix = np.empty_like(inputMatrix)
+        for chainIndex in range(inputMatrix.shape[1]):
+            filteredMatrix[:, chainIndex] = np.convolve(
+                inputMatrix[:, chainIndex],
+                firTaps,
+                mode="full",
+            )[: inputMatrix.shape[0]]
+        with np.errstate(over="ignore", invalid="ignore"):
+            feedbackGain = np.power(
+                10.0,
+                float(self.parameters["fbGainDb"]) / 20.0,
+            )
+        feedbackPhase = np.exp(
+            1j
+            * np.deg2rad(
+                float(self.parameters["fbPhaseDegrees"])
+            )
+        )
+        linearOutput = filteredMatrix * feedbackGain * feedbackPhase
+        if not np.all(np.isfinite(linearOutput)):
+            raise ValueError(
+                "feedback linear response exceeded the numeric range"
+            )
+        return (
+            linearOutput[:, 0]
+            if inputWasVector
+            else np.asarray(linearOutput, dtype=np.complex128)
+        )
+
+    def ApplyFeedbackNonlinearity(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply receiver third-order distortion and envelope clipping.
+
+        Processing details:
+            Algorithm: Evaluate the memoryless complex polynomial
+            ``x + c3*abs(x)**2*x`` and then, when configured, radially limit
+            samples whose complex-envelope magnitude exceeds
+            ``fbClipAmplitude``. These effects model feedback front-end
+            compression rather than PA nonlinearity.
+
+        Args:
+            inputSignal: Feedback signal after linear coupling response.
+
+        Returns:
+            result: Nonlinearly distorted normalized feedback waveform.
+        """
+
+        self.ValidateParameters()
+        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        thirdOrderCoefficient = complex(
+            self.parameters["fbThirdOrderCoefficient"]
+        )
+        nonlinearOutput = complexInput + (
+            thirdOrderCoefficient
+            * np.abs(complexInput) ** 2
+            * complexInput
+        )
+        clipAmplitudeValue = self.parameters["fbClipAmplitude"]
+        if clipAmplitudeValue is not None:
+            clipAmplitude = float(clipAmplitudeValue)
+            outputMagnitude = np.abs(nonlinearOutput)
+            overLimit = outputMagnitude > clipAmplitude
+            if np.any(overLimit):
+                nonlinearOutput = nonlinearOutput.copy()
+                nonlinearOutput[overLimit] *= (
+                    clipAmplitude / outputMagnitude[overLimit]
+                )
+        if not np.all(np.isfinite(nonlinearOutput)):
+            raise ValueError(
+                "feedback nonlinearity exceeded the numeric range"
+            )
+        return np.asarray(nonlinearOutput, dtype=np.complex128)
+
+    def ApplyFeedbackTimingAndFrequency(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply fractional/integer delay, SFO, and carrier offset.
+
+        Processing details:
+            Algorithm: Sample every chain at positions
+            ``n*(1+sfo)-fractionalDelay`` with linear interpolation and zero
+            extrapolation, prefix the configured integer delay while
+            preserving record length, then multiply by the carrier-frequency
+            phase ramp derived from ``sampleRateHz``.
+
+        Args:
+            inputSignal: Feedback analog waveform before oscillator effects.
+
+        Returns:
+            result: Same-shape waveform with timing and frequency offsets.
+        """
+
+        self.ValidateParameters()
+        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        inputWasVector = complexInput.ndim == 1
+        inputMatrix = (
+            complexInput.reshape(-1, 1)
+            if inputWasVector
+            else complexInput
+        )
+        sampleCount = inputMatrix.shape[0]
+        nominalPositions = np.arange(sampleCount, dtype=float)
+        samplingOffsetRatio = (
+            float(self.parameters["fbSamplingFrequencyOffsetPpm"])
+            * 1.0e-6
+        )
+        fractionalDelay = float(
+            self.parameters["fbFractionalDelaySamples"]
+        )
+        sourcePositions = (
+            nominalPositions * (1.0 + samplingOffsetRatio)
+            - fractionalDelay
+        )
+        if samplingOffsetRatio == 0.0 and fractionalDelay == 0.0:
+            resampledMatrix = inputMatrix.copy()
+        else:
+            resampledMatrix = np.empty_like(inputMatrix)
+            for chainIndex in range(inputMatrix.shape[1]):
+                inputColumn = inputMatrix[:, chainIndex]
+                resampledMatrix[:, chainIndex] = (
+                    np.interp(
+                        sourcePositions,
+                        nominalPositions,
+                        inputColumn.real,
+                        left=0.0,
+                        right=0.0,
+                    )
+                    + 1j
+                    * np.interp(
+                        sourcePositions,
+                        nominalPositions,
+                        inputColumn.imag,
+                        left=0.0,
+                        right=0.0,
+                    )
+                )
+        integerDelay = int(
+            self.parameters["fbIntegerDelaySamples"]
+        )
+        if integerDelay > 0:
+            delayedMatrix = np.zeros_like(resampledMatrix)
+            if integerDelay < sampleCount:
+                delayedMatrix[integerDelay:, :] = resampledMatrix[
+                    : sampleCount - integerDelay, :
+                ]
+        else:
+            delayedMatrix = resampledMatrix
+        carrierFrequencyOffsetHz = float(
+            self.parameters["fbCarrierFrequencyOffsetHz"]
+        )
+        if carrierFrequencyOffsetHz != 0.0:
+            carrierPhasor = np.exp(
+                1j
+                * 2.0
+                * np.pi
+                * carrierFrequencyOffsetHz
+                * nominalPositions
+                / float(self.parameters["sampleRateHz"])
+            ).reshape(-1, 1)
+            delayedMatrix = delayedMatrix * carrierPhasor
+        return (
+            delayedMatrix[:, 0]
+            if inputWasVector
+            else np.asarray(delayedMatrix, dtype=np.complex128)
+        )
+
+    def ApplyFeedbackIqImbalance(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply I/Q gain/phase mismatch and complex receiver DC offset.
+
+        Processing details:
+            Algorithm: Split the complex envelope into I and Q, apply
+            reciprocal half-gain factors so their ratio equals
+            ``fbIqGainImbalanceDb``, leak I into Q according to the quadrature
+            phase error, recombine the components, and add ``fbDcOffset``.
+
+        Args:
+            inputSignal: Feedback waveform after timing and frequency errors.
+
+        Returns:
+            result: Feedback baseband waveform with image and DC impairment.
+        """
+
+        self.ValidateParameters()
+        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        gainImbalanceDb = float(
+            self.parameters["fbIqGainImbalanceDb"]
+        )
+        iGain = np.power(10.0, gainImbalanceDb / 40.0)
+        qGain = np.power(10.0, -gainImbalanceDb / 40.0)
+        phaseErrorRadians = np.deg2rad(
+            float(self.parameters["fbIqPhaseImbalanceDegrees"])
+        )
+        inputI = complexInput.real
+        inputQ = complexInput.imag
+        outputI = iGain * inputI
+        outputQ = qGain * (
+            np.cos(phaseErrorRadians) * inputQ
+            + np.sin(phaseErrorRadians) * inputI
+        )
+        iqOutput = (
+            outputI
+            + 1j * outputQ
+            + complex(self.parameters["fbDcOffset"])
+        )
+        if not np.all(np.isfinite(iqOutput)):
+            raise ValueError(
+                "feedback I/Q imbalance exceeded the numeric range"
+            )
+        return np.asarray(iqOutput, dtype=np.complex128)
+
+    def ApplyFeedbackAdc(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply optional feedback ADC component clipping and quantization.
+
+        Processing details:
+            Algorithm: When ``fbAdcWidth`` is enabled, normalize I and Q by
+            ``fbAdcFullScale``, round each component to a signed W-bit code,
+            saturate to ``[-2**(W-1), 2**(W-1)-1]``, and decode the code back
+            to a floating receiver sample. None leaves the signal unchanged.
+
+        Args:
+            inputSignal: Noisy feedback receiver waveform before ADC.
+
+        Returns:
+            result: Same-shape floating waveform after ADC quantization.
+        """
+
+        self.ValidateParameters()
+        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        adcWidthValue = self.parameters["fbAdcWidth"]
+        if adcWidthValue is None:
+            return complexInput.copy()
+        adcWidth = int(adcWidthValue)
+        fullScale = float(self.parameters["fbAdcFullScale"])
+        codeScale = float(2 ** (adcWidth - 1))
+        minimumCode = -codeScale
+        maximumCode = codeScale - 1.0
+        realCodes = np.clip(
+            np.rint(complexInput.real / fullScale * codeScale),
+            minimumCode,
+            maximumCode,
+        )
+        imagCodes = np.clip(
+            np.rint(complexInput.imag / fullScale * codeScale),
+            minimumCode,
+            maximumCode,
+        )
+        return np.asarray(
+            fullScale * (realCodes + 1j * imagCodes) / codeScale,
+            dtype=np.complex128,
+        )
+
+    def ApplyFeedbackAnalogImpairments(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply every configured embedded-feedback analog impairment.
+
+        Processing details:
+            Algorithm: Execute coupling/FIR distortion, receiver third-order
+            compression and clipping, timing/CFO/SFO errors, then I/Q mismatch
+            and DC offset. AWGN and ADC quantization are intentionally applied
+            later so noise is quantized by the modeled converter.
+
+        Args:
+            inputSignal: Normalized PA output after common phase rotation.
+
+        Returns:
+            result: Feedback analog baseband waveform immediately before noise.
+        """
+
+        linearOutput = self.ApplyFeedbackLinearResponse(inputSignal)
+        nonlinearOutput = self.ApplyFeedbackNonlinearity(linearOutput)
+        timingOutput = self.ApplyFeedbackTimingAndFrequency(
+            nonlinearOutput
+        )
+        return self.ApplyFeedbackIqImbalance(timingOutput)
+
+    def FeedbackDirectSmallSignalGain(self) -> complex:
+        """Return the feedback path's analytic direct small-signal coefficient.
+
+        Processing details:
+            Algorithm: Multiply coupling gain/phase, FIR DC response, and the
+            direct ``x`` coefficient of the widely-linear I/Q mapping.
+            Third-order distortion vanishes at zero amplitude; delay, CFO,
+            SFO, DC, noise, clipping, and ADC are not representable by one
+            stationary scalar and therefore do not modify this diagnostic.
+
+        Returns:
+            result: Complex direct small-signal coefficient before common PA
+                and ``phaseDegrees`` gain.
+        """
+
+        self.ValidateParameters()
+        feedbackGain = np.power(
+            10.0, float(self.parameters["fbGainDb"]) / 20.0
+        )
+        feedbackPhase = np.exp(
+            1j
+            * np.deg2rad(
+                float(self.parameters["fbPhaseDegrees"])
+            )
+        )
+        firDcResponse = np.sum(self.ResolveFeedbackFirTaps())
+        gainImbalanceDb = float(
+            self.parameters["fbIqGainImbalanceDb"]
+        )
+        iGain = np.power(10.0, gainImbalanceDb / 40.0)
+        qGain = np.power(10.0, -gainImbalanceDb / 40.0)
+        phaseErrorRadians = np.deg2rad(
+            float(self.parameters["fbIqPhaseImbalanceDegrees"])
+        )
+        directIqCoefficient = 0.5 * (
+            iGain
+            + qGain * np.cos(phaseErrorRadians)
+            + 1j * qGain * np.sin(phaseErrorRadians)
+        )
+        return complex(
+            feedbackGain
+            * feedbackPhase
+            * firDcResponse
+            * directIqCoefficient
+        )
+
     def ApplyChannelEffects(
         self, paOutputSignal: np.ndarray
     ) -> np.ndarray:
-        """Apply phase rotation followed by receiver white noise.
+        """Apply the selected forward-instrument or feedback sample path.
 
         Processing details:
-            Algorithm: Validate the live configuration, rotate the normalized
-            PA output first, then add AWGN so the implemented order exactly
-            matches ``PA -> phase -> AddNoise``.
+            Algorithm: Validate and apply the common phase first. Forward mode
+            then adds only configured measurement noise. Feedback mode applies
+            the complete embedded analog impairment chain, adds noise, and
+            finally quantizes through the optional feedback ADC.
 
         Args:
             paOutputSignal: Normalized floating PA output samples.
@@ -878,7 +1850,13 @@ class Channel:
 
         self.ValidateParameters()
         phaseRotatedSignal = self.ApplyPhaseRotation(paOutputSignal)
-        return self.AddNoise(phaseRotatedSignal)
+        if self.sampleMode == "forward":
+            return self.AddNoise(phaseRotatedSignal)
+        feedbackAnalogSignal = self.ApplyFeedbackAnalogImpairments(
+            phaseRotatedSignal
+        )
+        noisyFeedbackSignal = self.AddNoise(feedbackAnalogSignal)
+        return self.ApplyFeedbackAdc(noisyFeedbackSignal)
 
     def ProcessPaOutput(
         self, paOutputSignal: np.ndarray
@@ -886,9 +1864,10 @@ class Channel:
         """Apply channel effects to an already evaluated public PA output.
 
         Processing details:
-            Algorithm: Decode public integer I/Q codes once, execute phase
-            rotation and noise in normalized floating units, and encode the
-            receiver signal back to the same public interface convention.
+            Algorithm: Decode public integer I/Q codes once, apply configured
+            post-PA inter-chain coupling, execute the selected forward or
+            feedback sampling path in normalized floating units, and encode
+            the receiver signal back to the same public interface convention.
 
         Args:
             paOutputSignal: Public PA output vector or matrix.
@@ -901,27 +1880,31 @@ class Channel:
         normalizedPaOutput = interfaceFormat.DecodeComplex(
             self.ValidateSignal(paOutputSignal, "paOutputSignal")
         )
-        normalizedReceiverSignal = self.ApplyChannelEffects(
+        coupledPaOutput = self.ApplyPostPaCoupling(
             normalizedPaOutput
+        )
+        normalizedReceiverSignal = self.ApplyChannelEffects(
+            coupledPaOutput
         )
         return interfaceFormat.EncodeComplex(normalizedReceiverSignal)
 
-    def ProcessFloating(
+    def ProcessBoundPaFloating(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
-        """Evaluate the bound PA and channel in normalized floating units.
+        """Evaluate only the bound PA bank in normalized floating units.
 
         Processing details:
             Algorithm: Prefer the PA's direct ``ProcessFloating`` entry. For
             a fixed-only third-party PA, encode and decode around its public
-            width exactly once. Apply phase rotation and AWGN only after the
-            PA output has returned to normalized floating units.
+            width exactly once. No pre/post coupling or sampling impairment is
+            applied here, which keeps one unambiguous PA-bank calculation
+            reusable by normal processing and closed-loop power calibration.
 
         Args:
             inputSignal: Normalized floating PA input vector or matrix.
 
         Returns:
-            result: Normalized floating receiver-input waveform.
+            result: Normalized floating output of the bound PA bank.
         """
 
         if self.paModel is None or self._paProcessMethod is None:
@@ -946,7 +1929,69 @@ class Channel:
             normalizedPaOutput = paInterfaceFormat.DecodeComplex(
                 publicPaOutput
             )
-        return self.ApplyChannelEffects(normalizedPaOutput)
+        normalizedOutput = self.ValidateSignal(
+            normalizedPaOutput, "paOutputSignal"
+        )
+        if normalizedOutput.shape != normalizedInput.shape:
+            raise ValueError(
+                "bound PA must preserve the input vector or matrix shape"
+            )
+        return normalizedOutput
+
+    def ProcessPaBankForCalibration(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Evaluate pre-PA coupling and the PA bank at the public boundary.
+
+        Processing details:
+            Algorithm: Decode the trial waveform once, apply PA-input
+            cross-coupling, evaluate every nonlinear PA, and encode the clean
+            per-PA outputs. Post-PA coupling and receiver effects are excluded
+            so ``outputPowerDbm`` continues to mean each physical PA's own
+            output power. The joint calibrator accounts for pre-PA coupling.
+
+        Args:
+            inputSignal: Public SISO or samples-by-chains calibration trial.
+
+        Returns:
+            result: Public clean PA outputs before post-PA coupling.
+        """
+
+        interfaceFormat = FixedPoint(self.width)
+        normalizedInput = interfaceFormat.DecodeComplex(
+            self.ValidateSignal(inputSignal, "inputSignal")
+        )
+        actualPaInput = self.ApplyPrePaCoupling(normalizedInput)
+        normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
+        return interfaceFormat.EncodeComplex(normalizedPaOutput)
+
+    def ProcessFloating(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Evaluate coupled PA inputs, PA outputs, and the selected sampler.
+
+        Processing details:
+            Algorithm: Apply additive complex FIR coupling before the PA bank,
+            evaluate all configured nonlinear branches simultaneously, apply
+            additive coupling between their clean outputs, and finally run
+            the forward-instrument or embedded-feedback receive path.
+
+        Args:
+            inputSignal: Normalized PA-bank input vector or matrix.
+
+        Returns:
+            result: Normalized floating receiver-input waveform.
+        """
+
+        normalizedInput = self.ValidateSignal(
+            inputSignal, "inputSignal"
+        )
+        actualPaInput = self.ApplyPrePaCoupling(normalizedInput)
+        normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
+        coupledPaOutput = self.ApplyPostPaCoupling(
+            normalizedPaOutput
+        )
+        return self.ApplyChannelEffects(coupledPaOutput)
 
     def Process(
         self,
@@ -961,9 +2006,9 @@ class Channel:
             Algorithm: When ``outputPowerDbm`` is provided, first run the
             private closed loop that repeatedly adjusts only the PA input and
             observes clean PA output until its active-region power converges.
-            Apply phase rotation and receiver noise exactly once to the cached
+            Apply the selected sampling path exactly once to the cached
             accepted PA output. When the target is None, preserve the direct
-            one-pass PA-to-receiver behavior required by iterative algorithms.
+            one-pass PA-to-sampler behavior required by iterative algorithms.
 
         Args:
             inputSignal: Public PA input vector or samples-by-chains matrix.
@@ -984,16 +2029,17 @@ class Channel:
         return interfaceFormat.EncodeComplex(normalizedOutput)
 
     def SmallSignalGain(self) -> complex:
-        """Return the deterministic small-signal gain through phase rotation.
+        """Return the deterministic direct small-signal sampling-path gain.
 
         Processing details:
             Algorithm: Query the bound PA's small-signal complex gain and
-            multiply it by the configured unit-magnitude phase factor. AWGN
-            has zero mean and therefore does not contribute deterministic
-            small-signal gain.
+            multiply it by the common phase. In feedback mode also multiply
+            by the feedback direct small-signal coefficient. AWGN has zero
+            mean and does not contribute deterministic gain; time-varying and
+            nonanalytic effects are described by the feedback diagnostics.
 
         Returns:
-            result: Complex PA-plus-phase small-signal gain.
+            result: Complex direct small-signal gain for the selected mode.
         """
 
         if self.paModel is None:
@@ -1011,6 +2057,9 @@ class Channel:
         phaseRadians = np.deg2rad(
             float(cast(float, self.parameters["phaseDegrees"]))
         )
-        return complex(
+        selectedPathGain = complex(
             smallSignalGainMethod() * np.exp(1j * phaseRadians)
         )
+        if self.sampleMode == "fb":
+            selectedPathGain *= self.FeedbackDirectSmallSignalGain()
+        return complex(selectedPathGain)

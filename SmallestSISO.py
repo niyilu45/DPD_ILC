@@ -108,6 +108,8 @@ def RunSisoMode(
     channel = Channel(
         paModel=paModel,
         parameters={
+            "sampleMode": "forward",
+            "sampleRateHz": waveform.sampleRateHz,
             "phaseDegrees": 0,
             "noiseAmpMv": 10.0,
             "noisePwrDbm": None,

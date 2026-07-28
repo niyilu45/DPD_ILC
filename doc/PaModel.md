@@ -1,11 +1,12 @@
-# 功率放大器模型：Wiener、GMP 的物理原理与公式推导
+# 功率放大器模型：Wiener、GMP与Doherty的物理原理
 
-本文解释 `inc/lib/PaModel.py` 中功率放大器（Power Amplifier，PA）模型的物理意义、数学来源、参数作用和适用边界。工程支持两类模型：
+本文解释 `inc/lib/PaModel.py` 中功率放大器（Power Amplifier，PA）模型的物理意义、数学来源、参数作用和适用边界。工程支持三类模型：
 
 - **Wiener 模型**：线性记忆滤波器后接无记忆非线性，直观、参数少；
-- **GMP 模型**：主记忆多项式加包络超前/滞后交叉项，表达能力更强。
+- **GMP 模型**：主记忆多项式加包络超前/滞后交叉项，表达能力更强；
+- **Doherty 模型**：载波PA和峰值PA并联，通过包络门控、支路时延、复合成与简化负载调制描述Doherty架构。
 
-> 这两种都是复基带“行为模型”，描述输入波形和输出波形之间的关系。它们不是晶体管电路模型，不能直接预测漏极电压、电流、结温、效率或器件可靠性。
+> 这三种都是复基带“行为模型”，描述输入波形和输出波形之间的关系。它们不是晶体管电路模型，不能直接预测漏极电压、电流、结温、效率或器件可靠性。
 
 ---
 
@@ -425,6 +426,136 @@ G_{\mathrm{small}}=\sum_m a_{1,m},
 
 ---
 
+## 4.8 Doherty载波/峰值双支路模型
+
+### 4.8.1 为什么需要两条PA支路
+
+传统单路PA为了容纳Wi-Fi等高PAPR信号，平均工作点通常远离饱和区，效率较低。Doherty架构让Carrier PA持续工作，让Peaking PA只在包络较高时逐渐开启，并通过合成网络改变Carrier看到的等效负载：
+
+```mermaid
+flowchart LR
+    input["输入 x(n)"] --> carrierGain["Carrier输入增益"]
+    input --> activation["包络门控 a(r)"]
+    activation --> peakingGain["Peaking输入增益"]
+    carrierGain --> carrierPa["Carrier<br/>Wiener或GMP"]
+    peakingGain --> peakingPa["Peaking<br/>Wiener或GMP"]
+    activation --> load["Carrier负载调制"]
+    carrierPa --> load
+    peakingPa --> delay["Peaking支路时延"]
+    load --> combine["复系数功率合成"]
+    delay --> combine
+    combine --> output["Doherty输出 y(n)"]
+```
+
+**图 5 说明**：低包络区只有Carrier支路贡献输出；包络跨过开启门限后，Peaking支路平滑导通，同时Carrier支路乘以包络相关的负载调制因子。两条支路可以分别选择Wiener或GMP，因此可以具有不同压缩、记忆和AM-PM特性。
+
+令输入包络为
+
+```math
+r(n)=|x(n)|.
+```
+
+归一化开启位置为
+
+```math
+t(n)
+=
+\frac{r(n)-r_{\mathrm{on}}}
+     {\Delta r}.
+```
+
+代码先把 $t(n)$ 限制在0到1，再使用连续光滑的三次门控：
+
+```math
+a(n)
+=
+t^2(n)\left[3-2t(n)\right].
+```
+
+门限以下 $a(n)=0$，过渡区以上 $a(n)=1$。两条支路的输入为：
+
+```math
+u_c(n)=g_c x(n),
+```
+
+```math
+u_p(n)=g_p a(n)x(n).
+```
+
+Carrier与Peaking的非线性行为分别记为 $F_c$ 和 $F_p$。简化负载调制及复功率合成为：
+
+```math
+y(n)
+=
+c_c
+\left[
+1+\lambda a(n)
+\right]
+F_c\{u_c(n)\}
++
+c_p
+F_p\{u_p(n-D_p)\}.
+```
+
+其中：
+
+- $r_{\mathrm{on}}$ 对应 `peakingTurnOnAmplitude`；
+- $\Delta r$ 对应 `peakingTransitionWidth`；
+- $D_p$ 对应 `peakingDelaySamples`；
+- $c_c$ 和 $c_p$ 是两路复合成系数；
+- $\lambda$ 是 `loadModulationStrength`。
+
+小信号极限下 $a(n)=0$，所以Peaking支路关闭，Doherty小信号增益只有Carrier贡献：
+
+```math
+G_{\mathrm{Doherty,small}}
+=
+c_c g_c G_{c,\mathrm{small}}.
+```
+
+该模型能够研究支路开启拐点、支路幅相失配、记忆差异和负载调制对EVM/ACLR的影响，但不直接输出漏极效率，也没有求解晶体管阻抗、反射波或电磁合成网络。
+
+### 4.8.2 典型调用
+
+```python
+from inc.lib.PaModel import (
+    DohertyConfig,
+    GMPConfig,
+    PaModel,
+    WienerConfig,
+)
+
+
+dohertyConfig = DohertyConfig(
+    carrierModelName="wiener",
+    peakingModelName="gmp",
+    carrierWienerConfig=WienerConfig(
+        saturationAmplitude=1.0,
+        rappSmoothness=3.0,
+        ampmCoefficient=0.12,
+    ),
+    peakingGmpConfig=GMPConfig(
+        nonlinearOrders=(1, 3, 5, 7),
+        memoryDepth=3,
+        crossMemoryDepth=2,
+    ),
+    peakingTurnOnAmplitude=0.45,
+    peakingTransitionWidth=0.15,
+    peakingDelaySamples=1,
+    loadModulationStrength=0.10,
+)
+dohertyPa = PaModel(
+    parameters={
+        "modelName": "doherty",
+        "dohertyConfig": dohertyConfig,
+        "width": 0,
+    }
+)
+paOutput = dohertyPa.Process(paInput)
+```
+
+---
+
 ## 5. 非线性为什么会产生邻道频谱再生
 
 考虑两个复音调
@@ -537,19 +668,19 @@ w_I,w_Q\sim\mathcal N\left(0,\frac{P_n}{2}\right).
 
 ---
 
-## 9. 两类模型的选择
+## 9. 三类模型的选择
 
-| 对比项 | Wiener | GMP |
-|---|---|---|
-| 结构 | FIR 后接静态非线性 | 多阶、多延迟、交叉包络基函数并联 |
-| 参数数量 | 少 | 较多 |
-| 物理直觉 | 很直观 | 需要基函数理解 |
-| 动态非线性表达力 | 中等、结构受限 | 强 |
-| 系数辨识 | 非线性参数拟合可能较复杂 | 对系数线性，可最小二乘 |
-| 计算量 | 较低 | 随阶次/记忆/交叉深度增加 |
-| 适合用途 | 算法原理验证、可解释压缩曲线 | 宽带 PA 行为拟合、DPD 基函数验证 |
+| 对比项 | Wiener | GMP | Doherty |
+|---|---|---|---|
+| 结构 | FIR后接静态非线性 | 多阶、多延迟、交叉包络基函数并联 | Carrier与Peaking两条行为PA并联合成 |
+| 参数数量 | 少 | 较多 | 取决于两条支路模型 |
+| 物理直觉 | 很直观 | 需要基函数理解 | 直接对应双支路开启和合成 |
+| 动态非线性表达力 | 中等、结构受限 | 强 | 两支路可各自使用Wiener或GMP |
+| 系数辨识 | 非线性参数拟合可能较复杂 | 对系数线性，可最小二乘 | 需要分别辨识支路及开启/合成参数 |
+| 计算量 | 较低 | 随阶次/记忆/交叉深度增加 | 约为两条所选支路之和 |
+| 适合用途 | 算法原理验证、可解释压缩曲线 | 宽带PA行为拟合、DPD基函数验证 | Doherty架构、支路失配和开启区研究 |
 
-建议：先用 Wiener 模型观察 ILC 收敛和压缩机制，再用 GMP 检查算法面对宽带动态非线性时的稳健性。
+建议：先用Wiener观察ILC收敛和压缩机制，再用GMP检查宽带动态非线性，最后用Doherty研究载波/峰值支路切换、失配和合成对DPD的影响。
 
 ---
 
@@ -573,7 +704,7 @@ z_m[n]
 =b_m\,f_m\!\left(a_m x_m[n]\right),
 ```
 
-其中 $f_m(\cdot)$ 可以是该路自己的 Wiener 或 GMP 模型，输入和输出幅度标尺分别为
+其中 $f_m(\cdot)$ 可以是该路自己的Wiener、GMP或Doherty模型，输入和输出幅度标尺分别为
 
 ```math
 a_m=10^{G_{\mathrm{in},m}/20},
@@ -595,7 +726,7 @@ $r_m$ 是复包络 RMS。比如 `outputPowerDbPerChain=(0,-3,-6)` 会让三路�
 flowchart LR
     matrix["输入矩阵 X"] --> split["按列拆分"]
     split --> in0["输入 dB：aₘ"]
-    in0 --> pa0["独立 fₘ：Wiener/GMP"]
+    in0 --> pa0["独立 fₘ：Wiener/GMP/Doherty"]
     pa0 --> out0["输出 dB：bₘ"]
     out0 --> target{"启用绝对 dBm?"}
     target -->|否| column["zₘ"]
@@ -625,19 +756,29 @@ Python接口优先使用 `targetOutputPowerDbmPerChain` 和 `SetTargetOutputPowe
 
 ### 10.1 独立 PA 假设的边界
 
-当前模型满足
+`MimoPaModel`本身仍满足
 
 ```math
 y_m[n]=F_m\{x_m[n]\},
 ```
 
-而没有 $x_q,q\ne m$ 的交叉项。因此它能表示每路器件系数、记忆、驱动和输出功率不同，但不能表示功放间电源耦合、LO 泄漏、天线互耦或热串扰。含串扰的更一般模型可以写为
+而没有 $x_q,q\ne m$ 的交叉项。因此它负责每一路不同的器件结构、记忆、驱动和输出功率。PA前后电气串扰由 `Channel.prePaCouplingPaths` 和 `Channel.postPaCouplingPaths` 建模：
+
+```math
+\mathbf u(n)=\mathbf H_{\mathrm{pre}}(z)\mathbf x(n),
+```
+
+```math
+\mathbf z(n)=\mathbf H_{\mathrm{post}}(z)\mathbf y(n).
+```
+
+PA前耦合会改变每个PA的非线性激励，PA后耦合会混合已经产生的失真。这个分层可以描述线性耦合网络与独立非线性PA的级联。若天线反射波会反向改变PA负载，使PA本身成为多输入非线性函数，则更一般模型为
 
 ```math
 y_m[n]=F_m\{x_1[n],\ldots,x_{N_{TX}}[n]\},
 ```
 
-需要矩阵 Volterra/GMP 或多输入神经模型；这超出当前独立 `MimoPaModel` 的范围。
+这需要有源负载牵引、矩阵Volterra/GMP或多输入神经模型，不应误认为普通PA后线性耦合。
 
 ### 10.2 每路 ILC/DPD
 
@@ -648,7 +789,7 @@ U_m^{(i+1)}[k]
 =Q_f[k]\left(U_m^{(i)}[k]+L_m^{(i)}[k]E_m^{(i)}[k]\right).
 ```
 
-因此各 PA 有独立学习输入、反馈随机种子和收敛历史。`FitMimoGmpPredistorter` 再对每路 $(x_m,u_m^*)$ 标签独立拟合 GMP。这是传导测试中常用且可解释的 per-chain DPD 结构；若发射链之间存在显著耦合，则需要联合 MIMO DPD。
+因此各PA有独立学习输入、反馈随机种子和收敛历史。`FitMimoGmpPredistorter` 再对每路 $(x_m,u_m^*)$ 标签独立拟合GMP。这只适用于关闭耦合或耦合可以忽略的传导测试；启用Channel的PA前/后耦合后，当前 `RunMimoFrequencyDomainIlc` 不能把联合plant拆成独立SISO，需要后续完整矩阵频响/Jacobian的联合MIMO ILC。
 
 ---
 
@@ -706,12 +847,20 @@ classDiagram
         +Process(inputSignal)
         +SmallSignalGain()
     }
+    class DohertyConfig
+    class DohertyPA {
+        +BuildBranchModel(modelName, wienerConfig, gmpConfig)
+        +PeakingActivation(inputMagnitude)
+        +Process(inputSignal)
+        +SmallSignalGain()
+    }
     class IQImbalancePA {
         +Process(inputSignal)
     }
     class MimoPaModel {
         +width
         +Process(inputMatrix)
+        +ProcessFloating(inputMatrix)
         +ProcessChain(inputSignal, chainIndex)
         +SetOutputPowerDb(chainIndex, outputPowerDb)
         +SetTargetOutputRms(chainIndex, targetOutputRms)
@@ -723,15 +872,22 @@ classDiagram
     MimoPaModel --> PowerCalibration : absolute dBm calibration
     PaModel --> WienerPA : modelName=wiener
     PaModel --> GMPPA : modelName=gmp
+    PaModel --> DohertyPA : modelName=doherty
     WienerPA --> WienerConfig
     GMPPA --> GMPConfig
+    DohertyPA --> DohertyConfig
+    DohertyPA o-- WienerPA : carrier or peaking
+    DohertyPA o-- GMPPA : carrier or peaking
     IQImbalancePA o-- PaModel : wraps
 ```
 
-**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择 Wiener 或 GMP。`MimoPaModel` 按物理链持有多个 `PaModel`。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或仪表适配器，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。`IQImbalancePA` 可以包装任意PA；反馈噪声由独立的 `AddAwgn` 添加。
+**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Wiener、GMP或Doherty。Doherty的Carrier和Peaking又各自选择Wiener或GMP。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
+
+如果需要区分实验室前向仪表与板载反馈接收机，应把同一份干净PA输出交给两个独立Channel。`sampleMode="forward"` 跳过反馈专用非理想，用于最终主路EVM/ACLR评价；`sampleMode="fb"` 可增加反馈FIR、时频偏、I/Q/DC、接收机非线性、限幅和ADC量化，用于模拟板载闭环。反馈链参数属于观察接收机，不属于PA模型系数，不能写入Wiener或GMP来混合拟合。
 
 ```python
 from inc.lib.PaModel import (
+    DohertyConfig,
     GMPConfig,
     PaModel,
     WienerConfig,
@@ -761,10 +917,22 @@ paOverrides.update(
 )
 # Process detects the live mapping change and rebuilds the selected PA.
 gmpOutput = paModel.Process(inputSignal)
+
+paOverrides.update(
+    {
+        "modelName": "doherty",
+        "dohertyConfig": DohertyConfig(
+            carrierModelName="wiener",
+            peakingModelName="gmp",
+            peakingTurnOnAmplitude=0.45,
+        ),
+    }
+)
+dohertyOutput = paModel.Process(inputSignal)
 ```
 
 `PaModel` 的公开构造签名为
-`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收 I/Q 整数码，解码成归一化浮点后使用 Wiener 或 GMP 模型计算，最后把结果编码回整数码。公开返回容器始终是 `numpy.complex128`：
+`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收I/Q整数码，解码成归一化浮点后使用Wiener、GMP或Doherty模型计算，最后把结果编码回整数码。公开返回容器始终是 `numpy.complex128`：
 
 ```python
 from inc.lib.PaModel import PaModel
@@ -802,7 +970,7 @@ mimoPaModel = MimoPaModel(
     numTransmitChains=4,
     paParametersPerChain=(
         {"modelName": "wiener"},
-        {"modelName": "wiener"},
+        {"modelName": "doherty"},
         {"modelName": "gmp"},
         {"modelName": "gmp"},
     ),

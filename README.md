@@ -1,14 +1,14 @@
 # DPD-ILC VHT/HE/EHT Wi-Fi与双音仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Wiener/GMP PA、闭环输出功率校准和全部适用ILC更新律。Wi-Fi路径输出功率、SNR、EVM、ACLR和功率-EVM曲线；双音路径输出IM3、IM5、IM7及所有SISO ILC方法的同功率对比图。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Wiener、GMP或Doherty PA、闭环输出功率校准和全部适用ILC更新律。MIMO Channel还可在PA前后加入方向不对称、具有独立FIR和时延的通道耦合。Wi-Fi路径输出功率、SNR、EVM、ACLR和功率-EVM曲线；双音路径输出IM3、IM5、IM7及所有SISO ILC方法的同功率对比图。
 
 ## 理论文档
 
 - [Wi-Fi 帧生成物理原理与推导](doc/WaveGenWifi.md)：复基带、OFDM 正交性、QAM 归一化、MCS、循环前缀、VHT/HE/EHT 字段和 PAPR。
 - [双音信号生成物理原理与用法](doc/WaveGenTwoTone.md)：复基带双音、奇数阶互调频率、RMS/定点边界和ILC带宽。
 - [FEC编码译码原理与用法](doc/Fec.md)：55/90短块LDPC校验矩阵、系统编码、软输入normalized min-sum译码和调用示例。
-- [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、Rapp AM-AM、AM-PM、GMP、频谱再生、IQ 失衡和反馈噪声。
-- [PA到接收端Channel物理原理与用法](doc/Channel.md)：PA→移相→白噪声链路、毫伏/dBm换算、定点边界和ILC接线。
+- [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、GMP、Doherty载波/峰值双支路、频谱再生和IQ失衡。
+- [PA到接收端Channel物理原理与用法](doc/Channel.md)：PA前/后多通道耦合、前向仪表/板载反馈采样、反馈链路非理想和联合功率校准。
 - [信号同步、补偿与功率标定原理](doc/SigProc.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样、复增益补偿和 dBm/RMS 换算。
 - [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
 - [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：10 bit seed、短块LDPC、历史CRC兼容、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
@@ -36,10 +36,10 @@ python -m pip install -r requirements.txt
 main.py                 命令行主程序
 SmallestSISO.py         浮点与16位定点SISO EHT/GMP/ILC对比示例
 inc/lib/Analysis.py         模拟功率、SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
-inc/lib/Channel.py          PA到接收端的固定移相和物理幅度/功率白噪声链路
+inc/lib/Channel.py          PA前后多通道耦合、联合功率校准及forward/fb采样链路
 inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
 inc/lib/Fec.py              55/90短块LDPC矩阵构造、系统编码和软输入译码
-inc/lib/PaModel.py          SISO/MIMO Wiener 和 GMP 非线性 PA、每路功率控制
+inc/lib/PaModel.py          SISO/MIMO Wiener、GMP和Doherty非线性PA
 inc/lib/ParseWifi.py        接收帧描述解析、包起点检测与参考波形恢复
 inc/lib/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
 inc/lib/WaveGenTwoTone.py   WaveGenTwoTone 类、双音波形及IM3/IM5/IM7频率元数据
@@ -129,7 +129,12 @@ paModel = PaModel(
 )
 channel = Channel(
     paModel=paModel,
-    parameters={"noiseAmpMv": 10.0, "width": 16},
+    parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": 80.0e6,
+        "noiseAmpMv": 10.0,
+        "width": 16,
+    },
 )
 wifiWaveform = wifiGenerator.Generate()
 receivedSignal = channel.Process(
@@ -153,7 +158,7 @@ resultAnalysis = Analysis(
 python SmallestSISO.py
 ```
 
-浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序最后打印两种模式的最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本直接调用 `Channel.Process(waveform.samples, outputPowerDbm=20.0)`；Channel内部按有效Wi-Fi突发区间把PA输出闭环标定到20 dBm，再使用0度移相和10 mV复包络总RMS白噪声。baseline、每轮ILC反馈和最终接收分析都经过该链路，但接收噪声不进入PA功率校准。前后补零或长占空比静默不进入功率RMS。
+浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序最后打印两种模式的最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本直接调用 `Channel.Process(waveform.samples, outputPowerDbm=20.0)`；Channel内部按有效Wi-Fi突发区间把PA输出闭环标定到20 dBm，再使用 `sampleMode="forward"`、0度移相和10 mV复包络总RMS白噪声，表示由仪表直接采样主路输出。baseline、每轮ILC反馈和最终接收分析都经过该仪表路径，但接收噪声不进入PA功率校准。前后补零或长占空比静默不进入功率RMS。
 脚本还打印两种波形的峰值以及 `waveformMinimumI/MaximumI/MinimumQ/MaximumQ`。定点版本的 I/Q 字段是公开码值，因此16位分量会位于 `-32768…32767`，并不是小于1的归一化数；复数幅度 `waveformPeakAmplitude` 最多可接近 $\sqrt{2}\,32768$。
 
 ## 工程工作流程图
@@ -168,20 +173,27 @@ flowchart TD
     spatialMap --> rawReference["原始 samples × TX chains 波形与帧元数据"]
 
     overrideMap --> paModel["创建 PaModel 或 MimoPaModel；类内追加默认参数层"]
-    paModel --> paImplementation["每路 WienerPA 或 GMPPA + 独立功率设置"]
+    paModel --> paImplementation["每路 WienerPA / GMPPA / DohertyPA"]
     rawReference --> channel["Channel.Process：原始波形 + 目标输出dBm"]
     paModel --> channel
-    channel --> powerCalibration["内部PowerCalibration：隐藏驱动预设 → PA → 实测功率 → 更新预设"]
+    channel --> preCoupling["PA前 Hpre(z)：方向相关FIR与时延"]
+    preCoupling --> powerCalibration["PowerCalibration：逐链或联合Jacobian更新隐藏驱动"]
     paImplementation --> powerCalibration
     powerCalibration --> reference["Channel缓存的收敛PA输入参考矩阵 S"]
-    powerCalibration --> calibratedBaseline["容限内的实测PA基线输出"]
-    calibratedBaseline --> channelEffects["Channel固定移相 + 物理白噪声"]
-    channelEffects --> receivedBaseline["接收端baseline"]
+    powerCalibration --> calibratedBaseline["容限内的各PA自身基线输出"]
+    calibratedBaseline --> postCoupling["PA后 Hpost(z)：混合非线性输出"]
+    postCoupling --> channelEffects["Channel公共移相"]
+    channelEffects --> sampleMode{"sampleMode"}
+    sampleMode -->|forward| forwardCapture["前向仪表采样<br/>跳过fb专用非理想"]
+    sampleMode -->|fb| feedbackCapture["板载反馈链路<br/>频响/时频偏/IQ/非线性/ADC"]
+    forwardCapture --> receiverNoise["物理白噪声"]
+    feedbackCapture --> receiverNoise
+    receiverNoise --> receivedBaseline["所选采样端baseline"]
 
     start --> frequencyIlc["SISO 或逐 PA RunMimoFrequencyDomainIlc"]
     reference --> frequencyIlc
     paModel --> frequencyIlc
-    channel -. "需要含链路影响的反馈" .-> frequencyIlc
+    channel -. "仪表闭环使用forward；板载反馈使用fb" .-> frequencyIlc
 
     frequencyIlc --> nativeHistory["保存每轮输入、PA输出和原生MSE"]
     nativeHistory --> ilcAnalysis["Analysis.AnalyzeIlcHistory<br/>分析每轮真实功率 / SNR / EVM / ACLR"]
@@ -238,8 +250,9 @@ flowchart TD
 
 1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `WaveGenWifi`、`PaModel`、`Analysis` 和 `Draw`；需要接收链路影响时再构造 `Channel`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
 2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
-3. 普通用户只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`。Channel内部的 `PowerCalibration` 把原始SISO/MIMO波形按隐藏驱动预设送入PA，仅对干净PA输出的有效突发计算功率；误差超限时在dB域更新预设，有上下括区后改用二分，直到所有链收敛。随后Channel只对接受的PA输出执行一次移相和接收噪声。`GetLastPaInput`、`GetLastPaOutput` 和 `GetLastCalibrationMetrics` 只用于需要诊断的调用方。
-4. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮真实输入、plant反馈输出和原生MSE；不会在PA后把每轮输出缩放到目标dBm。plant可以是纯PA，也可以是包含PA、移相与噪声的 `Channel`。ILC返回后，`Analysis.AnalyzeIlcHistory` 或 `AnalyzeMimoIlcHistory` 才逐轮计算RF性能，并按严格EVM选择 `u*`。该输入可在闭环功率校准后复测，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN。
+3. 普通用户只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`。Channel先把隐藏驱动预设经过PA前耦合送入不同的PA，并对各PA自身输出计算有效突发功率。没有PA前耦合时使用逐链闭环；存在耦合时自动用有限差分功率Jacobian联合更新全部驱动。收敛后只执行一次PA后耦合、公共移相以及 `sampleMode` 选择的采样路径。`GetLastPaInput`、`GetLastPaOutput` 和 `GetLastCalibrationMetrics` 只用于诊断。
+4. `sampleMode="forward"` 表示VSA等前向仪表直接观测主路，全部 `fb...` 参数被忽略；`sampleMode="fb"` 表示板载反馈接收机，能够配置反馈增益/FIR、时延、CFO/SFO、I/Q不平衡、DC、三阶失真、限幅和ADC。仪表闭环ILC可直接把forward Channel作为plant；板载闭环ILC把fb Channel作为plant，但最终EVM/ACLR应由独立forward Channel评价。
+5. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮真实输入、plant反馈输出和原生MSE。现有 `RunMimoFrequencyDomainIlc` 是逐PA独立算法，只适用于关闭或忽略跨通道耦合；启用PA前/后耦合后的联合补偿需要完整矩阵频响或Jacobian的MIMO ILC，文档不会把逐链结果误写成联合补偿结果。
 5. `Analysis` 使用三条互相独立的路径。显式参考模式直接保存 `referenceSignal` 与 `WifiWaveform`；发送波形辅助模式对NumPy数组或 `WifiWaveform.samples` 做互相关，直接截取公共区间，绝不解析Descriptor、恢复seed或重新生成参考；只有盲分析模式才调用 `ParseWifi` 恢复包起点、格式、MCS、FFT/GI、空间结构和参考样值。三条路径之后共用 `SigProc`；具备Wi-Fi元数据时再用 `FrameProcess` 计算严格子载波EVM。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
 6. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
 
@@ -486,10 +499,12 @@ flowchart TD
     pa --> select{"modelName"}
     select -->|wiener| wiener["WienerPA"]
     select -->|gmp| gmp["GMPPA"]
+    select -->|doherty| doherty["DohertyPA"]
     pa --> paProcess["PaModel.Process"]
     pa --> paGain["PaModel.SmallSignalGain"]
     paProcess --> wienerProcess["WienerPA.Process"]
     paProcess --> gmpProcess["GMPPA.Process"]
+    paProcess --> dohertyProcess["Carrier + Peaking + 负载调制"]
     paGain --> wienerGain["WienerPA.SmallSignalGain"]
     paGain --> gmpGain["GMPPA.SmallSignalGain"]
 
@@ -500,6 +515,11 @@ flowchart TD
     defaults["DefaultGmpCoefficients"] --> gmp
     gmpProcess --> asComplex
     gmpProcess --> delay["DelaySignal"]
+
+    dohertyConfig["DohertyConfig.Validate"] --> doherty
+    doherty --> carrier["Carrier：Wiener或GMP"]
+    doherty --> peaking["Peaking：Wiener或GMP"]
+    dohertyProcess --> delay
 
     iq["IQImbalancePA"] --> pa
     iq --> wrappedProcess["IQImbalancePA.Process"]
@@ -519,10 +539,11 @@ flowchart TD
 
 **图示说明：**
 
-- 调用方先创建 `PaModel(modelName="wiener" 或 "gmp")`；统一类根据名称持有 `WienerPA` 或 `GMPPA` 实现，并可接收对应的配置对象。
+- 调用方创建 `PaModel(modelName="wiener"、"gmp" 或 "doherty")`；统一类根据名称持有对应实现和配置对象。
 - `PaModel.Process` 与 `PaModel.SmallSignalGain` 将调用委托给当前实现，因此主程序和 ILC 无须包含模型类型分支。
 - `WienerPA.Process` 依次执行线性记忆滤波、Rapp AM-AM 压缩和 AM-PM 相位旋转。
 - `GMPPA.Process` 使用 `DelaySignal` 构造主项、滞后包络项和超前包络项；未提供系数时由 `DefaultGmpCoefficients` 创建稳定的默认模型。
+- `DohertyPA.Process` 持续驱动Carrier支路，在包络越过门限时平滑开启Peaking支路，并加入支路时延、复合成和简化负载调制；两条支路可分别选择Wiener或GMP。
 - `IQImbalancePA` 在已有 PA 输出上增加共轭镜像，用于测试增广 ILC；`AddAwgn` 模拟反馈接收链噪声。
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
 - `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。它反复改变PA输入并测量真实输出，直到目标误差进入容限，不在PA输出端追加常数增益。
@@ -535,21 +556,29 @@ flowchart TD
     raw["原始公开波形"] --> process["Process(inputSignal, outputPowerDbm)"]
     target["共同或逐链目标dBm"] --> process
     process --> calibration["内部PowerCalibration"]
-    calibration --> pa["绑定的PaModel"]
+    calibration --> pre["PA前耦合 Hpre(z)"]
+    pre --> pa["不同参数的多路PaModel"]
     pa --> detector["有效突发PA输出功率"]
     detector -. "误差超限" .-> calibration
-    detector --> phase["ApplyPhaseRotation<br/>-90° / 0° / +90°"]
-    phase --> noise["AddNoise<br/>noiseAmpMv / noisePwrDbm / noiseSnrDb"]
-    noise --> encode["FixedPoint编码"]
+    detector --> post["PA后耦合 Hpost(z)"]
+    post --> phase["ApplyPhaseRotation<br/>-90° / 0° / +90°"]
+    phase --> mode{"sampleMode"}
+    mode -->|forward| forward["前向仪表采样<br/>忽略fb专用参数"]
+    mode -->|fb| feedback["反馈接收机非理想<br/>FIR/时频偏/IQ/非线性/ADC"]
+    forward --> noise["AddNoise<br/>noiseAmpMv / noisePwrDbm / noiseSnrDb"]
+    feedback --> noise
+    noise --> encode["FixedPoint公开边界编码"]
     encode --> receiver["公开接收波形"]
     paOutput["已有公开PA输出"] --> paDecode["ProcessPaOutput解码"]
-    paDecode --> phase
+    paDecode --> post
 ```
 
 **图示说明：**
 
-- 推荐调用 `Process(rawSignal, outputPowerDbm=20.0)`。用户只给原始波形和PA目标输出功率；Channel内部调整输入缩放并反复运行PA，收敛后再执行一次移相与AddNoise。
+- 推荐调用 `Process(rawSignal, outputPowerDbm=20.0)`。用户只给原始波形和PA目标输出功率；Channel先施加PA前耦合并反复运行PA。存在PA前串扰时自动用功率Jacobian联合调整各路输入，收敛后再执行一次PA后耦合与所选采样路径。
 - `Process(rawSignal)` 保留不校准功率的单次链路，供ILC plant等内部循环使用；`ProcessPaOutput` 用于已有PA输出，不会再次运行PA。
+- `sampleMode="forward"` 模拟前向VSA/仪表采样，并忽略全部 `fb...` 配置；`sampleMode="fb"` 模拟板载反馈接收机，并依次加入反馈频响、时频偏、I/Q与DC误差、接收机非线性、限幅和ADC量化。
+- `prePaCouplingPaths` 和 `postPaCouplingPaths` 使用逐方向路径配置，每条路径具有独立增益、相位、复FIR、整数和分数时延；0到1与1到0无需对称。
 - `noiseAmpMv` 定义复包络总RMS毫伏数；`noisePwrDbm` 定义端口噪声功率；`noiseSnrDb` 定义每路有效突发信号功率与复噪声功率之比。三者默认都是 `None`，只能选择一个非 `None` 控制量。
 - 相位只允许 `-90`、`0`、`90` 度，默认0度不旋转。圆对称复噪声的I/Q分量各承担总方差的一半。
 - 浮点和定点公开数据类型都为 `numpy.complex128`；定点模式输出I/Q整数码，物理噪声的电压换算只发生在模块内部。
@@ -607,7 +636,7 @@ flowchart TD
 - 频域 ILC 和其他波形更新律共享 `ILCConfig`、`CalculateIterationMetrics`、`LimitAmplitude` 与 `ILCResult`。每轮反馈先由 `SigProc` 完成整数/分数时延、CFO、SFO和公共复增益对齐，再构造学习误差；`CalculateIterationMetrics` 记录参考域Raw/LC误差、输入峰值、对齐输出和同步估计，不调用任何RF性能评估器。
 - 标量 P、复增益、FIR、方向 Gauss-Newton 和增广 IQ 路线通过 `RunWaveformUpdate` 复用测量与迭代骨架；参数域 ILC 使用 `MemoryPolynomialBasis` 直接更新可部署系数。
 - GMP、Volterra、LUT 和神经网络拟合都消费收敛标签 `u*`。各 `Fit...` 函数负责训练，相应 `...Predistorter.Process` 方法负责在独立验证帧上推理。
-- MIMO 路线用 `MimoPaChain` 将每个物理 PA 暴露给同一频域 ILC，再按链保存历史并分别拟合 GMP；当前模型假设 PA 之间没有隐藏耦合。
+- MIMO 路线用 `MimoPaChain` 将每个物理 PA 暴露给同一频域 ILC，再按链保存历史并分别拟合 GMP。`Channel` 已能模拟PA前后耦合，但当前逐链 `RunMimoFrequencyDomainIlc` 不经过Channel，因此只适用于无耦合plant；耦合场景需要矩阵/联合更新器，不能把独立链结果误称为耦合MIMO DPD。
 - 测试波形、特殊损伤、方法组合、结果文件和功率扫描全部移到 `tests/BenchMark.py`，因此生产算法不依赖任何 benchmark 流程。
 
 ### `tests/BenchMark.py`
@@ -774,7 +803,7 @@ flowchart LR
     init["inc/__init__.py"] --> waveApi["WaveGenWifi"]
     init --> metadataApi["WifiWaveform / MCSInfo"]
     init --> frameApi["FrameProcess / BuildCsdPhaseMatrix"]
-    init --> paApi["PaModel / MimoPaModel / WienerPA / GMPPA"]
+    init --> paApi["PaModel / MimoPaModel / WienerPA / GMPPA / DohertyPA"]
     init --> signalApi["SigProc / SignalProcessingResult / PowerCalibration"]
     init --> analysisApi["Analysis / 普通指标字典"]
     init --> drawApi["Draw / PowerEvmCurve 绘图入口"]
@@ -844,7 +873,7 @@ flowchart LR
 | `--format` | `VHT/11ac`、`HE/11ax`、`EHT/11be`，也接受 `802.11ac/ax/be` | `EHT` | 输入不区分大小写并规范化为 VHT、HE 或 EHT。 |
 | `--bandwidth` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
 | `--mcs` | VHT：`0–9`；HE：`0–11`；EHT：`0–13` | `9` | 调制编码方案索引；默认值对三种格式都有效。 |
-| `--pa` | `wiener`、`gmp` | `wiener` | 非线性 PA 模型。 |
+| `--pa` | `wiener`、`gmp`、`doherty` | `wiener` | 非线性 PA 模型；Doherty使用载波与峰值双支路默认配置。 |
 | `--tx-antennas` | `1–8` | `1` | VHT/HE/EHT 物理发射链及独立 PA 数量。 |
 | `--spatial-streams` | 正整数且不大于发射链数 | `1` | 独立空间流数，VHT/HE/EHT 最大 8。 |
 | `--spatial-mapping` | `direct`、`dft` | `direct` | 空间流到发射链的正交映射。自定义矩阵通过 Python API 设置。 |
@@ -993,16 +1022,17 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 ### `PaModel` 参数
 
 当前构造函数签名为
-`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, parameters=None, width=None, **parameterOverrides)`。
-三个常用模型参数既可以直接传入，也可以放入 `parameters` 映射；直接参数优先级更高。
+`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, parameters=None, width=None, **parameterOverrides)`。
+四个常用模型参数既可以直接传入，也可以放入 `parameters` 映射；直接参数优先级更高。
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `PaModel` 构造函数内部的不可变默认参数补齐。 |
 | `width` | 非负整数 | `16` | PA输入、输出I/Q接口位宽；`0`为浮点，正数返回I/Q整数码，容器仍为 `complex128`。 |
-| `modelName` | `"wiener"`、`"gmp"`，不区分大小写 | `"wiener"` | 选择内部 PA 实现。 |
+| `modelName` | `"wiener"`、`"gmp"`、`"doherty"`，不区分大小写 | `"wiener"` | 选择内部PA实现。 |
 | `wienerConfig` | `WienerConfig` 或 `None` | `None` | Wiener 模式的配置；`None` 使用默认配置。 |
 | `gmpConfig` | `GMPConfig` 或 `None` | `None` | GMP 模式的配置；`None` 使用默认配置。 |
+| `dohertyConfig` | `DohertyConfig` 或 `None` | `None` | Doherty载波/峰值双支路配置；`None`使用默认架构。 |
 
 `WienerConfig` 支持：
 
@@ -1024,6 +1054,23 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 | `mainCoefficients` | `None` | 主项系数字典，键为 `(order, memoryIndex)`；`None` 使用内置稳定系数。 |
 | `laggingCoefficients` | `None` | 滞后交叉项字典，键为 `(order, memoryIndex, crossIndex)`。 |
 | `leadingCoefficients` | `None` | 超前交叉项字典，键为 `(order, memoryIndex, crossIndex)`。 |
+
+`DohertyConfig` 支持：
+
+| 参数 | 默认值 | 约束或含义 |
+| --- | --- | --- |
+| `carrierModelName` | `"wiener"` | Carrier支路选择Wiener或GMP。 |
+| `peakingModelName` | `"wiener"` | Peaking支路选择Wiener或GMP。 |
+| `carrierWienerConfig`、`carrierGmpConfig` | `None` | Carrier支路对应模型配置。 |
+| `peakingWienerConfig`、`peakingGmpConfig` | `None` | Peaking支路对应模型配置。 |
+| `carrierInputGain` | `1.0` | Carrier正输入电压增益。 |
+| `peakingInputGain` | `1.0` | Peaking正输入电压增益。 |
+| `peakingTurnOnAmplitude` | `0.45` | Peaking开始导通的归一化包络。 |
+| `peakingTransitionWidth` | `0.15` | 从关闭到完全导通的平滑包络宽度。 |
+| `carrierCombineCoefficient` | `1+0j` | Carrier复功率合成系数，不能为零。 |
+| `peakingCombineCoefficient` | `0.5+0j` | Peaking复功率合成系数。 |
+| `peakingDelaySamples` | `0` | Peaking支路非负整数时延。 |
+| `loadModulationStrength` | `0.10` | Carrier包络相关简化负载调制强度。 |
 
 `PaModel.Process(inputSignal)` 返回 PA 复基带输出；`SmallSignalGain()` 返回当前模型的 DC 小信号复增益。
 
@@ -1049,6 +1096,7 @@ PA 辅助接口还包括：
 | --- | --- | --- |
 | `WienerPA(config)` | `config` | 默认使用 `WienerConfig()`；通常建议通过 `PaModel` 构造。 |
 | `GMPPA(config)` | `config` | 默认使用 `GMPConfig()`；通常建议通过 `PaModel` 构造。 |
+| `DohertyPA(config)` | `config` | 默认使用 `DohertyConfig()`；内部组合Carrier与Peaking行为模型。 |
 | `IQImbalancePA(paModel, directCoefficient, imageCoefficient)` | `paModel`、直通系数、镜像系数 | `directCoefficient=1+0j`，`imageCoefficient=0.045·exp(j·0.35)`。 |
 | `AddAwgn(inputSignal, snrDb, randomGenerator)` | 输入、反馈 SNR、NumPy 随机数生成器 | `snrDb=None` 时原样复制输入，否则加入复高斯白噪声。 |
 
@@ -1062,22 +1110,43 @@ Channel(paModel=None, parameters=None, width=None, **parameterOverrides)
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
+| `sampleMode` | `"forward"` | `"forward"`选择前向仪表采样；`"fb"`选择板载反馈接收机。 |
+| `sampleRateHz` | `1.0` | 采样率，反馈CFO使用该值换算逐样点相位。 |
 | `phaseDegrees` | `0` | 固定相位旋转，仅允许 `-90`、`0` 或 `90` 度。 |
 | `noiseAmpMv` | `None` | 复包络总RMS噪声幅度，单位mV。 |
 | `noisePwrDbm` | `None` | 端口总噪声功率，单位dBm。 |
 | `noiseSnrDb` | `None` | 每路有效突发信号功率与复噪声功率之比，单位dB；MIMO逐列独立计算噪声RMS。 |
+| `fbGainDb` | `0.0` | fb模式的反馈耦合与接收机电压增益，单位dB。 |
+| `fbPhaseDegrees` | `0.0` | fb模式附加相位，允许任意有限角度。 |
+| `fbFirTaps` | `None` | fb模式因果复FIR；`None`表示单位抽头。 |
+| `fbIntegerDelaySamples` | `0` | fb模式非负整数时延。 |
+| `fbFractionalDelaySamples` | `0.0` | fb模式分数时延，范围为 `[-0.5, 0.5)`。 |
+| `fbCarrierFrequencyOffsetHz` | `0.0` | fb模式载波频偏，单位Hz。 |
+| `fbSamplingFrequencyOffsetPpm` | `0.0` | fb模式采样频偏，单位ppm。 |
+| `fbIqGainImbalanceDb` | `0.0` | fb模式I/Q增益不平衡，单位dB。 |
+| `fbIqPhaseImbalanceDegrees` | `0.0` | fb模式I/Q正交相位误差。 |
+| `fbDcOffset` | `0+0j` | fb模式复直流偏置。 |
+| `fbThirdOrderCoefficient` | `0+0j` | fb模式接收机三阶复非线性系数。 |
+| `fbClipAmplitude` | `None` | fb模式复包络径向限幅；正数启用。 |
+| `fbAdcWidth` | `None` | fb模式内部ADC位宽，支持2至32；与公开接口 `width` 相互独立。 |
+| `fbAdcFullScale` | `1.0` | fb模式内部ADC的I/Q分量满量程。 |
+| `prePaCouplingPaths` | `None` | PA前串扰路径序列；每条路径配置源/目标链、增益、相位、FIR和时延。 |
+| `postPaCouplingPaths` | `None` | PA后串扰路径序列；格式与PA前路径相同。 |
 | `loadResistanceOhm` | `50.0` | 噪声功率与RMS电压换算使用的阻抗。 |
 | `maximumOutputPowerDbm` | `25.0` | 内部归一化PA输出RMS等于1所代表的功率。 |
 | `calibrationToleranceDb` | `0.25` | Channel内部PA输出功率闭环允许的最大误差，单位dB。 |
 | `maximumCalibrationIterations` | `60` | 内部功率闭环最多运行PA的次数。 |
 | `calibrationLearningRate` | `0.8` | 尚未括住目标时的dB域驱动修正比例。 |
 | `maximumDriveAdjustmentDb` | `6.0` | 单轮隐藏PA输入预设的最大调整量。 |
+| `jointPowerCalibration` | `None` | `None`在存在PA前耦合时自动启用联合Jacobian校准；布尔值可强制选择。 |
+| `calibrationProbeStepDb` | `0.05` | 联合校准估计功率Jacobian的逐路dB扰动。 |
+| `calibrationRegularization` | `1e-6` | 联合功率更新的正则化系数。 |
 | `activePowerThresholdDb` | `-60.0` | 有效突发相对峰值功率门限。 |
 | `activeGapToleranceSamples` | `16` | 有效区内部允许填充的短低幅间隔。 |
 | `randomSeed` | `1701` | 固定非负整数使整次噪声序列可复现；`None` 使用系统熵。 |
 | `width` | `16` | 外部I/Q位宽；`0`为浮点，正值返回整数码。 |
 
-`Process(inputSignal, outputPowerDbm=None)` 执行完整链路：提供目标时先完成内部PA输入功率闭环；目标为 `None` 时只运行一次PA。`outputPowerDbm` 可以是SISO/全部链共同标量，也可以是按列排列的MIMO序列。`GetLastPaInput()`、`GetLastPaOutput()` 和 `GetLastCalibrationMetrics()` 提供可选诊断；`ProcessPaOutput(paOutputSignal)` 只处理已有PA输出；`ResetRandomGenerator()` 从配置种子重新开始噪声序列。10 mV与50 Ω下约 `-26.99 dBm` 等效。`noiseAmpMv`、`noisePwrDbm`、`noiseSnrDb` 三者严格互斥；SNR模式排除补零和长静默后按每路有效信号RMS配置噪声。完整物理定义见 [Channel.md](doc/Channel.md)。
+`Process(inputSignal, outputPowerDbm=None)` 执行“PA前耦合→不同PA→PA后耦合→采样”完整链路。提供目标时先完成PA自身输出功率闭环；存在PA前耦合时默认联合调节全部输入。`outputPowerDbm` 可以是SISO/全部链共同标量，也可以是按列排列的MIMO序列。`ProcessPaOutput(paOutputSignal)` 接收尚未经过PA后耦合的各PA输出。反馈专用参数只在 `sampleMode="fb"` 时生效，forward模式可作为独立仪表黄金评价路径。完整路径字段、物理公式和示例见 [Channel.md](doc/Channel.md)。
 
 ### `SigProc` 参数与方法
 
@@ -1152,7 +1221,7 @@ Channel(paModel=None, parameters=None, width=None, **parameterOverrides)
 
 发送参考可以包含帧外前后补零，也可以长于实际PA输入或接收捕获。Parser不会把发送长度大于接收长度视为错误，而是在公共有效区间内估计有符号时延。若裁剪删除的只是帧外补零，性能指标保持不变；若裁剪切入OFDM帧内部，缺失样点无法恢复并会反映到EVM中。
 
-当接收数组是 `PaModel.Process(...)` 的输出时，Parser会分别用每个描述OFDM符号的已知导频估计复增益，撤销跨符号交织，再对90 bit短块LDPC码字执行软输入归一化min-sum译码。因此典型20 dBm输出下的Wiener和GMP输出可以直接使用 `Analysis(paOutput).Analyze()`。Parser仍可读取旧版magic加CRC描述。若PA已进入严重饱和、描述字段相关度低于门限，任何无参考解析都不能可靠恢复随机种子；此时应使用 `Analysis(paOutput, transmittedSignal=transmitSamples)`，其中 `transmitSamples` 可以是原始NumPy发送数组或 `WifiWaveform`。
+当接收数组是 `PaModel.Process(...)` 的输出时，Parser会分别用每个描述OFDM符号的已知导频估计复增益，撤销跨符号交织，再对90 bit短块LDPC码字执行软输入归一化min-sum译码。因此典型20 dBm输出下的Wiener、GMP和Doherty输出可以直接使用 `Analysis(paOutput).Analyze()`。Parser仍可读取旧版magic加CRC描述。若PA已进入严重饱和、描述字段相关度低于门限，任何无参考解析都不能可靠恢复随机种子；此时应使用 `Analysis(paOutput, transmittedSignal=transmitSamples)`，其中 `transmitSamples` 可以是原始NumPy发送数组或 `WifiWaveform`。
 
 后一种发送辅助调用不会把 `transmitSamples` 交给Parser。Analysis直接对发送与接收样值做互相关并将公共区间作为Reference，因此Descriptor、seed、MCS、GI和重生成步骤全部被绕过。
 
@@ -1394,7 +1463,7 @@ x[n]-\frac{\bar y_k[n]}{\hat g_k}.
 | `maximumOutputPowerDbm` | `25.0` | 每路PA额定极限输出功率。 |
 | `loadResistanceOhm` | `50.0` | dBm 与复包络 RMS 电压换算所用端口电阻。 |
 | `numIterations` | `10` | 每种 ILC 的迭代预算。 |
-| `paModelName` | `"wiener"` | `"wiener"` 或 `"gmp"`。 |
+| `paModelName` | `"wiener"` | `"wiener"`、`"gmp"` 或 `"doherty"`。 |
 | `seed` | `101` | 训练帧10 bit随机种子，范围0至926；验证帧自动使用 `seed + 97`，因此仍不超过1023。 |
 | `powerStartDbm` | `10.0` | 全方法功率-EVM输出功率扫描起点。 |
 | `powerStopDbm` | `25.0` | 全方法功率-EVM输出功率扫描终点。 |
@@ -1548,7 +1617,7 @@ python main.py --format EHT --bandwidth 20 --tx-antennas 4 --spatial-streams 2 -
 ```python
 from inc.lib.Analysis import Analysis
 from inc.lib.Channel import Channel
-from inc.lib.PaModel import MimoPaModel
+from inc.lib.PaModel import DohertyConfig, MimoPaModel
 from inc.lib.WaveGenWifi import WaveGenWifi
 
 wifiGenerator = WaveGenWifi(
@@ -1565,7 +1634,12 @@ outputPowerDbmPerChain = (22.0, 21.0, 20.0, 19.0)
 mimoPaModel = MimoPaModel(
     numTransmitChains=4,
     paParametersPerChain=(
-        {"modelName": "wiener"},
+        {
+            "modelName": "doherty",
+            "dohertyConfig": DohertyConfig(
+                peakingTurnOnAmplitude=0.45,
+            ),
+        },
         {"modelName": "wiener"},
         {"modelName": "gmp"},
         {"modelName": "gmp"},
@@ -1576,6 +1650,32 @@ mimoPaModel = MimoPaModel(
 channel = Channel(
     paModel=mimoPaModel,
     parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": waveform.sampleRateHz,
+        "prePaCouplingPaths": (
+            {
+                "sourceChain": 0,
+                "destinationChain": 1,
+                "gainDb": -28.0,
+                "phaseDegrees": 20.0,
+                "integerDelaySamples": 2,
+            },
+            {
+                "sourceChain": 1,
+                "destinationChain": 0,
+                "gainDb": -31.0,
+                "phaseDegrees": -15.0,
+                "integerDelaySamples": 4,
+            },
+        ),
+        "postPaCouplingPaths": (
+            {
+                "sourceChain": 0,
+                "destinationChain": 1,
+                "gainDb": -23.0,
+                "integerDelaySamples": 1,
+            },
+        ),
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
     },

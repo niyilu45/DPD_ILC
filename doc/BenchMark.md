@@ -641,7 +641,7 @@ Save convergence histories and power-EVM data
 | `maximumOutputPowerDbm` | 25 | 25 | 每路PA额定极限输出功率和0 dB回退参考点 |
 | `loadResistanceOhm` | 50 | 50 | dBm与复包络RMS电压换算 |
 | `numIterations` | 10 | 6 | 每种ILC记录轮数 |
-| `paModelName` | wiener | wiener | 被测PA模型 |
+| `paModelName` | wiener | wiener | 被测PA模型；可选Wiener、GMP或Doherty |
 | `seed` | 101 | 101 | 训练帧及方法种子基准；允许0至926，验证帧使用 `seed + 97` |
 | `powerStartDbm` | 10 | 10 | 每路输出功率扫描起点，单位dBm |
 | `powerStopDbm` | 25 | 25 | 每路输出功率扫描终点，单位dBm |
@@ -1681,7 +1681,7 @@ G类不构造Wi-Fi帧，也不使用EVM、MCS、GI或Descriptor。它回答：
 | `outputPowerDbm` | `20.0` | 每种方法最终实际PA输出功率 |
 | `maximumOutputPowerDbm` | `25.0` | 归一化PA满量程功率 |
 | `numIterations` | `10` | 所有方法相同的迭代预算 |
-| `paModelName` | `"wiener"` | 默认PA；也支持GMP |
+| `paModelName` | `"wiener"` | 默认PA；也支持GMP与Doherty载波/峰值双支路模型 |
 | `seed` | `211` | ILC反馈随机过程种子基准 |
 
 默认频率对应：
@@ -1698,7 +1698,7 @@ flowchart TD
     config["TwoToneBenchmarkConfig.Validate"] --> generator["WaveGenTwoTone.Generate"]
     generator --> raw["原始双音"]
     raw --> calibration["PowerCalibration闭环"]
-    calibration --> pa["Wiener或GMP PA"]
+    calibration --> pa["Wiener、GMP或Doherty PA"]
     pa --> baseline["20 dBm baseline"]
     baseline --> analysis["TwoToneAnalysis：IM3/IM5/IM7"]
     calibration --> methods["七种适用SISO ILC"]

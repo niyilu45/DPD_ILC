@@ -35,6 +35,13 @@ y[m]
 
 这里的目标不是把 $v[m]$ 也消除，而是只消除不应计入 PA/DPD 性能的确定性同步误差。
 
+当波形来自 `Channel(sampleMode="fb")` 时，$v[m]$ 还可能包含板载反馈接收机的频率选择性响应、I/Q镜像、DC、三阶非线性、限幅和ADC量化。SigProc可以估计整数/分数时延、CFO、SFO和单一公共复增益，但不会假装能够用一个标量消除所有反馈链非理想：
+
+- 反馈FIR需要额外的频率响应校准或均衡；
+- I/Q不平衡包含共轭镜像项，需要广义线性校准；
+- 接收机非线性、限幅和ADC量化通常不可由同步恢复；
+- 因此板载fb波形适合ILC反馈或反馈链诊断，最终PA性能仍应由独立forward仪表波形评价。
+
 ---
 
 ## 2. 处理工作流
@@ -469,6 +476,7 @@ processingResult = resultAnalysis.GetLastSignalProcessingResult()
 3. CFO 相位解缠要求相邻估计窗口之间的相位变化不过度模糊；极大 CFO 应先使用前导重复结构做粗频偏估计。
 4. 单一线性采样频偏模型不描述采样时钟抖动或随时间变化的非线性漂移。
 5. 公共复增益只消除统一幅相误差，不等于频率选择性信道均衡；真实 OTA MIMO 测量仍需要信道估计和均衡。
+6. 对 `sampleMode="fb"` 的Channel波形，同步可以补偿配置的时延、CFO、SFO和一部分公共增益/相位，但不能自动校正反馈FIR、I/Q镜像、三阶失真、限幅或ADC量化；这些残差应与forward仪表结果分开解释。
 6. 插值会改变记录边缘；测量采集应在帧前后保留足够保护样点，避免时延补偿后丢失有效数据。
 
 ---
@@ -748,6 +756,86 @@ e_m^{(k)}
 其中默认 $\epsilon_P=0.25$ dB，最多试探60次；用户可按仪表重复性和目标精度收紧容限。收敛后的 $d_m$ 保存在类内部并作为下一次同目标校准的初值，但 `GetLastCalibrationMetrics()` 只返回目标、实测功率、残差和迭代次数，不把隐藏预设暴露给用户。若PA饱和、定点满量程或仪表限幅导致目标不可达，函数在达到迭代上限后明确报错，而不是对PA输出做后级缩放。
 
 该闭环假设目标附近的有效突发平均输出功率随输入驱动单调不减，这对正常AM-AM曲线成立。若真实仪表反馈噪声大于功率容限，应先增加仪表平均次数或放宽 `calibrationToleranceDb`；若PA存在热记忆或迟滞，应保证每轮测量使用相同等待时间和采集条件，否则二分上下界可能不再代表同一静态映射。
+
+#### 13.2.1 PA前耦合下的联合功率校准
+
+逐链二分隐含“第 $j$ 路驱动只改变第 $j$ 路PA功率”的假设。PA前存在串扰时，第 $j$ 路数字驱动会同时进入多路PA，因此全部PA输出功率应写成驱动向量的联合函数：
+
+```math
+\mathbf p
+=
+\mathbf F(\mathbf d),
+```
+
+其中
+
+```math
+\mathbf d
+=
+\begin{bmatrix}
+d_0 & d_1 & \cdots & d_{M-1}
+\end{bmatrix}^{T}
+```
+
+是各路隐藏驱动预设，$\mathbf p$ 是在PA后耦合和接收噪声之前测得的逐PA有效突发功率。若仍独立修正，每一路控制器会把其他路引起的功率变化误认为本路误差，可能出现来回振荡或收敛到错误工作点。
+
+联合模式用小的dB探测步长 $\delta$ 对每一路驱动做有限差分，建立局部功率雅可比矩阵：
+
+```math
+J_{i,j}
+\approx
+\frac{
+F_i(\mathbf d+\delta\mathbf e_j)-F_i(\mathbf d)
+}{
+\delta
+}.
+```
+
+$J_{i,j}$ 表示第 $j$ 路驱动增加1 dB时，第 $i$ 个PA输出功率大约变化多少dB。对目标误差
+
+```math
+\mathbf e
+=
+\mathbf p_{\mathrm{target}}-\mathbf p
+```
+
+采用带正则的最小二乘修正：
+
+```math
+\Delta\mathbf d
+=
+\left(
+\mathbf J^{H}\mathbf J+\lambda\mathbf I
+\right)^{-1}
+\mathbf J^{H}\mathbf e.
+```
+
+代码中的功率雅可比为实矩阵，式中的共轭转置等价于普通转置。$\lambda$ 防止强耦合导致矩阵接近奇异；随后仍按 `maximumDriveAdjustmentDb` 对每个分量限幅，并乘 `calibrationLearningRate`，避免一次线性化跨越过大的非线性区间。
+
+```mermaid
+flowchart LR
+    drive["当前多路驱动预设 d"] --> base["EvaluateDrivePreset<br/>测量基准功率 p"]
+    base --> probes["逐路增加小探测量"]
+    probes --> plant["PA前耦合 + 各路PA"]
+    plant --> jacobian["有限差分构造功率雅可比 J"]
+    jacobian --> solve["正则最小二乘求联合修正"]
+    solve --> limit["学习率与逐路步长限幅"]
+    limit --> drive
+```
+
+**图 5 说明：**每个探测点都重新生成PA输入并真实调用绑定plant。Channel提供的校准plant只包含PA前耦合和各路PA，因此目标功率定义为每个PA自身的输出功率；PA后耦合、forward/fb接收链与噪声不进入闭环。这样不会让接收端串扰或随机噪声改变PA工作点。
+
+相关参数为：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `enableJointCalibration` | `False` | 启用有限差分雅可比联合更新；Channel检测到PA前耦合时默认自动启用 |
+| `calibrationProbeStepDb` | `0.05` | 构造雅可比时单路驱动的dB探测步长 |
+| `calibrationRegularization` | `1e-6` | 联合最小二乘的对角正则系数 |
+| `calibrationLearningRate` | `0.8` | 联合修正与独立比例修正共用的更新学习率 |
+| `maximumDriveAdjustmentDb` | `6.0` | 每轮每路允许的最大dB修正量 |
+
+`EvaluateDrivePreset(normalizedInput, driveDb, inputWasVector, interfaceFormat)` 是内部统一观测入口。它按给定驱动向量产生公开位宽PA输入，调用一次绑定plant，返回本次PA输入、PA输出和逐路实测dBm。普通用户仍只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`，不需要直接构造雅可比或管理驱动向量。
 
 ### 13.3 定点接口
 

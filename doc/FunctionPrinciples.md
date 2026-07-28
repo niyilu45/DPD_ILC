@@ -154,19 +154,22 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `WienerConfig.Validate`, `GMPConfig.Validate` | E | 检查饱和幅度、阶次、记忆和系数合法性 | PaModel §3.6、§4 |
-| `WienerPA.__init__`, `GMPPA.__init__` | E | 保存已验证模型参数，不另引入物理过程 | PaModel §3、§4 |
+| `WienerConfig.Validate`, `GMPConfig.Validate`, `DohertyConfig.Validate` | E | 检查饱和幅度、阶次、记忆、分支模型、峰值支路开启门限、合路系数和系数合法性 | PaModel §3.6、§4、§4.8 |
+| `WienerPA.__init__`, `GMPPA.__init__`, `DohertyPA.__init__`, `DohertyPA.BuildBranchModel` | E | 保存已验证模型参数；Doherty按配置为载波支路和峰值支路分别构造Wiener或GMP内核 | PaModel §3、§4、§4.8 |
 | `WienerPA.Process` | P/N | FIR 线性记忆→Rapp AM-AM→幅度相关 AM-PM | PaModel §3.1–§3.4 |
 | `WienerPA.SmallSignalGain` | P/N | 取零幅度极限，返回线性 FIR 直流复增益 | PaModel §3.5 |
 | `GMPPA.Process` | P/N | 计算主、滞后包络和超前包络 GMP 支路 | PaModel §4.2–§4.6 |
 | `GMPPA.SmallSignalGain` | P/N | 只保留一阶主支路得到小信号增益 | PaModel §4.7 |
-| `PaModel.__init__`, `PaModel.ResolveConfiguration`, `PaModel.SynchronizeModel` | E | ChainMap 覆盖解析、未知键警告后忽略，并构造选定 Wiener/GMP 内核 | PaModel §12 |
+| `DohertyPA.PeakingActivation` | P/N | 对输入包络执行带有限过渡宽度的平滑峰值支路开启函数，避免硬开关产生不连续谱再生 | PaModel §4.8 |
+| `DohertyPA.Process` | P/N | 组合连续工作的载波支路、包络门控的峰值支路、支路时延/复合路系数及简化负载调制 | PaModel §4.8 |
+| `DohertyPA.SmallSignalGain` | P/N | 在零包络极限关闭峰值支路，只返回载波支路与载波合路系数构成的复增益 | PaModel §4.8 |
+| `PaModel.__init__`, `PaModel.ResolveConfiguration`, `PaModel.SynchronizeModel` | E | ChainMap 覆盖解析、未知键警告后忽略，并构造选定 Wiener、GMP或Doherty 内核 | PaModel §12 |
 | `PaModel.ModelName`, `PaModel.Width`, `PaModel.GetParameters`, `PaModel.UpdateParameters` | E | 查询或更新配置；更新后重建模型以保持状态一致 | PaModel §12、FixedPoint §6 |
 | `PaModel.Process`, `PaModel.SmallSignalGain` | E/P | 统一分派到选定物理 PA 的同名计算 | PaModel §9、§12 |
 | `MimoPaModel.__init__`, `MimoPaModel.ResolveNumericSequence`, `MimoPaModel.ResolvePaParametersPerChain`, `MimoPaModel.ValidateParameters`, `MimoPaModel.SynchronizeModels` | E | 警告并忽略未知键，把已识别标量/序列配置扩展到每条物理链并构造独立PA | PaModel §10 |
 | `MimoPaModel.NumTransmitChains`, `MimoPaModel.Width`, `MimoPaModel.GetParameters`, `MimoPaModel.UpdateParameters` | E | 返回或更新多路配置，不改变功率定义 | PaModel §10、§12、FixedPoint §6 |
 | `MimoPaModel.SetOutputPowerDb`, `MimoPaModel.SetTargetOutputRms`, `MimoPaModel.SetTargetOutputPowerDbm` | P/E | 设置相对幅度比例、旧RMS目标或基于端口阻抗的绝对dBm目标；dB幅度比例为 $10^{P_{dB}/20}$ | PaModel §10 |
-| `MimoPaModel.Process`, `MimoPaModel.ProcessChain` | P/N | 每列通过独立 PA，再执行相对增益或经端口阻抗换算的绝对 dBm 校准 | PaModel §10、§10.2 |
+| `MimoPaModel.Process`, `MimoPaModel.ProcessFloating`, `MimoPaModel.ProcessChain` | P/N | 每列通过独立 PA，再执行相对增益或经端口阻抗换算的绝对 dBm 校准；浮点入口避免Channel内部重复公开接口量化 | PaModel §10、§10.2 |
 | `MimoPaModel.GetOutputRmsPerChain`, `MimoPaModel.GetOutputPowerDbmPerChain` | E/P | 返回最近一次实际链输出RMS，并可通过端口阻抗换算为dBm | PaModel §10 |
 | `IQImbalancePA.__init__`, `IQImbalancePA.Process`, `IQImbalancePA.SmallSignalGain` | P/N | 广义线性模型 $y=\alpha v+\beta v^*$ 及其直接支路小信号增益 | PaModel §7 |
 | `PaModel.AsComplexVector` | N | 把输入约束为有限一维复包络；不改变样值 | PaModel §2 |
@@ -180,9 +183,13 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `Channel.__init__`, `Channel.Width`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层，未知配置警告后忽略，并校验相位、噪声互斥、阻抗、满量程功率、闭环收敛参数、有效区检测参数、随机种子和位宽 | Channel §5 |
+| `Channel.__init__`, `Channel.Width`, `Channel.SampleMode`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层，未知配置警告后忽略；把采样模式规范为forward或fb，并校验公共相位/噪声、PA前后耦合、反馈链参数、联合功率闭环、随机种子和公开位宽 | Channel §1、§5 |
 | `Channel.SetPaModel` | E | 绑定必须提供公开Process入口的PA对象，并在PA更换时清除私有功率校准状态 | Channel §1、§6 |
-| `Channel.ResolveCalibrationTargets`, `Channel.ConfigurePowerCalibration` | P/E | 把SISO共同目标或MIMO逐链dBm序列规范化，并用Channel当前端口、位宽、有效区和收敛参数配置内部 `PowerCalibration` | Channel §1、§5–§6.3 |
+| `Channel.ResolveCouplingPaths`, `Channel.HasPrePaCoupling` | P/E | 把每条源链到目的链的复增益、整数/分数时延和FIR规范为有限参数，并判断PA输入功率是否存在链间耦合依赖 | Channel §1.3、§5 |
+| `Channel.ApplyCouplingPath`, `Channel.ApplyMimoCoupling` | P/N | 对单条串扰路径依次执行FIR、分数时延、整数时延和复系数，再把所有间接路径与隐含单位直通路径线性叠加 | Channel §1.3 |
+| `Channel.ApplyPrePaCoupling`, `Channel.ApplyPostPaCoupling` | P/N | 分别在非线性PA之前和干净PA输出之后应用不同耦合矩阵；前者改变PA实际激励，后者只改变观测到的多路叠加 | Channel §1.3 |
+| `Channel.ProcessBoundPaFloating`, `Channel.ProcessPaBankForCalibration` | P/N/E | 在内部浮点域运行绑定PA；校准回调固定采用“PA前耦合→各路PA”，并返回尚未经过PA后耦合和接收噪声的逐PA输出 | Channel §1.3–§1.4、§6 |
+| `Channel.ResolveCalibrationTargets`, `Channel.ConfigurePowerCalibration` | P/E | 把SISO共同目标或MIMO逐链dBm序列规范化，并配置内部 `PowerCalibration`；存在PA前耦合时默认启用有限差分雅可比联合功率闭环 | Channel §1.4、§5–§6.3 |
 | `Channel.CalibratePaInput`, `Channel.GetLastPaInput`, `Channel.GetLastPaOutput`, `Channel.GetLastCalibrationMetrics` | P/N/E | 对任意初始幅度原始波形执行隐藏PA输入闭环，排除补零/长静默，缓存收敛PA输入与干净输出，并提供不暴露驱动预设的诊断字典 | Channel §1、§6.3、§6.8 |
 | `Channel.SynchronizeRandomGenerator`, `Channel.ResetRandomGenerator` | N/E | 在外部活动参数改变种子时同步随机状态，并支持从固定种子重放同一白噪声序列 | Channel §4–§5 |
 | `Channel.ValidateSignal` | N/E | 保留SISO向量或MIMO矩阵形状，并拒绝空、非有限或不支持维度的波形 | Channel §1、§6 |
@@ -190,10 +197,17 @@ flowchart LR
 | `Channel.ResolveSnrNoiseRmsPerChain` | P/N | 按逐链有效突发信号RMS与 `10^{-SNR/20}` 计算复噪声总RMS，排除补零和长占空比静默 | Channel §3.4 |
 | `Channel.ApplyPhaseRotation` | P/N | 计算PA输出乘以单位复指数，当前相位仅为-90、0或+90度 | Channel §2 |
 | `Channel.AddNoise` | P/N | 在毫伏、绝对dBm或有效突发SNR三种互斥控制中选择一种，生成I/Q各占总方差一半的圆对称复白高斯噪声并叠加到旋转后波形 | Channel §3.1–§3.5 |
-| `Channel.ApplyChannelEffects` | P/E | 严格按移相后加噪的次序处理已经归一化的PA输出 | Channel §1 |
-| `Channel.ProcessPaOutput` | E/N | 对已有公开PA输出执行一次解码、链路影响和一次编码，避免功率闭环包含接收噪声 | Channel §1、§6.2 |
-| `Channel.ProcessFloating`, `Channel.Process` | P/N/E | `Process(inputSignal, outputPowerDbm)` 在给定目标时先闭环调整PA输入，收敛后只执行一次移相和噪声；目标为None时保留单次plant路径，并在定点模式返回整数I/Q码 | Channel §1、§3.4、§6.2–§6.3 |
-| `Channel.SmallSignalGain` | P/N | 把PA小信号复增益乘以固定相位因子；零均值噪声不计入确定性增益 | Channel §2、§4 |
+| `Channel.ResolveFeedbackFirTaps`, `Channel.ApplyFeedbackLinearResponse` | P/N | 将可选反馈FIR规范为非空有限复抽头，并按每链执行因果卷积、反馈电压增益和附加相位 | Channel §1.2、§4.1 |
+| `Channel.ApplyFeedbackNonlinearity` | P/N | 使用 $v+c_3|v|^2v$ 模拟观察接收机三阶AM-AM/AM-PM，并可执行保持相位的复包络径向限幅 | Channel §4.2 |
+| `Channel.ApplyFeedbackTimingAndFrequency` | P/N | 通过插值模拟分数时延和SFO，补入整数时延，再按真实采样率施加CFO相位斜坡 | Channel §4.3 |
+| `Channel.ApplyFeedbackIqImbalance` | P/N | 分别改变I/Q增益并引入正交相位泄漏，随后加入复直流偏置；该镜像误差不能由单一公共复增益完全消除 | Channel §4.4 |
+| `Channel.ApplyFeedbackAdc` | P/N | 对反馈接收机内部I/Q分量执行独立满量程限幅、舍入与有限位宽量化，再解码回内部浮点域 | Channel §4.5 |
+| `Channel.ApplyFeedbackAnalogImpairments` | P/E | 依次组合反馈增益/FIR、非线性/限幅、时频偏和I/Q/DC，保证可重复的物理处理顺序 | Channel §1.2、§4 |
+| `Channel.FeedbackDirectSmallSignalGain` | P/N | 返回反馈FIR直流和、反馈增益/相位及I/Q直通分量组成的小信号复增益；不把镜像、DC、噪声和量化当成确定性标量增益 | Channel §4、§4.6 |
+| `Channel.ApplyChannelEffects` | P/E | 先执行公共相位；forward模式跳过全部fb专用参数，fb模式执行完整反馈模拟链；随后加入公共AWGN，最后仅在fb模式执行反馈ADC | Channel §1–§4 |
+| `Channel.ProcessPaOutput` | E/N | 把已有逐PA公开输出解码后先执行PA后耦合，再执行一次forward/fb采样链路并编码；功率闭环因此不包含接收噪声或PA后串扰 | Channel §1、§1.3、§6.2 |
+| `Channel.ProcessFloating`, `Channel.Process` | P/N/E | `Process(inputSignal, outputPowerDbm)` 按“PA前耦合→逐路PA→PA后耦合→采样链”运行；给定目标时先联合或独立闭环调整PA输入，收敛后只采样一次，并在定点公开模式返回整数I/Q码 | Channel §1、§1.3–§1.4、§3.4、§6.2–§6.4 |
+| `Channel.SmallSignalGain` | P/N | forward模式返回PA小信号增益与公共相位；fb模式再乘反馈直通小信号系数；零均值噪声、DC、镜像和量化不伪装成标量增益 | Channel §2、§4 |
 
 ## 5. `DpdIlc.py`：全部 ILC、部署模型和基准函数
 
@@ -263,11 +277,12 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.MaximumOutputPowerDbm`, `PowerCalibration.Width`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate`, `PowerCalibration.SetPaModel` | E | 用ChainMap保存50 Ω端口、默认25 dBm额定输出极限、统一/逐链目标dBm、闭环容差/迭代参数、有效区检测阈值和公开I/Q位宽；校验并绑定具有`Process`接口的PA或测量适配器，未知键警告后忽略，已识别值继续严格验证 | SigProc §13 |
+| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.MaximumOutputPowerDbm`, `PowerCalibration.Width`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate`, `PowerCalibration.SetPaModel` | E | 用ChainMap保存50 Ω端口、默认25 dBm额定输出极限、统一/逐链目标dBm、独立或联合闭环参数、有效区检测阈值和公开I/Q位宽；校验并绑定具有`Process`接口的PA或测量适配器，未知键警告后忽略，已识别值继续严格验证 | SigProc §13 |
 | `PowerCalibration.DbmToRms`, `PowerCalibration.RmsToDbm` | P/N | 按 $P=V_{\mathrm{RMS}}^2/R$ 在绝对 dBm 功率与复包络 RMS 电压之间双向换算 | SigProc §13 |
 | `PowerCalibration.OutputPowerToDriveScale`, `PowerCalibration.NormalizedRmsToOutputPowerDbm` | P | 在目标dBm与相对额定满量程的归一化RMS之间双向换算 | SigProc §13 |
 | `PowerCalibration.FindActiveSampleMask`, `PowerCalibration.CalculateActiveRmsPerChain` | P/N | 以逐链峰值相对门限识别突发有效样点，闭合短过零间隙，但排除前后补零和长占空比静默区，再按有效样点能量计算RMS | SigProc §13.1 |
-| `PowerCalibration.Calibrate`, `PowerCalibration.GetLastPaInput`, `PowerCalibration.GetLastPaOutput`, `PowerCalibration.GetLastCalibrationMetrics` | P/N/E | `Calibrate` 只接收原始波形，内部反复更新隐藏驱动预设、送入PA并测量有效突发输出功率，采用有界dB校正和括区后二分直到误差进入容限；返回最终PA输入并缓存PA实测输出，指标字典不公开隐藏预设 | SigProc §13.2–§13.3 |
+| `PowerCalibration.EvaluateDrivePreset` | P/N/E | 按当前dB驱动向量重建公开PA输入、调用一次真实plant并测量每路有效突发输出功率，为独立和联合闭环提供同一观测入口 | SigProc §13.2–§13.3 |
+| `PowerCalibration.Calibrate`, `PowerCalibration.GetLastPaInput`, `PowerCalibration.GetLastPaOutput`, `PowerCalibration.GetLastCalibrationMetrics` | P/N/E | `Calibrate` 反复更新隐藏驱动预设并观测实际PA输出；无耦合时采用有界dB校正/二分，有PA前耦合时由有限差分功率雅可比和正则最小二乘联合更新，直到全部误差进入容限 | SigProc §13.2–§13.3 |
 | `PowerCalibration.CalibrateFixedColumn`, `PowerCalibration.CalibrateWaveformToOutputPower`, `PowerCalibration.CalibrateWaveformToOutputPowers` | P/N/E | 兼容性底层接口：不经过PA闭环，直接消除任意初始RMS归一化并重建目标dBm波形；定点模式通过量化后RMS搜索补偿取整并维持公开整数I/Q码接口，不应用于真实PA工作点设定 | SigProc §13.2–§13.4 |
 | `PowerCalibration.ScaleSignalToOutputPower`, `PowerCalibration.ScaleSignalToOutputPowers` | P/E | 按有效区RMS施加逐链常数增益，把物理电压波形标定到目标dBm且不把补零或长静默计入平均 | SigProc §13.4 |
 | `SignalProcessingResult.ToDict`, `SignalOverlapResult.ToDict` | E | 只序列化估计标量或重叠坐标，不重新计算同步与相关 | SigProc §9 |
@@ -384,7 +399,7 @@ flowchart LR
 | `FixedPoint.QuantizeCodes` | N/E | Round and saturate public I/Q integer codes independently; `complex128` is only the common storage container. | [FixedPoint.md](./FixedPoint.md) |
 | `FixedPoint.EncodeComplex` | N | Multiply normalized physical components by $2^{W-1}$ and map them to signed integer codes. | [FixedPoint.md](./FixedPoint.md) |
 | `FixedPoint.DecodeComplex` | N | Divide public integer codes by $2^{W-1}$ only at an internal floating-processing boundary. | [FixedPoint.md](./FixedPoint.md) |
-| `PaModel.ProcessFloating` | P/E | Evaluate the Wiener or GMP PA after code decoding without applying a second interface conversion. | [PaModel.md](./PaModel.md) |
+| `PaModel.ProcessFloating` | P/E | Evaluate the Wiener, GMP, or Doherty PA after code decoding without applying a second interface conversion. | [PaModel.md](./PaModel.md) |
 | `MimoPaModel.ProcessChainFloating` | P/E | Apply one chain's input gain, nonlinear PA, output gain, and optional power calibration in normalized floating units. | [PaModel.md](./PaModel.md) |
 | `IQImbalancePA.Width`, `IQImbalancePA.ProcessFloating` | P/E | Inherit the wrapped PA width and evaluate direct plus conjugate image paths in floating units. | [PaModel.md](./PaModel.md) |
 | `DpdIlc.ResolvePaWidth` | E | Read the PA interface width and preserve width zero for third-party floating PA models. | [DpdIlc.md](./DpdIlc.md) |

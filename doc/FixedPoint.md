@@ -200,19 +200,31 @@ flowchart LR
 
 ### 7.3 Channel
 
-`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码。提供目标功率时，内部 `PowerCalibration` 每轮以同一位宽产生PA输入码、实际运行PA并测量解码后的有效突发功率；收敛后只对最后一次PA输出执行移相和白噪声叠加，再编码返回。目标为 `None` 时，`Channel.Process` 只解码一次并执行单次PA链路。`Channel.ProcessPaOutput` 用于已有PA输出，同样只解码和编码一次。
+`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码。提供目标功率时，内部 `PowerCalibration` 每轮以同一公开位宽产生PA输入码，随后在浮点域执行PA前耦合和各路PA，并测量解码后的有效突发功率；收敛后只对最后一次逐PA输出执行PA后耦合与 `sampleMode` 选择的采样路径，再编码返回。目标为 `None` 时，`Channel.Process` 只解码一次并执行单次耦合PA与采样链路。`Channel.ProcessPaOutput` 用于已有逐PA输出，同样只解码和编码一次，并从PA后耦合开始处理。
 
 ```mermaid
 flowchart LR
     publicInput["公开整数码"] --> decode["FixedPoint.DecodeComplex"]
-    decode --> pa["浮点PA"]
-    pa --> phase["浮点相位旋转"]
-    phase --> noise["物理mV/dBm换算后的浮点噪声"]
+    decode --> pre["浮点PA前耦合<br/>复系数/FIR/时延"]
+    pre --> pa["各路浮点PA<br/>Wiener/GMP/Doherty"]
+    pa --> post["浮点PA后耦合<br/>复系数/FIR/时延"]
+    post --> phase["浮点相位旋转"]
+    phase --> mode{"sampleMode"}
+    mode -->|forward| forward["前向仪表浮点路径"]
+    mode -->|fb| fb["反馈模拟非理想<br/>可选内部ADC"]
+    forward --> noise["物理mV/dBm换算后的浮点噪声"]
+    fb --> noise
     noise --> encode["FixedPoint.EncodeComplex"]
     encode --> publicOutput["公开整数码"]
 ```
 
-**图 3 说明**：例如16位接口中的10 mV噪声不是码值10。模块先用 `maximumOutputPowerDbm` 和 `loadResistanceOhm` 求出归一化RMS，再乘以32768并舍入成最终公开噪声码。浮点和定点模式因此代表相同物理噪声。
+**图 3 说明**：耦合复增益、FIR和分数时延滤波都在解码后的内部浮点域计算，最后只在公开出口量化一次，因此启用耦合不会改变调用方看到的数据类型。例如16位接口中的10 mV噪声不是码值10。模块先用 `maximumOutputPowerDbm` 和 `loadResistanceOhm` 求出归一化RMS，再乘以32768并舍入成最终公开噪声码。浮点和定点模式因此代表相同物理耦合与噪声。
+
+`width` 与 `fbAdcWidth` 是两个不同边界：
+
+- `width` 定义Channel函数公开输入和输出的I/Q整数码；默认16，设为0时公开接口旁路量化。
+- `fbAdcWidth` 只在 `sampleMode="fb"` 时模拟板载反馈ADC；默认 `None`，表示不增加该内部量化。
+- 当两者同时启用时，信号先在反馈链内部按 `fbAdcWidth` 量化并解码回浮点，随后在函数出口再按公开 `width` 编码。这样可以独立研究反馈ADC精度和软件接口位宽。
 
 ### 7.4 Analysis
 

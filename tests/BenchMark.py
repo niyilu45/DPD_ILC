@@ -155,6 +155,14 @@ class BenchmarkConfig:
         )
         if self.numIterations < 1:
             raise ValueError("numIterations must be positive")
+        if self.paModelName.lower() not in (
+            "wiener",
+            "gmp",
+            "doherty",
+        ):
+            raise ValueError(
+                "paModelName must be 'wiener', 'gmp', or 'doherty'"
+            )
         if (
             not isinstance(self.seed, int)
             or isinstance(self.seed, bool)
@@ -256,8 +264,14 @@ class TwoToneBenchmarkConfig:
                 "width": self.width,
             }
         )
-        if self.paModelName.lower() not in ("wiener", "gmp"):
-            raise ValueError("paModelName must be 'wiener' or 'gmp'")
+        if self.paModelName.lower() not in (
+            "wiener",
+            "gmp",
+            "doherty",
+        ):
+            raise ValueError(
+                "paModelName must be 'wiener', 'gmp', or 'doherty'"
+            )
         if (
             not isinstance(self.numIterations, int)
             or isinstance(self.numIterations, bool)
@@ -1839,7 +1853,7 @@ def ParseBenchmarkArguments() -> Union[
     argumentParser.add_argument(
         "--pa",
         dest="paModelName",
-        choices=("wiener", "gmp"),
+        choices=("wiener", "gmp", "doherty"),
         default="wiener",
     )
     argumentParser.add_argument("--seed", type=int, default=101)

@@ -2,29 +2,188 @@
 
 ## 1. 模块边界
 
-`inc/lib/Channel.py` 描述PA输出端到接收机输入端之间的简化链路。当前处理顺序固定为：
+`inc/lib/Channel.py` 描述PA前多通道耦合、独立非线性PA、PA后耦合、外部仪表采样和板载反馈接收机。`sampleMode` 决定耦合后的PA输出进入哪条采样路径：
 
 ```mermaid
 flowchart LR
     raw["用户原始波形"] --> calibration["Channel内部功率闭环<br/>调整PA输入缩放"]
     target["用户目标输出功率 dBm"] --> calibration
-    calibration --> pa["PA非线性模型"]
-    pa --> paOutput["PA输出 yPA(n)"]
+    calibration --> preCoupling["PA前耦合 Hpre(z)"]
+    preCoupling --> pa["每路独立PA<br/>Wiener/GMP/Doherty"]
+    pa --> paOutput["各PA自身输出 yPA(n)"]
     paOutput --> detector["有效突发功率检测"]
     detector -. "误差超出容差时反馈" .-> calibration
-    paOutput --> phase["固定相位旋转<br/>-90° / 0° / +90°"]
-    phase --> noise["AddNoise<br/>noiseAmpMv / noisePwrDbm / noiseSnrDb"]
-    noise --> receiver["接收端波形 r(n)"]
+    paOutput --> postCoupling["PA后耦合 Hpost(z)"]
+    postCoupling --> phase["公共固定相位旋转"]
+    phase --> mode{"sampleMode"}
+    mode -->|forward| instrument["前向仪表采样<br/>跳过fb专用非理想"]
+    mode -->|fb| fbAnalog["板载反馈模拟链<br/>频响/增益/非线性/时频偏/IQ/DC"]
+    instrument --> noise["AddNoise"]
+    fbAnalog --> noise
+    noise --> fbAdc{"fb模式？"}
+    fbAdc -->|forward| receiver["仪表采样波形"]
+    fbAdc -->|fb| adc["反馈ADC限幅与量化"]
+    adc --> receiverFb["反馈采样波形"]
 ```
 
 图示说明：
 
-- `Channel.Process(rawSignal, outputPowerDbm=...)` 是推荐入口。用户只提供任意初始幅度的原始波形和目标PA输出功率；Channel内部调整PA输入、反复观测PA输出并收敛，然后只对最终PA输出执行一次移相和加噪。
-- `Channel.Process(rawSignal)` 保留无功率校准的单次PA→移相→加噪路径，主要供ILC每轮plant调用。
-- `Channel.ProcessPaOutput` 接收已经产生的PA输出，只执行移相和加噪。
+- `sampleMode="forward"` 是默认值，表示用校准仪表直接观测PA主路输出。所有 `fb...` 参数都被保留但不生效，因此不会把板载反馈接收机失真混入PA/DPD评价。
+- `sampleMode="fb"` 表示通过板载反馈接收链采样；只有此模式会执行 `fbGainDb`、`fbFirTaps`、时延、CFO/SFO、I/Q不平衡、反馈非线性、限幅、DC和ADC量化。
+- `prePaCouplingPaths` 在非线性之前把其他通道的延迟复泄漏叠加到每个PA输入；`postPaCouplingPaths` 在非线性之后混合各PA输出。两者都与forward/fb选择无关。
+- `Channel.Process(rawSignal, outputPowerDbm=...)` 是推荐入口。用户只提供任意初始幅度的原始波形和目标PA输出功率；Channel内部调整PA输入、反复观测PA输出并收敛，然后只对最终PA输出执行一次所选采样路径。
+- `Channel.Process(rawSignal)` 保留无功率校准的单次PA→采样路径，主要供ILC每轮plant调用。
+- `Channel.ProcessPaOutput` 接收各PA已经产生但尚未经过输出耦合的矩阵，不再次运行PA，依次执行PA后耦合和所选采样路径。
 - 功率闭环由Channel私有持有的 `PowerCalibration` 完成。普通用户不需要构造、配置或调用校准器。
-- PA输出功率闭环只观察移相和噪声之前的干净PA输出，因此不会把接收噪声误认为PA发射功率。
-- ILC需要学习整条观测链路时，可把 `Channel` 作为被控对象传给ILC。此时每轮反馈包含相位和接收噪声。
+- PA输出功率闭环只观察所有采样路径非理想之前的干净PA输出，因此不会把仪表或板载反馈接收机的失真误认为PA发射功率。
+- 实验室“仪表闭环ILC”把forward模式的Channel作为plant；验证板载反馈算法时把fb模式的Channel作为plant，但最终EVM/ACLR仍应由独立forward模式采样评价。
+
+### 1.1 前向仪表采样
+
+前向模式以高性能VSA作为相对可信的黄金参考。设公共相位为 $\phi_c$，仪表噪声为 $w(n)$：
+
+```math
+z_{\mathrm{forward}}(n)
+=
+y_{\mathrm{PA}}(n)\exp(j\phi_c)+w(n).
+```
+
+`fb...` 配置不会进入该公式。这一点允许用同一组反馈非理想参数在forward和fb之间切换并进行公平对比，而不需要删除配置。
+
+### 1.2 板载反馈采样
+
+反馈模式的内部顺序为：
+
+```text
+PA output
+  -> common phase
+  -> feedback gain/phase and FIR
+  -> third-order receiver distortion and envelope clipping
+  -> fractional delay/SFO resampling and integer delay
+  -> CFO phase ramp
+  -> IQ gain/phase imbalance and DC offset
+  -> AWGN
+  -> feedback ADC clipping and quantization
+```
+
+用组合算子表示：
+
+```math
+z_{\mathrm{fb}}
+=
+Q_{\mathrm{ADC}}
+\left\{
+F_{\mathrm{IQ,DC}}
+\left[
+F_{\mathrm{time,freq}}
+\left(
+F_{\mathrm{NL}}
+\left\{
+H_{\mathrm{fb}}[y_{\mathrm{PA}}]
+\right\}
+\right)
+\right]
++w
+\right\}.
+```
+
+这条路径故意包含板载观察接收机的非理想。若直接用未经校准的 $z_{\mathrm{fb}}$ 更新ILC，算法可能学习PA与反馈链路的组合逆响应；因此工程测试应同时保留forward模式作为独立评价路径。
+
+### 1.3 PA前与PA后多通道耦合
+
+输入和输出矩阵都使用“样点数 × 物理通道数”。设第 $i$ 路原始输入为 $x_i(n)$，PA前耦合后第 $j$ 路实际激励为：
+
+```math
+u_j(n)
+=
+x_j(n)
++
+\sum_{i\ne j}
+\sum_{k=0}^{K_{\mathrm{pre}}-1}
+h^{\mathrm{pre}}_{j,i}(k)x_i(n-k).
+```
+
+每一路再经过自己配置的Wiener、GMP或Doherty PA：
+
+```math
+y_j(n)=F_j\{u_j(n)\}.
+```
+
+PA后耦合为：
+
+```math
+v_j(n)
+=
+y_j(n)
++
+\sum_{i\ne j}
+\sum_{k=0}^{K_{\mathrm{post}}-1}
+h^{\mathrm{post}}_{j,i}(k)y_i(n-k).
+```
+
+代码始终保留每路单位直通项，用户配置的路径作为额外串扰相加。每条路径使用：
+
+```math
+h_{j,i}
+=
+10^{G_{j,i}/20}
+\exp(j\phi_{j,i})
+f_{j,i}.
+```
+
+$f_{j,i}$ 是可选复FIR；随后再施加独立整数和分数时延。路径方向明确规定为 `sourceChain` 指向 `destinationChain`，因此0到1和1到0可以使用不同增益、相位、FIR及时延。
+
+```mermaid
+flowchart LR
+    x0["x0"] --> sum0["PA0输入求和"]
+    x1["x1"] --> sum1["PA1输入求和"]
+    x0 --> c01["0→1<br/>增益/相位/FIR/时延"]
+    c01 --> sum1
+    x1 --> c10["1→0<br/>增益/相位/FIR/时延"]
+    c10 --> sum0
+    sum0 --> pa0["PA0"]
+    sum1 --> pa1["PA1"]
+    pa0 --> out0["输出0求和"]
+    pa1 --> out1["输出1求和"]
+    pa0 --> p01["0→1后耦合"]
+    p01 --> out1
+    pa1 --> p10["1→0后耦合"]
+    p10 --> out0
+```
+
+**图示说明**：PA前耦合改变非线性工作点并产生跨通道包络相关失真；PA后耦合只混合已经生成的失真。当前模型描述线性耦合网络与独立非线性PA的级联。如果天线反射波会改变PA负载，使PA本身直接依赖其他通道输出，则还需要有源负载牵引模型，不能仅用PA后线性相加代替。
+
+### 1.4 耦合条件下的联合功率校准
+
+`outputPowerDbm=(P_0,P_1,...)` 仍表示PA后耦合之前每个物理PA自身的目标输出功率。只有PA前耦合时，调整一路输入会同时改变多个PA输出，Channel默认自动启用联合校准。
+
+令隐藏驱动dB向量为 $\mathbf d$，实测PA功率向量为 $\mathbf p(\mathbf d)$。代码逐路增加 `calibrationProbeStepDb`，以有限差分估计：
+
+```math
+J_{m,n}
+\approx
+\frac{
+p_m(\mathbf d+\Delta d\mathbf e_n)-p_m(\mathbf d)
+}{
+\Delta d
+}.
+```
+
+联合更新为：
+
+```math
+\Delta\mathbf d
+=
+\left(
+\mathbf J^T\mathbf J+\lambda\mathbf I
+\right)^{-1}
+\mathbf J^T
+\left(
+\mathbf p_{\mathrm{target}}-\mathbf p
+\right).
+```
+
+`jointPowerCalibration=None` 表示自动模式：存在PA前耦合时启用Jacobian联合更新，否则沿用较快的逐链闭环。用户也可以显式设为 `True` 或 `False`。PA后耦合不进入功率检测，因此不会改变“每个PA自身输出dBm”的含义。
 
 ## 2. 固定相位旋转
 
@@ -242,7 +401,144 @@ V_{\mathrm{FS,rms}}
 
 这种换算保证相同的10 mV在浮点接口和16位定点接口中表示同一个物理噪声，而不是把“10”错误地当成归一化幅度或整数码。
 
-## 4. 相位、噪声与ILC
+## 4. 反馈链路非理想及其对ILC的影响
+
+### 4.1 增益、相位和频率响应
+
+反馈FIR及耦合增益为：
+
+```math
+v_m(n)
+=
+10^{G_{\mathrm{fb}}/20}
+\exp(j\phi_{\mathrm{fb}})
+\sum_{k=0}^{K-1}h_k y_m(n-k).
+```
+
+`fbFirTaps=None` 等价于 $h_0=1$。FIR按每一路独立卷积并保留原记录长度。若DPD不去嵌反馈频响，收敛条件可能变成 $H_{\mathrm{fb}}Y\approx X$，真实主路输出则错误地趋向 $Y\approx X/H_{\mathrm{fb}}$。
+
+### 4.2 反馈接收机非线性和限幅
+
+三阶反馈非线性为：
+
+```math
+v_{\mathrm{nl}}(n)
+=
+v(n)+c_3|v(n)|^2v(n).
+```
+
+`fbThirdOrderCoefficient` 是可为复数的 $c_3$，其实部主要改变AM-AM，虚部同时产生AM-PM。`fbClipAmplitude=A` 时再进行复包络径向限幅。若幅度没有超过门限：
+
+```math
+v_{\mathrm{clip}}(n)=v_{\mathrm{nl}}(n),
+\qquad
+|v_{\mathrm{nl}}(n)|\leq A.
+```
+
+若幅度超过门限，则只压缩幅度并保留相位：
+
+```math
+v_{\mathrm{clip}}(n)
+=
+A\frac{v_{\mathrm{nl}}(n)}
+       {|v_{\mathrm{nl}}(n)|},
+\qquad
+|v_{\mathrm{nl}}(n)|>A.
+```
+
+反馈接收机压缩会让ILC补偿“PA+观察接收机”的组合非线性，因此最终必须使用forward仪表采样独立验证。
+
+### 4.3 时延、CFO和SFO
+
+分数时延与采样频偏使用保持长度的插值模型。正的 `fbFractionalDelaySamples=d` 取源位置 $n-d$；采样偏差为 $\epsilon_{\mathrm{sfo}}=\mathrm{ppm}\times10^{-6}$：
+
+```math
+v_{\mathrm{sfo}}(n)
+=
+v_{\mathrm{clip}}
+\left(
+n(1+\epsilon_{\mathrm{sfo}})-d
+\right).
+```
+
+随后加入非负整数时延 $D$，并施加载波偏移：
+
+```math
+v_{\mathrm{cfo}}(n)
+=
+v_{\mathrm{sfo}}(n-D)
+\exp
+\left(
+j2\pi\frac{\Delta f}{f_s}n
+\right).
+```
+
+超出原采样记录的插值位置补零。`sampleRateHz` 决定CFO相位斜率的物理尺度。
+
+### 4.4 I/Q不平衡与直流偏置
+
+令I/Q增益不平衡为 $\Delta G$ dB、正交相位误差为 $\theta$：
+
+```math
+g_I=10^{\Delta G/40},
+\qquad
+g_Q=10^{-\Delta G/40}.
+```
+
+实现的实分量模型为：
+
+```math
+I'(n)=g_I I(n),
+```
+
+```math
+Q'(n)
+=
+g_Q
+\left[
+\cos(\theta)Q(n)+\sin(\theta)I(n)
+\right].
+```
+
+最后加复直流偏置：
+
+```math
+v_{\mathrm{IQ,DC}}(n)
+=
+I'(n)+jQ'(n)+d_{\mathrm{DC}}.
+```
+
+非零I/Q误差会形成共轭镜像分量，不能只靠公共复增益完全去除。
+
+### 4.5 反馈ADC
+
+`fbAdcWidth` 取 $W$ 时启用反馈ADC，`fbAdcFullScale` 取 $A_{\mathrm{FS}}$ 时定义每个I/Q分量的正负满量程。每个分量先转换成码值：
+
+```math
+q
+=
+\mathrm{clip}
+\left(
+\mathrm{round}
+\left[
+\frac{x}{A_{\mathrm{FS}}}2^{W-1}
+\right],
+-2^{W-1},
+2^{W-1}-1
+\right),
+```
+
+再解码回内部浮点采样：
+
+```math
+\widehat{x}
+=
+A_{\mathrm{FS}}\frac{q}{2^{W-1}}.
+```
+
+`fbAdcWidth=None` 表示不启用反馈ADC模型。这个位宽与Channel公开接口 `width` 不同：前者模拟板载反馈ADC内部量化，后者定义Python函数边界的I/Q码格式。
+
+### 4.6 相位、噪声与ILC
 
 固定相位是确定性线性项。若链路无噪声并且ILC执行公共复增益对齐，则公共相位通常可以被同步步骤准确估计：
 
@@ -279,16 +575,37 @@ Channel(
 
 | 参数 | 默认值 | 单位 | 说明 |
 |---|---:|---|---|
+| `sampleMode` | `"forward"` | 无 | `"forward"`为校准仪表采样；`"fb"`为板载反馈接收机采样 |
+| `sampleRateHz` | `1.0` | sample/s | CFO物理相位斜率使用的采样率；配置Hz级CFO时应设置真实值 |
 | `phaseDegrees` | `0` | degree | 仅允许 `-90`、`0`、`90` |
 | `noiseAmpMv` | `None` | mV RMS | 复包络总RMS噪声幅度 |
 | `noisePwrDbm` | `None` | dBm | 配置端口上的总噪声功率 |
 | `noiseSnrDb` | `None` | dB | 每路有效突发信号功率与复噪声功率之比 |
+| `fbGainDb` | `0.0` | dB | fb模式反馈耦合与接收机电压增益 |
+| `fbPhaseDegrees` | `0.0` | degree | fb模式附加反馈相位，允许任意有限值 |
+| `fbFirTaps` | `None` | 无 | fb模式因果复FIR；`None`等价于单个单位抽头 |
+| `fbIntegerDelaySamples` | `0` | sample | fb模式非负整数时延 |
+| `fbFractionalDelaySamples` | `0.0` | sample | fb模式分数时延，范围 `[-0.5, 0.5)` |
+| `fbCarrierFrequencyOffsetHz` | `0.0` | Hz | fb模式载波频偏 |
+| `fbSamplingFrequencyOffsetPpm` | `0.0` | ppm | fb模式采样频偏，绝对值必须小于一百万 |
+| `fbIqGainImbalanceDb` | `0.0` | dB | fb模式I/Q分量增益比 |
+| `fbIqPhaseImbalanceDegrees` | `0.0` | degree | fb模式正交相位误差 |
+| `fbDcOffset` | `0+0j` | normalized | fb模式复直流偏置 |
+| `fbThirdOrderCoefficient` | `0+0j` | normalized | fb模式接收机三阶复多项式系数 |
+| `fbClipAmplitude` | `None` | normalized | fb模式复包络径向限幅；正数启用 |
+| `fbAdcWidth` | `None` | bit/I或Q | fb模式内部ADC位宽，支持2至32；`None`禁用 |
+| `fbAdcFullScale` | `1.0` | normalized | fb模式内部ADC每个I/Q分量满量程 |
+| `prePaCouplingPaths` | `None` | 无 | PA前串扰路径序列；每项配置源/目标链、增益、相位、FIR和时延 |
+| `postPaCouplingPaths` | `None` | 无 | PA后串扰路径序列；格式与PA前路径相同 |
 | `loadResistanceOhm` | `50.0` | Ω | dBm与RMS电压换算阻抗 |
 | `maximumOutputPowerDbm` | `25.0` | dBm | 归一化PA输出RMS等于1所代表的功率 |
 | `calibrationToleranceDb` | `0.25` | dB | 内部闭环允许的最大PA输出功率误差 |
 | `maximumCalibrationIterations` | `60` | 次 | 内部闭环最多激励和测量PA的次数 |
 | `calibrationLearningRate` | `0.8` | 无 | 尚未括住目标时的dB域修正比例 |
 | `maximumDriveAdjustmentDb` | `6.0` | dB/次 | 单轮PA输入预设最大调整量 |
+| `jointPowerCalibration` | `None` | 无 | `None`按PA前耦合自动选择；布尔值强制联合或逐链校准 |
+| `calibrationProbeStepDb` | `0.05` | dB | 联合校准估计功率Jacobian的逐路扰动 |
+| `calibrationRegularization` | `1e-6` | 无 | 联合校准正规方程的正则化系数 |
 | `activePowerThresholdDb` | `-60.0` | dB | 相对峰值的有效突发功率门限 |
 | `activeGapToleranceSamples` | `16` | sample | 有效区内部允许闭合的短低幅空洞 |
 | `randomSeed` | `1701` | 无 | 非负整数可复现；`None` 使用系统熵 |
@@ -296,16 +613,45 @@ Channel(
 
 与其他主类相同，默认值都定义在构造函数内部，并通过 `ChainMap` 与调用方配置合并。未知参数会产生警告、被忽略，并且不会中止处理；已识别但数值非法的参数仍会抛出异常。
 
+`prePaCouplingPaths` 与 `postPaCouplingPaths` 中每个路径映射支持：
+
+| 路径字段 | 默认值 | 说明 |
+|---|---:|---|
+| `sourceChain` | `0` | 泄漏源物理通道索引 |
+| `destinationChain` | `1` | 泄漏进入的目标通道索引；不能等于源索引 |
+| `gainDb` | `-30.0` | 电压耦合增益，使用20对数换算 |
+| `phaseDegrees` | `0.0` | 路径固定相位 |
+| `integerDelaySamples` | `0` | 非负因果整数时延 |
+| `fractionalDelaySamples` | `0.0` | 分数时延，范围 `[-0.5,0.5)` |
+| `firTaps` | `None` | 可选非空有限复FIR；`None`为单位抽头 |
+
+路径中的未知字段会单独发出警告并忽略；已识别但非法的索引、时延、增益或FIR仍然报错。
+
 主要接口为：
 
 | 方法 | 参数 | 返回值或作用 |
 |---|---|---|
-| `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 有目标时内部闭环校准PA输入，随后返回经过移相和噪声的接收波形；`None`时只执行一次链路 |
+| `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 有目标时内部闭环校准PA输入，随后执行 `sampleMode` 选择的采样路径；`None`时只执行一次PA与采样 |
 | `CalibratePaInput(inputSignal, outputPowerDbm)` | 原始波形、目标功率 | 高级诊断入口；只运行内部PA输入闭环并返回收敛PA输入 |
 | `GetLastPaInput()` | 无 | 返回最近一次内部闭环实际送入PA的波形 |
 | `GetLastPaOutput()` | 无 | 返回最近一次内部闭环接受的干净PA输出 |
 | `GetLastCalibrationMetrics()` | 无 | 返回目标、实测dBm、误差和迭代次数字典 |
-| `ProcessPaOutput(paOutputSignal)` | 已有PA输出 | 不运行PA或功率闭环，只执行移相和噪声 |
+| `ProcessPaOutput(paOutputSignal)` | 已有各PA自身输出 | 不运行PA或功率闭环，执行PA后耦合及所选采样路径 |
+| `ResolveCouplingPaths(parameterName, chainCount=None)` | 路径参数名、可选链数 | 过滤未知子键并规范、校验耦合路径 |
+| `ApplyCouplingPath(sourceSignal, couplingPath)` | 单路源信号、规范路径 | 应用FIR、整数/分数时延、增益与相位 |
+| `ApplyMimoCoupling(inputSignal, parameterName)` | 多路矩阵、路径参数名 | 保留直通并累加所有非对角耦合 |
+| `ApplyPrePaCoupling(inputSignal)` | PA前矩阵 | 生成每个PA真正看到的耦合激励 |
+| `ApplyPostPaCoupling(paOutputSignal)` | 各PA自身输出矩阵 | 在采样前混合PA非线性输出 |
+| `HasPrePaCoupling()` | 无 | 判断自动联合功率校准是否需要启用 |
+| `ProcessBoundPaFloating(inputSignal)` | 实际PA激励 | 只运行绑定PA，不加耦合或采样影响 |
+| `ProcessPaBankForCalibration(inputSignal)` | 公开试探波形 | 执行PA前耦合和PA，用于功率闭环 |
+| `ApplyFeedbackLinearResponse(inputSignal)` | fb模拟输入 | 应用反馈增益、相位和FIR |
+| `ApplyFeedbackNonlinearity(inputSignal)` | fb线性输出 | 应用反馈三阶非线性和包络限幅 |
+| `ApplyFeedbackTimingAndFrequency(inputSignal)` | fb模拟波形 | 应用分数/整数时延、CFO和SFO |
+| `ApplyFeedbackIqImbalance(inputSignal)` | fb时频偏输出 | 应用I/Q增益/相位误差和DC |
+| `ApplyFeedbackAdc(inputSignal)` | fb含噪波形 | 应用反馈ADC分量限幅与量化 |
+| `ApplyFeedbackAnalogImpairments(inputSignal)` | 公共移相后的PA输出 | 按固定顺序组合全部fb模拟非理想 |
+| `FeedbackDirectSmallSignalGain()` | 无 | 返回fb线性直通分量的复小信号系数 |
 | `ResolveSnrNoiseRmsPerChain(inputSignal)` | 内部归一化SISO/MIMO信号 | 返回按有效突发SNR推导的逐链复噪声总RMS |
 | `ResetRandomGenerator()` | 无 | 按当前种子重放接收噪声序列 |
 
@@ -315,8 +661,10 @@ Channel(
 
 | 用户已有数据或目标 | 推荐入口 | 是否再次运行PA |
 |---|---|---|
+| 校准仪表采样PA主路 | `sampleMode="forward"` | 取决于Process入口 |
+| 板载反馈接收机采样 | `sampleMode="fb"`并配置 `fb...` 参数 | 取决于Process入口 |
 | 原始波形和目标PA输出功率 | `Channel.Process(rawSignal, outputPowerDbm=20.0)` | 内部闭环多次，收敛后返回 |
-| MIMO原始矩阵和逐链目标 | `Channel.Process(rawMatrix, outputPowerDbm=(22.0, 21.0))` | 每链内部闭环 |
+| MIMO原始矩阵和逐链目标 | `Channel.Process(rawMatrix, outputPowerDbm=(22.0, 21.0))` | 有PA前耦合时联合闭环 |
 | 已有精确PA输入，不需要设定功率 | `Channel.Process(paInputSignal)` | 一次 |
 | 已有PA输出或仪器PA采集 | `Channel.ProcessPaOutput(paOutputSignal)` | 否 |
 | 只验证移相 | `ProcessPaOutput`，三个噪声参数均为 `None` | 否 |
@@ -356,7 +704,7 @@ assert np.allclose(receivedSignal, 1j * paOutputSignal)
 
 若 `phaseDegrees=-90`，结果为 `-1j * paOutputSignal`；若为0，则在无噪声条件下返回等值副本。
 
-### 6.2 完整PA到接收端链路
+### 6.2 完整PA到前向仪表采样链路
 
 ```python
 import numpy as np
@@ -378,6 +726,8 @@ paModel = PaModel(
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": 80.0e6,
         "phaseDegrees": 90,
         "noiseAmpMv": 10.0,
         "noisePwrDbm": None,
@@ -399,13 +749,77 @@ flowchart LR
     publicInput["公开PA输入"] --> decode["解码到内部浮点"]
     decode --> pa["PA.ProcessFloating"]
     pa --> phase["固定移相"]
-    phase --> noise["AddNoise"]
+    phase --> forward["forward仪表采样<br/>跳过全部fb参数"]
+    forward --> noise["AddNoise"]
     noise --> encode["编码到公开输出"]
 ```
 
 图示说明：`width=0` 时解码和编码是等值复制；`width>0` 时公开I/Q为整数码，但PA、移相和噪声仍在内部归一化浮点域计算。
 
-### 6.3 用户只提供原始波形与目标输出功率
+### 6.3 前向仪表与板载反馈路径对比
+
+推荐用两个Channel共享同一个PA模型：fb路径作为ILC训练观测，forward路径作为独立黄金参考和最终评价。已经得到一次干净PA输出时，用 `ProcessPaOutput` 分路可以避免PA被重复运行：
+
+```python
+from inc.lib.Channel import Channel
+
+
+forwardChannel = Channel(
+    paModel=paModel,
+    parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": 160.0e6,
+        "noiseSnrDb": 50.0,
+        "width": 0,
+    },
+)
+feedbackChannel = Channel(
+    paModel=paModel,
+    parameters={
+        "sampleMode": "fb",
+        "sampleRateHz": 160.0e6,
+        "fbGainDb": -6.0,
+        "fbPhaseDegrees": 18.0,
+        "fbFirTaps": (
+            1.0 + 0.0j,
+            0.08 - 0.04j,
+            -0.02 + 0.01j,
+        ),
+        "fbIntegerDelaySamples": 12,
+        "fbFractionalDelaySamples": 0.18,
+        "fbCarrierFrequencyOffsetHz": 2500.0,
+        "fbSamplingFrequencyOffsetPpm": 8.0,
+        "fbIqGainImbalanceDb": 0.35,
+        "fbIqPhaseImbalanceDegrees": 1.5,
+        "fbDcOffset": 0.002 - 0.001j,
+        "fbThirdOrderCoefficient": -0.015 + 0.004j,
+        "fbClipAmplitude": 0.95,
+        "fbAdcWidth": 14,
+        "fbAdcFullScale": 1.0,
+        "noiseSnrDb": 35.0,
+        "width": 0,
+    },
+)
+
+cleanPaOutput = paModel.Process(paInputSignal)
+instrumentCapture = forwardChannel.ProcessPaOutput(cleanPaOutput)
+feedbackCapture = feedbackChannel.ProcessPaOutput(cleanPaOutput)
+```
+
+`instrumentCapture` 用于最终EVM、ACLR和功率判断；`feedbackCapture` 用于训练或验证反馈校准。不能只用未经校准的 `feedbackCapture` 同时训练和评价DPD，否则容易得到“板载反馈EVM很好但主路仪表EVM变差”的虚假结论。
+
+运行时也可以保留一套参数并切换：
+
+```python
+feedbackChannel.UpdateParameters(sampleMode="forward")
+forwardCaptureFromSameObject = feedbackChannel.ProcessPaOutput(
+    cleanPaOutput
+)
+```
+
+forward模式会完整跳过所有 `fb...` 非理想，但公共 `phaseDegrees` 和三种互斥噪声控制仍然生效。
+
+### 6.4 用户只提供原始波形与目标输出功率
 
 普通用户不需要主动创建 `PowerCalibration`，也不需要先归一化原始波形。把任意初始幅度的波形和目标dBm直接交给 `Channel.Process`：
 
@@ -431,6 +845,8 @@ paModel = PaModel(
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": wifiWaveform.sampleRateHz,
         "phaseDegrees": 0,
         "noiseAmpMv": 10.0,
         "noisePwrDbm": None,
@@ -472,7 +888,7 @@ flowchart TD
 
 图示说明：闭环每次都重新缩放原始波形并真实运行PA，不是在PA输出后乘常数伪造功率。有效区检测会排除前后补零和长静默。功率误差只由干净PA输出决定；相位和接收噪声在收敛后只执行一次，不会改变隐藏的PA输入预设。
 
-### 6.4 毫伏、dBm和SNR三种噪声配置
+### 6.5 毫伏、dBm和SNR三种噪声配置
 
 在50 Ω端口上，10 mV复包络总RMS约等于 `-26.9897 dBm`。使用相同随机种子时，下面两个Channel会产生同一段噪声：
 
@@ -544,9 +960,9 @@ snrOutput = snrChannel.ProcessPaOutput(paddedSignal)
 
 这里的30 dB针对 `activeSignal` 所在的开启区间。前1000个和后2000个零样点不会降低信号RMS，也不会导致噪声被错误配置得过小。实际使用时三个噪声参数只能选择一个。
 
-### 6.5 Channel输出直接送入Analysis
+### 6.6 Channel输出直接送入Analysis
 
-继续使用6.3节得到的 `referenceSignal`、`wifiWaveform` 和 `receivedSignal`：
+继续使用6.4节得到的 `referenceSignal`、`wifiWaveform` 和 `receivedSignal`：
 
 ```python
 from inc.lib.Analysis import Analysis
@@ -571,7 +987,7 @@ print(metrics["aclrWorstDb"])
 
 固定移相会由Analysis的公共复增益步骤补偿；随机噪声、PA非线性和记忆失真仍会进入SNR和EVM残差。`Analysis` 的独立使用方式见 [Analysis.md §11](./Analysis.md)。
 
-### 6.6 16位定点接口
+### 6.7 16位定点接口
 
 定点模式下，输入输出容器仍是 `numpy.complex128`，但每个I/Q分量都是整数码：
 
@@ -615,7 +1031,7 @@ assert np.array_equal(
 
 10 mV不会被直接当成整数码10。Channel先把物理电压转换为内部归一化RMS，生成浮点噪声，最后统一编码为16位整数码。
 
-### 6.7 运行时更新参数和复现噪声
+### 6.8 运行时更新参数和复现噪声
 
 调用方传入的 `parameters` 字典保持活动状态；修改已识别键后，下一次处理会读取新值。`UpdateParameters` 可写入最高优先级覆盖：
 
@@ -657,13 +1073,13 @@ assert np.array_equal(
 
 固定种子保证整次仿真的噪声序列可复现，但连续两次 `Process` 默认会消耗不同的随机样值。只有调用 `ResetRandomGenerator()` 才会从同一种子起点重放。
 
-### 6.8 MIMO矩阵
+### 6.9 MIMO矩阵
 
 Channel保留 `samples × chains` 形状，并对每个元素加入独立白噪声。绑定 `MimoPaModel` 后可以处理完整多链矩阵：
 
 ```python
 from inc.lib.Channel import Channel
-from inc.lib.PaModel import MimoPaModel
+from inc.lib.PaModel import DohertyConfig, MimoPaModel
 from inc.lib.WaveGenWifi import WaveGenWifi
 
 
@@ -683,6 +1099,16 @@ wifiWaveform = WaveGenWifi(
 mimoPaModel = MimoPaModel(
     parameters={
         "numTransmitChains": 2,
+        "paParametersPerChain": (
+            {
+                "modelName": "doherty",
+                "dohertyConfig": DohertyConfig(
+                    peakingTurnOnAmplitude=0.45,
+                    peakingTransitionWidth=0.15,
+                ),
+            },
+            {"modelName": "gmp"},
+        ),
         "inputPowerDbPerChain": (0.0, -1.0),
         "outputPowerDbPerChain": (0.0, -0.5),
         "width": 0,
@@ -691,6 +1117,35 @@ mimoPaModel = MimoPaModel(
 channel = Channel(
     paModel=mimoPaModel,
     parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": wifiWaveform.sampleRateHz,
+        "prePaCouplingPaths": (
+            {
+                "sourceChain": 0,
+                "destinationChain": 1,
+                "gainDb": -28.0,
+                "phaseDegrees": 20.0,
+                "integerDelaySamples": 2,
+                "fractionalDelaySamples": 0.15,
+                "firTaps": (1.0 + 0.0j, 0.06 - 0.02j),
+            },
+            {
+                "sourceChain": 1,
+                "destinationChain": 0,
+                "gainDb": -31.0,
+                "phaseDegrees": -15.0,
+                "integerDelaySamples": 4,
+            },
+        ),
+        "postPaCouplingPaths": (
+            {
+                "sourceChain": 0,
+                "destinationChain": 1,
+                "gainDb": -23.0,
+                "phaseDegrees": 35.0,
+                "integerDelaySamples": 1,
+            },
+        ),
         "phaseDegrees": 0,
         "noiseAmpMv": None,
         "noisePwrDbm": None,
@@ -708,7 +1163,9 @@ assert receivedMatrix.shape == wifiWaveform.samples.shape
 print(channel.GetLastCalibrationMetrics())
 ```
 
-`outputPowerDbm=(22.0, 20.0)` 按列控制两路PA输出。传一个标量时，所有链使用同一目标。当前固定相位参数是所有链共用的标量；噪声样值在各链之间独立。如果需要每链独立相位、噪声功率或相关噪声矩阵，应在后续扩展中增加逐链参数，而不能把单个 `phaseDegrees` 误解为逐链序列。
+`outputPowerDbm=(22.0, 20.0)` 按列控制两个PA在输出耦合之前的自身功率。第一路是Doherty，第二路是GMP。PA前存在双向、不对称且不同时延的耦合，所以Channel自动使用联合Jacobian功率闭环；PA后再增加0到1的输出泄漏。传一个标量时，所有链使用同一目标。
+
+当前公共 `phaseDegrees` 和fb接收机参数仍由所有链共用；耦合路径自身的增益、相位、FIR及时延则可以逐方向独立配置。噪声样值在各链之间独立，`noiseSnrDb` 按各路有效信号RMS分别设置强度。
 
 ## 7. `SmallestSISO.py`中的设置
 
@@ -718,6 +1175,8 @@ print(channel.GetLastCalibrationMetrics())
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": waveform.sampleRateHz,
         "phaseDegrees": 0,
         "noiseAmpMv": 10.0,
         "noisePwrDbm": None,

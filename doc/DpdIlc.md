@@ -29,9 +29,12 @@ flowchart LR
     wave["WaveGenWifi.Generate<br/>生成SISO或MIMO Wi-Fi原始信号"] --> channelCalibration
     pa["PaModel或MimoPaModel"] --> channelCalibration
     channelCalibration --> reference["Channel.GetLastPaInput<br/>期望PA输出及ILC初始输入"]
-    channelCalibration --> baseline["Channel返回未补偿baseline"]
+    channelCalibration --> sampleMode{"Channel sampleMode"}
+    sampleMode -->|forward| baseline["前向仪表baseline"]
+    sampleMode -->|fb| feedback["板载反馈接收机观测"]
     reference --> ilc["DpdIlc中的Run...Ilc"]
     pa --> ilc
+    feedback --> ilc
     config["ILCConfig<br/>仅含算法和反馈参数"] --> ilc
     ilc --> learned["ILCResult.learnedInput<br/>LC-NMSE最佳轮输入"]
     ilc --> output["ILCResult.outputSignal<br/>LC-NMSE最佳轮干净输出"]
@@ -56,6 +59,7 @@ flowchart LR
 - `ILCConfig` 不保存任何EVM、SNR或ACLR计算器；它只控制学习更新、幅度约束和反馈采集。
 - `DpdIlc.py` 不接收任何EVM、SNR或ACLR回调；每轮只计算算法原生MSE并保存对应输入和PA输出。
 - ILC返回后，`Analysis.AnalyzeIlcHistory` 才逐轮计算模拟输出功率、SNR、EVM和ACLR，并在分析层按严格EVM选择最佳实测轮。
+- 仪表闭环训练可把 `sampleMode="forward"` 的Channel作为plant；板载闭环训练把 `sampleMode="fb"` 的Channel作为plant。无论训练来自哪一路，最终性能都应通过独立forward采样评价，避免把反馈接收机自身的失真误认为PA失真。
 - `ILCAnalysisResult.bestInputSignal` 只对当前重复波形直接有效；拟合部署模型后，才能处理独立的新Wi-Fi帧。
 
 ---
@@ -150,6 +154,8 @@ paOutputPowerDbm = 20.0
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": waveform.sampleRateHz,
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
     }
@@ -162,6 +168,67 @@ referenceSignal = channel.GetLastPaInput()
 ```
 
 对调用方公开的工作点是 `paOutputPowerDbm`。20 dBm相对25 dBm额定极限的5 dB回退只作为第一次驱动预设。Channel内部会把重新缩放的输入真正送入 `paModel`，对PA输出的有效Wi-Fi突发测量功率，再更新预设并重试；`GetLastPaInput()` 返回收敛后的PA输入，`GetLastPaOutput()` 返回移相和噪声之前的最后一次PA实测输出。整个过程不对PA输出做后级常数缩放，因此EVM和ACLR反映实际压缩工作点。
+
+#### 4.3.1 前向仪表和板载反馈如何接入ILC
+
+两种采样方式看到的是同一个PA输出，但观测方程不同。理想化的前向仪表采样为：
+
+```math
+z_{\mathrm{forward}}[n]
+=
+y_{\mathrm{PA}}[n]\exp(j\phi_c)+w_{\mathrm{forward}}[n].
+```
+
+板载反馈采样还包含耦合器、反馈接收机和ADC：
+
+```math
+z_{\mathrm{fb}}[n]
+=
+Q_{\mathrm{ADC}}
+\left(
+F_{\mathrm{fb}}
+\left[
+y_{\mathrm{PA}}[n]
+\right]
++w_{\mathrm{fb}}[n]
+\right).
+```
+
+这里 $F_{\mathrm{fb}}$ 代表可配置的反馈FIR、增益/相位、时延、CFO/SFO、I/Q不平衡、DC、三阶非线性和限幅。若直接令ILC满足 $z_{\mathrm{fb}}\approx x$，算法学习的是“PA与反馈接收机组合”的逆，而不一定是PA本身的逆。因此推荐同时建立两个Channel：
+
+```python
+forwardChannel = Channel(
+    paModel=paModel,
+    parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": waveform.sampleRateHz,
+        "noiseSnrDb": 50.0,
+        "width": 0,
+    },
+)
+feedbackChannel = Channel(
+    paModel=paModel,
+    parameters={
+        "sampleMode": "fb",
+        "sampleRateHz": waveform.sampleRateHz,
+        "fbGainDb": -6.0,
+        "fbFirTaps": (1.0 + 0.0j, 0.08 - 0.03j),
+        "fbIntegerDelaySamples": 8,
+        "fbCarrierFrequencyOffsetHz": 1500.0,
+        "fbIqGainImbalanceDb": 0.25,
+        "fbThirdOrderCoefficient": -0.01 + 0.003j,
+        "fbAdcWidth": 14,
+        "noiseSnrDb": 38.0,
+        "width": 0,
+    },
+)
+```
+
+- 仪表闭环ILC：把 `forwardChannel` 作为plant，反馈精度通常更高，但依赖仪表控制和传输时延。
+- 板载闭环ILC：把 `feedbackChannel` 作为plant，实时性更好，但必须校准或补偿反馈接收机非理想。
+- 最终验收：把选中的DPD输入送入同一个PA，再由 `forwardChannel` 采集，并交给Analysis计算EVM、ACLR和功率。
+
+`phaseDegrees` 和三种噪声控制是两条路径的公共参数；所有以 `fb` 开头的参数只在fb模式生效。完整处理次序和参数定义见 [Channel.md](./Channel.md)。
 
 ### 4.4 PA对象接口要求
 
@@ -184,7 +251,7 @@ outputSignal = paModel.Process(inputSignal)
 
 ## 5. 最小可运行SISO示例
 
-工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。示例保留默认GMP的全部主项、滞后项和超前项，但把非线性系数缩放为25%，使20 dBm平均输出在有符号定点转换器范围内可达；这不是放宽功率误差。PA后接入0度移相和10 mV复包络总RMS白噪声的 `Channel`。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
+工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。示例保留默认GMP的全部主项、滞后项和超前项，但把非线性系数缩放为25%，使20 dBm平均输出在有符号定点转换器范围内可达；这不是放宽功率误差。PA后接入 `sampleMode="forward"`、0度移相和10 mV复包络总RMS白噪声的 `Channel`，表示实验室仪表闭环。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
 
 ```python
 from SmallestSISO import RunSisoMode
@@ -236,7 +303,7 @@ V_{\mathrm{out,RMS}}
 
 20 dBm相对25 dBm极限具有5 dB输出回退。提高目标输出功率会提高归一化驱动，把PA推向更深压缩；降低目标输出功率则增加回退量。功率闭环只观测PA有效突发，不观测Channel接收噪声；因此10 mV噪声不会反向改变PA隐藏驱动预设。50%占空比的长关断区不会让PA报告功率额外降低3.01 dB。
 
-ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和实际反馈输出。当plant为 `Channel` 时，该反馈就是经过PA、移相和独立白噪声后的接收波形。运行结束后，直接调用 `resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 计算每轮严格的数据子载波EVM、SNR、ACLR和实际接收功率，禁止替换或缩放 `outputSignal`。若需要在规定dBm工作点复测最佳输入，直接调用 `channel.Process(bestInputSignal, outputPowerDbm=targetPowerDbm)`；Channel内部校准干净PA输出并在收敛后施加链路影响。
+ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和实际反馈输出。当plant为 `Channel` 时，该反馈就是经过PA和 `sampleMode` 所选采样链路后的波形：forward用于仪表闭环，fb用于含板载反馈接收机非理想的闭环。运行结束后，直接调用 `resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 可以观察该训练观测，但最终验收应把最佳输入通过独立forward Channel复测，再计算严格的数据子载波EVM、SNR、ACLR和实际接收功率。禁止为了指标好看而替换或缩放 `outputSignal`。若需要在规定dBm工作点复测最佳输入，调用forward Channel的 `Process(bestInputSignal, outputPowerDbm=targetPowerDbm)`；Channel内部校准干净PA输出并在收敛后施加仪表路径影响。
 
 ---
 
@@ -649,6 +716,8 @@ noiseAwareAnalysis = resultAnalysis.AnalyzeIlcHistory(
 
 理想独立噪声下，平均后的噪声方差为单次测量的 `1/R`。
 
+如果plant已经是配置了 `noiseAmpMv`、`noisePwrDbm` 或 `noiseSnrDb` 的Channel，应把 `ILCConfig.feedbackSnrDb` 保持为 `None`，否则会同时叠加Channel接收噪声和ILC内部抽象反馈噪声。对于板载反馈实验，Channel还可用 `sampleMode="fb"` 加入反馈接收机的确定性非理想；这些非理想不会被 `feedbackAverages` 消除。
+
 ### 10.2 结果解释
 
 - `history` 中的逐轮指标使用当轮含噪平均反馈。
@@ -1016,9 +1085,39 @@ flowchart LR
 
 - 每路使用自己的 `MimoPaChain`。
 - 随机种子按链号递增，避免多路反馈噪声完全相同。
-- 当前不建模PA之间的电耦合或OTA耦合。
+- `Channel` 已能在PA前后模拟线性复FIR耦合，但本函数绕过Channel并逐链调用 `MimoPaChain`，所以该耦合不会进入当前逐链ILC。
 - 每路ILC历史独立保存。
 - 当前逐链ILC会把完整MIMO EVM回调清空，因为单列PA输出不能直接执行空间解映射后的完整EVM计算。
+
+因此必须区分“仿真plant支持耦合”和“算法联合补偿耦合”：
+
+```math
+\mathbf u(n)=\mathbf H_{\mathrm{pre}}(z)\mathbf x(n),
+```
+
+```math
+\mathbf z(n)
+=
+\mathbf H_{\mathrm{post}}(z)
+\mathbf F\{\mathbf u(n)\}.
+```
+
+Channel能够计算这条完整链路，也能在PA前耦合存在时用有限差分功率Jacobian联合校准各PA工作点；但是现有 `RunMimoFrequencyDomainIlc` 仍假设 $\mathbf H_{\mathrm{pre}}$ 和 $\mathbf H_{\mathrm{post}}$ 都是单位对角矩阵。启用耦合后不能用逐链结果宣称已经完成联合MIMO DPD。
+
+真正的联合频域更新需要先估计完整矩阵频响，再计算正则化更新：
+
+```math
+\Delta\mathbf U(k)
+=
+\mu
+\mathbf H^H(k)
+\left[
+\mathbf H(k)\mathbf H^H(k)+\lambda\mathbf I
+\right]^{-1}
+\mathbf E(k).
+```
+
+非线性部署模型还需要加入其他通道包络的交叉基函数。当前版本先保证Doherty、PA前/后耦合、forward/fb观测和联合功率工作点仿真正确，不把尚未实现的联合MIMO ILC隐藏在旧函数名下。
 
 ### 14.2 完整4×2示例
 
@@ -1066,6 +1165,8 @@ mimoPaModel = MimoPaModel(
 channel = Channel(
     paModel=mimoPaModel,
     parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": waveform.sampleRateHz,
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
     }
@@ -1163,7 +1264,7 @@ paInput = channel.GetLastPaInput()
 paOutput = channel.GetLastPaOutput()
 ```
 
-Channel内部会同时更新各列隐藏驱动预设，但必须等待所有PA链的实测输出误差都进入容限才返回。普通用户不需要访问内部 `PowerCalibration`。
+Channel内部会同时更新各列隐藏驱动预设，但必须等待所有PA链的实测输出误差都进入容限才返回。没有PA前耦合时使用逐链括区/二分；存在 `prePaCouplingPaths` 时，默认有限差分估计功率Jacobian并联合更新所有驱动，因为改变一列也可能影响其他PA功率。`outputPowerDbm` 测量点位于PA后耦合之前，保持“每个物理PA自身输出功率”的含义。普通用户不需要访问内部 `PowerCalibration`。
 
 旧接口也允许直接给 `MimoPaModel` 设置绝对输出功率：
 

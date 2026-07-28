@@ -9,7 +9,14 @@ from .utils.WifiMetadata import MCSInfo, WifiWaveform
 from .utils.FrameProcess import BuildCsdPhaseMatrix, FrameProcess
 from .utils.FixedPoint import FixedPoint
 from .lib.ParseWifi import ParsedWifiFrame, ParseWifi
-from .lib.PaModel import GMPPA, MimoPaModel, PaModel, WienerPA
+from .lib.PaModel import (
+    DohertyConfig,
+    DohertyPA,
+    GMPPA,
+    MimoPaModel,
+    PaModel,
+    WienerPA,
+)
 from .utils.SigProc import (
     PowerCalibration,
     SignalOverlapResult,

@@ -1,13 +1,16 @@
 """Power-amplifier behavioral models used by the DPD-ILC simulation.
 
-Callers construct ``PaModel`` with ``modelName="wiener"`` or
-``modelName="gmp"`` and then call ``Process``. Two nonlinear model families
-are provided internally:
+Callers construct ``PaModel`` with ``modelName="wiener"``, ``"gmp"``, or
+``"doherty"`` and then call ``Process``. Three nonlinear model families are
+provided internally:
 
 * ``WienerPA`` applies a linear memory filter followed by a smooth Rapp
   AM-AM characteristic and a saturating AM-PM characteristic.
 * ``GMPPA`` implements the generalized memory polynomial main, lagging,
   and leading cross terms described in the project theory document.
+* ``DohertyPA`` combines independently configurable carrier and peaking
+  behavioral branches with envelope-dependent peaking turn-on, branch delay,
+  complex combining, and simplified load modulation.
 
 ``PaModel`` accepts one complex stream. ``MimoPaModel`` owns one independent
 ``PaModel`` per transmit chain, accepts a samples-by-chains matrix, and applies
@@ -296,8 +299,306 @@ class GMPPA:
         )
 
 
+@dataclass(frozen=True)
+class DohertyConfig:
+    """Configure a behavioral carrier-plus-peaking Doherty architecture."""
+
+    carrierModelName: str = "wiener"
+    peakingModelName: str = "wiener"
+    carrierWienerConfig: Optional[WienerConfig] = None
+    carrierGmpConfig: Optional[GMPConfig] = None
+    peakingWienerConfig: Optional[WienerConfig] = None
+    peakingGmpConfig: Optional[GMPConfig] = None
+    carrierInputGain: float = 1.0
+    peakingInputGain: float = 1.0
+    peakingTurnOnAmplitude: float = 0.45
+    peakingTransitionWidth: float = 0.15
+    carrierCombineCoefficient: complex = 1.0 + 0.0j
+    peakingCombineCoefficient: complex = 0.50 + 0.0j
+    peakingDelaySamples: int = 0
+    loadModulationStrength: float = 0.10
+
+    def Validate(self) -> None:
+        """Validate both branch families and all Doherty physical controls.
+
+        Processing details:
+            Algorithm: Normalize each branch name, require Wiener or GMP,
+            type-check optional branch configurations, and reject nonfinite,
+            nonpositive, or unsupported envelope, delay, gain, combining, and
+            load-modulation settings before either PA branch is constructed.
+
+        Returns:
+            result: None. Invalid architecture settings raise an exception.
+        """
+
+        for branchName, modelName in (
+            ("carrierModelName", self.carrierModelName),
+            ("peakingModelName", self.peakingModelName),
+        ):
+            if not isinstance(modelName, str):
+                raise TypeError(f"{branchName} must be a string")
+            if modelName.strip().lower() not in ("wiener", "gmp"):
+                raise ValueError(
+                    f"{branchName} must be either 'wiener' or 'gmp'"
+                )
+        for configName, branchConfig, expectedType in (
+            (
+                "carrierWienerConfig",
+                self.carrierWienerConfig,
+                WienerConfig,
+            ),
+            ("carrierGmpConfig", self.carrierGmpConfig, GMPConfig),
+            (
+                "peakingWienerConfig",
+                self.peakingWienerConfig,
+                WienerConfig,
+            ),
+            ("peakingGmpConfig", self.peakingGmpConfig, GMPConfig),
+        ):
+            if branchConfig is not None and not isinstance(
+                branchConfig, expectedType
+            ):
+                raise TypeError(
+                    f"{configName} must be a {expectedType.__name__} "
+                    "or None"
+                )
+        for gainName, gainValue in (
+            ("carrierInputGain", self.carrierInputGain),
+            ("peakingInputGain", self.peakingInputGain),
+        ):
+            if (
+                not isinstance(gainValue, (int, float))
+                or isinstance(gainValue, bool)
+                or not np.isfinite(gainValue)
+                or float(gainValue) <= 0.0
+            ):
+                raise ValueError(f"{gainName} must be finite and positive")
+        if (
+            not isinstance(self.peakingTurnOnAmplitude, (int, float))
+            or isinstance(self.peakingTurnOnAmplitude, bool)
+            or not np.isfinite(self.peakingTurnOnAmplitude)
+            or float(self.peakingTurnOnAmplitude) <= 0.0
+        ):
+            raise ValueError(
+                "peakingTurnOnAmplitude must be finite and positive"
+            )
+        if (
+            not isinstance(self.peakingTransitionWidth, (int, float))
+            or isinstance(self.peakingTransitionWidth, bool)
+            or not np.isfinite(self.peakingTransitionWidth)
+            or float(self.peakingTransitionWidth) <= 0.0
+        ):
+            raise ValueError(
+                "peakingTransitionWidth must be finite and positive"
+            )
+        for coefficientName, coefficientValue in (
+            (
+                "carrierCombineCoefficient",
+                self.carrierCombineCoefficient,
+            ),
+            (
+                "peakingCombineCoefficient",
+                self.peakingCombineCoefficient,
+            ),
+        ):
+            if not isinstance(
+                coefficientValue, (int, float, complex)
+            ) or isinstance(coefficientValue, bool):
+                raise TypeError(
+                    f"{coefficientName} must be a finite complex scalar"
+                )
+            complexCoefficient = complex(coefficientValue)
+            if not (
+                np.isfinite(complexCoefficient.real)
+                and np.isfinite(complexCoefficient.imag)
+            ):
+                raise ValueError(f"{coefficientName} must be finite")
+        if (
+            abs(complex(self.carrierCombineCoefficient))
+            <= np.finfo(float).tiny
+        ):
+            raise ValueError(
+                "carrierCombineCoefficient cannot be zero"
+            )
+        if (
+            not isinstance(self.peakingDelaySamples, int)
+            or isinstance(self.peakingDelaySamples, bool)
+            or self.peakingDelaySamples < 0
+        ):
+            raise ValueError(
+                "peakingDelaySamples must be a nonnegative integer"
+            )
+        if (
+            not isinstance(self.loadModulationStrength, (int, float))
+            or isinstance(self.loadModulationStrength, bool)
+            or not np.isfinite(self.loadModulationStrength)
+            or float(self.loadModulationStrength) < 0.0
+        ):
+            raise ValueError(
+                "loadModulationStrength must be finite and nonnegative"
+            )
+
+
+class DohertyPA:
+    """Model a behavioral Doherty carrier and envelope-gated peaking PA."""
+
+    def __init__(
+        self, config: DohertyConfig = DohertyConfig()
+    ) -> None:
+        """Construct independently configurable carrier and peaking branches.
+
+        Processing details:
+            Algorithm: Validate the architecture, construct a Wiener or GMP
+            behavioral model for each branch, and retain the immutable
+            envelope-gating, combining, branch-delay, and load-modulation
+            controls used by every waveform evaluation.
+
+        Args:
+            config: Doherty architecture and branch-model configuration.
+
+        Returns:
+            result: None. Both nonlinear branches are ready for processing.
+        """
+
+        config.Validate()
+        self.config = config
+        self.carrierModel = self.BuildBranchModel(
+            config.carrierModelName,
+            config.carrierWienerConfig,
+            config.carrierGmpConfig,
+        )
+        self.peakingModel = self.BuildBranchModel(
+            config.peakingModelName,
+            config.peakingWienerConfig,
+            config.peakingGmpConfig,
+        )
+
+    @staticmethod
+    def BuildBranchModel(
+        modelName: str,
+        wienerConfig: Optional[WienerConfig],
+        gmpConfig: Optional[GMPConfig],
+    ) -> Any:
+        """Construct one validated Wiener or GMP Doherty branch.
+
+        Processing details:
+            Algorithm: Normalize the already validated family name and select
+            the matching branch configuration, falling back to that family's
+            immutable built-in defaults when the optional object is None.
+
+        Args:
+            modelName: Branch family name, either Wiener or GMP.
+            wienerConfig: Optional Wiener settings for this branch.
+            gmpConfig: Optional GMP settings for this branch.
+
+        Returns:
+            result: WienerPA or GMPPA object exposing Process and gain methods.
+        """
+
+        if modelName.strip().lower() == "wiener":
+            return WienerPA(
+                WienerConfig() if wienerConfig is None else wienerConfig
+            )
+        return GMPPA(GMPConfig() if gmpConfig is None else gmpConfig)
+
+    def PeakingActivation(
+        self, inputMagnitude: np.ndarray
+    ) -> np.ndarray:
+        """Return the smooth envelope-dependent peaking turn-on factor.
+
+        Processing details:
+            Algorithm: Map magnitudes below ``peakingTurnOnAmplitude`` to
+            zero, transition over ``peakingTransitionWidth``, clamp to one,
+            and apply the cubic smooth-step polynomial so branch derivatives
+            remain continuous at both transition endpoints.
+
+        Args:
+            inputMagnitude: Nonnegative input-envelope magnitude array.
+
+        Returns:
+            result: Real activation array in the closed interval zero to one.
+        """
+
+        transitionPosition = (
+            np.asarray(inputMagnitude, dtype=float)
+            - float(self.config.peakingTurnOnAmplitude)
+        ) / float(self.config.peakingTransitionWidth)
+        clippedPosition = np.clip(transitionPosition, 0.0, 1.0)
+        return (
+            clippedPosition**2
+            * (3.0 - 2.0 * clippedPosition)
+        )
+
+    def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Evaluate carrier, peaking turn-on, load modulation, and combining.
+
+        Processing details:
+            Algorithm: Drive the carrier continuously, gate the peaking input
+            with the smooth envelope activation, evaluate both nonlinear
+            behavioral branches, delay the peaking output, multiply the
+            carrier by an activation-dependent load-modulation factor, and
+            coherently combine both complex outputs without changing length.
+
+        Args:
+            inputSignal: One-dimensional normalized complex input waveform.
+
+        Returns:
+            result: Combined normalized Doherty PA output waveform.
+        """
+
+        complexInput = AsComplexVector(inputSignal)
+        activation = self.PeakingActivation(np.abs(complexInput))
+        carrierInput = (
+            float(self.config.carrierInputGain) * complexInput
+        )
+        peakingInput = (
+            float(self.config.peakingInputGain)
+            * activation
+            * complexInput
+        )
+        carrierOutput = self.carrierModel.Process(carrierInput)
+        peakingOutput = DelaySignal(
+            self.peakingModel.Process(peakingInput),
+            self.config.peakingDelaySamples,
+        )
+        carrierLoadFactor = (
+            1.0
+            + float(self.config.loadModulationStrength) * activation
+        )
+        combinedOutput = (
+            complex(self.config.carrierCombineCoefficient)
+            * carrierLoadFactor
+            * carrierOutput
+            + complex(self.config.peakingCombineCoefficient)
+            * peakingOutput
+        )
+        if not np.all(np.isfinite(combinedOutput)):
+            raise ValueError(
+                "Doherty branch combination exceeded the numeric range"
+            )
+        return np.asarray(combinedOutput, dtype=np.complex128)
+
+    def SmallSignalGain(self) -> complex:
+        """Return the low-power gain while the peaking branch is disabled.
+
+        Processing details:
+            Algorithm: At the origin the peaking activation and simplified
+            load modulation are zero, so multiply only the carrier branch's
+            small-signal gain by its input and complex combining coefficients.
+
+        Returns:
+            result: Complex carrier-path small-signal gain.
+        """
+
+        return complex(
+            complex(self.config.carrierCombineCoefficient)
+            * float(self.config.carrierInputGain)
+            * self.carrierModel.SmallSignalGain()
+        )
+
+
 class PaModel:
-    """Configure and operate one Wiener or GMP nonlinear PA model.
+    """Configure and operate one Wiener, GMP, or Doherty nonlinear PA model.
 
     The facade gives every caller the same object-oriented construction and
     processing interface while retaining the dedicated model implementations.
@@ -312,6 +613,7 @@ class PaModel:
         modelName: Optional[str] = None,
         wienerConfig: Optional[WienerConfig] = None,
         gmpConfig: Optional[GMPConfig] = None,
+        dohertyConfig: Optional[DohertyConfig] = None,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
         **parameterOverrides: object,
@@ -327,6 +629,7 @@ class PaModel:
             modelName: Selected PA model family name.
             wienerConfig: Optional Wiener configuration; None selects built-in values.
             gmpConfig: Optional GMP configuration; None selects built-in values.
+            dohertyConfig: Optional carrier/peaking Doherty configuration.
             parameters: Optional external mapping layered ahead of the built-in defaults.
             width: Optional external I/Q width. None selects the internal
                 16-bit default, zero selects floating point, and a positive
@@ -342,6 +645,7 @@ class PaModel:
                 "modelName": "wiener",
                 "wienerConfig": None,
                 "gmpConfig": None,
+                "dohertyConfig": None,
                 "width": 16,
             }
         )
@@ -352,6 +656,8 @@ class PaModel:
             directOverrides["wienerConfig"] = wienerConfig
         if gmpConfig is not None:
             directOverrides["gmpConfig"] = gmpConfig
+        if dohertyConfig is not None:
+            directOverrides["dohertyConfig"] = dohertyConfig
         if width is not None:
             directOverrides["width"] = width
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -377,7 +683,12 @@ class PaModel:
         )
         self.model = None
         self._activeConfiguration: Optional[
-            Tuple[str, Optional[WienerConfig], Optional[GMPConfig]]
+            Tuple[
+                str,
+                Optional[WienerConfig],
+                Optional[GMPConfig],
+                Optional[DohertyConfig],
+            ]
         ] = None
         self.SynchronizeModel()
 
@@ -392,7 +703,7 @@ class PaModel:
             result: str. The computed value described by the summary, with documented units, shape, and normalization.
         """
 
-        normalizedName, _, _ = self.ResolveConfiguration()
+        normalizedName, _, _, _ = self.ResolveConfiguration()
         return normalizedName
 
     modelName = ModelName
@@ -455,7 +766,12 @@ class PaModel:
 
     def ResolveConfiguration(
         self,
-    ) -> Tuple[str, Optional[WienerConfig], Optional[GMPConfig]]:
+    ) -> Tuple[
+        str,
+        Optional[WienerConfig],
+        Optional[GMPConfig],
+        Optional[DohertyConfig],
+    ]:
         """Validate and return the currently resolved PA configuration.
 
         Processing details:
@@ -469,8 +785,10 @@ class PaModel:
         if not isinstance(rawModelName, str):
             raise TypeError("modelName must be a string")
         normalizedName = rawModelName.strip().lower()
-        if normalizedName not in ("wiener", "gmp"):
-            raise ValueError("modelName must be either 'wiener' or 'gmp'")
+        if normalizedName not in ("wiener", "gmp", "doherty"):
+            raise ValueError(
+                "modelName must be 'wiener', 'gmp', or 'doherty'"
+            )
 
         rawWienerConfig = self.parameters["wienerConfig"]
         if rawWienerConfig is not None and not isinstance(
@@ -482,11 +800,19 @@ class PaModel:
             rawGmpConfig, GMPConfig
         ):
             raise TypeError("gmpConfig must be a GMPConfig or None")
+        rawDohertyConfig = self.parameters["dohertyConfig"]
+        if rawDohertyConfig is not None and not isinstance(
+            rawDohertyConfig, DohertyConfig
+        ):
+            raise TypeError(
+                "dohertyConfig must be a DohertyConfig or None"
+            )
         FixedPoint(self.width)
         return (
             normalizedName,
             cast(Optional[WienerConfig], rawWienerConfig),
             cast(Optional[GMPConfig], rawGmpConfig),
+            cast(Optional[DohertyConfig], rawDohertyConfig),
         )
 
     def SynchronizeModel(self) -> None:
@@ -502,14 +828,25 @@ class PaModel:
         selectedConfiguration = self.ResolveConfiguration()
         if selectedConfiguration == self._activeConfiguration:
             return
-        normalizedName, wienerConfig, gmpConfig = selectedConfiguration
+        (
+            normalizedName,
+            wienerConfig,
+            gmpConfig,
+            dohertyConfig,
+        ) = selectedConfiguration
         if normalizedName == "wiener":
             selectedModel = WienerPA(
                 WienerConfig() if wienerConfig is None else wienerConfig
             )
-        else:
+        elif normalizedName == "gmp":
             selectedModel = GMPPA(
                 GMPConfig() if gmpConfig is None else gmpConfig
+            )
+        else:
+            selectedModel = DohertyPA(
+                DohertyConfig()
+                if dohertyConfig is None
+                else dohertyConfig
             )
         self.model = selectedModel
         self._activeConfiguration = selectedConfiguration
@@ -541,9 +878,10 @@ class PaModel:
 
         Processing details:
             Algorithm: Validate finite normalized complex samples and pass
-            them to the active Wiener or GMP calculation without applying the
-            public fixed-point encoding. This method is used by internal
-            algorithms such as ILC after they have crossed the public boundary.
+            them to the active Wiener, GMP, or Doherty calculation without
+            applying the public fixed-point encoding. This method is used by
+            internal algorithms such as ILC after they have crossed the public
+            boundary.
 
         Args:
             inputSignal: Normalized physical complex samples of any shape.
@@ -577,11 +915,12 @@ class PaModel:
 class MimoPaModel:
     """Operate independent nonlinear PA models on all transmit chains.
 
-    Each chain can select its own Wiener/GMP configuration, input drive,
-    relative output power, and optional absolute output-power target in dBm.
-    A legacy RMS-voltage target remains available for compatibility. The class
-    intentionally does not add electrical crosstalk; a coupled MIMO PA can be
-    introduced later without changing the samples-by-chains interface.
+    Each chain can select its own Wiener, GMP, or Doherty configuration, input
+    drive, relative output power, and optional absolute output-power target in
+    dBm. A legacy RMS-voltage target remains available for compatibility.
+    This class intentionally owns only the independent nonlinear PA bank;
+    ``Channel`` applies configurable coupling before and after this bank while
+    preserving the same samples-by-chains interface.
     """
 
     def __init__(
@@ -1058,6 +1397,58 @@ class MimoPaModel:
             )
         outputMatrix = np.column_stack(outputColumns)
         self.lastOutputRmsPerChain = tuple(outputRmsValues)
+        if inputWasVector and self.numTransmitChains == 1:
+            return outputMatrix[:, 0]
+        return outputMatrix
+
+    def ProcessFloating(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Evaluate every PA chain without public fixed-point conversion.
+
+        Processing details:
+            Algorithm: Validate a normalized samples-by-chains matrix, call
+            each independently configured PA's floating processing path,
+            update the most recent per-chain RMS diagnostics, and preserve a
+            SISO vector only when the configured PA bank has one chain.
+
+        Args:
+            inputSignal: Normalized vector or samples-by-chains matrix.
+
+        Returns:
+            result: Same-orientation floating PA-bank output.
+        """
+
+        self.SynchronizeModels()
+        complexInput = np.asarray(
+            inputSignal, dtype=np.complex128
+        )
+        inputWasVector = complexInput.ndim == 1
+        inputMatrix = (
+            complexInput.reshape(-1, 1)
+            if inputWasVector
+            else complexInput
+        )
+        if (
+            inputMatrix.ndim != 2
+            or inputMatrix.shape[1] != self.numTransmitChains
+            or inputMatrix.shape[0] == 0
+            or not np.all(np.isfinite(inputMatrix))
+        ):
+            raise ValueError(
+                "inputSignal must have one finite column per transmit chain"
+            )
+        outputColumns = [
+            self.ProcessChainFloating(
+                inputMatrix[:, chainIndex], chainIndex
+            )
+            for chainIndex in range(self.numTransmitChains)
+        ]
+        outputMatrix = np.column_stack(outputColumns)
+        self.lastOutputRmsPerChain = tuple(
+            float(np.sqrt(np.mean(np.abs(outputColumn) ** 2)))
+            for outputColumn in outputColumns
+        )
         if inputWasVector and self.numTransmitChains == 1:
             return outputMatrix[:, 0]
         return outputMatrix

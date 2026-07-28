@@ -70,6 +70,9 @@ class PowerCalibration:
                 "maximumCalibrationIterations": 60,
                 "calibrationLearningRate": 0.8,
                 "maximumDriveAdjustmentDb": 6.0,
+                "enableJointCalibration": False,
+                "calibrationProbeStepDb": 0.05,
+                "calibrationRegularization": 1.0e-6,
                 "activePowerThresholdDb": -60.0,
                 "activeGapToleranceSamples": 16,
                 "width": 16,
@@ -361,6 +364,35 @@ class PowerCalibration:
             raise ValueError(
                 "maximumDriveAdjustmentDb must be finite and positive"
             )
+        enableJointCalibration = self.parameters[
+            "enableJointCalibration"
+        ]
+        if not isinstance(enableJointCalibration, bool):
+            raise TypeError("enableJointCalibration must be a boolean")
+        calibrationProbeStepDb = self.parameters[
+            "calibrationProbeStepDb"
+        ]
+        if (
+            not isinstance(calibrationProbeStepDb, (int, float))
+            or isinstance(calibrationProbeStepDb, bool)
+            or not np.isfinite(calibrationProbeStepDb)
+            or float(calibrationProbeStepDb) <= 0.0
+        ):
+            raise ValueError(
+                "calibrationProbeStepDb must be finite and positive"
+            )
+        calibrationRegularization = self.parameters[
+            "calibrationRegularization"
+        ]
+        if (
+            not isinstance(calibrationRegularization, (int, float))
+            or isinstance(calibrationRegularization, bool)
+            or not np.isfinite(calibrationRegularization)
+            or float(calibrationRegularization) <= 0.0
+        ):
+            raise ValueError(
+                "calibrationRegularization must be finite and positive"
+            )
         FixedPoint(self.width)
 
     def SetPaModel(self, paModel: Any) -> None:
@@ -568,51 +600,15 @@ class PowerCalibration:
         bestMaximumErrorDb = np.inf
 
         for iterationIndex in range(maximumIterations):
-            driveScale = np.power(10.0, driveDb / 20.0)
-            trialInputMatrix = (
-                normalizedInput * driveScale.reshape(1, -1)
-            )
-            publicTrialInputMatrix = interfaceFormat.EncodeComplex(
-                trialInputMatrix
-            )
-            publicTrialInput = (
-                publicTrialInputMatrix[:, 0]
-                if inputWasVector
-                else publicTrialInputMatrix
-            )
-            publicPaOutput = np.asarray(
-                self._paProcessMethod(publicTrialInput),
-                dtype=np.complex128,
-            )
-            floatingPaOutput = interfaceFormat.DecodeComplex(
-                publicPaOutput
-            )
-            if floatingPaOutput.ndim == 1:
-                outputMatrix = floatingPaOutput.reshape(-1, 1)
-            elif floatingPaOutput.ndim == 2:
-                outputMatrix = floatingPaOutput
-            else:
-                raise ValueError(
-                    "paModel.Process must return a vector or matrix"
-                )
-            if (
-                outputMatrix.shape[0] == 0
-                or outputMatrix.shape[1] != chainCount
-                or not np.all(np.isfinite(outputMatrix))
-            ):
-                raise ValueError(
-                    "paModel.Process returned invalid chain dimensions "
-                    "or nonfinite samples"
-                )
-            outputRmsPerChain = self.CalculateActiveRmsPerChain(
-                outputMatrix
-            )
-            measuredPowerArray = np.asarray(
-                [
-                    self.NormalizedRmsToOutputPowerDbm(outputRms)
-                    for outputRms in outputRmsPerChain
-                ],
-                dtype=float,
+            (
+                publicTrialInput,
+                publicPaOutput,
+                measuredPowerArray,
+            ) = self.EvaluateDrivePreset(
+                normalizedInput,
+                driveDb,
+                inputWasVector,
+                interfaceFormat,
             )
             errorDb = targetPowerArray - measuredPowerArray
             maximumErrorDb = float(np.max(np.abs(errorDb)))
@@ -634,6 +630,54 @@ class PowerCalibration:
                     iterationIndex + 1
                 )
                 return publicTrialInput
+
+            if (
+                bool(self.parameters["enableJointCalibration"])
+                and chainCount > 1
+            ):
+                probeStepDb = float(
+                    self.parameters["calibrationProbeStepDb"]
+                )
+                powerJacobian = np.empty(
+                    (chainCount, chainCount), dtype=float
+                )
+                for driveIndex in range(chainCount):
+                    probeDriveDb = driveDb.copy()
+                    probeDriveDb[driveIndex] += probeStepDb
+                    _, _, probePowerArray = self.EvaluateDrivePreset(
+                        normalizedInput,
+                        probeDriveDb,
+                        inputWasVector,
+                        interfaceFormat,
+                    )
+                    powerJacobian[:, driveIndex] = (
+                        probePowerArray - measuredPowerArray
+                    ) / probeStepDb
+                regularization = float(
+                    self.parameters["calibrationRegularization"]
+                )
+                normalMatrix = (
+                    powerJacobian.T @ powerJacobian
+                    + regularization * np.eye(chainCount)
+                )
+                normalVector = powerJacobian.T @ errorDb
+                try:
+                    jointAdjustmentDb = np.linalg.solve(
+                        normalMatrix, normalVector
+                    )
+                except np.linalg.LinAlgError:
+                    jointAdjustmentDb = np.linalg.lstsq(
+                        normalMatrix,
+                        normalVector,
+                        rcond=None,
+                    )[0]
+                jointAdjustmentDb = np.clip(
+                    learningRate * jointAdjustmentDb,
+                    -maximumAdjustmentDb,
+                    maximumAdjustmentDb,
+                )
+                driveDb = driveDb + jointAdjustmentDb
+                continue
 
             measuredTooLow = errorDb > 0.0
             lowerDriveDb = np.where(
@@ -664,6 +708,101 @@ class PowerCalibration:
             "closed-loop PA power calibration did not converge within "
             f"{maximumIterations} iterations; best error was "
             f"{bestMaximumErrorDb:.3f} dB"
+        )
+
+    def EvaluateDrivePreset(
+        self,
+        normalizedInput: np.ndarray,
+        driveDb: np.ndarray,
+        inputWasVector: bool,
+        interfaceFormat: FixedPoint,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Run one candidate drive vector and measure every output power.
+
+        Processing details:
+            Algorithm: Apply the candidate dB drive independently to each
+            normalized input column, cross the configured public fixed-point
+            boundary once, execute the bound PA or coupled-plant callback,
+            validate its chain dimensions, and convert active-region output
+            RMS values into the configured absolute dBm reference.
+
+        Args:
+            normalizedInput: Unit-active-RMS samples-by-chain matrix.
+            driveDb: Candidate input drive in dB for every matrix column.
+            inputWasVector: Whether the original public input was SISO.
+            interfaceFormat: Validated public fixed-point boundary converter.
+
+        Returns:
+            result: Public trial input, public plant output, and measured dBm
+                vector in physical chain order.
+        """
+
+        if self._paProcessMethod is None:
+            raise RuntimeError(
+                "EvaluateDrivePreset requires a bound PA model"
+            )
+        inputMatrix = np.asarray(
+            normalizedInput, dtype=np.complex128
+        )
+        driveVector = np.asarray(driveDb, dtype=float).reshape(-1)
+        if (
+            inputMatrix.ndim != 2
+            or inputMatrix.shape[1] != driveVector.size
+            or inputMatrix.shape[0] == 0
+        ):
+            raise ValueError(
+                "normalizedInput and driveDb must contain matching chains"
+            )
+        driveScale = np.power(10.0, driveVector / 20.0)
+        trialInputMatrix = (
+            inputMatrix * driveScale.reshape(1, -1)
+        )
+        publicTrialInputMatrix = interfaceFormat.EncodeComplex(
+            trialInputMatrix
+        )
+        publicTrialInput = (
+            publicTrialInputMatrix[:, 0]
+            if inputWasVector
+            else publicTrialInputMatrix
+        )
+        publicPaOutput = np.asarray(
+            self._paProcessMethod(publicTrialInput),
+            dtype=np.complex128,
+        )
+        floatingPaOutput = interfaceFormat.DecodeComplex(
+            publicPaOutput
+        )
+        if floatingPaOutput.ndim == 1:
+            outputMatrix = floatingPaOutput.reshape(-1, 1)
+        elif floatingPaOutput.ndim == 2:
+            outputMatrix = floatingPaOutput
+        else:
+            raise ValueError(
+                "paModel.Process must return a vector or matrix"
+            )
+        if (
+            outputMatrix.shape[0] == 0
+            or outputMatrix.shape[1] != driveVector.size
+            or not np.all(np.isfinite(outputMatrix))
+        ):
+            raise ValueError(
+                "paModel.Process returned invalid chain dimensions "
+                "or nonfinite samples"
+            )
+        outputRmsPerChain = self.CalculateActiveRmsPerChain(
+            outputMatrix
+        )
+        measuredPowerArray = np.asarray(
+            [
+                self.NormalizedRmsToOutputPowerDbm(outputRms)
+                for outputRms in outputRmsPerChain
+            ],
+            dtype=float,
+        )
+        return (
+            np.asarray(publicTrialInput, dtype=np.complex128),
+            np.asarray(publicPaOutput, dtype=np.complex128),
+            measuredPowerArray,
         )
 
     def DbmToRms(self, powerDbm: float) -> float:
