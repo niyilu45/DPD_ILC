@@ -475,7 +475,7 @@ processingResult = resultAnalysis.GetLastSignalProcessingResult()
 
 ## 13. PA输出dBm、输出回退与复包络标定
 
-`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它负责dBm/RMS换算、根据额定输出功率产生第一次输入驱动预设，并闭环调整PA输入；PA非线性仍由绑定的PA模型或仪表实现。它不会在PA输出端乘常数增益来伪造目标功率。
+`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它负责dBm/RMS换算、根据额定输出功率产生第一次输入驱动预设，并闭环调整PA输入；PA非线性仍由绑定的PA模型或仪表实现。它不会在PA输出端乘常数增益来伪造目标功率。普通业务代码不需要主动构造该类；推荐通过 `Channel.Process(rawSignal, outputPowerDbm=...)` 使用，Channel在内部组合本工具。
 
 工程约定复包络 RMS 幅度等于纯电阻端口上的 RF RMS 电压。设端口电阻为 $R$，RMS 电压为 $V_{\mathrm{RMS}}$，则端口平均功率为
 
@@ -525,7 +525,7 @@ flowchart LR
     error --> preset
 ```
 
-**图 3 说明：**`PowerCalibration` 为主程序、`PaModel`、`Analysis` 和 Benchmark 提供同一个端口阻抗基准。箭头回路表示每次都重新生成PA输入并重新观测实际PA输出，而不是对已有输出做离线缩放。它位于 `SigProc.py` 后，`Analysis` 不再需要为了功率换算而导入 `PaModel.py`。其 `ChainMap` 参数同样遵循“未知键警告并忽略、已识别非法值继续报错”的规则。
+**图 3 说明：**`PowerCalibration` 为Channel、主程序、`Analysis` 和 Benchmark 提供同一个端口阻抗基准。箭头回路表示每次都重新生成PA输入并重新观测实际PA输出，而不是对已有输出做离线缩放。业务用户只看见Channel的“原始波形+目标dBm”接口；该工具位于 `SigProc.py` 后，`Analysis` 不再需要为了功率换算而导入 `PaModel.py`。其 `ChainMap` 参数同样遵循“未知键警告并忽略、已识别非法值继续报错”的规则。
 
 默认每路PA极限输出功率为
 
@@ -545,7 +545,7 @@ a=10^{-\mathrm{OBO}/20}.
 
 默认20 dBm工作点对应5 dB名义回退和 $a\approx0.5623$。这个数只作为闭环第一次试探的驱动预设，不能假定经过非线性PA后一定正好得到20 dBm。
 
-`Calibrate(inputSignal)` 是推荐的统一公开入口。构造 `PowerCalibration` 时绑定具有 `Process(inputSignal)` 接口的PA模型或仪表适配器，并把目标功率写入 `parameters`。函数内部重复执行“生成PA输入—实际激励PA—测量有效突发功率—更新隐藏预设”，直到每一路误差均不超过 `calibrationToleranceDb`。调用方只传原始波形，不需要读写每轮驱动预设。
+`Calibrate(inputSignal)` 是底层校准器的统一入口。Channel内部构造 `PowerCalibration`、绑定具有 `Process(inputSignal)` 接口的PA模型或仪表适配器，并把调用 `Channel.Process` 时给出的目标功率写入该工具。函数内部重复执行“生成PA输入—实际激励PA—测量有效突发功率—更新隐藏预设”，直到每一路误差均不超过 `calibrationToleranceDb`。普通用户只传原始波形与目标dBm，不需要感知该调用或读写每轮驱动预设。
 
 闭环返回的是最终PA输入波形；`GetLastPaOutput()` 返回收敛判定所使用的最后一次PA实测输出。代码不会在PA后把输出乘常数来伪造目标dBm，因此AM-AM压缩、AM-PM、EVM和ACLR均对应真实驱动工作点。`outputPowerDbmPerChain` 不为 `None` 时逐列独立闭环，否则所有链使用共同的 `outputPowerDbm`。
 

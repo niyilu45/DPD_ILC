@@ -25,13 +25,12 @@
 
 ```mermaid
 flowchart LR
-    power["用户配置PA输出功率 dBm"] --> calibration["PowerCalibration<br/>相对25 dBm极限计算输出回退"]
-    wave["WaveGenWifi.Generate<br/>生成SISO或MIMO Wi-Fi参考信号"] --> scale["按归一化驱动比例缩放"]
-    calibration --> scale
-    scale --> reference["referenceSignal<br/>期望PA输出及ILC初始输入"]
-    reference --> baseline["PaModel.Process<br/>未补偿baseline"]
+    power["用户配置PA输出功率 dBm"] --> channelCalibration["Channel.Process内部功率闭环"]
+    wave["WaveGenWifi.Generate<br/>生成SISO或MIMO Wi-Fi原始信号"] --> channelCalibration
+    pa["PaModel或MimoPaModel"] --> channelCalibration
+    channelCalibration --> reference["Channel.GetLastPaInput<br/>期望PA输出及ILC初始输入"]
+    channelCalibration --> baseline["Channel返回未补偿baseline"]
     reference --> ilc["DpdIlc中的Run...Ilc"]
-    pa["PaModel或MimoPaModel"] --> baseline
     pa --> ilc
     config["ILCConfig<br/>仅含算法和反馈参数"] --> ilc
     ilc --> learned["ILCResult.learnedInput<br/>LC-NMSE最佳轮输入"]
@@ -141,26 +140,28 @@ chainSignal = referenceSignal[:, chainIndex]
 1. 它是期望PA输出的时域参考；
 2. 它是第1轮ILC的初始PA输入，随后每轮在其基础上学习校正量。
 
-通常先让 `WaveGenWifi` 生成单位RMS波形，再设置工作点：
+通常先让 `WaveGenWifi` 生成原始波形，再把波形和工作点直接交给Channel。调用方不需要创建功率校准器：
 
 ```python
-from inc.utils.SigProc import PowerCalibration
+from inc.lib.Channel import Channel
 
 waveform = wifiGenerator.Generate()
 paOutputPowerDbm = 20.0
-powerCalibration = PowerCalibration(
+channel = Channel(
     paModel=paModel,
     parameters={
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
-        "outputPowerDbm": paOutputPowerDbm,
     }
 )
-referenceSignal = powerCalibration.Calibrate(waveform.samples)
-baselineOutput = powerCalibration.GetLastPaOutput()
+baselineOutput = channel.Process(
+    waveform.samples,
+    outputPowerDbm=paOutputPowerDbm,
+)
+referenceSignal = channel.GetLastPaInput()
 ```
 
-对调用方公开的工作点是 `paOutputPowerDbm`。20 dBm相对25 dBm额定极限的5 dB回退只作为第一次驱动预设。`Calibrate` 会把重新生成的输入真正送入 `paModel`，对PA输出的有效Wi-Fi突发测量功率，再在内部更新预设并重试；返回值是收敛后的PA输入，最后一次实测输出由 `GetLastPaOutput()` 取得。整个过程不对PA输出做后级常数缩放，因此EVM和ACLR反映实际压缩工作点。
+对调用方公开的工作点是 `paOutputPowerDbm`。20 dBm相对25 dBm额定极限的5 dB回退只作为第一次驱动预设。Channel内部会把重新缩放的输入真正送入 `paModel`，对PA输出的有效Wi-Fi突发测量功率，再更新预设并重试；`GetLastPaInput()` 返回收敛后的PA输入，`GetLastPaOutput()` 返回移相和噪声之前的最后一次PA实测输出。整个过程不对PA输出做后级常数缩放，因此EVM和ACLR反映实际压缩工作点。
 
 ### 4.4 PA对象接口要求
 
@@ -235,7 +236,7 @@ V_{\mathrm{out,RMS}}
 
 20 dBm相对25 dBm极限具有5 dB输出回退。提高目标输出功率会提高归一化驱动，把PA推向更深压缩；降低目标输出功率则增加回退量。功率闭环只观测PA有效突发，不观测Channel接收噪声；因此10 mV噪声不会反向改变PA隐藏驱动预设。50%占空比的长关断区不会让PA报告功率额外降低3.01 dB。
 
-ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和实际反馈输出。当plant为 `Channel` 时，该反馈就是经过PA、移相和独立白噪声后的接收波形。运行结束后，直接调用 `resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 计算每轮严格的数据子载波EVM、SNR、ACLR和实际接收功率，禁止替换或缩放 `outputSignal`。若需要在规定dBm工作点复测最佳输入，应先把该输入交给绑定PA的 `PowerCalibration.Calibrate`，从 `GetLastPaOutput()` 取得闭环收敛的干净PA输出，再调用 `Channel.ProcessPaOutput` 得到接收波形。
+ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和实际反馈输出。当plant为 `Channel` 时，该反馈就是经过PA、移相和独立白噪声后的接收波形。运行结束后，直接调用 `resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 计算每轮严格的数据子载波EVM、SNR、ACLR和实际接收功率，禁止替换或缩放 `outputSignal`。若需要在规定dBm工作点复测最佳输入，直接调用 `channel.Process(bestInputSignal, outputPowerDbm=targetPowerDbm)`；Channel内部校准干净PA输出并在收敛后施加链路影响。
 
 ---
 
@@ -835,6 +836,7 @@ x[n]\longrightarrow u^\star[n].
 import numpy as np
 
 from inc.lib.Analysis import Analysis
+from inc.lib.Channel import Channel
 from inc.lib.DpdIlc import (
     FitGmpPredistorter,
     ILCConfig,
@@ -1029,7 +1031,6 @@ from inc.lib.DpdIlc import (
 )
 from inc.lib.PaModel import MimoPaModel
 from inc.lib.WaveGenWifi import WaveGenWifi
-from inc.utils.SigProc import PowerCalibration
 
 wifiGenerator = WaveGenWifi(
     parameters={
@@ -1062,18 +1063,18 @@ mimoPaModel = MimoPaModel(
         "maximumOutputPowerDbm": 25.0,
     }
 )
-powerCalibration = PowerCalibration(
+channel = Channel(
     paModel=mimoPaModel,
     parameters={
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
-        "outputPowerDbmPerChain": tuple(
-            targetOutputPowerDbmPerChain
-        ),
     }
 )
-referenceSignal = powerCalibration.Calibrate(waveform.samples)
-baselineOutput = powerCalibration.GetLastPaOutput()
+baselineOutput = channel.Process(
+    waveform.samples,
+    outputPowerDbm=targetOutputPowerDbmPerChain,
+)
+referenceSignal = channel.GetLastPaInput()
 
 mimoConfig = ILCConfig(
     numIterations=8,
@@ -1096,10 +1097,11 @@ mimoIlcAnalysis = resultAnalysis.AnalyzeMimoIlcHistory(
         for chainResult in mimoResult.chainResults
     )
 )
-selectedMimoInput = powerCalibration.Calibrate(
-    mimoIlcAnalysis.bestInputSignal
+selectedMimoOutput = channel.Process(
+    mimoIlcAnalysis.bestInputSignal,
+    outputPowerDbm=targetOutputPowerDbmPerChain,
 )
-selectedMimoOutput = powerCalibration.GetLastPaOutput()
+selectedMimoInput = channel.GetLastPaInput()
 
 mimoPredistorter = FitMimoGmpPredistorter(
     referenceSignal,
@@ -1110,10 +1112,10 @@ mimoPredistorter = FitMimoGmpPredistorter(
     ridgeFactor=1e-6,
 )
 rawDeployedInput = mimoPredistorter.Process(referenceSignal)
-deployedInput = powerCalibration.Calibrate(
-    rawDeployedInput
+deployedOutput = channel.Process(
+    rawDeployedInput,
+    outputPowerDbm=targetOutputPowerDbmPerChain,
 )
-deployedOutput = powerCalibration.GetLastPaOutput()
 physicalAnalysis = Analysis(referenceSignal, waveform)
 physicalAnalysis.AnalyzeStages(
     {
@@ -1143,27 +1145,25 @@ secondChainHistory = mimoResult.chainResults[chainIndex].history
 
 ### 14.4 每路独立输出功率
 
-推荐把每路目标输出功率、25 dBm额定极限和完整MIMO PA绑定到 `PowerCalibration`，随后只传原始矩阵：
+推荐把完整MIMO PA绑定到Channel，然后在同一次调用中传原始矩阵和逐链目标功率：
 
 ```python
-powerCalibration = PowerCalibration(
+channel = Channel(
     paModel=mimoPaModel,
     parameters={
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
-        "outputPowerDbmPerChain": (
-            22.0,
-            21.0,
-            20.0,
-            19.0,
-        ),
     },
 )
-paInput = powerCalibration.Calibrate(waveform.samples)
-paOutput = powerCalibration.GetLastPaOutput()
+receivedSignal = channel.Process(
+    waveform.samples,
+    outputPowerDbm=(22.0, 21.0, 20.0, 19.0),
+)
+paInput = channel.GetLastPaInput()
+paOutput = channel.GetLastPaOutput()
 ```
 
-`PowerCalibration` 会同时更新各列隐藏驱动预设，但必须等待所有PA链的实测输出误差都进入容限才返回。
+Channel内部会同时更新各列隐藏驱动预设，但必须等待所有PA链的实测输出误差都进入容限才返回。普通用户不需要访问内部 `PowerCalibration`。
 
 旧接口也允许直接给 `MimoPaModel` 设置绝对输出功率：
 
@@ -1191,7 +1191,7 @@ mimoPaModel.SetTargetOutputPowerDbm(
 )
 ```
 
-学习 PA 非线性时，推荐把 `MimoPaModel.targetOutputPowerDbmPerChain` 保持为 `None`。该旧参数会在PA内部直接缩放输出，可能掩盖AM-AM变化。主流程应由外部 `PowerCalibration` 调整PA输入并观察真实输出：闭环只在建立或复测目标工作点时运行，ILC内部保存的每轮PA输出不做后级功率重标定。
+学习 PA 非线性时，推荐把 `MimoPaModel.targetOutputPowerDbmPerChain` 保持为 `None`。该旧参数会在PA内部直接缩放输出，可能掩盖AM-AM变化。主流程应由 `Channel.Process(..., outputPowerDbm=...)` 在内部调整PA输入并观察真实输出：闭环只在建立或复测目标工作点时运行，ILC内部保存的每轮PA输出不做后级功率重标定。
 
 ### 14.5 读取每路实际输出功率
 

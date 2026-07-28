@@ -180,16 +180,19 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `Channel.__init__`, `Channel.Width`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层，未知配置警告后忽略，并校验相位、噪声互斥、阻抗、满量程功率、随机种子和位宽 | Channel §5 |
-| `Channel.SetPaModel` | E | 绑定必须提供公开Process入口的PA对象，并优先保留其浮点直通能力 | Channel §1、§6 |
+| `Channel.__init__`, `Channel.Width`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层，未知配置警告后忽略，并校验相位、噪声互斥、阻抗、满量程功率、闭环收敛参数、有效区检测参数、随机种子和位宽 | Channel §5 |
+| `Channel.SetPaModel` | E | 绑定必须提供公开Process入口的PA对象，并在PA更换时清除私有功率校准状态 | Channel §1、§6 |
+| `Channel.ResolveCalibrationTargets`, `Channel.ConfigurePowerCalibration` | P/E | 把SISO共同目标或MIMO逐链dBm序列规范化，并用Channel当前端口、位宽、有效区和收敛参数配置内部 `PowerCalibration` | Channel §1、§5–§6.3 |
+| `Channel.CalibratePaInput`, `Channel.GetLastPaInput`, `Channel.GetLastPaOutput`, `Channel.GetLastCalibrationMetrics` | P/N/E | 对任意初始幅度原始波形执行隐藏PA输入闭环，排除补零/长静默，缓存收敛PA输入与干净输出，并提供不暴露驱动预设的诊断字典 | Channel §1、§6.3、§6.8 |
 | `Channel.SynchronizeRandomGenerator`, `Channel.ResetRandomGenerator` | N/E | 在外部活动参数改变种子时同步随机状态，并支持从固定种子重放同一白噪声序列 | Channel §4–§5 |
 | `Channel.ValidateSignal` | N/E | 保留SISO向量或MIMO矩阵形状，并拒绝空、非有限或不支持维度的波形 | Channel §1、§6 |
-| `Channel.ResolveNoiseRmsVolts`, `Channel.ResolveNoiseRmsNormalized` | P/N | 把毫伏或dBm噪声换成复包络总RMS电压，再按PA满量程dBm映射到内部归一化单位 | Channel §3.2–§3.4 |
+| `Channel.ResolveNoiseRmsVolts`, `Channel.ResolveNoiseRmsNormalized` | P/N | 把毫伏或dBm噪声换成复包络总RMS电压，再按PA满量程dBm映射到内部归一化单位 | Channel §3.2–§3.3、§3.5 |
+| `Channel.ResolveSnrNoiseRmsPerChain` | P/N | 按逐链有效突发信号RMS与 `10^{-SNR/20}` 计算复噪声总RMS，排除补零和长占空比静默 | Channel §3.4 |
 | `Channel.ApplyPhaseRotation` | P/N | 计算PA输出乘以单位复指数，当前相位仅为-90、0或+90度 | Channel §2 |
-| `Channel.AddNoise` | P/N | 生成I/Q各占总方差一半的圆对称复白高斯噪声并叠加到旋转后波形 | Channel §3.1 |
+| `Channel.AddNoise` | P/N | 在毫伏、绝对dBm或有效突发SNR三种互斥控制中选择一种，生成I/Q各占总方差一半的圆对称复白高斯噪声并叠加到旋转后波形 | Channel §3.1–§3.5 |
 | `Channel.ApplyChannelEffects` | P/E | 严格按移相后加噪的次序处理已经归一化的PA输出 | Channel §1 |
 | `Channel.ProcessPaOutput` | E/N | 对已有公开PA输出执行一次解码、链路影响和一次编码，避免功率闭环包含接收噪声 | Channel §1、§6.2 |
-| `Channel.ProcessFloating`, `Channel.Process` | P/N/E | 优先调用PA浮点入口，执行PA到接收端完整链路，并在公开定点模式返回整数I/Q码 | Channel §1、§3.4、§6.1 |
+| `Channel.ProcessFloating`, `Channel.Process` | P/N/E | `Process(inputSignal, outputPowerDbm)` 在给定目标时先闭环调整PA输入，收敛后只执行一次移相和噪声；目标为None时保留单次plant路径，并在定点模式返回整数I/Q码 | Channel §1、§3.4、§6.2–§6.3 |
 | `Channel.SmallSignalGain` | P/N | 把PA小信号复增益乘以固定相位因子；零均值噪声不计入确定性增益 | Channel §2、§4 |
 
 ## 5. `DpdIlc.py`：全部 ILC、部署模型和基准函数

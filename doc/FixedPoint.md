@@ -200,7 +200,7 @@ flowchart LR
 
 ### 7.3 Channel
 
-`Channel.Process` 在公开边界把整数码解码一次，随后在归一化浮点域依次执行PA、固定移相和白噪声叠加，最后重新编码。`Channel.ProcessPaOutput` 用于已有PA输出，同样只解码和编码一次。
+`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码。提供目标功率时，内部 `PowerCalibration` 每轮以同一位宽产生PA输入码、实际运行PA并测量解码后的有效突发功率；收敛后只对最后一次PA输出执行移相和白噪声叠加，再编码返回。目标为 `None` 时，`Channel.Process` 只解码一次并执行单次PA链路。`Channel.ProcessPaOutput` 用于已有PA输出，同样只解码和编码一次。
 
 ```mermaid
 flowchart LR

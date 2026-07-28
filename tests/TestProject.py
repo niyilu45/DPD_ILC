@@ -834,6 +834,12 @@ def CheckDocumentationApiConsistency() -> None:
         inspect.signature(PowerCalibration.Calibrate).parameters
     ) == ("self", "inputSignal")
     assert "Calibrate(inputSignal)" in readmeText
+    assert tuple(
+        inspect.signature(Channel.Process).parameters
+    ) == ("self", "inputSignal", "outputPowerDbm")
+    assert (
+        "Process(inputSignal, outputPowerDbm=None)" in readmeText
+    )
     assert (
         "chunkSize"
         not in inspect.signature(
@@ -3085,10 +3091,11 @@ def CheckChannelModel() -> None:
     """Verify PA, phase, physical-noise, seed, and fixed-point behavior.
 
     Processing details:
-        Algorithm: Exercise every supported phase, compare the two noise
-        control units through a 50-ohm conversion, estimate generated noise
-        RMS over a long record, require deterministic reset behavior, compare
-        bound-PA processing with a direct PA result, and validate error cases.
+        Algorithm: Exercise every supported phase, compare amplitude and power
+        noise controls through a 50-ohm conversion, verify active-burst SNR
+        control for SISO and MIMO, estimate generated noise over long records,
+        require deterministic reset behavior, compare bound-PA processing
+        with a direct PA result, and validate mutual-exclusion error cases.
 
     Returns:
         result: None. Assertions enforce the documented channel contract.
@@ -3159,6 +3166,63 @@ def CheckChannelModel() -> None:
         powerChannel.ResolveNoiseRmsNormalized(),
     )
 
+    activeSampleCount = 120000
+    activeSamples = np.exp(
+        1j
+        * 2.0
+        * np.pi
+        * np.arange(activeSampleCount, dtype=float)
+        / 37.0
+    )
+    paddedSignal = np.r_[
+        np.zeros(1000, dtype=np.complex128),
+        activeSamples,
+        np.zeros(2000, dtype=np.complex128),
+    ]
+    snrChannel = Channel(
+        parameters={
+            "noiseSnrDb": 30.0,
+            "randomSeed": 83,
+            "width": 0,
+        }
+    )
+    snrOutput = snrChannel.ProcessPaOutput(paddedSignal)
+    activeSlice = slice(1000, 1000 + activeSampleCount)
+    activeNoise = (
+        snrOutput[activeSlice] - paddedSignal[activeSlice]
+    )
+    measuredSnrDb = float(
+        10.0
+        * np.log10(
+            np.mean(np.abs(paddedSignal[activeSlice]) ** 2)
+            / np.mean(np.abs(activeNoise) ** 2)
+        )
+    )
+    assert abs(measuredSnrDb - 30.0) <= 0.10
+
+    mimoPaddedSignal = np.column_stack(
+        (paddedSignal, 0.25 * paddedSignal)
+    )
+    mimoSnrChannel = Channel(
+        parameters={
+            "noiseSnrDb": 24.0,
+            "randomSeed": 89,
+            "width": 0,
+        }
+    )
+    mimoSnrOutput = mimoSnrChannel.ProcessPaOutput(
+        mimoPaddedSignal
+    )
+    mimoActiveSignal = mimoPaddedSignal[activeSlice, :]
+    mimoActiveNoise = (
+        mimoSnrOutput[activeSlice, :] - mimoActiveSignal
+    )
+    measuredMimoSnrDb = 10.0 * np.log10(
+        np.mean(np.abs(mimoActiveSignal) ** 2, axis=0)
+        / np.mean(np.abs(mimoActiveNoise) ** 2, axis=0)
+    )
+    assert np.all(np.abs(measuredMimoSnrDb - 24.0) <= 0.10)
+
     paModel = PaModel(parameters={"modelName": "wiener", "width": 0})
     paChannel = Channel(
         paModel=paModel,
@@ -3172,6 +3236,80 @@ def CheckChannelModel() -> None:
     assert np.allclose(
         paChannel.SmallSignalGain(),
         1j * paModel.SmallSignalGain(),
+    )
+
+    # A user-facing calibrated call accepts an arbitrarily scaled burst and
+    # target output power. Channel must hide all repeated PA evaluations,
+    # exclude padding from the detector, and add impairments only after the
+    # clean PA output has met the target.
+    burstSamples = 1.7 * np.exp(
+        1j * 2.0 * np.pi * np.arange(1024, dtype=float) / 29.0
+    )
+    rawBurst = np.r_[
+        np.zeros(80, dtype=np.complex128),
+        burstSamples,
+        np.zeros(120, dtype=np.complex128),
+    ]
+    calibratedChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.10,
+            "width": 0,
+        },
+    )
+    calibratedOutput = calibratedChannel.Process(
+        rawBurst,
+        outputPowerDbm=18.0,
+    )
+    calibrationMetrics = (
+        calibratedChannel.GetLastCalibrationMetrics()
+    )
+    assert calibrationMetrics["converged"]
+    assert abs(
+        calibrationMetrics["measuredOutputPowerDbmPerChain"][0]
+        - 18.0
+    ) <= 0.10
+    assert np.array_equal(
+        calibratedOutput,
+        calibratedChannel.GetLastPaOutput(),
+    )
+    assert calibratedChannel.GetLastPaInput().shape == rawBurst.shape
+
+    # A target sequence calibrates each MIMO PA independently while the
+    # public caller still makes one Channel call.
+    mimoRawBurst = np.column_stack((rawBurst, 0.35 * rawBurst))
+    mimoChannel = Channel(
+        paModel=MimoPaModel(
+            parameters={
+                "numTransmitChains": 2,
+                "width": 0,
+            }
+        ),
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.15,
+            "width": 0,
+        },
+    )
+    mimoOutput = mimoChannel.Process(
+        mimoRawBurst,
+        outputPowerDbm=(17.0, 19.0),
+    )
+    mimoCalibrationMetrics = (
+        mimoChannel.GetLastCalibrationMetrics()
+    )
+    assert mimoOutput.shape == mimoRawBurst.shape
+    assert np.all(
+        np.abs(
+            np.asarray(
+                mimoCalibrationMetrics[
+                    "measuredOutputPowerDbmPerChain"
+                ]
+            )
+            - np.asarray((17.0, 19.0))
+        )
+        <= 0.15
     )
 
     fixedPa = PaModel(parameters={"modelName": "gmp", "width": 16})
@@ -3194,6 +3332,14 @@ def CheckChannelModel() -> None:
         {"phaseDegrees": 45},
         {"noiseAmpMv": -1.0},
         {"noiseAmpMv": 10.0, "noisePwrDbm": -27.0},
+        {"noiseAmpMv": 10.0, "noiseSnrDb": 30.0},
+        {"noisePwrDbm": -27.0, "noiseSnrDb": 30.0},
+        {
+            "noiseAmpMv": 10.0,
+            "noisePwrDbm": -27.0,
+            "noiseSnrDb": 30.0,
+        },
+        {"noiseSnrDb": np.nan},
     )
     for invalidParameters in invalidConfigurations:
         try:

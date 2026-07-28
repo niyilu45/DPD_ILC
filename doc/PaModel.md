@@ -605,7 +605,7 @@ flowchart LR
     column --> stack["按原链顺序堆叠 Z"]
 ```
 
-**图 7 说明**：输入dB改变非线性PA工作点；输出dB是PA后的相对线性校准。`MimoPaModel` 内部绝对输出dBm目标属于兼容接口，会在最后一级直接缩放输出。主程序不使用它设定物理工作点，而由外部 `PowerCalibration` 反复调整PA输入并测量实际输出；20 dBm相对25 dBm极限的5 dB回退只作为闭环初值。
+**图 7 说明**：输入dB改变非线性PA工作点；输出dB是PA后的相对线性校准。`MimoPaModel` 内部绝对输出dBm目标属于兼容接口，会在最后一级直接缩放输出。主流程不使用它设定物理工作点，而由 `Channel.Process(rawSignal, outputPowerDbm=...)` 内部的 `PowerCalibration` 反复调整PA输入并测量实际输出；20 dBm相对25 dBm极限的5 dB回退只作为闭环初值。
 
 若设绝对目标 $r_{\mathrm{target},m}$，代码先算未经绝对校准的
 
@@ -619,7 +619,7 @@ r_m=\sqrt{\frac{1}{N}\sum_n|z_m[n]|^2},
 y_m[n]=\frac{r_{\mathrm{target},m}}{r_m}z_m[n].
 ```
 
-PA后常数标定只适合兼容旧数据或模拟已知线性增益，不能用于比较相同绝对输出功率下的真实失真。此类比较必须由 `PowerCalibration` 在PA输入端闭环，使压缩深度、EVM和ACLR随实际驱动共同变化。
+PA后常数标定只适合兼容旧数据或模拟已知线性增益，不能用于比较相同绝对输出功率下的真实失真。此类比较必须调用 `Channel.Process(rawSignal, outputPowerDbm=...)`，由其内部校准器在PA输入端闭环，使压缩深度、EVM和ACLR随实际驱动共同变化。
 
 Python接口优先使用 `targetOutputPowerDbmPerChain` 和 `SetTargetOutputPowerDbm`。`targetOutputRmsPerChain` 与 `SetTargetOutputRms` 仅保留为旧接口；同一条链不能同时设置RMS和dBm目标。`GetOutputPowerDbmPerChain` 返回最近一次完整处理后按相同端口阻抗换算的实际功率。
 
@@ -728,7 +728,7 @@ classDiagram
     IQImbalancePA o-- PaModel : wraps
 ```
 
-**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择 Wiener 或 GMP。`MimoPaModel` 按物理链持有多个 `PaModel`。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或仪表适配器，通过闭环输入驱动校准设置真实输出dBm；`Analysis` 无需因此导入 `PaModel.py`。`IQImbalancePA` 可以包装任意PA；反馈噪声由独立的 `AddAwgn` 添加。
+**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择 Wiener 或 GMP。`MimoPaModel` 按物理链持有多个 `PaModel`。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或仪表适配器，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。`IQImbalancePA` 可以包装任意PA；反馈噪声由独立的 `AddAwgn` 添加。
 
 ```python
 from inc.lib.PaModel import (

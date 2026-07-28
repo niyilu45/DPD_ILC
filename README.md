@@ -131,6 +131,11 @@ channel = Channel(
     paModel=paModel,
     parameters={"noiseAmpMv": 10.0, "width": 16},
 )
+wifiWaveform = wifiGenerator.Generate()
+receivedSignal = channel.Process(
+    wifiWaveform.samples,
+    outputPowerDbm=20.0,
+)
 mimoPaModel = MimoPaModel(
     parameters={"numTransmitChains": 2, "width": 16}
 )
@@ -148,7 +153,7 @@ resultAnalysis = Analysis(
 python SmallestSISO.py
 ```
 
-浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序最后打印两种模式的最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本按有效Wi-Fi突发区间把PA输出闭环标定到20 dBm；PA后的 `Channel` 使用0度移相和10 mV复包络总RMS白噪声，baseline、每轮ILC反馈和最终接收分析都经过该链路，但接收噪声不进入PA功率校准。前后补零或长占空比静默不进入功率RMS。
+浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序最后打印两种模式的最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本直接调用 `Channel.Process(waveform.samples, outputPowerDbm=20.0)`；Channel内部按有效Wi-Fi突发区间把PA输出闭环标定到20 dBm，再使用0度移相和10 mV复包络总RMS白噪声。baseline、每轮ILC反馈和最终接收分析都经过该链路，但接收噪声不进入PA功率校准。前后补零或长占空比静默不进入功率RMS。
 脚本还打印两种波形的峰值以及 `waveformMinimumI/MaximumI/MinimumQ/MaximumQ`。定点版本的 I/Q 字段是公开码值，因此16位分量会位于 `-32768…32767`，并不是小于1的归一化数；复数幅度 `waveformPeakAmplitude` 最多可接近 $\sqrt{2}\,32768$。
 
 ## 工程工作流程图
@@ -164,14 +169,14 @@ flowchart TD
 
     overrideMap --> paModel["创建 PaModel 或 MimoPaModel；类内追加默认参数层"]
     paModel --> paImplementation["每路 WienerPA 或 GMPPA + 独立功率设置"]
-    rawReference --> powerCalibration["PowerCalibration闭环：隐藏驱动预设 → PA → 实测功率 → 更新预设"]
-    paImplementation --> powerCalibration
-    powerCalibration --> reference["收敛后的PA输入参考矩阵 S"]
-    powerCalibration --> calibratedBaseline["容限内的实测PA基线输出"]
-    overrideMap --> channel["可选Channel：固定移相 + 物理白噪声"]
+    rawReference --> channel["Channel.Process：原始波形 + 目标输出dBm"]
     paModel --> channel
-    calibratedBaseline --> channel
-    channel --> receivedBaseline["接收端baseline"]
+    channel --> powerCalibration["内部PowerCalibration：隐藏驱动预设 → PA → 实测功率 → 更新预设"]
+    paImplementation --> powerCalibration
+    powerCalibration --> reference["Channel缓存的收敛PA输入参考矩阵 S"]
+    powerCalibration --> calibratedBaseline["容限内的实测PA基线输出"]
+    calibratedBaseline --> channelEffects["Channel固定移相 + 物理白噪声"]
+    channelEffects --> receivedBaseline["接收端baseline"]
 
     start --> frequencyIlc["SISO 或逐 PA RunMimoFrequencyDomainIlc"]
     reference --> frequencyIlc
@@ -233,7 +238,7 @@ flowchart TD
 
 1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `WaveGenWifi`、`PaModel`、`Analysis` 和 `Draw`；需要接收链路影响时再构造 `Channel`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
 2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
-3. `PowerCalibration` 把原始SISO/MIMO波形按隐藏驱动预设送入 `PaModel` 或仪表适配器，仅对PA实测输出的有效突发计算功率。若目标误差超出容限，它在dB域更新预设并重新生成PA输入；有上下括区后改用二分，直到所有链收敛。返回值是最终PA输入，最后一次实测PA输出由 `GetLastPaOutput()` 取得。接收噪声必须在校准之后由 `Channel.ProcessPaOutput` 加入，不能参与PA功率闭环。
+3. 普通用户只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`。Channel内部的 `PowerCalibration` 把原始SISO/MIMO波形按隐藏驱动预设送入PA，仅对干净PA输出的有效突发计算功率；误差超限时在dB域更新预设，有上下括区后改用二分，直到所有链收敛。随后Channel只对接受的PA输出执行一次移相和接收噪声。`GetLastPaInput`、`GetLastPaOutput` 和 `GetLastCalibrationMetrics` 只用于需要诊断的调用方。
 4. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮真实输入、plant反馈输出和原生MSE；不会在PA后把每轮输出缩放到目标dBm。plant可以是纯PA，也可以是包含PA、移相与噪声的 `Channel`。ILC返回后，`Analysis.AnalyzeIlcHistory` 或 `AnalyzeMimoIlcHistory` 才逐轮计算RF性能，并按严格EVM选择 `u*`。该输入可在闭环功率校准后复测，也可作为监督标签拟合 MP、GMP、Volterra、LUT 或 NN。
 5. `Analysis` 使用三条互相独立的路径。显式参考模式直接保存 `referenceSignal` 与 `WifiWaveform`；发送波形辅助模式对NumPy数组或 `WifiWaveform.samples` 做互相关，直接截取公共区间，绝不解析Descriptor、恢复seed或重新生成参考；只有盲分析模式才调用 `ParseWifi` 恢复包起点、格式、MCS、FFT/GI、空间结构和参考样值。三条路径之后共用 `SigProc`；具备Wi-Fi元数据时再用 `FrameProcess` 计算严格子载波EVM。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
 6. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
@@ -526,11 +531,15 @@ flowchart TD
 ### `inc/lib/Channel.py`
 
 ```mermaid
-flowchart LR
-    input["公开PA输入"] --> decode["FixedPoint解码"]
-    decode --> pa["绑定的PaModel"]
-    pa --> phase["ApplyPhaseRotation<br/>-90° / 0° / +90°"]
-    phase --> noise["AddNoise<br/>noiseAmpMv或noisePwrDbm"]
+flowchart TD
+    raw["原始公开波形"] --> process["Process(inputSignal, outputPowerDbm)"]
+    target["共同或逐链目标dBm"] --> process
+    process --> calibration["内部PowerCalibration"]
+    calibration --> pa["绑定的PaModel"]
+    pa --> detector["有效突发PA输出功率"]
+    detector -. "误差超限" .-> calibration
+    detector --> phase["ApplyPhaseRotation<br/>-90° / 0° / +90°"]
+    phase --> noise["AddNoise<br/>noiseAmpMv / noisePwrDbm / noiseSnrDb"]
     noise --> encode["FixedPoint编码"]
     encode --> receiver["公开接收波形"]
     paOutput["已有公开PA输出"] --> paDecode["ProcessPaOutput解码"]
@@ -539,8 +548,9 @@ flowchart LR
 
 **图示说明：**
 
-- `Process` 实现完整的PA→移相→AddNoise顺序；`ProcessPaOutput` 用于已经由功率闭环产生的PA输出，不会再次运行PA。
-- `noiseAmpMv` 定义复包络总RMS毫伏数；`noisePwrDbm` 定义端口噪声功率。两者默认都是 `None`，只能选择一个非 `None` 控制量。
+- 推荐调用 `Process(rawSignal, outputPowerDbm=20.0)`。用户只给原始波形和PA目标输出功率；Channel内部调整输入缩放并反复运行PA，收敛后再执行一次移相与AddNoise。
+- `Process(rawSignal)` 保留不校准功率的单次链路，供ILC plant等内部循环使用；`ProcessPaOutput` 用于已有PA输出，不会再次运行PA。
+- `noiseAmpMv` 定义复包络总RMS毫伏数；`noisePwrDbm` 定义端口噪声功率；`noiseSnrDb` 定义每路有效突发信号功率与复噪声功率之比。三者默认都是 `None`，只能选择一个非 `None` 控制量。
 - 相位只允许 `-90`、`0`、`90` 度，默认0度不旋转。圆对称复噪声的I/Q分量各承担总方差的一半。
 - 浮点和定点公开数据类型都为 `numpy.complex128`；定点模式输出I/Q整数码，物理噪声的电压换算只发生在模块内部。
 - 完整公式、参数约束和功率校准接线见 [Channel.md](doc/Channel.md)。
@@ -954,23 +964,29 @@ P(dBm) = 10 log10(P(W) / 0.001)
 | `GetParameters()` | 无 | 返回当前解析参数。 |
 | `UpdateParameters(**parameterOverrides)` | 支持的任意配置 | 事务式更新覆盖层。 |
 
-典型调用只需把目标功率配置一次，之后向 `Calibrate` 送入波形：
+`PowerCalibration` 是Channel内部复用的底层工具。普通用户不需要主动构造它，推荐把原始波形与目标输出功率直接交给Channel：
 
 ```python
-powerCalibration = PowerCalibration(
+from inc.lib.Channel import Channel
+
+
+channel = Channel(
     paModel=paModel,
     parameters={
-        "outputPowerDbm": 22.0,
         "maximumOutputPowerDbm": 25.0,
         "width": 0,
     }
 )
-paInputWaveform = powerCalibration.Calibrate(inputWaveform)
-paOutputWaveform = powerCalibration.GetLastPaOutput()
-calibrationMetrics = powerCalibration.GetLastCalibrationMetrics()
+receivedWaveform = channel.Process(
+    inputWaveform,
+    outputPowerDbm=22.0,
+)
+paInputWaveform = channel.GetLastPaInput()
+paOutputWaveform = channel.GetLastPaOutput()
+calibrationMetrics = channel.GetLastCalibrationMetrics()
 ```
 
-MIMO独立功率使用 `outputPowerDbmPerChain=(22.0, 21.0, 20.0, 19.0)`，调用方式仍然是同一个 `Calibrate(inputWaveform)`。
+MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.0, 21.0, 20.0, 19.0))`。只有开发新的PA测量适配器或单独调试功率检测器时，才需要直接使用底层的 `PowerCalibration.Calibrate(inputSignal)`。
 
 例如在 50 Ω 端口上，`0 dBm = 1 mW` 对应约 `0.223607 V RMS`。对于带占空比的记录，本工程报告Wi-Fi突发开启期间的平均功率：若有效突发占整段采集的50%，整段平均会额外低3.01 dB，但该关断时间不会进入校准或Analysis的RMS分母。完整门限、短空洞闭合和定点搜索公式见 [SigProc.md](doc/SigProc.md#131-有效信号区间与占空比)。
 
@@ -1048,13 +1064,20 @@ Channel(paModel=None, parameters=None, width=None, **parameterOverrides)
 | --- | --- | --- |
 | `phaseDegrees` | `0` | 固定相位旋转，仅允许 `-90`、`0` 或 `90` 度。 |
 | `noiseAmpMv` | `None` | 复包络总RMS噪声幅度，单位mV。 |
-| `noisePwrDbm` | `None` | 端口总噪声功率，单位dBm；不能与 `noiseAmpMv` 同时非 `None`。 |
+| `noisePwrDbm` | `None` | 端口总噪声功率，单位dBm。 |
+| `noiseSnrDb` | `None` | 每路有效突发信号功率与复噪声功率之比，单位dB；MIMO逐列独立计算噪声RMS。 |
 | `loadResistanceOhm` | `50.0` | 噪声功率与RMS电压换算使用的阻抗。 |
 | `maximumOutputPowerDbm` | `25.0` | 内部归一化PA输出RMS等于1所代表的功率。 |
+| `calibrationToleranceDb` | `0.25` | Channel内部PA输出功率闭环允许的最大误差，单位dB。 |
+| `maximumCalibrationIterations` | `60` | 内部功率闭环最多运行PA的次数。 |
+| `calibrationLearningRate` | `0.8` | 尚未括住目标时的dB域驱动修正比例。 |
+| `maximumDriveAdjustmentDb` | `6.0` | 单轮隐藏PA输入预设的最大调整量。 |
+| `activePowerThresholdDb` | `-60.0` | 有效突发相对峰值功率门限。 |
+| `activeGapToleranceSamples` | `16` | 有效区内部允许填充的短低幅间隔。 |
 | `randomSeed` | `1701` | 固定非负整数使整次噪声序列可复现；`None` 使用系统熵。 |
 | `width` | `16` | 外部I/Q位宽；`0`为浮点，正值返回整数码。 |
 
-`Process(inputSignal)` 执行完整PA→移相→AddNoise链路；`ProcessPaOutput(paOutputSignal)` 只处理已有PA输出；`ResetRandomGenerator()` 从配置种子重新开始噪声序列。10 mV与50 Ω下约 `-26.99 dBm` 等效。完整物理定义见 [Channel.md](doc/Channel.md)。
+`Process(inputSignal, outputPowerDbm=None)` 执行完整链路：提供目标时先完成内部PA输入功率闭环；目标为 `None` 时只运行一次PA。`outputPowerDbm` 可以是SISO/全部链共同标量，也可以是按列排列的MIMO序列。`GetLastPaInput()`、`GetLastPaOutput()` 和 `GetLastCalibrationMetrics()` 提供可选诊断；`ProcessPaOutput(paOutputSignal)` 只处理已有PA输出；`ResetRandomGenerator()` 从配置种子重新开始噪声序列。10 mV与50 Ω下约 `-26.99 dBm` 等效。`noiseAmpMv`、`noisePwrDbm`、`noiseSnrDb` 三者严格互斥；SNR模式排除补零和长静默后按每路有效信号RMS配置噪声。完整物理定义见 [Channel.md](doc/Channel.md)。
 
 ### `SigProc` 参数与方法
 
@@ -1524,9 +1547,9 @@ python main.py --format EHT --bandwidth 20 --tx-antennas 4 --spatial-streams 2 -
 
 ```python
 from inc.lib.Analysis import Analysis
+from inc.lib.Channel import Channel
 from inc.lib.PaModel import MimoPaModel
 from inc.lib.WaveGenWifi import WaveGenWifi
-from inc.utils.SigProc import PowerCalibration
 
 wifiGenerator = WaveGenWifi(
     frameFormat="11ax",
@@ -1550,19 +1573,21 @@ mimoPaModel = MimoPaModel(
     maximumOutputPowerDbm=25.0,
     loadResistanceOhm=50.0,
 )
-powerCalibration = PowerCalibration(
+channel = Channel(
     paModel=mimoPaModel,
     parameters={
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
-        "outputPowerDbmPerChain": outputPowerDbmPerChain,
     },
 )
-referenceSignal = powerCalibration.Calibrate(waveform.samples)
-paOutput = powerCalibration.GetLastPaOutput()
+receivedSignal = channel.Process(
+    waveform.samples,
+    outputPowerDbm=outputPowerDbmPerChain,
+)
+referenceSignal = channel.GetLastPaInput()
 
 resultAnalysis = Analysis(referenceSignal, waveform)
-resultAnalysis.AnalyzeStages({"MIMO PA": paOutput})
+resultAnalysis.AnalyzeStages({"MIMO PA + Channel": receivedSignal})
 resultAnalysis.Print()
 resultAnalysis.PrintMimo()
 ```

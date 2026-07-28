@@ -15,7 +15,6 @@ from inc.lib.PaModel import (
 )
 from inc.lib.WaveGenWifi import WaveGenWifi
 from inc.utils.Draw import Draw
-from inc.utils.SigProc import PowerCalibration
 
 
 def RunSisoMode(
@@ -112,6 +111,7 @@ def RunSisoMode(
             "phaseDegrees": 0,
             "noiseAmpMv": 10.0,
             "noisePwrDbm": None,
+            "noiseSnrDb": None,
             "loadResistanceOhm": 50.0,
             "maximumOutputPowerDbm": maximumOutputPowerDbm,
             "randomSeed": 1019,
@@ -119,25 +119,19 @@ def RunSisoMode(
         },
     )
 
-    # Closed-loop calibration owns the hidden drive preset. It repeatedly
-    # regenerates the original Wi-Fi waveform, measures the actual PA output,
-    # and returns the converged PA input without exposing preset corrections.
     loadResistanceOhm = 50.0
-    powerCalibration = PowerCalibration(
-        paModel=paModel,
-        parameters={
-            "loadResistanceOhm": loadResistanceOhm,
-            "maximumOutputPowerDbm": maximumOutputPowerDbm,
-            "outputPowerDbm": paOutputPowerDbm,
-            "width": width,
-        },
+    # The caller supplies only the arbitrary raw waveform and requested PA
+    # output power. Channel owns the complete hidden closed loop: it changes
+    # PA input drive, measures clean PA output, converges to the target, and
+    # applies receiver phase/noise once after calibration has completed.
+    baselineOutput = channel.Process(
+        waveform.samples,
+        outputPowerDbm=paOutputPowerDbm,
     )
-    referenceSignal = powerCalibration.Calibrate(waveform.samples)
-    baselinePaOutput = powerCalibration.GetLastPaOutput()
+    referenceSignal = channel.GetLastPaInput()
     baselineCalibrationMetrics = (
-        powerCalibration.GetLastCalibrationMetrics()
+        channel.GetLastCalibrationMetrics()
     )
-    baselineOutput = channel.ProcessPaOutput(baselinePaOutput)
     resultAnalysis = Analysis(
         referenceSignal,
         waveform,
@@ -169,14 +163,13 @@ def RunSisoMode(
     ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(
         ilcResult.history
     )
-    selectedIlcInput = powerCalibration.Calibrate(
-        ilcAnalysisResult.bestInputSignal
+    selectedIlcOutput = channel.Process(
+        ilcAnalysisResult.bestInputSignal,
+        outputPowerDbm=paOutputPowerDbm,
     )
-    selectedPaOutput = powerCalibration.GetLastPaOutput()
     selectedCalibrationMetrics = (
-        powerCalibration.GetLastCalibrationMetrics()
+        channel.GetLastCalibrationMetrics()
     )
-    selectedIlcOutput = channel.ProcessPaOutput(selectedPaOutput)
     selectedMetrics = resultAnalysis.Analyze(selectedIlcOutput)
     resultAnalysis.AnalyzeStages(
         {

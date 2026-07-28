@@ -1839,14 +1839,13 @@ print(overlap.ToDict())
 
 ### 11.3 PA、Channel和功率闭环的独立分析
 
-下面的完整示例只做Wi-Fi生成、PA功率校准、接收链路和Analysis，不运行ILC。PA输出功率闭环只绑定 `PaModel`；10 mV接收噪声在校准后由 `Channel` 加入：
+下面的完整示例只做Wi-Fi生成、PA功率校准、接收链路和Analysis，不运行ILC。用户只把原始波形和目标PA输出功率交给 `Channel.Process`；内部闭环先让干净PA输出收敛，再加入10 mV接收噪声：
 
 ```python
 from inc.lib.Analysis import Analysis
 from inc.lib.Channel import Channel
 from inc.lib.PaModel import PaModel
 from inc.lib.WaveGenWifi import WaveGenWifi
-from inc.utils.SigProc import PowerCalibration
 
 
 wifiWaveform = WaveGenWifi(
@@ -1863,33 +1862,24 @@ wifiWaveform = WaveGenWifi(
 paModel = PaModel(
     parameters={"modelName": "wiener", "width": 0}
 )
-powerCalibration = PowerCalibration(
-    paModel=paModel,
-    parameters={
-        "outputPowerDbm": 20.0,
-        "maximumOutputPowerDbm": 25.0,
-        "loadResistanceOhm": 50.0,
-        "width": 0,
-    },
-)
-referenceSignal = powerCalibration.Calibrate(
-    wifiWaveform.samples
-)
-paOutputSignal = powerCalibration.GetLastPaOutput()
-
 channel = Channel(
     paModel=paModel,
     parameters={
         "phaseDegrees": 90,
         "noiseAmpMv": 10.0,
         "noisePwrDbm": None,
+        "noiseSnrDb": None,
         "maximumOutputPowerDbm": 25.0,
         "loadResistanceOhm": 50.0,
         "randomSeed": 311,
         "width": 0,
     },
 )
-receivedSignal = channel.ProcessPaOutput(paOutputSignal)
+receivedSignal = channel.Process(
+    wifiWaveform.samples,
+    outputPowerDbm=20.0,
+)
+referenceSignal = channel.GetLastPaInput()
 
 resultAnalysis = Analysis(
     referenceSignal,
@@ -1902,11 +1892,11 @@ resultAnalysis = Analysis(
 )
 metrics = resultAnalysis.Analyze(receivedSignal)
 
-print(powerCalibration.GetLastCalibrationMetrics())
+print(channel.GetLastCalibrationMetrics())
 print(metrics)
 ```
 
-90度固定相位会由公共复增益补偿，不应单独恶化EVM；PA非线性和10 mV随机噪声仍保留在误差中。`metrics["outputPowerDbm"]` 表示接收波形的分析结果，而 `GetLastCalibrationMetrics()` 保留不含接收噪声的PA闭环实测功率。
+90度固定相位会由公共复增益补偿，不应单独恶化EVM；PA非线性和10 mV随机噪声仍保留在误差中。`metrics["outputPowerDbm"]` 表示接收波形的分析结果，而 `channel.GetLastCalibrationMetrics()` 保留不含接收噪声的PA闭环实测功率。
 
 ### 11.4 非Wi-Fi波形的发送辅助分析
 

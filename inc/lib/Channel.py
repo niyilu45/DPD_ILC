@@ -8,7 +8,16 @@ integer I/Q codes while every physical operation remains floating point.
 
 from collections import ChainMap
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Optional, Tuple, cast
+from typing import (
+    Any,
+    Dict,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import numpy as np
 
@@ -20,12 +29,14 @@ if __package__ and "." in __package__:
         RecognizedParameterView,
     )
     from ..utils.FixedPoint import FixedPoint
+    from ..utils.SigProc import PowerCalibration
 else:
     from utils.ConfigUtils import (
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
     from utils.FixedPoint import FixedPoint
+    from utils.SigProc import PowerCalibration
 
 
 class Channel:
@@ -34,7 +45,8 @@ class Channel:
     ``noiseAmpMv`` is the RMS magnitude of the complete complex noise
     envelope, not the RMS of each individual I or Q component. Therefore the
     two real Gaussian components each use ``noiseAmpMv / sqrt(2)`` RMS.
-    Normalized PA output RMS equal to one represents
+    ``noiseSnrDb`` instead derives one noise RMS per chain from that chain's
+    active-region signal RMS. Normalized PA output RMS equal to one represents
     ``maximumOutputPowerDbm`` at ``loadResistanceOhm``.
     """
 
@@ -73,8 +85,15 @@ class Channel:
                 "phaseDegrees": 0,
                 "noiseAmpMv": None,
                 "noisePwrDbm": None,
+                "noiseSnrDb": None,
                 "loadResistanceOhm": 50.0,
                 "maximumOutputPowerDbm": 25.0,
+                "calibrationToleranceDb": 0.25,
+                "maximumCalibrationIterations": 60,
+                "calibrationLearningRate": 0.8,
+                "maximumDriveAdjustmentDb": 6.0,
+                "activePowerThresholdDb": -60.0,
+                "activeGapToleranceSamples": 16,
                 "randomSeed": 1701,
                 "width": 16,
             }
@@ -105,6 +124,7 @@ class Channel:
         )
         self.paModel: Optional[Any] = None
         self._paProcessMethod: Optional[Any] = None
+        self._powerCalibration: Optional[PowerCalibration] = None
         self._activeRandomSeed: Optional[int] = None
         self._randomGenerator = np.random.default_rng()
         self.ValidateParameters()
@@ -179,7 +199,7 @@ class Channel:
 
         Processing details:
             Algorithm: Restrict phase to minus 90, zero, or plus 90 degrees;
-            enforce mutual exclusion of the two noise controls; check all
+            enforce mutual exclusion of the three noise controls; check all
             physical scalars for finite values and valid domains; then use
             ``FixedPoint`` as the authoritative width validator.
 
@@ -200,9 +220,19 @@ class Channel:
 
         noiseAmpMv = self.parameters["noiseAmpMv"]
         noisePwrDbm = self.parameters["noisePwrDbm"]
-        if noiseAmpMv is not None and noisePwrDbm is not None:
+        noiseSnrDb = self.parameters["noiseSnrDb"]
+        configuredNoiseControls = sum(
+            noiseControl is not None
+            for noiseControl in (
+                noiseAmpMv,
+                noisePwrDbm,
+                noiseSnrDb,
+            )
+        )
+        if configuredNoiseControls > 1:
             raise ValueError(
-                "noiseAmpMv and noisePwrDbm cannot both be non-None"
+                "noiseAmpMv, noisePwrDbm, and noiseSnrDb are mutually "
+                "exclusive"
             )
         if noiseAmpMv is not None and (
             not isinstance(noiseAmpMv, (int, float))
@@ -219,6 +249,12 @@ class Channel:
             or not np.isfinite(noisePwrDbm)
         ):
             raise ValueError("noisePwrDbm must be finite or None")
+        if noiseSnrDb is not None and (
+            not isinstance(noiseSnrDb, (int, float))
+            or isinstance(noiseSnrDb, bool)
+            or not np.isfinite(noiseSnrDb)
+        ):
+            raise ValueError("noiseSnrDb must be finite or None")
 
         loadResistanceOhm = self.parameters["loadResistanceOhm"]
         if (
@@ -240,6 +276,77 @@ class Channel:
         ):
             raise ValueError(
                 "maximumOutputPowerDbm must be finite"
+            )
+
+        calibrationToleranceDb = self.parameters[
+            "calibrationToleranceDb"
+        ]
+        if (
+            not isinstance(calibrationToleranceDb, (int, float))
+            or isinstance(calibrationToleranceDb, bool)
+            or not np.isfinite(calibrationToleranceDb)
+            or float(calibrationToleranceDb) <= 0.0
+        ):
+            raise ValueError(
+                "calibrationToleranceDb must be finite and positive"
+            )
+        maximumCalibrationIterations = self.parameters[
+            "maximumCalibrationIterations"
+        ]
+        if (
+            not isinstance(maximumCalibrationIterations, int)
+            or isinstance(maximumCalibrationIterations, bool)
+            or maximumCalibrationIterations < 1
+        ):
+            raise ValueError(
+                "maximumCalibrationIterations must be a positive integer"
+            )
+        calibrationLearningRate = self.parameters[
+            "calibrationLearningRate"
+        ]
+        if (
+            not isinstance(calibrationLearningRate, (int, float))
+            or isinstance(calibrationLearningRate, bool)
+            or not np.isfinite(calibrationLearningRate)
+            or not 0.0 < float(calibrationLearningRate) <= 1.0
+        ):
+            raise ValueError(
+                "calibrationLearningRate must be in the interval (0, 1]"
+            )
+        maximumDriveAdjustmentDb = self.parameters[
+            "maximumDriveAdjustmentDb"
+        ]
+        if (
+            not isinstance(maximumDriveAdjustmentDb, (int, float))
+            or isinstance(maximumDriveAdjustmentDb, bool)
+            or not np.isfinite(maximumDriveAdjustmentDb)
+            or float(maximumDriveAdjustmentDb) <= 0.0
+        ):
+            raise ValueError(
+                "maximumDriveAdjustmentDb must be finite and positive"
+            )
+        activePowerThresholdDb = self.parameters[
+            "activePowerThresholdDb"
+        ]
+        if (
+            not isinstance(activePowerThresholdDb, (int, float))
+            or isinstance(activePowerThresholdDb, bool)
+            or not np.isfinite(activePowerThresholdDb)
+            or float(activePowerThresholdDb) >= 0.0
+        ):
+            raise ValueError(
+                "activePowerThresholdDb must be finite and negative"
+            )
+        activeGapToleranceSamples = self.parameters[
+            "activeGapToleranceSamples"
+        ]
+        if (
+            not isinstance(activeGapToleranceSamples, int)
+            or isinstance(activeGapToleranceSamples, bool)
+            or activeGapToleranceSamples < 0
+        ):
+            raise ValueError(
+                "activeGapToleranceSamples must be a nonnegative integer"
             )
 
         randomSeed = self.parameters["randomSeed"]
@@ -274,6 +381,214 @@ class Channel:
             raise TypeError("paModel must expose a callable Process method")
         self.paModel = paModel
         self._paProcessMethod = paProcessMethod
+        self._powerCalibration = None
+
+    @staticmethod
+    def ResolveCalibrationTargets(
+        outputPowerDbm: Union[float, Sequence[float], np.ndarray],
+    ) -> Tuple[float, Optional[Tuple[float, ...]]]:
+        """Normalize one SISO target or one target per MIMO PA chain.
+
+        Processing details:
+            Algorithm: Treat a finite real scalar as one shared output-power
+            target. Treat a nonempty one-dimensional sequence as independent
+            per-chain targets, convert every element to a plain float, and
+            reject booleans, strings, nested arrays, or nonfinite values.
+
+        Args:
+            outputPowerDbm: Shared target dBm or a sequence ordered by chain.
+
+        Returns:
+            result: Scalar fallback target and optional per-chain target tuple.
+        """
+
+        if (
+            isinstance(outputPowerDbm, (int, float, np.integer, np.floating))
+            and not isinstance(outputPowerDbm, (bool, np.bool_))
+        ):
+            scalarTarget = float(outputPowerDbm)
+            if not np.isfinite(scalarTarget):
+                raise ValueError("outputPowerDbm must be finite")
+            return scalarTarget, None
+        if isinstance(outputPowerDbm, (str, bytes)):
+            raise TypeError(
+                "outputPowerDbm must be a real scalar or numeric sequence"
+            )
+        targetArray = np.asarray(outputPowerDbm, dtype=object)
+        if targetArray.ndim != 1 or targetArray.size == 0:
+            raise ValueError(
+                "outputPowerDbm sequence must be nonempty and "
+                "one-dimensional"
+            )
+        targetValues = []
+        for targetValue in targetArray:
+            if (
+                not isinstance(
+                    targetValue,
+                    (int, float, np.integer, np.floating),
+                )
+                or isinstance(targetValue, (bool, np.bool_))
+            ):
+                raise TypeError(
+                    "every outputPowerDbm target must be a real number"
+                )
+            floatingTarget = float(targetValue)
+            if not np.isfinite(floatingTarget):
+                raise ValueError(
+                    "every outputPowerDbm target must be finite"
+                )
+            targetValues.append(floatingTarget)
+        targetTuple = tuple(targetValues)
+        return targetTuple[0], targetTuple
+
+    def ConfigurePowerCalibration(
+        self,
+        outputPowerDbm: Union[float, Sequence[float], np.ndarray],
+    ) -> PowerCalibration:
+        """Prepare the hidden PA-input calibration loop for one request.
+
+        Processing details:
+            Algorithm: Resolve scalar or per-chain targets, copy the current
+            Channel power detector and convergence settings into a private
+            ``PowerCalibration`` instance, and reuse that instance so its
+            converged drive preset can accelerate later requests. Rebuild the
+            helper only after a PA replacement or public-width change.
+
+        Args:
+            outputPowerDbm: Shared target dBm or one target for every PA chain.
+
+        Returns:
+            result: Configured private calibration helper bound to this PA.
+        """
+
+        if self.paModel is None or self._paProcessMethod is None:
+            raise RuntimeError(
+                "power calibration requires a PA bound through paModel "
+                "or SetPaModel"
+            )
+        self.ValidateParameters()
+        scalarTarget, perChainTargets = self.ResolveCalibrationTargets(
+            outputPowerDbm
+        )
+        calibrationParameters = {
+            "loadResistanceOhm": self.parameters["loadResistanceOhm"],
+            "maximumOutputPowerDbm": self.parameters[
+                "maximumOutputPowerDbm"
+            ],
+            "outputPowerDbm": scalarTarget,
+            "outputPowerDbmPerChain": perChainTargets,
+            "calibrationToleranceDb": self.parameters[
+                "calibrationToleranceDb"
+            ],
+            "maximumCalibrationIterations": self.parameters[
+                "maximumCalibrationIterations"
+            ],
+            "calibrationLearningRate": self.parameters[
+                "calibrationLearningRate"
+            ],
+            "maximumDriveAdjustmentDb": self.parameters[
+                "maximumDriveAdjustmentDb"
+            ],
+            "activePowerThresholdDb": self.parameters[
+                "activePowerThresholdDb"
+            ],
+            "activeGapToleranceSamples": self.parameters[
+                "activeGapToleranceSamples"
+            ],
+            "width": self.width,
+        }
+        if (
+            self._powerCalibration is None
+            or self._powerCalibration.paModel is not self.paModel
+            or self._powerCalibration.width != self.width
+        ):
+            self._powerCalibration = PowerCalibration(
+                paModel=self.paModel,
+                parameters=calibrationParameters,
+            )
+        else:
+            self._powerCalibration.UpdateParameters(
+                **calibrationParameters
+            )
+        return self._powerCalibration
+
+    def CalibratePaInput(
+        self,
+        inputSignal: np.ndarray,
+        outputPowerDbm: Union[float, Sequence[float], np.ndarray],
+    ) -> np.ndarray:
+        """Generate a hidden-drive PA input that meets requested output dBm.
+
+        Processing details:
+            Algorithm: Configure the private closed loop, normalize only the
+            active part of the caller's arbitrary waveform, repeatedly send a
+            newly scaled input through the bound PA, measure actual active PA
+            output power, and update the input preset until every chain falls
+            inside the configured tolerance. Padding and long idle intervals
+            are excluded by the active-region detector.
+
+        Args:
+            inputSignal: Arbitrarily scaled public SISO or MIMO waveform.
+            outputPowerDbm: Shared target dBm or one target per PA chain.
+
+        Returns:
+            result: Public PA-input waveform accepted by the closed loop.
+        """
+
+        powerCalibration = self.ConfigurePowerCalibration(outputPowerDbm)
+        return powerCalibration.Calibrate(inputSignal)
+
+    def GetLastPaInput(self) -> np.ndarray:
+        """Return the most recent internally calibrated public PA input.
+
+        Processing details:
+            Algorithm: Delegate to the private calibration helper and return
+            its defensive copy without exposing the hidden dB drive preset.
+
+        Returns:
+            result: Last converged waveform sent to the bound PA.
+        """
+
+        if self._powerCalibration is None:
+            raise RuntimeError(
+                "calibrated Process must run before GetLastPaInput"
+            )
+        return self._powerCalibration.GetLastPaInput()
+
+    def GetLastPaOutput(self) -> np.ndarray:
+        """Return the clean PA output measured by the last calibration.
+
+        Processing details:
+            Algorithm: Return the cached converged PA observation before
+            phase rotation and receiver noise, avoiding another PA evaluation.
+
+        Returns:
+            result: Last clean public PA output waveform.
+        """
+
+        if self._powerCalibration is None:
+            raise RuntimeError(
+                "calibrated Process must run before GetLastPaOutput"
+            )
+        return self._powerCalibration.GetLastPaOutput()
+
+    def GetLastCalibrationMetrics(self) -> Dict[str, object]:
+        """Return the latest target, measured power, error, and iteration data.
+
+        Processing details:
+            Algorithm: Delegate to the private calibration helper while
+            preserving its ordinary dictionary result and hidden drive state.
+
+        Returns:
+            result: Dictionary describing the converged PA power loop.
+        """
+
+        if self._powerCalibration is None:
+            raise RuntimeError(
+                "calibrated Process must run before "
+                "GetLastCalibrationMetrics"
+            )
+        return self._powerCalibration.GetLastCalibrationMetrics()
 
     def SynchronizeRandomGenerator(
         self, forceReset: bool = False
@@ -351,13 +666,20 @@ class Channel:
         Processing details:
             Algorithm: Convert ``noiseAmpMv`` directly from millivolts, or
             convert ``noisePwrDbm`` to watts and then RMS voltage through the
-            configured resistive port. Two None values resolve to zero noise.
+            configured resistive port. All three controls set to None resolve
+            to zero noise. An SNR-controlled value is signal-dependent and
+            must instead use ``ResolveSnrNoiseRmsPerChain``.
 
         Returns:
             result: Nonnegative complex-envelope RMS noise voltage.
         """
 
         self.ValidateParameters()
+        if self.parameters["noiseSnrDb"] is not None:
+            raise RuntimeError(
+                "noiseSnrDb has no signal-independent RMS voltage; use "
+                "ResolveSnrNoiseRmsPerChain(inputSignal)"
+            )
         noiseAmpMv = self.parameters["noiseAmpMv"]
         if noiseAmpMv is not None:
             return float(noiseAmpMv) * 1.0e-3
@@ -411,6 +733,57 @@ class Channel:
             )
         return float(noiseRmsVolts / fullScaleRmsVolts)
 
+    def ResolveSnrNoiseRmsPerChain(
+        self, inputSignal: np.ndarray
+    ) -> Tuple[float, ...]:
+        """Derive per-chain normalized noise RMS from active-signal SNR.
+
+        Processing details:
+            Algorithm: Detect each chain's active burst with the same relative
+            power threshold and short-gap rule used by PA power calibration,
+            measure signal RMS only over those samples, and multiply by
+            ``10**(-noiseSnrDb/20)``. This keeps leading/trailing padding and
+            long duty-cycle off intervals from artificially reducing noise.
+
+        Args:
+            inputSignal: Normalized phase-rotated SISO or MIMO signal.
+
+        Returns:
+            result: One total complex-envelope noise RMS per signal chain.
+        """
+
+        self.ValidateParameters()
+        noiseSnrDb = self.parameters["noiseSnrDb"]
+        if noiseSnrDb is None:
+            raise RuntimeError(
+                "ResolveSnrNoiseRmsPerChain requires noiseSnrDb"
+            )
+        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        activePowerDetector = PowerCalibration(
+            parameters={
+                "activePowerThresholdDb": self.parameters[
+                    "activePowerThresholdDb"
+                ],
+                "activeGapToleranceSamples": self.parameters[
+                    "activeGapToleranceSamples"
+                ],
+                "width": 0,
+            },
+        )
+        signalRmsPerChain = activePowerDetector.CalculateActiveRmsPerChain(
+            complexInput
+        )
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            noiseToSignalScale = np.power(
+                10.0, -float(noiseSnrDb) / 20.0
+            )
+        if not np.isfinite(noiseToSignalScale):
+            raise ValueError("noiseSnrDb is outside the numeric range")
+        return tuple(
+            float(signalRms * noiseToSignalScale)
+            for signalRms in signalRmsPerChain
+        )
+
     def ApplyPhaseRotation(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
@@ -442,10 +815,12 @@ class Channel:
         """Add circular complex white Gaussian noise in normalized units.
 
         Processing details:
-            Algorithm: Resolve the total complex-envelope RMS, divide it by
-            square root two for independent I and Q Gaussian components,
-            draw an independent sample for every array element, and add it
-            after phase rotation. Zero configured RMS returns an exact copy.
+            Algorithm: For an SNR control, derive one total noise RMS from
+            each chain's active signal RMS. Otherwise resolve the common
+            physical amplitude or power setting. Divide total RMS by square
+            root two for independent I and Q Gaussian components, draw one
+            sample per array element, and add it after phase rotation. No
+            configured noise returns an exact copy.
 
         Args:
             inputSignal: Normalized floating complex samples after rotation.
@@ -456,10 +831,25 @@ class Channel:
 
         complexInput = self.ValidateSignal(inputSignal, "inputSignal")
         self.SynchronizeRandomGenerator()
-        noiseRmsNormalized = self.ResolveNoiseRmsNormalized()
-        if noiseRmsNormalized == 0.0:
-            return complexInput.copy()
-        componentScale = noiseRmsNormalized / np.sqrt(2.0)
+        noiseSnrDb = self.parameters["noiseSnrDb"]
+        if noiseSnrDb is None:
+            noiseRmsNormalized = self.ResolveNoiseRmsNormalized()
+            if noiseRmsNormalized == 0.0:
+                return complexInput.copy()
+            componentScale: Union[float, np.ndarray] = (
+                noiseRmsNormalized / np.sqrt(2.0)
+            )
+        else:
+            noiseRmsPerChain = self.ResolveSnrNoiseRmsPerChain(
+                complexInput
+            )
+            if complexInput.ndim == 1:
+                componentScale = noiseRmsPerChain[0] / np.sqrt(2.0)
+            else:
+                componentScale = (
+                    np.asarray(noiseRmsPerChain, dtype=float).reshape(1, -1)
+                    / np.sqrt(2.0)
+                )
         complexNoise = componentScale * (
             self._randomGenerator.standard_normal(complexInput.shape)
             + 1j
@@ -558,22 +948,34 @@ class Channel:
             )
         return self.ApplyChannelEffects(normalizedPaOutput)
 
-    def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+    def Process(
+        self,
+        inputSignal: np.ndarray,
+        outputPowerDbm: Optional[
+            Union[float, Sequence[float], np.ndarray]
+        ] = None,
+    ) -> np.ndarray:
         """Evaluate the complete PA-to-receiver path at the public boundary.
 
         Processing details:
-            Algorithm: Decode public PA-input codes to normalized values,
-            evaluate the bound PA, phase rotation, and white noise entirely
-            in floating point, then encode the receiver waveform back to raw
-            integer I/Q codes when ``width`` is positive.
+            Algorithm: When ``outputPowerDbm`` is provided, first run the
+            private closed loop that repeatedly adjusts only the PA input and
+            observes clean PA output until its active-region power converges.
+            Apply phase rotation and receiver noise exactly once to the cached
+            accepted PA output. When the target is None, preserve the direct
+            one-pass PA-to-receiver behavior required by iterative algorithms.
 
         Args:
             inputSignal: Public PA input vector or samples-by-chains matrix.
+            outputPowerDbm: Optional shared target dBm or per-chain sequence.
 
         Returns:
             result: Public receiver waveform with matching shape and type.
         """
 
+        if outputPowerDbm is not None:
+            self.CalibratePaInput(inputSignal, outputPowerDbm)
+            return self.ProcessPaOutput(self.GetLastPaOutput())
         interfaceFormat = FixedPoint(self.width)
         normalizedInput = interfaceFormat.DecodeComplex(
             self.ValidateSignal(inputSignal, "inputSignal")
