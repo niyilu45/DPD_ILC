@@ -486,3 +486,13 @@ flowchart LR
 | `NormalizedPaAdapter.__init__`, `NormalizedPaAdapter.Process` | E/P | Hide integer-code transport from the ILC update law so learning always uses normalized physical amplitudes. | [DpdIlc.md](./DpdIlc.md) |
 | `DpdIlc.EncodeIlcResult` | E/N | Encode selected and per-iteration waveform fields as public integer codes without altering normalized-domain MSE values. | [DpdIlc.md](./DpdIlc.md) |
 | `MimoPaChain.Width` | E | Expose the parent MIMO PA width to the per-chain SISO ILC adapter. | [DpdIlc.md](./DpdIlc.md) |
+
+## 16. 增广 GMP 与 IRR 新增函数索引
+
+| 函数或方法 | 类型 | 原理或职责 | 对应文档 |
+|---|---|---|---|
+| `DpdGmp.BuildBasisChunk` | P/N | 按活动 main、lagging 和 leading 规格构造直接 GMP 基矩阵；子类通过覆盖此入口复用同一个归一化岭回归求解器。 | DPD-GMP §16 |
+| `AugmentedDpdGmp.RebuildStructure`, `AugmentedDpdGmp.BuildBasisChunk` | P/N/E | 联合编号直接 GMP 基与其共轭副本；共轭支路保留阶数、信号时延和包络交叉时延，用于表达 IQ 镜像及其非线性记忆。 | DPD-GMP §16 |
+| `AugmentedDpdGmp.GetDirectCoefficients`, `AugmentedDpdGmp.GetImageCoefficients` | E | 分别返回直接支路与镜像支路系数副本，便于诊断而不允许外部静默修改模型。 | DpdGmp §17 |
+| `Analysis.CalculateIrr`, `Analysis.CalculatePreparedIrr` | P/N | 在统一同步和公共复增益补偿后联合拟合直接项与共轭项，以两项功率之比计算 IRR；微小岭项保护病态参考。 | Analysis §5.11 |
+| `Draw.CreateIqGmpComparisonFigure`, `Draw.SaveIqGmpComparison` | E | 绘制并保存普通 GMP 与增广 GMP 的同功率 EVM、IRR 双面板曲线，不重新训练模型或计算指标。 | ChannelAnalyse §16 |

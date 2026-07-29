@@ -694,3 +694,174 @@ p_i=D_i\{q_i\},
 该方法适用于“线性耦合网络 + 相互独立的非线性 PA”。若负载牵引使一个 PA 的非线性直接依赖其他通道包络，则需要加入跨通道 GMP 基函数并联合训练，不能仅依赖线性矩阵求逆。
 
 通道冲激响应、平坦度、耦合参数、群时延、条件数、因果正则逆和修改前后性能比较见 [ChannelAnalyse.md](./ChannelAnalyse.md)。
+
+## 16. 增广 GMP：把 IQ 镜像纳入可部署 DPD
+
+### 16.1 普通 GMP 的结构盲区
+
+把第 $q$ 个普通 GMP 基函数统一记为
+
+```math
+\phi_q[n]
+=
+x[n-m_q]
+|x[n-m_q-r_q]|^{p_q-1}.
+```
+
+$r_q=0$ 表示 main 支路，$r_q>0$ 或 $r_q<0$ 分别表示滞后、超前包络交叉项。普通 DPD 为
+
+```math
+u[n]
+=
+\sum_q c_q\phi_q[n].
+```
+
+无论阶数和记忆深度怎样增加，载波因子仍然是 $x$ 而不是 $x^*$。因此它不能一般性地表示 IQ 失衡所需的反向镜像。
+
+### 16.2 直接支路与共轭支路
+
+增广 GMP 使用
+
+```math
+u[n]
+=
+\sum_q c_q\phi_q[n]
++
+\sum_q d_q\phi_q^*[n].
+```
+
+因为包络绝对值为实数，
+
+```math
+\phi_q^*[n]
+=
+x^*[n-m_q]
+|x[n-m_q-r_q]|^{p_q-1}.
+```
+
+所以共轭支路同时保留：
+
+- 非线性阶数 $p_q$；
+- 信号记忆时延 $m_q$；
+- 包络交叉时延 $r_q$；
+- main、lagging 和 leading 三类结构。
+
+一阶、零时延的 $d_q$ 主要补偿频率平坦的线性 IQ 镜像；更高阶和更多时延用于补偿 PA 非线性与频率选择性 IQ 不平衡共同产生的镜像记忆。
+
+### 16.3 为什么它能提高 IRR
+
+设 PA 后的 IQ 失衡为
+
+```math
+y[n]
+=
+aF(u[n])
++
+bF^*(u[n]).
+```
+
+在线性、无记忆特例 $F(u)=u$ 中，精确逆输入为
+
+```math
+u[n]
+=
+\frac{
+a^*x[n]-b\,x^*[n]
+}{
+|a|^2-|b|^2
+}.
+```
+
+该式同时含 $x$ 与 $x^*$。普通 GMP 只能拟合第一项；增广 GMP 的一阶直接和共轭基函数能同时表示两项。当 $F$ 还含有 AM-AM、AM-PM 和记忆时，额外的高阶共轭 GMP 项近似这一逆映射的非线性扩展。
+
+可逆性的必要条件是
+
+```math
+|a|>|b|.
+```
+
+当镜像路径接近期望路径，分母接近零，逆增益、DPD 峰值和噪声放大都会急剧增加，此时不应依赖 DPD 强行求逆。
+
+### 16.4 联合回归与系数更新
+
+直接基矩阵为 $\mathbf{\Phi}$，增广基矩阵为
+
+```math
+\mathbf{\Phi}_{\mathrm{aug}}
+=
+\begin{bmatrix}
+\mathbf{\Phi} & \mathbf{\Phi}^*
+\end{bmatrix}.
+```
+
+系数向量为
+
+```math
+\boldsymbol{\theta}
+=
+\begin{bmatrix}
+\mathbf{c} \\
+\mathbf{d}
+\end{bmatrix}.
+```
+
+当前 `AugmentedDpdGmp` 与普通 `DpdGmp` 使用同一个列归一化、加权岭回归和先验中心：
+
+```math
+\widehat{\boldsymbol{\theta}}
+=
+\left(
+\mathbf{\Phi}_{\mathrm{aug}}^H
+\mathbf{W}
+\mathbf{\Phi}_{\mathrm{aug}}
++
+\lambda\mathbf{I}
+\right)^{-1}
+\left(
+\mathbf{\Phi}_{\mathrm{aug}}^H
+\mathbf{W}\mathbf{u}_{\mathrm{label}}
++
+\lambda\boldsymbol{\theta}_0
+\right).
+```
+
+增量更新仍为
+
+```math
+\boldsymbol{\theta}_{k+1}
+=
+\boldsymbol{\theta}_k
++
+\mu
+\left(
+\widehat{\boldsymbol{\theta}}
+-
+\boldsymbol{\theta}_k
+\right).
+```
+
+初始先验只有直接支路的一阶零时延系数为 1，所有镜像系数为 0。因此训练前的 `AugmentedDpdGmp` 与恒等 DPD 完全一致。
+
+### 16.5 参数数量、条件数与退化风险
+
+若普通 GMP 有 $Q$ 个特征，增广 GMP 有 $2Q$ 个特征。额外自由度会带来三类代价：
+
+1. 法方程规模增大，训练和推理计算量近似增加。
+2. $\mathbf{\Phi}$ 与 $\mathbf{\Phi}^*$ 相关时条件数升高。
+3. 没有真实镜像时，共轭支路可能拟合反馈噪声并损害验证集 EVM 或 ACLR。
+
+因此应根据 `Analysis` 输出的 `irrDb` 决定是否启用，并在独立帧和独立功率点比较。若增广模型只改善训练 NMSE，却使验证 EVM、ACLR、峰值或定点饱和率变差，应提高 `ridgeFactor`、减少阶数/记忆、延长训练记录，或者恢复普通 GMP。
+
+### 16.6 与通道耦合的组合
+
+线性跨通道耦合和单路 IQ 镜像是两个不同维度：
+
+```math
+\mathbf{y}
+=
+\mathbf{H}_{d}\mathbf{u}
++
+\mathbf{H}_{i}\mathbf{u}^*.
+```
+
+$\mathbf{H}_{d}$ 描述直接 MIMO 通道，$\mathbf{H}_{i}$ 描述跨链共轭镜像。只有 $\mathbf{H}_{d}$ 非对角时，现有 `CouplingAwareDpdGmp` 的直接通道去嵌入适用；检测到显著 $\mathbf{H}_{i}$ 时，每路 PA 逆模型应改用 `AugmentedDpdGmp`，并在更强的跨链镜像场景中升级为联合 widely-linear MIMO GMP。测量与选择流程见 [ChannelAnalyse.md](./ChannelAnalyse.md)。

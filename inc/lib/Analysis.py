@@ -1,4 +1,4 @@
-"""Object-oriented SNR, EVM, and ACLR analysis for VHT/HE/EHT simulations."""
+"""Object-oriented SNR, EVM, IRR, and ACLR analysis for Wi-Fi simulations."""
 
 import csv
 import json
@@ -66,6 +66,7 @@ class SignalMetrics(TypedDict):
     snrDb: float
     evmDb: float
     evmPercent: float
+    irrDb: float
     aclrLowerDb: float
     aclrUpperDb: float
     aclrWorstDb: float
@@ -1326,6 +1327,93 @@ class Analysis:
         )
         return float(evmDb), float(evmPercent)
 
+    def CalculateIrr(self, measuredSignal: np.ndarray) -> float:
+        """Calculate image-rejection ratio after common synchronization.
+
+        Processing details:
+            Algorithm: Run the standard timing, frequency, sampling-clock,
+            and common complex-gain compensation once, then estimate the
+            desired and conjugate response coefficients on the data field.
+
+        Args:
+            measuredSignal: Measured or simulated complex samples.
+
+        Returns:
+            result: Aggregate direct-to-image power ratio in decibels.
+        """
+
+        preparedSignal = self.PrepareMeasuredSignal(measuredSignal)
+        return self.CalculatePreparedIrr(preparedSignal)
+
+    def CalculatePreparedIrr(self, preparedSignal: np.ndarray) -> float:
+        """Estimate IRR with a regularized widely linear least-squares fit.
+
+        Processing details:
+            Algorithm: Fit each measured chain to ``a*x + b*conj(x)`` on the
+            useful data field, accumulate ``|a|^2`` as desired-path power and
+            ``|b|^2`` as image-path power, and report their decibel ratio.
+            A tiny scale-relative ridge protects nearly real or otherwise
+            poorly conditioned reference captures without biasing ordinary
+            circular Wi-Fi signals.
+
+        Args:
+            preparedSignal: Signal returned by ``PrepareMeasuredSignal``.
+
+        Returns:
+            result: Image-rejection ratio in dB; larger is better.
+        """
+
+        complexMeasured = self.ValidatePreparedSignal(preparedSignal)
+        referenceMatrix = (
+            self.referenceSignal.reshape(-1, 1)
+            if self.referenceSignal.ndim == 1
+            else self.referenceSignal
+        )
+        measuredMatrix = (
+            complexMeasured.reshape(-1, 1)
+            if complexMeasured.ndim == 1
+            else complexMeasured
+        )
+        dataSlice = (
+            slice(0, referenceMatrix.shape[0])
+            if self.waveform is None
+            else self.waveform.fieldSlices[self.waveform.dataFieldName]
+        )
+        directPower = 0.0
+        imagePower = 0.0
+        for chainIndex in range(referenceMatrix.shape[1]):
+            referenceData = referenceMatrix[dataSlice, chainIndex].reshape(-1)
+            measuredData = measuredMatrix[dataSlice, chainIndex].reshape(-1)
+            regressionMatrix = np.column_stack(
+                (referenceData, np.conj(referenceData))
+            )
+            normalMatrix = (
+                regressionMatrix.conj().T @ regressionMatrix
+            )
+            diagonalScale = max(
+                float(np.mean(np.real(np.diag(normalMatrix)))),
+                np.finfo(float).tiny,
+            )
+            regularizedMatrix = normalMatrix + (
+                1.0e-12
+                * diagonalScale
+                * np.eye(2, dtype=np.complex128)
+            )
+            coefficients = np.linalg.solve(
+                regularizedMatrix,
+                regressionMatrix.conj().T @ measuredData,
+            )
+            directPower += float(np.abs(coefficients[0]) ** 2)
+            imagePower += float(np.abs(coefficients[1]) ** 2)
+        numericFloor = np.finfo(float).tiny
+        return float(
+            10.0
+            * np.log10(
+                max(directPower, numericFloor)
+                / max(imagePower, numericFloor)
+            )
+        )
+
     def CalculatePreparedSnrPerChain(
         self, preparedSignal: np.ndarray
     ) -> Tuple[float, ...]:
@@ -1644,7 +1732,7 @@ class Analysis:
     def Analyze(
         self, measuredSignal: Optional[np.ndarray] = None
     ) -> SignalMetrics:
-        """Calculate power, SNR, EVM, and ACLR for one measured waveform.
+        """Calculate power, SNR, EVM, IRR, and ACLR for one measured waveform.
 
         Processing details:
             Algorithm: Use the explicit measured waveform in reference mode,
@@ -1658,7 +1746,7 @@ class Analysis:
 
         Returns:
             result: Ordinary dictionary containing output power, SNR, EVM,
-                and ACLR values.
+                IRR, and ACLR values.
         """
 
         selectedSignal = measuredSignal
@@ -1679,6 +1767,7 @@ class Analysis:
         ) = self.CalculateOutputPower(complexMeasured)
         snrDb = self.CalculatePreparedSnr(complexMeasured)
         evmDb, evmPercent = self.CalculatePreparedEvm(complexMeasured)
+        irrDb = self.CalculatePreparedIrr(complexMeasured)
         (
             aclrLowerDb,
             aclrUpperDb,
@@ -1715,6 +1804,7 @@ class Analysis:
             "snrDb": float(snrDb),
             "evmDb": float(evmDb),
             "evmPercent": float(evmPercent),
+            "irrDb": float(irrDb),
             "aclrLowerDb": float(aclrLowerDb),
             "aclrUpperDb": float(aclrUpperDb),
             "aclrWorstDb": float(aclrWorstDb),
@@ -1991,7 +2081,7 @@ class Analysis:
             raise ValueError("no stage metrics are available to print")
         header = (
             f"{'Stage':<16} {'Pout(dBm)':>10} {'SNR(dB)':>10} "
-            f"{'EVM(dB)':>10} "
+            f"{'EVM(dB)':>10} {'IRR(dB)':>10} "
             f"{'EVM(%)':>10} {'ACLR-L':>10} {'ACLR-U':>10} {'ACLR-W':>10}"
         )
         print(header)
@@ -2001,6 +2091,7 @@ class Analysis:
                 f"{stageName:<16} {metrics['outputPowerDbm']:>10.2f} "
                 f"{metrics['snrDb']:>10.2f} "
                 f"{metrics['evmDb']:>10.2f} "
+                f"{metrics['irrDb']:>10.2f} "
                 f"{metrics['evmPercent']:>10.3f} "
                 f"{metrics['aclrLowerDb']:>10.2f} "
                 f"{metrics['aclrUpperDb']:>10.2f} "
@@ -2124,6 +2215,7 @@ class Analysis:
             "snrDb",
             "evmDb",
             "evmPercent",
+            "irrDb",
             "aclrLowerDb",
             "aclrUpperDb",
             "aclrWorstDb",

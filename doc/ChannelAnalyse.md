@@ -1863,3 +1863,150 @@ PA 前、PA 后和仪表端的线缆、衰减器、耦合器必须去嵌入到�
 4. 逆补偿后的 DAC 峰值与定点饱和率。
 5. Independent 与 Coupling-aware 在同功率下的 EVM、NMSE、ACLR 和残余耦合。
 6. 使用独立验证帧和未参与训练的功率点复测，避免只记住训练波形。
+
+## 15. 如何检测通道中存在 IQ 不平衡
+
+### 15.1 普通通道模型为什么不够
+
+普通复基带 MIMO 通道只含直接项：
+
+```math
+\mathbf{y}[n]
+=
+\sum_{\ell}
+\mathbf{H}_{d}[\ell]\mathbf{x}[n-\ell].
+```
+
+IQ 不平衡会增加共轭项：
+
+```math
+\mathbf{y}[n]
+=
+\sum_{\ell}
+\mathbf{H}_{d}[\ell]\mathbf{x}[n-\ell]
++
+\sum_{\ell}
+\mathbf{H}_{i}[\ell]\mathbf{x}^*[n-\ell].
+```
+
+$\mathbf{H}_{d}$ 是直接通道矩阵，$\mathbf{H}_{i}$ 是镜像通道矩阵。$\mathbf{H}_{i}$ 的对角元素表示每路自身 IQ 镜像，非对角元素表示“其他通道的共轭镜像”耦合到当前接收链。
+
+频域形式为
+
+```math
+\mathbf{Y}(f)
+=
+\mathbf{H}_{d}(f)\mathbf{X}(f)
++
+\mathbf{H}_{i}(f)\mathbf{X}^*(-f).
+```
+
+关键现象是频率翻转：直接项把 $f$ 处激励映射到 $f$，镜像项把 $-f$ 处激励的共轭映射到 $f$。因此只测普通 $\mathbf{Y}(f)/\mathbf{X}(f)$ 会把镜像混入噪声或频响误差。
+
+### 15.2 推荐检测步骤
+
+1. 在每个发射通道发送独立的 proper complex 宽带探测信号，其他通道静默。
+2. 按现有 `ChannelAnalyse` 流程先估计整数/分数时延、CFO、SFO 和公共复增益。
+3. 在有效数据区联合拟合 $x$ 与 $x^*$，得到直接系数 $\hat a$ 和镜像系数 $\hat b$。
+4. 计算 `Analysis.Analyze()` 返回的 `irrDb`。
+5. 改变输出功率、中心频率和温度重复测量，判断镜像是固定、频率选择性还是功率相关。
+6. 用已知高 IRR 信号直通接收机，单独测量反馈接收机的 IRR 地板。
+
+对单路时域记录，代码对应的回归为
+
+```math
+\begin{bmatrix}
+\hat a \\
+\hat b
+\end{bmatrix}
+=
+\left(
+\mathbf{A}^H\mathbf{A}
++
+\lambda\mathbf{I}
+\right)^{-1}
+\mathbf{A}^H\mathbf{y},
+```
+
+```math
+\mathbf{A}
+=
+\begin{bmatrix}
+\mathbf{x} & \mathbf{x}^*
+\end{bmatrix}.
+```
+
+若要得到随频率变化的 $\mathbf{H}_{i}(f)$，应把带宽分成多个子带，或用正负频率独立的多次探测建立同样的局部广义线性回归。单个实双音不适合独立估计，因为实信号满足 $x=x^*$，直接列与共轭列完全重合。
+
+### 15.3 如何区分发射端 IQ 不平衡与反馈接收机 IQ 不平衡
+
+- 前向仪表和反馈接收机都看到相同镜像：优先怀疑发射链。
+- 只有反馈接收机看到镜像：优先校准反馈链，不能让 DPD 预补偿该测量误差。
+- IRR 随 PA 输出功率变化：可能是 PA 非线性与 IQ 支路的级联效应。
+- IRR 与输出功率无关但随频率变化：更像调制器、滤波器或接收机的频率选择性 IQ 失衡。
+- 更换独立接收机后镜像系数相位翻转或大幅变化：说明参考面尚未固定。
+
+## 16. 检测后的 DPD 推荐与增广 GMP 仿真
+
+### 16.1 选择建议
+
+| 测量现象 | 推荐 |
+|---|---|
+| IRR 高且 EVM 主要由 PA 压缩决定 | 保留普通 `DpdGmp` |
+| 单路自身镜像明显，且镜像在 DPD 可控发射链内 | 使用 `AugmentedDpdGmp` |
+| 镜像随频率变化 | 增加增广 GMP 的 `memoryDepth` 和 `crossMemoryDepth` |
+| 非对角 $\mathbf{H}_{i}$ 明显 | 升级为联合 widely-linear MIMO GMP |
+| 镜像来自反馈接收机 | 先校准反馈链或采用前向仪表结果，不应由发射 DPD 补偿 |
+| 增广训练条件数高或验证集变差 | 增大 `ridgeFactor`、减少阶数/记忆并延长训练帧 |
+
+### 16.2 场景构造
+
+`tests/BenchMark.py --channel-analyse` 现在同时构造一个独立的 IQ 归因场景：
+
+- EHT、20 MHz、80 MS/s、MCS 7；
+- 近线性无记忆 PA，用于隔离 IQ 镜像；
+- 直接系数 $a=1$；
+- 镜像系数幅度 $|b|=0.08$、相位 0.40 rad；
+- 输出功率 8、11.5、15、18.5 和 22 dBm；
+- 三个同功率方法：未补偿、普通 GMP、增广 GMP；
+- 普通和增广模型使用相同训练标签、阶数、记忆、岭系数和功率闭环。
+
+理论未补偿 IRR 为
+
+```math
+\mathit{IRR}_{\mathrm{dB}}
+=
+20\log_{10}
+\frac{1}{0.08}
+\approx
+21.94\ \mathrm{dB}.
+```
+
+### 16.3 仿真结果
+
+| 方法 | 8 dBm IRR | 22 dBm IRR | 8 dBm EVM | 22 dBm EVM |
+|---|---:|---:|---:|---:|
+| IQ-impaired PA | 21.938 dB | 21.938 dB | -21.944 dB | -21.944 dB |
+| Conventional GMP | 21.938 dB | 21.957 dB | -21.943 dB | -21.957 dB |
+| Augmented GMP | 193.466 dB | 196.802 dB | -186.376 dB | -189.155 dB |
+
+![普通 GMP 与增广 GMP 的功率-EVM/IRR 曲线](./images/channel_analyse/iq_gmp_comparison.png)
+
+**图 4 说明：** 左图越低越好，右图越高越好。普通 GMP 与未补偿曲线几乎重合，说明增加普通非线性阶数不能替代共轭结构；增广 GMP 能表示解析逆中的 $x^*$ 项，因此同时消除镜像和由镜像主导的 EVM。曲线使用无噪声、近线性 PA 和双精度计算，约 190 dB 的结果只表示残差到达数值精度，不代表实际射频硬件性能。真实链路应由接收机 IRR、噪声和量化建立可信测量上限。
+
+### 16.4 改进是否符合预期
+
+在所有五个功率点：
+
+- 增广 GMP 相对普通 GMP 的 IRR 提高超过 170 dB；
+- 增广 GMP 的 EVM 降低超过 160 dB；
+- 普通 GMP 只有不足 0.02 dB 的 IRR 变化，属于有限样本相关和极弱 PA 数值非线性的影响；
+- 未观察到随功率恶化，因为本场景故意把 PA 设置在近线性区。
+
+若把 PA 改为强压缩模型，增广 GMP 的优势仍应在 IRR 上存在，但绝对 EVM 会由压缩、削顶、记忆和训练覆盖共同限制。应另外使用现有 PA 功率扫描评估，而不能把本隔离场景的数值精度结果当作整机指标。
+
+### 16.5 输出文件
+
+- `doc/images/channel_analyse/iq_gmp_comparison.png`：EVM/IRR 双曲线；
+- `doc/images/channel_analyse/iq_gmp_comparison.csv`：15 个原始曲线点；
+- `doc/images/channel_analyse/channel_analysis.json`：`iqImbalanceStages` 完整记录。

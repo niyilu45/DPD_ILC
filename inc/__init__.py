@@ -44,6 +44,7 @@ from .lib.ChannelAnalyse import (
     ChannelPathMeasurement,
 )
 from .lib.DpdGmp import (
+    AugmentedDpdGmp,
     CouplingAwareDpdGmp,
     CouplingAwareDpdGmpTrainingResult,
     DpdGmp,

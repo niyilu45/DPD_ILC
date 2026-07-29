@@ -34,7 +34,11 @@ if str(GetProjectRoot()) not in sys.path:
 from inc.lib.Analysis import Analysis
 from inc.lib.Channel import Channel
 from inc.lib.ChannelAnalyse import ChannelAnalyse
-from inc.lib.DpdGmp import CouplingAwareDpdGmp, DpdGmp
+from inc.lib.DpdGmp import (
+    AugmentedDpdGmp,
+    CouplingAwareDpdGmp,
+    DpdGmp,
+)
 from inc.lib.DpdIlc import (
     CalculateIterationMetrics,
     FitMimoGmpPredistorter,
@@ -1496,6 +1500,7 @@ def CheckIdealMetrics() -> None:
             "snrDb",
             "evmDb",
             "evmPercent",
+            "irrDb",
             "aclrLowerDb",
             "aclrUpperDb",
             "aclrWorstDb",
@@ -1505,6 +1510,7 @@ def CheckIdealMetrics() -> None:
         assert metrics["snrDb"] > 250.0
         assert metrics["evmDb"] < -250.0
         assert metrics["evmPercent"] < 1e-10
+        assert metrics["irrDb"] > 200.0
         normalizedReferenceRms = float(
             np.sqrt(np.mean(np.abs(resultAnalysis.referenceSignal) ** 2))
         )
@@ -1517,6 +1523,24 @@ def CheckIdealMetrics() -> None:
             expectedOutputPowerDbm,
             atol=1.0e-10,
         )
+
+    iqReference = (
+        np.random.default_rng(404).standard_normal(4096)
+        + 1j * np.random.default_rng(405).standard_normal(4096)
+    )
+    iqReference /= np.sqrt(np.mean(np.abs(iqReference) ** 2))
+    imageCoefficient = 0.05 * np.exp(1j * 0.3)
+    iqMeasured = iqReference + imageCoefficient * np.conj(iqReference)
+    iqMetrics = Analysis(
+        iqMeasured,
+        parameters={
+            "width": 0,
+            "sampleRateHz": 80.0e6,
+        },
+        transmittedSignal=iqReference,
+    ).Analyze()
+    expectedIrrDb = 20.0 * np.log10(1.0 / np.abs(imageCoefficient))
+    assert abs(iqMetrics["irrDb"] - expectedIrrDb) < 0.1
 
 
 def CheckSignalProcessingCompensation() -> None:
@@ -4234,6 +4258,48 @@ def CheckDpdGmpModelAndBenchmark() -> None:
     assert fittedDpd.GetLastTrainingResult() == trainingResult
     assert trainingResult.featureCount == 2
 
+    augmentedTarget = (
+        1.08 * referenceSignal
+        + 0.16 * referenceSignal * np.abs(referenceSignal) ** 2
+        + 0.12 * np.conj(referenceSignal)
+        + 0.05
+        * np.conj(referenceSignal)
+        * np.abs(referenceSignal) ** 2
+    )
+    directOnlyDpd = DpdGmp(
+        parameters={
+            "nonlinearOrders": (1, 3),
+            "memoryDepth": 1,
+            "crossMemoryDepth": 0,
+            "ridgeFactor": 1.0e-8,
+            "maximumOutputMagnitude": None,
+            "width": 0,
+        }
+    )
+    augmentedDpd = AugmentedDpdGmp(
+        parameters={
+            "nonlinearOrders": (1, 3),
+            "memoryDepth": 1,
+            "crossMemoryDepth": 0,
+            "ridgeFactor": 1.0e-8,
+            "maximumOutputMagnitude": None,
+            "width": 0,
+        }
+    )
+    directOnlyResult = directOnlyDpd.Fit(
+        referenceSignal,
+        augmentedTarget,
+    )
+    augmentedResult = augmentedDpd.Fit(
+        referenceSignal,
+        augmentedTarget,
+    )
+    assert augmentedResult.featureCount == 2 * directOnlyResult.featureCount
+    assert augmentedResult.afterNmseDb < directOnlyResult.afterNmseDb - 20.0
+    assert np.linalg.norm(
+        augmentedDpd.GetImageCoefficients()
+    ) > 0.01
+
     firstOrderParameters = {
         "nonlinearOrders": (1,),
         "memoryDepth": 1,
@@ -4276,6 +4342,13 @@ def CheckDpdGmpModelAndBenchmark() -> None:
     assert fixedOutput.dtype == np.complex128
     assert np.max(np.abs(fixedOutput.real)) > 1.0
     assert np.array_equal(fixedOutput, fixedWaveform.samples)
+    fixedAugmentedDpd = AugmentedDpdGmp(
+        parameters={"width": 16}
+    )
+    assert np.array_equal(
+        fixedAugmentedDpd.Process(fixedWaveform.samples),
+        fixedWaveform.samples,
+    )
     with warnings.catch_warnings(record=True) as warningRecords:
         warnings.simplefilter("always")
         warnedDpd = DpdGmp(
@@ -4411,6 +4484,18 @@ def CheckChannelAnalysisAndCoupledDpd() -> None:
         assert len(result.postPaMeasurement.paths) == 4
         assert len(result.stages) == 4
         assert len(result.improvements) == 4
+        assert len(result.iqImbalanceStages) == 15
+        conventionalIrr = max(
+            stage.irrDb
+            for stage in result.iqImbalanceStages
+            if stage.methodName == "Conventional GMP"
+        )
+        augmentedIrr = min(
+            stage.irrDb
+            for stage in result.iqImbalanceStages
+            if stage.methodName == "Augmented GMP"
+        )
+        assert augmentedIrr > conventionalIrr + 40.0
         assert all(
             improvement.expectationMet
             for improvement in result.improvements
@@ -4430,6 +4515,8 @@ def CheckChannelAnalysisAndCoupledDpd() -> None:
             "channel_dpd_comparison.csv",
             "channel_dpd_improvements.csv",
             "channel_analysis.png",
+            "iq_gmp_comparison.csv",
+            "iq_gmp_comparison.png",
         ):
             assert (outputDirectory / artifactName).exists()
         savedResult = json.loads(

@@ -62,6 +62,7 @@ class Draw:
                 "paPowerFileStem": "pa_power_characteristics",
                 "dpdGmpFileStem": "dpd_gmp_performance",
                 "channelAnalysisFileStem": "channel_analysis",
+                "iqGmpFileStem": "iq_gmp_comparison",
                 "figureWidthInches": 10.5,
                 "figureHeightInches": 6.2,
                 "figureDpi": 180,
@@ -88,6 +89,9 @@ class Draw:
                 ),
                 "channelAnalysisPlotTitle": (
                     "Measured MIMO channel and coupling-aware DPD-GMP"
+                ),
+                "iqGmpPlotTitle": (
+                    "IQ imbalance: conventional versus augmented GMP"
                 ),
                 "xAxisLabel": "PA output power per chain (dBm)",
                 "yAxisLabel": "RMS EVM (dB, lower is better)",
@@ -187,6 +191,7 @@ class Draw:
             "paPowerFileStem",
             "dpdGmpFileStem",
             "channelAnalysisFileStem",
+            "iqGmpFileStem",
         ):
             fileStem = self.parameters[parameterName]
             if not isinstance(fileStem, str):
@@ -237,6 +242,7 @@ class Draw:
             "paPowerPlotTitle",
             "dpdGmpPlotTitle",
             "channelAnalysisPlotTitle",
+            "iqGmpPlotTitle",
         ):
             parameterValue = self.parameters[parameterName]
             if not isinstance(parameterValue, str):
@@ -2068,6 +2074,162 @@ class Draw:
         axes.legend(loc="best")
         figure.tight_layout()
         return figure
+
+    def CreateIqGmpComparisonFigure(
+        self,
+        stageResults: Sequence[Mapping[str, object]],
+    ) -> Any:
+        """Create equal-power EVM and IRR curves for IQ-aware DPD.
+
+        Processing details:
+            Algorithm: Group validated flat rows by method, sort every group
+            by requested PA output power, and draw EVM and IRR on separate
+            shared-power panels so lower EVM and higher IRR remain visually
+            unambiguous.
+
+        Args:
+            stageResults: Flat rows containing method, power, EVM, and IRR.
+
+        Returns:
+            result: Matplotlib Figure with EVM and IRR comparison panels.
+        """
+
+        self.ValidateParameters()
+        stageRows = tuple(stageResults)
+        if not stageRows:
+            raise ValueError("stageResults must be nonempty")
+        methodRows: Dict[str, list[Mapping[str, object]]] = {}
+        for stageIndex, stageRow in enumerate(stageRows):
+            if not isinstance(stageRow, Mapping):
+                raise TypeError(
+                    f"stageResults[{stageIndex}] must be a mapping"
+                )
+            methodName = stageRow.get("methodName")
+            if not isinstance(methodName, str) or not methodName:
+                raise ValueError(
+                    "every IQ-GMP stage requires a methodName"
+                )
+            for fieldName in ("outputPowerDbm", "evmDb", "irrDb"):
+                fieldValue = stageRow.get(fieldName)
+                if (
+                    not isinstance(fieldValue, (int, float))
+                    or isinstance(fieldValue, bool)
+                    or not np.isfinite(fieldValue)
+                ):
+                    raise ValueError(
+                        f"{methodName}.{fieldName} must be finite"
+                    )
+            methodRows.setdefault(methodName, []).append(stageRow)
+        if len(methodRows) < 2:
+            raise ValueError(
+                "stageResults must contain at least two methods"
+            )
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "matplotlib is required for IQ-GMP plots"
+            ) from error
+        figure, axes = plt.subplots(
+            1,
+            2,
+            figsize=(
+                float(self.parameters["figureWidthInches"]) * 1.2,
+                float(self.parameters["figureHeightInches"]),
+            ),
+            sharex=True,
+        )
+        for methodName, methodStageRows in methodRows.items():
+            sortedRows = sorted(
+                methodStageRows,
+                key=lambda row: float(row["outputPowerDbm"]),
+            )
+            outputPowers = [
+                float(row["outputPowerDbm"])
+                for row in sortedRows
+            ]
+            axes[0].plot(
+                outputPowers,
+                [float(row["evmDb"]) for row in sortedRows],
+                marker="o",
+                linewidth=float(self.parameters["lineWidth"]),
+                markersize=float(self.parameters["markerSize"]),
+                label=methodName,
+            )
+            axes[1].plot(
+                outputPowers,
+                [float(row["irrDb"]) for row in sortedRows],
+                marker="o",
+                linewidth=float(self.parameters["lineWidth"]),
+                markersize=float(self.parameters["markerSize"]),
+                label=methodName,
+            )
+        axes[0].set_title("Modulation accuracy")
+        axes[0].set_ylabel("RMS EVM (dB, lower is better)")
+        axes[1].set_title("Image suppression")
+        axes[1].set_ylabel("IRR (dB, higher is better)")
+        for selectedAxes in axes:
+            selectedAxes.set_xlabel("PA output power (dBm)")
+            selectedAxes.grid(True, linestyle=":", linewidth=0.7)
+            selectedAxes.legend(loc="best")
+        figure.suptitle(str(self.parameters["iqGmpPlotTitle"]))
+        figure.tight_layout()
+        return figure
+
+    def SaveIqGmpComparison(
+        self,
+        stageResults: Sequence[Mapping[str, object]],
+        outputDirectory: Path,
+        fileStem: Optional[str] = None,
+    ) -> Path:
+        """Save the IQ-imbalance EVM/IRR comparison as a PNG.
+
+        Processing details:
+            Algorithm: Resolve a safe file stem, create the destination,
+            render the validated two-panel comparison, save it at configured
+            DPI, and close Matplotlib resources in all cases.
+
+        Args:
+            stageResults: Flat IQ-GMP benchmark result rows.
+            outputDirectory: Destination directory for the PNG.
+            fileStem: Optional simple filename overriding the default.
+
+        Returns:
+            result: Path to the saved comparison figure.
+        """
+
+        selectedFileStem = (
+            str(self.parameters["iqGmpFileStem"])
+            if fileStem is None
+            else fileStem
+        )
+        if (
+            not isinstance(selectedFileStem, str)
+            or not selectedFileStem
+            or any(
+                character in selectedFileStem
+                for character in '<>:"/\\|?*'
+            )
+        ):
+            raise ValueError("fileStem must be a valid simple file name")
+        outputPath = Path(outputDirectory)
+        outputPath.mkdir(parents=True, exist_ok=True)
+        figurePath = outputPath / f"{selectedFileStem}.png"
+        figure = self.CreateIqGmpComparisonFigure(stageResults)
+        try:
+            figure.savefig(
+                figurePath,
+                dpi=int(self.parameters["figureDpi"]),
+                bbox_inches="tight",
+            )
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
+        return figurePath
 
     def SaveConvergenceCurve(
         self,

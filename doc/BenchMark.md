@@ -2134,3 +2134,90 @@ python tests/BenchMark.py --channel-analyse `
 - [ ] Independent 与 Coupling-aware 使用同一物理 plant；
 - [ ] 四个预期比较全部通过；
 - [ ] JSON、CSV、PNG 与 [ChannelAnalyse.md](./ChannelAnalyse.md) 数值一致。
+
+## 32. K类：IQ 检测与增广 DPD-GMP 对比
+
+### 32.1 分类目的
+
+K 类回答三个独立问题：
+
+1. `Analysis` 能否从已知发送/接收波形估计 IRR；
+2. 普通 GMP 是否能补偿共轭 IQ 镜像；
+3. 增广 GMP 的改善是否在多个相同 PA 输出功率点保持。
+
+该场景随 `--channel-analyse` 一起运行，但与 J 类跨通道耦合结果分开保存。J 类研究 $\mathbf{H}_{d}$ 的非对角直接耦合，K 类研究 $\mathbf{H}_{i}$ 的共轭镜像，不能把两个 baseline 混合排名。
+
+### 32.2 控制变量
+
+| 项目 | 配置 |
+|---|---|
+| 波形 | EHT，20 MHz，80 MS/s，MCS 7 |
+| PA | 近线性 Wiener，单抽头，饱和幅度 1000 |
+| IQ 直接系数 | 1 |
+| IQ 镜像系数 | $0.08e^{j0.40}$ |
+| 输出功率 | 8、11.5、15、18.5、22 dBm |
+| 普通/增广 GMP | 阶数 `(1, 3)`，记忆 2，交叉记忆 1 |
+| 岭系数 | `1e-9` |
+| 对比指标 | EVM、IRR、ACLR、实际输出功率 |
+
+近线性 PA 是有意的控制变量：它使结果能明确归因于“模型有没有 $x^*$ 支路”，而不是由 PA 压缩强弱决定。
+
+### 32.3 测试流程
+
+```mermaid
+flowchart LR
+    tx["Generate known complex Wi-Fi"] --> iq["Apply 8% conjugate image"]
+    tx --> label["Build exact widely-linear inverse label"]
+    label --> direct["Fit conventional GMP"]
+    label --> augmented["Fit augmented GMP"]
+    iq --> compare["Equal-output-power Analysis"]
+    direct --> compare
+    augmented --> compare
+    compare --> metrics["EVM / IRR / ACLR"]
+    metrics --> curve["iq_gmp_comparison.png"]
+```
+
+**图 18 说明：** 三种方法共用同一 Wi-Fi 帧、IQ plant、目标功率和指标函数。普通与增广 GMP 都拟合同一个精确逆标签，因此结果差异来自模型结构，而不是标签质量。
+
+### 32.4 结果预期
+
+- 未补偿 IRR 应接近 $20\log_{10}(1/0.08)=21.94$ dB；
+- 普通 GMP 没有独立共轭支路，IRR 不应有显著改善；
+- 增广 GMP 应明显提高 IRR，并降低由镜像主导的 EVM；
+- 五个功率点的趋势应一致；
+- 实际输出功率应接近目标，不能通过后级缩放伪造改善。
+
+### 32.5 仿真结果
+
+| 方法 | IRR 范围 | EVM 范围 | 结论 |
+|---|---:|---:|---|
+| IQ-impaired PA | 21.938 dB | -21.944 dB | 与理论镜像系数一致 |
+| Conventional GMP | 21.938 至 21.957 dB | -21.943 至 -21.957 dB | 基本不能消除镜像 |
+| Augmented GMP | 193.466 至 196.802 dB | -186.376 至 -189.155 dB | 达到无噪声双精度残差底 |
+
+![K类增广GMP性能曲线](./images/channel_analyse/iq_gmp_comparison.png)
+
+**图 19 说明：** 右图中普通 GMP 与 baseline 重合，而增广 GMP 显著提高 IRR；左图显示镜像被消除后 EVM 同时下降。极高数值来自理想、无噪声的结构验证，不代表仪器动态范围。
+
+### 32.6 输出与验收
+
+运行：
+
+```powershell
+python tests/BenchMark.py --channel-analyse
+```
+
+新增输出：
+
+- `iq_gmp_comparison.csv`；
+- `iq_gmp_comparison.png`；
+- `channel_analysis.json` 的 `iqImbalanceStages`。
+
+验收清单：
+
+- [ ] 三种方法各有五个同功率点；
+- [ ] `Analysis` 结果字典含 `irrDb`；
+- [ ] baseline IRR 与 21.94 dB 理论值一致；
+- [ ] 增广 GMP 的最差 IRR 比普通 GMP 的最好 IRR至少高 40 dB；
+- [ ] 曲线、CSV 和 JSON 使用同一批计算结果；
+- [ ] 文档明确区分理想数值残差与真实测量上限。

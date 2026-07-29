@@ -52,6 +52,7 @@ from inc.lib.ChannelAnalyse import (
     ChannelMeasurementResult,
 )
 from inc.lib.DpdGmp import (
+    AugmentedDpdGmp,
     CouplingAwareDpdGmp,
     CouplingAwareDpdGmpTrainingResult,
     DpdGmp,
@@ -74,7 +75,12 @@ from inc.lib.DpdIlc import (
     RunParameterDomainIlc,
     RunScalarPIlc,
 )
-from inc.lib.PaModel import IQImbalancePA, MimoPaModel, PaModel
+from inc.lib.PaModel import (
+    IQImbalancePA,
+    MimoPaModel,
+    PaModel,
+    WienerConfig,
+)
 from inc.lib.TwoToneAnalysis import (
     TwoToneAnalysis,
     TwoToneILCAnalysisResult,
@@ -3756,6 +3762,40 @@ class ChannelDpdImprovement:
 
 
 @dataclass(frozen=True)
+class IqGmpStageResult:
+    """Store one equal-power IQ-imbalance DPD comparison point."""
+
+    methodName: str
+    outputPowerDbm: float
+    measuredOutputPowerDbm: float
+    evmDb: float
+    evmPercent: float
+    irrDb: float
+    aclrWorstDb: float
+
+    def ToDict(self) -> Dict[str, object]:
+        """Convert one IQ-GMP curve point to a flat result mapping.
+
+        Processing details:
+            Algorithm: Copy method identity, requested/measured power, EVM,
+            IRR, and ACLR without changing metric sign conventions.
+
+        Returns:
+            result: CSV/JSON-compatible curve row.
+        """
+
+        return {
+            "methodName": self.methodName,
+            "outputPowerDbm": self.outputPowerDbm,
+            "measuredOutputPowerDbm": self.measuredOutputPowerDbm,
+            "evmDb": self.evmDb,
+            "evmPercent": self.evmPercent,
+            "irrDb": self.irrDb,
+            "aclrWorstDb": self.aclrWorstDb,
+        }
+
+
+@dataclass(frozen=True)
 class ChannelAnalysisBenchmarkResult:
     """Store channel measurements, DPD stages, and expected improvements."""
 
@@ -3764,6 +3804,7 @@ class ChannelAnalysisBenchmarkResult:
     stages: Tuple[ChannelDpdStageResult, ...]
     improvements: Tuple[ChannelDpdImprovement, ...]
     trainingResult: CouplingAwareDpdGmpTrainingResult
+    iqImbalanceStages: Tuple[IqGmpStageResult, ...]
 
     def ToDict(self) -> Dict[str, object]:
         """Convert the complete benchmark result to nested plain mappings.
@@ -3786,6 +3827,10 @@ class ChannelAnalysisBenchmarkResult:
                 for improvement in self.improvements
             ],
             "trainingResult": self.trainingResult.ToDict(),
+            "iqImbalanceStages": [
+                stage.ToDict()
+                for stage in self.iqImbalanceStages
+            ],
         }
 
 
@@ -4240,6 +4285,177 @@ def BuildChannelDpdImprovements(
     return tuple(improvements)
 
 
+def EvaluateIqGmpStage(
+    config: ChannelAnalysisBenchmarkConfig,
+    waveform: WifiWaveform,
+    iqPaModel: IQImbalancePA,
+    outputPowerDbm: float,
+    methodName: str,
+    predistorter: Optional[DpdGmp] = None,
+) -> IqGmpStageResult:
+    """Evaluate one IQ-imbalance compensation method at equal output power.
+
+    Processing details:
+        Algorithm: Calibrate either the IQ-impaired PA or a DPD-plus-PA
+        cascade to the requested native output power, retain the calibrated
+        waveform as the ideal reference, and calculate EVM, IRR, and ACLR
+        from the unscaled PA output through the common Analysis path.
+
+    Args:
+        config: Validated power, impedance, and interface controls.
+        waveform: Common deterministic Wi-Fi waveform and metadata.
+        iqPaModel: Widely linear IQ-impaired PA used by every method.
+        outputPowerDbm: Requested native plant output power in dBm.
+        methodName: Stable curve and table label.
+        predistorter: Optional conventional or augmented GMP DPD.
+
+    Returns:
+        result: One comparable power, EVM, IRR, and ACLR record.
+    """
+
+    calibratedPlant: Any = (
+        iqPaModel
+        if predistorter is None
+        else DpdGmpPaCascade(predistorter, iqPaModel)
+    )
+    powerCalibration = PowerCalibration(
+        paModel=calibratedPlant,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "outputPowerDbm": outputPowerDbm,
+            "width": 0,
+        },
+    )
+    referenceSignal = powerCalibration.Calibrate(
+        waveform.samples
+    )
+    measuredSignal = powerCalibration.GetLastPaOutput()
+    metrics = Analysis(
+        referenceSignal,
+        waveform,
+        parameters={
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "width": 0,
+        },
+    ).Analyze(measuredSignal)
+    return IqGmpStageResult(
+        methodName=methodName,
+        outputPowerDbm=float(outputPowerDbm),
+        measuredOutputPowerDbm=metrics["outputPowerDbm"],
+        evmDb=metrics["evmDb"],
+        evmPercent=metrics["evmPercent"],
+        irrDb=metrics["irrDb"],
+        aclrWorstDb=metrics["aclrWorstDb"],
+    )
+
+
+def RunIqGmpPowerSweep(
+    config: ChannelAnalysisBenchmarkConfig,
+) -> Tuple[IqGmpStageResult, ...]:
+    """Compare baseline, conventional GMP, and augmented GMP versus power.
+
+    Processing details:
+        Algorithm: Generate one Wi-Fi frame, construct a nearly linear PA
+        followed by a known conjugate IQ image path, derive the exact
+        widely-linear inverse labels, fit ordinary and augmented GMP models
+        to the same labels, and evaluate all three methods at five equal
+        native output-power points. The isolated linear PA makes any IRR
+        difference attributable to image-model structure rather than PA
+        compression.
+
+    Args:
+        config: Validated channel-analysis benchmark configuration.
+
+    Returns:
+        result: Method-major tuple containing all equal-power curve points.
+    """
+
+    waveform = WaveGenWifi(
+        parameters={
+            "frameFormat": config.frameFormat,
+            "bandwidthMhz": config.bandwidthMhz,
+            "sampleRateHz": config.sampleRateHz,
+            "mcs": config.mcs,
+            "numDataSymbols": config.numDataSymbols,
+            "seed": config.seed + 211,
+            "width": 0,
+        }
+    ).Generate()
+    directCoefficient = 1.0 + 0.0j
+    imageCoefficient = 0.08 * np.exp(1j * 0.40)
+    linearPa = PaModel(
+        wienerConfig=WienerConfig(
+            linearTaps=(1.0 + 0.0j,),
+            linearGain=1.0,
+            saturationAmplitude=1000.0,
+            rappSmoothness=3.0,
+            ampmCoefficient=0.0,
+        ),
+        parameters={
+            "modelName": "wiener",
+            "width": 0,
+        },
+    )
+    iqPaModel = IQImbalancePA(
+        linearPa,
+        directCoefficient=directCoefficient,
+        imageCoefficient=imageCoefficient,
+    )
+    inverseDenominator = (
+        np.abs(directCoefficient) ** 2
+        - np.abs(imageCoefficient) ** 2
+    )
+    referenceSignal = np.asarray(
+        waveform.samples, dtype=np.complex128
+    )
+    inverseLabels = (
+        np.conj(directCoefficient) * referenceSignal
+        - imageCoefficient * np.conj(referenceSignal)
+    ) / inverseDenominator
+    dpdParameters = {
+        "nonlinearOrders": (1, 3),
+        "memoryDepth": 2,
+        "crossMemoryDepth": 1,
+        "ridgeFactor": 1.0e-9,
+        "maximumOutputMagnitude": None,
+        "width": 0,
+    }
+    conventionalDpd = DpdGmp(parameters=dpdParameters)
+    augmentedDpd = AugmentedDpdGmp(parameters=dpdParameters)
+    conventionalDpd.Fit(referenceSignal, inverseLabels)
+    augmentedDpd.Fit(referenceSignal, inverseLabels)
+    highestPowerDbm = config.maximumOutputPowerDbm - 3.0
+    lowestPowerDbm = highestPowerDbm - 14.0
+    powerValuesDbm = tuple(
+        float(powerValue)
+        for powerValue in np.linspace(
+            lowestPowerDbm,
+            highestPowerDbm,
+            5,
+        )
+    )
+    stageResults = []
+    for methodName, predistorter in (
+        ("IQ-impaired PA", None),
+        ("Conventional GMP", conventionalDpd),
+        ("Augmented GMP", augmentedDpd),
+    ):
+        for outputPowerDbm in powerValuesDbm:
+            stageResults.append(
+                EvaluateIqGmpStage(
+                    config,
+                    waveform,
+                    iqPaModel,
+                    outputPowerDbm,
+                    methodName,
+                    predistorter,
+                )
+            )
+    return tuple(stageResults)
+
+
 def SaveChannelAnalysisResults(
     result: ChannelAnalysisBenchmarkResult,
     config: ChannelAnalysisBenchmarkConfig,
@@ -4331,6 +4547,18 @@ def SaveChannelAnalysisResults(
         )
         csvWriter.writeheader()
         csvWriter.writerows(improvementRows)
+    iqStageRows = [
+        stage.ToDict()
+        for stage in result.iqImbalanceStages
+    ]
+    with (
+        outputDirectory / "iq_gmp_comparison.csv"
+    ).open("w", newline="", encoding="utf-8-sig") as csvFile:
+        csvWriter = csv.DictWriter(
+            csvFile, fieldnames=list(iqStageRows[0].keys())
+        )
+        csvWriter.writeheader()
+        csvWriter.writerows(iqStageRows)
     frequencyRows = []
     for measurement in (
         result.prePaMeasurement,
@@ -4392,6 +4620,10 @@ def SaveChannelAnalysisResults(
         stageRows,
         outputDirectory,
     )
+    Draw().SaveIqGmpComparison(
+        iqStageRows,
+        outputDirectory,
+    )
 
 
 def PrintChannelAnalysisResults(
@@ -4438,6 +4670,14 @@ def PrintChannelAnalysisResults(
         print(
             f"{status:<4} {improvement.metricName:<24} "
             f"{improvement.improvementValue:>8.3f} dB"
+        )
+    print("\nIQ imbalance and augmented-GMP comparison")
+    for stage in result.iqImbalanceStages:
+        print(
+            f"{stage.methodName:<18} "
+            f"Pout={stage.measuredOutputPowerDbm:>6.2f} dBm  "
+            f"EVM={stage.evmDb:>8.3f} dB  "
+            f"IRR={stage.irrDb:>8.3f} dB"
         )
 
 
@@ -4603,12 +4843,14 @@ def RunChannelAnalysisBenchmark(
         postOnlyStage,
         couplingAwareStage,
     )
+    iqImbalanceStages = RunIqGmpPowerSweep(config)
     result = ChannelAnalysisBenchmarkResult(
         prePaMeasurement=prePaMeasurement,
         postPaMeasurement=postPaMeasurement,
         stages=stages,
         improvements=BuildChannelDpdImprovements(stages),
         trainingResult=trainingResult,
+        iqImbalanceStages=iqImbalanceStages,
     )
     SaveChannelAnalysisResults(result, config)
     PrintChannelAnalysisResults(result)

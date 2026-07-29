@@ -666,3 +666,109 @@ print(trainingResult.ToDict())
 ```
 
 不能把 `rawDacMatrix` 当作训练标签。训练标签所在参考面是 PA 输入端，而 DAC 波形还要经过 PA 前耦合网络。完整测量原理、用例和修改前后结果见 [ChannelAnalyse.md](./ChannelAnalyse.md)。
+
+## 17. `AugmentedDpdGmp` 使用说明
+
+`AugmentedDpdGmp` 与 `DpdGmp` 位于同一个 `inc/lib/DpdGmp.py` 文件中。它继承普通 GMP 的全部配置、定点边界、训练和增量更新接口，但内部基矩阵由“直接 GMP + 共轭 GMP”组成。
+
+### 17.1 最小训练示例
+
+```python
+import numpy as np
+
+from inc.lib.DpdGmp import AugmentedDpdGmp
+
+# referenceSignal is the desired complex waveform.
+# learnedInput is an ILC or inverse-learning PA-input label. It may contain
+# both direct and conjugate components.
+augmentedDpd = AugmentedDpdGmp(
+    parameters={
+        "nonlinearOrders": (1, 3, 5, 7),
+        "memoryDepth": 3,
+        "crossMemoryDepth": 2,
+        "ridgeFactor": 1.0e-5,
+        "maximumOutputMagnitude": 2.0,
+        "width": 0,
+    }
+)
+trainingResult = augmentedDpd.FitFromIlc(
+    referenceSignal,
+    learnedInput,
+)
+predistortedSignal = augmentedDpd.Process(referenceSignal)
+
+print(trainingResult.ToDict())
+print(np.linalg.norm(augmentedDpd.GetDirectCoefficients()))
+print(np.linalg.norm(augmentedDpd.GetImageCoefficients()))
+```
+
+### 17.2 配置参数
+
+`AugmentedDpdGmp` 的参数与第 2 节完全相同：
+
+| 参数 | 默认值 | 增广模型中的含义 |
+|---|---:|---|
+| `nonlinearOrders` | `(1, 3, 5, 7)` | 直接和共轭两支路共同采用的奇数阶 |
+| `memoryDepth` | `3` | 两支路共同采用的载波时延深度 |
+| `crossMemoryDepth` | `2` | 两支路共同采用的包络交叉时延深度 |
+| `ridgeFactor` | `1e-6` | 联合增广法方程的岭系数 |
+| `coefficientLearningRate` | `1.0` | 直接与共轭系数共同使用的更新混合率 |
+| `chunkSize` | `8192` | 增广基矩阵的分块样点数 |
+| `peakWeightExponent` | `0.0` | 对高包络训练样点的额外权重 |
+| `maximumOutputMagnitude` | `2.0` | DPD 输出归一化峰值限制 |
+| `width` | `16` | 公共 I/Q 位宽；0 表示浮点 |
+
+由于特征数翻倍，相同 `ridgeFactor` 下增广矩阵可能比普通 GMP 更敏感。工程初值可先把普通 GMP 的岭系数提高 3 至 10 倍，再依据独立验证帧的 EVM、IRR 和 ACLR 调整。
+
+### 17.3 新增诊断方法
+
+| 方法 | 返回值 |
+|---|---|
+| `BuildBasisChunk(inputSignal, startIndex, stopIndex)` | 直接列在前、共轭列在后的增广基矩阵 |
+| `GetDirectCoefficients()` | 普通 main/lagging/leading 系数副本 |
+| `GetImageCoefficients()` | 共轭 main/lagging/leading 系数副本 |
+
+继承的方法 `Fit`、`FitSegments`、`UpdateCoefficients`、`FitFromIlc`、`FitIndirect`、`CalculateNmse`、`Process` 和 `GetLastTrainingResult` 的调用方式不变。
+
+### 17.4 结合 `Analysis` 验收
+
+```python
+from inc.lib.Analysis import Analysis
+
+measuredOutput = iqImbalancedPa.Process(predistortedSignal)
+metrics = Analysis(
+    measuredOutput,
+    transmittedSignal=referenceSignal,
+    sampleRateHz=sampleRateHz,
+    channelBandwidthHz=channelBandwidthHz,
+    width=0,
+).Analyze()
+
+print(metrics["evmDb"])
+print(metrics["irrDb"])
+print(metrics["aclrWorstDb"])
+```
+
+不要只用训练 `afterNmseDb` 判断增广模型。至少还要检查：
+
+1. 独立帧的 `irrDb` 是否稳定提高；
+2. `evmDb` 是否同步改善；
+3. `aclrWorstDb` 是否没有因过拟合或峰值增加而下降；
+4. `GetImageCoefficients()` 的范数是否在重复训练间稳定；
+5. 定点模式下是否发生新增削顶。
+
+### 17.5 Benchmark
+
+运行
+
+```powershell
+python tests/BenchMark.py --channel-analyse
+```
+
+会额外生成：
+
+- `iq_gmp_comparison.csv`；
+- `iq_gmp_comparison.png`；
+- `channel_analysis.json` 中的 `iqImbalanceStages`。
+
+曲线同时比较 `IQ-impaired PA`、`Conventional GMP` 和 `Augmented GMP`，所有点都由功率闭环校准到相同目标 PA 输出 dBm。

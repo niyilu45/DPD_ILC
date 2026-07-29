@@ -1,6 +1,6 @@
 # DPD-ILC VHT/HE/EHT Wi-Fi与双音仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Wiener、GMP或Doherty PA、闭环输出功率校准和全部适用ILC更新律。MIMO Channel还可在PA前后加入方向不对称、具有独立FIR和时延的通道耦合。Wi-Fi路径输出功率、SNR、EVM、ACLR和功率-EVM曲线；双音路径既能比较所有SISO ILC的IM3/IM5/IM7，也能独立扫描三种PA的频率响应、记忆效应和10至25 dBm输出功率特性。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Wiener、GMP或Doherty PA、闭环输出功率校准和全部适用ILC更新律。MIMO Channel还可在PA前后加入方向不对称、具有独立FIR和时延的通道耦合。Wi-Fi路径输出功率、SNR、EVM、IRR、ACLR和功率-EVM曲线；双音路径既能比较所有SISO ILC的IM3/IM5/IM7，也能独立扫描三种PA的频率响应、记忆效应和10至25 dBm输出功率特性。
 
 ## 理论文档
 
@@ -39,11 +39,11 @@ python -m pip install -r requirements.txt
 ```text
 main.py                 命令行主程序
 SmallestSISO.py         浮点与16位定点SISO EHT/GMP/ILC对比示例
-inc/lib/Analysis.py         模拟功率、SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
+inc/lib/Analysis.py         模拟功率、SNR、EVM、IRR、ACLR、逐轮ILC性能分析及结果输出
 inc/lib/Channel.py          PA前后多通道耦合、联合功率校准及forward/fb采样链路
 inc/lib/ChannelAnalyse.py   MIMO冲激响应、平坦度、耦合、群时延和条件数测量
 inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
-inc/lib/DpdGmp.py           SISO GMP及测量驱动的耦合感知MIMO DPD
+inc/lib/DpdGmp.py           SISO普通/增广GMP及测量驱动的耦合感知MIMO DPD
 inc/lib/Fec.py              55/90短块LDPC矩阵构造、系统编码和软输入译码
 inc/lib/PaModel.py          SISO/MIMO Wiener、GMP和Doherty非线性PA
 inc/lib/ParseWifi.py        接收帧描述解析、包起点检测与参考波形恢复
@@ -79,7 +79,7 @@ doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整�
 from inc.lib.Analysis import Analysis
 from inc.lib.Channel import Channel
 from inc.lib.ChannelAnalyse import ChannelAnalyse
-from inc.lib.DpdGmp import CouplingAwareDpdGmp, DpdGmp
+from inc.lib.DpdGmp import AugmentedDpdGmp, CouplingAwareDpdGmp, DpdGmp
 from inc.lib.Fec import EncodeDescriptorLdpc
 from inc.lib.ParseWifi import ParseWifi
 from inc.lib.WaveGenWifi import WaveGenWifi
@@ -93,7 +93,7 @@ from inc.lib.TwoToneAnalysis import TwoToneAnalysis
 from lib.Analysis import Analysis
 from lib.Channel import Channel
 from lib.ChannelAnalyse import ChannelAnalyse
-from lib.DpdGmp import CouplingAwareDpdGmp, DpdGmp
+from lib.DpdGmp import AugmentedDpdGmp, CouplingAwareDpdGmp, DpdGmp
 from lib.Fec import EncodeDescriptorLdpc
 from lib.ParseWifi import ParseWifi
 from lib.WaveGenWifi import WaveGenWifi
@@ -105,7 +105,7 @@ from lib.TwoToneAnalysis import TwoToneAnalysis
 
 ## 浮点与定点接口
 
-`WaveGenWifi`、`WaveGenTwoTone`、`PaModel`、`MimoPaModel`、`Channel`、`ChannelAnalyse`、`DpdGmp`、`CouplingAwareDpdGmp`、`ParseWifi`、`Analysis` 和 `TwoToneAnalysis` 都把 `width` 定义在各自的 `parameters` 配置中。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量使用有符号整数码。默认值为 `16`。为兼容已有代码，各主类仍保留直接 `width=` 便捷参数，但新代码统一推荐 `parameters={"width": ...}`。
+`WaveGenWifi`、`WaveGenTwoTone`、`PaModel`、`MimoPaModel`、`Channel`、`ChannelAnalyse`、`DpdGmp`、`AugmentedDpdGmp`、`CouplingAwareDpdGmp`、`ParseWifi`、`Analysis` 和 `TwoToneAnalysis` 都把 `width` 定义在各自的 `parameters` 配置中。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量使用有符号整数码。默认值为 `16`。为兼容已有代码，各主类仍保留直接 `width=` 便捷参数，但新代码统一推荐 `parameters={"width": ...}`。
 
 ```math
 -2^{W-1}\leq q_{\mathrm{I}},q_{\mathrm{Q}}\leq 2^{W-1}-1
@@ -871,7 +871,7 @@ flowchart TD
 - 每次 `Analyze` 只调用一次 `SigProc.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
 - SNR 直接计算校正后数据字段与参考的残差功率；EVM 由 `FrameProcess` 根据 `WifiWaveform` 的数据字段位置去循环前缀、FFT、撤销 CSD 和空间解映射，再与采用相同接收路径得到的参考星座比较。
 - ACLR 通过 `AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
-- `Analyze` 直接返回包含模拟输出功率、SNR、EVM和ACLR的普通Python字典；调用方用 `metrics["outputPowerDbm"]` 和 `metrics["evmDb"]` 读取结果。功率在同步后、公共复增益补偿前计算，并按逐链峰值相对门限只统计有效突发样点；帧外补零和长占空比静默不参与RMS，短暂OFDM过零仍被保留。字典也可以直接交给 `Print`，或由 `Save` 写入JSON/CSV。
+- `Analyze` 直接返回包含模拟输出功率、SNR、EVM、IRR和ACLR的普通Python字典；调用方用 `metrics["outputPowerDbm"]`、`metrics["evmDb"]` 和 `metrics["irrDb"]` 读取结果。功率在同步后、公共复增益补偿前计算，并按逐链峰值相对门限只统计有效突发样点；帧外补零和长占空比静默不参与RMS，短暂OFDM过零仍被保留。字典也可以直接交给 `Print`，或由 `Save` 写入JSON/CSV。
 - `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
 - `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、模拟输出功率、公共复增益幅相和输入峰值。
 - MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA 输出功率/SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
@@ -1452,6 +1452,7 @@ assert resultAnalysis.width == 16
 | `CalculateSnr(measuredSignal)` | 待测输出 | 返回数据字段 SNR，单位 dB。 |
 | `CalculateEvmAlignedMse(measuredSignal)` | 待测输出 | 返回与 EVM 接收链完全一致的归一化 MSE；该值等于 RMS EVM 的平方。 |
 | `CalculateEvm(measuredSignal)` | 待测输出 | 返回 `(evmDb, evmPercent)`。 |
+| `CalculateIrr(measuredSignal)` | 待测输出 | 对同步后的直接/共轭分量做联合最小二乘，返回 IRR dB。 |
 | `CalculateAclr(measuredSignal)` | 待测输出 | 返回 `(aclrLowerDb, aclrUpperDb, aclrWorstDb)`。 |
 | `DemodulateWifiData(measuredSignal)` | 待测输出 | 返回 VHT/HE/EHT 数据子载波星座。 |
 | `AnalyzeIlcHistory(ilcHistory)` | SISO原生ILC历史 | 逐轮计算输出功率/SNR/EVM/ACLR，并返回EVM最佳轮及完整 `ILCPerformanceIteration` 历史。 |
@@ -1464,7 +1465,7 @@ assert resultAnalysis.width == 16
 | `AnalyzePowerEvmCurve(outputPowerDbmValues, methodEvaluators)` | 递增输出dBm点、`{方法名: 求值器}` 映射 | 按输出回退驱动PA，把每种方法标定到相同输出功率后计算EVM。 |
 | `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取实例解析后的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
 
-`Analyze` 返回字典的固定键包括 `outputPowerDbm`、`snrDb`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。SISO的 `outputPowerDbm` 是单端口功率；MIMO的该字段是所有独立PA端口在线性功率域求和后的结果，每路值位于 `GetLastMimoMetrics()["outputPowerDbmPerChain"]`。`ILCPerformanceIteration` 把RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存同一普通指标字典。`PowerEvmCurve` 保存 `outputPowerDbmValues`、`driveScaleValues`、`targetOutputRmsValues` 以及各方法的EVM数组。
+`Analyze` 返回字典的固定键包括 `outputPowerDbm`、`snrDb`、`evmDb`、`evmPercent`、`irrDb`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。SISO的 `outputPowerDbm` 是单端口功率；MIMO的该字段是所有独立PA端口在线性功率域求和后的结果，每路值位于 `GetLastMimoMetrics()["outputPowerDbmPerChain"]`。`ILCPerformanceIteration` 把RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存同一普通指标字典。`PowerEvmCurve` 保存 `outputPowerDbmValues`、`driveScaleValues`、`targetOutputRmsValues` 以及各方法的EVM数组。
 
 ### `Draw` 参数与方法
 
@@ -1482,6 +1483,7 @@ assert resultAnalysis.width == 16
 | `paPowerFileStem` | `"pa_power_characteristics"` | PA输出功率相关特性图前缀。 |
 | `dpdGmpFileStem` | `"dpd_gmp_performance"` | DPD-GMP阶段性能四联图前缀。 |
 | `channelAnalysisFileStem` | `"channel_analysis"` | 通道频响、条件数和耦合感知DPD四联图前缀。 |
+| `iqGmpFileStem` | `"iq_gmp_comparison"` | 普通/增广GMP功率-EVM/IRR双曲线前缀。 |
 | `figureWidthInches` | `10.5` | 图像宽度，单位英寸，必须为正数。 |
 | `figureHeightInches` | `6.2` | 图像高度，单位英寸，必须为正数。 |
 | `figureDpi` | `180` | PNG 分辨率，必须为正整数。 |
@@ -1497,6 +1499,7 @@ assert resultAnalysis.width == 16
 | `paPowerPlotTitle` | `"PA output-power-dependent characteristics"` | PA输出功率特性图标题。 |
 | `dpdGmpPlotTitle` | `"PA-analysis-driven DPD-GMP improvements"` | DPD-GMP阶段比较图标题。 |
 | `channelAnalysisPlotTitle` | `"Measured MIMO channel and coupling-aware DPD-GMP"` | 通道测量与耦合感知DPD图标题。 |
+| `iqGmpPlotTitle` | `"IQ imbalance: conventional versus augmented GMP"` | 增广GMP的EVM/IRR对比图标题。 |
 | `xAxisLabel` | `"PA output power per chain (dBm)"` | 横轴标题。 |
 | `yAxisLabel` | `"RMS EVM (dB, lower is better)"` | 纵轴标题。 |
 | `convergenceXAxisLabel` | `"ILC iteration"` | 收敛图横轴标题。 |
@@ -1532,6 +1535,8 @@ assert resultAnalysis.width == 16
 | `ValidateChannelAnalysis(channelMeasurements, stageResults)` | 通道测量映射与阶段字典 | 检查频响矩阵和EVM/NMSE/ACLR/残余耦合字段。 |
 | `CreateChannelAnalysisFigure(channelMeasurements, stageResults)` | 通道测量与DPD阶段 | 返回直通频响、耦合频响、条件数和DPD性能四联图。 |
 | `SaveChannelAnalysis(channelMeasurements, stageResults, outputDirectory, fileStem=None)` | 通道测量、阶段和目录 | 保存并返回通道分析PNG路径。 |
+| `CreateIqGmpComparisonFigure(stageResults)` | 含方法、输出功率、EVM和IRR的阶段字典 | 返回普通/增广GMP的EVM和IRR双面板图。 |
+| `SaveIqGmpComparison(stageResults, outputDirectory, fileStem=None)` | IQ-GMP阶段、目录和可选文件名 | 保存并返回增广GMP性能PNG路径。 |
 
 ### `ILCConfig` 与算法参数
 
@@ -2050,7 +2055,7 @@ python tests\BenchMark.py --help
 ```
 
 上述benchmark命令的结果保存在 `results/all_ilc_benchmark/`，其中 `all_ilc_metrics.csv` 和
-`all_ilc_metrics.json` 包含每种方案的 SNR、EVM、ACLR 及相对基线改善量；
+`all_ilc_metrics.json` 包含每种方案的 SNR、EVM、IRR、ACLR 及相对基线改善量；
 每种迭代更新律还会生成独立的 `convergence_*.csv`。全部方法的功率-EVM 对比输出为
 `all_ilc_power_evm_curve.png`、`all_ilc_power_evm_curve.csv` 和
 `all_ilc_power_evm_curve.json`。

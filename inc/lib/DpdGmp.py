@@ -525,9 +525,8 @@ class DpdGmp:
         chunkSize = cast(int, self.parameters["chunkSize"])
         for startIndex in range(0, complexInput.size, chunkSize):
             stopIndex = min(startIndex + chunkSize, complexInput.size)
-            basisChunk = BuildGmpBasisChunk(
+            basisChunk = self.BuildBasisChunk(
                 complexInput,
-                self.featureSpecs,
                 startIndex,
                 stopIndex,
             )
@@ -535,6 +534,36 @@ class DpdGmp:
                 basisChunk @ self.coefficients
             )
         return self.LimitMagnitude(outputSignal)
+
+    def BuildBasisChunk(
+        self,
+        inputSignal: np.ndarray,
+        startIndex: int,
+        stopIndex: int,
+    ) -> np.ndarray:
+        """Build one deterministic GMP regression-basis chunk.
+
+        Processing details:
+            Algorithm: Evaluate the active main, lagging-envelope, and
+            leading-envelope feature specifications on the requested sample
+            interval. Subclasses may override this method to add physically
+            motivated branches while reusing the common training solver.
+
+        Args:
+            inputSignal: Normalized finite complex desired waveform.
+            startIndex: Inclusive output-sample index of the basis chunk.
+            stopIndex: Exclusive output-sample index of the basis chunk.
+
+        Returns:
+            result: Complex matrix with one column per active coefficient.
+        """
+
+        return BuildGmpBasisChunk(
+            inputSignal,
+            self.featureSpecs,
+            startIndex,
+            stopIndex,
+        )
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
         """Apply DPD while preserving the configured public data convention.
@@ -900,9 +929,8 @@ class DpdGmp:
                 stopIndex = min(
                     startIndex + chunkSize, referenceSignal.size
                 )
-                basisChunk = BuildGmpBasisChunk(
+                basisChunk = self.BuildBasisChunk(
                     referenceSignal,
-                    self.featureSpecs,
                     startIndex,
                     stopIndex,
                 )
@@ -932,9 +960,8 @@ class DpdGmp:
                 stopIndex = min(
                     startIndex + chunkSize, referenceSignal.size
                 )
-                basisChunk = BuildGmpBasisChunk(
+                basisChunk = self.BuildBasisChunk(
                     referenceSignal,
-                    self.featureSpecs,
                     startIndex,
                     stopIndex,
                 )
@@ -1001,9 +1028,8 @@ class DpdGmp:
                 stopIndex = min(
                     startIndex + chunkSize, referenceSignal.size
                 )
-                basisChunk = BuildGmpBasisChunk(
+                basisChunk = self.BuildBasisChunk(
                     referenceSignal,
-                    self.featureSpecs,
                     startIndex,
                     stopIndex,
                 )
@@ -1168,6 +1194,134 @@ class DpdGmp:
 
         self.SynchronizeStructure()
         return self.lastTrainingResult
+
+
+class AugmentedDpdGmp(DpdGmp):
+    """Model direct and conjugate nonlinear paths with one joint GMP fit.
+
+    The direct branch represents ordinary PA AM/AM, AM/PM, and memory
+    behavior. The conjugate branch represents IQ image leakage and its
+    nonlinear memory products. Both branches share the proven normalized
+    ridge solver implemented by ``DpdGmp``.
+    """
+
+    def RebuildStructure(self, resetCoefficients: bool) -> None:
+        """Build paired direct/conjugate feature indices and identity state.
+
+        Processing details:
+            Algorithm: Enumerate the ordinary GMP feature list first, append
+            an ``image_`` copy in identical order, preserve an existing
+            coefficient vector only when its size remains valid, and
+            initialize only the direct zero-delay linear feature to one.
+
+        Args:
+            resetCoefficients: Whether to discard coefficients and use identity.
+
+        Returns:
+            result: None. Augmented feature and coefficient state are synchronized.
+        """
+
+        directFeatureSpecs = BuildFeatureSpecs(*self.ResolveStructure())
+        imageFeatureSpecs = [
+            (
+                f"image_{branchName}",
+                nonlinearOrder,
+                signalDelay,
+                envelopeDelay,
+            )
+            for (
+                branchName,
+                nonlinearOrder,
+                signalDelay,
+                envelopeDelay,
+            ) in directFeatureSpecs
+        ]
+        featureSpecs = [
+            *directFeatureSpecs,
+            *imageFeatureSpecs,
+        ]
+        if not resetCoefficients and len(featureSpecs) != len(
+            self.coefficients
+        ):
+            raise ValueError(
+                "coefficient count cannot be preserved across structure change"
+            )
+        self.featureSpecs = list(featureSpecs)
+        self.activeStructure = self.ResolveStructure()
+        if resetCoefficients:
+            self.coefficients = np.zeros(
+                len(self.featureSpecs), dtype=np.complex128
+            )
+            identityIndex = self.featureSpecs.index(
+                ("main", 1, 0, 0)
+            )
+            self.coefficients[identityIndex] = 1.0 + 0.0j
+            self.lastTrainingResult = None
+
+    def BuildBasisChunk(
+        self,
+        inputSignal: np.ndarray,
+        startIndex: int,
+        stopIndex: int,
+    ) -> np.ndarray:
+        """Build paired GMP and conjugate-GMP basis columns.
+
+        Processing details:
+            Algorithm: Evaluate the canonical direct GMP basis once and
+            concatenate its complex conjugate. Because envelope factors are
+            real magnitudes, conjugating a GMP column changes the carrier
+            factor from ``x`` to ``conj(x)`` while preserving every nonlinear
+            order, signal delay, and envelope cross-memory delay.
+
+        Args:
+            inputSignal: Normalized finite complex desired waveform.
+            startIndex: Inclusive output-sample index of the basis chunk.
+            stopIndex: Exclusive output-sample index of the basis chunk.
+
+        Returns:
+            result: Direct columns followed by conjugate-image columns.
+        """
+
+        directFeatureCount = len(self.featureSpecs) // 2
+        directBasis = BuildGmpBasisChunk(
+            inputSignal,
+            self.featureSpecs[:directFeatureCount],
+            startIndex,
+            stopIndex,
+        )
+        return np.column_stack(
+            (directBasis, np.conj(directBasis))
+        )
+
+    def GetDirectCoefficients(self) -> np.ndarray:
+        """Return a detached copy of ordinary GMP branch coefficients.
+
+        Processing details:
+            Algorithm: Synchronize live structure settings and copy the first
+            half of the deterministic coefficient vector.
+
+        Returns:
+            result: Direct main/lagging/leading GMP coefficients.
+        """
+
+        self.SynchronizeStructure()
+        directFeatureCount = len(self.featureSpecs) // 2
+        return self.coefficients[:directFeatureCount].copy()
+
+    def GetImageCoefficients(self) -> np.ndarray:
+        """Return a detached copy of conjugate-image branch coefficients.
+
+        Processing details:
+            Algorithm: Synchronize live structure settings and copy the
+            second half of the deterministic coefficient vector.
+
+        Returns:
+            result: Conjugate main/lagging/leading GMP coefficients.
+        """
+
+        self.SynchronizeStructure()
+        directFeatureCount = len(self.featureSpecs) // 2
+        return self.coefficients[directFeatureCount:].copy()
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,4 @@
-# 结果计算：SNR、EVM、ACLR 与功率–EVM 曲线原理
+# 结果计算：SNR、EVM、IRR、ACLR 与功率–EVM 曲线原理
 
 本文解释 `inc/lib/Analysis.py` 中结果统计的物理含义和公式推导。分析器始终需要一段发送参考样值，但参考来源有三种：调用方显式提供理想参考、调用方提供实际发送波形，或者在完全盲分析时由 `ParseWifi` 从接收帧恢复。只有严格的Wi-Fi子载波EVM需要 `WifiWaveform` 元数据；已知发送NumPy样值时无需猜测MCS、GI或seed，也能直接计算波形域EVM和SNR。待测信号可以来自PA模型、Channel、线缆、接收机、仪器抓包、普通算法输出、ILC或部署型DPD；Analysis对来源没有强制依赖，统一计算：
 
@@ -1675,6 +1675,7 @@ Analysis只根据输入矩阵的列解释“通道”，不依赖Channel或PA模
 | `snrDb` | 数据字段校正后参考功率/残差功率比 | 越大越好 |
 | `evmDb` | RMS EVM 的 dB 值 | 越负越好 |
 | `evmPercent` | RMS EVM 百分比 | 越小越好 |
+| `irrDb` | 直接分量功率与共轭镜像分量功率之比 | 越大越好 |
 | `aclrLowerDb` | 主信道/下邻道功率比 | 越大越好 |
 | `aclrUpperDb` | 主信道/上邻道功率比 | 越大越好 |
 | `aclrWorstDb` | 上下邻道较差者 | 越大越好 |
@@ -1722,6 +1723,7 @@ ILC 每轮收敛结果另外输出：
 | OFDM 数据解调 | `Analysis.DemodulateWifiData` |
 | EVM 对齐 MSE | `Analysis.CalculateEvmAlignedMse` |
 | RMS EVM | `Analysis.CalculateEvm` |
+| IQ 镜像抑制度 | `Analysis.CalculateIrr` |
 | Welch PSD | `AveragePeriodogram` |
 | ACLR | `Analysis.CalculateAclr` |
 | 指标字典汇总 | `Analysis.Analyze` |
@@ -2403,3 +2405,191 @@ EVM/SNR 去除了一个标量增益和相位。如果要研究 AM-AM 平均增�
 - [IEEE 802.11be-2024 标准页面](https://standards.ieee.org/ieee/802.11be/7516/)
 
 ETSI 链接用于说明 ACLR 的通用物理定义，不表示本工程采用 3GPP 的具体测量滤波器或限值；本工程的实际积分窗口以 `inc/lib/Analysis.py` 为准。
+
+## 15. IRR：IQ 镜像的定量检测
+
+### 15.1 IQ 幅相不平衡为什么会产生共轭项
+
+理想复基带为
+
+```math
+x[n]=I[n]+jQ[n].
+```
+
+若 I、Q 两路的等效复增益分别为 $g_I e^{j\varphi/2}$ 和 $g_Q e^{-j\varphi/2}$，输出可以重写为
+
+```math
+y[n]=a\,x[n]+b\,x^*[n],
+```
+
+其中
+
+```math
+a
+=
+\frac{
+g_I e^{j\varphi/2}
++
+g_Q e^{-j\varphi/2}
+}{2},
+```
+
+```math
+b
+=
+\frac{
+g_I e^{j\varphi/2}
+-
+g_Q e^{-j\varphi/2}
+}{2}.
+```
+
+$a$ 是期望直接路径，$b$ 是把正频率搬到负频率、把负频率搬到正频率的镜像路径。幅度失配或正交相位误差中的任意一种都能使 $b$ 非零。
+
+### 15.2 IRR 定义
+
+本工程采用直接路径功率与镜像路径功率之比：
+
+```math
+\mathit{IRR}
+=
+\frac{|a|^2}{|b|^2},
+```
+
+```math
+\mathit{IRR}_{\mathrm{dB}}
+=
+10\log_{10}\mathit{IRR}
+=
+20\log_{10}
+\frac{|a|}{|b|}.
+```
+
+IRR 越大，镜像越小。IRR 与 EVM 不是同一个指标：IRR 只观察能被 $x^*$ 解释的结构性镜像，EVM 还包含 PA 非线性、记忆、噪声、同步残差和量化误差。
+
+若唯一误差是很小的镜像项，且 $|a|$ 约为 1，则有近似关系
+
+```math
+\mathit{EVM}_{\mathrm{rms}}
+\approx
+\frac{|b|}{|a|},
+```
+
+```math
+\mathit{EVM}_{\mathrm{dB}}
+\approx
+-\mathit{IRR}_{\mathrm{dB}}.
+```
+
+出现明显偏差并不表示计算错误，而是说明残差中还有非镜像分量。
+
+### 15.3 `Analysis` 的广义线性最小二乘估计
+
+同步、CFO、SFO 和公共复增益补偿后，构造
+
+```math
+\mathbf{A}
+=
+\begin{bmatrix}
+\mathbf{x} & \mathbf{x}^*
+\end{bmatrix}.
+```
+
+然后计算
+
+```math
+\widehat{\boldsymbol{\theta}}
+=
+\left(
+\mathbf{A}^H\mathbf{A}
++
+\lambda\mathbf{I}
+\right)^{-1}
+\mathbf{A}^H\mathbf{y},
+```
+
+```math
+\widehat{\boldsymbol{\theta}}
+=
+\begin{bmatrix}
+\hat a \\
+\hat b
+\end{bmatrix}.
+```
+
+代码使用相对于法方程对角均值的极小岭项，避免实信号、单一相位轨迹或过短记录使 $\mathbf{x}$ 与 $\mathbf{x}^*$ 无法区分。Wi-Fi 的随机复星座通常接近 proper complex 信号，因此两列相关性较低，适合做 IRR 估计。
+
+MIMO 输入按物理链分别估计 $\hat a_i$ 和 $\hat b_i$，再累加直接功率与镜像功率：
+
+```math
+\mathit{IRR}_{\mathrm{MIMO,dB}}
+=
+10\log_{10}
+\frac{
+\sum_i|\hat a_i|^2
+}{
+\sum_i|\hat b_i|^2
+}.
+```
+
+### 15.4 为什么先去公共复增益不会破坏 IRR
+
+设同步处理把整路测量除以非零公共复增益 $g$：
+
+```math
+y'[n]
+=
+\frac{a}{g}x[n]
++
+\frac{b}{g}x^*[n].
+```
+
+则
+
+```math
+\frac{|a/g|^2}{|b/g|^2}
+=
+\frac{|a|^2}{|b|^2}.
+```
+
+因此公共复增益会改变两个拟合系数的绝对值，却不会改变 IRR。同步仍然必须先做，因为未补偿时延、CFO 或 SFO 会把结构性镜像能量扩散到残差中并降低估计可信度。
+
+### 15.5 API 与结果字典
+
+完整分析会直接返回 `irrDb`：
+
+```python
+from inc.lib.Analysis import Analysis
+
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=transmittedSignal,
+    sampleRateHz=80.0e6,
+    width=0,
+)
+metrics = resultAnalysis.Analyze()
+
+print(metrics["evmDb"])
+print(metrics["irrDb"])
+```
+
+只需要 IRR 时可使用：
+
+```python
+resultAnalysis = Analysis(
+    referenceSignal,
+    waveform,
+    width=0,
+)
+irrDb = resultAnalysis.CalculateIrr(measuredSignal)
+```
+
+`CalculateIrr` 自己执行一次同步；若调用方已经通过 `PrepareMeasuredSignal` 得到校正波形，应调用 `CalculatePreparedIrr`，避免重复估计。
+
+### 15.6 结果判断和限制
+
+- IRR 高而 EVM 差：主要问题可能是 PA 非线性、记忆、噪声或削顶。
+- IRR 低且 EVM 约等于 IRR 的负值：IQ 镜像很可能是 EVM 主导项。
+- IRR 随频率明显变化：需要带记忆的共轭支路，而不仅是一阶 $x^*$ 系数。
+- IRR 随输出功率变化：可能存在 PA 与 IQ 调制器级联产生的共轭非线性。
+- 使用真实仪器时，应先测量接收机自身 IRR；否则会把反馈接收机镜像错误地当成发射机镜像。
