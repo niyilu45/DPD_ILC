@@ -60,6 +60,7 @@ class Draw:
                     "pa_nonlinearity_comparison"
                 ),
                 "paPowerFileStem": "pa_power_characteristics",
+                "dpdGmpFileStem": "dpd_gmp_performance",
                 "figureWidthInches": 10.5,
                 "figureHeightInches": 6.2,
                 "figureDpi": 180,
@@ -80,6 +81,9 @@ class Draw:
                 ),
                 "paPowerPlotTitle": (
                     "PA output-power-dependent characteristics"
+                ),
+                "dpdGmpPlotTitle": (
+                    "PA-analysis-driven DPD-GMP improvements"
                 ),
                 "xAxisLabel": "PA output power per chain (dBm)",
                 "yAxisLabel": "RMS EVM (dB, lower is better)",
@@ -177,6 +181,7 @@ class Draw:
             "paMemoryFileStem",
             "paNonlinearityFileStem",
             "paPowerFileStem",
+            "dpdGmpFileStem",
         ):
             fileStem = self.parameters[parameterName]
             if not isinstance(fileStem, str):
@@ -225,6 +230,7 @@ class Draw:
             "paMemoryPlotTitle",
             "paNonlinearityPlotTitle",
             "paPowerPlotTitle",
+            "dpdGmpPlotTitle",
         ):
             parameterValue = self.parameters[parameterName]
             if not isinstance(parameterValue, str):
@@ -1325,6 +1331,263 @@ class Draw:
         figure = self.CreatePaPowerCharacteristicsFigure(
             powerSweepByModel
         )
+        try:
+            figure.savefig(
+                figurePath,
+                dpi=int(self.parameters["figureDpi"]),
+                bbox_inches="tight",
+            )
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
+        return figurePath
+
+    def ValidateDpdGmpStages(
+        self,
+        stageResults: Sequence[Mapping[str, object]],
+    ) -> None:
+        """Validate DPD-GMP stage rows before comparison plotting.
+
+        Processing details:
+            Algorithm: Require at least two uniquely named stages, finite
+            equal-power EVM/ACLR/IM metrics, and finite positive optional
+            condition numbers while allowing baseline label diagnostics to
+            remain None.
+
+        Args:
+            stageResults: Ordered flat benchmark stage mappings.
+
+        Returns:
+            result: None. Malformed or nonfinite values raise an exception.
+        """
+
+        stageRows = tuple(stageResults)
+        if len(stageRows) < 2:
+            raise ValueError(
+                "stageResults must contain at least two stages"
+            )
+        stageNames = []
+        for stageIndex, stageRow in enumerate(stageRows):
+            if not isinstance(stageRow, Mapping):
+                raise TypeError(
+                    f"stageResults[{stageIndex}] must be a mapping"
+                )
+            stageName = stageRow.get("stageName")
+            if not isinstance(stageName, str) or not stageName:
+                raise ValueError(
+                    "every DPD-GMP stage must have a nonempty stageName"
+                )
+            stageNames.append(stageName)
+            for fieldName in (
+                "evmDb",
+                "aclrWorstDb",
+                "im3WorstDbc",
+            ):
+                fieldValue = stageRow.get(fieldName)
+                if (
+                    not isinstance(fieldValue, (int, float))
+                    or isinstance(fieldValue, bool)
+                    or not np.isfinite(fieldValue)
+                ):
+                    raise ValueError(
+                        f"{stageName}.{fieldName} must be finite"
+                    )
+            for fieldName in (
+                "labelNmseDb",
+                "peakWeightedLabelNmseDb",
+                "regularizedConditionNumber",
+            ):
+                fieldValue = stageRow.get(fieldName)
+                if fieldValue is None:
+                    continue
+                if (
+                    not isinstance(fieldValue, (int, float))
+                    or isinstance(fieldValue, bool)
+                    or not np.isfinite(fieldValue)
+                ):
+                    raise ValueError(
+                        f"{stageName}.{fieldName} must be finite or None"
+                    )
+                if (
+                    fieldName == "regularizedConditionNumber"
+                    and float(fieldValue) <= 0.0
+                ):
+                    raise ValueError(
+                        "regularizedConditionNumber must be positive"
+                    )
+        if len(set(stageNames)) != len(stageNames):
+            raise ValueError("DPD-GMP stage names must be unique")
+
+    def CreateDpdGmpPerformanceFigure(
+        self,
+        stageResults: Sequence[Mapping[str, object]],
+    ) -> Any:
+        """Create one four-panel DPD-GMP improvement comparison figure.
+
+        Processing details:
+            Algorithm: Draw equal-output-power Wi-Fi EVM and two-tone IM3 for
+            every stage, draw ordinary and peak-weighted label NMSE only for
+            trained stages, and show the regularized solver condition number
+            on a logarithmic scale.
+
+        Args:
+            stageResults: Ordered flat DPD-GMP benchmark stage mappings.
+
+        Returns:
+            result: Matplotlib Figure containing four labeled comparison axes.
+        """
+
+        self.ValidateParameters()
+        stageRows = tuple(stageResults)
+        self.ValidateDpdGmpStages(stageRows)
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "matplotlib is required for DPD-GMP performance plots"
+            ) from error
+        stageNames = [str(stage["stageName"]) for stage in stageRows]
+        stagePositions = np.arange(len(stageRows), dtype=float)
+        figure, axes = plt.subplots(
+            2,
+            2,
+            figsize=(
+                float(self.parameters["figureWidthInches"]) * 1.25,
+                float(self.parameters["figureHeightInches"]) * 1.35,
+            ),
+        )
+        axes[0, 0].bar(
+            stagePositions,
+            [float(stage["evmDb"]) for stage in stageRows],
+        )
+        axes[0, 0].set_title("Equal-output-power Wi-Fi EVM")
+        axes[0, 0].set_ylabel("RMS EVM (dB, lower is better)")
+        axes[0, 1].bar(
+            stagePositions,
+            [float(stage["im3WorstDbc"]) for stage in stageRows],
+        )
+        axes[0, 1].set_title("Equal-output-power two-tone IM3")
+        axes[0, 1].set_ylabel("Worst-side IM3 (dBc, lower is better)")
+
+        trainedPositions = np.asarray(
+            [
+                stageIndex
+                for stageIndex, stage in enumerate(stageRows)
+                if stage["labelNmseDb"] is not None
+            ],
+            dtype=float,
+        )
+        trainedRows = [
+            stage
+            for stage in stageRows
+            if stage["labelNmseDb"] is not None
+        ]
+        barWidth = 0.38
+        axes[1, 0].bar(
+            trainedPositions - 0.5 * barWidth,
+            [float(stage["labelNmseDb"]) for stage in trainedRows],
+            width=barWidth,
+            label="Uniform label NMSE",
+        )
+        axes[1, 0].bar(
+            trainedPositions + 0.5 * barWidth,
+            [
+                float(stage["peakWeightedLabelNmseDb"])
+                for stage in trainedRows
+            ],
+            width=barWidth,
+            label="Peak-weighted label NMSE",
+        )
+        axes[1, 0].set_title("ILC-label modeling accuracy")
+        axes[1, 0].set_ylabel("NMSE (dB, lower is better)")
+        axes[1, 0].legend(loc="best")
+
+        conditionPositions = np.asarray(
+            [
+                stageIndex
+                for stageIndex, stage in enumerate(stageRows)
+                if stage["regularizedConditionNumber"] is not None
+            ],
+            dtype=float,
+        )
+        conditionRows = [
+            stage
+            for stage in stageRows
+            if stage["regularizedConditionNumber"] is not None
+        ]
+        axes[1, 1].bar(
+            conditionPositions,
+            [
+                float(stage["regularizedConditionNumber"])
+                for stage in conditionRows
+            ],
+        )
+        axes[1, 1].set_yscale("log")
+        axes[1, 1].set_title("Regularized normal-matrix conditioning")
+        axes[1, 1].set_ylabel("Condition number (lower is better)")
+
+        for selectedAxes in axes.reshape(-1):
+            selectedAxes.set_xticks(stagePositions)
+            selectedAxes.set_xticklabels(
+                stageNames,
+                rotation=28,
+                ha="right",
+            )
+            selectedAxes.grid(
+                True,
+                axis="y",
+                which="both",
+                linestyle=":",
+                linewidth=0.7,
+            )
+        figure.suptitle(str(self.parameters["dpdGmpPlotTitle"]))
+        figure.tight_layout()
+        return figure
+
+    def SaveDpdGmpPerformance(
+        self,
+        stageResults: Sequence[Mapping[str, object]],
+        outputDirectory: Path,
+        fileStem: Optional[str] = None,
+    ) -> Path:
+        """Save the four-panel DPD-GMP improvement comparison PNG.
+
+        Processing details:
+            Algorithm: Resolve and validate a simple filename, create the
+            output directory, render through CreateDpdGmpPerformanceFigure,
+            save at configured DPI, and always close Matplotlib resources.
+
+        Args:
+            stageResults: Ordered flat DPD-GMP benchmark stage mappings.
+            outputDirectory: Destination directory for the PNG.
+            fileStem: Optional simple filename overriding dpdGmpFileStem.
+
+        Returns:
+            result: Path to the generated DPD-GMP performance figure.
+        """
+
+        selectedFileStem = (
+            str(self.parameters["dpdGmpFileStem"])
+            if fileStem is None
+            else fileStem
+        )
+        if (
+            not isinstance(selectedFileStem, str)
+            or not selectedFileStem
+            or any(
+                character in selectedFileStem
+                for character in '<>:"/\\|?*'
+            )
+        ):
+            raise ValueError("fileStem must be a valid simple file name")
+        outputPath = Path(outputDirectory)
+        outputPath.mkdir(parents=True, exist_ok=True)
+        figurePath = outputPath / f"{selectedFileStem}.png"
+        figure = self.CreateDpdGmpPerformanceFigure(stageResults)
         try:
             figure.savefig(
                 figurePath,

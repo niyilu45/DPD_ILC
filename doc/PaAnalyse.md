@@ -1,6 +1,6 @@
 # PA双音特性分析：频率响应、记忆效应与非线性
 
-本文说明 `tests/BenchMark.py` 中 `RunPaCharacterizationBenchmark` 的测试原理、流程、参数、输出文件和参考仿真结果。该场景不运行ILC，也不把某个PA当成其他PA的参考；它用相同的双音激励与功率定义分别测量Wiener、GMP和Doherty模型，从而回答三个问题：
+本文说明 `tests/BenchMark.py` 中 `RunPaCharacterizationBenchmark` 的测试原理、流程、参数、输出文件和参考仿真结果。PA特性测量核心不运行ILC，也不把某个PA当成其他PA的参考；它用相同的双音激励与功率定义分别测量Wiener、GMP和Doherty模型，从而回答四个问题。特性测量完成后，默认再运行一条相互独立的DPD-GMP/ILC标签性能基准，把测量结论转换为逐项可验证的改进：
 
 1. 小信号复增益是否随频率变化？
 2. 非线性互调是否随双音间隔变化，并出现上下侧带不对称？
@@ -436,11 +436,13 @@ flowchart TD
     powerMetrics --> result
     result --> recommendation["BuildPaDpdRecommendations"]
     recommendation --> design["每种PA、每项测试的DPD结构/参数/训练/验收建议"]
+    recommendation --> dpdGmp["运行嵌套DPD-GMP分阶段性能验证"]
+    dpdGmp --> dpdCompare["逐项保存改进前后EVM、ACLR、IM3、标签NMSE和条件数"]
     result --> data["CSV与JSON"]
     result --> draw["Draw生成四张PNG"]
 ```
 
-**图5说明：**频响路径保持共同低功率输入，避免功率闭环掩盖增益起伏；非线性与记忆路径保持共同实际输出功率，避免工作点差异污染IM对比。功率扫描则主动改变共同工作点，观察特性随输出功率的变化。测量完成后，Benchmark按照实测阈值和PA架构生成DPD结构、初始参数、训练方法与验收门限；`Draw.py`仍只读取结果并生成图像。
+**图5说明：**频响路径保持共同低功率输入，避免功率闭环掩盖增益起伏；非线性与记忆路径保持共同实际输出功率，避免工作点差异污染IM对比。功率扫描则主动改变共同工作点，观察特性随输出功率的变化。测量完成后，Benchmark按照实测阈值和PA架构生成DPD结构、初始参数、训练方法与验收门限，并在 `dpd_gmp` 子目录运行可量化的DpdGmp改进验证；`Draw.py`仍只读取结果并生成图像。
 
 ---
 
@@ -463,6 +465,7 @@ flowchart TD
 | `loadResistanceOhm` | 50 Ω | dBm/RMS换算端口 |
 | `width` | 0 | 文档参考结果使用浮点公开接口 |
 | `paModelNames` | Wiener、GMP、Doherty | 被测PA集合 |
+| `runDpdGmpBenchmark` | `True` | PA特性测试结束后运行嵌套DPD-GMP改进测试 |
 
 ---
 
@@ -518,6 +521,10 @@ for recommendation in result.recommendations:
 | `pa_memory_effect.png` | IM3间隔变化、侧带不对称和动态迟滞四图 |
 | `pa_nonlinearity_comparison.png` | 标称IM3/IM5/IM7分组柱状图 |
 | `pa_power_characteristics.png` | IM3/IM5/IM7和动态迟滞随实际输出功率变化的四联图 |
+| `dpd_gmp/dpd_gmp_stage_metrics.csv` | DPD-GMP各改进阶段的射频与训练指标 |
+| `dpd_gmp/dpd_gmp_improvement_comparison.csv` | 每项改进措施的前后数值、方向和通过状态 |
+| `dpd_gmp/dpd_gmp_benchmark.json` | DPD-GMP完整配置、阶段和比较记录 |
+| `dpd_gmp/dpd_gmp_performance.png` | DPD-GMP的EVM、IM3、标签NMSE和条件数四联图 |
 
 本文引用的可复现数据和图表保存在 `doc/images/pa_analyse`。
 
@@ -568,7 +575,262 @@ for recommendation in result.recommendations:
 
 ---
 
-## 12. 测试边界
+## 12. PA特性分析后的DPD-GMP改进与实测对比
+
+前面的PA分析不能停留在“建议增加阶数”这一层。`RunPaCharacterizationBenchmark` 默认继续调用 `RunDpdGmpBenchmark`，对默认GMP PA执行一条可复现的闭环：
+
+```mermaid
+flowchart TD
+    paResult["GMP PA特性：记忆、动态相位、功率敏感、深压缩"] --> label["10/12/14 dBm分别运行ILC生成PA输入标签"]
+    label --> basic["基础DPD-GMP"]
+    basic --> memory["扩展阶数与main/cross记忆"]
+    memory --> peak["峰值加权"]
+    peak --> ridge["增强岭正则"]
+    ridge --> multi["多功率联合正规方程"]
+    basic --> stress["15 dBm深压缩验证"]
+    stress --> backoff["回退至12 dBm"]
+    basic --> metrics["同功率Wi-Fi EVM/ACLR和双音IM3/5/7"]
+    memory --> metrics
+    peak --> metrics
+    ridge --> metrics
+    multi --> metrics
+```
+
+**图6说明：**每个模型阶段都在DPD加PA的完整串联系统上重新闭环输入，PA输出不做事后缩放。扩展结构、峰值加权、正则化和多功率训练分别针对不同问题，因此各自使用与设计目标一致的验收指标。
+
+### 12.1 共同测试条件
+
+| 条目 | 默认值 |
+|---|---:|
+| PA | `PaModel(modelName="gmp", width=0)` |
+| Wi-Fi | EHT、20 MHz、80 MS/s、MCS 7、4个数据符号、seed 321 |
+| 双音 | -2 MHz和+2 MHz、8192点 |
+| ILC标签功率 | 10、12、14 dBm |
+| 标称优化功率 | 12 dBm |
+| 压缩压力功率 | 15 dBm |
+| ILC迭代 | 8轮 |
+| 满量程功率 | 25 dBm |
+| 端口 | 50 Ω |
+
+12 dBm并不是随意选择。第6节功率扫描显示默认GMP PA约14.83 dBm已经跨过 -30 dBc IM3门限；因此12 dBm用于建立稳定局部逆，15 dBm用于验证深压缩风险。
+
+### 12.2 全阶段结果
+
+![DPD-GMP性能改进](./images/pa_analyse/dpd_gmp/dpd_gmp_performance.png)
+
+**图7说明：**左上为同输出功率Wi-Fi EVM，右上为同输出功率双音IM3，左下为ILC标签普通/峰值加权NMSE，右下为正则矩阵条件数。两条PA baseline没有标签和系数，所以后两类值为空。条件数使用对数坐标。
+
+| 阶段 | 实测输出(dBm) | EVM(dB) | ACLR(dB) | IM3(dBc) | 12 dBm标签NMSE(dB) |
+|---|---:|---:|---:|---:|---:|
+| PA baseline stress | 14.753 | -17.363 | 23.962 | -24.414 | — |
+| PA baseline nominal | 11.849 | -25.133 | 29.762 | -32.249 | — |
+| Basic DPD-GMP stress | 14.781 | -15.856 | 22.136 | -28.505 | -44.452 |
+| Basic DPD-GMP nominal | 11.848 | -28.632 | 30.648 | -38.549 | -44.452 |
+| Memory-expanded DPD-GMP | 11.848 | -28.623 | 30.604 | -38.447 | -45.981 |
+| Peak-weighted DPD-GMP | 11.848 | -28.630 | 30.581 | -38.615 | -45.771 |
+| Regularized DPD-GMP | 11.848 | -28.604 | 30.607 | -38.378 | -45.664 |
+| Multi-power DPD-GMP | 11.836 | -27.536 | 30.727 | -35.995 | -37.721 |
+
+这张表不能按单一纵轴从上到下选“最好模型”。后续阶段有意改变目标：Memory-expanded追求结构表达能力，Peak-weighted追求峰值误差，Regularized追求数值稳定，Multi-power追求多个工作点的最差性能。
+
+### 12.3 改进一：建立基础局部逆
+
+**PA依据：**12 dBm低于默认GMP进入强互调的约14.83 dBm点，局部映射仍可稳定求逆。
+
+**具体方法：**
+
+```python
+basicDpd = DpdGmp(
+    parameters={
+        "nonlinearOrders": (1, 3, 5),
+        "memoryDepth": 3,
+        "crossMemoryDepth": 1,
+        "ridgeFactor": 1.0e-5,
+        "peakWeightExponent": 0.0,
+        "maximumOutputMagnitude": 1.5,
+        "width": 0,
+    }
+)
+basicDpd.FitFromIlc(reference12Dbm, learnedInput12Dbm)
+```
+
+**前后比较：**
+
+| 目标指标 | PA baseline 12 dBm | Basic DPD-GMP 12 dBm | 改善 | 是否符合预期 |
+|---|---:|---:|---:|---|
+| Wi-Fi EVM | -25.133 dB | -28.632 dB | 3.499 dB | 是，EVM更负 |
+| 双音IM3 | -32.249 dBc | -38.549 dBc | 6.300 dB | 是，IM3更负 |
+| ACLR | 29.762 dB | 30.648 dB | 0.887 dB | 是，ACLR更高 |
+
+Wi-Fi训练的系数在没有双音重训练的情况下仍改善IM3，说明模型学到的是PA局部逆，而不只是记住一组Wi-Fi样点。
+
+### 12.4 改进二：深压缩时执行输出回退
+
+**PA依据：**功率扫描表明15 dBm附近已经进入明显非线性。此时PA局部斜率减小，高峰值区的逆响应需要很大的输入变化，容易触发DPD限幅并放大模型误差。
+
+**具体方法：**保持基础DPD结构不变，只把完整DPD加PA串联系统的目标输出由15 dBm降到12 dBm，再由 `PowerCalibration` 重新调整DPD之前的输入。不能把15 dBm PA输出直接缩小后冒充12 dBm结果。
+
+**前后比较：**
+
+| 指标 | Basic DPD 15 dBm | Basic DPD 12 dBm | 改善 | 是否符合预期 |
+|---|---:|---:|---:|---|
+| Wi-Fi EVM | -15.856 dB | -28.632 dB | 12.776 dB | 是 |
+| ACLR | 22.136 dB | 30.648 dB | 8.513 dB | 是 |
+
+在15 dBm处，基础DPD的EVM甚至比同功率PA baseline的 -17.363 dB差。这是“当前工作点不可由该受限结构稳定求逆”的直接证据，不应通过继续增加无约束阶数掩盖。
+
+### 12.5 改进三：扩展非线性和交叉记忆
+
+**PA依据：**默认GMP的IM3随双音间隔变化1.284 dB、最大上下侧不对称1.618 dB，动态AM-PM迟滞7.631度，表明浅Memory Polynomial不足。
+
+**具体方法：**
+
+```text
+nonlinearOrders:    (1,3,5) -> (1,3,5,7)
+memoryDepth:        3 -> 5
+crossMemoryDepth:   1 -> 3
+ridgeFactor:        保持1e-5
+training power:     保持12 dBm
+```
+
+系数数量按
+
+```math
+K=QM+2(Q-1)ML
+```
+
+从较小结构扩展到能表示更多lagging/leading包络历史的结构。
+
+**前后比较：**
+
+| 目标指标 | Basic | Memory-expanded | 改善 | 是否符合预期 |
+|---|---:|---:|---:|---|
+| 12 dBm标签NMSE | -44.452 dB | -45.981 dB | 1.529 dB | 是，表达能力提高 |
+| Wi-Fi EVM | -28.632 dB | -28.623 dB | -0.008 dB | 基本不变 |
+
+本项预期是“更准确描述ILC标签中的记忆”，不是保证同一验证帧EVM必然同步下降。标签NMSE达到预期，而EVM基本持平，说明继续增加结构的边际射频收益已经很小。
+
+### 12.6 改进四：对OFDM峰值加权
+
+**PA依据：**功率扫描显示高包络区压缩显著，但普通MSE主要由数量更多的中低幅度样点决定。
+
+**具体方法：**保持扩展结构，设置
+
+```python
+peakWeightExponent = 2.0
+ridgeFactor = 1.0e-6
+```
+
+每个样点的附加权重为
+
+```math
+w_n
+=
+\left[
+\max
+\left(
+\frac{|x[n]|}{\max_r|x[r]|},
+0.05
+\right)
+\right]^2.
+```
+
+**前后比较：**
+
+| 目标指标 | Memory-expanded | Peak-weighted | 改善 | 是否符合预期 |
+|---|---:|---:|---:|---|
+| 峰值加权标签NMSE | -48.077 dB | -48.458 dB | 0.381 dB | 是 |
+| 普通标签NMSE | -45.981 dB | -45.771 dB | -0.210 dB | 允许的权衡 |
+
+峰值目标改善而普通目标略退化，方向与加权方法完全一致。若只看普通NMSE，会错误判断峰值加权无效。
+
+### 12.7 改进五：增强岭正则以降低系数敏感度
+
+**PA依据：**扩展后的高阶、主记忆和交叉记忆列高度相关，峰值加权又减少了低幅度样点的有效贡献，因此正规方程容易病态。
+
+**具体方法：**保持结构和峰值权重不变，只把
+
+```text
+ridgeFactor: 1e-6 -> 1e-4
+```
+
+正则矩阵为
+
+```math
+\mathbf R_{\lambda}
+=
+\mathbf Z^H\mathbf W\mathbf Z
++
+\lambda\alpha\mathbf I.
+```
+
+**前后比较：**
+
+| 目标指标 | Peak-weighted | Regularized | 改善 | 是否符合预期 |
+|---|---:|---:|---:|---|
+| 条件数 | `5.435e7` | `5.481e5` | 降低约99.2倍，19.964 dB | 是 |
+| 系数稳定目标 | 弱正则 | 强正则 | 对噪声更不敏感 | 是 |
+| Wi-Fi EVM | -28.630 dB | -28.604 dB | -0.026 dB | 允许的小幅代价 |
+
+本项设计目标是稳定性。训练误差或即时EVM的小幅牺牲不能否定条件数降低；应进一步用重复采集和定点量化验证系数方差。
+
+### 12.8 改进六：多功率联合训练
+
+**PA依据：**第6节表明默认GMP的非线性和AM-PM随功率快速变化，一个12 dBm系数集无法同时代表10、12、14 dBm。
+
+**具体方法：**分别运行三个功率的ILC，得到独立标签；不拼接波形历史，只累加三个片段的正规方程：
+
+```python
+multiPowerDpd.FitSegments(
+    referenceSignals=(
+        reference10Dbm,
+        reference12Dbm,
+        reference14Dbm,
+    ),
+    targetSignals=(
+        learnedInput10Dbm,
+        learnedInput12Dbm,
+        learnedInput14Dbm,
+    ),
+    segmentWeights=(1.0, 2.0, 1.0),
+)
+```
+
+12 dBm权重为2，保留主工作点优先级；10和14 dBm各为1，用于限制工作范围边缘的误差。
+
+**前后比较：**
+
+| 目标指标 | 单功率Regularized | Multi-power | 改善 | 是否符合预期 |
+|---|---:|---:|---:|---|
+| 10/12/14 dBm最差标签NMSE | -26.460 dB | -29.706 dB | 3.246 dB | 是 |
+| 10/12/14 dBm最差ACLR | 25.694 dB | 26.106 dB | 0.412 dB | 是 |
+| 12 dBm EVM | -28.604 dB | -27.536 dB | -1.068 dB | 单点性能折中 |
+
+多功率模型达到了“改善最差工作点”的预期，但牺牲了12 dBm最佳单点EVM。这说明下一步有两种选择：
+
+1. 若系统必须使用一个系数集覆盖全部功率，保留联合训练并调整1/2/1权重；
+2. 若允许按功率切换系数，建立10、12、14 dBm系数库并在相邻锚点平滑插值，可避免单一系数集的折中。
+
+### 12.9 自动验收规则
+
+`dpd_gmp_improvement_comparison.csv` 对每项措施保存：
+
+- 改进名称；
+- 前后阶段；
+- 唯一目标指标；
+- 改进前值和改进后值；
+- 预期方向；
+- 正向改善量；
+- `expectationMet` 布尔结果；
+- 可直接复现的参数变化说明。
+
+默认八项检查全部为 `True`。任何PA参数、采样率、训练功率或随机种子变化后，都必须重新运行，而不能继续引用本文默认数值。
+
+完整系数更新推导见 [DPD-GMP.md](./DPD-GMP.md)，类参数和调用方式见 [DpdGmp.md](./DpdGmp.md)。
+
+---
+
+## 13. 测试边界
 
 1. 频响是复基带等效响应，不包含射频载波、匹配网络S参数或天线响应。
 2. 双音间隔扫描能够显示记忆，但不能唯一判断记忆来自热效应、偏置网络、陷波器、负载调制还是数字滤波；需要结合器件结构和更多测试。

@@ -5,7 +5,7 @@
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `main.py` 和 `inc/**/*.py` 中 367 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis和DPD-ILC核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
+本次审计共检查 `main.py` 和 `inc/**/*.py` 中 396 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis、DPD-ILC和独立DpdGmp核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC与MIMO ILC统一位于 `DpdIlc.py`，可部署且可增量更新的GMP位于`DpdGmp.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
 
 ## 1. 分类规则
 
@@ -32,7 +32,7 @@ flowchart LR
     pa --> sync
     sync --> analysis["Analysis.md：MSE/SNR/EVM/ACLR"]
     analysis --> report["打印/保存/绘图"]
-    audit["本文：268 个定义位置逐项索引"] -.-> wave
+    audit["本文：396 个定义位置逐项索引"] -.-> wave
     audit -.-> pa
     audit -.-> ilc
     audit -.-> sync
@@ -271,6 +271,26 @@ flowchart LR
 
 若存在天线耦合、电源耦合或串扰，上述逐链分解不成立，必须使用 DPD-ILC §3.10 的联合增广 MIMO 模型。
 
+### 5.4 `DpdGmp.py`：独立可部署GMP数字预失真器
+
+完整物理模型、加权岭回归和系数更新推导见 [DPD-GMP.md](./DPD-GMP.md)，API示例见 [DpdGmp.md](./DpdGmp.md)。
+
+| 函数/方法 | 类型 | 原理或职责 | 对应章节 |
+|---|---|---|---|
+| `DpdGmpTrainingResult.ToDict` | E | 把样点/片段/特征数量、更新前后标签NMSE、正则条件数和归一化系数变化量复制为普通字典，不重新训练 | DpdGmp §1.2 |
+| `DpdGmp.__init__`, `DpdGmp.Width`, `DpdGmp.GetParameters`, `DpdGmp.UpdateParameters`, `DpdGmp.ValidateParameters` | E | 在类内建立ChainMap默认参数，警告并忽略未知键，验证奇数阶、记忆、岭系数、学习率、峰值权重、限幅和公开位宽；结构变化时安全恢复恒等系数 | DpdGmp §1–§2 |
+| `DpdGmp.ResolveStructure`, `DpdGmp.SynchronizeStructure`, `DpdGmp.RebuildStructure`, `DpdGmp.ResetCoefficients` | N/E | 按固定main/lagging/leading顺序解析结构；活动外部映射改变阶数或记忆时验证并重建；把零时延一阶main项设为1，其余项设为0，形成恒等DPD先验 | DPD-GMP §3–§4、DpdGmp §2 |
+| `DpdGmp.GetFeatureSpecs`, `DpdGmp.GetCoefficients`, `DpdGmp.SetCoefficients`, `DpdGmp.GetLastTrainingResult` | E | 返回不可外部篡改的结构、系数或诊断副本；恢复系数时要求数量与基函数一一对应 | DpdGmp §3、§10 |
+| `DpdGmp.PreparePublicSignal` | N/E | 在公开边界把浮点波形或有符号整数I/Q码解码为有限一维归一化复信号，避免重复缩放 | DpdGmp §11、FixedPoint §6 |
+| `DpdGmp.LimitMagnitude` | P/N | 保持相位地把DPD复包络投影到配置圆盘，模拟DAC/PA输入峰值保护；频繁触发表示模型或工作点不合适 | DPD-GMP §13 |
+| `DpdGmp.ProcessFloating`, `DpdGmp.Process` | P/N/E | 分块构造GMP基矩阵并乘当前系数；公开入口执行一次解码、内部浮点GMP/限幅和一次重新编码 | DPD-GMP §3–§4、DpdGmp §11 |
+| `DpdGmp.BuildSampleWeights` | N/P | 组合显式样点权重、归一化包络峰值权重和保留绝对贡献的片段权重；片段权重在片段内归一化之后施加，避免被均值除法抵消 | DPD-GMP §8–§9 |
+| `DpdGmp.CalculateNmse` | N | 用调用方显式权重计算当前GMP预测相对目标标签的归一化残差功率；不会隐式复用训练峰值权重 | DPD-GMP §8、DpdGmp §9 |
+| `DpdGmp.Fit`, `DpdGmp.UpdateCoefficients` | N | 对单一波形执行两遍列RMS归一化、复加权岭正规方程和学习率混合；Fit先恢复恒等先验，Update保留当前系数先验 | DPD-GMP §6–§7 |
+| `DpdGmp.FitSegments`, `DpdGmp.UpdateCoefficientSegments` | N/P | 对多帧或多功率片段独立建立记忆并累加正规方程，防止简单拼接在边界制造不存在的PA历史 | DPD-GMP §9、DpdGmp §6 |
+| `DpdGmp.FitFromIlc` | P/N | 用原始理想波形建立GMP基函数，以ILC收敛PA输入为监督标签，把波形专用逆压缩成可复用系数 | DPD-GMP §5.1、DpdGmp §5 |
+| `DpdGmp.FitIndirect` | P/N/E | 调用SigProc同步并公共复增益归一化PA输出，以校正输出为后置逆输入、真实PA输入为目标，再把后置逆系数用于前置DPD | DPD-GMP §5.3、DpdGmp §8 |
+
 ## 6. `SigProc.py`：同步、补偿和功率标定函数
 
 详细推导统一见 [SigProc.md](./SigProc.md)。
@@ -358,6 +378,8 @@ flowchart LR
 | `Draw.CreatePaMemoryEffectFigure`, `Draw.SavePaMemoryEffect` | 绘制/保存IM3间隔变化、侧带不对称与动态AM-AM/AM-PM迟滞 | PaAnalyse §3–§4 |
 | `Draw.CreatePaNonlinearityComparisonFigure`, `Draw.SavePaNonlinearityComparison` | 绘制/保存共同20 dBm工作点的IM3/IM5/IM7柱状图 | PaAnalyse §5 |
 | `Draw.CreatePaPowerCharacteristicsFigure`, `Draw.SavePaPowerCharacteristics` | 绘制/保存互调和动态迟滞随实测输出功率的变化 | PaAnalyse §6 |
+| `Draw.ValidateDpdGmpStages` | 检查DPD-GMP阶段名、EVM、ACLR、IM3和可选标签/条件数字段，不填造baseline缺失值 | PaAnalyse §12 |
+| `Draw.CreateDpdGmpPerformanceFigure`, `Draw.SaveDpdGmpPerformance` | 绘制/保存DPD-GMP的同功率EVM、IM3、标签NMSE和对数条件数四联图，不重新训练或计算指标 | PaAnalyse §12、DPD-GMP §12 |
 
 图上的连线只帮助阅读离散采样点，不表示功率点或迭代轮次之间存在连续物理轨迹。
 
@@ -396,6 +418,7 @@ flowchart LR
 - 所有具有物理或信号处理含义的函数均可追溯到专题文档中的公式和边界；
 - 所有纯配置、查询、序列化、保存和绘图函数均被明确标为 E 类，没有为其虚构物理原理；
 - `DpdIlc.py` 中的简化 Volterra、幅度 LUT 和 ELM 风格神经网络以前只有一般模型说明，本次已在 DPD-ILC §3.13 补充代码精确方程；
+- 独立`DpdGmp.py`的恒等先验、因果main/lagging/leading基函数、峰值与片段权重、列归一化岭回归、增量系数混合和多功率片段边界均已在DPD-GMP文档建立公式与函数索引；
 - ILC 的低功率频响融合、方向 Gauss-Newton、峰值/带宽投影、反馈平均和 GMP 分块岭回归以前缺少实现级推导，本次已在 DPD-ILC §3.14 补齐；
 - prepared指标、每链/每流指标、每轮三级MSE和绘图的生产函数入口均已在本文建立索引；benchmark函数的场景含义、预期和实测结果在 `BenchMark.md` 分类说明。
 

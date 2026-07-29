@@ -33,6 +33,7 @@ if str(GetProjectRoot()) not in sys.path:
 
 from inc.lib.Analysis import Analysis
 from inc.lib.Channel import Channel
+from inc.lib.DpdGmp import DpdGmp
 from inc.lib.DpdIlc import (
     CalculateIterationMetrics,
     FitMimoGmpPredistorter,
@@ -318,6 +319,9 @@ def CheckModuleResponsibilityBoundaries() -> None:
     ilcSource = (projectRoot / "inc" / "lib" / "DpdIlc.py").read_text(
         encoding="utf-8"
     )
+    dpdGmpSource = (
+        projectRoot / "inc" / "lib" / "DpdGmp.py"
+    ).read_text(encoding="utf-8")
 
     assert not (projectRoot / "inc" / "SigProcess.py").exists()
     assert not (
@@ -327,6 +331,7 @@ def CheckModuleResponsibilityBoundaries() -> None:
         "Analysis.py",
         "Channel.py",
         "DpdIlc.py",
+        "DpdGmp.py",
         "Fec.py",
         "PaModel.py",
         "WaveGenWifi.py",
@@ -342,6 +347,8 @@ def CheckModuleResponsibilityBoundaries() -> None:
         assert not (projectRoot / "inc" / movedModuleName).exists()
     assert "class SigProc:" in signalProcessorSource
     assert "class PowerCalibration:" in signalProcessorSource
+    assert "class DpdGmp:" in dpdGmpSource
+    assert "from .DpdIlc import BuildFeatureSpecs" in dpdGmpSource
     assert "class PowerCalibration:" not in paSource
     assert "def BuildCsdPhaseMatrix(" in frameProcessorSource
     assert "def BuildCsdPhaseMatrix(" not in waveGeneratorSource
@@ -362,6 +369,7 @@ def CheckModuleResponsibilityBoundaries() -> None:
         "from lib.ParseWifi import ParseWifi; "
         "from lib.Analysis import Analysis; "
         "from lib.Channel import Channel; "
+        "from lib.DpdGmp import DpdGmp; "
         "from lib.DpdIlc import RunFrequencyDomainIlc; "
         "from lib.Fec import EncodeDescriptorLdpc; "
         "from lib.WaveGenWifi import WaveGenWifi; "
@@ -433,6 +441,14 @@ def CheckBenchmarkSeparation() -> None:
         "SavePaCharacterizationResults",
         "PrintPaCharacterizationResults",
         "PrintPaDpdRecommendations",
+        "DpdGmpBenchmarkConfig",
+        "DpdGmpStageResult",
+        "DpdGmpImprovementComparison",
+        "DpdGmpBenchmarkResult",
+        "DpdGmpPaCascade",
+        "RunDpdGmpBenchmark",
+        "SaveDpdGmpBenchmarkResults",
+        "PrintDpdGmpBenchmarkResults",
     )
     for forbiddenName in forbiddenProductionNames:
         assert forbiddenName not in ilcSource, (
@@ -493,6 +509,10 @@ def CheckBenchmarkSeparation() -> None:
         assert sectionTitle in benchmarkDocument, (
             f"missing classified benchmark documentation: {sectionTitle}"
         )
+    assert (
+        "I类：PA分析驱动的DPD-GMP分阶段性能测试"
+        in benchmarkDocument
+    )
 
 
 def CheckFunctionPrincipleCoverage() -> None:
@@ -4070,6 +4090,24 @@ def CheckPaCharacterizationBenchmark() -> None:
             ).read_text(encoding="utf-8")
         )
         assert len(recommendationDocument["recommendations"]) == 15
+        dpdGmpDirectory = outputDirectory / "dpd_gmp"
+        for artifactName in (
+            "dpd_gmp_stage_metrics.csv",
+            "dpd_gmp_improvement_comparison.csv",
+            "dpd_gmp_benchmark.json",
+            "dpd_gmp_performance.png",
+        ):
+            assert (dpdGmpDirectory / artifactName).exists()
+        dpdGmpDocument = json.loads(
+            (
+                dpdGmpDirectory / "dpd_gmp_benchmark.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert len(dpdGmpDocument["stages"]) == 8
+        assert all(
+            comparison["expectationMet"]
+            for comparison in dpdGmpDocument["comparisons"]
+        )
     paAnalysisDocument = (
         GetProjectRoot() / "doc" / "PaAnalyse.md"
     ).read_text(encoding="utf-8")
@@ -4091,6 +4129,138 @@ def CheckPaCharacterizationBenchmark() -> None:
         "pa_power_characteristics.png",
     ):
         assert requiredText in paAnalysisDocument
+
+
+def CheckDpdGmpModelAndBenchmark() -> None:
+    """Verify DpdGmp training modes and every staged performance artifact.
+
+    Processing details:
+        Algorithm: Check floating identity inference, direct nonlinear fitting,
+        retained multi-segment weights, fixed-point public codes, unknown-key
+        warnings, and the deterministic PA-analysis-driven benchmark whose
+        target metric must improve for every declared method change.
+
+    Returns:
+        result: None. Assertions identify GMP model or benchmark regressions.
+    """
+
+    randomGenerator = np.random.default_rng(701)
+    referenceSignal = (
+        randomGenerator.standard_normal(2048)
+        + 1j * randomGenerator.standard_normal(2048)
+    )
+    referenceSignal *= 0.18 / np.sqrt(
+        np.mean(np.abs(referenceSignal) ** 2)
+    )
+    identityDpd = DpdGmp(
+        parameters={
+            "width": 0,
+            "maximumOutputMagnitude": None,
+        }
+    )
+    assert np.array_equal(
+        identityDpd.Process(referenceSignal),
+        referenceSignal,
+    )
+    featureCount = len(identityDpd.GetFeatureSpecs())
+    assert featureCount == 4 * 3 + 2 * 3 * 3 * 2
+
+    targetSignal = (
+        1.08 * referenceSignal
+        + 0.16 * referenceSignal * np.abs(referenceSignal) ** 2
+    )
+    fittedDpd = DpdGmp(
+        parameters={
+            "nonlinearOrders": (1, 3),
+            "memoryDepth": 1,
+            "crossMemoryDepth": 0,
+            "ridgeFactor": 1.0e-8,
+            "maximumOutputMagnitude": None,
+            "width": 0,
+        }
+    )
+    beforeNmseDb = fittedDpd.CalculateNmse(
+        referenceSignal,
+        targetSignal,
+    )
+    trainingResult = fittedDpd.Fit(
+        referenceSignal,
+        targetSignal,
+    )
+    afterNmseDb = fittedDpd.CalculateNmse(
+        referenceSignal,
+        targetSignal,
+    )
+    assert afterNmseDb < beforeNmseDb - 40.0
+    assert trainingResult.afterNmseDb < trainingResult.beforeNmseDb
+    assert fittedDpd.GetLastTrainingResult() == trainingResult
+    assert trainingResult.featureCount == 2
+
+    firstOrderParameters = {
+        "nonlinearOrders": (1,),
+        "memoryDepth": 1,
+        "crossMemoryDepth": 0,
+        "ridgeFactor": 1.0e-8,
+        "maximumOutputMagnitude": None,
+        "width": 0,
+    }
+    uniformDpd = DpdGmp(parameters=firstOrderParameters)
+    uniformDpd.FitSegments(
+        (referenceSignal, referenceSignal),
+        (referenceSignal, 2.0 * referenceSignal),
+        segmentWeights=(1.0, 1.0),
+    )
+    weightedDpd = DpdGmp(parameters=firstOrderParameters)
+    weightedDpd.FitSegments(
+        (referenceSignal, referenceSignal),
+        (referenceSignal, 2.0 * referenceSignal),
+        segmentWeights=(1.0, 4.0),
+    )
+    assert (
+        weightedDpd.GetCoefficients()[0].real
+        > uniformDpd.GetCoefficients()[0].real + 0.20
+    )
+
+    fixedWaveform = WaveGenWifi(
+        parameters={
+            "frameFormat": "EHT",
+            "bandwidthMhz": 20,
+            "numDataSymbols": 1,
+            "width": 16,
+        }
+    ).Generate()
+    fixedDpd = DpdGmp(
+        parameters={
+            "width": 16,
+        }
+    )
+    fixedOutput = fixedDpd.Process(fixedWaveform.samples)
+    assert fixedOutput.dtype == np.complex128
+    assert np.max(np.abs(fixedOutput.real)) > 1.0
+    assert np.array_equal(fixedOutput, fixedWaveform.samples)
+    with warnings.catch_warnings(record=True) as warningRecords:
+        warnings.simplefilter("always")
+        warnedDpd = DpdGmp(
+            parameters={
+                "width": 0,
+                "unknownGmpOption": 9,
+            }
+        )
+    assert warnedDpd.width == 0
+    assert any(
+        "unknownGmpOption" in str(warningRecord.message)
+        for warningRecord in warningRecords
+    )
+
+    for documentName, requiredText in (
+        ("DPD-GMP.md", "加权岭回归"),
+        ("DpdGmp.md", "多功率联合训练"),
+        ("PaAnalyse.md", "PA特性分析后的DPD-GMP改进与实测对比"),
+    ):
+        documentText = (
+            GetProjectRoot() / "doc" / documentName
+        ).read_text(encoding="utf-8")
+        assert requiredText in documentText
 
 
 def RunTests() -> None:
@@ -4133,6 +4303,7 @@ def RunTests() -> None:
     CheckMseEvmConvergence()
     CheckTwoToneIlcAnalysis()
     CheckPaCharacterizationBenchmark()
+    CheckDpdGmpModelAndBenchmark()
     print("All DPD-ILC project checks passed.")
 
 

@@ -1916,3 +1916,111 @@ python tests/BenchMark.py --pa-analyse --sample-rate-hz 200000000 --tone-samples
 - [ ] 频响、记忆、标称互调和功率特性四张图均由同一份CSV/JSON数据生成；
 - [ ] 每种PA都生成频响、间隔记忆、动态迟滞、标称非线性和输出功率五类DPD建议；
 - [ ] 报告明确结果属于默认行为模型，不泛化为真实器件架构结论。
+
+---
+
+## 30. I类：PA分析驱动的DPD-GMP分阶段性能测试
+
+### 30.1 分类目的
+
+I类把H类得到的PA结论转换成可执行的GMP DPD改进，并要求每一种修改都具有：
+
+1. 明确的PA特性依据；
+2. 唯一的主要修改；
+3. 与修改目标一致的验收指标；
+4. 修改前后的数值；
+5. 自动保存的 `expectationMet` 结果。
+
+生产算法位于 `inc/lib/DpdGmp.py`；I类只在 `tests/BenchMark.py` 中构造波形、功率点和对比阶段。
+
+### 30.2 默认配置
+
+| 参数 | 默认值 |
+|---|---:|
+| Wi-Fi | EHT、20 MHz、80 MS/s、MCS 7、4个数据符号 |
+| Wi-Fi seed | 321 |
+| 双音 | -2 MHz、+2 MHz、8192点 |
+| PA | GMP |
+| 标称输出功率 | 12 dBm |
+| 压力输出功率 | 15 dBm |
+| 多功率标签 | 10、12、14 dBm |
+| 每个标签ILC轮数 | 8 |
+| 公开位宽 | 0 |
+
+### 30.3 阶段与控制变量
+
+| 阶段 | 相对前一相关阶段的修改 | 主要验收指标 |
+|---|---|---|
+| PA baseline nominal/stress | 无DPD，分别闭环至12/15 dBm | EVM、ACLR、IM3/5/7参考 |
+| Basic DPD-GMP nominal/stress | 1/3/5阶、主记忆3、交叉记忆1、12 dBm ILC标签 | 同功率EVM和IM3；15/12 dBm可逆性 |
+| Memory-expanded | 增加7阶，主记忆5，交叉记忆3 | 普通标签NMSE |
+| Peak-weighted | 包络平方权重，岭系数1e-6 | 峰值加权标签NMSE |
+| Regularized | 岭系数由1e-6增至1e-4 | 正则矩阵条件数 |
+| Multi-power | 10/12/14 dBm片段权重1/2/1 | 最差功率标签NMSE和ACLR |
+
+所有射频比较均重新闭环完整DPD加PA串联系统的输入，PA输出不做常数缩放。多功率片段分别建立GMP历史，只累加正规方程。
+
+### 30.4 执行流程
+
+```mermaid
+flowchart TD
+    config["DpdGmpBenchmarkConfig.Validate"] --> wifi["生成确定性EHT帧"]
+    config --> tone["生成确定性双音"]
+    wifi --> labels["10/12/14 dBm频域ILC标签"]
+    labels --> models["训练Basic、Memory、Peak、Regularized、Multi-power"]
+    models --> calibrate["每阶段重新闭环DPD+PA输出功率"]
+    calibrate --> wifiMetrics["Analysis：EVM/ACLR/输出功率"]
+    calibrate --> toneMetrics["TwoToneAnalysis：IM3/IM5/IM7"]
+    models --> fitMetrics["标签NMSE、条件数、系数范数"]
+    wifiMetrics --> compare["BuildDpdGmpImprovementComparisons"]
+    toneMetrics --> compare
+    fitMetrics --> compare
+    compare --> files["阶段CSV、比较CSV、JSON、四联PNG"]
+```
+
+**图示说明：**ILC只生成监督标签，不在DpdGmp内部计算RF指标。`Analysis`和`TwoToneAnalysis`独立消费PA输出；`Draw`只消费已计算阶段字典。
+
+### 30.5 改进前后预期
+
+| 改进 | 前值 | 后值 | 默认改善 | 预期 |
+|---|---:|---:|---:|---|
+| 基础DPD Wi-Fi EVM | -25.133 dB | -28.632 dB | 3.499 dB | EVM降低 |
+| 基础DPD双音IM3 | -32.249 dBc | -38.549 dBc | 6.300 dB | IM3降低 |
+| 深压缩回退 EVM | -15.856 dB | -28.632 dB | 12.776 dB | EVM降低 |
+| 扩展结构标签NMSE | -44.452 dB | -45.981 dB | 1.529 dB | NMSE降低 |
+| 峰值加权标签NMSE | -48.077 dB | -48.458 dB | 0.381 dB | 峰值目标降低 |
+| 增强正则条件数 | `5.435e7` | `5.481e5` | 19.964 dB | 条件数降低 |
+| 多功率最差标签NMSE | -26.460 dB | -29.706 dB | 3.246 dB | 最差值降低 |
+| 多功率最差ACLR | 25.694 dB | 26.106 dB | 0.412 dB | 最差值提高 |
+
+扩展结构、峰值加权和正则化不要求即时EVM都下降，因为三者分别优化标签表达、峰值误差和数值稳定。多功率训练也允许牺牲最佳单点，前提是预先声明的最差功率目标改善。
+
+### 30.6 运行和输出
+
+```powershell
+python tests/BenchMark.py --dpd-gmp
+```
+
+| 文件 | 内容 |
+|---|---|
+| `dpd_gmp_stage_metrics.csv` | 所有阶段的射频、标签、条件数和多功率指标 |
+| `dpd_gmp_improvement_comparison.csv` | 每项改进的前后值、方向、改善量和通过状态 |
+| `dpd_gmp_benchmark.json` | 完整配置和嵌套结果 |
+| `dpd_gmp_performance.png` | EVM、IM3、标签NMSE和条件数四联图 |
+
+`--pa-analyse` 默认在PA特性目录的 `dpd_gmp` 子目录自动运行相同I类测试。只需要PA原始特性而不需要嵌套DPD时，Python配置可设置 `runDpdGmpBenchmark=False`。
+
+### 30.7 I类验收清单
+
+- [ ] 三个ILC标签分别在10、12、14 dBm生成；
+- [ ] baseline和每个DPD阶段均按完整plant重新闭环输出功率；
+- [ ] Wi-Fi、双音和标签指标由相互独立的分析路径产生；
+- [ ] 每项修改只用与其物理目标一致的主指标判定；
+- [ ] 扩展结构改善普通标签NMSE；
+- [ ] 峰值加权改善显式峰值加权NMSE；
+- [ ] 增强岭正则降低条件数；
+- [ ] 多功率训练改善最差功率标签NMSE和ACLR；
+- [ ] `expectationMet` 全部为真，否则测试失败并保留实际结果；
+- [ ] CSV、JSON、PNG和文档使用相同阶段顺序和数值。
+
+完整原理和改进解释见 [DPD-GMP.md](./DPD-GMP.md) 与 [PaAnalyse.md第12节](./PaAnalyse.md#12-pa特性分析后的dpd-gmp改进与实测对比)。

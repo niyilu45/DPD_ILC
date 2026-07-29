@@ -38,6 +38,7 @@ from .lib.TwoToneAnalysis import (
     TwoToneMetrics,
 )
 from .lib.Channel import Channel
+from .lib.DpdGmp import DpdGmp, DpdGmpTrainingResult
 from .utils.Draw import Draw
 from .lib.DpdIlc import (
     CalculateIterationMetrics,

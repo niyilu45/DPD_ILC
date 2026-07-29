@@ -45,6 +45,7 @@ if str(GetProjectRoot()) not in sys.path:
     sys.path.insert(0, str(GetProjectRoot()))
 
 from inc.lib.Analysis import Analysis, ILCAnalysisResult, SignalMetrics
+from inc.lib.DpdGmp import DpdGmp, DpdGmpTrainingResult
 from inc.utils.Draw import Draw
 from inc.lib.DpdIlc import (
     FitGmpPredistorter,
@@ -68,7 +69,7 @@ from inc.lib.TwoToneAnalysis import (
     TwoToneILCAnalysisResult,
     TwoToneMetrics,
 )
-from inc.lib.WaveGenTwoTone import WaveGenTwoTone
+from inc.lib.WaveGenTwoTone import TwoToneWaveform, WaveGenTwoTone
 from inc.utils.FixedPoint import FixedPoint
 from inc.utils.SigProc import PowerCalibration
 from inc.lib.WaveGenWifi import WaveGenWifi
@@ -383,6 +384,7 @@ class PaCharacterizationConfig:
         "gmp",
         "doherty",
     )
+    runDpdGmpBenchmark: bool = True
     outputDirectory: Path = Path("results/pa_characterization")
 
     def Validate(self) -> None:
@@ -424,6 +426,8 @@ class PaCharacterizationConfig:
             raise ValueError(
                 "numSamples must be an integer no smaller than 512"
             )
+        if not isinstance(self.runDpdGmpBenchmark, bool):
+            raise TypeError("runDpdGmpBenchmark must be a boolean")
         if (
             not isinstance(self.settlingSamples, int)
             or isinstance(self.settlingSamples, bool)
@@ -833,6 +837,307 @@ class PaCharacterizationResult:
                 for recommendation in self.recommendations
             ],
         }
+
+
+@dataclass(frozen=True)
+class DpdGmpBenchmarkConfig:
+    """Configure the PA-analysis-driven DPD-GMP improvement benchmark."""
+
+    frameFormat: str = "EHT"
+    bandwidthMhz: int = 20
+    sampleRateHz: float = 80.0e6
+    mcs: int = 7
+    numDataSymbols: int = 4
+    seed: int = 321
+    toneFrequenciesHz: Tuple[float, float] = (-2.0e6, 2.0e6)
+    toneNumSamples: int = 8192
+    stressOutputPowerDbm: float = 15.0
+    optimizedOutputPowerDbm: float = 12.0
+    trainingPowerDbm: Tuple[float, ...] = (10.0, 12.0, 14.0)
+    maximumOutputPowerDbm: float = 25.0
+    loadResistanceOhm: float = 50.0
+    numIterations: int = 8
+    width: int = 0
+    outputDirectory: Path = Path("results/dpd_gmp_benchmark")
+
+    def Validate(self) -> None:
+        """Validate waveform, power, ILC-label, and output settings.
+
+        Processing details:
+            Algorithm: Instantiate representative Wi-Fi and two-tone
+            generators, require ordered power anchors containing the optimized
+            point and below the rated ceiling, validate iteration/record
+            counts, and use PowerCalibration for dBm/width constraints.
+
+        Returns:
+            result: None. Invalid benchmark controls raise an exception.
+        """
+
+        if (
+            not isinstance(self.bandwidthMhz, int)
+            or isinstance(self.bandwidthMhz, bool)
+            or self.bandwidthMhz not in (20, 40, 80, 160)
+            or not isinstance(self.sampleRateHz, (int, float))
+            or isinstance(self.sampleRateHz, bool)
+            or not np.isfinite(self.sampleRateHz)
+            or self.sampleRateHz
+            < 3.0 * self.bandwidthMhz * 1.0e6
+        ):
+            raise ValueError(
+                "bandwidthMhz must be supported and sampleRateHz must be "
+                "at least three times its channel bandwidth for DPD-GMP "
+                "ACLR analysis"
+            )
+        WaveGenWifi(
+            parameters={
+                "frameFormat": self.frameFormat,
+                "bandwidthMhz": self.bandwidthMhz,
+                "sampleRateHz": self.sampleRateHz,
+                "mcs": self.mcs,
+                "numDataSymbols": self.numDataSymbols,
+                "seed": self.seed,
+                "width": self.width,
+            }
+        )
+        WaveGenTwoTone(
+            parameters={
+                "sampleRateHz": self.sampleRateHz,
+                "toneFrequenciesHz": self.toneFrequenciesHz,
+                "numSamples": self.toneNumSamples,
+                "width": self.width,
+            }
+        )
+        if (
+            not isinstance(self.trainingPowerDbm, tuple)
+            or len(self.trainingPowerDbm) < 3
+            or any(
+                not isinstance(powerDbm, (int, float))
+                or isinstance(powerDbm, bool)
+                or not np.isfinite(powerDbm)
+                for powerDbm in self.trainingPowerDbm
+            )
+            or any(
+                laterPowerDbm <= earlierPowerDbm
+                for earlierPowerDbm, laterPowerDbm in zip(
+                    self.trainingPowerDbm[:-1],
+                    self.trainingPowerDbm[1:],
+                )
+            )
+            or self.optimizedOutputPowerDbm
+            not in self.trainingPowerDbm
+        ):
+            raise ValueError(
+                "trainingPowerDbm must be an increasing tuple with at "
+                "least three points including optimizedOutputPowerDbm"
+            )
+        if self.stressOutputPowerDbm <= self.optimizedOutputPowerDbm:
+            raise ValueError(
+                "stressOutputPowerDbm must exceed optimizedOutputPowerDbm"
+            )
+        for outputPowerDbm in (
+            *self.trainingPowerDbm,
+            self.stressOutputPowerDbm,
+        ):
+            PowerCalibration(
+                parameters={
+                    "outputPowerDbm": outputPowerDbm,
+                    "maximumOutputPowerDbm": (
+                        self.maximumOutputPowerDbm
+                    ),
+                    "loadResistanceOhm": self.loadResistanceOhm,
+                    "width": self.width,
+                }
+            )
+        if (
+            not isinstance(self.numIterations, int)
+            or isinstance(self.numIterations, bool)
+            or self.numIterations < 2
+        ):
+            raise ValueError(
+                "numIterations must be an integer no smaller than two"
+            )
+        if (
+            not isinstance(self.toneNumSamples, int)
+            or isinstance(self.toneNumSamples, bool)
+            or self.toneNumSamples < 1024
+        ):
+            raise ValueError(
+                "toneNumSamples must be an integer no smaller than 1024"
+            )
+
+
+@dataclass(frozen=True)
+class DpdGmpStageResult:
+    """Store RF, label-fit, conditioning, and robustness stage metrics."""
+
+    stageName: str
+    improvementCategory: str
+    targetOutputPowerDbm: float
+    measuredOutputPowerDbm: float
+    evmDb: float
+    evmPercent: float
+    aclrWorstDb: float
+    im3WorstDbc: float
+    im5WorstDbc: float
+    im7WorstDbc: float
+    labelNmseDb: Optional[float]
+    peakWeightedLabelNmseDb: Optional[float]
+    regularizedConditionNumber: Optional[float]
+    coefficientNorm: Optional[float]
+    worstPowerLabelNmseDb: Optional[float]
+    worstPowerEvmDb: Optional[float]
+    worstPowerAclrDb: Optional[float]
+    modelDescription: str
+
+    def ToDict(self) -> Dict[str, object]:
+        """Flatten one DPD-GMP stage without changing metric conventions.
+
+        Processing details:
+            Algorithm: Copy stage identity, equal-power RF metrics, optional
+            coefficient/label diagnostics, robustness metrics, and the exact
+            model description into one stable row.
+
+        Returns:
+            result: CSV/JSON-ready stage result mapping.
+        """
+
+        return {
+            "stageName": self.stageName,
+            "improvementCategory": self.improvementCategory,
+            "targetOutputPowerDbm": self.targetOutputPowerDbm,
+            "measuredOutputPowerDbm": self.measuredOutputPowerDbm,
+            "evmDb": self.evmDb,
+            "evmPercent": self.evmPercent,
+            "aclrWorstDb": self.aclrWorstDb,
+            "im3WorstDbc": self.im3WorstDbc,
+            "im5WorstDbc": self.im5WorstDbc,
+            "im7WorstDbc": self.im7WorstDbc,
+            "labelNmseDb": self.labelNmseDb,
+            "peakWeightedLabelNmseDb": (
+                self.peakWeightedLabelNmseDb
+            ),
+            "regularizedConditionNumber": (
+                self.regularizedConditionNumber
+            ),
+            "coefficientNorm": self.coefficientNorm,
+            "worstPowerLabelNmseDb": self.worstPowerLabelNmseDb,
+            "worstPowerEvmDb": self.worstPowerEvmDb,
+            "worstPowerAclrDb": self.worstPowerAclrDb,
+            "modelDescription": self.modelDescription,
+        }
+
+
+@dataclass(frozen=True)
+class DpdGmpImprovementComparison:
+    """Store one before/after test of a concrete DPD-GMP improvement."""
+
+    improvementName: str
+    beforeStage: str
+    afterStage: str
+    targetMetric: str
+    beforeValue: float
+    afterValue: float
+    improvementValue: float
+    expectedDirection: str
+    expectationMet: bool
+    methodDetails: str
+
+    def ToDict(self) -> Dict[str, object]:
+        """Return one auditable improvement comparison dictionary.
+
+        Processing details:
+            Algorithm: Copy the compared stages, target metric, raw values,
+            consistently positive improvement, expected direction, pass/fail
+            result, and implementation details.
+
+        Returns:
+            result: CSV/JSON-ready improvement record.
+        """
+
+        return {
+            "improvementName": self.improvementName,
+            "beforeStage": self.beforeStage,
+            "afterStage": self.afterStage,
+            "targetMetric": self.targetMetric,
+            "beforeValue": self.beforeValue,
+            "afterValue": self.afterValue,
+            "improvementValue": self.improvementValue,
+            "expectedDirection": self.expectedDirection,
+            "expectationMet": self.expectationMet,
+            "methodDetails": self.methodDetails,
+        }
+
+
+@dataclass(frozen=True)
+class DpdGmpBenchmarkResult:
+    """Store complete DPD-GMP stages and expected improvement checks."""
+
+    stages: Tuple[DpdGmpStageResult, ...]
+    comparisons: Tuple[DpdGmpImprovementComparison, ...]
+
+    def ToDict(self) -> Dict[str, object]:
+        """Convert all DPD-GMP benchmark records to ordinary mappings.
+
+        Processing details:
+            Algorithm: Preserve stage/comparison order and delegate each flat
+            record conversion without recalculating metrics.
+
+        Returns:
+            result: Mapping containing stage and comparison row lists.
+        """
+
+        return {
+            "stages": [stage.ToDict() for stage in self.stages],
+            "comparisons": [
+                comparison.ToDict()
+                for comparison in self.comparisons
+            ],
+        }
+
+
+class DpdGmpPaCascade:
+    """Expose a DpdGmp followed by one PA as a calibration-compatible plant."""
+
+    def __init__(self, predistorter: DpdGmp, paModel: PaModel) -> None:
+        """Store equal-width DPD and PA objects.
+
+        Processing details:
+            Algorithm: Require matching public widths and retain both stages
+            for deterministic DPD-then-PA processing.
+
+        Args:
+            predistorter: Trained SISO DpdGmp object.
+            paModel: SISO PaModel under compensation.
+
+        Returns:
+            result: None. The cascade is ready for PowerCalibration.
+        """
+
+        if predistorter.width != paModel.width:
+            raise ValueError(
+                "predistorter and paModel must use the same public width"
+            )
+        self.predistorter = predistorter
+        self.paModel = paModel
+        self.width = predistorter.width
+
+    def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Apply DPD followed by the physical PA model.
+
+        Processing details:
+            Algorithm: Preserve the public data convention across both object
+            boundaries and return the PA output without post-scaling.
+
+        Args:
+            inputSignal: Desired public waveform before DPD.
+
+        Returns:
+            result: Public PA output produced by DPD then PA.
+        """
+
+        return self.paModel.Process(
+            self.predistorter.Process(inputSignal)
+        )
 
 
 def AddRow(
@@ -1974,6 +2279,12 @@ def SavePaCharacterizationResults(
             "loadResistanceOhm": config.loadResistanceOhm,
             "width": config.width,
             "paModelNames": list(config.paModelNames),
+            "runDpdGmpBenchmark": config.runDpdGmpBenchmark,
+            "dpdGmpResultDirectory": (
+                "dpd_gmp"
+                if config.runDpdGmpBenchmark
+                else None
+            ),
         },
         "frequencyResponse": frequencyRows,
         "memoryEffect": memoryRows,
@@ -2069,7 +2380,9 @@ def RunPaCharacterizationBenchmark(
         equal-output-power tone-spacing sweep for every requested PA family,
         derive linear response, group delay, spectral memory, dynamic
         hysteresis, nominal IM3/IM5/IM7, and output-power-dependent features,
-        save raw/summary data, and delegate all comparison figures to ``Draw``.
+        save raw/summary data, delegate all comparison figures to ``Draw``,
+        and optionally run the independent staged DPD-GMP benchmark in a
+        child result directory after PA recommendations are available.
 
     Args:
         config: Optional complete characterization setup. None uses defaults.
@@ -2181,6 +2494,1109 @@ def RunPaCharacterizationBenchmark(
     )
     PrintPaCharacterizationResults(result.summaries)
     PrintPaDpdRecommendations(result.recommendations)
+    if config.runDpdGmpBenchmark:
+        # PA characterization identifies the nonlinear and memory mechanisms;
+        # the nested benchmark then verifies concrete GMP inverse-design
+        # responses to those mechanisms with independent RF metrics.
+        gmpPowerPoints = sorted(
+            (
+                point
+                for point in result.powerSweep
+                if point.modelName == "gmp"
+            ),
+            key=lambda point: point.targetOutputPowerDbm,
+        )
+        strongDistortionPoints = tuple(
+            point
+            for point in gmpPowerPoints
+            if point.im3WorstDbc > -30.0
+        )
+        measuredStressPowerDbm = (
+            strongDistortionPoints[0].targetOutputPowerDbm
+            if strongDistortionPoints
+            else min(15.0, config.maximumOutputPowerDbm)
+        )
+        # The documented benchmark caps the stress point at 15 dBm because
+        # the default GMP is already poorly invertible there. A measured
+        # earlier knee is retained instead of being hidden by that cap.
+        stressOutputPowerDbm = min(
+            measuredStressPowerDbm,
+            15.0,
+            config.maximumOutputPowerDbm,
+        )
+        optimizedOutputPowerDbm = stressOutputPowerDbm - 3.0
+        RunDpdGmpBenchmark(
+            DpdGmpBenchmarkConfig(
+                stressOutputPowerDbm=stressOutputPowerDbm,
+                optimizedOutputPowerDbm=optimizedOutputPowerDbm,
+                trainingPowerDbm=(
+                    optimizedOutputPowerDbm - 2.0,
+                    optimizedOutputPowerDbm,
+                    optimizedOutputPowerDbm + 2.0,
+                ),
+                maximumOutputPowerDbm=config.maximumOutputPowerDbm,
+                loadResistanceOhm=config.loadResistanceOhm,
+                width=config.width,
+                outputDirectory=(
+                    Path(config.outputDirectory) / "dpd_gmp"
+                ),
+            )
+        )
+    return result
+
+
+def GenerateDpdGmpIlcLabel(
+    config: DpdGmpBenchmarkConfig,
+    waveform: WifiWaveform,
+    paModel: PaModel,
+    outputPowerDbm: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate one equal-power Wi-Fi reference and converged ILC input label.
+
+    Processing details:
+        Algorithm: Close the unlinearized PA drive loop at the requested
+        output power, use the calibrated desired waveform as the ILC target,
+        run frequency-domain ILC with synchronization and common-gain
+        alignment enabled by the production implementation, and return the
+        desired waveform together with its learned PA-input label.
+
+    Args:
+        config: Validated DPD-GMP benchmark controls.
+        waveform: Deterministic Wi-Fi frame used for training.
+        paModel: GMP PA whose inverse is learned.
+        outputPowerDbm: Conducted PA output-power target in dBm.
+
+    Returns:
+        result: Calibrated desired waveform and matching ILC-learned input.
+    """
+
+    powerCalibration = PowerCalibration(
+        paModel=paModel,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "outputPowerDbm": outputPowerDbm,
+            "width": config.width,
+        },
+    )
+    referenceSignal = powerCalibration.Calibrate(waveform.samples)
+    floatingReference = FixedPoint(config.width).DecodeComplex(
+        referenceSignal
+    )
+    maximumInputMagnitude = max(
+        1.5,
+        2.0 * float(np.max(np.abs(floatingReference))),
+    )
+    ilcResult = RunFrequencyDomainIlc(
+        referenceSignal,
+        paModel,
+        waveform.sampleRateHz,
+        waveform.bandwidthHz,
+        ILCConfig(
+            numIterations=config.numIterations,
+            learningRate=0.10,
+            regularization=1.0e-3,
+            maxAmplitude=maximumInputMagnitude,
+        ),
+    )
+    return referenceSignal, ilcResult.learnedInput
+
+
+def EvaluateDpdGmpWifiStage(
+    config: DpdGmpBenchmarkConfig,
+    waveform: WifiWaveform,
+    paModel: PaModel,
+    outputPowerDbm: float,
+    predistorter: Optional[DpdGmp] = None,
+) -> SignalMetrics:
+    """Measure one baseline or DPD-GMP Wi-Fi stage at equal PA output power.
+
+    Processing details:
+        Algorithm: Bind PowerCalibration either to the PA alone or to the
+        DPD-then-PA cascade, adjust only the plant input until native PA
+        output reaches the requested dBm, then analyze that output against
+        the calibrated desired Wi-Fi waveform. No post-PA rescaling occurs.
+
+    Args:
+        config: Validated benchmark power and interface controls.
+        waveform: Wi-Fi metadata and original samples.
+        paModel: GMP PA used by every comparison.
+        outputPowerDbm: Equal conducted output-power target.
+        predistorter: Optional trained DpdGmp; None measures the PA baseline.
+
+    Returns:
+        result: Independent Analysis SNR, EVM, ACLR, and output-power mapping.
+    """
+
+    calibratedPlant: Any = (
+        paModel
+        if predistorter is None
+        else DpdGmpPaCascade(predistorter, paModel)
+    )
+    powerCalibration = PowerCalibration(
+        paModel=calibratedPlant,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "outputPowerDbm": outputPowerDbm,
+            "width": config.width,
+        },
+    )
+    desiredInput = powerCalibration.Calibrate(waveform.samples)
+    paOutput = powerCalibration.GetLastPaOutput()
+    resultAnalysis = Analysis(
+        desiredInput,
+        waveform,
+        parameters={
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "width": config.width,
+        },
+    )
+    return resultAnalysis.Analyze(paOutput)
+
+
+def EvaluateDpdGmpTwoToneStage(
+    config: DpdGmpBenchmarkConfig,
+    waveform: TwoToneWaveform,
+    paModel: PaModel,
+    outputPowerDbm: float,
+    predistorter: Optional[DpdGmp] = None,
+) -> TwoToneMetrics:
+    """Measure IM3, IM5, and IM7 for one baseline or DPD-GMP stage.
+
+    Processing details:
+        Algorithm: Reuse the same equal-output-power calibration convention
+        as the Wi-Fi test, then project the native PA output onto exact
+        fundamental and odd-order intermodulation frequencies.
+
+    Args:
+        config: Validated benchmark controls.
+        waveform: TwoToneWaveform descriptor and periodic samples.
+        paModel: Common GMP PA under test.
+        outputPowerDbm: Conducted output-power target in dBm.
+        predistorter: Optional trained DpdGmp; None selects the PA baseline.
+
+    Returns:
+        result: TwoToneAnalysis output-power and IM product dictionary.
+    """
+
+    calibratedPlant: Any = (
+        paModel
+        if predistorter is None
+        else DpdGmpPaCascade(predistorter, paModel)
+    )
+    powerCalibration = PowerCalibration(
+        paModel=calibratedPlant,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "outputPowerDbm": outputPowerDbm,
+            "width": config.width,
+        },
+    )
+    powerCalibration.Calibrate(waveform.samples)
+    paOutput = powerCalibration.GetLastPaOutput()
+    resultAnalysis = TwoToneAnalysis(
+        waveform,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "width": config.width,
+        },
+    )
+    return resultAnalysis.Analyze(paOutput)
+
+
+def CalculateDpdGmpLabelMetrics(
+    predistorter: DpdGmp,
+    referenceSignals: Tuple[np.ndarray, ...],
+    learnedInputs: Tuple[np.ndarray, ...],
+    optimizedPowerIndex: int,
+) -> Tuple[float, float, float]:
+    """Calculate ordinary, peak-weighted, and worst-power label NMSE.
+
+    Processing details:
+        Algorithm: Evaluate the optimized-power pair with uniform weights,
+        evaluate it again with a squared normalized-envelope weight, and
+        select the least-negative ordinary NMSE across all power anchors.
+
+    Args:
+        predistorter: Trained GMP coefficient set.
+        referenceSignals: Desired Wi-Fi waveforms at all training powers.
+        learnedInputs: Matching ILC-learned PA-input labels.
+        optimizedPowerIndex: Index of the nominal optimized operating point.
+
+    Returns:
+        result: Nominal NMSE, peak-weighted NMSE, and worst-power NMSE in dB.
+    """
+
+    selectedReference = referenceSignals[optimizedPowerIndex]
+    selectedLabel = learnedInputs[optimizedPowerIndex]
+    floatingReference = FixedPoint(
+        predistorter.width
+    ).DecodeComplex(selectedReference)
+    peakMagnitude = max(
+        float(np.max(np.abs(floatingReference))),
+        np.finfo(float).tiny,
+    )
+    peakWeights = np.maximum(
+        np.abs(floatingReference) / peakMagnitude,
+        0.05,
+    ) ** 2
+    labelNmseDb = predistorter.CalculateNmse(
+        selectedReference,
+        selectedLabel,
+    )
+    peakWeightedLabelNmseDb = predistorter.CalculateNmse(
+        selectedReference,
+        selectedLabel,
+        peakWeights,
+    )
+    worstPowerLabelNmseDb = max(
+        predistorter.CalculateNmse(referenceSignal, learnedInput)
+        for referenceSignal, learnedInput in zip(
+            referenceSignals,
+            learnedInputs,
+        )
+    )
+    return (
+        labelNmseDb,
+        peakWeightedLabelNmseDb,
+        worstPowerLabelNmseDb,
+    )
+
+
+def EvaluateDpdGmpPowerRobustness(
+    config: DpdGmpBenchmarkConfig,
+    waveform: WifiWaveform,
+    paModel: PaModel,
+    predistorter: DpdGmp,
+) -> Tuple[float, float]:
+    """Return worst Wi-Fi EVM and ACLR across all configured power anchors.
+
+    Processing details:
+        Algorithm: Recalibrate the complete DPD-plus-PA cascade independently
+        at every power, select the highest EVM dB as worst modulation quality,
+        and select the lowest positive ACLR as worst spectral containment.
+
+    Args:
+        config: Validated multi-power benchmark controls.
+        waveform: Common Wi-Fi evaluation frame.
+        paModel: GMP PA used by the cascade.
+        predistorter: DPD model being checked for power robustness.
+
+    Returns:
+        result: Worst EVM dB and worst ACLR dB over the configured powers.
+    """
+
+    powerMetrics = tuple(
+        EvaluateDpdGmpWifiStage(
+            config,
+            waveform,
+            paModel,
+            outputPowerDbm,
+            predistorter,
+        )
+        for outputPowerDbm in config.trainingPowerDbm
+    )
+    return (
+        max(metrics["evmDb"] for metrics in powerMetrics),
+        min(metrics["aclrWorstDb"] for metrics in powerMetrics),
+    )
+
+
+def BuildDpdGmpStageResult(
+    stageName: str,
+    improvementCategory: str,
+    outputPowerDbm: float,
+    wifiMetrics: SignalMetrics,
+    twoToneMetrics: TwoToneMetrics,
+    modelDescription: str,
+    predistorter: Optional[DpdGmp] = None,
+    trainingResult: Optional[DpdGmpTrainingResult] = None,
+    referenceSignals: Tuple[np.ndarray, ...] = tuple(),
+    learnedInputs: Tuple[np.ndarray, ...] = tuple(),
+    optimizedPowerIndex: int = 0,
+    robustnessMetrics: Optional[Tuple[float, float]] = None,
+) -> DpdGmpStageResult:
+    """Combine independently measured RF and optional training diagnostics.
+
+    Processing details:
+        Algorithm: Copy Wi-Fi and two-tone metrics directly; for trained
+        stages calculate nominal, peak-aware, and power-robust label errors,
+        attach solver conditioning and coefficient norm, and retain optional
+        measured worst-power Wi-Fi quality.
+
+    Args:
+        stageName: Stable benchmark stage label.
+        improvementCategory: Physical issue addressed by this stage.
+        outputPowerDbm: Equal-power target used for displayed RF metrics.
+        wifiMetrics: Analysis result for the native PA output.
+        twoToneMetrics: TwoToneAnalysis result for the same stage.
+        modelDescription: Human-readable DPD structure and training method.
+        predistorter: Optional trained DpdGmp model.
+        trainingResult: Optional diagnostics from its latest fit.
+        referenceSignals: Desired waveforms used for label evaluation.
+        learnedInputs: Matching ILC labels used for label evaluation.
+        optimizedPowerIndex: Nominal operating-point index.
+        robustnessMetrics: Optional measured worst EVM and ACLR pair.
+
+    Returns:
+        result: One immutable, serialization-ready stage record.
+    """
+
+    labelNmseDb: Optional[float] = None
+    peakWeightedLabelNmseDb: Optional[float] = None
+    worstPowerLabelNmseDb: Optional[float] = None
+    coefficientNorm: Optional[float] = None
+    regularizedConditionNumber: Optional[float] = None
+    if predistorter is not None:
+        if (
+            not referenceSignals
+            or len(referenceSignals) != len(learnedInputs)
+        ):
+            raise ValueError(
+                "trained stages require matching nonempty label segments"
+            )
+        (
+            labelNmseDb,
+            peakWeightedLabelNmseDb,
+            worstPowerLabelNmseDb,
+        ) = CalculateDpdGmpLabelMetrics(
+            predistorter,
+            referenceSignals,
+            learnedInputs,
+            optimizedPowerIndex,
+        )
+        coefficientNorm = float(
+            np.linalg.norm(predistorter.GetCoefficients())
+        )
+        if trainingResult is not None:
+            regularizedConditionNumber = (
+                trainingResult.regularizedConditionNumber
+            )
+    return DpdGmpStageResult(
+        stageName=stageName,
+        improvementCategory=improvementCategory,
+        targetOutputPowerDbm=float(outputPowerDbm),
+        measuredOutputPowerDbm=wifiMetrics["outputPowerDbm"],
+        evmDb=wifiMetrics["evmDb"],
+        evmPercent=wifiMetrics["evmPercent"],
+        aclrWorstDb=wifiMetrics["aclrWorstDb"],
+        im3WorstDbc=twoToneMetrics["im3WorstDbc"],
+        im5WorstDbc=twoToneMetrics["im5WorstDbc"],
+        im7WorstDbc=twoToneMetrics["im7WorstDbc"],
+        labelNmseDb=labelNmseDb,
+        peakWeightedLabelNmseDb=peakWeightedLabelNmseDb,
+        regularizedConditionNumber=regularizedConditionNumber,
+        coefficientNorm=coefficientNorm,
+        worstPowerLabelNmseDb=worstPowerLabelNmseDb,
+        worstPowerEvmDb=(
+            None if robustnessMetrics is None else robustnessMetrics[0]
+        ),
+        worstPowerAclrDb=(
+            None if robustnessMetrics is None else robustnessMetrics[1]
+        ),
+        modelDescription=modelDescription,
+    )
+
+
+def BuildDpdGmpImprovementComparisons(
+    stages: Tuple[DpdGmpStageResult, ...],
+) -> Tuple[DpdGmpImprovementComparison, ...]:
+    """Create auditable before/after checks for every proposed improvement.
+
+    Processing details:
+        Algorithm: Resolve stages by stable names, calculate positive-is-better
+        differences with the correct direction for each metric, and mark an
+        expectation successful only when the measured target metric improves.
+
+    Args:
+        stages: Complete ordered DPD-GMP stage result tuple.
+
+    Returns:
+        result: Ordered concrete improvements with measured pass/fail flags.
+    """
+
+    stageByName = {stage.stageName: stage for stage in stages}
+
+    def AddLowerIsBetter(
+        comparisonRows: List[DpdGmpImprovementComparison],
+        improvementName: str,
+        beforeStage: str,
+        afterStage: str,
+        targetMetric: str,
+        beforeValue: float,
+        afterValue: float,
+        methodDetails: str,
+    ) -> None:
+        """Append one check whose target value must decrease.
+
+        Processing details:
+            Algorithm: Subtract the after value from the before value so a
+            positive result consistently means improvement, retain both raw
+            values, and mark the expectation only for a strict decrease.
+        """
+
+        improvementValue = beforeValue - afterValue
+        comparisonRows.append(
+            DpdGmpImprovementComparison(
+                improvementName=improvementName,
+                beforeStage=beforeStage,
+                afterStage=afterStage,
+                targetMetric=targetMetric,
+                beforeValue=float(beforeValue),
+                afterValue=float(afterValue),
+                improvementValue=float(improvementValue),
+                expectedDirection="lower",
+                expectationMet=bool(improvementValue > 0.0),
+                methodDetails=methodDetails,
+            )
+        )
+
+    def AddHigherIsBetter(
+        comparisonRows: List[DpdGmpImprovementComparison],
+        improvementName: str,
+        beforeStage: str,
+        afterStage: str,
+        targetMetric: str,
+        beforeValue: float,
+        afterValue: float,
+        methodDetails: str,
+    ) -> None:
+        """Append one check whose target value must increase.
+
+        Processing details:
+            Algorithm: Subtract the before value from the after value so a
+            positive result consistently means improvement, retain both raw
+            values, and mark the expectation only for a strict increase.
+        """
+
+        improvementValue = afterValue - beforeValue
+        comparisonRows.append(
+            DpdGmpImprovementComparison(
+                improvementName=improvementName,
+                beforeStage=beforeStage,
+                afterStage=afterStage,
+                targetMetric=targetMetric,
+                beforeValue=float(beforeValue),
+                afterValue=float(afterValue),
+                improvementValue=float(improvementValue),
+                expectedDirection="higher",
+                expectationMet=bool(improvementValue > 0.0),
+                methodDetails=methodDetails,
+            )
+        )
+
+    comparisonRows: List[DpdGmpImprovementComparison] = []
+    baselineNominal = stageByName["PA baseline nominal"]
+    basicNominal = stageByName["Basic DPD-GMP nominal"]
+    AddLowerIsBetter(
+        comparisonRows,
+        "Enable basic DPD-GMP for Wi-Fi modulation",
+        baselineNominal.stageName,
+        basicNominal.stageName,
+        "evmDb",
+        baselineNominal.evmDb,
+        basicNominal.evmDb,
+        "Fit orders 1/3/5, three main-memory taps, and one cross-memory "
+        f"tap to the {basicNominal.targetOutputPowerDbm:g} dBm ILC "
+        "input label.",
+    )
+    AddLowerIsBetter(
+        comparisonRows,
+        "Enable basic DPD-GMP for two-tone intermodulation",
+        baselineNominal.stageName,
+        basicNominal.stageName,
+        "im3WorstDbc",
+        baselineNominal.im3WorstDbc,
+        basicNominal.im3WorstDbc,
+        "Apply the Wi-Fi-trained basic GMP coefficients without retraining "
+        "to verify that the inverse suppresses a physical IM3 product.",
+    )
+    basicStress = stageByName["Basic DPD-GMP stress"]
+    AddLowerIsBetter(
+        comparisonRows,
+        "Back off the severe compression operating point",
+        basicStress.stageName,
+        basicNominal.stageName,
+        "evmDb",
+        basicStress.evmDb,
+        basicNominal.evmDb,
+        "Reduce the target PA output from "
+        f"{basicStress.targetOutputPowerDbm:g} to "
+        f"{basicNominal.targetOutputPowerDbm:g} dBm while preserving the "
+        "same basic coefficient structure, then recalibrate the cascade.",
+    )
+    memoryExpanded = stageByName["Memory-expanded DPD-GMP"]
+    if (
+        basicNominal.labelNmseDb is None
+        or memoryExpanded.labelNmseDb is None
+    ):
+        raise RuntimeError("label NMSE is required for structure comparison")
+    AddLowerIsBetter(
+        comparisonRows,
+        "Expand nonlinear order and memory structure",
+        basicNominal.stageName,
+        memoryExpanded.stageName,
+        "labelNmseDb",
+        basicNominal.labelNmseDb,
+        memoryExpanded.labelNmseDb,
+        "Increase maximum odd order from five to seven, main memory from "
+        "three to five, and cross-memory depth from one to three.",
+    )
+    peakWeighted = stageByName["Peak-weighted DPD-GMP"]
+    if (
+        memoryExpanded.peakWeightedLabelNmseDb is None
+        or peakWeighted.peakWeightedLabelNmseDb is None
+    ):
+        raise RuntimeError(
+            "peak-weighted NMSE is required for weighting comparison"
+        )
+    AddLowerIsBetter(
+        comparisonRows,
+        "Add envelope-peak-aware sample weighting",
+        memoryExpanded.stageName,
+        peakWeighted.stageName,
+        "peakWeightedLabelNmseDb",
+        memoryExpanded.peakWeightedLabelNmseDb,
+        peakWeighted.peakWeightedLabelNmseDb,
+        "Multiply each regression sample by the squared normalized envelope "
+        "magnitude before solving the GMP normal equations.",
+    )
+    regularized = stageByName["Regularized DPD-GMP"]
+    if (
+        peakWeighted.regularizedConditionNumber is None
+        or regularized.regularizedConditionNumber is None
+    ):
+        raise RuntimeError(
+            "condition numbers are required for ridge comparison"
+        )
+    conditionImprovementDb = 10.0 * np.log10(
+        peakWeighted.regularizedConditionNumber
+        / regularized.regularizedConditionNumber
+    )
+    comparisonRows.append(
+        DpdGmpImprovementComparison(
+            improvementName="Increase ridge stabilization",
+            beforeStage=peakWeighted.stageName,
+            afterStage=regularized.stageName,
+            targetMetric="regularizedConditionNumber",
+            beforeValue=peakWeighted.regularizedConditionNumber,
+            afterValue=regularized.regularizedConditionNumber,
+            improvementValue=float(conditionImprovementDb),
+            expectedDirection="lower",
+            expectationMet=bool(conditionImprovementDb > 0.0),
+            methodDetails=(
+                "Increase ridgeFactor from 1e-6 to 1e-4 while retaining "
+                "peak weighting; improvementValue is 10log10 of the "
+                "before/after condition-number ratio."
+            ),
+        )
+    )
+    multiPower = stageByName["Multi-power DPD-GMP"]
+    if (
+        regularized.worstPowerLabelNmseDb is None
+        or multiPower.worstPowerLabelNmseDb is None
+        or regularized.worstPowerAclrDb is None
+        or multiPower.worstPowerAclrDb is None
+    ):
+        raise RuntimeError(
+            "multi-power robustness metrics are required for comparison"
+        )
+    AddLowerIsBetter(
+        comparisonRows,
+        "Joint multi-power coefficient training",
+        regularized.stageName,
+        multiPower.stageName,
+        "worstPowerLabelNmseDb",
+        regularized.worstPowerLabelNmseDb,
+        multiPower.worstPowerLabelNmseDb,
+        multiPower.modelDescription
+        + "; accumulate each segment without joining memory across frame "
+        "boundaries.",
+    )
+    AddHigherIsBetter(
+        comparisonRows,
+        "Joint multi-power ACLR robustness",
+        regularized.stageName,
+        multiPower.stageName,
+        "worstPowerAclrDb",
+        regularized.worstPowerAclrDb,
+        multiPower.worstPowerAclrDb,
+        "Evaluate both coefficient sets at equal output powers and retain "
+        "the minimum ACLR across 10/12/14 dBm.",
+    )
+    return tuple(comparisonRows)
+
+
+def SaveDpdGmpBenchmarkResults(
+    result: DpdGmpBenchmarkResult,
+    config: DpdGmpBenchmarkConfig,
+) -> Tuple[Path, Path, Path, Path]:
+    """Save DPD-GMP stage data, improvement checks, JSON, and one figure.
+
+    Processing details:
+        Algorithm: Serialize flat stage and comparison tables, preserve the
+        complete configuration and nested records in JSON, and delegate all
+        graphical presentation to Draw.
+
+    Args:
+        result: Completed DPD-GMP benchmark result.
+        config: Controls used to generate the result.
+
+    Returns:
+        result: Paths to stage CSV, comparison CSV, JSON, and PNG artifacts.
+    """
+
+    outputDirectory = Path(config.outputDirectory)
+    outputDirectory.mkdir(parents=True, exist_ok=True)
+    stagePath = outputDirectory / "dpd_gmp_stage_metrics.csv"
+    comparisonPath = (
+        outputDirectory / "dpd_gmp_improvement_comparison.csv"
+    )
+    jsonPath = outputDirectory / "dpd_gmp_benchmark.json"
+    stageRows = [stage.ToDict() for stage in result.stages]
+    comparisonRows = [
+        comparison.ToDict() for comparison in result.comparisons
+    ]
+    with stagePath.open("w", newline="", encoding="utf-8-sig") as csvFile:
+        csvWriter = csv.DictWriter(
+            csvFile,
+            fieldnames=list(stageRows[0]),
+        )
+        csvWriter.writeheader()
+        csvWriter.writerows(stageRows)
+    with comparisonPath.open(
+        "w", newline="", encoding="utf-8-sig"
+    ) as csvFile:
+        csvWriter = csv.DictWriter(
+            csvFile,
+            fieldnames=list(comparisonRows[0]),
+        )
+        csvWriter.writeheader()
+        csvWriter.writerows(comparisonRows)
+    document = {
+        "configuration": {
+            "frameFormat": config.frameFormat,
+            "bandwidthMhz": config.bandwidthMhz,
+            "sampleRateHz": config.sampleRateHz,
+            "mcs": config.mcs,
+            "numDataSymbols": config.numDataSymbols,
+            "seed": config.seed,
+            "toneFrequenciesHz": list(config.toneFrequenciesHz),
+            "toneNumSamples": config.toneNumSamples,
+            "stressOutputPowerDbm": config.stressOutputPowerDbm,
+            "optimizedOutputPowerDbm": config.optimizedOutputPowerDbm,
+            "trainingPowerDbm": list(config.trainingPowerDbm),
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "numIterations": config.numIterations,
+            "width": config.width,
+        },
+        **result.ToDict(),
+    }
+    with jsonPath.open("w", encoding="utf-8") as jsonFile:
+        json.dump(document, jsonFile, indent=2, ensure_ascii=False)
+    figurePath = Draw().SaveDpdGmpPerformance(
+        stageRows,
+        outputDirectory,
+    )
+    return stagePath, comparisonPath, jsonPath, figurePath
+
+
+def PrintDpdGmpBenchmarkResults(
+    result: DpdGmpBenchmarkResult,
+) -> None:
+    """Print compact DPD-GMP stage and expected-improvement summaries.
+
+    Processing details:
+        Algorithm: Preserve benchmark ordering, show equal-power EVM/ACLR/IM3
+        and label NMSE, then print every improvement magnitude and pass state.
+
+    Args:
+        result: Complete DPD-GMP benchmark result.
+
+    Returns:
+        result: None. Human-readable tables are written to standard output.
+    """
+
+    header = (
+        f"{'Stage':<31} {'Pout':>7} {'EVM':>9} "
+        f"{'ACLR':>8} {'IM3':>9} {'Label':>9}"
+    )
+    print("\nDPD-GMP performance stages")
+    print(header)
+    print("-" * len(header))
+    for stage in result.stages:
+        labelText = (
+            "n/a"
+            if stage.labelNmseDb is None
+            else f"{stage.labelNmseDb:.2f}"
+        )
+        print(
+            f"{stage.stageName:<31} "
+            f"{stage.measuredOutputPowerDbm:>7.2f} "
+            f"{stage.evmDb:>9.2f} "
+            f"{stage.aclrWorstDb:>8.2f} "
+            f"{stage.im3WorstDbc:>9.2f} "
+            f"{labelText:>9}"
+        )
+    print("\nMeasured DPD-GMP improvement checks")
+    for comparison in result.comparisons:
+        status = "PASS" if comparison.expectationMet else "FAIL"
+        print(
+            f"- [{status}] {comparison.improvementName}: "
+            f"{comparison.improvementValue:.3f}"
+        )
+
+
+def RunDpdGmpBenchmark(
+    config: Optional[DpdGmpBenchmarkConfig] = None,
+) -> DpdGmpBenchmarkResult:
+    """Run staged, PA-analysis-driven DPD-GMP performance improvements.
+
+    Processing details:
+        Algorithm: Generate ILC input labels at 10/12/14 dBm, train basic,
+        memory-expanded, peak-weighted, stabilized, and multi-power GMP
+        models, measure native PA output at equal power with Wi-Fi and
+        two-tone stimuli, verify each intended metric change, and save all
+        tables and figures.
+
+    Args:
+        config: Optional complete benchmark setup. None uses internal defaults.
+
+    Returns:
+        result: Ordered stages and auditable improvement comparisons.
+    """
+
+    if config is None:
+        config = DpdGmpBenchmarkConfig()
+    config.Validate()
+    wifiWaveform = WaveGenWifi(
+        parameters={
+            "frameFormat": config.frameFormat,
+            "bandwidthMhz": config.bandwidthMhz,
+            "sampleRateHz": config.sampleRateHz,
+            "mcs": config.mcs,
+            "numDataSymbols": config.numDataSymbols,
+            "seed": config.seed,
+            "width": config.width,
+        }
+    ).Generate()
+    twoToneWaveform = WaveGenTwoTone(
+        parameters={
+            "sampleRateHz": config.sampleRateHz,
+            "toneFrequenciesHz": config.toneFrequenciesHz,
+            "numSamples": config.toneNumSamples,
+            "rmsLevel": 0.5,
+            "width": config.width,
+        }
+    ).Generate()
+    paModel = PaModel(
+        parameters={
+            "modelName": "gmp",
+            "width": config.width,
+        }
+    )
+    labelPairs = tuple(
+        GenerateDpdGmpIlcLabel(
+            config,
+            wifiWaveform,
+            paModel,
+            outputPowerDbm,
+        )
+        for outputPowerDbm in config.trainingPowerDbm
+    )
+    referenceSignals = tuple(pair[0] for pair in labelPairs)
+    learnedInputs = tuple(pair[1] for pair in labelPairs)
+    optimizedPowerIndex = config.trainingPowerDbm.index(
+        config.optimizedOutputPowerDbm
+    )
+    optimizedReference = referenceSignals[optimizedPowerIndex]
+    optimizedLearnedInput = learnedInputs[optimizedPowerIndex]
+
+    basicDpd = DpdGmp(
+        parameters={
+            "nonlinearOrders": (1, 3, 5),
+            "memoryDepth": 3,
+            "crossMemoryDepth": 1,
+            "ridgeFactor": 1.0e-5,
+            "peakWeightExponent": 0.0,
+            "maximumOutputMagnitude": 1.5,
+            "width": config.width,
+        }
+    )
+    basicTraining = basicDpd.FitFromIlc(
+        optimizedReference,
+        optimizedLearnedInput,
+    )
+    memoryDpd = DpdGmp(
+        parameters={
+            "nonlinearOrders": (1, 3, 5, 7),
+            "memoryDepth": 5,
+            "crossMemoryDepth": 3,
+            "ridgeFactor": 1.0e-5,
+            "peakWeightExponent": 0.0,
+            "maximumOutputMagnitude": 1.5,
+            "width": config.width,
+        }
+    )
+    memoryTraining = memoryDpd.FitFromIlc(
+        optimizedReference,
+        optimizedLearnedInput,
+    )
+    peakDpd = DpdGmp(
+        parameters={
+            "nonlinearOrders": (1, 3, 5, 7),
+            "memoryDepth": 5,
+            "crossMemoryDepth": 3,
+            "ridgeFactor": 1.0e-6,
+            "peakWeightExponent": 2.0,
+            "maximumOutputMagnitude": 1.5,
+            "width": config.width,
+        }
+    )
+    peakTraining = peakDpd.FitFromIlc(
+        optimizedReference,
+        optimizedLearnedInput,
+    )
+    regularizedDpd = DpdGmp(
+        parameters={
+            "nonlinearOrders": (1, 3, 5, 7),
+            "memoryDepth": 5,
+            "crossMemoryDepth": 3,
+            "ridgeFactor": 1.0e-4,
+            "peakWeightExponent": 2.0,
+            "maximumOutputMagnitude": 1.5,
+            "width": config.width,
+        }
+    )
+    regularizedTraining = regularizedDpd.FitFromIlc(
+        optimizedReference,
+        optimizedLearnedInput,
+    )
+    multiPowerDpd = DpdGmp(
+        parameters={
+            "nonlinearOrders": (1, 3, 5, 7),
+            "memoryDepth": 5,
+            "crossMemoryDepth": 3,
+            "ridgeFactor": 1.0e-4,
+            "peakWeightExponent": 2.0,
+            "maximumOutputMagnitude": 1.5,
+            "width": config.width,
+        }
+    )
+    segmentWeights = tuple(
+        2.0
+        if np.isclose(
+            powerDbm,
+            config.optimizedOutputPowerDbm,
+            rtol=0.0,
+            atol=np.finfo(float).eps
+            * max(1.0, abs(config.optimizedOutputPowerDbm)),
+        )
+        else 1.0
+        for powerDbm in config.trainingPowerDbm
+    )
+    multiPowerTraining = multiPowerDpd.FitSegments(
+        referenceSignals,
+        learnedInputs,
+        segmentWeights=segmentWeights,
+    )
+
+    baselineNominalWifi = EvaluateDpdGmpWifiStage(
+        config,
+        wifiWaveform,
+        paModel,
+        config.optimizedOutputPowerDbm,
+    )
+    baselineNominalTone = EvaluateDpdGmpTwoToneStage(
+        config,
+        twoToneWaveform,
+        paModel,
+        config.optimizedOutputPowerDbm,
+    )
+    baselineStressWifi = EvaluateDpdGmpWifiStage(
+        config,
+        wifiWaveform,
+        paModel,
+        config.stressOutputPowerDbm,
+    )
+    baselineStressTone = EvaluateDpdGmpTwoToneStage(
+        config,
+        twoToneWaveform,
+        paModel,
+        config.stressOutputPowerDbm,
+    )
+
+    modelStages = (
+        (
+            "Basic DPD-GMP nominal",
+            "Baseline inverse",
+            basicDpd,
+            basicTraining,
+            (
+                "Orders 1/3/5, memoryDepth=3, crossMemoryDepth=1, "
+                "ridgeFactor=1e-5, nominal-power ILC label"
+            ),
+        ),
+        (
+            "Memory-expanded DPD-GMP",
+            "Memory and nonlinear order",
+            memoryDpd,
+            memoryTraining,
+            (
+                "Orders 1/3/5/7, memoryDepth=5, crossMemoryDepth=3, "
+                "ridgeFactor=1e-5, nominal-power ILC label"
+            ),
+        ),
+        (
+            "Peak-weighted DPD-GMP",
+            "Envelope peaks",
+            peakDpd,
+            peakTraining,
+            (
+                "Expanded structure, ridgeFactor=1e-6, "
+                "peakWeightExponent=2, nominal-power ILC label"
+            ),
+        ),
+        (
+            "Regularized DPD-GMP",
+            "Numerical stability",
+            regularizedDpd,
+            regularizedTraining,
+            (
+                "Expanded peak-weighted structure, ridgeFactor=1e-4, "
+                "nominal-power ILC label"
+            ),
+        ),
+        (
+            "Multi-power DPD-GMP",
+            "Power robustness",
+            multiPowerDpd,
+            multiPowerTraining,
+            (
+                "Expanded peak-weighted structure, ridgeFactor=1e-4, "
+                "joint "
+                + "/".join(
+                    f"{powerDbm:g}"
+                    for powerDbm in config.trainingPowerDbm
+                )
+                + " dBm labels with "
+                + "/".join(
+                    f"{segmentWeight:g}"
+                    for segmentWeight in segmentWeights
+                )
+                + " segment weights"
+            ),
+        ),
+    )
+    stages: List[DpdGmpStageResult] = [
+        BuildDpdGmpStageResult(
+            "PA baseline stress",
+            "Severe compression reference",
+            config.stressOutputPowerDbm,
+            baselineStressWifi,
+            baselineStressTone,
+            "Unlinearized GMP PA",
+        ),
+        BuildDpdGmpStageResult(
+            "PA baseline nominal",
+            "Equal-power reference",
+            config.optimizedOutputPowerDbm,
+            baselineNominalWifi,
+            baselineNominalTone,
+            "Unlinearized GMP PA",
+        ),
+    ]
+    basicStressWifi = EvaluateDpdGmpWifiStage(
+        config,
+        wifiWaveform,
+        paModel,
+        config.stressOutputPowerDbm,
+        basicDpd,
+    )
+    basicStressTone = EvaluateDpdGmpTwoToneStage(
+        config,
+        twoToneWaveform,
+        paModel,
+        config.stressOutputPowerDbm,
+        basicDpd,
+    )
+    stages.append(
+        BuildDpdGmpStageResult(
+            "Basic DPD-GMP stress",
+            "Severe compression",
+            config.stressOutputPowerDbm,
+            basicStressWifi,
+            basicStressTone,
+            modelStages[0][4],
+            basicDpd,
+            basicTraining,
+            referenceSignals,
+            learnedInputs,
+            optimizedPowerIndex,
+        )
+    )
+    for (
+        stageName,
+        improvementCategory,
+        predistorter,
+        trainingResult,
+        modelDescription,
+    ) in modelStages:
+        wifiMetrics = EvaluateDpdGmpWifiStage(
+            config,
+            wifiWaveform,
+            paModel,
+            config.optimizedOutputPowerDbm,
+            predistorter,
+        )
+        twoToneMetrics = EvaluateDpdGmpTwoToneStage(
+            config,
+            twoToneWaveform,
+            paModel,
+            config.optimizedOutputPowerDbm,
+            predistorter,
+        )
+        robustnessMetrics = (
+            EvaluateDpdGmpPowerRobustness(
+                config,
+                wifiWaveform,
+                paModel,
+                predistorter,
+            )
+            if stageName in (
+                "Regularized DPD-GMP",
+                "Multi-power DPD-GMP",
+            )
+            else None
+        )
+        stages.append(
+            BuildDpdGmpStageResult(
+                stageName,
+                improvementCategory,
+                config.optimizedOutputPowerDbm,
+                wifiMetrics,
+                twoToneMetrics,
+                modelDescription,
+                predistorter,
+                trainingResult,
+                referenceSignals,
+                learnedInputs,
+                optimizedPowerIndex,
+                robustnessMetrics,
+            )
+        )
+    stageTuple = tuple(stages)
+    result = DpdGmpBenchmarkResult(
+        stages=stageTuple,
+        comparisons=BuildDpdGmpImprovementComparisons(stageTuple),
+    )
+    SaveDpdGmpBenchmarkResults(result, config)
+    PrintDpdGmpBenchmarkResults(result)
     return result
 
 
@@ -3505,16 +4921,18 @@ def ParseBenchmarkArguments() -> Union[
     BenchmarkConfig,
     TwoToneBenchmarkConfig,
     PaCharacterizationConfig,
+    DpdGmpBenchmarkConfig,
 ]:
-    """Parse standalone Wi-Fi or two-tone benchmark command-line options.
+    """Parse Wi-Fi, two-tone, PA, or DPD-GMP benchmark command-line options.
 
     Processing details:
         Algorithm: Define only scenario-level controls, parse one command
         line, convert it into ``BenchmarkConfig``, and validate it before
         returning. Algorithm-internal learning constants remain fixed so
             comparisons stay reproducible. The mutually exclusive
-            ``--two-tone`` and ``--pa-analyse`` switches select ILC/IM or
-            multi-model PA characterization and bypass Wi-Fi construction.
+            ``--two-tone``, ``--pa-analyse``, and ``--dpd-gmp`` switches
+            select ILC/IM, multi-model PA characterization, or staged GMP
+            predistortion validation and bypass the ordinary Wi-Fi suite.
 
     Returns:
         result: Validated configuration ready for the selected benchmark.
@@ -3540,6 +4958,15 @@ def ParseBenchmarkArguments() -> Union[
         help=(
             "Characterize Wiener, GMP, and Doherty PA frequency/memory "
             "features with two-tone sweeps"
+        ),
+    )
+    modeGroup.add_argument(
+        "--dpd-gmp",
+        dest="dpdGmp",
+        action="store_true",
+        help=(
+            "Run the staged PA-analysis-driven DPD-GMP benchmark with "
+            "Wi-Fi and two-tone comparisons"
         ),
     )
     argumentParser.add_argument(
@@ -3624,7 +5051,11 @@ def ParseBenchmarkArguments() -> Union[
         "--iterations",
         dest="numIterations",
         type=int,
-        default=10,
+        default=None,
+        help=(
+            "Iteration count (default: 8 for DPD-GMP, 10 for ILC "
+            "comparison modes)"
+        ),
     )
     argumentParser.add_argument(
         "--pa",
@@ -3697,6 +5128,30 @@ def ParseBenchmarkArguments() -> Union[
         help="Generated two-tone RMS before PA power calibration",
     )
     arguments = argumentParser.parse_args()
+    if arguments.dpdGmp:
+        dpdGmpOutputDirectory = (
+            Path("results/dpd_gmp_benchmark")
+            if arguments.outputDirectory is None
+            else arguments.outputDirectory
+        )
+        dpdGmpConfig = DpdGmpBenchmarkConfig(
+            sampleRateHz=(
+                80.0e6
+                if arguments.sampleRateHz is None
+                else arguments.sampleRateHz
+            ),
+            maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
+            loadResistanceOhm=arguments.loadResistanceOhm,
+            numIterations=(
+                8
+                if arguments.numIterations is None
+                else arguments.numIterations
+            ),
+            width=0 if arguments.width is None else arguments.width,
+            outputDirectory=dpdGmpOutputDirectory,
+        )
+        dpdGmpConfig.Validate()
+        return dpdGmpConfig
     if arguments.paAnalyse:
         paAnalysisOutputDirectory = (
             Path("results/pa_characterization")
@@ -3748,7 +5203,11 @@ def ParseBenchmarkArguments() -> Union[
             outputPowerDbm=arguments.outputPowerDbm,
             maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
             loadResistanceOhm=arguments.loadResistanceOhm,
-            numIterations=arguments.numIterations,
+            numIterations=(
+                10
+                if arguments.numIterations is None
+                else arguments.numIterations
+            ),
             paModelName=arguments.paModelName,
             seed=arguments.seed,
             outputDirectory=twoToneOutputDirectory,
@@ -3772,7 +5231,11 @@ def ParseBenchmarkArguments() -> Union[
         outputPowerDbm=arguments.outputPowerDbm,
         maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
         loadResistanceOhm=arguments.loadResistanceOhm,
-        numIterations=arguments.numIterations,
+        numIterations=(
+            10
+            if arguments.numIterations is None
+            else arguments.numIterations
+        ),
         paModelName=arguments.paModelName,
         seed=arguments.seed,
         powerStartDbm=arguments.powerStartDbm,
@@ -3790,15 +5253,18 @@ def Main() -> int:
 
     Processing details:
         Algorithm: Parse the requested scenario controls, execute the complete
-            Wi-Fi, ILC two-tone, or PA-characterization benchmark suite, and
-            print the absolute output path after every result has been saved.
+            Wi-Fi, ILC two-tone, PA-characterization, or DPD-GMP benchmark
+            suite, and print the absolute output path after every result has
+            been saved.
 
     Returns:
         result: Process exit status zero after successful completion.
     """
 
     config = ParseBenchmarkArguments()
-    if isinstance(config, PaCharacterizationConfig):
+    if isinstance(config, DpdGmpBenchmarkConfig):
+        RunDpdGmpBenchmark(config)
+    elif isinstance(config, PaCharacterizationConfig):
         RunPaCharacterizationBenchmark(config)
     elif isinstance(config, TwoToneBenchmarkConfig):
         RunTwoToneIlcBenchmark(config)
