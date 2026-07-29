@@ -571,3 +571,96 @@ flowchart TD
 4. `GetLastTrainingResult()` 在构造、重置或手工 `SetCoefficients` 后返回 `None`。
 5. 修改结构参数会重置系数；只修改岭系数、学习率、分块长度、峰值权重或限幅不会自动重置。
 6. benchmark 的默认参考结果不是硬件保证值，替换 PA 参数或反馈链后应重新运行全部比较。
+
+---
+
+## 16. 通道间耦合场景
+
+### 16.1 类声明
+
+```python
+CouplingAwareDpdGmp(
+    dpdModels,
+    preChannelMeasurement=None,
+    postChannelMeasurement=None,
+    parameters=None,
+    width=None,
+    **parameterOverrides,
+)
+```
+
+`dpdModels` 必须按物理 PA 顺序提供至少两个 `DpdGmp` 对象。两个测量参数既可以是 `ChannelMeasurementResult`，也可以直接是形状为
+
+```text
+delay × destination × source
+```
+
+的复数冲激响应矩阵。传入 `None` 表示该位置使用单位通道。
+
+### 16.2 参数
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `compensatePrePaCoupling` | `True` | 部署时对 DAC 波形施加 PA 前通道逆 |
+| `compensatePostPaCoupling` | `True` | 训练和部署时对最终目标做 PA 后去嵌入 |
+| `inverseRegularization` | `1e-8` | 零时延 MIMO 矩阵 SVD 逆的正则系数 |
+| `maximumInverseGainDb` | `18.0` | 最大允许逆奇异值增益 |
+| `impulseTruncationDb` | `-100.0` | 删除尾部无效抽头的相对幅度门限 |
+| `width` | `16` | 公开 MIMO 输入输出位宽；0 为浮点 |
+
+### 16.3 方法
+
+| 方法 | 输入 | 输出或作用 |
+|---|---|---|
+| `ConfigureChannelMeasurements(pre, post)` | 新的 PA 前/后测量结果 | 更新后续训练和补偿使用的通道 |
+| `BuildPaOutputTargets(referenceSignal)` | 最终端口参考矩阵 | PA 后耦合之前的逐 PA 输出目标 |
+| `FitCoupledSegments(references, labels, ...)` | 最终参考片段和 PA 输入标签片段 | 按物理链顺序训练所有 GMP |
+| `BuildDacInput(predistortedPaInput)` | 逐 PA 实际输入目标 | PA 前网络之前的 DAC 波形 |
+| `ProcessFloating(inputSignal)` | 浮点最终端口参考矩阵 | 浮点 DAC 波形 |
+| `Process(inputSignal)` | 公开浮点或定点参考矩阵 | 相同公开数据约定的 DAC 波形 |
+| `ApplyMeasuredResponse(inputSignal, h)` | 波形和测得的冲激响应 | 调试用因果 MIMO FIR 输出 |
+| `InvertMeasuredResponse(targetSignal, h)` | 目标和冲激响应 | 正则化因果反卷积结果 |
+| `GetLastTrainingResult()` | 无 | 每路训练诊断或 `None` |
+
+### 16.4 训练和部署示例
+
+```python
+from inc.lib.DpdGmp import CouplingAwareDpdGmp, DpdGmp
+
+dpdModels = (
+    DpdGmp(parameters={"width": 0}),
+    DpdGmp(parameters={"width": 0}),
+)
+
+coupledDpd = CouplingAwareDpdGmp(
+    dpdModels,
+    preChannelMeasurement=preMeasurement,
+    postChannelMeasurement=postMeasurement,
+    parameters={
+        "inverseRegularization": 1.0e-8,
+        "maximumInverseGainDb": 18.0,
+        "width": 0,
+    },
+)
+
+# referenceMatrix is the desired final two-port output.
+paOutputTargets = coupledDpd.BuildPaOutputTargets(
+    referenceMatrix
+)
+
+# Run ILC against each physical PA using paOutputTargets[:, chainIndex].
+# Stack the learned actual PA-input labels in physical-chain order.
+paInputLabels = GeneratePaInputLabels(paOutputTargets)
+
+trainingResult = coupledDpd.FitCoupledSegments(
+    referenceSignals=(referenceMatrix,),
+    paInputTargetSignals=(paInputLabels,),
+)
+
+rawDacMatrix = coupledDpd.Process(referenceMatrix)
+measuredMatrix = channel.Process(rawDacMatrix)
+
+print(trainingResult.ToDict())
+```
+
+不能把 `rawDacMatrix` 当作训练标签。训练标签所在参考面是 PA 输入端，而 DAC 波形还要经过 PA 前耦合网络。完整测量原理、用例和修改前后结果见 [ChannelAnalyse.md](./ChannelAnalyse.md)。

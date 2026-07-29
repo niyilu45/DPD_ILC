@@ -38,7 +38,17 @@ from .lib.TwoToneAnalysis import (
     TwoToneMetrics,
 )
 from .lib.Channel import Channel
-from .lib.DpdGmp import DpdGmp, DpdGmpTrainingResult
+from .lib.ChannelAnalyse import (
+    ChannelAnalyse,
+    ChannelMeasurementResult,
+    ChannelPathMeasurement,
+)
+from .lib.DpdGmp import (
+    CouplingAwareDpdGmp,
+    CouplingAwareDpdGmpTrainingResult,
+    DpdGmp,
+    DpdGmpTrainingResult,
+)
 from .utils.Draw import Draw
 from .lib.DpdIlc import (
     CalculateIterationMetrics,

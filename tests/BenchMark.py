@@ -19,6 +19,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -45,7 +46,17 @@ if str(GetProjectRoot()) not in sys.path:
     sys.path.insert(0, str(GetProjectRoot()))
 
 from inc.lib.Analysis import Analysis, ILCAnalysisResult, SignalMetrics
-from inc.lib.DpdGmp import DpdGmp, DpdGmpTrainingResult
+from inc.lib.Channel import Channel
+from inc.lib.ChannelAnalyse import (
+    ChannelAnalyse,
+    ChannelMeasurementResult,
+)
+from inc.lib.DpdGmp import (
+    CouplingAwareDpdGmp,
+    CouplingAwareDpdGmpTrainingResult,
+    DpdGmp,
+    DpdGmpTrainingResult,
+)
 from inc.utils.Draw import Draw
 from inc.lib.DpdIlc import (
     FitGmpPredistorter,
@@ -63,7 +74,7 @@ from inc.lib.DpdIlc import (
     RunParameterDomainIlc,
     RunScalarPIlc,
 )
-from inc.lib.PaModel import IQImbalancePA, PaModel
+from inc.lib.PaModel import IQImbalancePA, MimoPaModel, PaModel
 from inc.lib.TwoToneAnalysis import (
     TwoToneAnalysis,
     TwoToneILCAnalysisResult,
@@ -3600,6 +3611,1010 @@ def RunDpdGmpBenchmark(
     return result
 
 
+@dataclass(frozen=True)
+class ChannelAnalysisBenchmarkConfig:
+    """Configure channel measurement and coupling-aware DPD comparison."""
+
+    frameFormat: str = "EHT"
+    bandwidthMhz: int = 20
+    sampleRateHz: float = 80.0e6
+    mcs: int = 7
+    numDataSymbols: int = 4
+    seed: int = 517
+    outputPowerDbm: float = 13.0
+    maximumOutputPowerDbm: float = 25.0
+    loadResistanceOhm: float = 50.0
+    fftLength: int = 2048
+    impulseLength: int = 64
+    numIterations: int = 10
+    width: int = 0
+    outputDirectory: Path = Path("results/channel_analysis")
+
+    def Validate(self) -> None:
+        """Validate waveform, measurement, power, and learning controls.
+
+        Processing details:
+            Algorithm: Instantiate the production Wi-Fi generator and channel
+            analyzer with the requested values, validate the absolute output
+            power through PowerCalibration, and reject too-short learning or
+            waveform records before the multi-stage benchmark starts.
+
+        Returns:
+            result: None. Invalid settings raise descriptive exceptions.
+        """
+
+        if (
+            not isinstance(self.numDataSymbols, int)
+            or isinstance(self.numDataSymbols, bool)
+            or self.numDataSymbols < 2
+        ):
+            raise ValueError(
+                "numDataSymbols must be an integer no smaller than two"
+            )
+        if (
+            not isinstance(self.numIterations, int)
+            or isinstance(self.numIterations, bool)
+            or self.numIterations < 2
+        ):
+            raise ValueError(
+                "numIterations must be an integer no smaller than two"
+            )
+        WaveGenWifi(
+            parameters={
+                "frameFormat": self.frameFormat,
+                "bandwidthMhz": self.bandwidthMhz,
+                "sampleRateHz": self.sampleRateHz,
+                "mcs": self.mcs,
+                "numDataSymbols": self.numDataSymbols,
+                "seed": self.seed,
+                "width": self.width,
+            }
+        )
+        ChannelAnalyse(
+            parameters={
+                "sampleRateHz": self.sampleRateHz,
+                "channelBandwidthHz": self.bandwidthMhz * 1.0e6,
+                "fftLength": self.fftLength,
+                "impulseLength": self.impulseLength,
+                "width": self.width,
+            }
+        )
+        PowerCalibration(
+            parameters={
+                "outputPowerDbm": self.outputPowerDbm,
+                "maximumOutputPowerDbm": self.maximumOutputPowerDbm,
+                "loadResistanceOhm": self.loadResistanceOhm,
+                "width": self.width,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class ChannelDpdStageResult:
+    """Store one equal-reference MIMO DPD performance stage."""
+
+    stageName: str
+    methodDescription: str
+    evmDb: float
+    evmPercent: float
+    normalizedMseDb: float
+    aclrWorstDb: float
+    residualCouplingDb: float
+
+    def ToDict(self) -> Dict[str, object]:
+        """Convert one immutable comparison stage to a flat mapping.
+
+        Processing details:
+            Algorithm: Copy the method identity and all aggregate waveform,
+            spectral, and residual-coupling metrics without recalculation.
+
+        Returns:
+            result: CSV/JSON-compatible performance row.
+        """
+
+        return {
+            "stageName": self.stageName,
+            "methodDescription": self.methodDescription,
+            "evmDb": self.evmDb,
+            "evmPercent": self.evmPercent,
+            "normalizedMseDb": self.normalizedMseDb,
+            "aclrWorstDb": self.aclrWorstDb,
+            "residualCouplingDb": self.residualCouplingDb,
+        }
+
+
+@dataclass(frozen=True)
+class ChannelDpdImprovement:
+    """Store the measured benefit of coupling-aware DPD over independent DPD."""
+
+    metricName: str
+    beforeValue: float
+    afterValue: float
+    improvementValue: float
+    expectedDirection: str
+    expectationMet: bool
+
+    def ToDict(self) -> Dict[str, object]:
+        """Convert one before/after assertion to a flat result mapping.
+
+        Processing details:
+            Algorithm: Preserve raw values, the consistently positive
+            improvement convention, expected direction, and pass/fail flag.
+
+        Returns:
+            result: JSON/CSV-compatible comparison record.
+        """
+
+        return {
+            "metricName": self.metricName,
+            "beforeValue": self.beforeValue,
+            "afterValue": self.afterValue,
+            "improvementValue": self.improvementValue,
+            "expectedDirection": self.expectedDirection,
+            "expectationMet": self.expectationMet,
+        }
+
+
+@dataclass(frozen=True)
+class ChannelAnalysisBenchmarkResult:
+    """Store channel measurements, DPD stages, and expected improvements."""
+
+    prePaMeasurement: ChannelMeasurementResult
+    postPaMeasurement: ChannelMeasurementResult
+    stages: Tuple[ChannelDpdStageResult, ...]
+    improvements: Tuple[ChannelDpdImprovement, ...]
+    trainingResult: CouplingAwareDpdGmpTrainingResult
+
+    def ToDict(self) -> Dict[str, object]:
+        """Convert the complete benchmark result to nested plain mappings.
+
+        Processing details:
+            Algorithm: Serialize pre/post channel summaries, every DPD stage,
+            all expectation checks, and per-chain training diagnostics while
+            retaining large complex frequency arrays outside JSON.
+
+        Returns:
+            result: JSON-compatible benchmark record.
+        """
+
+        return {
+            "prePaMeasurement": self.prePaMeasurement.ToDict(),
+            "postPaMeasurement": self.postPaMeasurement.ToDict(),
+            "stages": [stage.ToDict() for stage in self.stages],
+            "improvements": [
+                improvement.ToDict()
+                for improvement in self.improvements
+            ],
+            "trainingResult": self.trainingResult.ToDict(),
+        }
+
+
+def BuildChannelAnalysisPaBank(width: int) -> MimoPaModel:
+    """Construct two different nonlinear PA branches for channel testing.
+
+    Processing details:
+        Algorithm: Bind a memory-polynomial PA to chain zero and a Wiener PA
+        to chain one so the compensation test cannot benefit from an
+        accidental common inverse model, while preserving the selected
+        public I/Q convention at the MIMO boundary.
+
+    Args:
+        width: Public floating or fixed-point component width.
+
+    Returns:
+        result: Two-chain independent nonlinear PA bank.
+    """
+
+    return MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "paParametersPerChain": (
+                {"modelName": "gmp"},
+                {"modelName": "wiener"},
+            ),
+            "width": width,
+        }
+    )
+
+
+def BuildChannelAnalysisPlant(
+    config: ChannelAnalysisBenchmarkConfig,
+) -> Channel:
+    """Construct the asymmetric frequency-selective coupled MIMO plant.
+
+    Processing details:
+        Algorithm: Place direction-dependent complex FIR leakage with
+        different integer and fractional delays both before and after two
+        different PAs.  Disable noise and feedback impairments so every
+        before/after difference is attributable to measured coupling-aware
+        training and compensation.
+
+    Args:
+        config: Validated channel benchmark controls.
+
+    Returns:
+        result: Floating or fixed public Channel with a bound MIMO PA bank.
+    """
+
+    prePaCouplingPaths: Tuple[Mapping[str, object], ...] = (
+        {
+            "sourceChain": 0,
+            "destinationChain": 1,
+            "gainDb": -15.0,
+            "phaseDegrees": 35.0,
+            "integerDelaySamples": 2,
+            "fractionalDelaySamples": 0.25,
+            "firTaps": (
+                1.0 + 0.0j,
+                0.28 - 0.12j,
+            ),
+        },
+        {
+            "sourceChain": 1,
+            "destinationChain": 0,
+            "gainDb": -18.0,
+            "phaseDegrees": -42.0,
+            "integerDelaySamples": 1,
+            "fractionalDelaySamples": -0.20,
+            "firTaps": (
+                1.0 + 0.0j,
+                -0.18 + 0.09j,
+            ),
+        },
+    )
+    postPaCouplingPaths: Tuple[Mapping[str, object], ...] = (
+        {
+            "sourceChain": 0,
+            "destinationChain": 1,
+            "gainDb": -13.0,
+            "phaseDegrees": -25.0,
+            "integerDelaySamples": 1,
+            "fractionalDelaySamples": 0.15,
+            "firTaps": (
+                1.0 + 0.0j,
+                0.22 + 0.08j,
+            ),
+        },
+        {
+            "sourceChain": 1,
+            "destinationChain": 0,
+            "gainDb": -17.0,
+            "phaseDegrees": 55.0,
+            "integerDelaySamples": 3,
+            "fractionalDelaySamples": -0.10,
+            "firTaps": (
+                1.0 + 0.0j,
+                -0.16 - 0.05j,
+            ),
+        },
+    )
+    return Channel(
+        paModel=BuildChannelAnalysisPaBank(config.width),
+        parameters={
+            "sampleMode": "forward",
+            "sampleRateHz": config.sampleRateHz,
+            "phaseDegrees": 0,
+            "noiseAmpMv": None,
+            "noisePwrDbm": None,
+            "noiseSnrDb": None,
+            "prePaCouplingPaths": prePaCouplingPaths,
+            "postPaCouplingPaths": postPaCouplingPaths,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "width": config.width,
+        },
+    )
+
+
+def GenerateChannelAnalysisReferences(
+    config: ChannelAnalysisBenchmarkConfig,
+) -> Tuple[Tuple[WifiWaveform, ...], np.ndarray]:
+    """Generate two independent equal-power Wi-Fi reference waveforms.
+
+    Processing details:
+        Algorithm: Generate equal-format packets from decorrelated seeds,
+        scale each active burst to the same absolute conducted-power target,
+        decode public samples once, and stack the two physical-chain columns.
+
+    Args:
+        config: Validated waveform and power controls.
+
+    Returns:
+        result: Per-chain metadata tuple and normalized reference matrix.
+    """
+
+    waveforms = []
+    referenceColumns = []
+    for chainIndex in range(2):
+        waveform = WaveGenWifi(
+            parameters={
+                "frameFormat": config.frameFormat,
+                "bandwidthMhz": config.bandwidthMhz,
+                "sampleRateHz": config.sampleRateHz,
+                "mcs": config.mcs,
+                "numDataSymbols": config.numDataSymbols,
+                "seed": config.seed + 97 * chainIndex,
+                "width": config.width,
+            }
+        ).Generate()
+        powerCalibration = PowerCalibration(
+            parameters={
+                "outputPowerDbm": config.outputPowerDbm,
+                "maximumOutputPowerDbm": (
+                    config.maximumOutputPowerDbm
+                ),
+                "loadResistanceOhm": config.loadResistanceOhm,
+                "width": config.width,
+            }
+        )
+        scaledReference = powerCalibration.ScaleSignalToOutputPower(
+            waveform.samples,
+            config.outputPowerDbm,
+        )
+        waveforms.append(waveform)
+        referenceColumns.append(
+            FixedPoint(config.width).DecodeComplex(
+                scaledReference
+            )
+        )
+    if len({column.size for column in referenceColumns}) != 1:
+        raise ValueError(
+            "channel benchmark Wi-Fi references must have equal lengths"
+        )
+    return tuple(waveforms), np.column_stack(referenceColumns)
+
+
+def GenerateChannelPaInputLabels(
+    config: ChannelAnalysisBenchmarkConfig,
+    paOutputTargets: np.ndarray,
+    paModels: Sequence[PaModel],
+) -> np.ndarray:
+    """Generate independent ILC labels at the actual inputs of both PAs.
+
+    Processing details:
+        Algorithm: Run the synchronized frequency-domain ILC against each
+        physical PA alone using the post-deembedded target for that branch,
+        and stack the converged predistorted inputs.  These labels describe
+        signals after the pre-PA coupling network, which is canceled only at
+        deployment time.
+
+    Args:
+        config: Validated sample-rate, bandwidth, and iteration controls.
+        paOutputTargets: Desired individual PA-output matrix.
+        paModels: Ordered internal floating PA facades from the MIMO bank.
+
+    Returns:
+        result: Normalized samples-by-chain PA-input label matrix.
+    """
+
+    targetMatrix = np.asarray(
+        paOutputTargets, dtype=np.complex128
+    )
+    if (
+        targetMatrix.ndim != 2
+        or targetMatrix.shape[1] != len(paModels)
+        or targetMatrix.shape[0] == 0
+        or not np.all(np.isfinite(targetMatrix))
+    ):
+        raise ValueError(
+            "paOutputTargets must contain one finite column per PA"
+        )
+    learnedColumns = []
+    for chainIndex, paModel in enumerate(paModels):
+        targetColumn = targetMatrix[:, chainIndex]
+        maximumInputMagnitude = max(
+            1.5,
+            2.5 * float(np.max(np.abs(targetColumn))),
+        )
+        ilcResult = RunFrequencyDomainIlc(
+            targetColumn,
+            paModel,
+            config.sampleRateHz,
+            config.bandwidthMhz * 1.0e6,
+            ILCConfig(
+                numIterations=config.numIterations,
+                learningRate=0.12,
+                regularization=1.0e-3,
+                maxAmplitude=maximumInputMagnitude,
+            ),
+        )
+        learnedColumns.append(
+            np.asarray(
+                ilcResult.learnedInput, dtype=np.complex128
+            )
+        )
+    return np.column_stack(learnedColumns)
+
+
+def BuildChannelDpdModels(
+    chainCount: int,
+) -> Tuple[DpdGmp, ...]:
+    """Construct equal-structure floating GMP models for all PA branches.
+
+    Processing details:
+        Algorithm: Create one independent seventh-order, four-sample-memory
+        DpdGmp per chain with cross-envelope memory, ridge stabilization, and
+        no public quantization inside the benchmark learning loop.
+
+    Args:
+        chainCount: Number of independent physical PA inverse models.
+
+    Returns:
+        result: Ordered identity-initialized DPD model tuple.
+    """
+
+    if (
+        not isinstance(chainCount, int)
+        or isinstance(chainCount, bool)
+        or chainCount < 1
+    ):
+        raise ValueError("chainCount must be a positive integer")
+    return tuple(
+        DpdGmp(
+            parameters={
+                "nonlinearOrders": (1, 3, 5, 7),
+                "memoryDepth": 4,
+                "crossMemoryDepth": 3,
+                "ridgeFactor": 3.0e-5,
+                "peakWeightExponent": 1.0,
+                "maximumOutputMagnitude": 2.0,
+                "width": 0,
+            }
+        )
+        for _ in range(chainCount)
+    )
+
+
+def EvaluateChannelDpdStage(
+    config: ChannelAnalysisBenchmarkConfig,
+    channel: Channel,
+    waveforms: Sequence[WifiWaveform],
+    referenceSignal: np.ndarray,
+    dacInputSignal: np.ndarray,
+    stageName: str,
+    methodDescription: str,
+) -> ChannelDpdStageResult:
+    """Evaluate one raw-DAC strategy through the same coupled nonlinear plant.
+
+    Processing details:
+        Algorithm: Run the complete pre-coupling, independent PA, post-
+        coupling cascade once, analyze every observed chain against its known
+        Wi-Fi reference, aggregate worst EVM and ACLR, calculate common-gain-
+        aligned matrix NMSE, and project each output onto the other chain to
+        estimate residual linear leakage.
+
+    Args:
+        config: Validated analysis and physical-power settings.
+        channel: Common coupled nonlinear plant.
+        waveforms: Per-chain Wi-Fi metadata matching reference columns.
+        referenceSignal: Desired final samples-by-chain outputs.
+        dacInputSignal: Raw samples-by-chain input before pre-PA coupling.
+        stageName: Display label for this strategy.
+        methodDescription: Exact compensation operations used by this stage.
+
+    Returns:
+        result: Aggregate EVM, NMSE, ACLR, and residual coupling metrics.
+    """
+
+    referenceMatrix = np.asarray(
+        referenceSignal, dtype=np.complex128
+    )
+    measuredMatrix = np.asarray(
+        channel.ProcessFloating(dacInputSignal),
+        dtype=np.complex128,
+    )
+    if measuredMatrix.shape != referenceMatrix.shape:
+        raise ValueError(
+            "coupled plant output must match the reference matrix shape"
+        )
+    evmDbValues = []
+    evmPercentValues = []
+    aclrValues = []
+    residualPower = 0.0
+    alignedReferencePower = 0.0
+    residualCouplingValues = []
+    numericFloor = np.finfo(float).tiny
+    for chainIndex, waveform in enumerate(waveforms):
+        referenceColumn = referenceMatrix[:, chainIndex]
+        measuredColumn = measuredMatrix[:, chainIndex]
+        metrics = Analysis(
+            referenceColumn,
+            waveform,
+            parameters={
+                "maximumOutputPowerDbm": (
+                    config.maximumOutputPowerDbm
+                ),
+                "loadResistanceOhm": config.loadResistanceOhm,
+                "width": 0,
+            },
+        ).Analyze(measuredColumn)
+        evmDbValues.append(float(metrics["evmDb"]))
+        evmPercentValues.append(float(metrics["evmPercent"]))
+        aclrValues.append(float(metrics["aclrWorstDb"]))
+        complexGain = np.vdot(
+            referenceColumn, measuredColumn
+        ) / max(
+            float(np.vdot(referenceColumn, referenceColumn).real),
+            numericFloor,
+        )
+        residual = measuredColumn - complexGain * referenceColumn
+        residualPower += float(np.vdot(residual, residual).real)
+        alignedReferencePower += float(
+            np.vdot(
+                complexGain * referenceColumn,
+                complexGain * referenceColumn,
+            ).real
+        )
+        otherChain = 1 - chainIndex
+        otherReference = referenceMatrix[:, otherChain]
+        leakageCoefficient = np.vdot(
+            otherReference, residual
+        ) / max(
+            float(np.vdot(otherReference, otherReference).real),
+            numericFloor,
+        )
+        residualCouplingValues.append(
+            20.0
+            * np.log10(
+                max(float(np.abs(leakageCoefficient)), numericFloor)
+                / max(float(np.abs(complexGain)), numericFloor)
+            )
+        )
+    normalizedMseDb = 10.0 * np.log10(
+        max(residualPower, numericFloor)
+        / max(alignedReferencePower, numericFloor)
+    )
+    return ChannelDpdStageResult(
+        stageName=stageName,
+        methodDescription=methodDescription,
+        evmDb=float(max(evmDbValues)),
+        evmPercent=float(max(evmPercentValues)),
+        normalizedMseDb=float(normalizedMseDb),
+        aclrWorstDb=float(min(aclrValues)),
+        residualCouplingDb=float(max(residualCouplingValues)),
+    )
+
+
+def BuildChannelDpdImprovements(
+    stages: Sequence[ChannelDpdStageResult],
+) -> Tuple[ChannelDpdImprovement, ...]:
+    """Compare measured coupling-aware DPD with independent per-chain DPD.
+
+    Processing details:
+        Algorithm: Locate the named before and after stages, convert lower-
+        is-better EVM/NMSE/leakage and higher-is-better ACLR to consistently
+        positive improvement values, and require a strictly correct trend.
+
+    Args:
+        stages: Ordered benchmark stage results.
+
+    Returns:
+        result: Four auditable before/after expectation records.
+    """
+
+    stageByName = {stage.stageName: stage for stage in stages}
+    beforeStage = stageByName["Independent DPD-GMP"]
+    afterStage = stageByName["Coupling-aware DPD-GMP"]
+    lowerMetricValues = (
+        (
+            "EVM dB",
+            beforeStage.evmDb,
+            afterStage.evmDb,
+        ),
+        (
+            "Normalized MSE dB",
+            beforeStage.normalizedMseDb,
+            afterStage.normalizedMseDb,
+        ),
+        (
+            "Residual coupling dB",
+            beforeStage.residualCouplingDb,
+            afterStage.residualCouplingDb,
+        ),
+    )
+    improvements = [
+        ChannelDpdImprovement(
+            metricName=metricName,
+            beforeValue=beforeValue,
+            afterValue=afterValue,
+            improvementValue=beforeValue - afterValue,
+            expectedDirection="lower",
+            expectationMet=afterValue < beforeValue,
+        )
+        for metricName, beforeValue, afterValue in lowerMetricValues
+    ]
+    improvements.append(
+        ChannelDpdImprovement(
+            metricName="Worst ACLR dB",
+            beforeValue=beforeStage.aclrWorstDb,
+            afterValue=afterStage.aclrWorstDb,
+            improvementValue=(
+                afterStage.aclrWorstDb - beforeStage.aclrWorstDb
+            ),
+            expectedDirection="higher",
+            expectationMet=(
+                afterStage.aclrWorstDb > beforeStage.aclrWorstDb
+            ),
+        )
+    )
+    return tuple(improvements)
+
+
+def SaveChannelAnalysisResults(
+    result: ChannelAnalysisBenchmarkResult,
+    config: ChannelAnalysisBenchmarkConfig,
+) -> None:
+    """Save channel paths, frequency responses, DPD stages, JSON, and figure.
+
+    Processing details:
+        Algorithm: Create the output directory, serialize scalar summaries,
+        flatten pre/post path and DPD comparison tables, save every occupied-
+        band complex transfer entry as magnitude/phase CSV, and delegate the
+        comparison figure to Draw without recalculating physical metrics.
+
+    Args:
+        result: Complete measured and compensated benchmark result.
+        config: Validated output and reproducibility settings.
+
+    Returns:
+        result: None. JSON, CSV, and PNG artifacts are created.
+    """
+
+    outputDirectory = Path(config.outputDirectory)
+    outputDirectory.mkdir(parents=True, exist_ok=True)
+    with (
+        outputDirectory / "channel_analysis.json"
+    ).open("w", encoding="utf-8") as jsonFile:
+        json.dump(
+            {
+                "configuration": {
+                    "frameFormat": config.frameFormat,
+                    "bandwidthMhz": config.bandwidthMhz,
+                    "sampleRateHz": config.sampleRateHz,
+                    "mcs": config.mcs,
+                    "numDataSymbols": config.numDataSymbols,
+                    "seed": config.seed,
+                    "outputPowerDbm": config.outputPowerDbm,
+                    "maximumOutputPowerDbm": (
+                        config.maximumOutputPowerDbm
+                    ),
+                    "loadResistanceOhm": config.loadResistanceOhm,
+                    "fftLength": config.fftLength,
+                    "impulseLength": config.impulseLength,
+                    "numIterations": config.numIterations,
+                    "width": config.width,
+                },
+                **result.ToDict(),
+            },
+            jsonFile,
+            ensure_ascii=False,
+            indent=2,
+        )
+    pathRows = []
+    for measurement in (
+        result.prePaMeasurement,
+        result.postPaMeasurement,
+    ):
+        for pathMeasurement in measurement.paths:
+            pathRows.append(
+                {
+                    "stageName": measurement.stageName,
+                    **pathMeasurement.ToDict(),
+                }
+            )
+    with (
+        outputDirectory / "channel_path_measurements.csv"
+    ).open("w", newline="", encoding="utf-8-sig") as csvFile:
+        csvWriter = csv.DictWriter(
+            csvFile, fieldnames=list(pathRows[0].keys())
+        )
+        csvWriter.writeheader()
+        csvWriter.writerows(pathRows)
+    stageRows = [stage.ToDict() for stage in result.stages]
+    with (
+        outputDirectory / "channel_dpd_comparison.csv"
+    ).open("w", newline="", encoding="utf-8-sig") as csvFile:
+        csvWriter = csv.DictWriter(
+            csvFile, fieldnames=list(stageRows[0].keys())
+        )
+        csvWriter.writeheader()
+        csvWriter.writerows(stageRows)
+    improvementRows = [
+        improvement.ToDict()
+        for improvement in result.improvements
+    ]
+    with (
+        outputDirectory / "channel_dpd_improvements.csv"
+    ).open("w", newline="", encoding="utf-8-sig") as csvFile:
+        csvWriter = csv.DictWriter(
+            csvFile, fieldnames=list(improvementRows[0].keys())
+        )
+        csvWriter.writeheader()
+        csvWriter.writerows(improvementRows)
+    frequencyRows = []
+    for measurement in (
+        result.prePaMeasurement,
+        result.postPaMeasurement,
+    ):
+        occupiedMask = (
+            np.abs(measurement.frequencyBinsHz)
+            <= measurement.channelBandwidthHz / 2.0
+        )
+        for frequencyIndex in np.flatnonzero(occupiedMask):
+            for destinationChain in range(
+                measurement.frequencyResponse.shape[1]
+            ):
+                for sourceChain in range(
+                    measurement.frequencyResponse.shape[2]
+                ):
+                    transferValue = measurement.frequencyResponse[
+                        frequencyIndex,
+                        destinationChain,
+                        sourceChain,
+                    ]
+                    frequencyRows.append(
+                        {
+                            "stageName": measurement.stageName,
+                            "frequencyHz": float(
+                                measurement.frequencyBinsHz[
+                                    frequencyIndex
+                                ]
+                            ),
+                            "sourceChain": sourceChain,
+                            "destinationChain": destinationChain,
+                            "magnitudeDb": float(
+                                20.0
+                                * np.log10(
+                                    max(
+                                        float(np.abs(transferValue)),
+                                        np.finfo(float).tiny,
+                                    )
+                                )
+                            ),
+                            "phaseDegrees": float(
+                                np.degrees(np.angle(transferValue))
+                            ),
+                        }
+                    )
+    with (
+        outputDirectory / "channel_frequency_response.csv"
+    ).open("w", newline="", encoding="utf-8-sig") as csvFile:
+        csvWriter = csv.DictWriter(
+            csvFile, fieldnames=list(frequencyRows[0].keys())
+        )
+        csvWriter.writeheader()
+        csvWriter.writerows(frequencyRows)
+    Draw().SaveChannelAnalysis(
+        {
+            "pre-PA": result.prePaMeasurement,
+            "post-PA": result.postPaMeasurement,
+        },
+        stageRows,
+        outputDirectory,
+    )
+
+
+def PrintChannelAnalysisResults(
+    result: ChannelAnalysisBenchmarkResult,
+) -> None:
+    """Print compact channel measurements and DPD before/after comparisons.
+
+    Processing details:
+        Algorithm: Print the worst flatness, coupling, and condition number
+        for both measured networks, then print each DPD stage and every
+        expected improvement with an explicit pass/fail label.
+
+    Args:
+        result: Completed channel analysis benchmark.
+
+    Returns:
+        result: None. Human-readable results are written to standard output.
+    """
+
+    print("\nChannel measurements")
+    for measurement in (
+        result.prePaMeasurement,
+        result.postPaMeasurement,
+    ):
+        print(
+            f"{measurement.stageName:<9} "
+            f"direct-flat={measurement.worstDirectFlatnessDb:>6.3f} dB  "
+            f"path-flat={measurement.worstDetectedPathFlatnessDb:>6.3f} dB  "
+            f"coupling={measurement.worstCouplingDb:>7.3f} dB  "
+            f"cond={measurement.worstConditionNumber:>7.3f}"
+        )
+    print("\nCoupled DPD-GMP comparison")
+    for stage in result.stages:
+        print(
+            f"{stage.stageName:<28} "
+            f"EVM={stage.evmDb:>8.3f} dB  "
+            f"NMSE={stage.normalizedMseDb:>8.3f} dB  "
+            f"ACLR={stage.aclrWorstDb:>7.3f} dB  "
+            f"leakage={stage.residualCouplingDb:>8.3f} dB"
+        )
+    print("\nExpected improvements")
+    for improvement in result.improvements:
+        status = "PASS" if improvement.expectationMet else "FAIL"
+        print(
+            f"{status:<4} {improvement.metricName:<24} "
+            f"{improvement.improvementValue:>8.3f} dB"
+        )
+
+
+def RunChannelAnalysisBenchmark(
+    config: Optional[ChannelAnalysisBenchmarkConfig] = None,
+) -> ChannelAnalysisBenchmarkResult:
+    """Measure channel properties and verify coupling-aware DPD-GMP.
+
+    Processing details:
+        Algorithm: Construct one asymmetric two-PA coupled plant, measure its
+        pre/post linear networks using orthogonal impulse probes, generate two
+        independent equal-power Wi-Fi references, compare the raw PA,
+        independently trained DPD, post-only de-embedding, and complete
+        measured pre/post compensation, then save all values and figures.
+
+    Args:
+        config: Optional complete channel-analysis setup.
+
+    Returns:
+        result: Measurements, DPD stages, training diagnostics, and checks.
+    """
+
+    if config is None:
+        config = ChannelAnalysisBenchmarkConfig()
+    config.Validate()
+    channel = BuildChannelAnalysisPlant(config)
+    analyzer = ChannelAnalyse(
+        parameters={
+            "sampleRateHz": config.sampleRateHz,
+            "channelBandwidthHz": config.bandwidthMhz * 1.0e6,
+            "fftLength": config.fftLength,
+            "impulseLength": config.impulseLength,
+            "width": 0,
+        }
+    )
+    prePaMeasurement = analyzer.Measure(
+        channel.ApplyPrePaCoupling,
+        2,
+        "pre-PA",
+    )
+    postPaMeasurement = analyzer.Measure(
+        channel.ApplyPostPaCoupling,
+        2,
+        "post-PA",
+    )
+    waveforms, referenceSignal = GenerateChannelAnalysisReferences(
+        config
+    )
+    paBank = channel.paModel
+    if not isinstance(paBank, MimoPaModel):
+        raise TypeError(
+            "channel analysis plant must bind a MimoPaModel"
+        )
+    paModels = tuple(paBank.paModels)
+
+    baselineStage = EvaluateChannelDpdStage(
+        config,
+        channel,
+        waveforms,
+        referenceSignal,
+        referenceSignal,
+        "Coupled PA baseline",
+        "No nonlinear or coupling compensation.",
+    )
+
+    independentModels = BuildChannelDpdModels(2)
+    independentLabels = GenerateChannelPaInputLabels(
+        config,
+        referenceSignal,
+        paModels,
+    )
+    for chainIndex, dpdModel in enumerate(independentModels):
+        dpdModel.FitFromIlc(
+            referenceSignal[:, chainIndex],
+            independentLabels[:, chainIndex],
+        )
+    independentDacInput = np.column_stack(
+        tuple(
+            dpdModel.ProcessFloating(
+                referenceSignal[:, chainIndex]
+            )
+            for chainIndex, dpdModel in enumerate(independentModels)
+        )
+    )
+    independentStage = EvaluateChannelDpdStage(
+        config,
+        channel,
+        waveforms,
+        referenceSignal,
+        independentDacInput,
+        "Independent DPD-GMP",
+        (
+            "Per-chain PA inverse training without measured pre/post "
+            "coupling de-embedding."
+        ),
+    )
+
+    couplingAwareModels = BuildChannelDpdModels(2)
+    couplingAwareDpd = CouplingAwareDpdGmp(
+        couplingAwareModels,
+        prePaMeasurement,
+        postPaMeasurement,
+        parameters={
+            "compensatePrePaCoupling": True,
+            "compensatePostPaCoupling": True,
+            "inverseRegularization": 1.0e-8,
+            "maximumInverseGainDb": 18.0,
+            "width": 0,
+        },
+    )
+    paOutputTargets = couplingAwareDpd.BuildPaOutputTargets(
+        referenceSignal
+    )
+    couplingAwareLabels = GenerateChannelPaInputLabels(
+        config,
+        paOutputTargets,
+        paModels,
+    )
+    trainingResult = couplingAwareDpd.FitCoupledSegments(
+        (referenceSignal,),
+        (couplingAwareLabels,),
+    )
+
+    postOnlyDpd = CouplingAwareDpdGmp(
+        couplingAwareModels,
+        prePaMeasurement,
+        postPaMeasurement,
+        parameters={
+            "compensatePrePaCoupling": False,
+            "compensatePostPaCoupling": True,
+            "inverseRegularization": 1.0e-8,
+            "maximumInverseGainDb": 18.0,
+            "width": 0,
+        },
+    )
+    postOnlyStage = EvaluateChannelDpdStage(
+        config,
+        channel,
+        waveforms,
+        referenceSignal,
+        postOnlyDpd.ProcessFloating(referenceSignal),
+        "Post-deembedded DPD-GMP",
+        (
+            "Measured post-PA target de-embedding without pre-PA "
+            "DAC coupling cancellation."
+        ),
+    )
+    couplingAwareStage = EvaluateChannelDpdStage(
+        config,
+        channel,
+        waveforms,
+        referenceSignal,
+        couplingAwareDpd.ProcessFloating(referenceSignal),
+        "Coupling-aware DPD-GMP",
+        (
+            "Measured post-PA target de-embedding, per-PA GMP fitting, "
+            "and measured pre-PA DAC coupling cancellation."
+        ),
+    )
+    stages = (
+        baselineStage,
+        independentStage,
+        postOnlyStage,
+        couplingAwareStage,
+    )
+    result = ChannelAnalysisBenchmarkResult(
+        prePaMeasurement=prePaMeasurement,
+        postPaMeasurement=postPaMeasurement,
+        stages=stages,
+        improvements=BuildChannelDpdImprovements(stages),
+        trainingResult=trainingResult,
+    )
+    SaveChannelAnalysisResults(result, config)
+    PrintChannelAnalysisResults(result)
+    return result
+
+
 def SaveHistory(
     methodName: str,
     analysisResult: ILCAnalysisResult,
@@ -4922,17 +5937,18 @@ def ParseBenchmarkArguments() -> Union[
     TwoToneBenchmarkConfig,
     PaCharacterizationConfig,
     DpdGmpBenchmarkConfig,
+    ChannelAnalysisBenchmarkConfig,
 ]:
-    """Parse Wi-Fi, two-tone, PA, or DPD-GMP benchmark command-line options.
+    """Parse Wi-Fi, PA, DPD-GMP, or channel benchmark command-line options.
 
     Processing details:
         Algorithm: Define only scenario-level controls, parse one command
         line, convert it into ``BenchmarkConfig``, and validate it before
         returning. Algorithm-internal learning constants remain fixed so
             comparisons stay reproducible. The mutually exclusive
-            ``--two-tone``, ``--pa-analyse``, and ``--dpd-gmp`` switches
-            select ILC/IM, multi-model PA characterization, or staged GMP
-            predistortion validation and bypass the ordinary Wi-Fi suite.
+            mode switches select ILC/IM, multi-model PA characterization,
+            staged GMP predistortion, or channel/coupling-aware DPD
+            validation and bypass the ordinary Wi-Fi suite.
 
     Returns:
         result: Validated configuration ready for the selected benchmark.
@@ -4967,6 +5983,15 @@ def ParseBenchmarkArguments() -> Union[
         help=(
             "Run the staged PA-analysis-driven DPD-GMP benchmark with "
             "Wi-Fi and two-tone comparisons"
+        ),
+    )
+    modeGroup.add_argument(
+        "--channel-analyse",
+        dest="channelAnalyse",
+        action="store_true",
+        help=(
+            "Measure MIMO channel flatness/coupling/delay and compare "
+            "independent with coupling-aware DPD-GMP"
         ),
     )
     argumentParser.add_argument(
@@ -5128,6 +6153,36 @@ def ParseBenchmarkArguments() -> Union[
         help="Generated two-tone RMS before PA power calibration",
     )
     arguments = argumentParser.parse_args()
+    if arguments.channelAnalyse:
+        channelOutputDirectory = (
+            Path("results/channel_analysis")
+            if arguments.outputDirectory is None
+            else arguments.outputDirectory
+        )
+        channelConfig = ChannelAnalysisBenchmarkConfig(
+            frameFormat=arguments.frameFormat,
+            bandwidthMhz=arguments.bandwidthMhz,
+            sampleRateHz=(
+                80.0e6
+                if arguments.sampleRateHz is None
+                else arguments.sampleRateHz
+            ),
+            mcs=arguments.mcs,
+            numDataSymbols=arguments.numDataSymbols,
+            seed=arguments.seed,
+            outputPowerDbm=arguments.outputPowerDbm,
+            maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
+            loadResistanceOhm=arguments.loadResistanceOhm,
+            numIterations=(
+                10
+                if arguments.numIterations is None
+                else arguments.numIterations
+            ),
+            width=0 if arguments.width is None else arguments.width,
+            outputDirectory=channelOutputDirectory,
+        )
+        channelConfig.Validate()
+        return channelConfig
     if arguments.dpdGmp:
         dpdGmpOutputDirectory = (
             Path("results/dpd_gmp_benchmark")
@@ -5253,16 +6308,18 @@ def Main() -> int:
 
     Processing details:
         Algorithm: Parse the requested scenario controls, execute the complete
-            Wi-Fi, ILC two-tone, PA-characterization, or DPD-GMP benchmark
-            suite, and print the absolute output path after every result has
-            been saved.
+            Wi-Fi, ILC two-tone, PA-characterization, DPD-GMP, or channel
+            analysis suite, and print the absolute output path after every
+            result has been saved.
 
     Returns:
         result: Process exit status zero after successful completion.
     """
 
     config = ParseBenchmarkArguments()
-    if isinstance(config, DpdGmpBenchmarkConfig):
+    if isinstance(config, ChannelAnalysisBenchmarkConfig):
+        RunChannelAnalysisBenchmark(config)
+    elif isinstance(config, DpdGmpBenchmarkConfig):
         RunDpdGmpBenchmark(config)
     elif isinstance(config, PaCharacterizationConfig):
         RunPaCharacterizationBenchmark(config)

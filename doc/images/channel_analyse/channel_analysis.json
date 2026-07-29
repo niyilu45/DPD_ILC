@@ -1,0 +1,232 @@
+{
+  "configuration": {
+    "frameFormat": "EHT",
+    "bandwidthMhz": 20,
+    "sampleRateHz": 80000000.0,
+    "mcs": 7,
+    "numDataSymbols": 4,
+    "seed": 517,
+    "outputPowerDbm": 13.0,
+    "maximumOutputPowerDbm": 25.0,
+    "loadResistanceOhm": 50.0,
+    "fftLength": 2048,
+    "impulseLength": 64,
+    "numIterations": 10,
+    "width": 0
+  },
+  "prePaMeasurement": {
+    "stageName": "pre-PA",
+    "sampleRateHz": 80000000.0,
+    "channelBandwidthHz": 20000000.0,
+    "fftLength": 2048,
+    "chainCount": 2,
+    "impulseLength": 64,
+    "worstDirectFlatnessDb": 0.0,
+    "worstDetectedPathFlatnessDb": 1.547136209141577,
+    "worstCouplingDb": -12.817796958244545,
+    "medianConditionNumber": 1.319089127809247,
+    "worstConditionNumber": 1.3978930596102939,
+    "paths": [
+      {
+        "sourceChain": 0,
+        "destinationChain": 0,
+        "isDirectPath": true,
+        "detected": true,
+        "gainDb": 0.0,
+        "phaseDegrees": 0.0,
+        "flatnessDb": 0.0,
+        "groupDelaySamples": -0.0,
+        "groupDelayNs": -0.0
+      },
+      {
+        "sourceChain": 0,
+        "destinationChain": 1,
+        "isDirectPath": false,
+        "detected": true,
+        "gainDb": -12.817796958244545,
+        "phaseDegrees": 29.644174957144806,
+        "flatnessDb": 1.547136209141577,
+        "groupDelaySamples": 2.4629410965959018,
+        "groupDelayNs": 30.78676370744877
+      },
+      {
+        "sourceChain": 1,
+        "destinationChain": 0,
+        "isDirectPath": false,
+        "detected": true,
+        "gainDb": -19.671718704606455,
+        "phaseDegrees": -35.73650938566548,
+        "flatnessDb": 1.4191295334460143,
+        "groupDelaySamples": 0.617546830324684,
+        "groupDelayNs": 7.71933537905855
+      },
+      {
+        "sourceChain": 1,
+        "destinationChain": 1,
+        "isDirectPath": true,
+        "detected": true,
+        "gainDb": 0.0,
+        "phaseDegrees": 0.0,
+        "flatnessDb": 0.0,
+        "groupDelaySamples": -0.0,
+        "groupDelayNs": -0.0
+      }
+    ]
+  },
+  "postPaMeasurement": {
+    "stageName": "post-PA",
+    "sampleRateHz": 80000000.0,
+    "channelBandwidthHz": 20000000.0,
+    "fftLength": 2048,
+    "chainCount": 2,
+    "impulseLength": 64,
+    "worstDirectFlatnessDb": 0.0,
+    "worstDetectedPathFlatnessDb": 1.1484996234593687,
+    "worstCouplingDb": -11.254169108224001,
+    "medianConditionNumber": 1.3348742645285936,
+    "worstConditionNumber": 1.487052903854467,
+    "paths": [
+      {
+        "sourceChain": 0,
+        "destinationChain": 0,
+        "isDirectPath": true,
+        "detected": true,
+        "gainDb": 0.0,
+        "phaseDegrees": 0.0,
+        "flatnessDb": 0.0,
+        "groupDelaySamples": -0.0,
+        "groupDelayNs": -0.0
+      },
+      {
+        "sourceChain": 0,
+        "destinationChain": 1,
+        "isDirectPath": false,
+        "detected": true,
+        "gainDb": -11.254169108224001,
+        "phaseDegrees": -21.24827092947403,
+        "flatnessDb": 1.1484996234593687,
+        "groupDelaySamples": 1.3219238652426497,
+        "groupDelayNs": 16.524048315533122
+      },
+      {
+        "sourceChain": 1,
+        "destinationChain": 0,
+        "isDirectPath": false,
+        "detected": true,
+        "gainDb": -18.499054056132994,
+        "phaseDegrees": 51.59355624500528,
+        "flatnessDb": 0.822791327270533,
+        "groupDelaySamples": 2.7346375231201745,
+        "groupDelayNs": 34.18296903900218
+      },
+      {
+        "sourceChain": 1,
+        "destinationChain": 1,
+        "isDirectPath": true,
+        "detected": true,
+        "gainDb": 0.0,
+        "phaseDegrees": 0.0,
+        "flatnessDb": 0.0,
+        "groupDelaySamples": -0.0,
+        "groupDelayNs": -0.0
+      }
+    ]
+  },
+  "stages": [
+    {
+      "stageName": "Coupled PA baseline",
+      "methodDescription": "No nonlinear or coupling compensation.",
+      "evmDb": 7.392634922275446,
+      "evmPercent": 234.22419020354255,
+      "normalizedMseDb": 0.6917883176694549,
+      "aclrWorstDb": 5.731842252055701,
+      "residualCouplingDb": -12.505341767050638
+    },
+    {
+      "stageName": "Independent DPD-GMP",
+      "methodDescription": "Per-chain PA inverse training without measured pre/post coupling de-embedding.",
+      "evmDb": 2.710678106309505,
+      "evmPercent": 136.62617354084162,
+      "normalizedMseDb": -3.6285446544449713,
+      "aclrWorstDb": 8.91946339593069,
+      "residualCouplingDb": -12.198506617818822
+    },
+    {
+      "stageName": "Post-deembedded DPD-GMP",
+      "methodDescription": "Measured post-PA target de-embedding without pre-PA DAC coupling cancellation.",
+      "evmDb": 2.4195297421026782,
+      "evmPercent": 132.12241005944168,
+      "normalizedMseDb": -4.0759018532378795,
+      "aclrWorstDb": 9.300614766095041,
+      "residualCouplingDb": -14.065887974859297
+    },
+    {
+      "stageName": "Coupling-aware DPD-GMP",
+      "methodDescription": "Measured post-PA target de-embedding, per-PA GMP fitting, and measured pre-PA DAC coupling cancellation.",
+      "evmDb": 2.334314785231496,
+      "evmPercent": 130.83252985889177,
+      "normalizedMseDb": -4.486644073235669,
+      "aclrWorstDb": 9.244937602113442,
+      "residualCouplingDb": -16.562382691016925
+    }
+  ],
+  "improvements": [
+    {
+      "metricName": "EVM dB",
+      "beforeValue": 2.710678106309505,
+      "afterValue": 2.334314785231496,
+      "improvementValue": 0.37636332107800907,
+      "expectedDirection": "lower",
+      "expectationMet": true
+    },
+    {
+      "metricName": "Normalized MSE dB",
+      "beforeValue": -3.6285446544449713,
+      "afterValue": -4.486644073235669,
+      "improvementValue": 0.8580994187906978,
+      "expectedDirection": "lower",
+      "expectationMet": true
+    },
+    {
+      "metricName": "Residual coupling dB",
+      "beforeValue": -12.198506617818822,
+      "afterValue": -16.562382691016925,
+      "improvementValue": 4.363876073198103,
+      "expectedDirection": "lower",
+      "expectationMet": true
+    },
+    {
+      "metricName": "Worst ACLR dB",
+      "beforeValue": 8.91946339593069,
+      "afterValue": 9.244937602113442,
+      "improvementValue": 0.32547420618275247,
+      "expectedDirection": "higher",
+      "expectationMet": true
+    }
+  ],
+  "trainingResult": {
+    "segmentCount": 1,
+    "compensatePrePaCoupling": true,
+    "compensatePostPaCoupling": true,
+    "chainResults": [
+      {
+        "sampleCount": 8640,
+        "segmentCount": 1,
+        "featureCount": 88,
+        "beforeNmseDb": -24.976906006036643,
+        "afterNmseDb": -24.976906006036643,
+        "regularizedConditionNumber": 1585798.6674236967,
+        "normalizedCoefficientUpdateNorm": 1.1333786047205648e-10
+      },
+      {
+        "sampleCount": 8640,
+        "segmentCount": 1,
+        "featureCount": 88,
+        "beforeNmseDb": -11.159891389008136,
+        "afterNmseDb": -12.12055527650862,
+        "regularizedConditionNumber": 1605063.769844134,
+        "normalizedCoefficientUpdateNorm": 2.316637867022587
+      }
+    ]
+  }
+}

@@ -61,6 +61,7 @@ class Draw:
                 ),
                 "paPowerFileStem": "pa_power_characteristics",
                 "dpdGmpFileStem": "dpd_gmp_performance",
+                "channelAnalysisFileStem": "channel_analysis",
                 "figureWidthInches": 10.5,
                 "figureHeightInches": 6.2,
                 "figureDpi": 180,
@@ -84,6 +85,9 @@ class Draw:
                 ),
                 "dpdGmpPlotTitle": (
                     "PA-analysis-driven DPD-GMP improvements"
+                ),
+                "channelAnalysisPlotTitle": (
+                    "Measured MIMO channel and coupling-aware DPD-GMP"
                 ),
                 "xAxisLabel": "PA output power per chain (dBm)",
                 "yAxisLabel": "RMS EVM (dB, lower is better)",
@@ -182,6 +186,7 @@ class Draw:
             "paNonlinearityFileStem",
             "paPowerFileStem",
             "dpdGmpFileStem",
+            "channelAnalysisFileStem",
         ):
             fileStem = self.parameters[parameterName]
             if not isinstance(fileStem, str):
@@ -231,6 +236,7 @@ class Draw:
             "paNonlinearityPlotTitle",
             "paPowerPlotTitle",
             "dpdGmpPlotTitle",
+            "channelAnalysisPlotTitle",
         ):
             parameterValue = self.parameters[parameterName]
             if not isinstance(parameterValue, str):
@@ -1588,6 +1594,360 @@ class Draw:
         outputPath.mkdir(parents=True, exist_ok=True)
         figurePath = outputPath / f"{selectedFileStem}.png"
         figure = self.CreateDpdGmpPerformanceFigure(stageResults)
+        try:
+            figure.savefig(
+                figurePath,
+                dpi=int(self.parameters["figureDpi"]),
+                bbox_inches="tight",
+            )
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
+        return figurePath
+
+    def ValidateChannelAnalysis(
+        self,
+        channelMeasurements: Mapping[str, object],
+        stageResults: Sequence[Mapping[str, object]],
+    ) -> None:
+        """Validate measured response tensors and DPD performance rows.
+
+        Processing details:
+            Algorithm: Require at least one labeled measurement exposing a
+            finite frequency grid and square complex response tensor, then
+            require two or more uniquely named stages containing finite EVM,
+            NMSE, ACLR, and residual-coupling values.
+
+        Args:
+            channelMeasurements: Labels mapped to measurement result objects.
+            stageResults: Ordered flat coupled-DPD performance mappings.
+
+        Returns:
+            result: None. Malformed plot inputs raise an exception.
+        """
+
+        if (
+            not isinstance(channelMeasurements, Mapping)
+            or not channelMeasurements
+        ):
+            raise ValueError(
+                "channelMeasurements must be a nonempty mapping"
+            )
+        for measurementName, measurement in channelMeasurements.items():
+            if not isinstance(measurementName, str) or not measurementName:
+                raise ValueError(
+                    "every channel measurement name must be nonempty"
+                )
+            frequencyBinsHz = np.asarray(
+                getattr(measurement, "frequencyBinsHz", None),
+                dtype=float,
+            )
+            frequencyResponse = np.asarray(
+                getattr(measurement, "frequencyResponse", None),
+                dtype=np.complex128,
+            )
+            channelBandwidthHz = getattr(
+                measurement, "channelBandwidthHz", None
+            )
+            if (
+                frequencyBinsHz.ndim != 1
+                or frequencyBinsHz.size < 2
+                or frequencyResponse.ndim != 3
+                or frequencyResponse.shape[0]
+                != frequencyBinsHz.size
+                or frequencyResponse.shape[1]
+                != frequencyResponse.shape[2]
+                or not np.all(np.isfinite(frequencyBinsHz))
+                or not np.all(np.isfinite(frequencyResponse))
+                or not isinstance(
+                    channelBandwidthHz, (int, float)
+                )
+                or isinstance(channelBandwidthHz, bool)
+                or not np.isfinite(channelBandwidthHz)
+                or float(channelBandwidthHz) <= 0.0
+            ):
+                raise ValueError(
+                    f"{measurementName} does not contain a valid "
+                    "frequency-response measurement"
+                )
+        stageRows = tuple(stageResults)
+        if len(stageRows) < 2:
+            raise ValueError(
+                "stageResults must contain at least two DPD stages"
+            )
+        stageNames = []
+        for stageIndex, stageRow in enumerate(stageRows):
+            if not isinstance(stageRow, Mapping):
+                raise TypeError(
+                    f"stageResults[{stageIndex}] must be a mapping"
+                )
+            stageName = stageRow.get("stageName")
+            if not isinstance(stageName, str) or not stageName:
+                raise ValueError(
+                    "every channel DPD stage requires a stageName"
+                )
+            stageNames.append(stageName)
+            for fieldName in (
+                "evmDb",
+                "normalizedMseDb",
+                "aclrWorstDb",
+                "residualCouplingDb",
+            ):
+                fieldValue = stageRow.get(fieldName)
+                if (
+                    not isinstance(fieldValue, (int, float))
+                    or isinstance(fieldValue, bool)
+                    or not np.isfinite(fieldValue)
+                ):
+                    raise ValueError(
+                        f"{stageName}.{fieldName} must be finite"
+                    )
+        if len(set(stageNames)) != len(stageNames):
+            raise ValueError(
+                "channel DPD stage names must be unique"
+            )
+
+    def CreateChannelAnalysisFigure(
+        self,
+        channelMeasurements: Mapping[str, object],
+        stageResults: Sequence[Mapping[str, object]],
+    ) -> Any:
+        """Create channel response, conditioning, and DPD comparison panels.
+
+        Processing details:
+            Algorithm: Plot every occupied-band diagonal magnitude, every
+            off-diagonal response normalized to its source direct path, full
+            MIMO matrix condition number versus frequency, and grouped EVM/
+            NMSE bars with a separate ACLR axis for all compensation stages.
+
+        Args:
+            channelMeasurements: Labels mapped to measurement result objects.
+            stageResults: Ordered flat coupled-DPD performance mappings.
+
+        Returns:
+            result: Matplotlib Figure containing four explanatory panels.
+        """
+
+        self.ValidateParameters()
+        self.ValidateChannelAnalysis(
+            channelMeasurements, stageResults
+        )
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "matplotlib is required for channel analysis plots"
+            ) from error
+        figure, axes = plt.subplots(
+            2,
+            2,
+            figsize=(
+                float(self.parameters["figureWidthInches"]) * 1.30,
+                float(self.parameters["figureHeightInches"]) * 1.35,
+            ),
+        )
+        numericFloor = np.finfo(float).tiny
+        for measurementName, measurement in (
+            channelMeasurements.items()
+        ):
+            frequencyBinsHz = np.asarray(
+                getattr(measurement, "frequencyBinsHz"),
+                dtype=float,
+            )
+            frequencyResponse = np.asarray(
+                getattr(measurement, "frequencyResponse"),
+                dtype=np.complex128,
+            )
+            channelBandwidthHz = float(
+                getattr(measurement, "channelBandwidthHz")
+            )
+            occupiedMask = (
+                np.abs(frequencyBinsHz)
+                <= channelBandwidthHz / 2.0
+            )
+            occupiedFrequencyMhz = (
+                frequencyBinsHz[occupiedMask] / 1.0e6
+            )
+            chainCount = frequencyResponse.shape[1]
+            for chainIndex in range(chainCount):
+                directResponse = frequencyResponse[
+                    occupiedMask, chainIndex, chainIndex
+                ]
+                axes[0, 0].plot(
+                    occupiedFrequencyMhz,
+                    20.0
+                    * np.log10(
+                        np.maximum(
+                            np.abs(directResponse),
+                            numericFloor,
+                        )
+                    ),
+                    linewidth=float(self.parameters["lineWidth"]),
+                    label=(
+                        f"{measurementName} "
+                        f"{chainIndex + 1}->{chainIndex + 1}"
+                    ),
+                )
+                for destinationChain in range(chainCount):
+                    if destinationChain == chainIndex:
+                        continue
+                    couplingResponse = (
+                        frequencyResponse[
+                            occupiedMask,
+                            destinationChain,
+                            chainIndex,
+                        ]
+                        / np.where(
+                            np.abs(directResponse) > numericFloor,
+                            directResponse,
+                            numericFloor + 0.0j,
+                        )
+                    )
+                    axes[0, 1].plot(
+                        occupiedFrequencyMhz,
+                        20.0
+                        * np.log10(
+                            np.maximum(
+                                np.abs(couplingResponse),
+                                numericFloor,
+                            )
+                        ),
+                        linewidth=float(
+                            self.parameters["lineWidth"]
+                        ),
+                        label=(
+                            f"{measurementName} "
+                            f"{chainIndex + 1}->{destinationChain + 1}"
+                        ),
+                    )
+            conditionNumbers = [
+                float(
+                    np.linalg.cond(
+                        frequencyResponse[frequencyIndex, :, :]
+                    )
+                )
+                for frequencyIndex in np.flatnonzero(occupiedMask)
+            ]
+            axes[1, 0].plot(
+                occupiedFrequencyMhz,
+                conditionNumbers,
+                linewidth=float(self.parameters["lineWidth"]),
+                label=measurementName,
+            )
+        axes[0, 0].set_title("Measured direct-path magnitude")
+        axes[0, 0].set_ylabel("Magnitude (dB)")
+        axes[0, 1].set_title("Measured coupling relative to direct path")
+        axes[0, 1].set_ylabel("Relative coupling (dB)")
+        axes[1, 0].set_title("MIMO transfer-matrix conditioning")
+        axes[1, 0].set_ylabel("Condition number")
+        axes[1, 0].set_xlabel("Baseband frequency (MHz)")
+        axes[0, 0].set_xlabel("Baseband frequency (MHz)")
+        axes[0, 1].set_xlabel("Baseband frequency (MHz)")
+        axes[0, 0].legend(loc="best", fontsize=8)
+        axes[0, 1].legend(loc="best", fontsize=8)
+        axes[1, 0].legend(loc="best", fontsize=8)
+
+        stageRows = tuple(stageResults)
+        stageNames = [str(stage["stageName"]) for stage in stageRows]
+        stagePositions = np.arange(len(stageRows), dtype=float)
+        barWidth = 0.36
+        axes[1, 1].bar(
+            stagePositions - 0.5 * barWidth,
+            [float(stage["evmDb"]) for stage in stageRows],
+            width=barWidth,
+            label="EVM",
+        )
+        axes[1, 1].bar(
+            stagePositions + 0.5 * barWidth,
+            [
+                float(stage["normalizedMseDb"])
+                for stage in stageRows
+            ],
+            width=barWidth,
+            label="Waveform NMSE",
+        )
+        aclrAxes = axes[1, 1].twinx()
+        aclrAxes.plot(
+            stagePositions,
+            [float(stage["aclrWorstDb"]) for stage in stageRows],
+            color="black",
+            marker="o",
+            linewidth=float(self.parameters["lineWidth"]),
+            label="Worst ACLR",
+        )
+        axes[1, 1].set_title("Coupled DPD-GMP before/after")
+        axes[1, 1].set_ylabel(
+            "EVM / NMSE (dB, lower is better)"
+        )
+        aclrAxes.set_ylabel("Worst ACLR (dB, higher is better)")
+        axes[1, 1].set_xticks(stagePositions)
+        axes[1, 1].set_xticklabels(
+            stageNames,
+            rotation=25,
+            ha="right",
+        )
+        axes[1, 1].legend(loc="lower left", fontsize=8)
+        aclrAxes.legend(loc="upper right", fontsize=8)
+        for selectedAxes in axes.reshape(-1):
+            selectedAxes.grid(
+                True,
+                linestyle=":",
+                linewidth=0.7,
+            )
+        figure.suptitle(
+            str(self.parameters["channelAnalysisPlotTitle"])
+        )
+        figure.tight_layout()
+        return figure
+
+    def SaveChannelAnalysis(
+        self,
+        channelMeasurements: Mapping[str, object],
+        stageResults: Sequence[Mapping[str, object]],
+        outputDirectory: Path,
+        fileStem: Optional[str] = None,
+    ) -> Path:
+        """Save the four-panel channel and coupled-DPD analysis PNG.
+
+        Processing details:
+            Algorithm: Resolve a safe file stem, create the output directory,
+            render the validated figure, save it at configured DPI, and close
+            Matplotlib resources even if file writing fails.
+
+        Args:
+            channelMeasurements: Labels mapped to measurement result objects.
+            stageResults: Ordered flat coupled-DPD performance mappings.
+            outputDirectory: Destination directory for the PNG.
+            fileStem: Optional override for channelAnalysisFileStem.
+
+        Returns:
+            result: Path to the generated channel analysis figure.
+        """
+
+        selectedFileStem = (
+            str(self.parameters["channelAnalysisFileStem"])
+            if fileStem is None
+            else fileStem
+        )
+        if (
+            not isinstance(selectedFileStem, str)
+            or not selectedFileStem
+            or any(
+                character in selectedFileStem
+                for character in '<>:"/\\|?*'
+            )
+        ):
+            raise ValueError("fileStem must be a valid simple file name")
+        outputPath = Path(outputDirectory)
+        outputPath.mkdir(parents=True, exist_ok=True)
+        figurePath = outputPath / f"{selectedFileStem}.png"
+        figure = self.CreateChannelAnalysisFigure(
+            channelMeasurements, stageResults
+        )
         try:
             figure.savefig(
                 figurePath,

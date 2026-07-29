@@ -1,0 +1,5 @@
+﻿stageName,methodDescription,evmDb,evmPercent,normalizedMseDb,aclrWorstDb,residualCouplingDb
+Coupled PA baseline,No nonlinear or coupling compensation.,7.392634922275446,234.22419020354255,0.6917883176694549,5.731842252055701,-12.505341767050638
+Independent DPD-GMP,Per-chain PA inverse training without measured pre/post coupling de-embedding.,2.710678106309505,136.62617354084162,-3.6285446544449713,8.91946339593069,-12.198506617818822
+Post-deembedded DPD-GMP,Measured post-PA target de-embedding without pre-PA DAC coupling cancellation.,2.4195297421026782,132.12241005944168,-4.0759018532378795,9.300614766095041,-14.065887974859297
+Coupling-aware DPD-GMP,"Measured post-PA target de-embedding, per-PA GMP fitting, and measured pre-PA DAC coupling cancellation.",2.334314785231496,130.83252985889177,-4.486644073235669,9.244937602113442,-16.562382691016925

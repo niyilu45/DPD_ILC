@@ -1196,3 +1196,42 @@ channel = Channel(
 4. `RunFrequencyDomainIlc` 把 `Channel` 当作完整反馈链路。
 5. 最佳ILC输入再次通过同一个 `Channel.Process(..., outputPowerDbm=20.0)` 复测目标工作点。
 6. 输出字典同时保留Channel参数与内部PA功率闭环结果，避免把接收噪声功率误解为PA发射功率。
+
+## 8. Channel 特性测量与 DPD 联动
+
+`Channel` 负责施加已配置的 PA 前/后耦合，但不会读取这些配置并自动宣称它们是“测量结果”。独立的 `ChannelAnalyse` 使用逐路探测恢复：
+
+- 主路径和耦合路径的冲激响应；
+- 带内幅度平坦度；
+- 耦合增益和相位；
+- 等效群时延；
+- MIMO 频响矩阵条件数。
+
+仿真中可以直接测量两个线性子网络：
+
+```python
+from inc.lib.ChannelAnalyse import ChannelAnalyse
+
+channelAnalyzer = ChannelAnalyse(
+    parameters={
+        "sampleRateHz": 80.0e6,
+        "channelBandwidthHz": 20.0e6,
+        "width": 0,
+    }
+)
+
+preMeasurement = channelAnalyzer.Measure(
+    channel.ApplyPrePaCoupling,
+    chainCount=2,
+    stageName="pre-PA",
+)
+postMeasurement = channelAnalyzer.Measure(
+    channel.ApplyPostPaCoupling,
+    chainCount=2,
+    stageName="post-PA",
+)
+```
+
+真实硬件必须在对应参考面采集；只有最终端口输出时，一般不能唯一分离 PA 前耦合、PA 非线性和 PA 后耦合。`CouplingAwareDpdGmp` 可以使用上述测量结果修改训练目标并预消除 DAC 侧耦合。
+
+完整测量推导、参数表、实验接线边界、Benchmark 和修改前后性能见 [ChannelAnalyse.md](./ChannelAnalyse.md)。

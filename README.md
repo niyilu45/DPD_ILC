@@ -10,6 +10,7 @@
 - [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、GMP、Doherty载波/峰值双支路、频谱再生和IQ失衡。
 - [PA双音特性分析](doc/PaAnalyse.md)：小信号频响、双音间隔记忆、动态AM-AM/AM-PM迟滞、IM3/IM5/IM7、输出功率扫描及逐PA的DPD优化建议。
 - [PA到接收端Channel物理原理与用法](doc/Channel.md)：PA前/后多通道耦合、前向仪表/板载反馈采样、反馈链路非理想和联合功率校准。
+- [Channel特性测量与耦合感知DPD](doc/ChannelAnalyse.md)：平坦度、耦合增益/相位、群时延、条件数、测量接线以及耦合感知DPD-GMP前后对比。
 - [信号同步、补偿与功率标定原理](doc/SigProc.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样、复增益补偿和 dBm/RMS 换算。
 - [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
 - [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：10 bit seed、短块LDPC、历史CRC兼容、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
@@ -40,8 +41,9 @@ main.py                 命令行主程序
 SmallestSISO.py         浮点与16位定点SISO EHT/GMP/ILC对比示例
 inc/lib/Analysis.py         模拟功率、SNR、EVM、ACLR、逐轮ILC性能分析及结果输出
 inc/lib/Channel.py          PA前后多通道耦合、联合功率校准及forward/fb采样链路
+inc/lib/ChannelAnalyse.py   MIMO冲激响应、平坦度、耦合、群时延和条件数测量
 inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
-inc/lib/DpdGmp.py           独立SISO GMP DPD、加权岭回归、增量和多功率训练
+inc/lib/DpdGmp.py           SISO GMP及测量驱动的耦合感知MIMO DPD
 inc/lib/Fec.py              55/90短块LDPC矩阵构造、系统编码和软输入译码
 inc/lib/PaModel.py          SISO/MIMO Wiener、GMP和Doherty非线性PA
 inc/lib/ParseWifi.py        接收帧描述解析、包起点检测与参考波形恢复
@@ -59,6 +61,7 @@ tests/TestProject.py    自包含验证脚本
 tests/BenchMark.py      分类ILC基准、PA双音特性测试、结果保存和曲线比较
 doc/BenchMark.md        各 benchmark 场景的构造、预期和参考仿真结果
 doc/PaAnalyse.md        三种PA特性及PA分析驱动的DPD-GMP逐项改进对比
+doc/ChannelAnalyse.md   通道测量原理、用例和耦合感知DPD前后性能
 doc/DPD-GMP.md          GMP DPD物理模型和系数更新推导
 doc/DpdGmp.md           DpdGmp类参数、方法和完整用例
 doc/FAQ.md              小信号逆响应、局部逆、公共增益和高功率GMP常见问题
@@ -75,7 +78,8 @@ doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整�
 ```python
 from inc.lib.Analysis import Analysis
 from inc.lib.Channel import Channel
-from inc.lib.DpdGmp import DpdGmp
+from inc.lib.ChannelAnalyse import ChannelAnalyse
+from inc.lib.DpdGmp import CouplingAwareDpdGmp, DpdGmp
 from inc.lib.Fec import EncodeDescriptorLdpc
 from inc.lib.ParseWifi import ParseWifi
 from inc.lib.WaveGenWifi import WaveGenWifi
@@ -88,7 +92,8 @@ from inc.lib.TwoToneAnalysis import TwoToneAnalysis
 ```python
 from lib.Analysis import Analysis
 from lib.Channel import Channel
-from lib.DpdGmp import DpdGmp
+from lib.ChannelAnalyse import ChannelAnalyse
+from lib.DpdGmp import CouplingAwareDpdGmp, DpdGmp
 from lib.Fec import EncodeDescriptorLdpc
 from lib.ParseWifi import ParseWifi
 from lib.WaveGenWifi import WaveGenWifi
@@ -100,7 +105,7 @@ from lib.TwoToneAnalysis import TwoToneAnalysis
 
 ## 浮点与定点接口
 
-`WaveGenWifi`、`WaveGenTwoTone`、`PaModel`、`MimoPaModel`、`Channel`、`ParseWifi`、`Analysis` 和 `TwoToneAnalysis` 都把 `width` 定义在各自的 `parameters` 配置中。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量使用有符号整数码。默认值为 `16`。为兼容已有代码，各主类仍保留直接 `width=` 便捷参数，但新代码统一推荐 `parameters={"width": ...}`。
+`WaveGenWifi`、`WaveGenTwoTone`、`PaModel`、`MimoPaModel`、`Channel`、`ChannelAnalyse`、`DpdGmp`、`CouplingAwareDpdGmp`、`ParseWifi`、`Analysis` 和 `TwoToneAnalysis` 都把 `width` 定义在各自的 `parameters` 配置中。`width=0` 表示浮点旁路；`width>0` 表示每个 I、Q 分量使用有符号整数码。默认值为 `16`。为兼容已有代码，各主类仍保留直接 `width=` 便捷参数，但新代码统一推荐 `parameters={"width": ...}`。
 
 ```math
 -2^{W-1}\leq q_{\mathrm{I}},q_{\mathrm{Q}}\leq 2^{W-1}-1
@@ -593,6 +598,28 @@ flowchart TD
 - 浮点和定点公开数据类型都为 `numpy.complex128`；定点模式输出I/Q整数码，物理噪声的电压换算只发生在模块内部。
 - 完整公式、参数约束和功率校准接线见 [Channel.md](doc/Channel.md)。
 
+### `inc/lib/ChannelAnalyse.py`
+
+```mermaid
+flowchart TD
+    probe["逐源通道单位冲激"] --> network["PA前或PA后线性网络"]
+    network --> capture["同步采集所有目标通道"]
+    capture --> impulse["h[delay,destination,source]"]
+    impulse --> response["逐路径FFT与占用带宽截取"]
+    response --> flatness["主路/耦合路径平坦度"]
+    response --> coupling["相对耦合增益和相位"]
+    response --> delay["解缠相位斜率得到群时延"]
+    response --> condition["MIMO矩阵条件数"]
+    flatness --> result["ChannelMeasurementResult"]
+    coupling --> result
+    delay --> result
+    condition --> result
+```
+
+`ChannelAnalyse.Measure` 不读取 `Channel` 的路径配置，而是只通过可调用的被测网络和实际输出恢复响应。`AnalyzeImpulseResponses` 还能直接消费仪表去卷积后、形状为“时延×目标×源”的冲激响应。`ChannelPathMeasurement` 以字典形式输出每条方向路径的中心增益、中心相位、平坦度和群时延；`ChannelMeasurementResult` 另外保存完整频响、最差耦合和带内条件数。
+
+完整参数、测量参考面、实际接线、误差来源和使用示例见 [ChannelAnalyse.md](doc/ChannelAnalyse.md)。
+
 ### `inc/lib/DpdIlc.py`
 
 ```mermaid
@@ -663,9 +690,13 @@ flowchart TD
     coefficients --> process["Process：解码、GMP、限幅、编码"]
     process --> pa["PaModel或真实PA"]
     pa --> independent["Analysis / TwoToneAnalysis独立验收"]
+    channelMeasurement["ChannelAnalyse测得Hpre/Hpost"] --> postInverse["Hpost逆：最终参考转逐PA目标"]
+    postInverse --> coupledFit["FitCoupledSegments：逐PA标签训练"]
+    coupledFit --> preInverse["Hpre逆：逐PA输入转DAC波形"]
+    preInverse --> coupledPlant["耦合MIMO PA链路"]
 ```
 
-**图示说明：**`DpdGmp` 是独立可部署的SISO GMP DPD，不包含测试场景或RF指标。`Fit`重置为恒等先验后训练，`UpdateCoefficients`保留当前系数做增量跟踪；多片段版本在帧边界分别建立记忆，避免简单拼接制造错误历史。
+**图示说明：**`DpdGmp` 是独立可部署的SISO GMP DPD，不包含测试场景或RF指标。`Fit`重置为恒等先验后训练，`UpdateCoefficients`保留当前系数做增量跟踪；多片段版本在帧边界分别建立记忆，避免简单拼接制造错误历史。`CouplingAwareDpdGmp` 组合多个 SISO 模型，并根据 `ChannelAnalyse` 测得的 PA 后响应修改训练目标、根据 PA 前响应修改部署 DAC 波形。
 
 完整参数如下：
 
@@ -696,7 +727,17 @@ flowchart TD
 | `GetFeatureSpecs()` / `GetCoefficients()` / `SetCoefficients(...)` | 查询结构、保存或恢复系数。 |
 | `GetLastTrainingResult()` | 返回训练前后NMSE、条件数和系数变化诊断。 |
 
-完整公式、参数边界和示例分别见 [DPD-GMP补偿原理](doc/DPD-GMP.md) 与 [DpdGmp程序使用手册](doc/DpdGmp.md)。
+耦合感知类的主要方法为：
+
+| 方法 | 作用 |
+|---|---|
+| `ConfigureChannelMeasurements(pre, post)` | 更新测得的 PA 前和 PA 后冲激响应。 |
+| `BuildPaOutputTargets(referenceSignal)` | 对最终端口参考做 PA 后去嵌入。 |
+| `FitCoupledSegments(references, labels, ...)` | 用去嵌入目标和实际 PA 输入标签训练各路 GMP。 |
+| `BuildDacInput(predistortedPaInput)` | 用 PA 前因果正则逆生成 DAC 波形。 |
+| `Process(inputSignal)` | 完成“PA 后目标逆→逐路 GMP→PA 前输入逆”。 |
+
+完整公式、参数边界和示例分别见 [DPD-GMP补偿原理](doc/DPD-GMP.md)、[DpdGmp程序使用手册](doc/DpdGmp.md) 与 [Channel测量及耦合感知DPD](doc/ChannelAnalyse.md)。
 
 ### `tests/BenchMark.py`
 
@@ -711,6 +752,8 @@ flowchart TD
     benchmark --> power["全方法功率-EVM扫描"]
     paCharacterization["PaCharacterizationConfig"] --> paSweep["三种PA频响、间隔与功率扫描"]
     dpdGmpConfig["DpdGmpBenchmarkConfig"] --> dpdStages["基础/记忆扩展/峰值/正则/多功率DPD-GMP"]
+    channelConfig["ChannelAnalysisBenchmarkConfig"] --> channelMeasure["PA前/后平坦度、耦合、时延、条件数"]
+    channelMeasure --> coupledDpd["Independent / Post-deembedded / Coupling-aware DPD"]
     nominal --> algorithms["调用 DpdIlc 中的可复用算法"]
     constrained --> algorithms
     noisy --> algorithms
@@ -723,10 +766,11 @@ flowchart TD
     paAdvice --> dpdStages
     dpdStages --> dpdMetrics["同功率EVM/ACLR/IM3 + 标签NMSE + 条件数"]
     dpdMetrics --> dpdReport["逐项前后比较CSV / JSON / 四联PNG"]
+    coupledDpd --> channelReport["通道路径/频响CSV + DPD前后JSON/PNG"]
     paAdvice --> paReport["PA特性与建议CSV / JSON / 四张PNG"]
 ```
 
-**图示说明：**`BenchMark.py` 只负责场景编排和结果呈现，不重新实现任何ILC更新律、GMP基函数或PA方程。ILC场景分类、预期趋势和本机参考结果见[BenchMark场景说明](doc/BenchMark.md)；PA测试及其驱动的DPD-GMP逐项改进见[PA双音特性分析](doc/PaAnalyse.md)。
+**图示说明：**`BenchMark.py` 只负责场景编排和结果呈现，不重新实现任何ILC更新律、GMP基函数、通道测量方程或PA方程。ILC场景分类、预期趋势和本机参考结果见[BenchMark场景说明](doc/BenchMark.md)；PA测试及其驱动的DPD-GMP逐项改进见[PA双音特性分析](doc/PaAnalyse.md)；通道测量和耦合感知DPD前后比较见[ChannelAnalyse](doc/ChannelAnalyse.md)。
 
 ### `inc/utils/SigProc.py`
 
@@ -1437,6 +1481,7 @@ assert resultAnalysis.width == 16
 | `paNonlinearityFileStem` | `"pa_nonlinearity_comparison"` | PA标称IM3/IM5/IM7柱状图前缀。 |
 | `paPowerFileStem` | `"pa_power_characteristics"` | PA输出功率相关特性图前缀。 |
 | `dpdGmpFileStem` | `"dpd_gmp_performance"` | DPD-GMP阶段性能四联图前缀。 |
+| `channelAnalysisFileStem` | `"channel_analysis"` | 通道频响、条件数和耦合感知DPD四联图前缀。 |
 | `figureWidthInches` | `10.5` | 图像宽度，单位英寸，必须为正数。 |
 | `figureHeightInches` | `6.2` | 图像高度，单位英寸，必须为正数。 |
 | `figureDpi` | `180` | PNG 分辨率，必须为正整数。 |
@@ -1451,6 +1496,7 @@ assert resultAnalysis.width == 16
 | `paNonlinearityPlotTitle` | `"PA nominal intermodulation comparison"` | PA标称互调图标题。 |
 | `paPowerPlotTitle` | `"PA output-power-dependent characteristics"` | PA输出功率特性图标题。 |
 | `dpdGmpPlotTitle` | `"PA-analysis-driven DPD-GMP improvements"` | DPD-GMP阶段比较图标题。 |
+| `channelAnalysisPlotTitle` | `"Measured MIMO channel and coupling-aware DPD-GMP"` | 通道测量与耦合感知DPD图标题。 |
 | `xAxisLabel` | `"PA output power per chain (dBm)"` | 横轴标题。 |
 | `yAxisLabel` | `"RMS EVM (dB, lower is better)"` | 纵轴标题。 |
 | `convergenceXAxisLabel` | `"ILC iteration"` | 收敛图横轴标题。 |
@@ -1483,6 +1529,9 @@ assert resultAnalysis.width == 16
 | `ValidateDpdGmpStages(stageResults)` | DPD-GMP阶段字典序列 | 检查EVM、ACLR、IM3、标签NMSE和条件数字段。 |
 | `CreateDpdGmpPerformanceFigure(stageResults)` | DPD-GMP阶段字典序列 | 返回EVM、IM3、标签NMSE和条件数四联图。 |
 | `SaveDpdGmpPerformance(stageResults, outputDirectory, fileStem=None)` | 阶段结果和目录 | 保存并返回DPD-GMP性能PNG路径。 |
+| `ValidateChannelAnalysis(channelMeasurements, stageResults)` | 通道测量映射与阶段字典 | 检查频响矩阵和EVM/NMSE/ACLR/残余耦合字段。 |
+| `CreateChannelAnalysisFigure(channelMeasurements, stageResults)` | 通道测量与DPD阶段 | 返回直通频响、耦合频响、条件数和DPD性能四联图。 |
+| `SaveChannelAnalysis(channelMeasurements, stageResults, outputDirectory, fileStem=None)` | 通道测量、阶段和目录 | 保存并返回通道分析PNG路径。 |
 
 ### `ILCConfig` 与算法参数
 
@@ -2334,6 +2383,53 @@ print([item.ToDict() for item in result.comparisons])
 
 默认基准的每一项改进均有独立目标并要求 `expectationMet=True`。具体方法和参考数值见 [PaAnalyse第12节](doc/PaAnalyse.md#12-pa特性分析后的dpd-gmp改进与实测对比)。
 
+### Channel测量与耦合感知DPD-GMP Benchmark
+
+最简命令：
+
+```powershell
+python tests\BenchMark.py --channel-analyse
+```
+
+Python接口：
+
+```python
+from pathlib import Path
+
+from tests.BenchMark import (
+    ChannelAnalysisBenchmarkConfig,
+    RunChannelAnalysisBenchmark,
+)
+
+result = RunChannelAnalysisBenchmark(
+    ChannelAnalysisBenchmarkConfig(
+        sampleRateHz=80.0e6,
+        bandwidthMhz=20,
+        outputPowerDbm=13.0,
+        width=0,
+        outputDirectory=Path("results/channel_analysis"),
+    )
+)
+
+print(result.prePaMeasurement.ToDict())
+print(result.postPaMeasurement.ToDict())
+print([stage.ToDict() for stage in result.stages])
+print([item.ToDict() for item in result.improvements])
+```
+
+该场景逐路探测 PA 前和 PA 后网络，输出主路/耦合路径平坦度、中心耦合增益与相位、群时延和 MIMO 条件数；随后比较无 DPD、逐路独立 DPD、仅 PA 后目标去嵌入和完整耦合感知 DPD。默认参考结果中，完整方案相对逐路独立方案改善 EVM 0.376 dB、波形 NMSE 0.858 dB、残余耦合 4.364 dB，并提升最差 ACLR 0.325 dB。
+
+输出：
+
+- `channel_analysis.json`：配置、测量、训练和性能汇总；
+- `channel_path_measurements.csv`：每条有向路径的标量参数；
+- `channel_frequency_response.csv`：带内逐频点幅相；
+- `channel_dpd_comparison.csv`：四个补偿阶段；
+- `channel_dpd_improvements.csv`：修改前后、预期方向与通过状态；
+- `channel_analysis.png`：频响、耦合、条件数和DPD性能四联图。
+
+完整原理和图表解释见 [ChannelAnalyse.md](doc/ChannelAnalyse.md)。
+
 ## 指标定义
 
 - SNR：`SigProc` 完成时延、CFO、SFO 和公共复增益补偿后，数据字段参考功率与残差功率之比。
@@ -2373,4 +2469,10 @@ DPD-GMP分阶段改进基准：
 python tests\BenchMark.py --dpd-gmp
 ```
 
-验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善、多方法功率-EVM和双音IMD输出、Wiener/GMP/Doherty的频响/间隔记忆/动态迟滞/多输出功率图表，以及DpdGmp基础补偿、结构扩展、峰值加权、正则化和多功率训练的目标指标回归。
+通道测量与耦合感知DPD基准：
+
+```powershell
+python tests\BenchMark.py --channel-analyse
+```
+
+验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善、多方法功率-EVM和双音IMD输出、Wiener/GMP/Doherty的频响/间隔记忆/动态迟滞/多输出功率图表、DpdGmp基础补偿/结构扩展/峰值加权/正则化/多功率训练，以及PA前后MIMO通道平坦度、耦合参数、群时延、条件数和测量驱动耦合感知DPD的目标指标回归。

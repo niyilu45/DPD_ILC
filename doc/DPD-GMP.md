@@ -623,3 +623,63 @@ A_{\max}\frac{u[n]}{|u[n]|}, & |u[n]|>A_{\max}.
 4. 反馈链非线性可能被间接学习误认为 PA 失真；仪表前向采样通常更适合生成干净标签。
 5. 训练 NMSE、Wi-Fi EVM、ACLR和互调反映不同投影，不要求每一步都同时改善。
 6. 系数条件数只描述数值敏感度，不等于射频线性度。
+
+---
+
+## 15. 存在通道间耦合时的 DPD-GMP
+
+原始 `DpdGmp` 是 SISO PA 逆模型。若 PA 前和 PA 后分别存在测得的线性 MIMO 网络，完整级联为
+
+```math
+\mathbf{y}
+=
+\mathbf{H}_{\mathrm{post}}
+\mathbf{F}
+\left(
+\mathbf{H}_{\mathrm{pre}}\mathbf{z}
+\right).
+```
+
+逐路独立训练隐含假设两个通道矩阵都是单位阵。`CouplingAwareDpdGmp` 改成三步：
+
+```math
+\mathbf{q}
+=
+\mathbf{H}_{\mathrm{post}}^{-1}\mathbf{x},
+```
+
+```math
+p_i=D_i\{q_i\},
+```
+
+```math
+\mathbf{z}
+=
+\mathbf{H}_{\mathrm{pre}}^{-1}\mathbf{p}.
+```
+
+其中 $\mathbf{q}$ 是 PA 后耦合之前的逐 PA 输出目标，$\mathbf{p}$ 是逐路 GMP 生成的实际 PA 输入目标，$\mathbf{z}$ 才是最终 DAC 波形。
+
+训练时不能直接用最终端口参考 $x_i$ 作为第 $i$ 路 GMP 输入，而应先对 PA 后通道去嵌入：
+
+```math
+\widehat{\boldsymbol{\theta}}_i
+=
+\arg\min_{\boldsymbol{\theta}_i}
+\left\|
+\mathbf{\Phi}(q_i)\boldsymbol{\theta}_i
+-
+\mathbf{p}_i^{\mathrm{label}}
+\right\|_2^2
++
+\lambda
+\left\|
+\boldsymbol{\theta}_i-\boldsymbol{\theta}_{i,0}
+\right\|_2^2.
+```
+
+这里的 $\mathbf{p}_i^{\mathrm{label}}$ 是 PA 输入参考面上的 ILC 或逆学习标签。PA 前通道逆只在部署时把这些 PA 输入目标转换为 DAC 波形，不应再次改变训练标签。
+
+该方法适用于“线性耦合网络 + 相互独立的非线性 PA”。若负载牵引使一个 PA 的非线性直接依赖其他通道包络，则需要加入跨通道 GMP 基函数并联合训练，不能仅依赖线性矩阵求逆。
+
+通道冲激响应、平坦度、耦合参数、群时延、条件数、因果正则逆和修改前后性能比较见 [ChannelAnalyse.md](./ChannelAnalyse.md)。

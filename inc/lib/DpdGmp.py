@@ -3,7 +3,7 @@
 from collections import ChainMap
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, cast
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -1167,4 +1167,780 @@ class DpdGmp:
         """
 
         self.SynchronizeStructure()
+        return self.lastTrainingResult
+
+
+@dataclass(frozen=True)
+class CouplingAwareDpdGmpTrainingResult:
+    """Store per-chain GMP fitting diagnostics for one coupled MIMO update."""
+
+    chainResults: Tuple[DpdGmpTrainingResult, ...]
+    segmentCount: int
+    compensatePrePaCoupling: bool
+    compensatePostPaCoupling: bool
+
+    def ToDict(self) -> Dict[str, object]:
+        """Convert the coupled training result to ordinary nested mappings.
+
+        Processing details:
+            Algorithm: Copy segment and compensation-mode information, then
+            serialize every immutable SISO training result in physical-chain
+            order without recomputing coefficient diagnostics.
+
+        Returns:
+            result: JSON-compatible coupled-DPD training summary.
+        """
+
+        return {
+            "segmentCount": self.segmentCount,
+            "compensatePrePaCoupling": self.compensatePrePaCoupling,
+            "compensatePostPaCoupling": self.compensatePostPaCoupling,
+            "chainResults": [
+                chainResult.ToDict()
+                for chainResult in self.chainResults
+            ],
+        }
+
+
+class CouplingAwareDpdGmp:
+    """Deploy per-PA GMP models around measured pre/post coupling networks.
+
+    The class implements the cascade
+
+    ``reference -> inverse(post) -> per-PA DPD -> inverse(pre) -> DAC``.
+
+    Consequently, the physical pre-PA network recreates the intended
+    predistorted PA drives and the physical post-PA network recombines the
+    independently linearized PA outputs into the requested port waveforms.
+    Coupling inverses are obtained from measured causal impulse-response
+    matrices rather than from private ``Channel`` configuration values.
+    """
+
+    def __init__(
+        self,
+        dpdModels: Sequence[DpdGmp],
+        preChannelMeasurement: Optional[Any] = None,
+        postChannelMeasurement: Optional[Any] = None,
+        parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
+        **parameterOverrides: object,
+    ) -> None:
+        """Initialize a coupling-aware MIMO wrapper around SISO GMP models.
+
+        Processing details:
+            Algorithm: Define all defaults locally, layer recognized settings
+            with ChainMap precedence, retain one independent DpdGmp per PA,
+            validate chain count and inverse controls, and copy measured
+            pre/post impulse tensors after shape and finiteness checks.
+
+        Args:
+            dpdModels: Ordered sequence containing one trained model per PA.
+            preChannelMeasurement: Optional result exposing
+                ``impulseResponses`` or a raw response tensor.
+            postChannelMeasurement: Optional post-PA result or raw tensor.
+            parameters: Optional caller-owned live parameter mapping.
+            width: Optional public I/Q component width override.
+            parameterOverrides: Highest-priority recognized local settings.
+
+        Returns:
+            result: None. Identity coupling is used for omitted measurements.
+        """
+
+        self.defaultParameters: Mapping[str, object] = MappingProxyType(
+            {
+                "compensatePrePaCoupling": True,
+                "compensatePostPaCoupling": True,
+                "inverseRegularization": 1.0e-8,
+                "maximumInverseGainDb": 18.0,
+                "impulseTruncationDb": -100.0,
+                "width": 16,
+            }
+        )
+        directOverrides = dict(parameterOverrides)
+        if width is not None:
+            directOverrides["width"] = width
+        if parameters is not None and not isinstance(parameters, Mapping):
+            raise TypeError("parameters must be a mapping or None")
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "CouplingAwareDpdGmp",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
+            directOverrides,
+            self.defaultParameters,
+            "CouplingAwareDpdGmp",
+        )
+        self.parameters: ChainMap[str, object] = ChainMap(
+            recognizedOverrides,
+            externalParameters,
+            self.defaultParameters,
+        )
+        if isinstance(dpdModels, (str, bytes)):
+            raise TypeError("dpdModels must be a sequence of DpdGmp objects")
+        self.dpdModels = tuple(dpdModels)
+        self.preImpulseResponses: Optional[np.ndarray] = None
+        self.postImpulseResponses: Optional[np.ndarray] = None
+        self.lastTrainingResult: Optional[
+            CouplingAwareDpdGmpTrainingResult
+        ] = None
+        self.ValidateParameters()
+        self.ConfigureChannelMeasurements(
+            preChannelMeasurement,
+            postChannelMeasurement,
+        )
+
+    @property
+    def Width(self) -> int:
+        """Return the public signed I/Q component width.
+
+        Processing details:
+            Algorithm: Read the validated ChainMap value so live external
+            parameter changes affect the next matrix conversion.
+
+        Returns:
+            result: Zero for floating mode or a positive fixed-point width.
+        """
+
+        return cast(int, self.parameters["width"])
+
+    width = Width
+
+    @property
+    def ChainCount(self) -> int:
+        """Return the number of independently modeled PA branches.
+
+        Processing details:
+            Algorithm: Derive chain count directly from the immutable DPD
+            tuple so it cannot disagree with coefficient storage.
+
+        Returns:
+            result: Positive number of input/output columns.
+        """
+
+        return len(self.dpdModels)
+
+    chainCount = ChainCount
+
+    def GetParameters(self) -> Dict[str, object]:
+        """Return a flattened snapshot of all coupled-DPD settings.
+
+        Processing details:
+            Algorithm: Validate live values and copy the resolved ChainMap
+            without exposing caller or default mapping layers.
+
+        Returns:
+            result: Ordinary dictionary of inverse and boundary controls.
+        """
+
+        self.ValidateParameters()
+        return dict(self.parameters)
+
+    def UpdateParameters(self, **parameterOverrides: object) -> None:
+        """Apply recognized coupled-DPD parameter changes transactionally.
+
+        Processing details:
+            Algorithm: Filter unknown keys with warnings, update the local
+            ChainMap layer, validate the entire new state, and restore prior
+            values if any recognized setting is invalid.
+
+        Args:
+            parameterOverrides: Supported highest-priority replacements.
+
+        Returns:
+            result: None. Valid changes affect future fitting and inference.
+        """
+
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "CouplingAwareDpdGmp.UpdateParameters",
+        )
+        previousOverrides = dict(self.parameters.maps[0])
+        self.parameters.maps[0].update(recognizedOverrides)
+        try:
+            self.ValidateParameters()
+        except (TypeError, ValueError):
+            self.parameters.maps[0].clear()
+            self.parameters.maps[0].update(previousOverrides)
+            raise
+
+    def ValidateParameters(self) -> None:
+        """Validate model count, inverse controls, booleans, and public width.
+
+        Processing details:
+            Algorithm: Require at least two genuine DpdGmp branches, exact
+            booleans for each coupling stage, positive regularization and
+            inverse-gain limits, a negative impulse truncation level, and a
+            supported floating or signed fixed-point boundary.
+
+        Returns:
+            result: None. Invalid values raise descriptive exceptions.
+        """
+
+        if len(self.dpdModels) < 2 or any(
+            not isinstance(dpdModel, DpdGmp)
+            for dpdModel in self.dpdModels
+        ):
+            raise ValueError(
+                "dpdModels must contain at least two DpdGmp objects"
+            )
+        for parameterName in (
+            "compensatePrePaCoupling",
+            "compensatePostPaCoupling",
+        ):
+            if not isinstance(self.parameters[parameterName], bool):
+                raise TypeError(f"{parameterName} must be a bool")
+        for parameterName in (
+            "inverseRegularization",
+            "maximumInverseGainDb",
+        ):
+            parameterValue = self.parameters[parameterName]
+            if (
+                not isinstance(parameterValue, (int, float))
+                or isinstance(parameterValue, bool)
+                or not np.isfinite(parameterValue)
+                or float(parameterValue) <= 0.0
+            ):
+                raise ValueError(
+                    f"{parameterName} must be finite and positive"
+                )
+        impulseTruncationDb = self.parameters["impulseTruncationDb"]
+        if (
+            not isinstance(impulseTruncationDb, (int, float))
+            or isinstance(impulseTruncationDb, bool)
+            or not np.isfinite(impulseTruncationDb)
+            or float(impulseTruncationDb) >= 0.0
+        ):
+            raise ValueError(
+                "impulseTruncationDb must be finite and negative"
+            )
+        FixedPoint(self.width)
+
+    def ConfigureChannelMeasurements(
+        self,
+        preChannelMeasurement: Optional[Any],
+        postChannelMeasurement: Optional[Any],
+    ) -> None:
+        """Copy measured channel tensors used by training and compensation.
+
+        Processing details:
+            Algorithm: Accept either ChannelMeasurementResult-like objects or
+            raw delay-by-destination-by-source arrays, validate their chain
+            dimensions, remove only a trailing region below the configured
+            relative energy threshold, and use identity tensors for None.
+
+        Args:
+            preChannelMeasurement: PA-input network measurement or None.
+            postChannelMeasurement: PA-output network measurement or None.
+
+        Returns:
+            result: None. New responses affect subsequent operations.
+        """
+
+        self.ValidateParameters()
+        self.preImpulseResponses = self.ResolveImpulseResponses(
+            preChannelMeasurement,
+            "preChannelMeasurement",
+        )
+        self.postImpulseResponses = self.ResolveImpulseResponses(
+            postChannelMeasurement,
+            "postChannelMeasurement",
+        )
+
+    def ResolveImpulseResponses(
+        self,
+        channelMeasurement: Optional[Any],
+        measurementName: str,
+    ) -> np.ndarray:
+        """Resolve one measurement object or array to a compact owned tensor.
+
+        Processing details:
+            Algorithm: Substitute an identity impulse for None, retrieve the
+            public ``impulseResponses`` attribute when present, validate a
+            finite square tensor matching the DPD chain count, and retain all
+            taps through the last sample above the relative truncation floor.
+
+        Args:
+            channelMeasurement: Measurement result, raw tensor, or None.
+            measurementName: Name included in validation errors.
+
+        Returns:
+            result: Owned causal complex response tensor.
+        """
+
+        if channelMeasurement is None:
+            identityResponse = np.zeros(
+                (1, self.chainCount, self.chainCount),
+                dtype=np.complex128,
+            )
+            identityResponse[0, :, :] = np.eye(
+                self.chainCount, dtype=np.complex128
+            )
+            return identityResponse
+        rawImpulseResponses = getattr(
+            channelMeasurement,
+            "impulseResponses",
+            channelMeasurement,
+        )
+        responseTensor = np.asarray(
+            rawImpulseResponses, dtype=np.complex128
+        )
+        if (
+            responseTensor.ndim != 3
+            or responseTensor.shape[0] < 1
+            or responseTensor.shape[1]
+            != responseTensor.shape[2]
+            or responseTensor.shape[1] != self.chainCount
+            or not np.all(np.isfinite(responseTensor))
+        ):
+            raise ValueError(
+                f"{measurementName} must contain a finite "
+                "delay-by-destination-by-source tensor matching chain count"
+            )
+        tapMagnitudes = np.max(
+            np.abs(responseTensor), axis=(1, 2)
+        )
+        peakMagnitude = max(
+            float(np.max(tapMagnitudes)),
+            np.finfo(float).tiny,
+        )
+        truncationMagnitude = peakMagnitude * np.power(
+            10.0,
+            float(self.parameters["impulseTruncationDb"]) / 20.0,
+        )
+        significantTapIndices = np.flatnonzero(
+            tapMagnitudes >= truncationMagnitude
+        )
+        lastTapIndex = (
+            int(significantTapIndices[-1])
+            if significantTapIndices.size
+            else 0
+        )
+        return responseTensor[: lastTapIndex + 1, :, :].copy()
+
+    def PreparePublicMatrix(
+        self, inputSignal: np.ndarray, signalName: str
+    ) -> np.ndarray:
+        """Decode and validate one public samples-by-chain waveform matrix.
+
+        Processing details:
+            Algorithm: Decode the configured interface once, permit a vector
+            only for an impossible single-chain wrapper, and require a finite
+            nonempty matrix with exactly one column per physical PA.
+
+        Args:
+            inputSignal: Public floating samples or fixed I/Q codes.
+            signalName: Name included in validation errors.
+
+        Returns:
+            result: Normalized finite complex matrix.
+        """
+
+        decodedSignal = FixedPoint(self.width).DecodeComplex(
+            inputSignal
+        )
+        signalMatrix = np.asarray(
+            decodedSignal, dtype=np.complex128
+        )
+        if signalMatrix.ndim == 1 and self.chainCount == 1:
+            signalMatrix = signalMatrix.reshape(-1, 1)
+        if (
+            signalMatrix.ndim != 2
+            or signalMatrix.shape[0] == 0
+            or signalMatrix.shape[1] != self.chainCount
+            or not np.all(np.isfinite(signalMatrix))
+        ):
+            raise ValueError(
+                f"{signalName} must be a finite nonempty "
+                "samples-by-chain matrix"
+            )
+        return signalMatrix
+
+    def ApplyMeasuredResponse(
+        self,
+        inputSignal: np.ndarray,
+        impulseResponses: np.ndarray,
+    ) -> np.ndarray:
+        """Apply a measured causal MIMO response without circular convolution.
+
+        Processing details:
+            Algorithm: Convolve every source column with each directed FIR,
+            retain the original record length, and sum contributions at each
+            destination exactly according to
+            ``y[n] = sum_l H[l] x[n-l]``.
+
+        Args:
+            inputSignal: Normalized samples-by-source matrix.
+            impulseResponses: Delay-by-destination-by-source tensor.
+
+        Returns:
+            result: Same-length normalized destination matrix.
+        """
+
+        inputMatrix = np.asarray(
+            inputSignal, dtype=np.complex128
+        )
+        responseTensor = np.asarray(
+            impulseResponses, dtype=np.complex128
+        )
+        if (
+            inputMatrix.ndim != 2
+            or inputMatrix.shape[1] != self.chainCount
+            or responseTensor.ndim != 3
+            or responseTensor.shape[1:]
+            != (self.chainCount, self.chainCount)
+        ):
+            raise ValueError(
+                "inputSignal and impulseResponses have incompatible shapes"
+            )
+        outputMatrix = np.zeros_like(inputMatrix)
+        for destinationChain in range(self.chainCount):
+            for sourceChain in range(self.chainCount):
+                outputMatrix[:, destinationChain] += np.convolve(
+                    inputMatrix[:, sourceChain],
+                    responseTensor[
+                        :, destinationChain, sourceChain
+                    ],
+                    mode="full",
+                )[: inputMatrix.shape[0]]
+        if not np.all(np.isfinite(outputMatrix)):
+            raise ValueError(
+                "measured channel response exceeded numeric range"
+            )
+        return outputMatrix
+
+    def InvertMeasuredResponse(
+        self,
+        targetSignal: np.ndarray,
+        impulseResponses: np.ndarray,
+    ) -> np.ndarray:
+        """Solve a regularized causal MIMO deconvolution sample by sample.
+
+        Processing details:
+            Algorithm: Build a Tikhonov-regularized SVD inverse of the
+            zero-delay transfer matrix, cap every inverse singular gain, then
+            recursively subtract all already-known delayed contributions
+            before solving the current source vector.  This avoids circular
+            FFT wraparound and remains stable for weak measured coupling.
+
+        Args:
+            targetSignal: Desired samples-by-destination matrix.
+            impulseResponses: Measured causal response tensor.
+
+        Returns:
+            result: Source waveform whose measured response follows target.
+        """
+
+        targetMatrix = np.asarray(
+            targetSignal, dtype=np.complex128
+        )
+        responseTensor = np.asarray(
+            impulseResponses, dtype=np.complex128
+        )
+        if (
+            targetMatrix.ndim != 2
+            or targetMatrix.shape[1] != self.chainCount
+            or responseTensor.ndim != 3
+            or responseTensor.shape[1:]
+            != (self.chainCount, self.chainCount)
+            or not np.all(np.isfinite(targetMatrix))
+            or not np.all(np.isfinite(responseTensor))
+        ):
+            raise ValueError(
+                "targetSignal and impulseResponses have incompatible shapes"
+            )
+        zeroDelayMatrix = responseTensor[0, :, :]
+        leftVectors, singularValues, rightVectorsHermitian = (
+            np.linalg.svd(zeroDelayMatrix)
+        )
+        regularization = float(
+            self.parameters["inverseRegularization"]
+        )
+        maximumInverseGain = np.power(
+            10.0,
+            float(self.parameters["maximumInverseGainDb"]) / 20.0,
+        )
+        inverseSingularValues = np.minimum(
+            singularValues
+            / (singularValues**2 + regularization),
+            maximumInverseGain,
+        )
+        zeroDelayInverse = (
+            rightVectorsHermitian.conj().T
+            @ np.diag(inverseSingularValues)
+            @ leftVectors.conj().T
+        )
+        sourceMatrix = np.zeros_like(targetMatrix)
+        tapCount = responseTensor.shape[0]
+        for sampleIndex in range(targetMatrix.shape[0]):
+            delayedContribution = np.zeros(
+                self.chainCount, dtype=np.complex128
+            )
+            maximumDelay = min(tapCount - 1, sampleIndex)
+            for delayIndex in range(1, maximumDelay + 1):
+                delayedContribution += (
+                    responseTensor[delayIndex, :, :]
+                    @ sourceMatrix[sampleIndex - delayIndex, :]
+                )
+            sourceMatrix[sampleIndex, :] = (
+                zeroDelayInverse
+                @ (
+                    targetMatrix[sampleIndex, :]
+                    - delayedContribution
+                )
+            )
+        if not np.all(np.isfinite(sourceMatrix)):
+            raise ValueError(
+                "measured coupling inverse exceeded numeric range"
+            )
+        return sourceMatrix
+
+    def BuildPaOutputTargets(
+        self, referenceSignal: np.ndarray
+    ) -> np.ndarray:
+        """De-embed post-PA coupling from requested observation waveforms.
+
+        Processing details:
+            Algorithm: Validate a normalized reference matrix and, when
+            enabled, solve the measured post-network inverse so each SISO GMP
+            is trained and evaluated against the PA output required before
+            physical output coupling.
+
+        Args:
+            referenceSignal: Desired final observed waveform matrix.
+
+        Returns:
+            result: Desired individual PA-output matrix.
+        """
+
+        referenceMatrix = np.asarray(
+            referenceSignal, dtype=np.complex128
+        )
+        if (
+            referenceMatrix.ndim != 2
+            or referenceMatrix.shape[1] != self.chainCount
+            or referenceMatrix.shape[0] == 0
+            or not np.all(np.isfinite(referenceMatrix))
+        ):
+            raise ValueError(
+                "referenceSignal must be a finite samples-by-chain matrix"
+            )
+        if not cast(
+            bool, self.parameters["compensatePostPaCoupling"]
+        ):
+            return referenceMatrix.copy()
+        return self.InvertMeasuredResponse(
+            referenceMatrix,
+            cast(np.ndarray, self.postImpulseResponses),
+        )
+
+    def BuildDacInput(
+        self, predistortedPaInput: np.ndarray
+    ) -> np.ndarray:
+        """Pre-cancel the measured PA-input coupling network.
+
+        Processing details:
+            Algorithm: Validate the independently predistorted PA-drive
+            matrix and, when enabled, solve the measured pre-network inverse
+            so the physical coupling recreates those intended PA inputs.
+
+        Args:
+            predistortedPaInput: Desired actual input at every PA port.
+
+        Returns:
+            result: Raw DAC waveform matrix before physical pre-PA coupling.
+        """
+
+        paInputMatrix = np.asarray(
+            predistortedPaInput, dtype=np.complex128
+        )
+        if (
+            paInputMatrix.ndim != 2
+            or paInputMatrix.shape[1] != self.chainCount
+            or paInputMatrix.shape[0] == 0
+            or not np.all(np.isfinite(paInputMatrix))
+        ):
+            raise ValueError(
+                "predistortedPaInput must be a finite "
+                "samples-by-chain matrix"
+            )
+        if not cast(
+            bool, self.parameters["compensatePrePaCoupling"]
+        ):
+            return paInputMatrix.copy()
+        return self.InvertMeasuredResponse(
+            paInputMatrix,
+            cast(np.ndarray, self.preImpulseResponses),
+        )
+
+    def ProcessFloating(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Apply post de-embedding, per-PA GMP, and pre-coupling cancellation.
+
+        Processing details:
+            Algorithm: Convert the desired final outputs to individual PA
+            targets using the measured post inverse, evaluate every trained
+            DpdGmp in its normalized floating domain, then transform intended
+            PA drives to raw DAC samples using the measured pre inverse.
+
+        Args:
+            inputSignal: Normalized desired samples-by-chain outputs.
+
+        Returns:
+            result: Normalized raw DAC waveform matrix.
+        """
+
+        self.ValidateParameters()
+        paOutputTargets = self.BuildPaOutputTargets(inputSignal)
+        predistortedColumns = []
+        for chainIndex, dpdModel in enumerate(self.dpdModels):
+            predistortedColumns.append(
+                dpdModel.ProcessFloating(
+                    paOutputTargets[:, chainIndex]
+                )
+            )
+        predistortedPaInput = np.column_stack(
+            predistortedColumns
+        )
+        return self.BuildDacInput(predistortedPaInput)
+
+    def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Apply coupled MIMO DPD while preserving the public data convention.
+
+        Processing details:
+            Algorithm: Decode the complete matrix once, execute all channel
+            inverses and GMP models in normalized floating point, and encode
+            the raw DAC matrix once at the configured interface width.
+
+        Args:
+            inputSignal: Public desired waveform matrix.
+
+        Returns:
+            result: Public raw-DAC matrix in floating or integer-code form.
+        """
+
+        inputMatrix = self.PreparePublicMatrix(
+            inputSignal, "inputSignal"
+        )
+        outputMatrix = self.ProcessFloating(inputMatrix)
+        return FixedPoint(self.width).EncodeComplex(outputMatrix)
+
+    def FitCoupledSegments(
+        self,
+        referenceSignals: Sequence[np.ndarray],
+        paInputTargetSignals: Sequence[np.ndarray],
+        segmentWeights: Optional[Sequence[float]] = None,
+        sampleWeights: Optional[
+            Sequence[Optional[np.ndarray]]
+        ] = None,
+    ) -> CouplingAwareDpdGmpTrainingResult:
+        """Fit every PA inverse using post-deembedded references and labels.
+
+        Processing details:
+            Algorithm: Decode each desired final-output segment, remove the
+            measured post-PA coupling to obtain individual PA-output targets,
+            decode matching labels measured at the actual PA inputs after
+            pre-coupling, and fit one DpdGmp per physical chain.  Pre-network
+            cancellation is applied later during inference, not to labels.
+
+        Args:
+            referenceSignals: Desired final observed waveform segments.
+            paInputTargetSignals: Matching learned actual PA-input labels.
+            segmentWeights: Optional positive importance per segment.
+            sampleWeights: Optional sample weights per segment.
+
+        Returns:
+            result: Per-chain coefficient and conditioning diagnostics.
+        """
+
+        if (
+            isinstance(referenceSignals, (str, bytes))
+            or isinstance(paInputTargetSignals, (str, bytes))
+        ):
+            raise TypeError("training signals must be matrix sequences")
+        referenceSequence = tuple(referenceSignals)
+        targetSequence = tuple(paInputTargetSignals)
+        if (
+            not referenceSequence
+            or len(referenceSequence) != len(targetSequence)
+        ):
+            raise ValueError(
+                "referenceSignals and paInputTargetSignals must have "
+                "equal nonzero segment counts"
+            )
+        preparedPaOutputTargets = []
+        preparedPaInputLabels = []
+        for referenceSignal, targetSignal in zip(
+            referenceSequence, targetSequence
+        ):
+            referenceMatrix = self.PreparePublicMatrix(
+                referenceSignal, "referenceSignal"
+            )
+            targetMatrix = self.PreparePublicMatrix(
+                targetSignal, "paInputTargetSignal"
+            )
+            if referenceMatrix.shape != targetMatrix.shape:
+                raise ValueError(
+                    "every reference and PA-input target matrix must "
+                    "have identical shape"
+                )
+            preparedPaOutputTargets.append(
+                self.BuildPaOutputTargets(referenceMatrix)
+            )
+            preparedPaInputLabels.append(targetMatrix)
+        chainResults = []
+        for chainIndex, dpdModel in enumerate(self.dpdModels):
+            modelInterface = FixedPoint(dpdModel.width)
+            chainReferences = tuple(
+                modelInterface.EncodeComplex(
+                    targetMatrix[:, chainIndex]
+                )
+                for targetMatrix in preparedPaOutputTargets
+            )
+            chainLabels = tuple(
+                modelInterface.EncodeComplex(
+                    labelMatrix[:, chainIndex]
+                )
+                for labelMatrix in preparedPaInputLabels
+            )
+            chainResults.append(
+                dpdModel.FitSegments(
+                    chainReferences,
+                    chainLabels,
+                    segmentWeights,
+                    sampleWeights,
+                )
+            )
+        trainingResult = CouplingAwareDpdGmpTrainingResult(
+            chainResults=tuple(chainResults),
+            segmentCount=len(referenceSequence),
+            compensatePrePaCoupling=cast(
+                bool,
+                self.parameters["compensatePrePaCoupling"],
+            ),
+            compensatePostPaCoupling=cast(
+                bool,
+                self.parameters["compensatePostPaCoupling"],
+            ),
+        )
+        self.lastTrainingResult = trainingResult
+        return trainingResult
+
+    def GetLastTrainingResult(
+        self,
+    ) -> Optional[CouplingAwareDpdGmpTrainingResult]:
+        """Return the latest immutable coupled-training diagnostics.
+
+        Processing details:
+            Algorithm: Return the frozen result record directly because its
+            chain result tuple contains only immutable scalar dataclasses.
+
+        Returns:
+            result: Last fit result or None before training.
+        """
+
         return self.lastTrainingResult

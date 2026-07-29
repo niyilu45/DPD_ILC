@@ -2024,3 +2024,104 @@ python tests/BenchMark.py --dpd-gmp
 - [ ] CSV、JSON、PNG和文档使用相同阶段顺序和数值。
 
 完整原理和改进解释见 [DPD-GMP.md](./DPD-GMP.md) 与 [PaAnalyse.md第12节](./PaAnalyse.md#12-pa特性分析后的dpd-gmp改进与实测对比)。
+
+## 31. J类：通道测量与耦合感知 DPD-GMP
+
+### 31.1 分类目的
+
+J类验证完整闭环：
+
+1. 从探测波形恢复 PA 前和 PA 后 MIMO 冲激响应。
+2. 计算平坦度、耦合增益/相位、群时延和条件数。
+3. 根据测量结果修改 DPD-GMP 训练目标。
+4. 根据 PA 前测量结果修改部署 DAC 波形。
+5. 在同一耦合、PA、功率和 Wi-Fi 参考下比较修改前后性能。
+
+### 31.2 场景构造
+
+| 类别 | 设置 |
+|---|---|
+| Wi-Fi | 两路独立 EHT、20 MHz、80 MS/s、MCS 7 |
+| PA | 链 1 为 GMP，链 2 为 Wiener |
+| 输出工作点 | 每路 13 dBm |
+| PA 前网络 | 双向非对称耦合、FIR、整数和分数时延 |
+| PA 后网络 | 另一组双向非对称耦合、FIR和时延 |
+| 测量 | 逐源通道单位冲激，64 抽头，2048 点 FFT |
+| 接收噪声 | 关闭，保证控制变量 |
+| DPD | 1/3/5/7 阶、主记忆 4、交叉记忆 3 |
+
+### 31.3 阶段对比
+
+| 阶段 | PA 后目标去嵌入 | PA 前 DAC 预消除 | 目的 |
+|---|---:|---:|---|
+| Coupled PA baseline | 否 | 否 | 耦合非线性基线 |
+| Independent DPD-GMP | 否 | 否 | 旧的逐路 SISO 方案 |
+| Post-deembedded DPD-GMP | 是 | 否 | 单独验证训练目标修改 |
+| Coupling-aware DPD-GMP | 是 | 是 | 验证完整测量驱动方案 |
+
+预期不是“所有中间阶段所有指标都单调”。自动断言比较 Independent 与完整 Coupling-aware：
+
+- EVM 降低；
+- 波形 NMSE 降低；
+- 残余耦合降低；
+- 最差 ACLR 提高。
+
+### 31.4 执行流程
+
+```mermaid
+flowchart TD
+    plant["构造双通道 PA 前耦合、不同 PA、PA 后耦合"] --> measurePre["测量 Hpre"]
+    plant --> measurePost["测量 Hpost"]
+    measurePre --> pathMetrics["平坦度、耦合、时延、条件数"]
+    measurePost --> pathMetrics
+    references["两路独立等功率 Wi-Fi"] --> independent["逐路独立 DPD"]
+    references --> postInverse["Hpost 逆得到逐 PA 输出目标"]
+    postInverse --> labels["逐 PA ILC 标签"]
+    labels --> fit["FitCoupledSegments"]
+    fit --> preInverse["Hpre 逆得到 DAC 波形"]
+    independent --> compare["相同 plant 的 EVM/NMSE/ACLR/残余耦合"]
+    preInverse --> compare
+    pathMetrics --> files["路径 CSV、频响 CSV、JSON、PNG"]
+    compare --> files
+```
+
+图示说明：测量函数不读取 `Channel` 内部路径配置；DPD 只消费实测冲激响应。测试文件只负责编排与保存。
+
+### 31.5 默认结果
+
+| 对比指标 | Independent | Coupling-aware | 改善 |
+|---|---:|---:|---:|
+| EVM | 2.711 dB | 2.334 dB | 0.376 dB |
+| 波形 NMSE | -3.629 dB | -4.487 dB | 0.858 dB |
+| 残余耦合 | -12.199 dB | -16.562 dB | 4.364 dB |
+| 最差 ACLR | 8.919 dB | 9.245 dB | 0.325 dB |
+
+该强耦合高 PAPR 场景用于验证相对改进，不是产品 EVM 验收门限。四项 `expectationMet` 均为真。
+
+### 31.6 运行和输出
+
+```powershell
+python tests/BenchMark.py --channel-analyse `
+    --output-dir results/channel_analysis
+```
+
+| 文件 | 内容 |
+|---|---|
+| `channel_analysis.json` | 配置、测量、训练和性能 |
+| `channel_path_measurements.csv` | 每条方向路径的标量测量 |
+| `channel_frequency_response.csv` | 带内逐频点幅相 |
+| `channel_dpd_comparison.csv` | 四个补偿阶段 |
+| `channel_dpd_improvements.csv` | 修改前后与 PASS/FAIL |
+| `channel_analysis.png` | 通道与 DPD 四联图 |
+
+### 31.7 J类验收清单
+
+- [ ] PA 前和 PA 后测量各包含完整的 $N_{\mathrm{ch}}^2$ 路径；
+- [ ] 耦合方向、中心增益、相位和平坦度可在 CSV 中审计；
+- [ ] 群时延使用解缠相位斜率而不是只找最大抽头；
+- [ ] 全带内最差条件数已保存；
+- [ ] 标签使用 PA 后去嵌入目标；
+- [ ] 部署波形使用 PA 前因果正则逆；
+- [ ] Independent 与 Coupling-aware 使用同一物理 plant；
+- [ ] 四个预期比较全部通过；
+- [ ] JSON、CSV、PNG 与 [ChannelAnalyse.md](./ChannelAnalyse.md) 数值一致。

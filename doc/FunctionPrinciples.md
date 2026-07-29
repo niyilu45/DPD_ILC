@@ -5,7 +5,7 @@
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `main.py` 和 `inc/**/*.py` 中 396 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis、DPD-ILC和独立DpdGmp核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC与MIMO ILC统一位于 `DpdIlc.py`，可部署且可增量更新的GMP位于`DpdGmp.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
+本次审计共检查 `main.py` 和 `inc/**/*.py` 中 430 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis、DPD-ILC、通道测量和DpdGmp核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC与MIMO ILC统一位于 `DpdIlc.py`，可部署且可增量更新的GMP及耦合感知封装位于`DpdGmp.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
 
 ## 1. 分类规则
 
@@ -30,9 +30,11 @@ flowchart LR
     metadata --> frame["FrameProcess.md：OFDM与空间解映射"]
     frame --> analysis
     pa --> sync
+    pa --> channelMeasure["ChannelAnalyse.md：平坦度、耦合、时延和条件数"]
+    channelMeasure --> ilc
     sync --> analysis["Analysis.md：MSE/SNR/EVM/ACLR"]
     analysis --> report["打印/保存/绘图"]
-    audit["本文：396 个定义位置逐项索引"] -.-> wave
+    audit["本文：430 个定义位置逐项索引"] -.-> wave
     audit -.-> pa
     audit -.-> ilc
     audit -.-> sync
@@ -209,6 +211,22 @@ flowchart LR
 | `Channel.ProcessFloating`, `Channel.Process` | P/N/E | `Process(inputSignal, outputPowerDbm)` 按“PA前耦合→逐路PA→PA后耦合→采样链”运行；给定目标时先联合或独立闭环调整PA输入，收敛后只采样一次，并在定点公开模式返回整数I/Q码 | Channel §1、§1.3–§1.4、§3.4、§6.2–§6.4 |
 | `Channel.SmallSignalGain` | P/N | forward模式返回PA小信号增益与公共相位；fb模式再乘反馈直通小信号系数；零均值噪声、DC、镜像和量化不伪装成标量增益 | Channel §2、§4 |
 
+### 4.2 `ChannelAnalyse.py`：MIMO通道测量
+
+完整测量推导、参考面和耦合感知DPD联动见 [ChannelAnalyse.md](./ChannelAnalyse.md)。
+
+| 函数/方法 | 类型 | 原理或职责 | 对应章节 |
+|---|---|---|---|
+| `ChannelPathMeasurement.ToDict` | E | 序列化一条有向路径的增益、相位、平坦度、群时延和检测状态，不重新估计 | ChannelAnalyse §3–§4 |
+| `ChannelMeasurementResult.ToDict` | E | 序列化配置与标量汇总，完整复冲激/频响数组留在内存或独立CSV中 | ChannelAnalyse §9、§13 |
+| `ChannelMeasurementResult.GetPath` | E | 按源链和目标链返回已测路径，不执行插值或重新计算 | ChannelAnalyse §2 |
+| `ChannelAnalyse.__init__`, `ChannelAnalyse.Width`, `ChannelAnalyse.GetParameters`, `ChannelAnalyse.UpdateParameters`, `ChannelAnalyse.ValidateParameters` | E | 在类内建立ChainMap默认参数，未知键警告后忽略，并校验采样率、带宽、FFT、冲激记录、检测门限和公开位宽 | ChannelAnalyse §6、§9 |
+| `ChannelAnalyse.BuildImpulseProbe` | P/N | 在单一源链保护间隔后放置单位冲激，以正交时分探测恢复所有有向路径 | ChannelAnalyse §2.2 |
+| `ChannelAnalyse.Measure` | P/N/E | 逐源激励被测可调用网络，采集全部目标链并组装“时延×目标×源”因果冲激响应矩阵 | ChannelAnalyse §2、§6 |
+| `ChannelAnalyse.AnalyzeImpulseResponses` | P/N | 对每条冲激响应做FFT，在占用带宽内计算路径指标，并以逐频点SVD得到MIMO条件数 | ChannelAnalyse §3–§5 |
+| `ChannelAnalyse.ProtectMagnitude` | N | 对复频响施加保持相位的幅度下限，防止相对耦合除法和对数溢出 | ChannelAnalyse §3.3、§3.4 |
+| `ChannelAnalyse.MeasurePath` | P/N | 计算中心增益/相位、峰峰幅度平坦度，并对有效频点解缠相位斜率拟合群时延 | ChannelAnalyse §3–§4 |
+
 ## 5. `DpdIlc.py`：全部 ILC、部署模型和基准函数
 
 详细推导统一见 [DPD-ILC.md](./DPD-ILC.md)，MSE 选优见 [Analysis.md §5.5–§5.10](./Analysis.md)。
@@ -290,6 +308,17 @@ flowchart LR
 | `DpdGmp.FitSegments`, `DpdGmp.UpdateCoefficientSegments` | N/P | 对多帧或多功率片段独立建立记忆并累加正规方程，防止简单拼接在边界制造不存在的PA历史 | DPD-GMP §9、DpdGmp §6 |
 | `DpdGmp.FitFromIlc` | P/N | 用原始理想波形建立GMP基函数，以ILC收敛PA输入为监督标签，把波形专用逆压缩成可复用系数 | DPD-GMP §5.1、DpdGmp §5 |
 | `DpdGmp.FitIndirect` | P/N/E | 调用SigProc同步并公共复增益归一化PA输出，以校正输出为后置逆输入、真实PA输入为目标，再把后置逆系数用于前置DPD | DPD-GMP §5.3、DpdGmp §8 |
+| `CouplingAwareDpdGmpTrainingResult.ToDict` | E | 按物理链序列化每路GMP训练诊断和PA前/后补偿开关，不重新训练 | DpdGmp §16 |
+| `CouplingAwareDpdGmp.__init__`, `CouplingAwareDpdGmp.Width`, `CouplingAwareDpdGmp.ChainCount`, `CouplingAwareDpdGmp.GetParameters`, `CouplingAwareDpdGmp.UpdateParameters`, `CouplingAwareDpdGmp.ValidateParameters` | E | 保存逐PA模型、测量结果和ChainMap逆补偿参数，警告并忽略未知键，校验正则、逆增益和公开位宽 | DpdGmp §16 |
+| `CouplingAwareDpdGmp.ConfigureChannelMeasurements`, `CouplingAwareDpdGmp.ResolveImpulseResponses` | N/E | 接受测量对象或原始MIMO冲激张量，校验“时延×目标×源”形状，并按相对能量删除无效尾部抽头；None变为单位通道 | ChannelAnalyse §8–§9 |
+| `CouplingAwareDpdGmp.PreparePublicMatrix` | N/E | 在公开边界一次解码完整MIMO波形，保留样点×物理链形状 | DpdGmp §16 |
+| `CouplingAwareDpdGmp.ApplyMeasuredResponse` | P/N | 按测得的因果MIMO FIR执行所有源到目标路径的线性卷积，不使用循环卷积 | ChannelAnalyse §2、§8.5 |
+| `CouplingAwareDpdGmp.InvertMeasuredResponse` | N/P | 对零时延矩阵做正则化、限逆增益SVD，再逐样点递推减去已知历史，得到稳定因果MIMO反卷积 | ChannelAnalyse §5、§8.5 |
+| `CouplingAwareDpdGmp.BuildPaOutputTargets` | P/N | 用测得的PA后通道逆把最终端口参考转换为逐PA输出目标，避免把线性串扰拟合为非线性 | ChannelAnalyse §8.2 |
+| `CouplingAwareDpdGmp.BuildDacInput` | P/N | 用测得的PA前通道逆把逐PA实际输入目标转换为DAC波形，使物理耦合后恢复训练参考面 | ChannelAnalyse §8.4 |
+| `CouplingAwareDpdGmp.ProcessFloating`, `CouplingAwareDpdGmp.Process` | P/N/E | 依次执行PA后目标去嵌入、逐PA浮点GMP和PA前DAC预消除，并在公开入口只做一次解码和编码 | DPD-GMP §15、DpdGmp §16 |
+| `CouplingAwareDpdGmp.FitCoupledSegments` | P/N | 对最终参考做PA后去嵌入，再以实际PA输入ILC标签逐链运行多片段GMP岭回归；PA前逆留到部署 | ChannelAnalyse §8.2–§8.4 |
+| `CouplingAwareDpdGmp.GetLastTrainingResult` | E | 返回最近一次不可变逐链训练诊断或None | DpdGmp §16 |
 
 ## 6. `SigProc.py`：同步、补偿和功率标定函数
 
@@ -380,6 +409,8 @@ flowchart LR
 | `Draw.CreatePaPowerCharacteristicsFigure`, `Draw.SavePaPowerCharacteristics` | 绘制/保存互调和动态迟滞随实测输出功率的变化 | PaAnalyse §6 |
 | `Draw.ValidateDpdGmpStages` | 检查DPD-GMP阶段名、EVM、ACLR、IM3和可选标签/条件数字段，不填造baseline缺失值 | PaAnalyse §12 |
 | `Draw.CreateDpdGmpPerformanceFigure`, `Draw.SaveDpdGmpPerformance` | 绘制/保存DPD-GMP的同功率EVM、IM3、标签NMSE和对数条件数四联图，不重新训练或计算指标 | PaAnalyse §12、DPD-GMP §12 |
+| `Draw.ValidateChannelAnalysis` | 检查通道频率网格、方阵响应和各DPD阶段EVM/NMSE/ACLR/残余耦合字段，不修改测量 | ChannelAnalyse §12–§13 |
+| `Draw.CreateChannelAnalysisFigure`, `Draw.SaveChannelAnalysis` | 绘制/保存主路频响、相对耦合频响、MIMO条件数及耦合感知DPD前后性能，不重新测量或训练 | ChannelAnalyse §12–§13 |
 
 图上的连线只帮助阅读离散采样点，不表示功率点或迭代轮次之间存在连续物理轨迹。
 
@@ -410,6 +441,16 @@ flowchart LR
 | `BenchMark.BuildPaDpdRecommendations` | E/P | 根据实测频响、记忆、迟滞、互调和功率拐点，为每种PA的每类测试生成DPD结构、初始参数、训练和验收建议 | PaAnalyse §2.4、§3.4、§4.1、§5.1、§6.1 |
 | `BenchMark.RunPaCharacterizationBenchmark` | E/P | 对Wiener、GMP和Doherty运行共同频响、记忆与功率扫描并调用独立绘图层 | PaAnalyse §7 |
 | `BenchMark.SavePaCharacterizationResults`, `BenchMark.PrintPaCharacterizationResults`, `BenchMark.PrintPaDpdRecommendations` | E | 保存或打印既有PA特性与DPD建议，不修改测量值 | PaAnalyse §9–§10 |
+| `ChannelAnalysisBenchmarkConfig.Validate` | E | 校验Wi-Fi、通道测量、输出功率、位宽和ILC标签预算 | BenchMark §31 |
+| `ChannelDpdStageResult.ToDict`, `ChannelDpdImprovement.ToDict`, `ChannelAnalysisBenchmarkResult.ToDict` | E | 序列化通道测量、DPD阶段、改善和训练诊断，不重新计算 | ChannelAnalyse §11–§13 |
+| `BenchMark.BuildChannelAnalysisPaBank`, `BenchMark.BuildChannelAnalysisPlant` | E/P | 构造不同PA以及双向非对称、带FIR和不同时延的PA前/后耦合控制场景 | ChannelAnalyse §11 |
+| `BenchMark.GenerateChannelAnalysisReferences` | E/P | 生成两路独立seed、相同格式和相同目标dBm的Wi-Fi参考 | ChannelAnalyse §11 |
+| `BenchMark.GenerateChannelPaInputLabels` | P/E | 对PA后去嵌入目标逐PA运行频域ILC，得到PA输入参考面的监督标签 | ChannelAnalyse §8.3 |
+| `BenchMark.BuildChannelDpdModels` | E | 为各物理PA构造相同结构但独立系数的DpdGmp对象 | ChannelAnalyse §11 |
+| `BenchMark.EvaluateChannelDpdStage` | P/E | 通过同一耦合非线性plant，汇总逐链Wi-Fi EVM/ACLR、公共增益对齐NMSE和残余跨路投影 | ChannelAnalyse §11–§12 |
+| `BenchMark.BuildChannelDpdImprovements` | E | 以Independent为前值、Coupling-aware为后值，统一生成EVM/NMSE/耦合降低及ACLR提高的正向改善和预期状态 | ChannelAnalyse §12 |
+| `BenchMark.SaveChannelAnalysisResults`, `BenchMark.PrintChannelAnalysisResults` | E | 保存或显示既有路径、频响、阶段和改善值，不参与测量或训练 | ChannelAnalyse §13 |
+| `BenchMark.RunChannelAnalysisBenchmark` | E/P | 编排“测Hpre/Hpost→去嵌入训练→PA前预消除→同plant前后比较”的完整闭环 | BenchMark §31、ChannelAnalyse §11–§12 |
 
 ## 11. 审计结论与维护规则
 
@@ -419,6 +460,7 @@ flowchart LR
 - 所有纯配置、查询、序列化、保存和绘图函数均被明确标为 E 类，没有为其虚构物理原理；
 - `DpdIlc.py` 中的简化 Volterra、幅度 LUT 和 ELM 风格神经网络以前只有一般模型说明，本次已在 DPD-ILC §3.13 补充代码精确方程；
 - 独立`DpdGmp.py`的恒等先验、因果main/lagging/leading基函数、峰值与片段权重、列归一化岭回归、增量系数混合和多功率片段边界均已在DPD-GMP文档建立公式与函数索引；
+- `ChannelAnalyse.py` 的逐路冲激探测、路径平坦度、相对耦合、相位斜率群时延和MIMO条件数，以及 `CouplingAwareDpdGmp` 的PA后目标去嵌入与PA前因果正则逆，均已在ChannelAnalyse文档建立公式和实测比较；
 - ILC 的低功率频响融合、方向 Gauss-Newton、峰值/带宽投影、反馈平均和 GMP 分块岭回归以前缺少实现级推导，本次已在 DPD-ILC §3.14 补齐；
 - prepared指标、每链/每流指标、每轮三级MSE和绘图的生产函数入口均已在本文建立索引；benchmark函数的场景含义、预期和实测结果在 `BenchMark.md` 分类说明。
 

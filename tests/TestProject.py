@@ -33,7 +33,8 @@ if str(GetProjectRoot()) not in sys.path:
 
 from inc.lib.Analysis import Analysis
 from inc.lib.Channel import Channel
-from inc.lib.DpdGmp import DpdGmp
+from inc.lib.ChannelAnalyse import ChannelAnalyse
+from inc.lib.DpdGmp import CouplingAwareDpdGmp, DpdGmp
 from inc.lib.DpdIlc import (
     CalculateIterationMetrics,
     FitMimoGmpPredistorter,
@@ -449,6 +450,13 @@ def CheckBenchmarkSeparation() -> None:
         "RunDpdGmpBenchmark",
         "SaveDpdGmpBenchmarkResults",
         "PrintDpdGmpBenchmarkResults",
+        "ChannelAnalysisBenchmarkConfig",
+        "ChannelDpdStageResult",
+        "ChannelDpdImprovement",
+        "ChannelAnalysisBenchmarkResult",
+        "RunChannelAnalysisBenchmark",
+        "SaveChannelAnalysisResults",
+        "PrintChannelAnalysisResults",
     )
     for forbiddenName in forbiddenProductionNames:
         assert forbiddenName not in ilcSource, (
@@ -511,6 +519,10 @@ def CheckBenchmarkSeparation() -> None:
         )
     assert (
         "I类：PA分析驱动的DPD-GMP分阶段性能测试"
+        in benchmarkDocument
+    )
+    assert (
+        "J类：通道测量与耦合感知 DPD-GMP"
         in benchmarkDocument
     )
 
@@ -4263,6 +4275,160 @@ def CheckDpdGmpModelAndBenchmark() -> None:
         assert requiredText in documentText
 
 
+def CheckChannelAnalysisAndCoupledDpd() -> None:
+    """Verify channel extraction, causal inversion, and benchmark improvements.
+
+    Processing details:
+        Algorithm: Measure a known delayed complex leakage path, compare its
+        gain/phase/delay with configured truth, verify measured causal
+        pre-coupling inversion numerically, run the compact nonlinear MIMO
+        benchmark, require every declared before/after trend, and check all
+        documented CSV/JSON/PNG artifacts.
+
+    Returns:
+        result: None. Assertions expose channel or coupled-DPD regressions.
+    """
+
+    measurementChannel = Channel(
+        parameters={
+            "prePaCouplingPaths": (
+                {
+                    "sourceChain": 0,
+                    "destinationChain": 1,
+                    "gainDb": -20.0,
+                    "phaseDegrees": 30.0,
+                    "integerDelaySamples": 2,
+                },
+            ),
+            "width": 0,
+        }
+    )
+    channelAnalyzer = ChannelAnalyse(
+        parameters={
+            "sampleRateHz": 80.0e6,
+            "channelBandwidthHz": 20.0e6,
+            "fftLength": 512,
+            "impulseLength": 16,
+            "width": 0,
+        }
+    )
+    preMeasurement = channelAnalyzer.Measure(
+        measurementChannel.ApplyPrePaCoupling,
+        2,
+        "pre-PA",
+    )
+    measuredLeakage = preMeasurement.GetPath(0, 1)
+    assert measuredLeakage.detected
+    assert abs(measuredLeakage.gainDb + 20.0) < 0.01
+    assert abs(measuredLeakage.phaseDegrees - 30.0) < 0.01
+    assert abs(measuredLeakage.groupDelaySamples - 2.0) < 0.01
+    assert measuredLeakage.flatnessDb < 0.01
+    assert preMeasurement.worstConditionNumber > 1.0
+
+    identityModels = (
+        DpdGmp(parameters={"width": 0}),
+        DpdGmp(parameters={"width": 0}),
+    )
+    coupledDpd = CouplingAwareDpdGmp(
+        identityModels,
+        preMeasurement,
+        None,
+        parameters={"width": 0},
+    )
+    randomGenerator = np.random.default_rng(809)
+    desiredPaInput = 0.1 * (
+        randomGenerator.standard_normal((512, 2))
+        + 1j * randomGenerator.standard_normal((512, 2))
+    )
+    rawDacInput = coupledDpd.BuildDacInput(
+        desiredPaInput
+    )
+    restoredPaInput = measurementChannel.ApplyPrePaCoupling(
+        rawDacInput
+    )
+    inversionNmseDb = 10.0 * np.log10(
+        np.mean(np.abs(restoredPaInput - desiredPaInput) ** 2)
+        / np.mean(np.abs(desiredPaInput) ** 2)
+    )
+    assert inversionNmseDb < -120.0
+
+    with warnings.catch_warnings(record=True) as warningRecords:
+        warnings.simplefilter("always")
+        warnedAnalyzer = ChannelAnalyse(
+            parameters={
+                "width": 0,
+                "unknownChannelAnalysisOption": 5,
+            }
+        )
+    assert warnedAnalyzer.width == 0
+    assert any(
+        "unknownChannelAnalysisOption"
+        in str(warningRecord.message)
+        for warningRecord in warningRecords
+    )
+
+    from tests.BenchMark import (
+        ChannelAnalysisBenchmarkConfig,
+        RunChannelAnalysisBenchmark,
+    )
+
+    with TemporaryDirectory() as temporaryDirectory:
+        outputDirectory = Path(temporaryDirectory)
+        result = RunChannelAnalysisBenchmark(
+            ChannelAnalysisBenchmarkConfig(
+                numDataSymbols=2,
+                numIterations=8,
+                outputDirectory=outputDirectory,
+            )
+        )
+        assert len(result.prePaMeasurement.paths) == 4
+        assert len(result.postPaMeasurement.paths) == 4
+        assert len(result.stages) == 4
+        assert len(result.improvements) == 4
+        assert all(
+            improvement.expectationMet
+            for improvement in result.improvements
+        )
+        assert (
+            result.stages[-1].evmDb
+            < result.stages[1].evmDb
+        )
+        assert (
+            result.stages[-1].normalizedMseDb
+            < result.stages[1].normalizedMseDb
+        )
+        for artifactName in (
+            "channel_analysis.json",
+            "channel_path_measurements.csv",
+            "channel_frequency_response.csv",
+            "channel_dpd_comparison.csv",
+            "channel_dpd_improvements.csv",
+            "channel_analysis.png",
+        ):
+            assert (outputDirectory / artifactName).exists()
+        savedResult = json.loads(
+            (
+                outputDirectory / "channel_analysis.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert all(
+            improvement["expectationMet"]
+            for improvement in savedResult["improvements"]
+        )
+    channelDocument = (
+        GetProjectRoot() / "doc" / "ChannelAnalyse.md"
+    ).read_text(encoding="utf-8")
+    for requiredText in (
+        "平坦度",
+        "耦合参数",
+        "群时延",
+        "CouplingAwareDpdGmp",
+        "修改前后性能比较",
+        "channel_analysis.png",
+    ):
+        assert requiredText in channelDocument
+
+
 def RunTests() -> None:
     """Run all project checks and report a compact success message.
 
@@ -4304,6 +4470,7 @@ def RunTests() -> None:
     CheckTwoToneIlcAnalysis()
     CheckPaCharacterizationBenchmark()
     CheckDpdGmpModelAndBenchmark()
+    CheckChannelAnalysisAndCoupledDpd()
     print("All DPD-ILC project checks passed.")
 
 
