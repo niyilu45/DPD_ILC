@@ -387,29 +387,163 @@ PA 后测量需要获得每个 PA 自身输出与最终端口输出之间的关�
 
 这个乘积一般不能唯一分解为三个矩阵。必须增加内部观测点、已知校准件或结构先验。
 
-## 8. 根据测量结果修改 DPD-GMP
+## 8. 通道耦合条件下 DPD-GMP 的完整方案与推导
 
-### 8.1 旧方案：逐路独立训练
+本节把测得的通道参数真正连接到 DPD 的训练与部署。需要始终区分四个参考面：
 
-旧方案对每一路分别训练
+| 符号 | 参考面 | 物理含义 |
+|---|---|---|
+| $\mathbf{z}(n)$ | DAC 输出 | 最终需要写入发射芯片或仪表的波形 |
+| $\mathbf{u}(n)$ | PA 输入 | PA 前耦合网络作用后的实际驱动 |
+| $\mathbf{v}(n)$ | PA 输出 | 各 PA 独立输出、尚未经过 PA 后耦合 |
+| $\mathbf{y}(n)$ | 观测端 | 耦合器、仪表或接收端看到的最终波形 |
+
+期望最终端口波形记为 $\mathbf{x}(n)$。完整物理链路为
 
 ```math
-p_i(n)\approx D_i\{x_i(n)\},
+\mathbf{u}
+=
+\mathbf{H}_{\mathrm{pre}}\mathbf{z},
 ```
 
-并把 $p_i$ 直接送到 DAC。它隐含假设
+```math
+\mathbf{v}
+=
+\mathbf{F}\{\mathbf{u}\},
+```
 
 ```math
-\mathbf{H}_{\mathrm{pre}}(f)=\mathbf{I},
+\mathbf{y}
+=
+\mathbf{H}_{\mathrm{post}}\mathbf{v}.
+```
+
+这里的矩阵乘法代表 MIMO FIR 卷积，不只是一个常数矩阵；$\mathbf{F}$ 是由各物理 PA 组成的非线性算子：
+
+```math
+\mathbf{F}\{\mathbf{u}\}
+=
+\begin{bmatrix}
+F_0\{u_0\}\\
+F_1\{u_1\}\\
+\vdots\\
+F_{N-1}\{u_{N-1}\}
+\end{bmatrix}.
+```
+
+### 8.1 为什么逐路独立 DPD 会把耦合误认为 PA 失真
+
+逐路独立方案直接令
+
+```math
+z_i(n)=D_i\{x_i(n)\}.
+```
+
+它隐含假设
+
+```math
+\mathbf{H}_{\mathrm{pre}}=\mathbf{I},
 \qquad
-\mathbf{H}_{\mathrm{post}}(f)=\mathbf{I}.
+\mathbf{H}_{\mathrm{post}}=\mathbf{I}.
 ```
 
-存在耦合时，这两个假设都不成立。
+实际第 $i$ 个 PA 的输入却是
 
-### 8.2 第一步：PA 后目标去嵌入
+```math
+u_i(n)
+=
+\sum_j h_{\mathrm{pre},ij}(n)*z_j(n).
+```
 
-希望最终输出为 $\mathbf{x}$，先求各 PA 自身应产生的输出：
+其中星号表示线性卷积。于是 PA $i$ 的输入不仅包含本通道 DPD 输出，还包含其他通道的调制波形。即使每个 PA 本身完全线性，最终误差中也会出现
+
+```math
+\mathbf{e}_{\mathrm{linear}}
+=
+\left(
+\mathbf{H}_{\mathrm{post}}
+\mathbf{H}_{\mathrm{pre}}
+-
+\mathbf{I}
+\right)\mathbf{x}.
+```
+
+当 PA 非线性存在时，耦合分量还会进入 PA 的幂次项。例如三阶无记忆 PA
+
+```math
+v_i
+=
+a_{1,i}u_i
++
+a_{3,i}u_i|u_i|^2
+```
+
+中的 $u_i$ 是多路波形之和。展开 $u_i|u_i|^2$ 后，会产生本通道三阶项、其他通道三阶项以及通道间交调项。独立 DPD 只观察最终端口误差时，会尝试用本路 GMP 系数吸收这些随其他通道数据变化的分量，因此训练系数对特定训练波形过拟合，换帧、换功率或换通道相关性后容易失效。
+
+### 8.2 逆网络和非线性 DPD 为什么不能交换顺序
+
+线性矩阵与非线性算子通常不满足交换律：
+
+```math
+\mathbf{D}
+\left\{
+\mathbf{H}^{-1}\mathbf{x}
+\right\}
+\ne
+\mathbf{H}^{-1}
+\mathbf{D}\{\mathbf{x}\}.
+```
+
+原因可以从三阶项直接看出。对两个通道，若
+
+```math
+r_0=x_0+c x_1,
+```
+
+则
+
+```math
+r_0|r_0|^2
+=
+(x_0+c x_1)
+|x_0+c x_1|^2.
+```
+
+右侧包含 $x_0|x_1|^2$、$x_1|x_0|^2$ 和相位相关交叉项，而“先分别做非线性、再线性混合”不会自动产生完全相同的项。因此补偿顺序必须与物理参考面对应：
+
+```mermaid
+flowchart LR
+    desired["最终目标 x"] --> postInverse["PA 后网络逆"]
+    postInverse --> paTarget["逐 PA 输出目标 q"]
+    paTarget --> gmp["逐 PA GMP 逆模型"]
+    gmp --> paDrive["期望 PA 输入 p"]
+    paDrive --> preInverse["PA 前网络逆"]
+    preInverse --> dac["DAC 波形 z"]
+    dac --> physicalPre["物理 PA 前耦合"]
+    physicalPre --> pa["物理 PA"]
+    pa --> physicalPost["物理 PA 后耦合"]
+    physicalPost --> output["观测输出 y"]
+```
+
+图示说明：先用 PA 后逆决定“每个 PA 应该输出什么”，再用各 PA 的 GMP 逆决定“每个 PA 应该输入什么”，最后用 PA 前逆决定“DAC 应该发送什么”。任何调换都会把信号放到错误的参考面。
+
+### 8.3 第一步：由最终目标推导逐 PA 输出目标
+
+最终要求是
+
+```math
+\mathbf{y}\approx\mathbf{x}.
+```
+
+因为
+
+```math
+\mathbf{y}
+=
+\mathbf{H}_{\mathrm{post}}\mathbf{v},
+```
+
+所以各 PA 在后级耦合之前应产生
 
 ```math
 \mathbf{q}
@@ -417,49 +551,197 @@ p_i(n)\approx D_i\{x_i(n)\},
 \mathbf{H}_{\mathrm{post}}^{-1}\mathbf{x}.
 ```
 
-之后第 $i$ 路 DPD 的训练输入不再是 $x_i$，而是 $q_i$。这一步防止把“其他 PA 泄漏到本端口的线性分量”错误地塞进本路非线性 GMP 系数。
-
-### 8.3 第二步：逐 PA 生成训练标签
-
-对每个独立 PA，使用 ILC 或实测逆学习得到实际 PA 输入标签 $p_i^{\mathrm{label}}$，使
+$\mathbf{q}$ 就是逐 PA 输出目标。它不是仪表最终看到的波形，也不是 DAC 波形。频率选择性耦合存在时，上式应逐频点理解为
 
 ```math
-F_i\{p_i^{\mathrm{label}}\}\approx q_i.
+\mathbf{Q}(f)
+=
+\mathbf{H}_{\mathrm{post}}^{-1}(f)
+\mathbf{X}(f),
 ```
 
-随后拟合 GMP：
+工程实现则使用测得的因果冲激响应做正则化反卷积，避免 FFT 循环卷积。
+
+PA 后去嵌入非常重要。若直接让 PA 0 学习最终端口目标 $x_0$，PA 0 的训练误差中会混入 PA 1 通过 $H_{\mathrm{post},01}$ 泄漏过来的分量。该分量与 PA 0 自己的逆模型无关，却会污染 PA 0 的 GMP 系数。
+
+### 8.4 第二步：逐 PA 的 GMP 逆模型
+
+对第 $i$ 个 PA，需要寻找输入 $p_i$，使
 
 ```math
-\widehat{\boldsymbol{\theta}}_i
+F_i\{p_i\}\approx q_i.
+```
+
+本工程的 GMP 输入是 PA 输出目标 $q_i$，输出是所需 PA 输入 $p_i$。对奇数非线性阶集合 $\mathcal{P}$，GMP 写成三类基函数之和。
+
+主分支为
+
+```math
+D_{i,\mathrm{main}}\{q_i(n)\}
 =
-\arg\min_{\boldsymbol{\theta}_i}
+\sum_{p\in\mathcal{P}}
+\sum_{m=0}^{M-1}
+a_{i,p,m}
+q_i(n-m)
+|q_i(n-m)|^{p-1}.
+```
+
+滞后包络交叉分支为
+
+```math
+D_{i,\mathrm{lag}}\{q_i(n)\}
+=
+\sum_{\substack{p\in\mathcal{P}\\p>1}}
+\sum_{m=0}^{M-1}
+\sum_{r=1}^{R}
+b_{i,p,m,r}
+q_i(n-m)
+|q_i(n-m-r)|^{p-1}.
+```
+
+超前包络交叉分支为
+
+```math
+D_{i,\mathrm{lead}}\{q_i(n)\}
+=
+\sum_{\substack{p\in\mathcal{P}\\p>1}}
+\sum_{m=0}^{M-1}
+\sum_{r=1}^{R}
+c_{i,p,m,r}
+q_i(n-m-r)
+|q_i(n-m)|^{p-1}.
+```
+
+总输出为
+
+```math
+p_i(n)
+=
+D_i\{q_i(n)\}
+=
+D_{i,\mathrm{main}}
++
+D_{i,\mathrm{lag}}
++
+D_{i,\mathrm{lead}}.
+```
+
+这三组基函数分别描述：
+
+- 当前或过去复载波对自身包络的非线性响应；
+- 当前载波受更早包络状态影响的热、偏置和电记忆；
+- 较早载波受较新包络状态关联的等效交叉记忆。
+
+### 8.5 GMP 训练标签如何生成
+
+训练标签 $p_i^{\mathrm{label}}$ 必须位于 PA 输入参考面，并满足
+
+```math
+F_i\{p_i^{\mathrm{label}}\}
+\approx
+q_i.
+```
+
+标签可由 ILC、间接学习或经过同步的 PA 输入/输出实测得到。将所有 GMP 基函数按列排列成设计矩阵 $\mathbf{\Phi}_i$，则
+
+```math
+\mathbf{p}_i^{\mathrm{label}}
+\approx
+\mathbf{\Phi}_i\boldsymbol{\theta}_i.
+```
+
+带样本权重和恒等先验的岭回归目标为
+
+```math
+J_i(\boldsymbol{\theta}_i)
+=
 \left\|
-\mathbf{\Phi}(q_i)\boldsymbol{\theta}_i
+\mathbf{W}_i^{1/2}
+\left(
+\mathbf{\Phi}_i\boldsymbol{\theta}_i
 -
 \mathbf{p}_i^{\mathrm{label}}
+\right)
 \right\|_2^2
 +
 \lambda
 \left\|
-\boldsymbol{\theta}_i-\boldsymbol{\theta}_{i,0}
+\boldsymbol{\theta}_i
+-
+\boldsymbol{\theta}_{i,0}
 \right\|_2^2.
 ```
 
-这里的标签必须对应 PA 端实际输入，也就是 PA 前耦合之后的位置。不能把 DAC 波形和 PA 端标签混为一谈。
-
-### 8.4 第三步：PA 前耦合预消除
-
-逐 PA DPD 输出组成
+令梯度为零，得到正规方程
 
 ```math
-\mathbf{p}(n)=
+\left(
+\mathbf{\Phi}_i^{H}
+\mathbf{W}_i
+\mathbf{\Phi}_i
++
+\lambda\mathbf{I}
+\right)
+\widehat{\boldsymbol{\theta}}_i
+=
+\mathbf{\Phi}_i^{H}
+\mathbf{W}_i
+\mathbf{p}_i^{\mathrm{label}}
++
+\lambda\boldsymbol{\theta}_{i,0}.
+```
+
+这里 $\boldsymbol{\theta}_{i,0}$ 只保留线性直通项，其他项为零。正则化可防止高阶、强相关 GMP 基函数导致系数爆炸。
+
+如果 ILC 最终给出的是 DAC 参考面的标签 $\mathbf{z}^{\mathrm{label}}$，不能直接传给 `FitCoupledSegments`。应先映射到实际 PA 输入参考面：
+
+```math
+\mathbf{p}^{\mathrm{label}}
+=
+\mathbf{H}_{\mathrm{pre}}
+\mathbf{z}^{\mathrm{label}}.
+```
+
+对应代码为：
+
+```python
+paInputLabels = coupledDpd.ApplyMeasuredResponse(
+    ilcDacLabels,
+    preMeasurement.impulseResponses,
+)
+
+trainingResult = coupledDpd.FitCoupledSegments(
+    referenceSignals=[desiredPortWaveforms],
+    paInputTargetSignals=[paInputLabels],
+)
+```
+
+上例使用浮点归一化波形。定点公开接口下，应先按本工程定点约定解码到内部归一化值，再进行参考面转换。
+
+### 8.6 第三步：由期望 PA 输入推导 DAC 波形
+
+所有逐 PA GMP 输出组成
+
+```math
+\mathbf{p}(n)
+=
 \begin{bmatrix}
 D_0\{q_0(n)\}\\
-D_1\{q_1(n)\}
+D_1\{q_1(n)\}\\
+\vdots\\
+D_{N-1}\{q_{N-1}(n)\}
 \end{bmatrix}.
 ```
 
-DAC 波形应改为
+因为物理 PA 前网络满足
+
+```math
+\mathbf{u}
+=
+\mathbf{H}_{\mathrm{pre}}\mathbf{z},
+```
+
+所以 DAC 波形应为
 
 ```math
 \mathbf{z}
@@ -467,17 +749,86 @@ DAC 波形应改为
 \mathbf{H}_{\mathrm{pre}}^{-1}\mathbf{p}.
 ```
 
-物理 PA 前网络作用后：
+物理网络作用后
 
 ```math
-\mathbf{H}_{\mathrm{pre}}\mathbf{z}
+\mathbf{u}
+=
+\mathbf{H}_{\mathrm{pre}}
+\mathbf{H}_{\mathrm{pre}}^{-1}
+\mathbf{p}
 \approx
 \mathbf{p}.
 ```
 
-因此各 PA 在部署时仍能看到训练时定义的输入。
+因此部署时各 PA 看到的输入仍与训练标签位于同一参考面。PA 前逆只在推理部署阶段作用于 GMP 输出，不应提前重复作用到 PA 输入标签上。
 
-### 8.5 程序中的正则化因果逆
+### 8.7 端到端补偿成立的推导
+
+把三步串联：
+
+```math
+\mathbf{q}
+=
+\mathbf{H}_{\mathrm{post}}^{-1}\mathbf{x},
+```
+
+```math
+\mathbf{p}
+=
+\mathbf{D}\{\mathbf{q}\},
+```
+
+```math
+\mathbf{z}
+=
+\mathbf{H}_{\mathrm{pre}}^{-1}\mathbf{p}.
+```
+
+代回物理链路：
+
+```math
+\mathbf{y}
+=
+\mathbf{H}_{\mathrm{post}}
+\mathbf{F}
+\left\{
+\mathbf{H}_{\mathrm{pre}}
+\mathbf{H}_{\mathrm{pre}}^{-1}
+\mathbf{D}
+\left\{
+\mathbf{H}_{\mathrm{post}}^{-1}
+\mathbf{x}
+\right\}
+\right\}.
+```
+
+若两个线性逆在有效带宽内足够准确，并且
+
+```math
+\mathbf{F}\{\mathbf{D}\{\mathbf{q}\}\}
+\approx
+\mathbf{q},
+```
+
+则
+
+```math
+\mathbf{y}
+\approx
+\mathbf{H}_{\mathrm{post}}
+\mathbf{q}
+=
+\mathbf{H}_{\mathrm{post}}
+\mathbf{H}_{\mathrm{post}}^{-1}
+\mathbf{x}
+\approx
+\mathbf{x}.
+```
+
+这就是当前 `CouplingAwareDpdGmp` 的核心物理闭环。它没有把线性耦合硬塞进 GMP，而是先把线性 MIMO 网络和逐 PA 非线性逆分解到正确参考面。
+
+### 8.8 频率选择性耦合的正则化因果逆
 
 对因果 MIMO FIR：
 
@@ -504,27 +855,625 @@ DAC 波形应改为
 \right].
 ```
 
-零时延矩阵的正则化逆由奇异值分解得到：
+对零时延矩阵做奇异值分解：
+
+```math
+\mathbf{H}(0)
+=
+\mathbf{U}
+\mathbf{\Sigma}
+\mathbf{V}^{H}.
+```
+
+第 $r$ 个奇异方向的正则化逆增益为
+
+```math
+g_r
+=
+\min
+\left(
+\frac{\sigma_r}{\sigma_r^2+\lambda},
+\;
+10^{G_{\mathrm{max,dB}}/20}
+\right).
+```
+
+因此
 
 ```math
 \mathbf{H}_{\lambda}^{+}(0)
 =
 \mathbf{V}
-\mathop{\mathrm{diag}}
-\left(
-\frac{\sigma_r}{\sigma_r^2+\lambda}
-\right)
+\begin{bmatrix}
+g_0 & 0 & \cdots\\
+0 & g_1 & \cdots\\
+\vdots & \vdots & \ddots
+\end{bmatrix}
 \mathbf{U}^{H}.
 ```
 
-程序还用 `maximumInverseGainDb` 限制每个逆奇异值，避免弱奇异方向导致 DAC 峰值、噪声和定点误差失控。因果递推不会产生 FFT 循环卷积的首尾串扰。
+在第 $r$ 个奇异方向上，补偿后的线性增益为
 
-### 8.6 什么时候需要进一步升级为联合非线性 MIMO DPD
+```math
+\rho_r
+=
+\sigma_r g_r.
+```
 
-当前 `CouplingAwareDpdGmp` 的假设是：
+理想逆要求 $\rho_r=1$。正则化或逆增益限幅会使 $\rho_r<1$，留下残余耦合，但同时避免将噪声、测量误差、DAC 量化误差和峰值放大到不可接受的程度。这是“残余耦合”和“数值稳定性”之间的主动权衡，不是算法计算错误。
 
-- PA 前和 PA 后耦合都是可测的线性时不变网络；
-- 去除线性耦合后，各 PA 的非线性可独立建模；
+例如默认 `maximumInverseGainDb=18` 时，任何奇异方向的逆幅度增益不会超过
+
+```math
+10^{18/20}\approx 7.94.
+```
+
+若测得的最小奇异值远小于 $1/7.94$，就不应期待完全消除该方向；应优先改善隔离度、缩小补偿带宽，或提高正则化并接受一定残差。
+
+### 8.9 耦合路径时延如何进入 DPD 公式
+
+前面的矩阵写法把时延包含在 $\mathbf{H}(\ell)$ 中，但为了观察它的物理影响，需要把每条耦合路径显式展开。设源通道 $j$ 到目标通道 $i$ 的 PA 前耦合路径具有：
+
+- 复耦合系数 $c_{\mathrm{pre},ij}$；
+- 整数时延 $d_{\mathrm{pre},ij}$ 个样点；
+- 分数时延 $\delta_{\mathrm{pre},ij}$ 个样点；
+- 路径自身的短 FIR $g_{\mathrm{pre},ij}(\ell)$。
+
+则第 $i$ 个 PA 的实际输入为
+
+```math
+u_i(n)
+=
+h_{\mathrm{pre},ii}(n)*z_i(n)
++
+\sum_{j\ne i}
+c_{\mathrm{pre},ij}
+\sum_{\ell}
+g_{\mathrm{pre},ij}(\ell)
+z_j
+\left(
+n-d_{\mathrm{pre},ij}-\delta_{\mathrm{pre},ij}-\ell
+\right).
+```
+
+分数样点位置不是直接访问数组，而是由分数时延 FIR 插值得到。若只考虑一条纯延迟耦合路径，其频域响应为
+
+```math
+C_{ij}(f)
+=
+c_{ij}
+\exp
+\left(
+-j2\pi f\tau_{ij}
+\right),
+```
+
+其中
+
+```math
+\tau_{ij}
+=
+\frac{
+d_{ij}+\delta_{ij}
+}{
+f_s
+}.
+```
+
+因此耦合时延首先表现为线性相位斜率：
+
+```math
+\phi_{ij}(f)
+=
+\phi_{ij}(0)
+-
+2\pi f\tau_{ij}.
+```
+
+如果只在中心频点测量一个复耦合系数并做常数消除，在偏移中心 $\Delta f$ 的频点仍会留下相位误差
+
+```math
+\Delta\phi_{ij}
+=
+-2\pi\Delta f\tau_{ij}.
+```
+
+例如 $\tau_{ij}=10$ ns、信号带宽为 20 MHz，则在正负 10 MHz 带边处，相对中心频点的相位变化幅度为
+
+```math
+2\pi
+\left(
+10\times10^6
+\right)
+\left(
+10\times10^{-9}
+\right)
+\approx
+0.628
+\ \mathrm{rad}
+\approx
+36^\circ.
+```
+
+两个带边之间的相位差约为 $72^\circ$。所以即使中心频点耦合消除得很好，使用常数矩阵也会在带边留下明显残差；必须使用包含时延抽头的 MIMO FIR。
+
+#### 8.9.1 时延为什么会形成带内幅度起伏
+
+当一路直达分量与一路延迟耦合分量在同一端口相加时，等效响应可写为
+
+```math
+H_{\mathrm{eq}}(f)
+=
+1
++
+c
+\exp
+\left(
+-j2\pi f\tau
+\right).
+```
+
+其功率增益为
+
+```math
+|H_{\mathrm{eq}}(f)|^2
+=
+1
++
+|c|^2
++
+2|c|
+\cos
+\left(
+2\pi f\tau-\phi_c
+\right).
+```
+
+因此时延不仅影响相位，也会通过直达波与耦合波的相长、相消产生频率选择性起伏。时延越大，在给定带宽内余弦变化越快；耦合越强，起伏越明显。这正是通道测量必须同时输出平坦度、耦合相位和群时延的原因。
+
+#### 8.9.2 PA 前时延耦合如何进入非线性项
+
+考虑简化的双通道 PA 前耦合：
+
+```math
+u_0(n)
+=
+z_0(n)
++
+c_{01}z_1(n-d_{01}).
+```
+
+令
+
+```math
+a=z_0(n),
+\qquad
+b=c_{01}z_1(n-d_{01}),
+```
+
+则三阶项可展开为
+
+```math
+u_0|u_0|^2
+=
+a|a|^2
++
+b|b|^2
++
+2a|b|^2
++
+2b|a|^2
++
+a^2b^*
++
+a^*b^2.
+```
+
+其中每一个含 $b$ 的交叉项都带有邻路的延迟样点 $z_1(n-d_{01})$。这说明 PA 前耦合时延会产生“跨通道、跨时间”的非线性失真。单通道 GMP 只使用 $z_0$ 的历史包络，无法从任意独立的 $z_1$ 数据中预测这些项。
+
+当前方案先用 $\mathbf{H}_{\mathrm{pre}}^{-1}$ 使物理 PA 输入恢复为训练时的 $\mathbf{p}$，从源头去除这些延迟邻路分量。若耦合通过负载牵引进入 PA 内部，线性预解耦后交叉项仍存在，则需要 8.13 节所述、包含邻路时延基函数的联合多输入 GMP。
+
+#### 8.9.3 PA 后时延耦合如何影响最终误差
+
+PA 后耦合发生在非线性之后。双通道例子为
+
+```math
+y_0(n)
+=
+v_0(n)
++
+c_{\mathrm{post},01}
+v_1(n-d_{\mathrm{post},01}).
+```
+
+若训练时错误地令 $v_0(n)\approx x_0(n)$，那么第二项会完整保留在最终误差中：
+
+```math
+e_0(n)
+=
+y_0(n)-x_0(n)
+\approx
+c_{\mathrm{post},01}
+v_1(n-d_{\mathrm{post},01}).
+```
+
+正确做法是先求
+
+```math
+\mathbf{q}
+=
+\mathbf{H}_{\mathrm{post}}^{-1}\mathbf{x},
+```
+
+使各 PA 的输出目标提前包含对延迟泄漏的抵消量。由于该耦合位于 PA 之后且假定为线性，PA 后去嵌入不需要把它错误地建模成 PA 的非线性 GMP 项。
+
+#### 8.9.4 双通道延迟耦合逆的显式递推
+
+设 PA 前网络为
+
+```math
+\mathbf{H}_{\mathrm{pre}}(z)
+=
+\begin{bmatrix}
+1 & c_{01}z^{-d_{01}}\\
+c_{10}z^{-d_{10}} & 1
+\end{bmatrix}.
+```
+
+要求物理 PA 输入等于 $\mathbf{p}$：
+
+```math
+\mathbf{H}_{\mathrm{pre}}(z)
+\mathbf{z}(n)
+=
+\mathbf{p}(n).
+```
+
+逐路展开得到
+
+```math
+z_0(n)
+=
+p_0(n)
+-
+c_{01}z_1(n-d_{01}),
+```
+
+```math
+z_1(n)
+=
+p_1(n)
+-
+c_{10}z_0(n-d_{10}).
+```
+
+这两个式子清楚表明：当前 DAC 样点需要减去其他通道在耦合时延之前发送的历史样点。继续代入会出现多次往返耦合项，例如
+
+```math
+c_{01}c_{10}
+z_0
+\left(
+n-d_{01}-d_{10}
+\right).
+```
+
+在变换域中，精确逆为
+
+```math
+\mathbf{H}_{\mathrm{pre}}^{-1}(z)
+=
+\frac{1}{
+1-c_{01}c_{10}z^{-(d_{01}+d_{10})}
+}
+\begin{bmatrix}
+1 & -c_{01}z^{-d_{01}}\\
+-c_{10}z^{-d_{10}} & 1
+\end{bmatrix}.
+```
+
+分母表示耦合在两个方向之间多次往返形成的无限因果序列。`InvertMeasuredResponse` 不显式生成无限长 IIR 系数，而是使用已经求出的历史输入逐样点递推，所以会自然包含这些往返项。
+
+更一般地，程序实际执行
+
+```math
+\mathbf{z}(n)
+=
+\mathbf{H}_{\lambda}^{+}(0)
+\left[
+\mathbf{p}(n)
+-
+\sum_{\ell=1}^{L-1}
+\mathbf{H}_{\mathrm{pre}}(\ell)
+\mathbf{z}(n-\ell)
+\right].
+```
+
+所有整数时延、分数时延 FIR 和路径频响都包含在 $\mathbf{H}_{\mathrm{pre}}(\ell)$ 中。PA 后目标去嵌入使用完全相同的递推，只是目标从 $\mathbf{p}$ 换成 $\mathbf{x}$，通道从 $\mathbf{H}_{\mathrm{pre}}$ 换成 $\mathbf{H}_{\mathrm{post}}$。
+
+#### 8.9.5 一个带时延的两路样点例子
+
+设
+
+```math
+u_0(n)=z_0(n)+0.2z_1(n-2),
+```
+
+```math
+u_1(n)=z_1(n)+0.1z_0(n-1).
+```
+
+为了让 PA 输入目标为 $p_0(n)$ 和 $p_1(n)$，预解耦器计算
+
+```math
+z_0(n)=p_0(n)-0.2z_1(n-2),
+```
+
+```math
+z_1(n)=p_1(n)-0.1z_0(n-1).
+```
+
+若 $n<0$ 的历史样点定义为零，则可以从帧首开始因果递推。代回物理网络：
+
+```math
+u_0(n)
+=
+p_0(n)
+-
+0.2z_1(n-2)
++
+0.2z_1(n-2)
+=
+p_0(n),
+```
+
+```math
+u_1(n)
+=
+p_1(n)
+-
+0.1z_0(n-1)
++
+0.1z_0(n-1)
+=
+p_1(n).
+```
+
+这说明预解耦不是简单地在当前样点减去邻路，而是必须按照测得的每条有向时延，从正确的历史位置减去邻路分量。
+
+实际采集时还必须保留各通道共同的绝对时间基准。若在测量后把每个接收通道分别平移到自己的峰值位置，会人为删除通道间相对时延，使构造出的 MIMO 逆在真实硬件上产生错误的抵消相位。
+
+### 8.10 双通道可手算无记忆数值例子
+
+为了直观看到各参考面的区别，考虑无记忆双通道耦合：
+
+```math
+\mathbf{H}_{\mathrm{pre}}
+=
+\begin{bmatrix}
+1 & 0.10\\
+0.20 & 1
+\end{bmatrix},
+\qquad
+\mathbf{H}_{\mathrm{post}}
+=
+\begin{bmatrix}
+1 & 0.15\\
+0.08 & 1
+\end{bmatrix}.
+```
+
+四条非对角路径分别约为 $-20.00$ dB、$-13.98$ dB、$-16.48$ dB 和 $-21.94$ dB。设最终目标样点为
+
+```math
+\mathbf{x}
+=
+\begin{bmatrix}
+1\\
+j0.5
+\end{bmatrix}.
+```
+
+第一步，对 PA 后耦合去嵌入：
+
+```math
+\mathbf{H}_{\mathrm{post}}^{-1}
+\approx
+\begin{bmatrix}
+1.0121 & -0.1518\\
+-0.0810 & 1.0121
+\end{bmatrix},
+```
+
+```math
+\mathbf{q}
+=
+\mathbf{H}_{\mathrm{post}}^{-1}\mathbf{x}
+\approx
+\begin{bmatrix}
+1.0121-j0.0759\\
+-0.0810+j0.5061
+\end{bmatrix}.
+```
+
+假设两个 PA 的简化模型为
+
+```math
+F_0\{u\}=u+0.08u|u|^2,
+\qquad
+F_1\{u\}=u+0.12u|u|^2.
+```
+
+使用一阶近似逆
+
+```math
+D_i\{q\}\approx q-\alpha_i q|q|^2
+```
+
+得到期望 PA 输入
+
+```math
+\mathbf{p}
+\approx
+\begin{bmatrix}
+0.9287-j0.0697\\
+-0.0784+j0.4901
+\end{bmatrix}.
+```
+
+第二步，对 PA 前耦合预消除：
+
+```math
+\mathbf{H}_{\mathrm{pre}}^{-1}
+\approx
+\begin{bmatrix}
+1.0204 & -0.1020\\
+-0.2041 & 1.0204
+\end{bmatrix},
+```
+
+```math
+\mathbf{z}
+=
+\mathbf{H}_{\mathrm{pre}}^{-1}\mathbf{p}
+\approx
+\begin{bmatrix}
+0.9557-j0.1211\\
+-0.2696+j0.5143
+\end{bmatrix}.
+```
+
+把 $\mathbf{z}$ 送入物理 PA 前网络，可恢复
+
+```math
+\mathbf{H}_{\mathrm{pre}}\mathbf{z}
+\approx
+\begin{bmatrix}
+0.9287-j0.0697\\
+-0.0784+j0.4901
+\end{bmatrix}
+=
+\mathbf{p}.
+```
+
+再通过两个 PA 和 PA 后网络，得到
+
+```math
+\mathbf{y}_{\mathrm{aware}}
+\approx
+\begin{bmatrix}
+0.9811+j0.0012\\
+-0.0013+j0.4987
+\end{bmatrix}.
+```
+
+因为这里只使用了三阶 PA 的一阶近似逆，仍有少量残差；使用训练后的完整 GMP 会继续降低该残差。
+
+若忽略耦合，各路只对自己的目标做独立三阶逆，并把结果直接送入 DAC，同一个样点约得到
+
+```math
+\mathbf{y}_{\mathrm{independent}}
+\approx
+\begin{bmatrix}
+1.0110+j0.1269\\
+0.2685+j0.5048
+\end{bmatrix}.
+```
+
+对这个单样点向量，归一化误差对比如下：
+
+| 方案 | 归一化误差 | 误差 dB | 主要原因 |
+|---|---:|---:|---|
+| 独立 DPD | 26.59% | -11.51 dB | PA 前串扰进入非线性，PA 后串扰直接叠加 |
+| 耦合感知 DPD | 1.71% | -35.36 dB | 仅剩近似 PA 逆和数值舍入残差 |
+
+该例子不是完整 OFDM EVM 测量，只用于展示矩阵去嵌入、GMP 逆和预解耦各自解决什么问题。正式 EVM、ACLR 和 NMSE 必须对完整波形、等输出功率和相同分析配置进行比较。
+
+### 8.11 与当前类接口对应的完整训练和部署例子
+
+下面假设 `preMeasurement` 和 `postMeasurement` 已由 `ChannelAnalyse.Measure` 得到，`desiredPortWaveforms` 是形状为“样点数 × 通道数”的最终端口目标，`ilcDacLabels` 是多通道 ILC 在 DAC 参考面学到的波形。
+
+```python
+from inc.lib.DpdGmp import CouplingAwareDpdGmp, DpdGmp
+
+dpdModels = [
+    DpdGmp(
+        parameters={
+            "nonlinearOrders": (1, 3, 5, 7),
+            "memoryDepth": 4,
+            "crossMemoryDepth": 3,
+            "ridgeFactor": 3.0e-5,
+            "width": 0,
+        }
+    )
+    for _ in range(2)
+]
+
+coupledDpd = CouplingAwareDpdGmp(
+    dpdModels=dpdModels,
+    preChannelMeasurement=preMeasurement,
+    postChannelMeasurement=postMeasurement,
+    parameters={
+        "inverseRegularization": 1.0e-8,
+        "maximumInverseGainDb": 18.0,
+        "width": 0,
+    },
+)
+
+# Convert DAC-reference ILC labels to the actual PA-input reference plane.
+paInputLabels = coupledDpd.ApplyMeasuredResponse(
+    ilcDacLabels,
+    preMeasurement.impulseResponses,
+)
+
+trainingResult = coupledDpd.FitCoupledSegments(
+    referenceSignals=[desiredPortWaveforms],
+    paInputTargetSignals=[paInputLabels],
+)
+
+# The returned matrix is the waveform that must be sent to the DAC channels.
+dacWaveforms = coupledDpd.Process(desiredPortWaveforms)
+```
+
+如果已有标签就是在每个 PA 输入耦合器处采集并同步后的波形，则不需要再次调用 `ApplyMeasuredResponse`，可以直接作为 `paInputTargetSignals`。
+
+训练与部署时必须保持以下一致：
+
+1. 通道顺序与 `impulseResponses[:, destination, source]` 的索引一致。
+2. `dpdModels[i]` 对应物理 PA $i$。
+3. 训练标签位于 PA 输入参考面，而训练参考经过 PA 后去嵌入后位于 PA 输出参考面。
+4. 功率、采样率、带宽、时延和定点缩放约定一致。
+5. 测量矩阵更新后重新验证，明显漂移时重新训练或更新系数。
+
+### 8.12 如何根据测量结果选择补偿强度
+
+下表给出工程起始建议，不是所有硬件都必须遵守的固定门限：
+
+| 测量现象 | 风险 | 建议 |
+|---|---|---|
+| 耦合低于约 -30 dB，条件数接近 1 | 独立 DPD 可能已足够 | 先做独立 DPD 基线，再决定是否启用矩阵逆 |
+| 耦合约 -30 dB 到 -15 dB | EVM、NMSE 和波束隔离开始可见受限 | 启用 PA 后去嵌入和 PA 前预解耦 |
+| 耦合高于约 -15 dB | PA 输入分布明显改变，逆网络峰值可能升高 | 做多功率训练，限制逆增益并检查 PAPR/削顶 |
+| 带内平坦度较差或群时延差明显 | 常数耦合矩阵不足 | 使用完整 MIMO FIR，不要只用中心频点复系数 |
+| 最坏条件数明显增大 | 求逆放大噪声和量化误差 | 增大 `inverseRegularization`，降低 `maximumInverseGainDb` |
+| 耦合随输出功率明显变化 | 网络或 PA 存在工作点依赖 | 建立多功率测量与系数库，或做在线跟踪 |
+| 去除线性耦合后仍有与其他通道包络相关的残差 | 存在非线性交叉耦合 | 升级为联合多输入 GMP |
+
+验收时至少同时检查：
+
+- 每路 EVM 和 NMSE；
+- 每路 ACLR；
+- 残余交叉投影或通道隔离；
+- DAC 和 PA 输入峰值；
+- 不同功率、不同帧和不同通道相关性下的稳健性。
+
+只看某一路 EVM 可能掩盖“本路变好但对邻路泄漏更强”的问题。
+
+### 8.13 什么时候需要升级为联合非线性 MIMO GMP
+
+当前 `CouplingAwareDpdGmp` 的适用前提是：
+
+- PA 前和 PA 后耦合是可测的线性时不变网络；
+- 去除线性耦合后，各 PA 的非线性可以独立建模；
 - 耦合不会通过负载牵引改变 PA 本身的非线性系数。
 
 如果天线失配、负载调制或强反馈使
@@ -535,14 +1484,36 @@ v_i(n)
 F_i\{u_0(n),u_1(n),\ldots\},
 ```
 
-则必须在 GMP 中加入其他通道包络基函数，例如
+则第 $i$ 路 PA 输出直接依赖其他通道。联合多输入 GMP 可加入三类跨通道项：
 
 ```math
 u_i(n-m)|u_j(n-r)|^{p-1},
-\qquad i\ne j,
 ```
 
-并联合求解所有通道系数。此时仅做线性矩阵去耦不够。
+```math
+u_j(n-m)|u_i(n-r)|^{p-1},
+```
+
+```math
+u_j(n-m)|u_k(n-r)|^{p-1},
+\qquad i\ne j.
+```
+
+将本路和跨路基函数拼成联合设计矩阵
+
+```math
+\mathbf{\Phi}_{i,\mathrm{joint}}
+=
+\begin{bmatrix}
+\mathbf{\Phi}_{i,\mathrm{self}}
+&
+\mathbf{\Phi}_{i,\mathrm{cross}}
+\end{bmatrix},
+```
+
+再用正则化最小二乘联合求解。为了避免系数数量按通道数、阶数和记忆深度快速膨胀，应根据测得的耦合方向和强度只保留显著路径，并用验证集检查跨通道项是否真正改善 EVM、ACLR 和残余耦合。
+
+当前工程实现的是“测得线性 MIMO 网络 + 独立非线性 PA”的分解方案，尚未把上述联合非线性跨通道基函数加入 `DpdGmp`。如果线性去嵌入后残差仍明显依赖邻路包络，应将其识别为模型边界，而不是盲目继续增加单通道 GMP 阶数。
 
 ## 9. 类参数和方法
 

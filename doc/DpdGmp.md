@@ -578,6 +578,8 @@ flowchart TD
 
 ### 16.1 类声明
 
+关于为什么 PA 后逆、逐 PA GMP 和 PA 前逆必须采用当前顺序，耦合时延如何进入 PA 非线性项和因果逆，以及训练标签为何必须位于 PA 输入参考面，请阅读 [ChannelAnalyse：通道耦合条件下 DPD-GMP 的完整方案与推导](./ChannelAnalyse.md#8-通道耦合条件下-dpd-gmp-的完整方案与推导)。其中包含两个双通道例子和完整训练代码。
+
 ```python
 CouplingAwareDpdGmp(
     dpdModels,

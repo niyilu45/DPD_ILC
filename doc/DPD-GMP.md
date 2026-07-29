@@ -628,6 +628,8 @@ A_{\max}\frac{u[n]}{|u[n]|}, & |u[n]|>A_{\max}.
 
 ## 15. 存在通道间耦合时的 DPD-GMP
 
+本节给出结构摘要；从四个参考面的定义、带时延耦合、GMP 基函数、加权岭回归、因果正则化矩阵逆到双通道数值例子的完整推导，见 [ChannelAnalyse：通道耦合条件下 DPD-GMP 的完整方案与推导](./ChannelAnalyse.md#8-通道耦合条件下-dpd-gmp-的完整方案与推导)。
+
 原始 `DpdGmp` 是 SISO PA 逆模型。若 PA 前和 PA 后分别存在测得的线性 MIMO 网络，完整级联为
 
 ```math
