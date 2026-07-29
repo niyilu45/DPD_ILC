@@ -1866,10 +1866,11 @@ flowchart TD
     response --> result["PaCharacterizationResult"]
     memory --> result
     compression --> result
-    result --> files["5个数据文件与4张PNG"]
+    result --> advice["逐PA、逐测试DPD优化建议"]
+    advice --> files["6个数据文件与4张PNG"]
 ```
 
-**图示说明：**三个分支使用相同PA默认参数，但使用与问题匹配的控制变量。频率路径测线性记忆，间隔路径测非线性记忆，功率路径测工作点依赖性；结果先写入结构化数据，再由`Draw.py`绘图。
+**图示说明：**三个分支使用相同PA默认参数，但使用与问题匹配的控制变量。频率路径测线性记忆，间隔路径测非线性记忆，功率路径测工作点依赖性；测量完成后按实测阈值生成DPD结构、初始参数、训练和验收建议，结果写入结构化数据，再由`Draw.py`绘图。
 
 ### 29.4 运行方式
 
@@ -1893,7 +1894,8 @@ python tests/BenchMark.py --pa-analyse --sample-rate-hz 200000000 --tone-samples
 | `pa_memory_effect.csv/.png` | 对比间隔敏感度、上下侧不对称和动态迟滞 |
 | `pa_power_sweep.csv`、`pa_power_characteristics.png` | 对比10至25 dBm工作点变化 |
 | `pa_nonlinearity_comparison.png` | 对比20 dBm标称IM3/IM5/IM7 |
-| `pa_characterization_summary.csv`、`pa_characterization.json` | 保存汇总和全部可复现原始点 |
+| `pa_dpd_recommendations.csv` | 三种PA在五类测试后的15条DPD结构、参数、训练和验收建议 |
+| `pa_characterization_summary.csv`、`pa_characterization.json` | 保存汇总、全部可复现原始点和建议 |
 
 默认预期不是“某一种架构在所有指标上必然最好”，而是：
 
@@ -1901,6 +1903,8 @@ python tests/BenchMark.py --pa-analyse --sample-rate-hz 200000000 --tone-samples
 - GMP的记忆抽头和包络交叉项带来更明显的间隔依赖、侧带不对称和动态迟滞；
 - 接近25 dBm时，各模型进入不同压缩状态，互调和迟滞明显依赖输出功率；
 - Doherty支路之间可能在个别功率点发生复数抵消，因此曲线不强制单调。
+
+每项测试后的具体建议不只依据PA名称，还引用当前仿真的增益起伏、相位曲率、IM3间隔变化、动态迟滞、标称互调和失真拐点。用户修改PA系数或功率点后，应重新运行H类，不能照搬默认结果的阶数、记忆深度或功率锚点。
 
 ### 29.6 H类验收清单
 
@@ -1910,4 +1914,5 @@ python tests/BenchMark.py --pa-analyse --sample-rate-hz 200000000 --tone-samples
 - [ ] 功率分支覆盖10、15、20、23、25 dBm并保存目标与实测值；
 - [ ] IM3、IM5、IM7和动态AM-AM/AM-PM均随功率输出；
 - [ ] 频响、记忆、标称互调和功率特性四张图均由同一份CSV/JSON数据生成；
+- [ ] 每种PA都生成频响、间隔记忆、动态迟滞、标称非线性和输出功率五类DPD建议；
 - [ ] 报告明确结果属于默认行为模型，不泛化为真实器件架构结论。

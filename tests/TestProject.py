@@ -427,9 +427,12 @@ def CheckBenchmarkSeparation() -> None:
         "PrintTwoToneBenchmarkResults",
         "PaCharacterizationConfig",
         "PaCharacterizationResult",
+        "PaDpdRecommendation",
+        "BuildPaDpdRecommendations",
         "RunPaCharacterizationBenchmark",
         "SavePaCharacterizationResults",
         "PrintPaCharacterizationResults",
+        "PrintPaDpdRecommendations",
     )
     for forbiddenName in forbiddenProductionNames:
         assert forbiddenName not in ilcSource, (
@@ -483,6 +486,8 @@ def CheckBenchmarkSeparation() -> None:
         "同场景部署模型优缺点对比",
         "功率维度的优缺点对比",
         "G类：双音IM3/IM5/IM7场景",
+        "H类：Wiener/GMP/Doherty PA双音特性",
+        "逐PA、逐测试DPD优化建议",
     )
     for sectionTitle in requiredDocumentSections:
         assert sectionTitle in benchmarkDocument, (
@@ -3950,8 +3955,9 @@ def CheckPaCharacterizationBenchmark() -> None:
     Processing details:
         Algorithm: Run a compact Wiener/GMP/Doherty frequency and tone-spacing
         sweep, require the expected point counts and finite summary metrics,
-        verify equal-power nonlinear measurements, and check all CSV, JSON,
-        and PNG outputs plus the dedicated principle document.
+        verify equal-power nonlinear measurements, require five complete
+        measurement-backed DPD recommendations per model, and check all CSV,
+        JSON, and PNG outputs plus the dedicated principle document.
 
     Returns:
         result: None. Assertion failures identify PA characterization
@@ -3984,8 +3990,10 @@ def CheckPaCharacterizationBenchmark() -> None:
         assert len(result.memoryEffect) == 9
         assert len(result.powerSweep) == 6
         assert len(result.summaries) == 3
+        assert len(result.recommendations) == 15
         resultDocument = result.ToDict()
         assert len(resultDocument["powerSweep"]) == 6
+        assert len(resultDocument["recommendations"]) == 15
         assert tuple(
             summary.modelName for summary in result.summaries
         ) == ("wiener", "gmp", "doherty")
@@ -4018,11 +4026,37 @@ def CheckPaCharacterizationBenchmark() -> None:
                 for powerPoint in result.powerSweep
                 if powerPoint.modelName == modelName
             ) == (15.0, 20.0)
+            modelRecommendations = tuple(
+                recommendation
+                for recommendation in result.recommendations
+                if recommendation.modelName == modelName
+            )
+            assert tuple(
+                recommendation.testName
+                for recommendation in modelRecommendations
+            ) == (
+                "frequency_response",
+                "memory_effect",
+                "dynamic_hysteresis",
+                "nominal_nonlinearity",
+                "output_power",
+            )
+            for recommendation in modelRecommendations:
+                recommendationRow = recommendation.ToDict()
+                for fieldName in (
+                    "measuredEvidence",
+                    "dpdArchitecture",
+                    "dpdConfiguration",
+                    "trainingStrategy",
+                    "acceptanceCriteria",
+                ):
+                    assert recommendationRow[fieldName]
         for artifactName in (
             "pa_frequency_response.csv",
             "pa_memory_effect.csv",
             "pa_power_sweep.csv",
             "pa_characterization_summary.csv",
+            "pa_dpd_recommendations.csv",
             "pa_characterization.json",
             "pa_frequency_response.png",
             "pa_memory_effect.png",
@@ -4030,6 +4064,12 @@ def CheckPaCharacterizationBenchmark() -> None:
             "pa_power_characteristics.png",
         ):
             assert (outputDirectory / artifactName).exists()
+        recommendationDocument = json.loads(
+            (
+                outputDirectory / "pa_characterization.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert len(recommendationDocument["recommendations"]) == 15
     paAnalysisDocument = (
         GetProjectRoot() / "doc" / "PaAnalyse.md"
     ).read_text(encoding="utf-8")
@@ -4038,6 +4078,12 @@ def CheckPaCharacterizationBenchmark() -> None:
         "双音间隔扫描",
         "动态AM-AM/AM-PM迟滞",
         "输出功率扫描",
+        "小信号频响测试后的DPD建议",
+        "双音间隔测试后的DPD建议",
+        "动态迟滞测试后的DPD建议",
+        "标称非线性测试后的DPD建议",
+        "输出功率测试后的DPD建议",
+        "pa_dpd_recommendations.csv",
         "测试结果",
         "pa_frequency_response.png",
         "pa_memory_effect.png",

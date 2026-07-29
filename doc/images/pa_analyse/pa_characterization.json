@@ -764,5 +764,142 @@
       "nominalIm5Dbc": -23.03323838120845,
       "nominalIm7Dbc": -54.83217956125041
     }
+  ],
+  "recommendations": [
+    {
+      "modelName": "wiener",
+      "testName": "frequency_response",
+      "measuredEvidence": "Gain ripple=0.285 dB, group delay=0.148 ns, residual phase=0.629 deg.",
+      "dpdArchitecture": "Short complex FIR pre-equalizer followed by a memory-polynomial nonlinear stage.",
+      "dpdConfiguration": "Start with 5 complex FIR taps; normalize the center tap and regularize the remaining tap energy.",
+      "trainingStrategy": "Estimate the inverse linear response at low drive, freeze the FIR, then identify nonlinear coefficients at nominal power.",
+      "acceptanceCriteria": "On an independent frequency sweep, require residual gain ripple <=0.10 dB and residual phase curvature <=0.50 deg before nonlinear training is accepted."
+    },
+    {
+      "modelName": "wiener",
+      "testName": "memory_effect",
+      "measuredEvidence": "Memory severity=weak; IM3 spacing variation=0.013 dB and maximum sideband asymmetry=0.000 dB.",
+      "dpdArchitecture": "Memory polynomial after the linear FIR; add GMP cross terms only if validation exposes spacing-dependent residual IM.",
+      "dpdConfiguration": "Use odd orders (1,3,5,7), main memory depth 3, and zero cross-memory depth initially.",
+      "trainingStrategy": "Train with at least the minimum, nominal, and maximum tested tone spacings using equal output-power weighting; select memory depth on a held-out spacing.",
+      "acceptanceCriteria": "Require residual IM3 spacing variation <0.50 dB and upper/lower IM3 asymmetry <0.50 dB without worsening IM5 or IM7 by more than 1 dB."
+    },
+    {
+      "modelName": "wiener",
+      "testName": "dynamic_hysteresis",
+      "measuredEvidence": "Dynamic AM-AM RMS=0.061 dB and dynamic AM-PM RMS=0.012 deg.",
+      "dpdArchitecture": "Keep the static nonlinear inverse and short memory polynomial unless the dynamic loop grows at deployment power.",
+      "dpdConfiguration": "Start with depth 2-3 and strong ridge regularization on all delayed nonlinear terms.",
+      "trainingStrategy": "Balance rising and falling envelope samples in every amplitude bin; do not let dense low-amplitude samples dominate the regression.",
+      "acceptanceCriteria": "Require dynamic AM-AM RMS <0.10 dB and dynamic AM-PM RMS <1.0 deg on a held-out two-tone phase and spacing."
+    },
+    {
+      "modelName": "wiener",
+      "testName": "nominal_nonlinearity",
+      "measuredEvidence": "Nonlinearity severity=moderate at 20.0 dBm: IM3=-33.25, IM5=-45.73, IM7=-68.77 dBc.",
+      "dpdArchitecture": "Odd-order memory polynomial or GMP with the measured linear FIR handled separately.",
+      "dpdConfiguration": "Start with orders (1,3,5,7), depth 3, and remove order 7 only if held-out IM7 remains below the target.",
+      "trainingStrategy": "Identify at nominal power, then add maximum-power samples with peak-aware weighting; optimize waveform error and IM3/IM5/IM7 at equal measured output power.",
+      "acceptanceCriteria": "Require at least 10 dB IM3 improvement at equal output power, no IM5/IM7 regression larger than 1 dB, and no increase in peak input beyond the configured limit."
+    },
+    {
+      "modelName": "wiener",
+      "testName": "output_power",
+      "measuredEvidence": "First strong-distortion point=22.80 dBm (IM3=-19.31 dBc); IM3 power trend=monotonic.",
+      "dpdArchitecture": "Power-conditioned memory polynomial with coefficient interpolation between linear and compression regions.",
+      "dpdConfiguration": "Use coefficient anchors at 10, 15, 20, 23, 25 dBm; apply stronger peak projection above the detected knee when a knee is present.",
+      "trainingStrategy": "Train and validate every configured output-power point, up-weight the detected knee and maximum-power point, and interpolate coefficients only inside the measured range.",
+      "acceptanceCriteria": "At every power point require improved EVM and worst-side ACLR on Wi-Fi plus non-regressing IM3/IM5/IM7 on two-tone; reject improvements caused by PA-output rescaling."
+    },
+    {
+      "modelName": "gmp",
+      "testName": "frequency_response",
+      "measuredEvidence": "Gain ripple=0.229 dB, group delay=0.095 ns, residual phase=0.749 deg.",
+      "dpdArchitecture": "Complex FIR or frequency-domain pre-equalizer followed by GMP so linear and nonlinear memory remain jointly modeled.",
+      "dpdConfiguration": "Start with 7 complex FIR taps; normalize the center tap and regularize the remaining tap energy.",
+      "trainingStrategy": "Jointly fit FIR and GMP on multitone or wideband data with ridge regularization; retain edge-frequency validation.",
+      "acceptanceCriteria": "On an independent frequency sweep, require residual gain ripple <=0.10 dB and residual phase curvature <=0.50 deg before nonlinear training is accepted."
+    },
+    {
+      "modelName": "gmp",
+      "testName": "memory_effect",
+      "measuredEvidence": "Memory severity=strong; IM3 spacing variation=1.284 dB and maximum sideband asymmetry=1.618 dB.",
+      "dpdArchitecture": "Full lagging-and-leading GMP or frequency-selective ILC with explicit envelope cross-memory branches.",
+      "dpdConfiguration": "Use odd orders (1,3,5,7,9), main memory depth 5-7, and lagging/leading envelope cross-memory depth 3-5.",
+      "trainingStrategy": "Train with at least the minimum, nominal, and maximum tested tone spacings using equal output-power weighting; select memory depth on a held-out spacing.",
+      "acceptanceCriteria": "Require residual IM3 spacing variation <0.50 dB and upper/lower IM3 asymmetry <0.50 dB without worsening IM5 or IM7 by more than 1 dB."
+    },
+    {
+      "modelName": "gmp",
+      "testName": "dynamic_hysteresis",
+      "measuredEvidence": "Dynamic AM-AM RMS=0.952 dB and dynamic AM-PM RMS=7.631 deg.",
+      "dpdArchitecture": "Use bidirectional envelope GMP terms or a compact recurrent envelope-state branch in addition to the main polynomial.",
+      "dpdConfiguration": "Retain at least 3 lagging and 3 leading envelope delays; weight AM-PM residuals explicitly in coefficient fitting.",
+      "trainingStrategy": "Balance rising and falling envelope samples in every amplitude bin; do not let dense low-amplitude samples dominate the regression.",
+      "acceptanceCriteria": "Require dynamic AM-AM RMS <0.10 dB and dynamic AM-PM RMS <1.0 deg on a held-out two-tone phase and spacing."
+    },
+    {
+      "modelName": "gmp",
+      "testName": "nominal_nonlinearity",
+      "measuredEvidence": "Nonlinearity severity=severe at 20.0 dBm: IM3=-0.70, IM5=-15.46, IM7=-18.19 dBc.",
+      "dpdArchitecture": "Regularized high-order GMP trained with peak-aware weighting and explicit input-amplitude projection.",
+      "dpdConfiguration": "Start with orders (1,3,5,7,9), depth 5, cross-depth 3, coefficient normalization, and ridge-factor search.",
+      "trainingStrategy": "Begin about 5 dB below the 20.0 dBm severe-distortion point, fit a stable regularized inverse, and increase power in small steps only while held-out error continues to improve.",
+      "acceptanceCriteria": "Require at least 10 dB IM3 improvement at equal output power, no IM5/IM7 regression larger than 1 dB, and no increase in peak input beyond the configured limit."
+    },
+    {
+      "modelName": "gmp",
+      "testName": "output_power",
+      "measuredEvidence": "First strong-distortion point=14.83 dBm (IM3=-24.27 dBc); IM3 power trend=nonmonotonic.",
+      "dpdArchitecture": "Multi-operating-point GMP or coefficient bank indexed by measured output power and envelope RMS.",
+      "dpdConfiguration": "Use all measured anchors (10, 15, 20, 23, 25 dBm), normalize each power block, and regularize coefficient changes between adjacent blocks.",
+      "trainingStrategy": "Train and validate every configured output-power point, up-weight the detected knee and maximum-power point, and interpolate coefficients only inside the measured range.",
+      "acceptanceCriteria": "At every power point require improved EVM and worst-side ACLR on Wi-Fi plus non-regressing IM3/IM5/IM7 on two-tone; reject improvements caused by PA-output rescaling."
+    },
+    {
+      "modelName": "doherty",
+      "testName": "frequency_response",
+      "measuredEvidence": "Gain ripple=0.285 dB, group delay=0.148 ns, residual phase=0.629 deg.",
+      "dpdArchitecture": "Power-conditioned complex FIR followed by a branch-aware or piecewise nonlinear DPD.",
+      "dpdConfiguration": "Start with 5 complex FIR taps; normalize the center tap and regularize the remaining tap energy.",
+      "trainingStrategy": "Initialize from the carrier-only low-power response, then repeat identification above peaking turn-on instead of reusing one fixed inverse.",
+      "acceptanceCriteria": "On an independent frequency sweep, require residual gain ripple <=0.10 dB and residual phase curvature <=0.50 deg before nonlinear training is accepted."
+    },
+    {
+      "modelName": "doherty",
+      "testName": "memory_effect",
+      "measuredEvidence": "Memory severity=weak; IM3 spacing variation=0.022 dB and maximum sideband asymmetry=0.029 dB.",
+      "dpdArchitecture": "Shallow branch-aware memory polynomial with separate carrier-only and carrier-plus-peaking regions.",
+      "dpdConfiguration": "Use odd orders (1,3,5,7), depth 3 per region, and a smooth gate around the peaking turn-on amplitude.",
+      "trainingStrategy": "Train with at least the minimum, nominal, and maximum tested tone spacings using equal output-power weighting; select memory depth on a held-out spacing.",
+      "acceptanceCriteria": "Require residual IM3 spacing variation <0.50 dB and upper/lower IM3 asymmetry <0.50 dB without worsening IM5 or IM7 by more than 1 dB."
+    },
+    {
+      "modelName": "doherty",
+      "testName": "dynamic_hysteresis",
+      "measuredEvidence": "Dynamic AM-AM RMS=0.063 dB and dynamic AM-PM RMS=0.018 deg.",
+      "dpdArchitecture": "Use a smooth mixture-of-experts DPD whose state includes envelope direction near peaking activation.",
+      "dpdConfiguration": "Use two smoothly blended coefficient sets and constrain their boundary value and first derivative to be continuous.",
+      "trainingStrategy": "Balance rising and falling envelope samples in every amplitude bin; do not let dense low-amplitude samples dominate the regression.",
+      "acceptanceCriteria": "Require dynamic AM-AM RMS <0.10 dB and dynamic AM-PM RMS <1.0 deg on a held-out two-tone phase and spacing."
+    },
+    {
+      "modelName": "doherty",
+      "testName": "nominal_nonlinearity",
+      "measuredEvidence": "Nonlinearity severity=severe at 20.0 dBm: IM3=-15.57, IM5=-23.03, IM7=-54.83 dBc.",
+      "dpdArchitecture": "Piecewise carrier/peaking DPD, such as a smooth LUT plus GMP residual corrector, rather than one global polynomial.",
+      "dpdConfiguration": "Use orders (1,3,5,7) per operating region, a continuous transition gate, and separate carrier/peaking gain anchors.",
+      "trainingStrategy": "Collect balanced samples below, inside, and above peaking turn-on; fit regional inverses jointly and penalize boundary discontinuity while monitoring every odd-order product.",
+      "acceptanceCriteria": "Require at least 10 dB IM3 improvement at equal output power, no IM5/IM7 regression larger than 1 dB, and no increase in peak input beyond the configured limit."
+    },
+    {
+      "modelName": "doherty",
+      "testName": "output_power",
+      "measuredEvidence": "First strong-distortion point=20.17 dBm (IM3=-15.57 dBc); IM3 power trend=nonmonotonic.",
+      "dpdArchitecture": "Carrier-only/carrier-plus-peaking mixture-of-experts DPD with a physically aligned smooth transition gate.",
+      "dpdConfiguration": "Retain the measured anchors (10, 15, 20, 23, 25 dBm), add dense anchors at the detected knee +/-1 dB when present, and constrain regional outputs and slopes to join continuously.",
+      "trainingStrategy": "Train and validate every configured output-power point, up-weight the detected knee and maximum-power point, and interpolate coefficients only inside the measured range.",
+      "acceptanceCriteria": "At every power point require improved EVM and worst-side ACLR on Wi-Fi plus non-regressing IM3/IM5/IM7 on two-tone; reject improvements caused by PA-output rescaling."
+    }
   ]
 }

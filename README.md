@@ -8,7 +8,7 @@
 - [双音信号生成物理原理与用法](doc/WaveGenTwoTone.md)：复基带双音、奇数阶互调频率、RMS/定点边界和ILC带宽。
 - [FEC编码译码原理与用法](doc/Fec.md)：55/90短块LDPC校验矩阵、系统编码、软输入normalized min-sum译码和调用示例。
 - [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、GMP、Doherty载波/峰值双支路、频谱再生和IQ失衡。
-- [PA双音特性分析](doc/PaAnalyse.md)：小信号频响、双音间隔记忆、动态AM-AM/AM-PM迟滞、IM3/IM5/IM7及输出功率扫描。
+- [PA双音特性分析](doc/PaAnalyse.md)：小信号频响、双音间隔记忆、动态AM-AM/AM-PM迟滞、IM3/IM5/IM7、输出功率扫描及逐PA的DPD优化建议。
 - [PA到接收端Channel物理原理与用法](doc/Channel.md)：PA前/后多通道耦合、前向仪表/板载反馈采样、反馈链路非理想和联合功率校准。
 - [信号同步、补偿与功率标定原理](doc/SigProc.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样、复增益补偿和 dBm/RMS 换算。
 - [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
@@ -661,7 +661,8 @@ flowchart TD
     algorithms --> analysis["Analysis：SNR / EVM / ACLR"]
     analysis --> report["CSV / JSON / 收敛图 / 功率-EVM图"]
     paSweep --> toneAnalysis["TwoToneAnalysis：H(f) / IM3 / IM5 / IM7"]
-    toneAnalysis --> paReport["PA特性CSV / JSON / 四张PNG"]
+    toneAnalysis --> paAdvice["测量驱动的逐PA DPD优化建议"]
+    paAdvice --> paReport["PA特性与建议CSV / JSON / 四张PNG"]
 ```
 
 **图示说明：**`BenchMark.py` 只负责场景编排和结果呈现，不重新实现任何ILC更新律或PA方程。ILC场景分类、预期趋势和本机参考结果见[BenchMark场景说明](doc/BenchMark.md)；独立PA测试见[PA双音特性分析](doc/PaAnalyse.md)。
@@ -2193,9 +2194,15 @@ result = RunPaCharacterizationBenchmark(
     )
 )
 print([summary.ToDict() for summary in result.summaries])
+print(
+    [
+        recommendation.ToDict()
+        for recommendation in result.recommendations
+    ]
+)
 ```
 
-输出包括频响、双音间隔记忆、20 dBm标称互调和随实测输出功率变化的四张PNG，以及每个原始点的CSV/JSON。完整公式、流程、参考数值和图表见[PA双音特性分析](doc/PaAnalyse.md)。
+输出包括频响、双音间隔记忆、20 dBm标称互调和随实测输出功率变化的四张PNG，以及每个原始点的CSV/JSON。`pa_dpd_recommendations.csv`进一步按“PA模型×测试类别”保存实测依据、DPD结构、初始配置、训练策略和验收条件；默认三种PA、五类测试共15条建议。完整公式、流程、参考数值、逐测试优化建议和图表见[PA双音特性分析](doc/PaAnalyse.md)。
 
 ## 指标定义
 

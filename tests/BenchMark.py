@@ -758,13 +758,49 @@ class PaPowerSweepPoint:
 
 
 @dataclass(frozen=True)
+class PaDpdRecommendation:
+    """Store one measurement-backed DPD design recommendation."""
+
+    modelName: str
+    testName: str
+    measuredEvidence: str
+    dpdArchitecture: str
+    dpdConfiguration: str
+    trainingStrategy: str
+    acceptanceCriteria: str
+
+    def ToDict(self) -> Dict[str, object]:
+        """Flatten one recommendation without changing its measured basis.
+
+        Processing details:
+            Algorithm: Copy the PA identity, test category, measured evidence,
+            proposed DPD structure, initial configuration, training strategy,
+            and validation gate into a stable table row.
+
+        Returns:
+            result: CSV/JSON-ready DPD recommendation dictionary.
+        """
+
+        return {
+            "modelName": self.modelName,
+            "testName": self.testName,
+            "measuredEvidence": self.measuredEvidence,
+            "dpdArchitecture": self.dpdArchitecture,
+            "dpdConfiguration": self.dpdConfiguration,
+            "trainingStrategy": self.trainingStrategy,
+            "acceptanceCriteria": self.acceptanceCriteria,
+        }
+
+
+@dataclass(frozen=True)
 class PaCharacterizationResult:
-    """Store every PA characterization point and compact model summary."""
+    """Store PA measurements, summaries, and DPD design recommendations."""
 
     frequencyResponse: Tuple[PaFrequencyResponsePoint, ...]
     memoryEffect: Tuple[PaMemoryEffectPoint, ...]
     powerSweep: Tuple[PaPowerSweepPoint, ...]
     summaries: Tuple[PaCharacterizationSummary, ...]
+    recommendations: Tuple[PaDpdRecommendation, ...] = ()
 
     def ToDict(self) -> Dict[str, object]:
         """Convert every immutable result table to JSON-ready dictionaries.
@@ -791,6 +827,10 @@ class PaCharacterizationResult:
             ],
             "summaries": [
                 summary.ToDict() for summary in self.summaries
+            ],
+            "recommendations": [
+                recommendation.ToDict()
+                for recommendation in self.recommendations
             ],
         }
 
@@ -1440,15 +1480,429 @@ def SummarizePaCharacterization(
     )
 
 
+def BuildPaDpdRecommendations(
+    result: PaCharacterizationResult,
+    config: PaCharacterizationConfig,
+) -> Tuple[PaDpdRecommendation, ...]:
+    """Translate measured PA features into concrete DPD design guidance.
+
+    Processing details:
+        Algorithm: Derive a linear-equalizer tap budget from frequency
+        ripple/phase curvature, classify spectral and dynamic memory severity,
+        identify the first power point with strong IM3 or hysteresis, detect
+        nonmonotonic power behavior, and combine those measurements with each
+        PA architecture to recommend an initial DPD structure, configuration,
+        training plan, and quantitative validation gate for every test class.
+
+    Args:
+        result: Complete measured PA frequency, memory, power, and summary
+            result before recommendations are attached.
+        config: Exact characterization settings defining nominal power and
+            power-sweep coverage.
+
+    Returns:
+        result: Five ordered measurement-backed recommendations per PA model.
+    """
+
+    summaryByModel = {
+        summary.modelName: summary for summary in result.summaries
+    }
+    recommendations = []
+    minimumLinearTapsByModel = {
+        "wiener": 5,
+        "gmp": 7,
+        "doherty": 5,
+    }
+    for configuredModelName in config.paModelNames:
+        modelName = configuredModelName.strip().lower()
+        if modelName not in summaryByModel:
+            raise ValueError(
+                f"missing PA characterization summary for {modelName}"
+            )
+        summary = summaryByModel[modelName]
+        powerPoints = sorted(
+            (
+                point
+                for point in result.powerSweep
+                if point.modelName == modelName
+            ),
+            key=lambda point: point.measuredOutputPowerDbm,
+        )
+        if len(powerPoints) < 2:
+            raise ValueError(
+                f"at least two power points are required for {modelName}"
+            )
+        frequencyPenalty = (
+            4
+            if (
+                summary.gainRippleDb > 0.50
+                or summary.phaseNonlinearityDegrees > 1.00
+            )
+            else 0
+        )
+        linearTapCount = (
+            minimumLinearTapsByModel[modelName] + frequencyPenalty
+        )
+        memorySeverity = "strong" if (
+            summary.im3SpacingVariationDb > 1.0
+            or summary.maximumIm3AsymmetryDb > 1.0
+            or summary.dynamicGainHysteresisDb > 0.30
+            or summary.dynamicPhaseHysteresisDegrees > 3.0
+        ) else "moderate" if (
+            summary.im3SpacingVariationDb > 0.25
+            or summary.maximumIm3AsymmetryDb > 0.25
+            or summary.dynamicGainHysteresisDb > 0.10
+            or summary.dynamicPhaseHysteresisDegrees > 1.0
+        ) else "weak"
+        nonlinearSeverity = (
+            "severe"
+            if summary.nominalIm3Dbc > -20.0
+            else "moderate"
+            if summary.nominalIm3Dbc > -35.0
+            else "mild"
+        )
+        detectedKneePoint = next(
+            (
+                point
+                for point in powerPoints
+                if (
+                    point.im3WorstDbc > -30.0
+                    or point.dynamicGainHysteresisDb > 0.25
+                    or point.dynamicPhaseHysteresisDegrees > 1.0
+                )
+            ),
+            None,
+        )
+        kneeDetected = detectedKneePoint is not None
+        kneePoint = (
+            powerPoints[-1]
+            if detectedKneePoint is None
+            else detectedKneePoint
+        )
+        im3PowerTrend = np.diff(
+            np.asarray(
+                [point.im3WorstDbc for point in powerPoints],
+                dtype=float,
+            )
+        )
+        significantIm3PowerTrend = im3PowerTrend[
+            np.abs(im3PowerTrend) >= 0.25
+        ]
+        nonmonotonicPowerTrend = bool(
+            significantIm3PowerTrend.size >= 2
+            and np.any(
+                significantIm3PowerTrend[:-1]
+                * significantIm3PowerTrend[1:]
+                < 0.0
+            )
+        )
+        frequencyArchitecture = {
+            "wiener": (
+                "Short complex FIR pre-equalizer followed by a "
+                "memory-polynomial nonlinear stage."
+            ),
+            "gmp": (
+                "Complex FIR or frequency-domain pre-equalizer followed by "
+                "GMP so linear and nonlinear memory remain jointly modeled."
+            ),
+            "doherty": (
+                "Power-conditioned complex FIR followed by a branch-aware "
+                "or piecewise nonlinear DPD."
+            ),
+        }[modelName]
+        frequencyTraining = {
+            "wiener": (
+                "Estimate the inverse linear response at low drive, freeze "
+                "the FIR, then identify nonlinear coefficients at nominal "
+                "power."
+            ),
+            "gmp": (
+                "Jointly fit FIR and GMP on multitone or wideband data with "
+                "ridge regularization; retain edge-frequency validation."
+            ),
+            "doherty": (
+                "Initialize from the carrier-only low-power response, then "
+                "repeat identification above peaking turn-on instead of "
+                "reusing one fixed inverse."
+            ),
+        }[modelName]
+        recommendations.append(
+            PaDpdRecommendation(
+                modelName=modelName,
+                testName="frequency_response",
+                measuredEvidence=(
+                    f"Gain ripple={summary.gainRippleDb:.3f} dB, "
+                    f"group delay={summary.groupDelayNs:.3f} ns, "
+                    "residual phase="
+                    f"{summary.phaseNonlinearityDegrees:.3f} deg."
+                ),
+                dpdArchitecture=frequencyArchitecture,
+                dpdConfiguration=(
+                    f"Start with {linearTapCount} complex FIR taps; "
+                    "normalize the center tap and regularize the remaining "
+                    "tap energy."
+                ),
+                trainingStrategy=frequencyTraining,
+                acceptanceCriteria=(
+                    "On an independent frequency sweep, require residual "
+                    "gain ripple <=0.10 dB and residual phase curvature "
+                    "<=0.50 deg before nonlinear training is accepted."
+                ),
+            )
+        )
+        memoryArchitecture = {
+            "wiener": (
+                "Memory polynomial after the linear FIR; add GMP cross terms "
+                "only if validation exposes spacing-dependent residual IM."
+            ),
+            "gmp": (
+                "Full lagging-and-leading GMP or frequency-selective ILC "
+                "with explicit envelope cross-memory branches."
+            ),
+            "doherty": (
+                "Shallow branch-aware memory polynomial with separate "
+                "carrier-only and carrier-plus-peaking regions."
+            ),
+        }[modelName]
+        memoryConfiguration = {
+            "wiener": (
+                "Use odd orders (1,3,5,7), main memory depth 3, and zero "
+                "cross-memory depth initially."
+            ),
+            "gmp": (
+                "Use odd orders (1,3,5,7,9), main memory depth 5-7, and "
+                "lagging/leading envelope cross-memory depth 3-5."
+            ),
+            "doherty": (
+                "Use odd orders (1,3,5,7), depth 3 per region, and a smooth "
+                "gate around the peaking turn-on amplitude."
+            ),
+        }[modelName]
+        recommendations.append(
+            PaDpdRecommendation(
+                modelName=modelName,
+                testName="memory_effect",
+                measuredEvidence=(
+                    f"Memory severity={memorySeverity}; IM3 spacing "
+                    f"variation={summary.im3SpacingVariationDb:.3f} dB "
+                    "and maximum sideband asymmetry="
+                    f"{summary.maximumIm3AsymmetryDb:.3f} dB."
+                ),
+                dpdArchitecture=memoryArchitecture,
+                dpdConfiguration=memoryConfiguration,
+                trainingStrategy=(
+                    "Train with at least the minimum, nominal, and maximum "
+                    "tested tone spacings using equal output-power weighting; "
+                    "select memory depth on a held-out spacing."
+                ),
+                acceptanceCriteria=(
+                    "Require residual IM3 spacing variation <0.50 dB and "
+                    "upper/lower IM3 asymmetry <0.50 dB without worsening "
+                    "IM5 or IM7 by more than 1 dB."
+                ),
+            )
+        )
+        dynamicArchitecture = {
+            "wiener": (
+                "Keep the static nonlinear inverse and short memory "
+                "polynomial unless the dynamic loop grows at deployment "
+                "power."
+            ),
+            "gmp": (
+                "Use bidirectional envelope GMP terms or a compact recurrent "
+                "envelope-state branch in addition to the main polynomial."
+            ),
+            "doherty": (
+                "Use a smooth mixture-of-experts DPD whose state includes "
+                "envelope direction near peaking activation."
+            ),
+        }[modelName]
+        dynamicConfiguration = {
+            "wiener": (
+                "Start with depth 2-3 and strong ridge regularization on all "
+                "delayed nonlinear terms."
+            ),
+            "gmp": (
+                "Retain at least 3 lagging and 3 leading envelope delays; "
+                "weight AM-PM residuals explicitly in coefficient fitting."
+            ),
+            "doherty": (
+                "Use two smoothly blended coefficient sets and constrain "
+                "their boundary value and first derivative to be continuous."
+            ),
+        }[modelName]
+        recommendations.append(
+            PaDpdRecommendation(
+                modelName=modelName,
+                testName="dynamic_hysteresis",
+                measuredEvidence=(
+                    "Dynamic AM-AM RMS="
+                    f"{summary.dynamicGainHysteresisDb:.3f} dB and "
+                    "dynamic AM-PM RMS="
+                    f"{summary.dynamicPhaseHysteresisDegrees:.3f} deg."
+                ),
+                dpdArchitecture=dynamicArchitecture,
+                dpdConfiguration=dynamicConfiguration,
+                trainingStrategy=(
+                    "Balance rising and falling envelope samples in every "
+                    "amplitude bin; do not let dense low-amplitude samples "
+                    "dominate the regression."
+                ),
+                acceptanceCriteria=(
+                    "Require dynamic AM-AM RMS <0.10 dB and dynamic AM-PM "
+                    "RMS <1.0 deg on a held-out two-tone phase and spacing."
+                ),
+            )
+        )
+        nonlinearArchitecture = {
+            "wiener": (
+                "Odd-order memory polynomial or GMP with the measured linear "
+                "FIR handled separately."
+            ),
+            "gmp": (
+                "Regularized high-order GMP trained with peak-aware weighting "
+                "and explicit input-amplitude projection."
+            ),
+            "doherty": (
+                "Piecewise carrier/peaking DPD, such as a smooth LUT plus "
+                "GMP residual corrector, rather than one global polynomial."
+            ),
+        }[modelName]
+        nonlinearConfiguration = {
+            "wiener": (
+                "Start with orders (1,3,5,7), depth 3, and remove order 7 "
+                "only if held-out IM7 remains below the target."
+            ),
+            "gmp": (
+                "Start with orders (1,3,5,7,9), depth 5, cross-depth 3, "
+                "coefficient normalization, and ridge-factor search."
+            ),
+            "doherty": (
+                "Use orders (1,3,5,7) per operating region, a continuous "
+                "transition gate, and separate carrier/peaking gain anchors."
+            ),
+        }[modelName]
+        nonlinearTrainingStrategy = {
+            "wiener": (
+                "Identify at nominal power, then add maximum-power samples "
+                "with peak-aware weighting; optimize waveform error and "
+                "IM3/IM5/IM7 at equal measured output power."
+            ),
+            "gmp": (
+                f"Begin about 5 dB below the {config.outputPowerDbm:.1f} dBm "
+                "severe-distortion point, fit a stable regularized inverse, "
+                "and increase power in small steps only while held-out error "
+                "continues to improve."
+            ),
+            "doherty": (
+                "Collect balanced samples below, inside, and above peaking "
+                "turn-on; fit regional inverses jointly and penalize boundary "
+                "discontinuity while monitoring every odd-order product."
+            ),
+        }[modelName]
+        recommendations.append(
+            PaDpdRecommendation(
+                modelName=modelName,
+                testName="nominal_nonlinearity",
+                measuredEvidence=(
+                    f"Nonlinearity severity={nonlinearSeverity} at "
+                    f"{config.outputPowerDbm:.1f} dBm: IM3="
+                    f"{summary.nominalIm3Dbc:.2f}, IM5="
+                    f"{summary.nominalIm5Dbc:.2f}, IM7="
+                    f"{summary.nominalIm7Dbc:.2f} dBc."
+                ),
+                dpdArchitecture=nonlinearArchitecture,
+                dpdConfiguration=nonlinearConfiguration,
+                trainingStrategy=nonlinearTrainingStrategy,
+                acceptanceCriteria=(
+                    "Require at least 10 dB IM3 improvement at equal output "
+                    "power, no IM5/IM7 regression larger than 1 dB, and no "
+                    "increase in peak input beyond the configured limit."
+                ),
+            )
+        )
+        powerArchitecture = {
+            "wiener": (
+                "Power-conditioned memory polynomial with coefficient "
+                "interpolation between linear and compression regions."
+            ),
+            "gmp": (
+                "Multi-operating-point GMP or coefficient bank indexed by "
+                "measured output power and envelope RMS."
+            ),
+            "doherty": (
+                "Carrier-only/carrier-plus-peaking mixture-of-experts DPD "
+                "with a physically aligned smooth transition gate."
+            ),
+        }[modelName]
+        configuredPowerText = ", ".join(
+            f"{float(powerDbm):g}"
+            for powerDbm in config.powerSweepDbm
+        )
+        powerConfiguration = {
+            "wiener": (
+                f"Use coefficient anchors at {configuredPowerText} dBm; "
+                "apply stronger peak projection above the detected knee "
+                "when a knee is present."
+            ),
+            "gmp": (
+                f"Use all measured anchors ({configuredPowerText} dBm), "
+                "normalize each power block, and regularize coefficient "
+                "changes between adjacent blocks."
+            ),
+            "doherty": (
+                f"Retain the measured anchors ({configuredPowerText} dBm), "
+                "add dense anchors at the detected knee +/-1 dB when present, "
+                "and constrain regional outputs and slopes to join "
+                "continuously."
+            ),
+        }[modelName]
+        kneeEvidence = (
+            "First strong-distortion point="
+            f"{kneePoint.measuredOutputPowerDbm:.2f} dBm "
+            f"(IM3={kneePoint.im3WorstDbc:.2f} dBc)"
+            if kneeDetected
+            else (
+                "No strong-distortion threshold crossed; highest tested "
+                f"point={kneePoint.measuredOutputPowerDbm:.2f} dBm "
+                f"(IM3={kneePoint.im3WorstDbc:.2f} dBc)"
+            )
+        )
+        recommendations.append(
+            PaDpdRecommendation(
+                modelName=modelName,
+                testName="output_power",
+                measuredEvidence=(
+                    f"{kneeEvidence}; "
+                    "IM3 power trend="
+                    f"{'nonmonotonic' if nonmonotonicPowerTrend else 'monotonic'}."
+                ),
+                dpdArchitecture=powerArchitecture,
+                dpdConfiguration=powerConfiguration,
+                trainingStrategy=(
+                    "Train and validate every configured output-power point, "
+                    "up-weight the detected knee and maximum-power point, and "
+                    "interpolate coefficients only inside the measured range."
+                ),
+                acceptanceCriteria=(
+                    "At every power point require improved EVM and worst-side "
+                    "ACLR on Wi-Fi plus non-regressing IM3/IM5/IM7 on two-tone; "
+                    "reject improvements caused by PA-output rescaling."
+                ),
+            )
+        )
+    return tuple(recommendations)
+
+
 def SavePaCharacterizationResults(
     result: PaCharacterizationResult,
     config: PaCharacterizationConfig,
-) -> Tuple[Path, Path, Path, Path, Path]:
-    """Save frequency, memory, power, summary, and combined JSON files.
+) -> Tuple[Path, Path, Path, Path, Path, Path]:
+    """Save measurement tables, DPD recommendations, and combined JSON.
 
     Processing details:
         Algorithm: Create the configured directory, flatten immutable records
-        once, write three stable UTF-8 CSV tables, and serialize the same data
+        once, write five stable UTF-8 CSV tables, and serialize the same data
         with every reproducibility parameter in one structured JSON file.
 
     Args:
@@ -1456,7 +1910,8 @@ def SavePaCharacterizationResults(
         config: Exact benchmark controls used to create the result.
 
     Returns:
-        result: Paths to frequency, memory, power, summary CSV, and JSON.
+            result: Paths to frequency, memory, power, summary,
+                recommendation CSV, and combined JSON.
     """
 
     outputDirectory = Path(config.outputDirectory)
@@ -1465,17 +1920,22 @@ def SavePaCharacterizationResults(
     memoryPath = outputDirectory / "pa_memory_effect.csv"
     powerPath = outputDirectory / "pa_power_sweep.csv"
     summaryPath = outputDirectory / "pa_characterization_summary.csv"
+    recommendationPath = (
+        outputDirectory / "pa_dpd_recommendations.csv"
+    )
     jsonPath = outputDirectory / "pa_characterization.json"
     resultData = result.ToDict()
     frequencyRows = resultData["frequencyResponse"]
     memoryRows = resultData["memoryEffect"]
     powerRows = resultData["powerSweep"]
     summaryRows = resultData["summaries"]
+    recommendationRows = resultData["recommendations"]
     for outputPath, rows in (
         (frequencyPath, frequencyRows),
         (memoryPath, memoryRows),
         (powerPath, powerRows),
         (summaryPath, summaryRows),
+        (recommendationPath, recommendationRows),
     ):
         if not rows:
             raise ValueError(
@@ -1519,6 +1979,7 @@ def SavePaCharacterizationResults(
         "memoryEffect": memoryRows,
         "powerSweep": powerRows,
         "summaries": summaryRows,
+        "recommendations": recommendationRows,
     }
     with jsonPath.open("w", encoding="utf-8") as jsonFile:
         json.dump(document, jsonFile, indent=2, ensure_ascii=False)
@@ -1527,6 +1988,7 @@ def SavePaCharacterizationResults(
         memoryPath,
         powerPath,
         summaryPath,
+        recommendationPath,
         jsonPath,
     )
 
@@ -1568,6 +2030,35 @@ def PrintPaCharacterizationResults(
         )
 
 
+def PrintPaDpdRecommendations(
+    recommendations: Tuple[PaDpdRecommendation, ...],
+) -> None:
+    """Print a compact index of all measurement-backed DPD recommendations.
+
+    Processing details:
+        Algorithm: Preserve PA and test ordering, print the measured evidence
+        followed by the selected DPD architecture, and leave full parameter,
+        training, and acceptance details in CSV/JSON.
+
+    Args:
+        recommendations: Ordered recommendations created from measured data.
+
+    Returns:
+        result: None. A compact design-guidance table is printed.
+    """
+
+    if not recommendations:
+        raise ValueError("recommendations cannot be empty")
+    print("\nDPD design recommendations")
+    for recommendation in recommendations:
+        print(
+            f"- {recommendation.modelName}/"
+            f"{recommendation.testName}: "
+            f"{recommendation.measuredEvidence} "
+            f"{recommendation.dpdArchitecture}"
+        )
+
+
 def RunPaCharacterizationBenchmark(
     config: Optional[PaCharacterizationConfig] = None,
 ) -> PaCharacterizationResult:
@@ -1584,8 +2075,8 @@ def RunPaCharacterizationBenchmark(
         config: Optional complete characterization setup. None uses defaults.
 
     Returns:
-        result: Detailed immutable frequency points, memory points, and
-            per-model summaries.
+        result: Detailed immutable frequency, memory, and power points,
+            per-model summaries, and per-test DPD recommendations.
     """
 
     if config is None:
@@ -1618,11 +2109,22 @@ def RunPaCharacterizationBenchmark(
         allMemoryPoints.extend(memoryPoints)
         allPowerPoints.extend(powerPoints)
         summaries.append(summary)
-    result = PaCharacterizationResult(
+    measurementResult = PaCharacterizationResult(
         frequencyResponse=tuple(allFrequencyPoints),
         memoryEffect=tuple(allMemoryPoints),
         powerSweep=tuple(allPowerPoints),
         summaries=tuple(summaries),
+    )
+    recommendations = BuildPaDpdRecommendations(
+        measurementResult,
+        config,
+    )
+    result = PaCharacterizationResult(
+        frequencyResponse=measurementResult.frequencyResponse,
+        memoryEffect=measurementResult.memoryEffect,
+        powerSweep=measurementResult.powerSweep,
+        summaries=measurementResult.summaries,
+        recommendations=recommendations,
     )
     SavePaCharacterizationResults(result, config)
     frequencyByModel = {
@@ -1678,6 +2180,7 @@ def RunPaCharacterizationBenchmark(
         config.outputDirectory,
     )
     PrintPaCharacterizationResults(result.summaries)
+    PrintPaDpdRecommendations(result.recommendations)
     return result
 
 

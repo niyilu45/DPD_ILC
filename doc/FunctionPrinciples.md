@@ -379,14 +379,15 @@ flowchart LR
 | `BenchMark.RunTwoToneIlcBenchmark` | E/P | 在相同双音、PA、迭代预算和实际输出dBm下比较全部适用SISO ILC | BenchMark 双音G类 |
 | `BenchMark.SaveTwoToneBenchmarkResults`, `BenchMark.PrintTwoToneBenchmarkResults` | E | 保存和打印已计算的IM3/IM5/IM7比较，不修改数值 | BenchMark 双音G类 |
 | `BenchMark.PaCharacterizationConfig.Validate` | E | 校验频响、双音间隔、功率扫描、Nyquist、位宽和PA模型集合 | PaAnalyse §8 |
-| `BenchMark.PaFrequencyResponsePoint.ToDict`, `BenchMark.PaMemoryEffectPoint.ToDict`, `BenchMark.PaPowerSweepPoint.ToDict`, `BenchMark.PaCharacterizationSummary.ToDict`, `BenchMark.PaCharacterizationResult.ToDict` | E | 把频响、记忆、功率和汇总数据转换为普通标量字典 | PaAnalyse §10 |
+| `BenchMark.PaFrequencyResponsePoint.ToDict`, `BenchMark.PaMemoryEffectPoint.ToDict`, `BenchMark.PaPowerSweepPoint.ToDict`, `BenchMark.PaCharacterizationSummary.ToDict`, `BenchMark.PaDpdRecommendation.ToDict`, `BenchMark.PaCharacterizationResult.ToDict` | E | 把频响、记忆、功率、汇总和DPD建议转换为普通标量字典 | PaAnalyse §10 |
 | `BenchMark.CalculateDynamicHysteresis` | P/N | 在相同包络幅度箱中比较上升/下降支路，计算动态AM-AM与AM-PM迟滞RMS | PaAnalyse §4 |
 | `BenchMark.MeasurePaFrequencyResponse` | P/N | 用共同小信号双音扫描并在精确频率投影输入/输出，得到复频响 | PaAnalyse §2 |
 | `BenchMark.MeasurePaMemoryEffect` | P/N | 在共同20 dBm输出下扫描双音间隔，测量IM3/IM5/IM7、侧带不对称和动态迟滞 | PaAnalyse §3–§4 |
 | `BenchMark.MeasurePaPowerSweep` | P/N | 固定双音间隔、逐点闭环到目标dBm，测量互调和动态迟滞随实测功率变化 | PaAnalyse §6 |
 | `BenchMark.SummarizePaCharacterization` | N/E | 由原始点汇总增益起伏、群时延、相位曲率、间隔敏感度和标称互调 | PaAnalyse §2、§11 |
+| `BenchMark.BuildPaDpdRecommendations` | E/P | 根据实测频响、记忆、迟滞、互调和功率拐点，为每种PA的每类测试生成DPD结构、初始参数、训练和验收建议 | PaAnalyse §2.4、§3.4、§4.1、§5.1、§6.1 |
 | `BenchMark.RunPaCharacterizationBenchmark` | E/P | 对Wiener、GMP和Doherty运行共同频响、记忆与功率扫描并调用独立绘图层 | PaAnalyse §7 |
-| `BenchMark.SavePaCharacterizationResults`, `BenchMark.PrintPaCharacterizationResults` | E | 保存或打印既有PA特性数据，不修改测量值 | PaAnalyse §9–§10 |
+| `BenchMark.SavePaCharacterizationResults`, `BenchMark.PrintPaCharacterizationResults`, `BenchMark.PrintPaDpdRecommendations` | E | 保存或打印既有PA特性与DPD建议，不修改测量值 | PaAnalyse §9–§10 |
 
 ## 11. 审计结论与维护规则
 
