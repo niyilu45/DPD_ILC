@@ -12,7 +12,16 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 import sys
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 
@@ -327,6 +336,465 @@ class TwoToneBenchmarkRow:
         rowData.update(self.metrics)
         return rowData
 
+
+@dataclass(frozen=True)
+class PaCharacterizationConfig:
+    """Configure repeatable two-tone characterization of every PA family."""
+
+    sampleRateHz: float = 200.0e6
+    frequencyCentersHz: Tuple[float, ...] = (
+        -40.0e6,
+        -30.0e6,
+        -20.0e6,
+        -10.0e6,
+        0.0,
+        10.0e6,
+        20.0e6,
+        30.0e6,
+        40.0e6,
+    )
+    frequencyToneSpacingHz: float = 2.0e6
+    memoryToneSpacingsHz: Tuple[float, ...] = (
+        0.5e6,
+        1.0e6,
+        2.0e6,
+        4.0e6,
+        8.0e6,
+        12.0e6,
+    )
+    dynamicToneSpacingHz: float = 4.0e6
+    powerSweepDbm: Tuple[float, ...] = (
+        10.0,
+        15.0,
+        20.0,
+        23.0,
+        25.0,
+    )
+    numSamples: int = 16384
+    settlingSamples: int = 256
+    smallSignalRmsLevel: float = 0.05
+    nonlinearRmsLevel: float = 0.5
+    outputPowerDbm: float = 20.0
+    maximumOutputPowerDbm: float = 25.0
+    loadResistanceOhm: float = 50.0
+    width: int = 0
+    paModelNames: Tuple[str, ...] = (
+        "wiener",
+        "gmp",
+        "doherty",
+    )
+    outputDirectory: Path = Path("results/pa_characterization")
+
+    def Validate(self) -> None:
+        """Validate all frequency, power, model, record, and width settings.
+
+        Processing details:
+            Algorithm: Check scalar domains and ordered nonempty sequences,
+            require unique supported PA names, instantiate representative
+            frequency-sweep and spacing-sweep two-tone generators to verify
+            Nyquist/IM7 limits, and use the shared power converter to reject
+            an unreachable nonlinear output-power target.
+
+        Returns:
+            result: None. Invalid characterization settings raise an error.
+        """
+
+        for parameterName, parameterValue in (
+            ("sampleRateHz", self.sampleRateHz),
+            ("frequencyToneSpacingHz", self.frequencyToneSpacingHz),
+            ("dynamicToneSpacingHz", self.dynamicToneSpacingHz),
+            ("smallSignalRmsLevel", self.smallSignalRmsLevel),
+            ("nonlinearRmsLevel", self.nonlinearRmsLevel),
+            ("loadResistanceOhm", self.loadResistanceOhm),
+        ):
+            if (
+                not isinstance(parameterValue, (int, float))
+                or isinstance(parameterValue, bool)
+                or not np.isfinite(parameterValue)
+                or float(parameterValue) <= 0.0
+            ):
+                raise ValueError(
+                    f"{parameterName} must be finite and positive"
+                )
+        if (
+            not isinstance(self.numSamples, int)
+            or isinstance(self.numSamples, bool)
+            or self.numSamples < 512
+        ):
+            raise ValueError(
+                "numSamples must be an integer no smaller than 512"
+            )
+        if (
+            not isinstance(self.settlingSamples, int)
+            or isinstance(self.settlingSamples, bool)
+            or self.settlingSamples < 0
+            or 2 * self.settlingSamples + 64 > self.numSamples
+        ):
+            raise ValueError(
+                "settlingSamples must leave at least 64 analyzed samples"
+            )
+        if (
+            not 0.0 < float(self.smallSignalRmsLevel) <= 1.0
+            or not 0.0 < float(self.nonlinearRmsLevel) <= 1.0
+        ):
+            raise ValueError(
+                "smallSignalRmsLevel and nonlinearRmsLevel "
+                "must not exceed one"
+            )
+        if (
+            not isinstance(self.frequencyCentersHz, tuple)
+            or len(self.frequencyCentersHz) < 2
+            or any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not np.isfinite(value)
+                for value in self.frequencyCentersHz
+            )
+            or any(
+                laterValue <= earlierValue
+                for earlierValue, laterValue in zip(
+                    self.frequencyCentersHz[:-1],
+                    self.frequencyCentersHz[1:],
+                )
+            )
+        ):
+            raise ValueError(
+                "frequencyCentersHz must be a strictly increasing "
+                "finite tuple with at least two values"
+            )
+        if (
+            not isinstance(self.memoryToneSpacingsHz, tuple)
+            or len(self.memoryToneSpacingsHz) < 2
+            or any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not np.isfinite(value)
+                or float(value) <= 0.0
+                for value in self.memoryToneSpacingsHz
+            )
+            or any(
+                laterValue <= earlierValue
+                for earlierValue, laterValue in zip(
+                    self.memoryToneSpacingsHz[:-1],
+                    self.memoryToneSpacingsHz[1:],
+                )
+            )
+        ):
+            raise ValueError(
+                "memoryToneSpacingsHz must be a strictly increasing "
+                "positive tuple with at least two values"
+            )
+        if not any(
+            np.isclose(
+                self.dynamicToneSpacingHz,
+                spacingHz,
+                rtol=0.0,
+                atol=np.finfo(float).eps
+                * max(1.0, abs(float(spacingHz))),
+            )
+            for spacingHz in self.memoryToneSpacingsHz
+        ):
+            raise ValueError(
+                "dynamicToneSpacingHz must be one memoryToneSpacingsHz value"
+            )
+        for parameterName, parameterValue in (
+            ("outputPowerDbm", self.outputPowerDbm),
+            ("maximumOutputPowerDbm", self.maximumOutputPowerDbm),
+        ):
+            if (
+                not isinstance(parameterValue, (int, float))
+                or isinstance(parameterValue, bool)
+                or not np.isfinite(parameterValue)
+            ):
+                raise ValueError(f"{parameterName} must be finite")
+        if self.outputPowerDbm > self.maximumOutputPowerDbm:
+            raise ValueError(
+                "outputPowerDbm cannot exceed maximumOutputPowerDbm"
+            )
+        if (
+            not isinstance(self.powerSweepDbm, tuple)
+            or len(self.powerSweepDbm) < 2
+            or any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not np.isfinite(value)
+                for value in self.powerSweepDbm
+            )
+            or any(
+                laterValue <= earlierValue
+                for earlierValue, laterValue in zip(
+                    self.powerSweepDbm[:-1],
+                    self.powerSweepDbm[1:],
+                )
+            )
+            or any(
+                float(value) > self.maximumOutputPowerDbm
+                for value in self.powerSweepDbm
+            )
+        ):
+            raise ValueError(
+                "powerSweepDbm must be a strictly increasing finite "
+                "tuple whose values do not exceed maximumOutputPowerDbm"
+            )
+        normalizedModelNames = tuple(
+            str(modelName).strip().lower()
+            for modelName in self.paModelNames
+        )
+        if (
+            not self.paModelNames
+            or any(
+                modelName not in ("wiener", "gmp", "doherty")
+                for modelName in normalizedModelNames
+            )
+            or len(set(normalizedModelNames))
+            != len(normalizedModelNames)
+        ):
+            raise ValueError(
+                "paModelNames must contain unique Wiener, GMP, or "
+                "Doherty names"
+            )
+        for centerFrequencyHz in (
+            self.frequencyCentersHz[0],
+            self.frequencyCentersHz[-1],
+        ):
+            halfSpacingHz = 0.5 * self.frequencyToneSpacingHz
+            WaveGenTwoTone(
+                parameters={
+                    "sampleRateHz": self.sampleRateHz,
+                    "toneFrequenciesHz": (
+                        centerFrequencyHz - halfSpacingHz,
+                        centerFrequencyHz + halfSpacingHz,
+                    ),
+                    "numSamples": self.numSamples,
+                    "rmsLevel": self.smallSignalRmsLevel,
+                    "width": self.width,
+                }
+            )
+        for spacingHz in (
+            self.memoryToneSpacingsHz[0],
+            self.memoryToneSpacingsHz[-1],
+        ):
+            WaveGenTwoTone(
+                parameters={
+                    "sampleRateHz": self.sampleRateHz,
+                    "toneFrequenciesHz": (
+                        -0.5 * spacingHz,
+                        0.5 * spacingHz,
+                    ),
+                    "numSamples": self.numSamples,
+                    "rmsLevel": self.nonlinearRmsLevel,
+                    "width": self.width,
+                }
+            )
+        powerCalibration = PowerCalibration(
+            parameters={
+                "loadResistanceOhm": self.loadResistanceOhm,
+                "maximumOutputPowerDbm": self.maximumOutputPowerDbm,
+                "outputPowerDbm": self.outputPowerDbm,
+                "width": self.width,
+            }
+        )
+        powerCalibration.OutputPowerToDriveScale(self.outputPowerDbm)
+        for powerDbm in self.powerSweepDbm:
+            powerCalibration.OutputPowerToDriveScale(powerDbm)
+
+
+@dataclass(frozen=True)
+class PaFrequencyResponsePoint:
+    """Store one exact-tone complex small-signal response sample."""
+
+    modelName: str
+    frequencyHz: float
+    gainDb: float
+    phaseDegrees: float
+
+    def ToDict(self) -> Dict[str, object]:
+        """Convert one frequency-response point to a stable flat mapping.
+
+        Processing details:
+            Algorithm: Copy model identity and all finite physical scalars
+            without rewrapping phase or changing units.
+
+        Returns:
+            result: CSV/JSON-ready frequency-response dictionary.
+        """
+
+        return {
+            "modelName": self.modelName,
+            "frequencyHz": self.frequencyHz,
+            "gainDb": self.gainDb,
+            "phaseDegrees": self.phaseDegrees,
+        }
+
+
+@dataclass(frozen=True)
+class PaMemoryEffectPoint:
+    """Store one equal-power two-tone spacing and its nonlinear products."""
+
+    modelName: str
+    toneSpacingHz: float
+    outputPowerDbm: float
+    im3LowerDbc: float
+    im3UpperDbc: float
+    im3WorstDbc: float
+    im5WorstDbc: float
+    im7WorstDbc: float
+
+    def ToDict(self) -> Dict[str, object]:
+        """Convert one spacing measurement to a flat result dictionary.
+
+        Processing details:
+            Algorithm: Copy the measured lower/upper IM3, worse-side odd-order
+            products, actual PA output power, and spacing without recalculation.
+
+        Returns:
+            result: CSV/JSON-ready memory-effect dictionary.
+        """
+
+        return {
+            "modelName": self.modelName,
+            "toneSpacingHz": self.toneSpacingHz,
+            "outputPowerDbm": self.outputPowerDbm,
+            "im3LowerDbc": self.im3LowerDbc,
+            "im3UpperDbc": self.im3UpperDbc,
+            "im3WorstDbc": self.im3WorstDbc,
+            "im5WorstDbc": self.im5WorstDbc,
+            "im7WorstDbc": self.im7WorstDbc,
+            "im3AsymmetryDb": (
+                self.im3UpperDbc - self.im3LowerDbc
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class PaCharacterizationSummary:
+    """Summarize frequency, memory, and nominal nonlinear PA features."""
+
+    modelName: str
+    averageGainDb: float
+    gainRippleDb: float
+    groupDelayNs: float
+    phaseNonlinearityDegrees: float
+    im3SpacingVariationDb: float
+    maximumIm3AsymmetryDb: float
+    dynamicGainHysteresisDb: float
+    dynamicPhaseHysteresisDegrees: float
+    nominalIm3Dbc: float
+    nominalIm5Dbc: float
+    nominalIm7Dbc: float
+
+    def ToDict(self) -> Dict[str, object]:
+        """Return all summary features with their documented units.
+
+        Processing details:
+            Algorithm: Copy the immutable model label and scalar features
+            exactly as measured or derived by the benchmark.
+
+        Returns:
+            result: Flat summary dictionary for tables and grouped plots.
+        """
+
+        return {
+            "modelName": self.modelName,
+            "averageGainDb": self.averageGainDb,
+            "gainRippleDb": self.gainRippleDb,
+            "groupDelayNs": self.groupDelayNs,
+            "phaseNonlinearityDegrees": (
+                self.phaseNonlinearityDegrees
+            ),
+            "im3SpacingVariationDb": self.im3SpacingVariationDb,
+            "maximumIm3AsymmetryDb": self.maximumIm3AsymmetryDb,
+            "dynamicGainHysteresisDb": (
+                self.dynamicGainHysteresisDb
+            ),
+            "dynamicPhaseHysteresisDegrees": (
+                self.dynamicPhaseHysteresisDegrees
+            ),
+            "nominalIm3Dbc": self.nominalIm3Dbc,
+            "nominalIm5Dbc": self.nominalIm5Dbc,
+            "nominalIm7Dbc": self.nominalIm7Dbc,
+        }
+
+
+@dataclass(frozen=True)
+class PaPowerSweepPoint:
+    """Store one PA feature measurement at a controlled output power."""
+
+    modelName: str
+    targetOutputPowerDbm: float
+    measuredOutputPowerDbm: float
+    im3WorstDbc: float
+    im5WorstDbc: float
+    im7WorstDbc: float
+    dynamicGainHysteresisDb: float
+    dynamicPhaseHysteresisDegrees: float
+
+    def ToDict(self) -> Dict[str, object]:
+        """Flatten one controlled-power nonlinear and memory measurement.
+
+        Processing details:
+            Algorithm: Copy target/actual dBm, worse-side odd-order products,
+            and dynamic rising/falling loop separation without changing signs
+            or units.
+
+        Returns:
+            result: CSV/JSON-ready power-sweep point dictionary.
+        """
+
+        return {
+            "modelName": self.modelName,
+            "targetOutputPowerDbm": self.targetOutputPowerDbm,
+            "measuredOutputPowerDbm": self.measuredOutputPowerDbm,
+            "im3WorstDbc": self.im3WorstDbc,
+            "im5WorstDbc": self.im5WorstDbc,
+            "im7WorstDbc": self.im7WorstDbc,
+            "dynamicGainHysteresisDb": (
+                self.dynamicGainHysteresisDb
+            ),
+            "dynamicPhaseHysteresisDegrees": (
+                self.dynamicPhaseHysteresisDegrees
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class PaCharacterizationResult:
+    """Store every PA characterization point and compact model summary."""
+
+    frequencyResponse: Tuple[PaFrequencyResponsePoint, ...]
+    memoryEffect: Tuple[PaMemoryEffectPoint, ...]
+    powerSweep: Tuple[PaPowerSweepPoint, ...]
+    summaries: Tuple[PaCharacterizationSummary, ...]
+
+    def ToDict(self) -> Dict[str, object]:
+        """Convert every immutable result table to JSON-ready dictionaries.
+
+        Processing details:
+            Algorithm: Preserve record ordering and delegate unit-stable
+            flattening to each point or summary object without recalculating
+            any PA metric.
+
+        Returns:
+            result: Mapping containing all frequency, memory, power, and
+                summary records.
+        """
+
+        return {
+            "frequencyResponse": [
+                point.ToDict() for point in self.frequencyResponse
+            ],
+            "memoryEffect": [
+                point.ToDict() for point in self.memoryEffect
+            ],
+            "powerSweep": [
+                point.ToDict() for point in self.powerSweep
+            ],
+            "summaries": [
+                summary.ToDict() for summary in self.summaries
+            ],
+        }
+
+
 def AddRow(
     rows: List[BenchmarkRow],
     methodName: str,
@@ -422,6 +890,795 @@ def AddTwoToneRow(
             ),
         )
     )
+
+
+def CalculateDynamicHysteresis(
+    inputSignal: np.ndarray,
+    outputSignal: np.ndarray,
+    width: int,
+    settlingSamples: int,
+) -> Tuple[float, float]:
+    """Measure rising/falling envelope gain and phase loop separation.
+
+    Processing details:
+        Algorithm: Decode both public waveforms, remove settling edges,
+        calculate the instantaneous complex gain away from envelope nulls,
+        classify samples by positive or negative envelope slope, compare
+        median gain and circular-mean phase in common amplitude bins, and
+        return the RMS separation of the two trajectories. A memoryless PA
+        follows one trajectory, while electrical memory opens a hysteresis
+        loop because output also depends on recent envelope history.
+
+    Args:
+        inputSignal: Public two-tone waveform actually presented to the PA.
+        outputSignal: Matching public PA output waveform.
+        width: Shared public I/Q component width.
+        settlingSamples: Equal number of edge samples discarded at both ends.
+
+    Returns:
+        result: RMS gain-loop separation in dB and phase-loop separation in
+            degrees.
+    """
+
+    interfaceFormat = FixedPoint(width)
+    decodedInput = interfaceFormat.DecodeComplex(inputSignal).reshape(-1)
+    decodedOutput = interfaceFormat.DecodeComplex(outputSignal).reshape(-1)
+    if (
+        decodedInput.size != decodedOutput.size
+        or decodedInput.size == 0
+        or not np.all(np.isfinite(decodedInput))
+        or not np.all(np.isfinite(decodedOutput))
+    ):
+        raise ValueError(
+            "inputSignal and outputSignal must be finite equal-length vectors"
+        )
+    if settlingSamples > 0:
+        decodedInput = decodedInput[
+            settlingSamples:-settlingSamples
+        ]
+        decodedOutput = decodedOutput[
+            settlingSamples:-settlingSamples
+        ]
+    inputMagnitude = np.abs(decodedInput)
+    maximumMagnitude = float(np.max(inputMagnitude))
+    if maximumMagnitude <= np.finfo(float).tiny:
+        raise ValueError("inputSignal must contain a nonzero envelope")
+    normalizedMagnitude = inputMagnitude / maximumMagnitude
+    envelopeSlope = np.gradient(normalizedMagnitude)
+    validSamples = normalizedMagnitude >= 0.10
+    complexGain = decodedOutput[validSamples] / decodedInput[validSamples]
+    validMagnitude = normalizedMagnitude[validSamples]
+    validSlope = envelopeSlope[validSamples]
+    gainDifferencesDb = []
+    phaseDifferencesDegrees = []
+    amplitudeEdges = np.linspace(0.10, 1.00, 10)
+    for lowerEdge, upperEdge in zip(
+        amplitudeEdges[:-1], amplitudeEdges[1:]
+    ):
+        binMask = (
+            (validMagnitude >= lowerEdge)
+            & (validMagnitude < upperEdge)
+        )
+        risingMask = binMask & (validSlope > 0.0)
+        fallingMask = binMask & (validSlope < 0.0)
+        if np.count_nonzero(risingMask) < 8 or np.count_nonzero(
+            fallingMask
+        ) < 8:
+            continue
+        risingGainDb = 20.0 * np.log10(
+            max(
+                float(np.median(np.abs(complexGain[risingMask]))),
+                np.finfo(float).tiny,
+            )
+        )
+        fallingGainDb = 20.0 * np.log10(
+            max(
+                float(np.median(np.abs(complexGain[fallingMask]))),
+                np.finfo(float).tiny,
+            )
+        )
+        risingPhase = np.angle(
+            np.mean(
+                np.exp(1j * np.angle(complexGain[risingMask]))
+            )
+        )
+        fallingPhase = np.angle(
+            np.mean(
+                np.exp(1j * np.angle(complexGain[fallingMask]))
+            )
+        )
+        wrappedPhaseDifference = np.angle(
+            np.exp(1j * (risingPhase - fallingPhase))
+        )
+        gainDifferencesDb.append(risingGainDb - fallingGainDb)
+        phaseDifferencesDegrees.append(
+            float(np.rad2deg(wrappedPhaseDifference))
+        )
+    if len(gainDifferencesDb) < 2:
+        raise RuntimeError(
+            "dynamic hysteresis requires at least two populated "
+            "rising/falling envelope bins"
+        )
+    return (
+        float(
+            np.sqrt(np.mean(np.asarray(gainDifferencesDb) ** 2))
+        ),
+        float(
+            np.sqrt(
+                np.mean(
+                    np.asarray(phaseDifferencesDegrees) ** 2
+                )
+            )
+        ),
+    )
+
+
+def MeasurePaFrequencyResponse(
+    config: PaCharacterizationConfig,
+    modelName: str,
+) -> Tuple[PaFrequencyResponsePoint, ...]:
+    """Sweep exact low-power tone pairs through one PA model.
+
+    Processing details:
+        Algorithm: Generate a low-RMS pair around every configured center,
+        process it without output-power normalization so the drive remains
+        common, project input and output at both exact tone frequencies,
+        divide their complex coefficients to obtain H(f), sort all samples,
+        and unwrap phase along frequency.
+
+    Args:
+        config: Validated characterization controls.
+        modelName: Wiener, GMP, or Doherty model family.
+
+    Returns:
+        result: Ordered exact-frequency gain and unwrapped-phase points.
+    """
+
+    paModel = PaModel(
+        parameters={
+            "modelName": modelName,
+            "width": config.width,
+        }
+    )
+    rawPoints = []
+    halfSpacingHz = 0.5 * config.frequencyToneSpacingHz
+    for centerFrequencyHz in config.frequencyCentersHz:
+        waveform = WaveGenTwoTone(
+            parameters={
+                "sampleRateHz": config.sampleRateHz,
+                "toneFrequenciesHz": (
+                    centerFrequencyHz - halfSpacingHz,
+                    centerFrequencyHz + halfSpacingHz,
+                ),
+                "numSamples": config.numSamples,
+                "rmsLevel": config.smallSignalRmsLevel,
+                "width": config.width,
+            }
+        ).Generate()
+        paOutput = paModel.Process(waveform.samples)
+        resultAnalysis = TwoToneAnalysis(
+            waveform,
+            parameters={
+                "settlingSamples": config.settlingSamples,
+                "width": config.width,
+            },
+        )
+        interfaceFormat = FixedPoint(config.width)
+        decodedInput = interfaceFormat.DecodeComplex(
+            waveform.samples
+        )
+        decodedOutput = interfaceFormat.DecodeComplex(paOutput)
+        steadyInput = (
+            decodedInput
+            if config.settlingSamples == 0
+            else decodedInput[
+                config.settlingSamples:-config.settlingSamples
+            ]
+        )
+        steadyOutput = (
+            decodedOutput
+            if config.settlingSamples == 0
+            else decodedOutput[
+                config.settlingSamples:-config.settlingSamples
+            ]
+        )
+        analysisWindow = resultAnalysis.BuildAnalysisWindow(
+            steadyInput.size
+        )
+        for toneFrequencyHz in waveform.toneFrequenciesHz:
+            inputCoefficient = (
+                resultAnalysis.CalculateToneCoefficient(
+                    steadyInput,
+                    toneFrequencyHz,
+                    analysisWindow,
+                )
+            )
+            outputCoefficient = (
+                resultAnalysis.CalculateToneCoefficient(
+                    steadyOutput,
+                    toneFrequencyHz,
+                    analysisWindow,
+                )
+            )
+            if abs(inputCoefficient) <= np.finfo(float).tiny:
+                raise RuntimeError(
+                    "frequency-response input tone is below numeric floor"
+                )
+            complexResponse = outputCoefficient / inputCoefficient
+            rawPoints.append(
+                (
+                    float(toneFrequencyHz),
+                    float(
+                        20.0
+                        * np.log10(
+                            max(
+                                abs(complexResponse),
+                                np.finfo(float).tiny,
+                            )
+                        )
+                    ),
+                    float(np.angle(complexResponse)),
+                )
+            )
+    rawPoints.sort(key=lambda point: point[0])
+    unwrappedPhases = np.unwrap(
+        np.asarray([point[2] for point in rawPoints], dtype=float)
+    )
+    return tuple(
+        PaFrequencyResponsePoint(
+            modelName=modelName,
+            frequencyHz=frequencyHz,
+            gainDb=gainDb,
+            phaseDegrees=float(np.rad2deg(unwrappedPhases[pointIndex])),
+        )
+        for pointIndex, (frequencyHz, gainDb, _) in enumerate(rawPoints)
+    )
+
+
+def MeasurePaMemoryEffect(
+    config: PaCharacterizationConfig,
+    modelName: str,
+) -> Tuple[
+    Tuple[PaMemoryEffectPoint, ...],
+    float,
+    float,
+]:
+    """Sweep tone spacing at equal PA output power for one PA family.
+
+    Processing details:
+        Algorithm: Generate symmetric tone pairs, use the closed input-drive
+        loop to hold the actual PA output at the same dBm for every spacing,
+        measure exact IM3/IM5/IM7 products, and at the designated spacing
+        compare rising/falling dynamic gain and phase trajectories.
+
+    Args:
+        config: Validated characterization controls.
+        modelName: Wiener, GMP, or Doherty model family.
+
+    Returns:
+        result: Ordered spacing points plus dynamic gain and phase hysteresis.
+    """
+
+    paModel = PaModel(
+        parameters={
+            "modelName": modelName,
+            "width": config.width,
+        }
+    )
+    powerCalibration = PowerCalibration(
+        paModel=paModel,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "outputPowerDbm": config.outputPowerDbm,
+            "width": config.width,
+        },
+    )
+    memoryPoints = []
+    dynamicGainHysteresisDb = None
+    dynamicPhaseHysteresisDegrees = None
+    for toneSpacingHz in config.memoryToneSpacingsHz:
+        waveform = WaveGenTwoTone(
+            parameters={
+                "sampleRateHz": config.sampleRateHz,
+                "toneFrequenciesHz": (
+                    -0.5 * toneSpacingHz,
+                    0.5 * toneSpacingHz,
+                ),
+                "numSamples": config.numSamples,
+                "rmsLevel": config.nonlinearRmsLevel,
+                "width": config.width,
+            }
+        ).Generate()
+        paInput = powerCalibration.Calibrate(waveform.samples)
+        paOutput = powerCalibration.GetLastPaOutput()
+        resultAnalysis = TwoToneAnalysis(
+            waveform,
+            parameters={
+                "settlingSamples": config.settlingSamples,
+                "loadResistanceOhm": config.loadResistanceOhm,
+                "maximumOutputPowerDbm": (
+                    config.maximumOutputPowerDbm
+                ),
+                "width": config.width,
+            },
+        )
+        metrics = resultAnalysis.Analyze(paOutput)
+        memoryPoints.append(
+            PaMemoryEffectPoint(
+                modelName=modelName,
+                toneSpacingHz=float(toneSpacingHz),
+                outputPowerDbm=metrics["outputPowerDbm"],
+                im3LowerDbc=metrics["im3LowerDbc"],
+                im3UpperDbc=metrics["im3UpperDbc"],
+                im3WorstDbc=metrics["im3WorstDbc"],
+                im5WorstDbc=metrics["im5WorstDbc"],
+                im7WorstDbc=metrics["im7WorstDbc"],
+            )
+        )
+        if np.isclose(
+            toneSpacingHz,
+            config.dynamicToneSpacingHz,
+            rtol=0.0,
+            atol=np.finfo(float).eps
+            * max(1.0, abs(float(toneSpacingHz))),
+        ):
+            (
+                dynamicGainHysteresisDb,
+                dynamicPhaseHysteresisDegrees,
+            ) = CalculateDynamicHysteresis(
+                paInput,
+                paOutput,
+                config.width,
+                config.settlingSamples,
+            )
+    if (
+        dynamicGainHysteresisDb is None
+        or dynamicPhaseHysteresisDegrees is None
+    ):
+        raise RuntimeError(
+            "dynamicToneSpacingHz was not evaluated"
+        )
+    return (
+        tuple(memoryPoints),
+        float(dynamicGainHysteresisDb),
+        float(dynamicPhaseHysteresisDegrees),
+    )
+
+
+def MeasurePaPowerSweep(
+    config: PaCharacterizationConfig,
+    modelName: str,
+) -> Tuple[PaPowerSweepPoint, ...]:
+    """Measure nonlinear and dynamic-memory features versus PA output power.
+
+    Processing details:
+        Algorithm: Hold tone spacing, waveform statistics, record length, and
+        PA parameters fixed; step through configured target dBm values; close
+        the input-drive loop independently at every point; then calculate
+        actual output power, IM3/IM5/IM7, and rising/falling AM-AM/AM-PM
+        hysteresis from the accepted PA input and output.
+
+    Args:
+        config: Validated characterization controls and power sweep.
+        modelName: Wiener, GMP, or Doherty model family.
+
+    Returns:
+        result: Ordered controlled-power PA feature points.
+    """
+
+    halfSpacingHz = 0.5 * config.dynamicToneSpacingHz
+    waveform = WaveGenTwoTone(
+        parameters={
+            "sampleRateHz": config.sampleRateHz,
+            "toneFrequenciesHz": (
+                -halfSpacingHz,
+                halfSpacingHz,
+            ),
+            "numSamples": config.numSamples,
+            "rmsLevel": config.nonlinearRmsLevel,
+            "width": config.width,
+        }
+    ).Generate()
+    paModel = PaModel(
+        parameters={
+            "modelName": modelName,
+            "width": config.width,
+        }
+    )
+    powerCalibration = PowerCalibration(
+        paModel=paModel,
+        parameters={
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "outputPowerDbm": config.powerSweepDbm[0],
+            "width": config.width,
+        },
+    )
+    resultAnalysis = TwoToneAnalysis(
+        waveform,
+        parameters={
+            "settlingSamples": config.settlingSamples,
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
+            "width": config.width,
+        },
+    )
+    powerPoints = []
+    for targetOutputPowerDbm in config.powerSweepDbm:
+        powerCalibration.UpdateParameters(
+            outputPowerDbm=targetOutputPowerDbm
+        )
+        paInput = powerCalibration.Calibrate(waveform.samples)
+        paOutput = powerCalibration.GetLastPaOutput()
+        metrics = resultAnalysis.Analyze(paOutput)
+        (
+            dynamicGainHysteresisDb,
+            dynamicPhaseHysteresisDegrees,
+        ) = CalculateDynamicHysteresis(
+            paInput,
+            paOutput,
+            config.width,
+            config.settlingSamples,
+        )
+        powerPoints.append(
+            PaPowerSweepPoint(
+                modelName=modelName,
+                targetOutputPowerDbm=float(targetOutputPowerDbm),
+                measuredOutputPowerDbm=metrics["outputPowerDbm"],
+                im3WorstDbc=metrics["im3WorstDbc"],
+                im5WorstDbc=metrics["im5WorstDbc"],
+                im7WorstDbc=metrics["im7WorstDbc"],
+                dynamicGainHysteresisDb=(
+                    dynamicGainHysteresisDb
+                ),
+                dynamicPhaseHysteresisDegrees=(
+                    dynamicPhaseHysteresisDegrees
+                ),
+            )
+        )
+    return tuple(powerPoints)
+
+
+def SummarizePaCharacterization(
+    modelName: str,
+    frequencyPoints: Tuple[PaFrequencyResponsePoint, ...],
+    memoryPoints: Tuple[PaMemoryEffectPoint, ...],
+    dynamicGainHysteresisDb: float,
+    dynamicPhaseHysteresisDegrees: float,
+    nominalToneSpacingHz: float,
+) -> PaCharacterizationSummary:
+    """Reduce detailed sweeps to interpretable PA feature scalars.
+
+    Processing details:
+        Algorithm: Calculate gain peak-to-peak ripple, fit unwrapped phase
+        versus frequency for average group delay, measure residual phase
+        curvature, quantify IM3 variation and side asymmetry over tone
+        spacing, and copy IM3/IM5/IM7 at the nominal dynamic spacing.
+
+    Args:
+        modelName: PA family represented by all supplied points.
+        frequencyPoints: Ordered small-signal complex response samples.
+        memoryPoints: Ordered equal-power spacing-sweep results.
+        dynamicGainHysteresisDb: Rising/falling RMS gain separation.
+        dynamicPhaseHysteresisDegrees: Rising/falling RMS phase separation.
+        nominalToneSpacingHz: Spacing used for nominal IM comparison.
+
+    Returns:
+        result: Compact immutable feature summary for one PA model.
+    """
+
+    if len(frequencyPoints) < 2 or len(memoryPoints) < 2:
+        raise ValueError(
+            "summary requires at least two frequency and memory points"
+        )
+    frequencyHz = np.asarray(
+        [point.frequencyHz for point in frequencyPoints], dtype=float
+    )
+    gainDb = np.asarray(
+        [point.gainDb for point in frequencyPoints], dtype=float
+    )
+    phaseRadians = np.deg2rad(
+        np.asarray(
+            [point.phaseDegrees for point in frequencyPoints],
+            dtype=float,
+        )
+    )
+    centeredFrequencyHz = frequencyHz - float(np.mean(frequencyHz))
+    phaseDesignMatrix = np.column_stack(
+        (
+            centeredFrequencyHz,
+            np.ones(frequencyHz.size, dtype=float),
+        )
+    )
+    phaseSlope, phaseIntercept = np.linalg.lstsq(
+        phaseDesignMatrix,
+        phaseRadians,
+        rcond=None,
+    )[0]
+    fittedPhase = (
+        phaseSlope * centeredFrequencyHz + phaseIntercept
+    )
+    phaseResidual = phaseRadians - fittedPhase
+    im3WorstDbc = np.asarray(
+        [point.im3WorstDbc for point in memoryPoints], dtype=float
+    )
+    im3AsymmetryDb = np.asarray(
+        [
+            point.im3UpperDbc - point.im3LowerDbc
+            for point in memoryPoints
+        ],
+        dtype=float,
+    )
+    nominalPoint = min(
+        memoryPoints,
+        key=lambda point: abs(
+            point.toneSpacingHz - nominalToneSpacingHz
+        ),
+    )
+    return PaCharacterizationSummary(
+        modelName=modelName,
+        averageGainDb=float(np.mean(gainDb)),
+        gainRippleDb=float(np.ptp(gainDb)),
+        groupDelayNs=float(
+            -phaseSlope / (2.0 * np.pi) * 1.0e9
+        ),
+        phaseNonlinearityDegrees=float(
+            np.rad2deg(np.ptp(phaseResidual))
+        ),
+        im3SpacingVariationDb=float(np.ptp(im3WorstDbc)),
+        maximumIm3AsymmetryDb=float(
+            np.max(np.abs(im3AsymmetryDb))
+        ),
+        dynamicGainHysteresisDb=dynamicGainHysteresisDb,
+        dynamicPhaseHysteresisDegrees=(
+            dynamicPhaseHysteresisDegrees
+        ),
+        nominalIm3Dbc=nominalPoint.im3WorstDbc,
+        nominalIm5Dbc=nominalPoint.im5WorstDbc,
+        nominalIm7Dbc=nominalPoint.im7WorstDbc,
+    )
+
+
+def SavePaCharacterizationResults(
+    result: PaCharacterizationResult,
+    config: PaCharacterizationConfig,
+) -> Tuple[Path, Path, Path, Path, Path]:
+    """Save frequency, memory, power, summary, and combined JSON files.
+
+    Processing details:
+        Algorithm: Create the configured directory, flatten immutable records
+        once, write three stable UTF-8 CSV tables, and serialize the same data
+        with every reproducibility parameter in one structured JSON file.
+
+    Args:
+        result: Complete calculated PA characterization result.
+        config: Exact benchmark controls used to create the result.
+
+    Returns:
+        result: Paths to frequency, memory, power, summary CSV, and JSON.
+    """
+
+    outputDirectory = Path(config.outputDirectory)
+    outputDirectory.mkdir(parents=True, exist_ok=True)
+    frequencyPath = outputDirectory / "pa_frequency_response.csv"
+    memoryPath = outputDirectory / "pa_memory_effect.csv"
+    powerPath = outputDirectory / "pa_power_sweep.csv"
+    summaryPath = outputDirectory / "pa_characterization_summary.csv"
+    jsonPath = outputDirectory / "pa_characterization.json"
+    resultData = result.ToDict()
+    frequencyRows = resultData["frequencyResponse"]
+    memoryRows = resultData["memoryEffect"]
+    powerRows = resultData["powerSweep"]
+    summaryRows = resultData["summaries"]
+    for outputPath, rows in (
+        (frequencyPath, frequencyRows),
+        (memoryPath, memoryRows),
+        (powerPath, powerRows),
+        (summaryPath, summaryRows),
+    ):
+        if not rows:
+            raise ValueError(
+                "PA characterization result tables cannot be empty"
+            )
+        with outputPath.open(
+            "w", newline="", encoding="utf-8-sig"
+        ) as csvFile:
+            csvWriter = csv.DictWriter(
+                csvFile, fieldnames=tuple(rows[0])
+            )
+            csvWriter.writeheader()
+            csvWriter.writerows(rows)
+    document = {
+        "metadata": {
+            "sampleRateHz": config.sampleRateHz,
+            "frequencyCentersHz": list(
+                config.frequencyCentersHz
+            ),
+            "frequencyToneSpacingHz": (
+                config.frequencyToneSpacingHz
+            ),
+            "memoryToneSpacingsHz": list(
+                config.memoryToneSpacingsHz
+            ),
+            "dynamicToneSpacingHz": config.dynamicToneSpacingHz,
+            "powerSweepDbm": list(config.powerSweepDbm),
+            "numSamples": config.numSamples,
+            "settlingSamples": config.settlingSamples,
+            "smallSignalRmsLevel": config.smallSignalRmsLevel,
+            "nonlinearRmsLevel": config.nonlinearRmsLevel,
+            "outputPowerDbm": config.outputPowerDbm,
+            "maximumOutputPowerDbm": (
+                config.maximumOutputPowerDbm
+            ),
+            "loadResistanceOhm": config.loadResistanceOhm,
+            "width": config.width,
+            "paModelNames": list(config.paModelNames),
+        },
+        "frequencyResponse": frequencyRows,
+        "memoryEffect": memoryRows,
+        "powerSweep": powerRows,
+        "summaries": summaryRows,
+    }
+    with jsonPath.open("w", encoding="utf-8") as jsonFile:
+        json.dump(document, jsonFile, indent=2, ensure_ascii=False)
+    return (
+        frequencyPath,
+        memoryPath,
+        powerPath,
+        summaryPath,
+        jsonPath,
+    )
+
+
+def PrintPaCharacterizationResults(
+    summaries: Tuple[PaCharacterizationSummary, ...],
+) -> None:
+    """Print one compact comparison table for all characterized PA models.
+
+    Processing details:
+        Algorithm: Preserve requested model order and print gain ripple,
+        group delay, IM3 spacing variation/asymmetry, dynamic gain/phase
+        hysteresis, and nominal IM3 using fixed-width columns.
+
+    Args:
+        summaries: Nonempty ordered model feature summaries.
+
+    Returns:
+        result: None. The comparison table is written to standard output.
+    """
+
+    header = (
+        f"{'PA':<10} {'GainRip':>8} {'Delay(ns)':>10} "
+        f"{'IM3var':>8} {'IM3asym':>9} {'DynG':>8} "
+        f"{'DynP':>8} {'IM3':>9}"
+    )
+    print(header)
+    print("-" * len(header))
+    for summary in summaries:
+        print(
+            f"{summary.modelName:<10} "
+            f"{summary.gainRippleDb:>8.3f} "
+            f"{summary.groupDelayNs:>10.3f} "
+            f"{summary.im3SpacingVariationDb:>8.3f} "
+            f"{summary.maximumIm3AsymmetryDb:>9.3f} "
+            f"{summary.dynamicGainHysteresisDb:>8.3f} "
+            f"{summary.dynamicPhaseHysteresisDegrees:>8.3f} "
+            f"{summary.nominalIm3Dbc:>9.2f}"
+        )
+
+
+def RunPaCharacterizationBenchmark(
+    config: Optional[PaCharacterizationConfig] = None,
+) -> PaCharacterizationResult:
+    """Characterize Wiener, GMP, and Doherty PA frequency and memory effects.
+
+    Processing details:
+        Algorithm: Run a common low-drive two-tone frequency sweep and an
+        equal-output-power tone-spacing sweep for every requested PA family,
+        derive linear response, group delay, spectral memory, dynamic
+        hysteresis, nominal IM3/IM5/IM7, and output-power-dependent features,
+        save raw/summary data, and delegate all comparison figures to ``Draw``.
+
+    Args:
+        config: Optional complete characterization setup. None uses defaults.
+
+    Returns:
+        result: Detailed immutable frequency points, memory points, and
+            per-model summaries.
+    """
+
+    if config is None:
+        config = PaCharacterizationConfig()
+    config.Validate()
+    allFrequencyPoints = []
+    allMemoryPoints = []
+    allPowerPoints = []
+    summaries = []
+    for configuredModelName in config.paModelNames:
+        modelName = configuredModelName.strip().lower()
+        frequencyPoints = MeasurePaFrequencyResponse(
+            config, modelName
+        )
+        (
+            memoryPoints,
+            dynamicGainHysteresisDb,
+            dynamicPhaseHysteresisDegrees,
+        ) = MeasurePaMemoryEffect(config, modelName)
+        summary = SummarizePaCharacterization(
+            modelName,
+            frequencyPoints,
+            memoryPoints,
+            dynamicGainHysteresisDb,
+            dynamicPhaseHysteresisDegrees,
+            config.dynamicToneSpacingHz,
+        )
+        powerPoints = MeasurePaPowerSweep(config, modelName)
+        allFrequencyPoints.extend(frequencyPoints)
+        allMemoryPoints.extend(memoryPoints)
+        allPowerPoints.extend(powerPoints)
+        summaries.append(summary)
+    result = PaCharacterizationResult(
+        frequencyResponse=tuple(allFrequencyPoints),
+        memoryEffect=tuple(allMemoryPoints),
+        powerSweep=tuple(allPowerPoints),
+        summaries=tuple(summaries),
+    )
+    SavePaCharacterizationResults(result, config)
+    frequencyByModel = {
+        modelName: [
+            point.ToDict()
+            for point in result.frequencyResponse
+            if point.modelName == modelName
+        ]
+        for modelName in (
+            summary.modelName for summary in result.summaries
+        )
+    }
+    memoryByModel = {
+        modelName: [
+            point.ToDict()
+            for point in result.memoryEffect
+            if point.modelName == modelName
+        ]
+        for modelName in (
+            summary.modelName for summary in result.summaries
+        )
+    }
+    summaryByModel = {
+        summary.modelName: summary.ToDict()
+        for summary in result.summaries
+    }
+    powerByModel = {
+        modelName: [
+            point.ToDict()
+            for point in result.powerSweep
+            if point.modelName == modelName
+        ]
+        for modelName in (
+            summary.modelName for summary in result.summaries
+        )
+    }
+    resultDraw = Draw()
+    resultDraw.SavePaFrequencyResponse(
+        frequencyByModel,
+        config.outputDirectory,
+    )
+    resultDraw.SavePaMemoryEffect(
+        memoryByModel,
+        summaryByModel,
+        config.outputDirectory,
+    )
+    resultDraw.SavePaNonlinearityComparison(
+        summaryByModel,
+        config.outputDirectory,
+    )
+    resultDraw.SavePaPowerCharacteristics(
+        powerByModel,
+        config.outputDirectory,
+    )
+    PrintPaCharacterizationResults(result.summaries)
+    return result
 
 
 def SaveHistory(
@@ -1742,7 +2999,9 @@ def PrintBenchmarkResults(rows: List[BenchmarkRow]) -> None:
 
 
 def ParseBenchmarkArguments() -> Union[
-    BenchmarkConfig, TwoToneBenchmarkConfig
+    BenchmarkConfig,
+    TwoToneBenchmarkConfig,
+    PaCharacterizationConfig,
 ]:
     """Parse standalone Wi-Fi or two-tone benchmark command-line options.
 
@@ -1750,8 +3009,9 @@ def ParseBenchmarkArguments() -> Union[
         Algorithm: Define only scenario-level controls, parse one command
         line, convert it into ``BenchmarkConfig``, and validate it before
         returning. Algorithm-internal learning constants remain fixed so
-            comparisons stay reproducible. The ``--two-tone`` switch selects
-            physical tone parameters and bypasses Wi-Fi frame construction.
+            comparisons stay reproducible. The mutually exclusive
+            ``--two-tone`` and ``--pa-analyse`` switches select ILC/IM or
+            multi-model PA characterization and bypass Wi-Fi construction.
 
     Returns:
         result: Validated configuration ready for the selected benchmark.
@@ -1763,11 +3023,21 @@ def ParseBenchmarkArguments() -> Union[
             "the production main program."
         )
     )
-    argumentParser.add_argument(
+    modeGroup = argumentParser.add_mutually_exclusive_group()
+    modeGroup.add_argument(
         "--two-tone",
         dest="twoTone",
         action="store_true",
         help="Run the IM3/IM5/IM7 two-tone benchmark instead of Wi-Fi",
+    )
+    modeGroup.add_argument(
+        "--pa-analyse",
+        dest="paAnalyse",
+        action="store_true",
+        help=(
+            "Characterize Wiener, GMP, and Doherty PA frequency/memory "
+            "features with two-tone sweeps"
+        ),
     )
     argumentParser.add_argument(
         "--format",
@@ -1811,8 +3081,11 @@ def ParseBenchmarkArguments() -> Union[
     argumentParser.add_argument(
         "--width",
         type=int,
-        default=16,
-        help="External I/Q component width; 0 selects floating point",
+        default=None,
+        help=(
+            "External I/Q component width; 0 selects floating point "
+            "(default: 0 for PA analysis, 16 for ILC benchmarks)"
+        ),
     )
     argumentParser.add_argument(
         "--guard-interval",
@@ -1907,8 +3180,11 @@ def ParseBenchmarkArguments() -> Union[
         "--tone-samples",
         dest="toneNumSamples",
         type=int,
-        default=32768,
-        help="Number of samples in the repeated two-tone record",
+        default=None,
+        help=(
+            "Number of samples in the repeated two-tone record "
+            "(default: 16384 for PA analysis, 32768 for two-tone ILC)"
+        ),
     )
     argumentParser.add_argument(
         "--tone-rms-level",
@@ -1918,6 +3194,31 @@ def ParseBenchmarkArguments() -> Union[
         help="Generated two-tone RMS before PA power calibration",
     )
     arguments = argumentParser.parse_args()
+    if arguments.paAnalyse:
+        paAnalysisOutputDirectory = (
+            Path("results/pa_characterization")
+            if arguments.outputDirectory is None
+            else arguments.outputDirectory
+        )
+        paAnalysisConfig = PaCharacterizationConfig(
+            sampleRateHz=(
+                200.0e6
+                if arguments.sampleRateHz is None
+                else arguments.sampleRateHz
+            ),
+            numSamples=(
+                16384
+                if arguments.toneNumSamples is None
+                else arguments.toneNumSamples
+            ),
+            width=0 if arguments.width is None else arguments.width,
+            outputPowerDbm=arguments.outputPowerDbm,
+            maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
+            loadResistanceOhm=arguments.loadResistanceOhm,
+            outputDirectory=paAnalysisOutputDirectory,
+        )
+        paAnalysisConfig.Validate()
+        return paAnalysisConfig
     if arguments.twoTone:
         twoToneOutputDirectory = (
             Path("results/two_tone_ilc_benchmark")
@@ -1934,9 +3235,13 @@ def ParseBenchmarkArguments() -> Union[
                 arguments.toneLowerHz,
                 arguments.toneUpperHz,
             ),
-            numSamples=arguments.toneNumSamples,
+            numSamples=(
+                32768
+                if arguments.toneNumSamples is None
+                else arguments.toneNumSamples
+            ),
             rmsLevel=arguments.toneRmsLevel,
-            width=arguments.width,
+            width=16 if arguments.width is None else arguments.width,
             outputPowerDbm=arguments.outputPowerDbm,
             maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
             loadResistanceOhm=arguments.loadResistanceOhm,
@@ -1959,7 +3264,7 @@ def ParseBenchmarkArguments() -> Union[
         numDataSymbols=arguments.numDataSymbols,
         sampleRateHz=arguments.sampleRateHz,
         oversampling=arguments.oversampling,
-        width=arguments.width,
+        width=16 if arguments.width is None else arguments.width,
         guardIntervalUs=arguments.guardIntervalUs,
         outputPowerDbm=arguments.outputPowerDbm,
         maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
@@ -1982,15 +3287,17 @@ def Main() -> int:
 
     Processing details:
         Algorithm: Parse the requested scenario controls, execute the complete
-            Wi-Fi or two-tone benchmark suite, and print the absolute output
-            path after every result has been saved.
+            Wi-Fi, ILC two-tone, or PA-characterization benchmark suite, and
+            print the absolute output path after every result has been saved.
 
     Returns:
         result: Process exit status zero after successful completion.
     """
 
     config = ParseBenchmarkArguments()
-    if isinstance(config, TwoToneBenchmarkConfig):
+    if isinstance(config, PaCharacterizationConfig):
+        RunPaCharacterizationBenchmark(config)
+    elif isinstance(config, TwoToneBenchmarkConfig):
         RunTwoToneIlcBenchmark(config)
     else:
         RunAllIlcBenchmark(config)

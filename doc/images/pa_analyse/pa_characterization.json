@@ -1,0 +1,768 @@
+{
+  "metadata": {
+    "sampleRateHz": 200000000.0,
+    "frequencyCentersHz": [
+      -40000000.0,
+      -30000000.0,
+      -20000000.0,
+      -10000000.0,
+      0.0,
+      10000000.0,
+      20000000.0,
+      30000000.0,
+      40000000.0
+    ],
+    "frequencyToneSpacingHz": 2000000.0,
+    "memoryToneSpacingsHz": [
+      500000.0,
+      1000000.0,
+      2000000.0,
+      4000000.0,
+      8000000.0,
+      12000000.0
+    ],
+    "dynamicToneSpacingHz": 4000000.0,
+    "powerSweepDbm": [
+      10.0,
+      15.0,
+      20.0,
+      23.0,
+      25.0
+    ],
+    "numSamples": 16384,
+    "settlingSamples": 256,
+    "smallSignalRmsLevel": 0.05,
+    "nonlinearRmsLevel": 0.5,
+    "outputPowerDbm": 20.0,
+    "maximumOutputPowerDbm": 25.0,
+    "loadResistanceOhm": 50.0,
+    "width": 0,
+    "paModelNames": [
+      "wiener",
+      "gmp",
+      "doherty"
+    ]
+  },
+  "frequencyResponse": [
+    {
+      "modelName": "wiener",
+      "frequencyHz": -41000000.0,
+      "gainDb": 0.410903300130874,
+      "phaseDegrees": 1.4668950413818405
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": -39000000.0,
+      "gainDb": 0.41232478831895925,
+      "phaseDegrees": 1.2751296641659275
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": -31000000.0,
+      "gainDb": 0.3998542587948932,
+      "phaseDegrees": 0.6049263265898785
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": -29000000.0,
+      "gainDb": 0.39350300092484186,
+      "phaseDegrees": 0.46480036561716365
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": -21000000.0,
+      "gainDb": 0.36303633710389666,
+      "phaseDegrees": 0.014684582999127676
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": -19000000.0,
+      "gainDb": 0.35535346506237164,
+      "phaseDegrees": -0.07258209689250195
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": -11000000.0,
+      "gainDb": 0.32999424390455456,
+      "phaseDegrees": -0.35113430638439425
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": -9000000.0,
+      "gainDb": 0.32558078185674566,
+      "phaseDegrees": -0.40964792320154414
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": -1000000.0,
+      "gainDb": 0.3165334243449431,
+      "phaseDegrees": -0.6443876188639921
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": 1000000.0,
+      "gainDb": 0.3161266261883939,
+      "phaseDegrees": -0.7104297683357477
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": 9000000.0,
+      "gainDb": 0.31773648750227457,
+      "phaseDegrees": -1.0398855817144161
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": 11000000.0,
+      "gainDb": 0.31793055516206736,
+      "phaseDegrees": -1.142499283687865
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": 19000000.0,
+      "gainDb": 0.3106774724163315,
+      "phaseDegrees": -1.6415833065690706
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": 21000000.0,
+      "gainDb": 0.30559887930680435,
+      "phaseDegrees": -1.7868179032659306
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": 29000000.0,
+      "gainDb": 0.26524820965688717,
+      "phaseDegrees": -2.423483283883675
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": 31000000.0,
+      "gainDb": 0.24919487955576428,
+      "phaseDegrees": -2.5891700846853434
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": 39000000.0,
+      "gainDb": 0.1573391328925099,
+      "phaseDegrees": -3.2248933607632106
+    },
+    {
+      "modelName": "wiener",
+      "frequencyHz": 41000000.0,
+      "gainDb": 0.12723969208005662,
+      "phaseDegrees": -3.3655848644137327
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": -41000000.0,
+      "gainDb": 0.35318498804325443,
+      "phaseDegrees": 1.038382724896075
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": -39000000.0,
+      "gainDb": 0.3512105402083264,
+      "phaseDegrees": 0.8492214744604628
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": -31000000.0,
+      "gainDb": 0.3229172476124809,
+      "phaseDegrees": 0.20461574959878098
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": -29000000.0,
+      "gainDb": 0.3121596357284926,
+      "phaseDegrees": 0.07566803947911147
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": -21000000.0,
+      "gainDb": 0.2632495161687552,
+      "phaseDegrees": -0.29994824504207784
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": -19000000.0,
+      "gainDb": 0.2510192527566027,
+      "phaseDegrees": -0.36102436660329124
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": -11000000.0,
+      "gainDb": 0.2095510343450533,
+      "phaseDegrees": -0.4989677329638987
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": -9000000.0,
+      "gainDb": 0.20195670543585975,
+      "phaseDegrees": -0.5146256747669582
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": -1000000.0,
+      "gainDb": 0.18550193173651053,
+      "phaseDegrees": -0.5502383955464284
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": 1000000.0,
+      "gainDb": 0.1847902666281698,
+      "phaseDegrees": -0.5621351145574098
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": 9000000.0,
+      "gainDb": 0.19251364797460088,
+      "phaseDegrees": -0.6678421245405091
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": 11000000.0,
+      "gainDb": 0.19606326604986973,
+      "phaseDegrees": -0.7158136374214626
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": 19000000.0,
+      "gainDb": 0.20951369610030124,
+      "phaseDegrees": -1.0134962044460352
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": 21000000.0,
+      "gainDb": 0.21121371678547826,
+      "phaseDegrees": -1.1154267966304239
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": 29000000.0,
+      "gainDb": 0.20341920189698803,
+      "phaseDegrees": -1.615710979820811
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": 31000000.0,
+      "gainDb": 0.1965268810245556,
+      "phaseDegrees": -1.7586069287939514
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": 39000000.0,
+      "gainDb": 0.14390061580140637,
+      "phaseDegrees": -2.3514791452496158
+    },
+    {
+      "modelName": "gmp",
+      "frequencyHz": 41000000.0,
+      "gainDb": 0.12387197083071311,
+      "phaseDegrees": -2.4950863322654793
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": -41000000.0,
+      "gainDb": 0.410903300130874,
+      "phaseDegrees": 1.4668950413818405
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": -39000000.0,
+      "gainDb": 0.41232478831895925,
+      "phaseDegrees": 1.2751296641659275
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": -31000000.0,
+      "gainDb": 0.3998542587948932,
+      "phaseDegrees": 0.6049263265898785
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": -29000000.0,
+      "gainDb": 0.39350300092484186,
+      "phaseDegrees": 0.46480036561716365
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": -21000000.0,
+      "gainDb": 0.36303633710389666,
+      "phaseDegrees": 0.014684582999127676
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": -19000000.0,
+      "gainDb": 0.35535346506237164,
+      "phaseDegrees": -0.07258209689250195
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": -11000000.0,
+      "gainDb": 0.32999424390455456,
+      "phaseDegrees": -0.35113430638439425
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": -9000000.0,
+      "gainDb": 0.32558078185674566,
+      "phaseDegrees": -0.40964792320154414
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": -1000000.0,
+      "gainDb": 0.3165334243449431,
+      "phaseDegrees": -0.6443876188639921
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": 1000000.0,
+      "gainDb": 0.3161266261883939,
+      "phaseDegrees": -0.7104297683357477
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": 9000000.0,
+      "gainDb": 0.31773648750227457,
+      "phaseDegrees": -1.0398855817144161
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": 11000000.0,
+      "gainDb": 0.31793055516206736,
+      "phaseDegrees": -1.142499283687865
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": 19000000.0,
+      "gainDb": 0.3106774724163315,
+      "phaseDegrees": -1.6415833065690706
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": 21000000.0,
+      "gainDb": 0.30559887930680435,
+      "phaseDegrees": -1.7868179032659306
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": 29000000.0,
+      "gainDb": 0.26524820965688717,
+      "phaseDegrees": -2.423483283883675
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": 31000000.0,
+      "gainDb": 0.24919487955576428,
+      "phaseDegrees": -2.5891700846853434
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": 39000000.0,
+      "gainDb": 0.1573391328925099,
+      "phaseDegrees": -3.2248933607632106
+    },
+    {
+      "modelName": "doherty",
+      "frequencyHz": 41000000.0,
+      "gainDb": 0.12723969208005662,
+      "phaseDegrees": -3.3655848644137327
+    }
+  ],
+  "memoryEffect": [
+    {
+      "modelName": "wiener",
+      "toneSpacingHz": 500000.0,
+      "outputPowerDbm": 20.12724130241525,
+      "im3LowerDbc": -33.24667056554668,
+      "im3UpperDbc": -33.24690645124682,
+      "im3WorstDbc": -33.24667056554668,
+      "im5WorstDbc": -45.72111605058073,
+      "im7WorstDbc": -68.76646837151858,
+      "im3AsymmetryDb": -0.00023588570014254628
+    },
+    {
+      "modelName": "wiener",
+      "toneSpacingHz": 1000000.0,
+      "outputPowerDbm": 20.08337362812699,
+      "im3LowerDbc": -33.24843308176341,
+      "im3UpperDbc": -33.24833777097827,
+      "im3WorstDbc": -33.24833777097827,
+      "im5WorstDbc": -45.720836218787895,
+      "im7WorstDbc": -68.76855980652358,
+      "im3AsymmetryDb": 9.531078514157798e-05
+    },
+    {
+      "modelName": "wiener",
+      "toneSpacingHz": 2000000.0,
+      "outputPowerDbm": 20.1036240353473,
+      "im3LowerDbc": -33.24974682586763,
+      "im3UpperDbc": -33.24970867387253,
+      "im3WorstDbc": -33.24970867387253,
+      "im5WorstDbc": -45.72306602554473,
+      "im7WorstDbc": -68.76872061500266,
+      "im3AsymmetryDb": 3.815199509915601e-05
+    },
+    {
+      "modelName": "wiener",
+      "toneSpacingHz": 4000000.0,
+      "outputPowerDbm": 20.09463322843595,
+      "im3LowerDbc": -33.25453824370997,
+      "im3UpperDbc": -33.25442536643968,
+      "im3WorstDbc": -33.25442536643968,
+      "im5WorstDbc": -45.72970135330151,
+      "im7WorstDbc": -68.76960086793764,
+      "im3AsymmetryDb": 0.00011287727028985728
+    },
+    {
+      "modelName": "wiener",
+      "toneSpacingHz": 8000000.0,
+      "outputPowerDbm": 20.09452841320287,
+      "im3LowerDbc": -33.26031341832233,
+      "im3UpperDbc": -33.260061874373854,
+      "im3WorstDbc": -33.260061874373854,
+      "im5WorstDbc": -45.737680005383694,
+      "im7WorstDbc": -68.77049588931322,
+      "im3AsymmetryDb": 0.0002515439484795934
+    },
+    {
+      "modelName": "wiener",
+      "toneSpacingHz": 12000000.0,
+      "outputPowerDbm": 20.09567147315297,
+      "im3LowerDbc": -33.253687980398546,
+      "im3UpperDbc": -33.25321929750799,
+      "im3WorstDbc": -33.25321929750799,
+      "im5WorstDbc": -45.72809513075167,
+      "im7WorstDbc": -68.76862822015062,
+      "im3AsymmetryDb": 0.0004686828905562379
+    },
+    {
+      "modelName": "gmp",
+      "toneSpacingHz": 500000.0,
+      "outputPowerDbm": 19.835062839242283,
+      "im3LowerDbc": -0.9915375185289638,
+      "im3UpperDbc": -1.0520547244917609,
+      "im3WorstDbc": -0.9915375185289638,
+      "im5WorstDbc": -16.885555457491467,
+      "im7WorstDbc": -18.52443898764136,
+      "im3AsymmetryDb": -0.06051720596279708
+    },
+    {
+      "modelName": "gmp",
+      "toneSpacingHz": 1000000.0,
+      "outputPowerDbm": 19.804838455281022,
+      "im3LowerDbc": -0.957328238447475,
+      "im3UpperDbc": -1.078468588775505,
+      "im3WorstDbc": -0.957328238447475,
+      "im5WorstDbc": -16.641784859910253,
+      "im7WorstDbc": -18.456019582635722,
+      "im3AsymmetryDb": -0.12114035032802994
+    },
+    {
+      "modelName": "gmp",
+      "toneSpacingHz": 2000000.0,
+      "outputPowerDbm": 19.8249088332234,
+      "im3LowerDbc": -0.8808000351334844,
+      "im3UpperDbc": -1.1238716622375364,
+      "im3WorstDbc": -0.8808000351334844,
+      "im5WorstDbc": -16.194727604542397,
+      "im7WorstDbc": -18.338811075964742,
+      "im3AsymmetryDb": -0.24307162710405206
+    },
+    {
+      "modelName": "gmp",
+      "toneSpacingHz": 4000000.0,
+      "outputPowerDbm": 19.832676644636155,
+      "im3LowerDbc": -0.6971048838474614,
+      "im3UpperDbc": -1.1892747290558174,
+      "im3WorstDbc": -0.6971048838474614,
+      "im5WorstDbc": -15.457092530639862,
+      "im7WorstDbc": -18.188822127183034,
+      "im3AsymmetryDb": -0.49216984520835605
+    },
+    {
+      "modelName": "gmp",
+      "toneSpacingHz": 8000000.0,
+      "outputPowerDbm": 19.908430734924092,
+      "im3LowerDbc": -0.2341852527919212,
+      "im3UpperDbc": -1.2592147413671912,
+      "im3WorstDbc": -0.2341852527919212,
+      "im5WorstDbc": -14.547894721518116,
+      "im7WorstDbc": -18.257770171551467,
+      "im3AsymmetryDb": -1.02502948857527
+    },
+    {
+      "modelName": "gmp",
+      "toneSpacingHz": 12000000.0,
+      "outputPowerDbm": 20.015545734811706,
+      "im3LowerDbc": 0.29291991648310606,
+      "im3UpperDbc": -1.3249931098602483,
+      "im3WorstDbc": 0.29291991648310606,
+      "im5WorstDbc": -14.267420244324418,
+      "im7WorstDbc": -18.81814872960025,
+      "im3AsymmetryDb": -1.6179130263433543
+    },
+    {
+      "modelName": "doherty",
+      "toneSpacingHz": 500000.0,
+      "outputPowerDbm": 20.209249152056948,
+      "im3LowerDbc": -15.572559369293051,
+      "im3UpperDbc": -15.572664173191143,
+      "im3WorstDbc": -15.572559369293051,
+      "im5WorstDbc": -23.057791315691965,
+      "im7WorstDbc": -54.7416716527725,
+      "im3AsymmetryDb": -0.00010480389809153223
+    },
+    {
+      "modelName": "doherty",
+      "toneSpacingHz": 1000000.0,
+      "outputPowerDbm": 20.160174722245543,
+      "im3LowerDbc": -15.572501796756018,
+      "im3UpperDbc": -15.572719671015836,
+      "im3WorstDbc": -15.572501796756018,
+      "im5WorstDbc": -23.056683798018497,
+      "im7WorstDbc": -54.748182640748205,
+      "im3AsymmetryDb": -0.00021787425981756314
+    },
+    {
+      "modelName": "doherty",
+      "toneSpacingHz": 2000000.0,
+      "outputPowerDbm": 20.182804947995855,
+      "im3LowerDbc": -15.572902182051507,
+      "im3UpperDbc": -15.57344476600803,
+      "im3WorstDbc": -15.572902182051507,
+      "im5WorstDbc": -23.051875806291005,
+      "im7WorstDbc": -54.77256421165174,
+      "im3AsymmetryDb": -0.0005425839565234014
+    },
+    {
+      "modelName": "doherty",
+      "toneSpacingHz": 4000000.0,
+      "outputPowerDbm": 20.16936587967584,
+      "im3LowerDbc": -15.573189248203647,
+      "im3UpperDbc": -15.575104515896477,
+      "im3WorstDbc": -15.573189248203647,
+      "im5WorstDbc": -23.03323838120845,
+      "im7WorstDbc": -54.83217956125041,
+      "im3AsymmetryDb": -0.0019152676928300139
+    },
+    {
+      "modelName": "doherty",
+      "toneSpacingHz": 8000000.0,
+      "outputPowerDbm": 20.167766649499605,
+      "im3LowerDbc": -15.577183888083006,
+      "im3UpperDbc": -15.587287567241887,
+      "im3WorstDbc": -15.577183888083006,
+      "im5WorstDbc": -23.01196191353327,
+      "im7WorstDbc": -54.83776807753202,
+      "im3AsymmetryDb": -0.010103679158881107
+    },
+    {
+      "modelName": "doherty",
+      "toneSpacingHz": 12000000.0,
+      "outputPowerDbm": 20.169179281723405,
+      "im3LowerDbc": -15.555193745305312,
+      "im3UpperDbc": -15.584597804228332,
+      "im3WorstDbc": -15.555193745305312,
+      "im5WorstDbc": -22.968979219440712,
+      "im7WorstDbc": -54.68580112461494,
+      "im3AsymmetryDb": -0.02940405892302067
+    }
+  ],
+  "powerSweep": [
+    {
+      "modelName": "wiener",
+      "targetOutputPowerDbm": 10.0,
+      "measuredOutputPowerDbm": 10.062972346825108,
+      "im3WorstDbc": -51.46327329028347,
+      "im5WorstDbc": -87.44335063080243,
+      "im7WorstDbc": -121.36400192876734,
+      "dynamicGainHysteresisDb": 0.06140138440278942,
+      "dynamicPhaseHysteresisDegrees": 0.01553761782924426
+    },
+    {
+      "modelName": "wiener",
+      "targetOutputPowerDbm": 15.0,
+      "measuredOutputPowerDbm": 15.06264104536659,
+      "im3WorstDbc": -42.791813951006674,
+      "im5WorstDbc": -68.34937031120961,
+      "im7WorstDbc": -92.47098735621935,
+      "dynamicGainHysteresisDb": 0.061397966805580746,
+      "dynamicPhaseHysteresisDegrees": 0.014432697697766277
+    },
+    {
+      "modelName": "wiener",
+      "targetOutputPowerDbm": 20.0,
+      "measuredOutputPowerDbm": 20.09463322843595,
+      "im3WorstDbc": -33.25442536643968,
+      "im5WorstDbc": -45.72970135330151,
+      "im7WorstDbc": -68.76960086793764,
+      "dynamicGainHysteresisDb": 0.06128102071080186,
+      "dynamicPhaseHysteresisDegrees": 0.012102620618258089
+    },
+    {
+      "modelName": "wiener",
+      "targetOutputPowerDbm": 23.0,
+      "measuredOutputPowerDbm": 22.79823751130176,
+      "im3WorstDbc": -19.30813945711234,
+      "im5WorstDbc": -38.84358528863712,
+      "im7WorstDbc": -41.639345709700336,
+      "dynamicGainHysteresisDb": 0.06028674922659322,
+      "dynamicPhaseHysteresisDegrees": 0.009724072501285121
+    },
+    {
+      "modelName": "wiener",
+      "targetOutputPowerDbm": 25.0,
+      "measuredOutputPowerDbm": 24.754306543261755,
+      "im3WorstDbc": -9.742942216604902,
+      "im5WorstDbc": -14.578317586168012,
+      "im7WorstDbc": -18.09878089054144,
+      "dynamicGainHysteresisDb": 0.42519030549379144,
+      "dynamicPhaseHysteresisDegrees": 0.012767957394906536
+    },
+    {
+      "modelName": "gmp",
+      "targetOutputPowerDbm": 10.0,
+      "measuredOutputPowerDbm": 9.861136147864489,
+      "im3WorstDbc": -36.75182330795381,
+      "im5WorstDbc": -82.83199748988943,
+      "im7WorstDbc": -136.08459539446807,
+      "dynamicGainHysteresisDb": 0.019426403542184008,
+      "dynamicPhaseHysteresisDegrees": 0.07109557011332579
+    },
+    {
+      "modelName": "gmp",
+      "targetOutputPowerDbm": 15.0,
+      "measuredOutputPowerDbm": 14.828935208571858,
+      "im3WorstDbc": -24.265614090643396,
+      "im5WorstDbc": -58.053604028424886,
+      "im7WorstDbc": -98.85171118185337,
+      "dynamicGainHysteresisDb": 0.09019514664811755,
+      "dynamicPhaseHysteresisDegrees": 0.34485392350303684
+    },
+    {
+      "modelName": "gmp",
+      "targetOutputPowerDbm": 20.0,
+      "measuredOutputPowerDbm": 19.80582587233167,
+      "im3WorstDbc": -0.6827547767035334,
+      "im5WorstDbc": -15.427477128569006,
+      "im7WorstDbc": -18.19446106646644,
+      "dynamicGainHysteresisDb": 0.9516205969505549,
+      "dynamicPhaseHysteresisDegrees": 7.627152249960977
+    },
+    {
+      "modelName": "gmp",
+      "targetOutputPowerDbm": 23.0,
+      "measuredOutputPowerDbm": 22.79990905085708,
+      "im3WorstDbc": -1.9265103965299093,
+      "im5WorstDbc": -16.724075575038686,
+      "im7WorstDbc": -18.026485690619566,
+      "dynamicGainHysteresisDb": 1.018010791862431,
+      "dynamicPhaseHysteresisDegrees": 8.051428584779769
+    },
+    {
+      "modelName": "gmp",
+      "targetOutputPowerDbm": 25.0,
+      "measuredOutputPowerDbm": 25.223574503546022,
+      "im3WorstDbc": -2.5159338795933373,
+      "im5WorstDbc": -15.678685628482468,
+      "im7WorstDbc": -18.220103385727885,
+      "dynamicGainHysteresisDb": 1.068228643316008,
+      "dynamicPhaseHysteresisDegrees": 8.370777343984834
+    },
+    {
+      "modelName": "doherty",
+      "targetOutputPowerDbm": 10.0,
+      "measuredOutputPowerDbm": 10.062972346825108,
+      "im3WorstDbc": -51.46327329028347,
+      "im5WorstDbc": -87.44335063080243,
+      "im7WorstDbc": -121.36400192876734,
+      "dynamicGainHysteresisDb": 0.06140138440278942,
+      "dynamicPhaseHysteresisDegrees": 0.01553761782924426
+    },
+    {
+      "modelName": "doherty",
+      "targetOutputPowerDbm": 15.0,
+      "measuredOutputPowerDbm": 15.06264104536659,
+      "im3WorstDbc": -42.791813951006674,
+      "im5WorstDbc": -68.34937031120961,
+      "im7WorstDbc": -92.47098735621935,
+      "dynamicGainHysteresisDb": 0.061397966805580746,
+      "dynamicPhaseHysteresisDegrees": 0.014432697697766277
+    },
+    {
+      "modelName": "doherty",
+      "targetOutputPowerDbm": 20.0,
+      "measuredOutputPowerDbm": 20.16895860149269,
+      "im3WorstDbc": -15.573527358639776,
+      "im5WorstDbc": -23.032332941068454,
+      "im7WorstDbc": -54.83869028775227,
+      "dynamicGainHysteresisDb": 0.06270117327920961,
+      "dynamicPhaseHysteresisDegrees": 0.01838190543817647
+    },
+    {
+      "modelName": "doherty",
+      "targetOutputPowerDbm": 23.0,
+      "measuredOutputPowerDbm": 23.213072155462203,
+      "im3WorstDbc": -18.756965589955424,
+      "im5WorstDbc": -26.559068999897896,
+      "im7WorstDbc": -28.381191923182357,
+      "dynamicGainHysteresisDb": 0.06596267837222997,
+      "dynamicPhaseHysteresisDegrees": 0.031395130197268105
+    },
+    {
+      "modelName": "doherty",
+      "targetOutputPowerDbm": 25.0,
+      "measuredOutputPowerDbm": 25.109446340474932,
+      "im3WorstDbc": -27.536763098693502,
+      "im5WorstDbc": -22.932000927483422,
+      "im7WorstDbc": -36.415252281657445,
+      "dynamicGainHysteresisDb": 0.06813984360018303,
+      "dynamicPhaseHysteresisDegrees": 0.057446831143102395
+    }
+  ],
+  "summaries": [
+    {
+      "modelName": "wiener",
+      "averageGainDb": 0.31523197417795384,
+      "gainRippleDb": 0.28508509623890266,
+      "groupDelayNs": 0.14757853028715215,
+      "phaseNonlinearityDegrees": 0.6292374536246248,
+      "im3SpacingVariationDb": 0.013391308827173987,
+      "maximumIm3AsymmetryDb": 0.0004686828905562379,
+      "dynamicGainHysteresisDb": 0.06128102071080186,
+      "dynamicPhaseHysteresisDegrees": 0.012102620618258089,
+      "nominalIm3Dbc": -33.25442536643968,
+      "nominalIm5Dbc": -45.72970135330151,
+      "nominalIm7Dbc": -68.76960086793764
+    },
+    {
+      "modelName": "gmp",
+      "averageGainDb": 0.22847578417374553,
+      "gainRippleDb": 0.22931301721254133,
+      "groupDelayNs": 0.09543731031243942,
+      "phaseNonlinearityDegrees": 0.7485497434696705,
+      "im3SpacingVariationDb": 1.2844574350120699,
+      "maximumIm3AsymmetryDb": 1.6179130263433543,
+      "dynamicGainHysteresisDb": 0.9522557177173598,
+      "dynamicPhaseHysteresisDegrees": 7.63140996158061,
+      "nominalIm3Dbc": -0.6971048838474614,
+      "nominalIm5Dbc": -15.457092530639862,
+      "nominalIm7Dbc": -18.188822127183034
+    },
+    {
+      "modelName": "doherty",
+      "averageGainDb": 0.31523197417795384,
+      "gainRippleDb": 0.28508509623890266,
+      "groupDelayNs": 0.14757853028715215,
+      "phaseNonlinearityDegrees": 0.6292374536246248,
+      "im3SpacingVariationDb": 0.021990142777694288,
+      "maximumIm3AsymmetryDb": 0.02940405892302067,
+      "dynamicGainHysteresisDb": 0.06270131708525303,
+      "dynamicPhaseHysteresisDegrees": 0.01838313361963471,
+      "nominalIm3Dbc": -15.573189248203647,
+      "nominalIm5Dbc": -23.03323838120845,
+      "nominalIm7Dbc": -54.83217956125041
+    }
+  ]
+}

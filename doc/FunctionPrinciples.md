@@ -5,7 +5,7 @@
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `main.py` 和 `inc/**/*.py` 中 268 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis和DPD-ILC核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
+本次审计共检查 `main.py` 和 `inc/**/*.py` 中 367 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis和DPD-ILC核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC、MIMO ILC和部署模型统一位于 `DpdIlc.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
 
 ## 1. 分类规则
 
@@ -353,6 +353,11 @@ flowchart LR
 | `Draw.CreateConvergenceFigure`, `Draw.SaveConvergenceCurve` | 同轴绘制 Raw NMSE、LC-NMSE 和 EVM-MSE/EVM dB | Analysis §5.5–§5.10 |
 | `Draw.ValidateTwoToneMetrics` | 检查每个方法的IM3/IM5/IM7较差侧字段和有限性 | TwoToneAnalysis §10 |
 | `Draw.CreateTwoToneImdFigure`, `Draw.SaveTwoToneImdComparison` | 以分组柱状图绘制/保存全部方法的IM3、IM5和IM7，不重新计算互调 | TwoToneAnalysis §10 |
+| `Draw.ValidatePaSeries`, `Draw.ValidatePaSummary` | 检查PA频率点、间隔点、功率点和汇总字段的存在性与有限性 | PaAnalyse §7、§10 |
+| `Draw.CreatePaFrequencyResponseFigure`, `Draw.SavePaFrequencyResponse` | 绘制/保存小信号复增益幅相，不重新运行PA或频率投影 | PaAnalyse §2 |
+| `Draw.CreatePaMemoryEffectFigure`, `Draw.SavePaMemoryEffect` | 绘制/保存IM3间隔变化、侧带不对称与动态AM-AM/AM-PM迟滞 | PaAnalyse §3–§4 |
+| `Draw.CreatePaNonlinearityComparisonFigure`, `Draw.SavePaNonlinearityComparison` | 绘制/保存共同20 dBm工作点的IM3/IM5/IM7柱状图 | PaAnalyse §5 |
+| `Draw.CreatePaPowerCharacteristicsFigure`, `Draw.SavePaPowerCharacteristics` | 绘制/保存互调和动态迟滞随实测输出功率的变化 | PaAnalyse §6 |
 
 图上的连线只帮助阅读离散采样点，不表示功率点或迭代轮次之间存在连续物理轨迹。
 
@@ -373,6 +378,15 @@ flowchart LR
 | `BenchMark.TwoToneBenchmarkRow.ToDict`, `BenchMark.AddTwoToneRow` | E | 序列化IM指标，并以baseline减方法dBc得到正向改善量 | BenchMark 双音G类 |
 | `BenchMark.RunTwoToneIlcBenchmark` | E/P | 在相同双音、PA、迭代预算和实际输出dBm下比较全部适用SISO ILC | BenchMark 双音G类 |
 | `BenchMark.SaveTwoToneBenchmarkResults`, `BenchMark.PrintTwoToneBenchmarkResults` | E | 保存和打印已计算的IM3/IM5/IM7比较，不修改数值 | BenchMark 双音G类 |
+| `BenchMark.PaCharacterizationConfig.Validate` | E | 校验频响、双音间隔、功率扫描、Nyquist、位宽和PA模型集合 | PaAnalyse §8 |
+| `BenchMark.PaFrequencyResponsePoint.ToDict`, `BenchMark.PaMemoryEffectPoint.ToDict`, `BenchMark.PaPowerSweepPoint.ToDict`, `BenchMark.PaCharacterizationSummary.ToDict`, `BenchMark.PaCharacterizationResult.ToDict` | E | 把频响、记忆、功率和汇总数据转换为普通标量字典 | PaAnalyse §10 |
+| `BenchMark.CalculateDynamicHysteresis` | P/N | 在相同包络幅度箱中比较上升/下降支路，计算动态AM-AM与AM-PM迟滞RMS | PaAnalyse §4 |
+| `BenchMark.MeasurePaFrequencyResponse` | P/N | 用共同小信号双音扫描并在精确频率投影输入/输出，得到复频响 | PaAnalyse §2 |
+| `BenchMark.MeasurePaMemoryEffect` | P/N | 在共同20 dBm输出下扫描双音间隔，测量IM3/IM5/IM7、侧带不对称和动态迟滞 | PaAnalyse §3–§4 |
+| `BenchMark.MeasurePaPowerSweep` | P/N | 固定双音间隔、逐点闭环到目标dBm，测量互调和动态迟滞随实测功率变化 | PaAnalyse §6 |
+| `BenchMark.SummarizePaCharacterization` | N/E | 由原始点汇总增益起伏、群时延、相位曲率、间隔敏感度和标称互调 | PaAnalyse §2、§11 |
+| `BenchMark.RunPaCharacterizationBenchmark` | E/P | 对Wiener、GMP和Doherty运行共同频响、记忆与功率扫描并调用独立绘图层 | PaAnalyse §7 |
+| `BenchMark.SavePaCharacterizationResults`, `BenchMark.PrintPaCharacterizationResults` | E | 保存或打印既有PA特性数据，不修改测量值 | PaAnalyse §9–§10 |
 
 ## 11. 审计结论与维护规则
 

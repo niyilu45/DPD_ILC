@@ -1827,3 +1827,87 @@ rows = RunTwoToneIlcBenchmark(
 - [ ] 改善量为正时代表互调更负；
 - [ ] CSV、JSON和PNG中的方法顺序一致；
 - [ ] 若IM3改善而IM7恶化，报告保留该事实而不是隐藏。
+
+---
+
+## 29. H类：Wiener/GMP/Doherty PA双音特性
+
+### 29.1 分类目的
+
+H类不运行ILC，专门回答PA本身的三个问题：
+
+1. 小信号复增益在带内是否平坦；
+2. IM3、侧带不对称和动态迟滞是否随双音间隔变化；
+3. IM3、IM5、IM7与动态AM-AM/AM-PM迟滞如何随实际输出功率变化。
+
+它与G类的区别是：G类固定一个PA并比较ILC方法，H类固定测试方法并比较Wiener、GMP和Doherty三种PA。完整公式、参数、参考数值和四张结果图见[PA双音特性分析](./PaAnalyse.md)。
+
+### 29.2 控制变量和对比
+
+| 分支 | 共同条件 | 扫描变量 | 主要输出 | 对比意义 |
+|---|---|---|---|---|
+| 小信号频响 | RMS 0.05、2 MHz双音间隔 | 中心频率-40至40 MHz | 增益、展开相位、群时延、相位曲率 | 区分线性记忆与带内不平坦 |
+| 非线性记忆 | 实测PA输出20 dBm | 双音间隔0.5至12 MHz | IM3/IM5/IM7、IM3上下侧差、动态迟滞 | 区分静态非线性与频率相关记忆 |
+| 输出功率特性 | 固定4 MHz双音间隔 | 10、15、20、23、25 dBm | 逐功率互调与动态迟滞 | 观察小信号、压缩区和额定功率附近的变化 |
+
+频响分支故意不做逐频点功率闭环，否则输入缩放会掩盖真实增益起伏。记忆和功率分支则在每个点重新闭环PA输入，使横向比较对应共同实测输出功率；PA输出不会被后级乘常数。
+
+### 29.3 执行流程
+
+```mermaid
+flowchart TD
+    config["PaCharacterizationConfig.Validate"] --> models["Wiener、GMP、Doherty"]
+    models --> frequency["共同小信号输入下扫描中心频率"]
+    models --> spacing["20 dBm下扫描双音间隔"]
+    models --> power["固定间隔扫描10至25 dBm"]
+    frequency --> response["H(f)、增益起伏、群时延、相位曲率"]
+    spacing --> memory["IM3/IM5/IM7、侧带不对称、动态迟滞"]
+    power --> compression["逐功率互调和动态迟滞"]
+    response --> result["PaCharacterizationResult"]
+    memory --> result
+    compression --> result
+    result --> files["5个数据文件与4张PNG"]
+```
+
+**图示说明：**三个分支使用相同PA默认参数，但使用与问题匹配的控制变量。频率路径测线性记忆，间隔路径测非线性记忆，功率路径测工作点依赖性；结果先写入结构化数据，再由`Draw.py`绘图。
+
+### 29.4 运行方式
+
+```powershell
+python tests/BenchMark.py --pa-analyse
+```
+
+典型显式配置：
+
+```powershell
+python tests/BenchMark.py --pa-analyse --sample-rate-hz 200000000 --tone-samples 16384 --width 0 --output-power-dbm 20 --maximum-output-power-dbm 25 --load-resistance-ohm 50 --output-dir results/pa_characterization
+```
+
+`--pa-analyse`始终比较三种PA，`--pa`只用于Wi-Fi或G类双音ILC，不会缩小H类被测PA集合。
+
+### 29.5 输出和预期
+
+| 输出 | 预期用途 |
+|---|---|
+| `pa_frequency_response.csv/.png` | 对比增益与相位的频率选择性 |
+| `pa_memory_effect.csv/.png` | 对比间隔敏感度、上下侧不对称和动态迟滞 |
+| `pa_power_sweep.csv`、`pa_power_characteristics.png` | 对比10至25 dBm工作点变化 |
+| `pa_nonlinearity_comparison.png` | 对比20 dBm标称IM3/IM5/IM7 |
+| `pa_characterization_summary.csv`、`pa_characterization.json` | 保存汇总和全部可复现原始点 |
+
+默认预期不是“某一种架构在所有指标上必然最好”，而是：
+
+- Wiener与Doherty在Peaking关闭的小信号区频响接近；
+- GMP的记忆抽头和包络交叉项带来更明显的间隔依赖、侧带不对称和动态迟滞；
+- 接近25 dBm时，各模型进入不同压缩状态，互调和迟滞明显依赖输出功率；
+- Doherty支路之间可能在个别功率点发生复数抵消，因此曲线不强制单调。
+
+### 29.6 H类验收清单
+
+- [ ] 三种PA使用相同采样率、双音定义、端口阻抗和额定功率；
+- [ ] 频响分支使用相同小信号输入，而不是逐频点同输出功率；
+- [ ] 记忆分支各间隔点的实测输出功率误差不超过0.25 dB；
+- [ ] 功率分支覆盖10、15、20、23、25 dBm并保存目标与实测值；
+- [ ] IM3、IM5、IM7和动态AM-AM/AM-PM均随功率输出；
+- [ ] 频响、记忆、标称互调和功率特性四张图均由同一份CSV/JSON数据生成；
+- [ ] 报告明确结果属于默认行为模型，不泛化为真实器件架构结论。

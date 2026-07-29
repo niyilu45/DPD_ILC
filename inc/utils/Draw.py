@@ -54,6 +54,12 @@ class Draw:
                 "powerEvmFileStem": "power_evm_curve",
                 "convergenceFileStem": "ilc_convergence",
                 "imdFileStem": "two_tone_imd_comparison",
+                "paFrequencyFileStem": "pa_frequency_response",
+                "paMemoryFileStem": "pa_memory_effect",
+                "paNonlinearityFileStem": (
+                    "pa_nonlinearity_comparison"
+                ),
+                "paPowerFileStem": "pa_power_characteristics",
                 "figureWidthInches": 10.5,
                 "figureHeightInches": 6.2,
                 "figureDpi": 180,
@@ -63,6 +69,18 @@ class Draw:
                 "plotTitle": "Power-EVM comparison",
                 "convergencePlotTitle": "ILC MSE convergence",
                 "imdPlotTitle": "Two-tone ILC intermodulation comparison",
+                "paFrequencyPlotTitle": (
+                    "PA small-signal frequency response"
+                ),
+                "paMemoryPlotTitle": (
+                    "PA two-tone memory-effect comparison"
+                ),
+                "paNonlinearityPlotTitle": (
+                    "PA nominal intermodulation comparison"
+                ),
+                "paPowerPlotTitle": (
+                    "PA output-power-dependent characteristics"
+                ),
                 "xAxisLabel": "PA output power per chain (dBm)",
                 "yAxisLabel": "RMS EVM (dB, lower is better)",
                 "convergenceXAxisLabel": "ILC iteration",
@@ -155,6 +173,10 @@ class Draw:
             "powerEvmFileStem",
             "convergenceFileStem",
             "imdFileStem",
+            "paFrequencyFileStem",
+            "paMemoryFileStem",
+            "paNonlinearityFileStem",
+            "paPowerFileStem",
         ):
             fileStem = self.parameters[parameterName]
             if not isinstance(fileStem, str):
@@ -199,6 +221,10 @@ class Draw:
             "convergenceYAxisLabel",
             "imdPlotTitle",
             "imdYAxisLabel",
+            "paFrequencyPlotTitle",
+            "paMemoryPlotTitle",
+            "paNonlinearityPlotTitle",
+            "paPowerPlotTitle",
         ):
             parameterValue = self.parameters[parameterName]
             if not isinstance(parameterValue, str):
@@ -520,6 +546,785 @@ class Draw:
         outputPath.mkdir(parents=True, exist_ok=True)
         figurePath = outputPath / f"{selectedFileStem}.png"
         figure = self.CreateTwoToneImdFigure(metricsByMethod)
+        try:
+            figure.savefig(
+                figurePath,
+                dpi=int(self.parameters["figureDpi"]),
+                bbox_inches="tight",
+            )
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
+        return figurePath
+
+    def ValidatePaSeries(
+        self,
+        dataByModel: Mapping[
+            str, Sequence[Mapping[str, object]]
+        ],
+        requiredFieldNames: Sequence[str],
+        dataName: str,
+    ) -> None:
+        """Validate model-grouped finite PA characterization point series.
+
+        Processing details:
+            Algorithm: Require a nonempty model mapping, nonempty point
+            sequence per model, every requested scalar field, and finite
+            numeric values before any plot allocates resources.
+
+        Args:
+            dataByModel: Model names mapped to ordered point dictionaries.
+            requiredFieldNames: Numeric fields required in every point.
+            dataName: Human-readable series name for validation errors.
+
+        Returns:
+            result: None. Malformed or nonfinite data raises an exception.
+        """
+
+        if not isinstance(dataByModel, Mapping) or not dataByModel:
+            raise ValueError(f"{dataName} must be a nonempty mapping")
+        if (
+            isinstance(requiredFieldNames, (str, bytes))
+            or not requiredFieldNames
+        ):
+            raise ValueError(
+                "requiredFieldNames must be a nonempty sequence"
+            )
+        for modelName, modelPoints in dataByModel.items():
+            if not isinstance(modelName, str) or not modelName:
+                raise ValueError("PA model names must be nonempty strings")
+            if (
+                isinstance(modelPoints, (str, bytes))
+                or not isinstance(modelPoints, Sequence)
+                or len(modelPoints) == 0
+            ):
+                raise ValueError(
+                    f"{dataName} for '{modelName}' must be nonempty"
+                )
+            for pointIndex, modelPoint in enumerate(modelPoints):
+                if not isinstance(modelPoint, Mapping):
+                    raise TypeError(
+                        f"{dataName}[{modelName}][{pointIndex}] "
+                        "must be a mapping"
+                    )
+                for fieldName in requiredFieldNames:
+                    fieldValue = modelPoint.get(fieldName)
+                    if (
+                        not isinstance(fieldValue, (int, float))
+                        or isinstance(fieldValue, bool)
+                        or not np.isfinite(fieldValue)
+                    ):
+                        raise ValueError(
+                            f"{dataName}[{modelName}][{pointIndex}]."
+                            f"{fieldName} must be finite"
+                        )
+
+    def ValidatePaSummary(
+        self,
+        summaryByModel: Mapping[str, Mapping[str, object]],
+    ) -> None:
+        """Validate scalar PA memory and nonlinear summary dictionaries.
+
+        Processing details:
+            Algorithm: Require each model to provide finite dynamic
+            hysteresis and nominal IM3/IM5/IM7 values used by the two bar
+            comparisons.
+
+        Args:
+            summaryByModel: Model names mapped to summary dictionaries.
+
+        Returns:
+            result: None. Missing or nonfinite summary values raise an error.
+        """
+
+        if not isinstance(summaryByModel, Mapping) or not summaryByModel:
+            raise ValueError("summaryByModel must be a nonempty mapping")
+        requiredFields = (
+            "dynamicGainHysteresisDb",
+            "dynamicPhaseHysteresisDegrees",
+            "nominalIm3Dbc",
+            "nominalIm5Dbc",
+            "nominalIm7Dbc",
+        )
+        for modelName, modelSummary in summaryByModel.items():
+            if (
+                not isinstance(modelName, str)
+                or not modelName
+                or not isinstance(modelSummary, Mapping)
+            ):
+                raise TypeError(
+                    "each PA summary must have a nonempty model name "
+                    "and mapping value"
+                )
+            for fieldName in requiredFields:
+                fieldValue = modelSummary.get(fieldName)
+                if (
+                    not isinstance(fieldValue, (int, float))
+                    or isinstance(fieldValue, bool)
+                    or not np.isfinite(fieldValue)
+                ):
+                    raise ValueError(
+                        f"summaryByModel[{modelName}].{fieldName} "
+                        "must be finite"
+                    )
+
+    def CreatePaFrequencyResponseFigure(
+        self,
+        frequencyResponseByModel: Mapping[
+            str, Sequence[Mapping[str, object]]
+        ],
+    ) -> Any:
+        """Create aligned PA small-signal gain and phase response panels.
+
+        Processing details:
+            Algorithm: Sort each model's exact-tone points by frequency and
+            draw gain and already unwrapped phase on shared MHz coordinates
+            with consistent model labels, markers, grids, and titles.
+
+        Args:
+            frequencyResponseByModel: Model-grouped response point mappings.
+
+        Returns:
+            result: Matplotlib Figure containing gain and phase panels.
+        """
+
+        self.ValidateParameters()
+        self.ValidatePaSeries(
+            frequencyResponseByModel,
+            ("frequencyHz", "gainDb", "phaseDegrees"),
+            "frequencyResponseByModel",
+        )
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "matplotlib is required for PA frequency-response plots"
+            ) from error
+        figure, axes = plt.subplots(
+            2,
+            1,
+            sharex=True,
+            figsize=(
+                float(self.parameters["figureWidthInches"]),
+                float(self.parameters["figureHeightInches"]),
+            ),
+        )
+        markerStyles = ("o", "s", "^", "D", "v")
+        for modelIndex, (modelName, modelPoints) in enumerate(
+            frequencyResponseByModel.items()
+        ):
+            sortedPoints = sorted(
+                modelPoints,
+                key=lambda point: float(point["frequencyHz"]),
+            )
+            frequencyMhz = np.asarray(
+                [
+                    float(point["frequencyHz"]) * 1.0e-6
+                    for point in sortedPoints
+                ]
+            )
+            axes[0].plot(
+                frequencyMhz,
+                [float(point["gainDb"]) for point in sortedPoints],
+                label=modelName,
+                marker=markerStyles[
+                    modelIndex % len(markerStyles)
+                ],
+                linewidth=float(self.parameters["lineWidth"]),
+                markersize=float(self.parameters["markerSize"]),
+            )
+            axes[1].plot(
+                frequencyMhz,
+                [
+                    float(point["phaseDegrees"])
+                    for point in sortedPoints
+                ],
+                label=modelName,
+                marker=markerStyles[
+                    modelIndex % len(markerStyles)
+                ],
+                linewidth=float(self.parameters["lineWidth"]),
+                markersize=float(self.parameters["markerSize"]),
+            )
+        axes[0].set_ylabel("Small-signal gain (dB)")
+        axes[1].set_ylabel("Unwrapped phase (degrees)")
+        axes[1].set_xlabel("Complex-baseband frequency (MHz)")
+        axes[0].set_title(
+            str(self.parameters["paFrequencyPlotTitle"])
+        )
+        for selectedAxes in axes:
+            selectedAxes.grid(
+                True, which="both", linestyle=":", linewidth=0.7
+            )
+            selectedAxes.legend(loc="best")
+        figure.tight_layout()
+        return figure
+
+    def SavePaFrequencyResponse(
+        self,
+        frequencyResponseByModel: Mapping[
+            str, Sequence[Mapping[str, object]]
+        ],
+        outputDirectory: Path,
+        fileStem: Optional[str] = None,
+    ) -> Path:
+        """Save the PA small-signal gain/phase comparison PNG.
+
+        Processing details:
+            Algorithm: Resolve a safe filename, create the output directory,
+            delegate all rendering to CreatePaFrequencyResponseFigure, save at
+            configured DPI, and close resources on every exit path.
+
+        Args:
+            frequencyResponseByModel: Model-grouped frequency points.
+            outputDirectory: Destination directory for the PNG.
+            fileStem: Optional simple filename overriding the default.
+
+        Returns:
+            result: Path to the saved frequency-response image.
+        """
+
+        selectedFileStem = (
+            str(self.parameters["paFrequencyFileStem"])
+            if fileStem is None
+            else fileStem
+        )
+        if (
+            not isinstance(selectedFileStem, str)
+            or not selectedFileStem
+            or any(
+                character in selectedFileStem
+                for character in '<>:"/\\|?*'
+            )
+        ):
+            raise ValueError("fileStem must be a valid simple file name")
+        outputPath = Path(outputDirectory)
+        outputPath.mkdir(parents=True, exist_ok=True)
+        figurePath = outputPath / f"{selectedFileStem}.png"
+        figure = self.CreatePaFrequencyResponseFigure(
+            frequencyResponseByModel
+        )
+        try:
+            figure.savefig(
+                figurePath,
+                dpi=int(self.parameters["figureDpi"]),
+                bbox_inches="tight",
+            )
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
+        return figurePath
+
+    def CreatePaMemoryEffectFigure(
+        self,
+        memoryEffectByModel: Mapping[
+            str, Sequence[Mapping[str, object]]
+        ],
+        summaryByModel: Mapping[str, Mapping[str, object]],
+    ) -> Any:
+        """Create spectral and dynamic PA memory-effect comparison panels.
+
+        Processing details:
+            Algorithm: Plot worse-side IM3 and absolute upper/lower IM3
+            asymmetry against tone spacing, then compare rising/falling
+            envelope gain and phase hysteresis as grouped model bars.
+
+        Args:
+            memoryEffectByModel: Model-grouped spacing-sweep measurements.
+            summaryByModel: Model-grouped dynamic hysteresis summaries.
+
+        Returns:
+            result: Matplotlib Figure with two spectral and two dynamic panels.
+        """
+
+        self.ValidateParameters()
+        self.ValidatePaSeries(
+            memoryEffectByModel,
+            (
+                "toneSpacingHz",
+                "im3LowerDbc",
+                "im3UpperDbc",
+                "im3WorstDbc",
+            ),
+            "memoryEffectByModel",
+        )
+        self.ValidatePaSummary(summaryByModel)
+        if tuple(memoryEffectByModel) != tuple(summaryByModel):
+            raise ValueError(
+                "memoryEffectByModel and summaryByModel model order "
+                "must match"
+            )
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "matplotlib is required for PA memory-effect plots"
+            ) from error
+        figure, axes = plt.subplots(
+            2,
+            2,
+            figsize=(
+                float(self.parameters["figureWidthInches"]),
+                float(self.parameters["figureHeightInches"]) * 1.25,
+            ),
+        )
+        markerStyles = ("o", "s", "^", "D", "v")
+        for modelIndex, (modelName, modelPoints) in enumerate(
+            memoryEffectByModel.items()
+        ):
+            sortedPoints = sorted(
+                modelPoints,
+                key=lambda point: float(point["toneSpacingHz"]),
+            )
+            spacingMhz = np.asarray(
+                [
+                    float(point["toneSpacingHz"]) * 1.0e-6
+                    for point in sortedPoints
+                ]
+            )
+            markerStyle = markerStyles[
+                modelIndex % len(markerStyles)
+            ]
+            axes[0, 0].plot(
+                spacingMhz,
+                [
+                    float(point["im3WorstDbc"])
+                    for point in sortedPoints
+                ],
+                label=modelName,
+                marker=markerStyle,
+                linewidth=float(self.parameters["lineWidth"]),
+                markersize=float(self.parameters["markerSize"]),
+            )
+            axes[0, 1].plot(
+                spacingMhz,
+                [
+                    abs(
+                        float(point["im3UpperDbc"])
+                        - float(point["im3LowerDbc"])
+                    )
+                    for point in sortedPoints
+                ],
+                label=modelName,
+                marker=markerStyle,
+                linewidth=float(self.parameters["lineWidth"]),
+                markersize=float(self.parameters["markerSize"]),
+            )
+        modelNames = list(summaryByModel)
+        modelPositions = np.arange(len(modelNames), dtype=float)
+        axes[1, 0].bar(
+            modelPositions,
+            [
+                float(
+                    summaryByModel[modelName][
+                        "dynamicGainHysteresisDb"
+                    ]
+                )
+                for modelName in modelNames
+            ],
+        )
+        axes[1, 1].bar(
+            modelPositions,
+            [
+                float(
+                    summaryByModel[modelName][
+                        "dynamicPhaseHysteresisDegrees"
+                    ]
+                )
+                for modelName in modelNames
+            ],
+        )
+        axes[0, 0].set_title("Worst-side IM3 versus tone spacing")
+        axes[0, 0].set_ylabel("IM3 (dBc)")
+        axes[0, 1].set_title("Upper/lower IM3 asymmetry")
+        axes[0, 1].set_ylabel("Absolute asymmetry (dB)")
+        for selectedAxes in axes[0, :]:
+            selectedAxes.set_xlabel("Tone spacing (MHz)")
+            selectedAxes.legend(loc="best")
+        axes[1, 0].set_title("Dynamic AM-AM hysteresis")
+        axes[1, 0].set_ylabel("RMS rising/falling separation (dB)")
+        axes[1, 1].set_title("Dynamic AM-PM hysteresis")
+        axes[1, 1].set_ylabel(
+            "RMS rising/falling separation (degrees)"
+        )
+        for selectedAxes in axes[1, :]:
+            selectedAxes.set_xticks(modelPositions)
+            selectedAxes.set_xticklabels(modelNames)
+        for selectedAxes in axes.reshape(-1):
+            selectedAxes.grid(
+                True, axis="y", linestyle=":", linewidth=0.7
+            )
+        figure.suptitle(
+            str(self.parameters["paMemoryPlotTitle"])
+        )
+        figure.tight_layout()
+        return figure
+
+    def SavePaMemoryEffect(
+        self,
+        memoryEffectByModel: Mapping[
+            str, Sequence[Mapping[str, object]]
+        ],
+        summaryByModel: Mapping[str, Mapping[str, object]],
+        outputDirectory: Path,
+        fileStem: Optional[str] = None,
+    ) -> Path:
+        """Save the four-panel spectral/dynamic PA memory comparison.
+
+        Processing details:
+            Algorithm: Validate a safe filename, create the destination,
+            render through CreatePaMemoryEffectFigure, save at configured DPI,
+            and always close the Matplotlib figure.
+
+        Args:
+            memoryEffectByModel: Model-grouped tone-spacing measurements.
+            summaryByModel: Model-grouped dynamic memory summaries.
+            outputDirectory: Destination directory for the PNG.
+            fileStem: Optional simple filename overriding the default.
+
+        Returns:
+            result: Path to the saved memory-effect image.
+        """
+
+        selectedFileStem = (
+            str(self.parameters["paMemoryFileStem"])
+            if fileStem is None
+            else fileStem
+        )
+        if (
+            not isinstance(selectedFileStem, str)
+            or not selectedFileStem
+            or any(
+                character in selectedFileStem
+                for character in '<>:"/\\|?*'
+            )
+        ):
+            raise ValueError("fileStem must be a valid simple file name")
+        outputPath = Path(outputDirectory)
+        outputPath.mkdir(parents=True, exist_ok=True)
+        figurePath = outputPath / f"{selectedFileStem}.png"
+        figure = self.CreatePaMemoryEffectFigure(
+            memoryEffectByModel, summaryByModel
+        )
+        try:
+            figure.savefig(
+                figurePath,
+                dpi=int(self.parameters["figureDpi"]),
+                bbox_inches="tight",
+            )
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
+        return figurePath
+
+    def CreatePaNonlinearityComparisonFigure(
+        self,
+        summaryByModel: Mapping[str, Mapping[str, object]],
+    ) -> Any:
+        """Create a grouped nominal IM3, IM5, and IM7 PA comparison.
+
+        Processing details:
+            Algorithm: Preserve PA model order and place three adjacent dBc
+            bars per model using the common output-power and tone-spacing
+            summary measurements.
+
+        Args:
+            summaryByModel: Model-grouped nominal nonlinear metrics.
+
+        Returns:
+            result: Matplotlib Figure with the odd-order comparison.
+        """
+
+        self.ValidateParameters()
+        self.ValidatePaSummary(summaryByModel)
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "matplotlib is required for PA nonlinearity plots"
+            ) from error
+        modelNames = list(summaryByModel)
+        modelPositions = np.arange(len(modelNames), dtype=float)
+        barWidth = 0.24
+        figure, axes = plt.subplots(
+            figsize=(
+                float(self.parameters["figureWidthInches"]),
+                float(self.parameters["figureHeightInches"]),
+            )
+        )
+        for orderIndex, nonlinearOrder in enumerate((3, 5, 7)):
+            metricName = f"nominalIm{nonlinearOrder}Dbc"
+            axes.bar(
+                modelPositions + (orderIndex - 1) * barWidth,
+                [
+                    float(summaryByModel[modelName][metricName])
+                    for modelName in modelNames
+                ],
+                width=barWidth,
+                label=f"IM{nonlinearOrder}",
+            )
+        axes.set_xticks(modelPositions)
+        axes.set_xticklabels(modelNames)
+        axes.set_ylabel(
+            "Worst-side intermodulation (dBc, lower is better)"
+        )
+        axes.set_title(
+            str(self.parameters["paNonlinearityPlotTitle"])
+        )
+        axes.grid(True, axis="y", linestyle=":", linewidth=0.7)
+        axes.legend(loc="best")
+        figure.tight_layout()
+        return figure
+
+    def SavePaNonlinearityComparison(
+        self,
+        summaryByModel: Mapping[str, Mapping[str, object]],
+        outputDirectory: Path,
+        fileStem: Optional[str] = None,
+    ) -> Path:
+        """Save the grouped nominal PA intermodulation comparison.
+
+        Processing details:
+            Algorithm: Resolve and validate the filename, create the output
+            directory, render through the dedicated figure builder, save the
+            PNG at configured DPI, and close plotting resources.
+
+        Args:
+            summaryByModel: Model-grouped nominal IM summaries.
+            outputDirectory: Destination directory for the PNG.
+            fileStem: Optional simple filename overriding the default.
+
+        Returns:
+            result: Path to the saved nonlinearity comparison image.
+        """
+
+        selectedFileStem = (
+            str(self.parameters["paNonlinearityFileStem"])
+            if fileStem is None
+            else fileStem
+        )
+        if (
+            not isinstance(selectedFileStem, str)
+            or not selectedFileStem
+            or any(
+                character in selectedFileStem
+                for character in '<>:"/\\|?*'
+            )
+        ):
+            raise ValueError("fileStem must be a valid simple file name")
+        outputPath = Path(outputDirectory)
+        outputPath.mkdir(parents=True, exist_ok=True)
+        figurePath = outputPath / f"{selectedFileStem}.png"
+        figure = self.CreatePaNonlinearityComparisonFigure(
+            summaryByModel
+        )
+        try:
+            figure.savefig(
+                figurePath,
+                dpi=int(self.parameters["figureDpi"]),
+                bbox_inches="tight",
+            )
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
+        return figurePath
+
+    def CreatePaPowerCharacteristicsFigure(
+        self,
+        powerSweepByModel: Mapping[
+            str, Sequence[Mapping[str, object]]
+        ],
+    ) -> Any:
+        """Create nonlinear and dynamic-memory curves versus PA output power.
+
+        Processing details:
+            Algorithm: Sort each model by measured output dBm, plot IM3,
+            IM5/IM7, dynamic AM-AM hysteresis, and dynamic AM-PM hysteresis
+            on four common-power panels, and retain separate line styles for
+            the two higher odd orders.
+
+        Args:
+            powerSweepByModel: Model-grouped controlled-power point mappings.
+
+        Returns:
+            result: Matplotlib Figure containing four power-dependent panels.
+        """
+
+        self.ValidateParameters()
+        self.ValidatePaSeries(
+            powerSweepByModel,
+            (
+                "measuredOutputPowerDbm",
+                "im3WorstDbc",
+                "im5WorstDbc",
+                "im7WorstDbc",
+                "dynamicGainHysteresisDb",
+                "dynamicPhaseHysteresisDegrees",
+            ),
+            "powerSweepByModel",
+        )
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "matplotlib is required for PA power-characteristic plots"
+            ) from error
+        figure, axes = plt.subplots(
+            2,
+            2,
+            figsize=(
+                float(self.parameters["figureWidthInches"]),
+                float(self.parameters["figureHeightInches"]) * 1.25,
+            ),
+        )
+        markerStyles = ("o", "s", "^", "D", "v")
+        for modelIndex, (modelName, modelPoints) in enumerate(
+            powerSweepByModel.items()
+        ):
+            sortedPoints = sorted(
+                modelPoints,
+                key=lambda point: float(
+                    point["measuredOutputPowerDbm"]
+                ),
+            )
+            measuredPowerDbm = [
+                float(point["measuredOutputPowerDbm"])
+                for point in sortedPoints
+            ]
+            markerStyle = markerStyles[
+                modelIndex % len(markerStyles)
+            ]
+            commonPlotArguments = {
+                "marker": markerStyle,
+                "linewidth": float(self.parameters["lineWidth"]),
+                "markersize": float(self.parameters["markerSize"]),
+            }
+            axes[0, 0].plot(
+                measuredPowerDbm,
+                [
+                    float(point["im3WorstDbc"])
+                    for point in sortedPoints
+                ],
+                label=modelName,
+                **commonPlotArguments,
+            )
+            axes[0, 1].plot(
+                measuredPowerDbm,
+                [
+                    float(point["im5WorstDbc"])
+                    for point in sortedPoints
+                ],
+                label=f"{modelName} IM5",
+                **commonPlotArguments,
+            )
+            axes[0, 1].plot(
+                measuredPowerDbm,
+                [
+                    float(point["im7WorstDbc"])
+                    for point in sortedPoints
+                ],
+                label=f"{modelName} IM7",
+                linestyle="--",
+                **commonPlotArguments,
+            )
+            axes[1, 0].plot(
+                measuredPowerDbm,
+                [
+                    float(point["dynamicGainHysteresisDb"])
+                    for point in sortedPoints
+                ],
+                label=modelName,
+                **commonPlotArguments,
+            )
+            axes[1, 1].plot(
+                measuredPowerDbm,
+                [
+                    float(
+                        point["dynamicPhaseHysteresisDegrees"]
+                    )
+                    for point in sortedPoints
+                ],
+                label=modelName,
+                **commonPlotArguments,
+            )
+        axes[0, 0].set_title("IM3 versus output power")
+        axes[0, 0].set_ylabel("Worst-side IM3 (dBc)")
+        axes[0, 1].set_title("IM5 and IM7 versus output power")
+        axes[0, 1].set_ylabel("Worst-side IM level (dBc)")
+        axes[1, 0].set_title("Dynamic AM-AM versus output power")
+        axes[1, 0].set_ylabel("RMS hysteresis (dB)")
+        axes[1, 1].set_title("Dynamic AM-PM versus output power")
+        axes[1, 1].set_ylabel("RMS hysteresis (degrees)")
+        for selectedAxes in axes.reshape(-1):
+            selectedAxes.set_xlabel("Measured PA output power (dBm)")
+            selectedAxes.grid(
+                True, which="both", linestyle=":", linewidth=0.7
+            )
+            selectedAxes.legend(loc="best")
+        figure.suptitle(str(self.parameters["paPowerPlotTitle"]))
+        figure.tight_layout()
+        return figure
+
+    def SavePaPowerCharacteristics(
+        self,
+        powerSweepByModel: Mapping[
+            str, Sequence[Mapping[str, object]]
+        ],
+        outputDirectory: Path,
+        fileStem: Optional[str] = None,
+    ) -> Path:
+        """Save the four-panel PA output-power characteristic comparison.
+
+        Processing details:
+            Algorithm: Resolve a safe filename, create the output directory,
+            render the validated power curves, save at configured DPI, and
+            always close Matplotlib resources.
+
+        Args:
+            powerSweepByModel: Model-grouped controlled-power measurements.
+            outputDirectory: Destination directory for the PNG.
+            fileStem: Optional simple filename overriding the default.
+
+        Returns:
+            result: Path to the saved power-characteristic image.
+        """
+
+        selectedFileStem = (
+            str(self.parameters["paPowerFileStem"])
+            if fileStem is None
+            else fileStem
+        )
+        if (
+            not isinstance(selectedFileStem, str)
+            or not selectedFileStem
+            or any(
+                character in selectedFileStem
+                for character in '<>:"/\\|?*'
+            )
+        ):
+            raise ValueError("fileStem must be a valid simple file name")
+        outputPath = Path(outputDirectory)
+        outputPath.mkdir(parents=True, exist_ok=True)
+        figurePath = outputPath / f"{selectedFileStem}.png"
+        figure = self.CreatePaPowerCharacteristicsFigure(
+            powerSweepByModel
+        )
         try:
             figure.savefig(
                 figurePath,

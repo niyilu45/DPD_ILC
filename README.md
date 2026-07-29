@@ -1,6 +1,6 @@
 # DPD-ILC VHT/HE/EHT Wi-Fi与双音仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Wiener、GMP或Doherty PA、闭环输出功率校准和全部适用ILC更新律。MIMO Channel还可在PA前后加入方向不对称、具有独立FIR和时延的通道耦合。Wi-Fi路径输出功率、SNR、EVM、ACLR和功率-EVM曲线；双音路径输出IM3、IM5、IM7及所有SISO ILC方法的同功率对比图。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Wiener、GMP或Doherty PA、闭环输出功率校准和全部适用ILC更新律。MIMO Channel还可在PA前后加入方向不对称、具有独立FIR和时延的通道耦合。Wi-Fi路径输出功率、SNR、EVM、ACLR和功率-EVM曲线；双音路径既能比较所有SISO ILC的IM3/IM5/IM7，也能独立扫描三种PA的频率响应、记忆效应和10至25 dBm输出功率特性。
 
 ## 理论文档
 
@@ -8,6 +8,7 @@
 - [双音信号生成物理原理与用法](doc/WaveGenTwoTone.md)：复基带双音、奇数阶互调频率、RMS/定点边界和ILC带宽。
 - [FEC编码译码原理与用法](doc/Fec.md)：55/90短块LDPC校验矩阵、系统编码、软输入normalized min-sum译码和调用示例。
 - [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、GMP、Doherty载波/峰值双支路、频谱再生和IQ失衡。
+- [PA双音特性分析](doc/PaAnalyse.md)：小信号频响、双音间隔记忆、动态AM-AM/AM-PM迟滞、IM3/IM5/IM7及输出功率扫描。
 - [PA到接收端Channel物理原理与用法](doc/Channel.md)：PA前/后多通道耦合、前向仪表/板载反馈采样、反馈链路非理想和联合功率校准。
 - [信号同步、补偿与功率标定原理](doc/SigProc.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样、复增益补偿和 dBm/RMS 换算。
 - [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
@@ -45,15 +46,16 @@ inc/lib/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一�
 inc/lib/WaveGenTwoTone.py   WaveGenTwoTone 类、双音波形及IM3/IM5/IM7频率元数据
 inc/lib/TwoToneAnalysis.py  双音基波、IM3/IM5/IM7、逐轮ILC分析及结果保存
 inc/utils/ConfigUtils.py    ChainMap未知配置警告、过滤与外部活动映射视图
-inc/utils/Draw.py           功率-EVM、ILC收敛和双音IMD多方法对比图
+inc/utils/Draw.py           功率-EVM、ILC收敛、双音IMD及PA频响/记忆/功率特性图
 inc/utils/FixedPoint.py     浮点旁路、公开有符号整数码与内部归一化转换
 inc/utils/FrameProcess.py   Wi-Fi 去 CP、FFT、CSD 撤销与空间流解映射
 inc/utils/SigProc.py        SigProc 同步补偿、SignalProcessingResult 与 PowerCalibration
 inc/utils/WifiMetadata.py   MCSInfo 与 WifiWaveform 纯数据契约
 inc/__init__.py         公共接口汇总
 tests/TestProject.py    自包含验证脚本
-tests/BenchMark.py      分类场景 ILC 性能基准、结果保存和功率-EVM比较
+tests/BenchMark.py      分类ILC基准、PA双音特性测试、结果保存和曲线比较
 doc/BenchMark.md        各 benchmark 场景的构造、预期和参考仿真结果
+doc/PaAnalyse.md        三种PA的频响、记忆、互调和输出功率特性测试
 doc/FAQ.md              小信号逆响应、局部逆、公共增益和高功率GMP常见问题
 doc/Fec.md              FEC物理原理、数学推导、接口约束和调用示例
 doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整示例
@@ -650,6 +652,7 @@ flowchart TD
     benchmark --> iq["IQ镜像增广场景"]
     benchmark --> heldout["独立验证帧标签部署"]
     benchmark --> power["全方法功率-EVM扫描"]
+    paCharacterization["PaCharacterizationConfig"] --> paSweep["三种PA频响、间隔与功率扫描"]
     nominal --> algorithms["调用 DpdIlc 中的可复用算法"]
     constrained --> algorithms
     noisy --> algorithms
@@ -657,9 +660,11 @@ flowchart TD
     heldout --> algorithms
     algorithms --> analysis["Analysis：SNR / EVM / ACLR"]
     analysis --> report["CSV / JSON / 收敛图 / 功率-EVM图"]
+    paSweep --> toneAnalysis["TwoToneAnalysis：H(f) / IM3 / IM5 / IM7"]
+    toneAnalysis --> paReport["PA特性CSV / JSON / 四张PNG"]
 ```
 
-**图示说明：**`BenchMark.py` 只负责场景编排和结果呈现，不重新实现任何ILC更新律。场景分类、预期趋势和本机参考结果见[BenchMark场景说明](doc/BenchMark.md)。
+**图示说明：**`BenchMark.py` 只负责场景编排和结果呈现，不重新实现任何ILC更新律或PA方程。ILC场景分类、预期趋势和本机参考结果见[BenchMark场景说明](doc/BenchMark.md)；独立PA测试见[PA双音特性分析](doc/PaAnalyse.md)。
 
 ### `inc/utils/SigProc.py`
 
@@ -784,6 +789,9 @@ flowchart TD
     draw --> historyCreate
     historyCreate --> historySave["SaveConvergenceCurve"]
     historySave --> historyPng["Raw / LC / EVM-MSE 收敛 PNG"]
+    paSeries["PA频响、记忆和功率扫描结果"] --> paValidate["ValidatePaSeries / ValidatePaSummary"]
+    paValidate --> paCreate["四类PA特性Figure"]
+    paCreate --> paSave["四张PA特性PNG"]
 ```
 
 **图示说明：**
@@ -793,6 +801,7 @@ flowchart TD
 - `CreatePowerEvmFigure` 把所有方法绘制在同一坐标系中；方法较多时图例自动移到绘图区外，避免遮挡数据。
 - `SavePowerEvmCurve` 读取 `Draw` 在类内部解析后的绘图参数并仅输出 PNG；图形尺寸、DPI、线宽、标记大小、标题和坐标轴文字均可由外部覆盖。
 - `SaveConvergenceCurve` 在同一 dB 轴上绘制 Analysis 已计算好的 Raw NMSE、LC-NMSE 和 EVM-MSE/EVM dB，便于定位原始 MSE 停滞但 EVM 继续改善的原因。
+- PA特性绘图读取Benchmark已计算的频率点、双音间隔点、功率点和汇总表，只负责频响、记忆、标称互调和功率特性的视觉比较，不在绘图层运行PA或重算指标。
 
 ### `inc/__init__.py`
 
@@ -1361,6 +1370,10 @@ assert resultAnalysis.width == 16
 | `powerEvmFileStem` | `"power_evm_curve"` | PNG 默认文件名前缀。 |
 | `convergenceFileStem` | `"ilc_convergence"` | 每轮 MSE 收敛 PNG 的默认文件名前缀。 |
 | `imdFileStem` | `"two_tone_imd_comparison"` | 双音IM3/IM5/IM7多方法对比PNG前缀。 |
+| `paFrequencyFileStem` | `"pa_frequency_response"` | PA小信号增益/相位图前缀。 |
+| `paMemoryFileStem` | `"pa_memory_effect"` | PA双音间隔与动态迟滞图前缀。 |
+| `paNonlinearityFileStem` | `"pa_nonlinearity_comparison"` | PA标称IM3/IM5/IM7柱状图前缀。 |
+| `paPowerFileStem` | `"pa_power_characteristics"` | PA输出功率相关特性图前缀。 |
 | `figureWidthInches` | `10.5` | 图像宽度，单位英寸，必须为正数。 |
 | `figureHeightInches` | `6.2` | 图像高度，单位英寸，必须为正数。 |
 | `figureDpi` | `180` | PNG 分辨率，必须为正整数。 |
@@ -1370,6 +1383,10 @@ assert resultAnalysis.width == 16
 | `plotTitle` | `"Power-EVM comparison"` | 图标题。 |
 | `convergencePlotTitle` | `"ILC MSE convergence"` | 每轮 MSE 收敛图标题。 |
 | `imdPlotTitle` | `"Two-tone ILC intermodulation comparison"` | 双音IMD对比图标题。 |
+| `paFrequencyPlotTitle` | `"PA small-signal frequency response"` | PA频响图标题。 |
+| `paMemoryPlotTitle` | `"PA two-tone memory-effect comparison"` | PA记忆效应图标题。 |
+| `paNonlinearityPlotTitle` | `"PA nominal intermodulation comparison"` | PA标称互调图标题。 |
+| `paPowerPlotTitle` | `"PA output-power-dependent characteristics"` | PA输出功率特性图标题。 |
 | `xAxisLabel` | `"PA output power per chain (dBm)"` | 横轴标题。 |
 | `yAxisLabel` | `"RMS EVM (dB, lower is better)"` | 纵轴标题。 |
 | `convergenceXAxisLabel` | `"ILC iteration"` | 收敛图横轴标题。 |
@@ -1389,6 +1406,16 @@ assert resultAnalysis.width == 16
 | `ValidateTwoToneMetrics(metricsByMethod)` | 方法名到IM指标字典的映射 | 检查每个方法的IM3/IM5/IM7较差侧有限性。 |
 | `CreateTwoToneImdFigure(metricsByMethod)` | 多方法IM指标 | 返回IM3/IM5/IM7分组柱状图。 |
 | `SaveTwoToneImdComparison(metricsByMethod, outputDirectory, fileStem=None)` | 多方法IM指标、目录、可选文件名 | 保存并返回双音多方法对比PNG路径。 |
+| `ValidatePaSeries(seriesByModel, requiredFields, seriesName)` | 按PA分组的数据点、必需字段、序列名 | 检查模型名、非空序列、字段存在性和有限性。 |
+| `ValidatePaSummary(summaryByModel)` | 按PA分组的汇总字典 | 检查标称IM3/IM5/IM7字段。 |
+| `CreatePaFrequencyResponseFigure(seriesByModel)` | PA频响点 | 返回小信号增益和展开相位双图。 |
+| `SavePaFrequencyResponse(seriesByModel, outputDirectory, fileStem=None)` | PA频响点和目录 | 保存并返回频响PNG路径。 |
+| `CreatePaMemoryEffectFigure(seriesByModel)` | PA间隔扫描点 | 返回IM3、侧带不对称、动态AM-AM/AM-PM四联图。 |
+| `SavePaMemoryEffect(seriesByModel, outputDirectory, fileStem=None)` | PA间隔扫描点和目录 | 保存并返回记忆效应PNG路径。 |
+| `CreatePaNonlinearityComparisonFigure(summaryByModel)` | PA汇总指标 | 返回20 dBm标称IM3/IM5/IM7柱状图。 |
+| `SavePaNonlinearityComparison(summaryByModel, outputDirectory, fileStem=None)` | PA汇总指标和目录 | 保存并返回标称互调PNG路径。 |
+| `CreatePaPowerCharacteristicsFigure(seriesByModel)` | PA功率扫描点 | 返回IM3/IM5/IM7及动态迟滞随实测dBm变化的四联图。 |
+| `SavePaPowerCharacteristics(seriesByModel, outputDirectory, fileStem=None)` | PA功率扫描点和目录 | 保存并返回输出功率特性PNG路径。 |
 
 ### `ILCConfig` 与算法参数
 
@@ -2110,6 +2137,66 @@ python tests\BenchMark.py --two-tone --sample-rate-hz 100000000 --tone-lower-hz 
 
 完整物理推导见[双音生成文档](doc/WaveGenTwoTone.md)和[双音IM分析文档](doc/TwoToneAnalysis.md)。
 
+### 三种PA的双音特性Benchmark
+
+该模式不运行ILC，而是在共同条件下独立测试Wiener、GMP和Doherty。频响分支使用相同低RMS输入，避免功率闭环掩盖增益起伏；记忆分支在20 dBm共同实测输出功率下扫描双音间隔；功率分支固定4 MHz双音间隔并扫描10、15、20、23、25 dBm。
+
+`PaCharacterizationConfig` 支持以下全部参数：
+
+| 参数 | 默认值 | 作用 |
+|---|---:|---|
+| `sampleRateHz` | `200e6` | 复基带采样率。 |
+| `frequencyCentersHz` | `(-40,-30,...,40)e6` | 小信号频响的9个双音中心。 |
+| `frequencyToneSpacingHz` | `2e6` | 频响探针的双音间隔。 |
+| `memoryToneSpacingsHz` | `(0.5,1,2,4,8,12)e6` | 非线性记忆测试的双音间隔。 |
+| `dynamicToneSpacingHz` | `4e6` | 动态AM-AM/AM-PM迟滞统计点。 |
+| `powerSweepDbm` | `(10,15,20,23,25)` | 输出功率特性扫描点，单位dBm。 |
+| `numSamples` | `16384` | 每条双音记录的样点数。 |
+| `settlingSamples` | `256` | 精确投影前从首尾排除的PA暂态点数。 |
+| `smallSignalRmsLevel` | `0.05` | 频响分支的共同输入RMS。 |
+| `nonlinearRmsLevel` | `0.5` | 闭环功率校准前的初始双音RMS。 |
+| `outputPowerDbm` | `20.0` | 双音间隔扫描的共同PA输出目标。 |
+| `maximumOutputPowerDbm` | `25.0` | 归一化满量程PA输出功率。 |
+| `loadResistanceOhm` | `50.0` | dBm与复包络RMS换算端口。 |
+| `width` | `0` | PA特性模式默认浮点；正数为公开定点I/Q码。 |
+| `paModelNames` | `("wiener","gmp","doherty")` | 被测PA集合。 |
+| `outputDirectory` | `results/pa_characterization` | CSV、JSON和PNG输出目录。 |
+
+最简命令行：
+
+```powershell
+python tests\BenchMark.py --pa-analyse
+```
+
+覆盖共同测试条件：
+
+```powershell
+python tests\BenchMark.py --pa-analyse --sample-rate-hz 200000000 --tone-samples 16384 --width 0 --output-power-dbm 20 --maximum-output-power-dbm 25 --load-resistance-ohm 50 --output-dir results\pa_characterization
+```
+
+Python接口可以直接修改功率点：
+
+```python
+from pathlib import Path
+
+from tests.BenchMark import (
+    PaCharacterizationConfig,
+    RunPaCharacterizationBenchmark,
+)
+
+result = RunPaCharacterizationBenchmark(
+    PaCharacterizationConfig(
+        outputPowerDbm=20.0,
+        powerSweepDbm=(10.0, 15.0, 20.0, 23.0, 25.0),
+        width=0,
+        outputDirectory=Path("results/pa_characterization"),
+    )
+)
+print([summary.ToDict() for summary in result.summaries])
+```
+
+输出包括频响、双音间隔记忆、20 dBm标称互调和随实测输出功率变化的四张PNG，以及每个原始点的CSV/JSON。完整公式、流程、参考数值和图表见[PA双音特性分析](doc/PaAnalyse.md)。
+
 ## 指标定义
 
 - SNR：`SigProc` 完成时延、CFO、SFO 和公共复增益补偿后，数据字段参考功率与残差功率之比。
@@ -2137,4 +2224,10 @@ python tests\BenchMark.py
 python tests\BenchMark.py --two-tone
 ```
 
-验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善，以及多方法功率-EVM和双音IMD数据与图形输出。
+三种PA的频响、记忆和输出功率特性基准：
+
+```powershell
+python tests\BenchMark.py --pa-analyse
+```
+
+验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善、多方法功率-EVM和双音IMD输出，以及Wiener/GMP/Doherty的频响、间隔记忆、动态迟滞和多输出功率图表。

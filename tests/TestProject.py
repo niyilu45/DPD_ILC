@@ -425,6 +425,11 @@ def CheckBenchmarkSeparation() -> None:
         "RunTwoToneIlcBenchmark",
         "SaveTwoToneBenchmarkResults",
         "PrintTwoToneBenchmarkResults",
+        "PaCharacterizationConfig",
+        "PaCharacterizationResult",
+        "RunPaCharacterizationBenchmark",
+        "SavePaCharacterizationResults",
+        "PrintPaCharacterizationResults",
     )
     for forbiddenName in forbiddenProductionNames:
         assert forbiddenName not in ilcSource, (
@@ -3939,6 +3944,109 @@ def CheckTwoToneIlcAnalysis() -> None:
         ).exists()
 
 
+def CheckPaCharacterizationBenchmark() -> None:
+    """Verify multi-model two-tone PA feature sweeps and all artifacts.
+
+    Processing details:
+        Algorithm: Run a compact Wiener/GMP/Doherty frequency and tone-spacing
+        sweep, require the expected point counts and finite summary metrics,
+        verify equal-power nonlinear measurements, and check all CSV, JSON,
+        and PNG outputs plus the dedicated principle document.
+
+    Returns:
+        result: None. Assertion failures identify PA characterization
+            regressions.
+    """
+
+    from tests.BenchMark import (
+        PaCharacterizationConfig,
+        RunPaCharacterizationBenchmark,
+    )
+
+    with TemporaryDirectory() as temporaryDirectory:
+        outputDirectory = Path(temporaryDirectory)
+        result = RunPaCharacterizationBenchmark(
+            PaCharacterizationConfig(
+                sampleRateHz=100.0e6,
+                frequencyCentersHz=(-10.0e6, 0.0, 10.0e6),
+                frequencyToneSpacingHz=2.0e6,
+                memoryToneSpacingsHz=(0.5e6, 2.0e6, 4.0e6),
+                dynamicToneSpacingHz=2.0e6,
+                powerSweepDbm=(15.0, 20.0),
+                numSamples=4096,
+                settlingSamples=64,
+                outputPowerDbm=20.0,
+                width=0,
+                outputDirectory=outputDirectory,
+            )
+        )
+        assert len(result.frequencyResponse) == 18
+        assert len(result.memoryEffect) == 9
+        assert len(result.powerSweep) == 6
+        assert len(result.summaries) == 3
+        resultDocument = result.ToDict()
+        assert len(resultDocument["powerSweep"]) == 6
+        assert tuple(
+            summary.modelName for summary in result.summaries
+        ) == ("wiener", "gmp", "doherty")
+        for summary in result.summaries:
+            summaryValues = tuple(
+                value
+                for key, value in summary.ToDict().items()
+                if key != "modelName"
+            )
+            assert np.all(np.isfinite(summaryValues))
+            assert summary.gainRippleDb >= 0.0
+            assert summary.phaseNonlinearityDegrees >= 0.0
+            assert summary.im3SpacingVariationDb >= 0.0
+            assert summary.maximumIm3AsymmetryDb >= 0.0
+        for memoryPoint in result.memoryEffect:
+            assert (
+                abs(memoryPoint.outputPowerDbm - 20.0) <= 0.25
+            )
+        for powerPoint in result.powerSweep:
+            assert (
+                abs(
+                    powerPoint.measuredOutputPowerDbm
+                    - powerPoint.targetOutputPowerDbm
+                )
+                <= 0.25
+            )
+        for modelName in ("wiener", "gmp", "doherty"):
+            assert tuple(
+                powerPoint.targetOutputPowerDbm
+                for powerPoint in result.powerSweep
+                if powerPoint.modelName == modelName
+            ) == (15.0, 20.0)
+        for artifactName in (
+            "pa_frequency_response.csv",
+            "pa_memory_effect.csv",
+            "pa_power_sweep.csv",
+            "pa_characterization_summary.csv",
+            "pa_characterization.json",
+            "pa_frequency_response.png",
+            "pa_memory_effect.png",
+            "pa_nonlinearity_comparison.png",
+            "pa_power_characteristics.png",
+        ):
+            assert (outputDirectory / artifactName).exists()
+    paAnalysisDocument = (
+        GetProjectRoot() / "doc" / "PaAnalyse.md"
+    ).read_text(encoding="utf-8")
+    for requiredText in (
+        "小信号频率响应",
+        "双音间隔扫描",
+        "动态AM-AM/AM-PM迟滞",
+        "输出功率扫描",
+        "测试结果",
+        "pa_frequency_response.png",
+        "pa_memory_effect.png",
+        "pa_nonlinearity_comparison.png",
+        "pa_power_characteristics.png",
+    ):
+        assert requiredText in paAnalysisDocument
+
+
 def RunTests() -> None:
     """Run all project checks and report a compact success message.
 
@@ -3978,6 +4086,7 @@ def RunTests() -> None:
     CheckReceiveOnlyWifiAnalysis()
     CheckMseEvmConvergence()
     CheckTwoToneIlcAnalysis()
+    CheckPaCharacterizationBenchmark()
     print("All DPD-ILC project checks passed.")
 
 
