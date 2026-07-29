@@ -289,10 +289,19 @@ L_{c,v}.
 ```math
 \hat c_v
 =
-\begin{cases}
-0, & L_v^{\mathrm{post}}\ge 0, \\
-1, & L_v^{\mathrm{post}}<0.
-\end{cases}
+0,
+\qquad
+L_v^{\mathrm{post}}\ge 0.
+```
+
+当后验 LLR 小于零时：
+
+```math
+\hat c_v
+=
+1,
+\qquad
+L_v^{\mathrm{post}}<0.
 ```
 
 每轮计算综合：

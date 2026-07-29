@@ -278,7 +278,9 @@ Newton 更新为
 其中
 
 ```math
-\mathbf{J}_k=\left.\frac{\partial\mathcal{P}(\mathbf{u})}{\partial\mathbf{u}}\right|_{\mathbf{u}=\mathbf{u}_k}
+\mathbf{J}_k
+=
+\frac{\partial\mathcal{P}}{\partial\mathbf{u}}(\mathbf{u}_k)
 ```
 
 宽带 PA 的 $\mathbf{J}_k$ 规模大且可能病态，通常求解
@@ -310,11 +312,19 @@ Newton 更新为
 ```math
 \begin{bmatrix}\delta\mathbf{y}\\\delta\mathbf{y}^*\end{bmatrix}
 =
-\underbrace{\begin{bmatrix}
+\mathbf{J}_a
+\begin{bmatrix}\delta\mathbf{u}\\\delta\mathbf{u}^*\end{bmatrix}
+```
+
+其中增广雅可比矩阵定义为
+
+```math
+\mathbf{J}_a
+=
+\begin{bmatrix}
 \mathbf{J}_u&\mathbf{J}_{u^*}\\
 \mathbf{J}_{u^*}^*&\mathbf{J}_u^*
-\end{bmatrix}}_{\mathbf{J}_a}
-\begin{bmatrix}\delta\mathbf{u}\\\delta\mathbf{u}^*\end{bmatrix}
+\end{bmatrix}.
 ```
 
 于是
@@ -912,13 +922,21 @@ H_{\mathrm{local}}[k]
 `LimitAmplitude` 实现复平面圆盘投影：
 
 ```math
-\boxed{
 \Pi_{A}(u)
-=\begin{cases}
-u,&|u|\le A,\\
-A\frac{u}{|u|},&|u|>A.
-\end{cases}
-}
+=
+u,
+\qquad
+|u|\le A.
+```
+
+对于超限样点：
+
+```math
+\Pi_A(u)
+=
+A\frac{u}{|u|},
+\qquad
+|u|>A.
 ```
 
 它只改变超限样点的幅度，不改变其相位。

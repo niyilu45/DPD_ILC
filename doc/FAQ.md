@@ -250,23 +250,26 @@ a_1A+a_3A^3+a_5A^5+a_7A^7.
 A=A_0+\Delta A.
 ```
 
+定义工作点处的局部斜率：
+
+```math
+s(A_0)
+=
+\frac{dy}{dA}(A_0).
+```
+
 输出的一阶变化为：
 
 ```math
 \Delta y
 \approx
-\left.
-\frac{dy}{dA}
-\right|_{A=A_0}
-\Delta A.
+s(A_0)\Delta A.
 ```
 
-当前工作点的局部斜率为：
+将多项式导数代入，得到：
 
 ```math
-\left.
-\frac{dy}{dA}
-\right|_{A=A_0}
+s(A_0)
 =
 a_1
 +3a_3A_0^2

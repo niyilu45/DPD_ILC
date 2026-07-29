@@ -63,12 +63,15 @@ flowchart LR
 任意两个不同子载波 $k\ne l$ 的内积为
 
 ```math
-\begin{aligned}
 \int_0^{T_u}\phi_k(t)\phi_l^*(t)\,dt
-&=\int_0^{T_u}e^{j2\pi(k-l)t/T_u}\,dt\\
-&=\left.\frac{T_u e^{j2\pi(k-l)t/T_u}}{j2\pi(k-l)}\right|_0^{T_u}\\
-&=0.
-\end{aligned}
+=
+\int_0^{T_u}e^{j2\pi(k-l)t/T_u}\,dt
+=
+\left[
+\frac{T_u e^{j2\pi(k-l)t/T_u}}{j2\pi(k-l)}
+\right]_{t=0}^{t=T_u}
+=
+0.
 ```
 
 这就是“正交”的来源：每个子载波的频谱虽然相互重叠，但在一个完整有效符号内，其他子载波贡献的正负面积刚好抵消。

@@ -63,7 +63,7 @@ q_{\mathrm{I}}=
 2^{W-1}-1,
 \max\left(
 -2^{W-1},
-\mathop{\mathrm{round}}\left(S_W x_{\mathrm{I}}\right)
+\mathrm{round}\left(S_W x_{\mathrm{I}}\right)
 \right)
 \right)
 ```

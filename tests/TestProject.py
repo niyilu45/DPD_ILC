@@ -586,8 +586,34 @@ def CheckDocumentationMathCompatibility() -> None:
         equation before incompatible formulas can be published.
     """
 
-    documentPaths = sorted((GetProjectRoot() / "doc").glob("*.md"))
-    forbiddenMacros = (r"\operatorname", r"\text", r"\dfrac")
+    documentPaths = [GetProjectRoot() / "README.md"]
+    documentPaths.extend(
+        sorted((GetProjectRoot() / "doc").glob("*.md"))
+    )
+    forbiddenMacros = (
+        r"\operatorname",
+        r"\text",
+        r"\dfrac",
+        r"\tfrac",
+        r"\mathop",
+        r"\begin{aligned}",
+        r"\begin{align",
+        r"\begin{array}",
+        r"\begin{cases}",
+        r"\substack",
+        r"\overset",
+        r"\underset",
+        r"\underbrace",
+        r"\overbrace",
+        r"\left.",
+        r"\right.",
+        r"\tag",
+        r"\label",
+        r"\eqref",
+        r"\newcommand",
+        r"\require",
+        r"\unicode",
+    )
     fenceMarker = chr(96) * 3
     mathFenceMarker = fenceMarker + "math"
     mathBlockPattern = (

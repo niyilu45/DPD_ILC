@@ -603,10 +603,19 @@ J
 ```math
 u_{\mathrm{limited}}[n]
 =
-\begin{cases}
-u[n], & |u[n]|\leq A_{\max},\\
-A_{\max}\frac{u[n]}{|u[n]|}, & |u[n]|>A_{\max}.
-\end{cases}
+u[n],
+\qquad
+|u[n]|\leq A_{\max}.
+```
+
+对于超限样点：
+
+```math
+u_{\mathrm{limited}}[n]
+=
+A_{\max}\frac{u[n]}{|u[n]|},
+\qquad
+|u[n]|>A_{\max}.
 ```
 
 限幅是安全约束，不是理想线性化方法。若大量样点触发限幅，应降低工作点、改善训练覆盖或重新选择模型，而不是继续增大高阶系数。

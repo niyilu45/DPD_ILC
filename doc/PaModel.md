@@ -192,11 +192,13 @@ A_{\mathrm{out}}(r)\approx Gr.
 当 $r\gg A_{\mathrm{sat}}$ 时，$1+\rho^{2p}\approx\rho^{2p}$，所以
 
 ```math
-\begin{aligned}
 A_{\mathrm{out}}(r)
-&\approx\frac{Gr}{(\rho^{2p})^{1/(2p)}}\\
-&=\frac{Gr}{\rho}=GA_{\mathrm{sat}}.
-\end{aligned}
+\approx
+\frac{Gr}{(\rho^{2p})^{1/(2p)}}
+=
+\frac{Gr}{\rho}
+=
+GA_{\mathrm{sat}}.
 ```
 
 输出幅度趋近固定上限 $GA_{\mathrm{sat}}$。
@@ -321,17 +323,38 @@ a_{p,m}x[n-m]|x[n-m]|^{p-1}.
 
 ### 4.3 GMP 的三类基函数
 
-GMP 在主支路之外增加滞后与超前交叉项：
+GMP 在主支路之外增加滞后与超前交叉项。先分别定义三类分量：
 
 ```math
-\begin{aligned}
-y[n]={}&
-\underbrace{\sum_{p,m}a_{p,m}x[n-m]|x[n-m]|^{p-1}}_{\mathrm{main}}\\
-&+\underbrace{\sum_{p,m,l}b_{p,m,l}
-x[n-m]|x[n-m-l]|^{p-1}}_{\mathrm{lag}}\\
-&+\underbrace{\sum_{p,m,l}c_{p,m,l}
-x[n-m-l]|x[n-m]|^{p-1}}_{\mathrm{lead}}.
-\end{aligned}
+y_{\mathrm{main}}[n]
+=
+\sum_{p,m}a_{p,m}x[n-m]|x[n-m]|^{p-1}.
+```
+
+```math
+y_{\mathrm{lag}}[n]
+=
+\sum_{p,m,l}b_{p,m,l}
+x[n-m]|x[n-m-l]|^{p-1}.
+```
+
+```math
+y_{\mathrm{lead}}[n]
+=
+\sum_{p,m,l}c_{p,m,l}
+x[n-m-l]|x[n-m]|^{p-1}.
+```
+
+总输出为
+
+```math
+y[n]
+=
+y_{\mathrm{main}}[n]
++
+y_{\mathrm{lag}}[n]
++
+y_{\mathrm{lead}}[n].
 ```
 
 其中两个离散索引的取值范围为：

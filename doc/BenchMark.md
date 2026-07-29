@@ -935,10 +935,19 @@ A_{\mathrm{CFR}}
 ```math
 u_{\mathrm{projected}}[n]
 =
-\begin{cases}
-u[n], & |u[n]|\le A_{\mathrm{CFR}},\\
-A_{\mathrm{CFR}}\frac{u[n]}{|u[n]|}, & |u[n]|>A_{\mathrm{CFR}}.
-\end{cases}
+u[n],
+\qquad
+|u[n]|\le A_{\mathrm{CFR}}.
+```
+
+对于超限样点：
+
+```math
+u_{\mathrm{projected}}[n]
+=
+A_{\mathrm{CFR}}\frac{u[n]}{|u[n]|},
+\qquad
+|u[n]|>A_{\mathrm{CFR}}.
 ```
 
 为保持文档渲染兼容，代码对应含义是：未超限样点保持不变，超限样点只缩短幅度而保留复相位。该场景使用学习率0.12、种子108，其余频域ILC参数与标称场景一致。

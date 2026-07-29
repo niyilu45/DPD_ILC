@@ -639,10 +639,19 @@ sampleRateHz = 60.0e6
 ```math
 u_{\mathrm{limited}}[n]
 =
-\begin{cases}
-u[n], & |u[n]|\le A_{\max},\\
-A_{\max}\frac{u[n]}{|u[n]|}, & |u[n]|>A_{\max}.
-\end{cases}
+u[n],
+\qquad
+|u[n]|\le A_{\max}.
+```
+
+对于超限样点：
+
+```math
+u_{\mathrm{limited}}[n]
+=
+A_{\max}\frac{u[n]}{|u[n]|},
+\qquad
+|u[n]|>A_{\max}.
 ```
 
 构造相对初始波形的峰值约束：

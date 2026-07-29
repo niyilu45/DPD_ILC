@@ -591,7 +591,7 @@ q_i(n-m)
 ```math
 D_{i,\mathrm{lag}}\{q_i(n)\}
 =
-\sum_{\substack{p\in\mathcal{P}\\p>1}}
+\sum_{p\in\mathcal{P},\,p>1}
 \sum_{m=0}^{M-1}
 \sum_{r=1}^{R}
 b_{i,p,m,r}
@@ -604,7 +604,7 @@ q_i(n-m)
 ```math
 D_{i,\mathrm{lead}}\{q_i(n)\}
 =
-\sum_{\substack{p\in\mathcal{P}\\p>1}}
+\sum_{p\in\mathcal{P},\,p>1}
 \sum_{m=0}^{M-1}
 \sum_{r=1}^{R}
 c_{i,p,m,r}

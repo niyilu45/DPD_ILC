@@ -315,12 +315,12 @@ flowchart LR
 展开目标函数：
 
 ```math
-\begin{aligned}
 J(g)
-&=(\mathbf y-g\mathbf x)^H(\mathbf y-g\mathbf x)\\
-&=\mathbf y^H\mathbf y-g\mathbf y^H\mathbf x
+=
+(\mathbf y-g\mathbf x)^H(\mathbf y-g\mathbf x)
+=
+\mathbf y^H\mathbf y-g\mathbf y^H\mathbf x
 -g^*\mathbf x^H\mathbf y+|g|^2\mathbf x^H\mathbf x.
-\end{aligned}
 ```
 
 对 $g^*$ 求导并令其为零：
@@ -426,14 +426,14 @@ V_m=a_m V_{\mathrm{FS}},
 ```
 
 ```math
-\begin{aligned}
 P_{m,\mathrm{dBm}}
-&=10\log_{10}
+=
+10\log_{10}
 \left(
 \frac{V_m^2/R}{10^{-3}}
-\right)\\
-&=P_{\mathrm{max,dBm}}+20\log_{10}(a_m).
-\end{aligned}
+\right)
+=
+P_{\mathrm{max,dBm}}+20\log_{10}(a_m).
 ```
 
 默认值是 $R=50\ \Omega$、$P_{\mathrm{max,dBm}}=25\ \mathrm{dBm}$、`activePowerThresholdDb=-60.0`、`activeGapToleranceSamples=16`。定点模式先把公开整数 I/Q 码按位宽解码成归一化复包络，再使用同一公式，所以浮点和定点入口具有相同的功率定义。若外部系统使用不同的满量程功率，必须通过 `maximumOutputPowerDbm` 传入实际标定值；它不是由EVM或复增益自动猜测出来的。完整有效区检测与任意幅度重标定推导见 [SigProc.md](./SigProc.md#131-有效信号区间与占空比)。
@@ -657,12 +657,13 @@ EVM 会综合反映：
 于是
 
 ```math
-\begin{aligned}
 \mathrm{EVM}_{\mathrm{dB}}
-&=20\log_{10}\sqrt{\frac{P_e}{P_s}}\\
-&=10\log_{10}\frac{P_e}{P_s}\\
-&\approx-\mathrm{SNR}_{\mathrm{dB}}.
-\end{aligned}
+=
+20\log_{10}\sqrt{\frac{P_e}{P_s}}
+=
+10\log_{10}\frac{P_e}{P_s}
+\approx
+-\mathrm{SNR}_{\mathrm{dB}}.
 ```
 
 这个关系只是理想近似。当前 SNR 在时域数据样点上计算，EVM 在频域数据子载波上计算；空音调、导频、非线性带外能量和记忆失真会使两者不再严格互为相反数。
@@ -743,14 +744,14 @@ flowchart TB
 因为公共线性项和残差正交，勾股关系给出：
 
 ```math
-\begin{aligned}
 \left\|\mathbf{y}_k-\mathbf{x}\right\|_2^2
-&=\left\|(\hat{g}_k-1)\mathbf{x}
-          +\mathbf{e}_{\perp,k}\right\|_2^2\\
-&=\left|\hat{g}_k-1\right|^2
+=
+\left\|(\hat{g}_k-1)\mathbf{x}
++\mathbf{e}_{\perp,k}\right\|_2^2
+=
+\left|\hat{g}_k-1\right|^2
   \left\|\mathbf{x}\right\|_2^2
   +\left\|\mathbf{e}_{\perp,k}\right\|_2^2.
-\end{aligned}
 ```
 
 所以原始归一化 MSE 可写为：

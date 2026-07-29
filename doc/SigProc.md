@@ -615,14 +615,21 @@ p_{m,\max}=\max_n p_m[n].
 ```math
 M_m[n]
 =
-\begin{cases}
-1, &
+1,
+\qquad
 p_m[n]>
-p_{m,\max}
-10^{T_{\mathrm{active}}/10},
-\\
-0, & \mathrm{otherwise}.
-\end{cases}
+p_{m,\max}10^{T_{\mathrm{active}}/10}.
+```
+
+未超过门限时：
+
+```math
+M_m[n]
+=
+0,
+\qquad
+p_m[n]\le
+p_{m,\max}10^{T_{\mathrm{active}}/10}.
 ```
 
 默认 $T_{\mathrm{active}}=-60\ \mathrm{dB}$。OFDM样值会正常穿过零点，因此不能把每一个低幅样点都视为关断。`activeGapToleranceSamples=16` 会填充长度不超过16个样点的内部空洞；前置补零、后置补零以及更长的内部静默区仍保持无效。每一路MIMO信号独立建立掩码。
@@ -846,7 +853,7 @@ flowchart LR
 ```math
 \widehat c
 =
-\underset{c\geq0}{\mathrm{arg\,min}}
+\arg\min_{c\geq0}
 \left|
 \sqrt{
 \frac{
