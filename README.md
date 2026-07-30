@@ -1188,6 +1188,8 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 | `loadModulationStrength` | `0.10` | Carrier包络相关简化负载调制强度。 |
 
 `PaModel.Process(inputSignal)` 返回 PA 复基带输出；`SmallSignalGain()` 返回当前模型的 DC 小信号复增益。
+Wiener、GMP、Doherty 的静态增益曲线定义、1 dB 压缩点推导、每一个配置值对曲线的移动或变形方式、外部 dBm 工作点与模型曲线的区别，以及恒包络扫幅示例，见
+[PaModel.md：配置时如何读取和调节增益曲线](doc/PaModel.md#49-配置时如何读取和调节增益曲线)。
 
 `MimoPaModel(parameters=None, width=None, **parameterOverrides)` 在构造函数内部使用 `ChainMap` 管理以下参数：
 

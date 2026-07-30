@@ -579,6 +579,398 @@ paOutput = dohertyPa.Process(paInput)
 
 ---
 
+## 4.9 配置时如何读取和调节增益曲线
+
+这一节直接回答配置 `PaModel` 时最常见的两个问题：
+
+1. 当前参数对应的增益曲线是什么；
+2. 修改某个配置值后，曲线会向上、向右、变陡，还是只改变相位和记忆。
+
+### 4.9.1 先区分三条容易混淆的曲线
+
+对幅度为 $r$ 的恒包络复输入，忽略启动暂态后定义输出幅度为
+
+```math
+A_{\mathrm{out}}(r)=|y(r)|.
+```
+
+AM-AM 曲线直接画 $A_{\mathrm{out}}(r)$ 对 $r$。电压增益曲线为
+
+```math
+G_v(r)=\frac{A_{\mathrm{out}}(r)}{r},
+```
+
+对应的 dB 增益为
+
+```math
+G_{\mathrm{dB}}(r)=20\log_{10}G_v(r).
+```
+
+如果低功率增益为 $G_{v,0}$，增益压缩量定义为
+
+```math
+C_{\mathrm{dB}}(r)
+=
+20\log_{10}
+\frac{G_v(r)}{G_{v,0}}.
+```
+
+线性区内 $C_{\mathrm{dB}}$ 接近 0 dB；进入压缩后它为负数。因而：
+
+- **AM-AM 曲线**回答“输出幅度有多大”；
+- **增益曲线**回答“每个输入幅度被放大多少倍”；
+- **增益压缩曲线**去掉了小信号增益，最适合比较压缩膝点；
+- **AM-PM 曲线**回答“相位额外旋转多少”，不能从 AM-AM 曲线推断。
+
+下图是**参数与曲线位置关系的结构示意图**，不是选取若干参数值后的遍历结果。图中只保留一条代表性曲线，并把配置字段直接标在它主要控制的曲线区域；箭头表示该参数控制“高度、膝点位置、曲率、轨迹宽度或支路开启区”，不表示某个固定数值的定量仿真结果。
+
+![PA增益曲线参数影响](./images/pa_model/pa_gain_parameter_effects.png)
+
+**图 6 说明**：Wiener 图把 `linearGain`、`saturationAmplitude` 和 `rappSmoothness` 分别映射到低功率增益、压缩膝点及膝点陡峭度；GMP 图把一阶、三阶和更高阶系数映射到低、中、高幅度曲线区域，并用阴影表示记忆参数引起的动态轨迹宽度；Doherty 图把 Carrier 区、Peaking 开启门限、开启过渡宽度、高功率增益抬升和最终压缩区分开标注。绿色文字对应不会简单移动静态曲线、却会改变频响、AM-PM、迟滞或支路抵消的参数。
+
+### 4.9.2 Wiener 曲线的精确参数关系
+
+Wiener 模型先经过 FIR。令某个频率处的外部输入幅度为 $A$，FIR 频率响应为 $H$, 则进入 Rapp 非线性模块的幅度为
+
+```math
+r=|H|A.
+```
+
+Rapp 电压增益为
+
+```math
+G_v(r)
+=
+\frac{G}
+{\left[1+\left(r/A_{\mathrm{sat}}\right)^{2p}\right]^{1/(2p)}}.
+```
+
+相对于小信号增益 $G$ 的压缩量为
+
+```math
+C_{\mathrm{dB}}(r)
+=
+-\frac{10}{p}
+\log_{10}
+\left[
+1+\left(\frac{r}{A_{\mathrm{sat}}}\right)^{2p}
+\right].
+```
+
+在 $r=A_{\mathrm{sat}}$ 处：
+
+```math
+C_{\mathrm{dB}}(A_{\mathrm{sat}})
+=
+-\frac{3.0103}{p}\ {\rm dB}.
+```
+
+默认 `rappSmoothness=3.0` 时，这一点约为 1.003 dB 压缩点。因此默认 `saturationAmplitude=1.0` 可以近似理解为“FIR 输出幅度等于 1 时到达 1 dB 压缩”。
+
+更一般地，若希望求正数形式的 $C$ dB 压缩点，则
+
+```math
+r_C
+=
+A_{\mathrm{sat}}
+\left(10^{Cp/10}-1\right)^{1/(2p)}.
+```
+
+外部输入端看到的压缩点还要除以该频率处的 FIR 幅频响应：
+
+```math
+A_C
+=
+\frac{r_C}{|H|}.
+```
+
+这解释了为什么 `linearTaps` 虽然位于非线性之前，也会让不同频率的外部输入在不同幅度开始压缩。
+
+| Wiener 配置 | 是否改变小信号增益 | 对增益曲线的具体影响 | 不会直接改变的量 |
+|---|---|---|---|
+| `linearGain` | 是 | 乘以 $k$ 时整条内部增益曲线上移 $20\log_{10}k$ dB，饱和输出幅度也由 $GA_{\mathrm{sat}}$ 同比例变化 | 以 FIR 输出幅度表示的压缩膝点位置 |
+| `saturationAmplitude` | 否 | 增大时膝点向右移动，渐近饱和输出 $GA_{\mathrm{sat}}$ 同时增大 | 原点附近斜率 $G$ |
+| `rappSmoothness` | 否 | 增大时线性增益保持更久，随后更突然地压缩；减小时压缩提前且更圆滑 | 小信号增益和渐近饱和输出 |
+| `linearTaps` | 是，而且随频率变化 | 改变 $H$ 的幅相响应；某频率的 $|H|$ 越大，该频率相对外部输入越早进入压缩 | Rapp 模块自身以 $r/A_{\mathrm{sat}}$ 表示的归一化形状 |
+| `ampmCoefficient` | 否 | 不改变当前代码中的 AM-AM 或增益幅度曲线，只增加幅度相关相位旋转 | 输出幅度；但 EVM 仍可能明显变化 |
+
+几个调参结论可以直接从上式得到：
+
+- 想让整条增益曲线提高 3 dB，可把 `linearGain` 乘以约 1.412；
+- 想让压缩点在输入幅度轴上向右移动 20%，可把 `saturationAmplitude` 乘以 1.2；
+- 想保留相同小信号增益但让膝点更硬，只增大 `rappSmoothness`；
+- 想只增加 AM-PM 而保持 AM-AM 不变，只修改 `ampmCoefficient`；
+- 想模拟带内不同子载波具有不同增益和压缩点，应修改 `linearTaps`，而不是只修改 `linearGain`。
+
+### 4.9.3 GMP 曲线由哪些系数决定
+
+对已经越过启动暂态的恒包络输入
+
+```math
+x[n]=re^{j\theta},
+```
+
+所有延迟样本的幅度与相位相同。此时同一阶次的主项、滞后项和超前项可以合并为
+
+```math
+C_p
+=
+\sum_m a_{p,m}
++
+\sum_{m,l}b_{p,m,l}
++
+\sum_{m,l}c_{p,m,l}.
+```
+
+稳态输出和等效复增益分别为
+
+```math
+y
+=
+e^{j\theta}
+\sum_p C_p r^p,
+```
+
+```math
+G_{\mathrm{GMP}}(r)
+=
+\frac{y}{x}
+=
+\sum_p C_p r^{p-1}.
+```
+
+因此 GMP 的幅度增益和 AM-PM 为
+
+```math
+G_v(r)
+=
+\left|
+\sum_p C_p r^{p-1}
+\right|,
+```
+
+```math
+\phi(r)
+=
+\angle
+\left(
+\sum_p C_p r^{p-1}
+\right).
+```
+
+默认 `(1, 3, 5, 7)`、`memoryDepth=3`、`crossMemoryDepth=2` 在恒包络稳态下合并后的系数约为：
+
+| 阶次 | 合并系数 $C_p$ | 对默认曲线的主要作用 |
+|---:|---:|---|
+| 1 | $1.02475-j0.01100$ | 小信号复增益 |
+| 3 | $-0.87292+j0.29155$ | 主要压缩和 AM-PM |
+| 5 | $0.25421-j0.13484$ | 修正中高幅度曲率 |
+| 7 | $-0.03144+j0.02188$ | 限制高幅度端的曲线形状 |
+
+这些数值来自 `DefaultGmpCoefficients` 的实际默认字典，而不是器件测量值。
+
+| GMP 配置 | 使用默认系数时的影响 | 提供自定义系数时的影响 |
+|---|---|---|
+| `nonlinearOrders` | 决定生成哪些奇数阶；加入高阶会增加高幅度曲线自由度 | 数值曲线由三个系数字典中的实际键和值决定，不能只靠该元组改变已有字典 |
+| `memoryDepth` | 增加主项延迟抽头；默认一阶尾抽头改变小信号频响，高阶尾抽头改变动态压缩 | 自定义字典是最终执行项；只改深度不会自动创建或删除调用方给出的键 |
+| `crossMemoryDepth` | 增加滞后/超前包络项，增强动态 AM-AM、AM-PM 和迟滞 | 自定义 `laggingCoefficients`、`leadingCoefficients` 的实际内容决定执行项 |
+| `mainCoefficients[(1,m)]` | 直接决定小信号 FIR 增益和频率响应 | 实部、虚部共同决定幅度与相位，不能把虚部简单理解成“只影响相位” |
+| `mainCoefficients[(p,m)]`, $p>1$ | 决定静态曲率和对应阶次的记忆 | 负实方向的三阶项常产生压缩，正实方向常产生扩张，但最终结果取决于所有复向量之和 |
+| `laggingCoefficients` | 对恒包络稳态并入 $C_p$，对调制包络形成历史依赖 | 增大后通常加宽同一输入幅度对应的增益散点或迟滞环 |
+| `leadingCoefficients` | 对恒包络稳态并入 $C_p$，对调制包络补充另一类动态相关性 | 影响动态轨迹；代码仍是因果延迟，并不读取未来样本 |
+
+三个系数字典分别判断是否为 `None`。例如只自定义 `mainCoefficients`，却让 `laggingCoefficients=None` 和 `leadingCoefficients=None`，代码仍会生成默认交叉项。若需要严格的无记忆自定义曲线，必须同时设置 `memoryDepth=1`、`crossMemoryDepth=0`，并把两个交叉系数字典显式设为 `{}`。
+
+GMP 最重要的使用边界是：**具有记忆时不存在一条能完整描述宽带 PA 的唯一增益曲线**。静态扫幅只给出恒包络稳态截面。对 Wi-Fi 波形，同一个当前幅度 $|x[n]|$ 会因为过去包络不同而得到不同增益，所以 AM-AM 图会形成一条有宽度的轨迹带。此时应同时查看：
+
+- 恒包络静态增益曲线；
+- 上升包络与下降包络的增益差；
+- 不同双音间隔下的 IM3、IM5、IM7；
+- 带内频响和群时延；
+- Wi-Fi EVM 与 ACLR。
+
+这些动态测试在 [PaAnalyse.md](./PaAnalyse.md) 中给出。
+
+### 4.9.4 Doherty 曲线为什么有两个膝点
+
+忽略支路时延并把两条支路的复电压增益记为 $G_c(r)$ 和 $G_p(r)$。Doherty 的稳态总复增益近似为
+
+```math
+G_D(r)
+=
+c_c
+\left[1+\lambda a(r)\right]
+g_c G_c(g_c r)
++
+c_p
+g_p a(r)
+G_p\left(g_p a(r)r\right).
+```
+
+低于 `peakingTurnOnAmplitude` 时 $a(r)=0$，只有 Carrier 支路；进入过渡区后，Peaking 支路逐渐加入，同时 Carrier 的简化负载调制因子从 1 增长到 $1+\lambda$。所以 Doherty 增益曲线通常包含：
+
+1. Carrier 单独工作的低功率区；
+2. Peaking 开启和负载调制形成的第二膝点；
+3. 两支路共同工作并可能共同压缩的高功率区。
+
+| Doherty 配置 | 对低功率区的影响 | 对过渡区和高功率区的影响 |
+|---|---|---|
+| `carrierModelName` 与 Carrier 配置 | 决定小信号增益、第一压缩膝点、Carrier 记忆 | Carrier 在全幅度区持续贡献 |
+| `peakingModelName` 与 Peaking 配置 | Peaking 关闭时无影响 | 决定开启后的压缩、AM-PM 和记忆 |
+| `carrierInputGain` | 增大时小信号增益提高，同时 Carrier 相对外部输入更早压缩 | 也改变与 Peaking 的幅相平衡 |
+| `peakingInputGain` | 无影响 | 增大时 Peaking 贡献更强，但它自身也更早进入压缩 |
+| `peakingTurnOnAmplitude` | 不改变门限以下曲线 | 增大时第二膝点向右移动，减小时 Peaking 更早开启 |
+| `peakingTransitionWidth` | 不改变远低于门限的曲线 | 增大时开启更平滑、更宽；减小时开启更突然 |
+| `carrierCombineCoefficient` | 其幅度直接缩放低功率增益，相位旋转 Carrier 输出 | 参与两支路矢量合成 |
+| `peakingCombineCoefficient` | Peaking 关闭时无影响 | 幅度决定 Peaking 权重；相位失配可造成高功率增益下凹甚至局部抵消 |
+| `loadModulationStrength` | 门限以下无影响 | 增大时 Carrier 在 Peaking 开启区获得更强的增益抬升 |
+| `peakingDelaySamples` | 恒包络稳态且暂态丢弃后基本不改变静态曲线 | 对调制和多音信号形成频率相关相位差，可能造成增益波纹、动态迟滞和合成抵消 |
+
+`peakingDelaySamples` 是一个典型例子：静态 AM-AM 曲线可能看不出它的影响，但 Wi-Fi EVM、带内平坦度和 ACLR 会变差。因此不能只凭一张静态增益曲线判断 Doherty 配置是否合理。
+
+### 4.9.5 哪些外部配置只移动工作点，不改变 PA 方程
+
+工程还存在若干与功率有关的配置。它们和 PA 曲线参数必须分开理解：
+
+| 外部配置 | 实际作用 | 是否改变归一化 PA 曲线 |
+|---|---|---|
+| `Channel.Process(..., outputPowerDbm=...)` | 闭环调整 PA 输入缩放，直到 PA 自身有效输出达到目标 dBm | 否；它让波形沿同一条曲线移动到不同工作点 |
+| `maximumOutputPowerDbm` | 定义归一化输出与绝对 dBm 的标尺，并限制允许目标 | 否 |
+| `inputPowerDbPerChain` | 在每路 PA 前乘电压比例，改变驱动和压缩深度 | 否；改变外部输入轴上的工作点 |
+| `outputPowerDbPerChain` | PA 后施加常数相对增益 | 不改变内部压缩，只让观察到的 AM-AM 曲线竖直缩放 |
+| `targetOutputPowerDbmPerChain` | `MimoPaModel` 的兼容性 PA 后绝对缩放接口 | 不改变内部压缩；主测试流程应优先用 Channel 闭环 |
+| `width` | 在 PA 公开输入和输出边界量化 I/Q 码值 | 不改变内部浮点方程，但会让低幅度曲线出现量化台阶，过大码值还会剪切 |
+
+例如把 `outputPowerDbm` 从 15 dBm 改为 22 dBm，不是把 `linearGain` 改大，而是由 Channel 自动增加 PA 驱动，使波形在同一条增益曲线上向压缩区移动。因此输出功率升高时，测得增益、EVM 和 ACLR 可以同时恶化。
+
+### 4.9.6 典型调参目标与推荐配置
+
+| 目标 | 首选配置 | 调整方向 | 同时检查 |
+|---|---|---|---|
+| 提高 Wiener 小信号增益 | `linearGain` | 增大 | 饱和输出也会同倍增加 |
+| 把 Wiener 压缩点右移 | `saturationAmplitude` | 增大 | 输出归一化标尺和目标 dBm 的映射 |
+| 让 Wiener 膝点更硬 | `rappSmoothness` | 增大 | 高 PAPR 波形峰值是否突然剪切 |
+| 增加 AM-PM 但保持 AM-AM | `ampmCoefficient` | 增大绝对值 | EVM、相位随幅度曲线 |
+| 增加 GMP 压缩 | 三阶及更高阶复系数 | 增强与一阶项相反方向的合成分量 | 高幅度外推稳定性 |
+| 增加 GMP 记忆 | `memoryDepth`、`crossMemoryDepth` 或对应自定义系数 | 增大有效延迟范围 | 采样率变化后的物理记忆时间 |
+| 让 Doherty 更早开启 Peaking | `peakingTurnOnAmplitude` | 减小 | 低中功率增益隆起和线性度 |
+| 平滑 Doherty 第二膝点 | `peakingTransitionWidth` | 增大 | Peaking 开启是否过慢 |
+| 增强高功率 Doherty 输出 | `peakingInputGain`、`peakingCombineCoefficient`、`loadModulationStrength` | 适量增大 | 两支路相位、时延和各自压缩 |
+| 消除 Doherty 高功率增益下凹 | 两个复合成系数与 `peakingDelaySamples` | 先校相位和时延，再调幅度 | 不同频率下的矢量合成 |
+
+下面给出三个与实际曲线关系明确的配置例子。代码注释使用英文，并显式选择 `width=0`，避免定点量化掩盖模型本身的增益曲线。
+
+```python
+from inc.lib.PaModel import (
+    DohertyConfig,
+    GMPConfig,
+    PaModel,
+    WienerConfig,
+)
+
+
+# Move the Wiener compression knee 20 percent to the right without
+# changing its low-level voltage gain.
+wienerPa = PaModel(
+    parameters={
+        "modelName": "wiener",
+        "wienerConfig": WienerConfig(
+            linearGain=1.0,
+            saturationAmplitude=1.2,
+            rappSmoothness=3.0,
+            ampmCoefficient=0.18,
+        ),
+        "width": 0,
+    }
+)
+
+# Build a transparent memoryless GMP curve. The negative real cubic
+# coefficient bends the complex gain toward compression.
+gmpPa = PaModel(
+    parameters={
+        "modelName": "gmp",
+        "gmpConfig": GMPConfig(
+            nonlinearOrders=(1, 3, 5),
+            memoryDepth=1,
+            crossMemoryDepth=0,
+            mainCoefficients={
+                (1, 0): 1.0 + 0.0j,
+                (3, 0): -0.55 + 0.12j,
+                (5, 0): 0.10 - 0.04j,
+            },
+            laggingCoefficients={},
+            leadingCoefficients={},
+        ),
+        "width": 0,
+    }
+)
+
+# Move the Doherty peaking turn-on point earlier while retaining
+# independent branch nonlinearities.
+dohertyPa = PaModel(
+    parameters={
+        "modelName": "doherty",
+        "dohertyConfig": DohertyConfig(
+            carrierModelName="wiener",
+            peakingModelName="wiener",
+            peakingTurnOnAmplitude=0.35,
+            peakingTransitionWidth=0.15,
+            peakingInputGain=1.0,
+            peakingCombineCoefficient=0.5 + 0.0j,
+            loadModulationStrength=0.10,
+        ),
+        "width": 0,
+    }
+)
+```
+
+### 4.9.7 用当前配置直接测出增益曲线
+
+下面的最小示例不依赖 Wi-Fi、ILC 或 Analysis，只使用恒包络扫幅直接测量当前 PA 对象的静态增益。每个幅度生成 64 个相同复样本，并取最后一个样本，以避开 FIR 和整数支路时延的启动暂态。
+
+```python
+import numpy as np
+
+from inc.lib.PaModel import PaModel, WienerConfig
+
+
+paModel = PaModel(
+    parameters={
+        "modelName": "wiener",
+        "wienerConfig": WienerConfig(
+            linearGain=1.0,
+            saturationAmplitude=1.0,
+            rappSmoothness=3.0,
+            ampmCoefficient=0.18,
+        ),
+        "width": 0,
+    }
+)
+
+inputAmplitudes = np.linspace(0.02, 1.60, 160)
+outputAmplitudes = []
+gainDbValues = []
+phaseDegrees = []
+
+for inputAmplitude in inputAmplitudes:
+    steadyInput = np.full(64, inputAmplitude + 0.0j)
+    steadyOutput = paModel.Process(steadyInput)
+    complexGain = steadyOutput[-1] / steadyInput[-1]
+    outputAmplitudes.append(abs(steadyOutput[-1]))
+    gainDbValues.append(20.0 * np.log10(abs(complexGain)))
+    phaseDegrees.append(np.degrees(np.angle(complexGain)))
+
+print("Small-signal complex gain:", paModel.SmallSignalGain())
+print("Input amplitudes:", inputAmplitudes)
+print("Output amplitudes:", np.asarray(outputAmplitudes))
+print("Gain in dB:", np.asarray(gainDbValues))
+print("AM-PM in degrees:", np.asarray(phaseDegrees))
+```
+
+若测 GMP 或 Doherty 的**动态**增益，不应只把输入换成 Wi-Fi 后逐点相除，因为包络零点会放大数值噪声，时延也会造成错误配对。应使用 [PaAnalyse.md](./PaAnalyse.md) 中的包络分箱、上升/下降轨迹、频响和双音测试。
+
+---
+
 ## 5. 非线性为什么会产生邻道频谱再生
 
 考虑两个复音调
