@@ -50,6 +50,7 @@ from .lib.DpdGmp import (
     DpdGmp,
     DpdGmpTrainingResult,
 )
+from .lib.DpdLms import DpdLms, DpdLmsTrainingResult
 from .utils.Draw import Draw
 from .lib.DpdIlc import (
     CalculateIterationMetrics,

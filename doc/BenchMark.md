@@ -2221,3 +2221,130 @@ python tests/BenchMark.py --channel-analyse
 - [ ] 增广 GMP 的最差 IRR 比普通 GMP 的最好 IRR至少高 40 dB；
 - [ ] 曲线、CSV 和 JSON 使用同一批计算结果；
 - [ ] 文档明确区分理想数值残差与真实测量上限。
+
+## 33. L类：DPD-LMS逐样点更新与漂移跟踪
+
+### 33.1 分类目的
+
+L类不是重复PA特性或Wi-Fi EVM场景，而是单独验证逐样点自适应内核的三个实现属性：
+
+1. `updateDecimation=1`时，每个非零输入样点是否确实产生一次系数更新；
+2. 逐样点NLMS能否恢复与批量DpdGmp完全相同的已知GMP标签；
+3. 等效PA系数发生变化后，逐样点NLMS能否跟踪，而旧批量系数是否保持失配。
+
+该分类使用精确可解的两项GMP标签，消除PA、同步、反馈噪声和功率校准的干扰。其作用是验证算法和程序时序，不代替PA级EVM、ACLR或IM3验收。
+
+### 33.2 控制变量
+
+| 项目 | 配置 |
+|---|---|
+| 样点数 | 8192 |
+| 随机种子 | 907 |
+| 参考RMS | 0.25 |
+| GMP阶数 | `(1, 3)` |
+| 主记忆 | 1 |
+| 交叉记忆 | 0 |
+| NLMS步长 | 0.10 |
+| 特征尺度 | 帧冻结 |
+| 系数提交 | 帧提交 |
+| 更新抽取 | 1，每个非零样点更新 |
+| 输出限幅 | 关闭 |
+| 接口 | 浮点 |
+
+静态标签为：
+
+```math
+d_0[n]
+=
+(1.03+j0.01)x[n]
++
+(0.18-j0.04)x[n]|x[n]|^2.
+```
+
+漂移后标签为：
+
+```math
+d_1[n]
+=
+(0.97-j0.02)x[n]
++
+(0.30+j0.06)x[n]|x[n]|^2.
+```
+
+两组标签只改变系数，不改变参考样点、长度、功率或基函数结构，所以漂移前后的误差可以直接比较。
+
+### 33.3 对比方法
+
+| 方法 | 训练方式 | 系数变化时刻 | 目的 |
+|---|---|---|---|
+| Batch DpdGmp | 统计完整帧后求解岭正规方程 | 整批结束一次 | 静态精度参考 |
+| Sample NLMS | 按时间顺序逐点执行归一化梯度 | 影子系数每样点 | 验证逐点恢复 |
+| Stale Batch | 保留静态标签训练出的旧系数 | 不更新 | 模拟PA漂移后失配 |
+| Tracking NLMS | 从旧系数开始处理漂移标签 | 每个样点更新 | 验证连续跟踪能力 |
+
+批量方法会构造特征列统计和正规矩阵；NLMS只保留一行特征、因果历史、特征尺度和两个系数向量。详细程序差异见 [DPD-LMS.md](./DPD-LMS.md#11-逐样点与批量处理的程序实现差异)。
+
+### 33.4 测试流程
+
+```mermaid
+flowchart LR
+    reference["固定复参考 x(n)"] --> stationary["静态两项GMP标签 d0(n)"]
+    reference --> drift["漂移后两项GMP标签 d1(n)"]
+    stationary --> batch["Batch DpdGmp一次求解"]
+    stationary --> sample["Sample NLMS逐样点更新"]
+    batch --> stale["旧批量系数直接测d1"]
+    sample --> before["旧NLMS系数直接测d1"]
+    before --> tracking["按d1再逐样点更新一帧"]
+    batch --> compare["固定模型NMSE比较"]
+    sample --> compare
+    stale --> compare
+    tracking --> compare
+```
+
+**图 20 说明：** Batch和Sample使用同一静态参考及标签。漂移时不重新生成输入，只修改已知线性和三阶系数。旧模型先直接测量漂移NMSE，之后只有NLMS按样点继续更新，因此改善不能归因于数据或结构变化。
+
+### 33.5 结果预期
+
+- 批量和NLMS在静态精确标签上都应达到很低NMSE；
+- `updateCountPerFrame`应等于8192；
+- 漂移前训练出的Batch和NLMS系数应在新标签上表现出相近失配；
+- NLMS处理一帧漂移标签后，NMSE至少改善20 dB；
+- CSV和JSON必须保存同一数值。
+
+### 33.6 参考仿真结果
+
+| 指标 | 结果 |
+|---|---:|
+| Batch静态NMSE | -228.320 dB |
+| NLMS静态NMSE | -305.410 dB |
+| 旧Batch漂移NMSE | -26.030 dB |
+| NLMS跟踪前漂移NMSE | -26.030 dB |
+| NLMS跟踪后漂移NMSE | -292.382 dB |
+| 跟踪改善 | 266.352 dB |
+| 每帧实际更新次数 | 8192 |
+
+极低NMSE来自无噪声、模型结构完全匹配的双精度控制实验，不代表真实PA、反馈ADC或仪表动态范围。这个场景应读取“逐点更新次数正确”和“漂移后能够重新收敛”，不应把约-300 dB解释成产品性能。
+
+### 33.7 运行和输出
+
+```powershell
+python tests/BenchMark.py --dpd-lms
+```
+
+输出文件：
+
+| 文件 | 内容 |
+|---|---|
+| `results/dpd_lms_benchmark/dpd_lms_benchmark.csv` | 一行固定对比字段 |
+| `results/dpd_lms_benchmark/dpd_lms_benchmark.json` | 配置和相同结果字典 |
+
+### 33.8 L类验收清单
+
+- [ ] 静态和漂移标签使用同一参考样点；
+- [ ] Batch和NLMS使用相同 `(1,3)` 结构；
+- [ ] `updateCountPerFrame`等于样点数；
+- [ ] NLMS静态固定模型NMSE为有限值并明显优于恒等初值；
+- [ ] 旧Batch和NLMS在漂移标签上的NMSE接近；
+- [ ] NLMS跟踪改善超过20 dB；
+- [ ] 结果明确标注为精确标签结构测试；
+- [ ] CSV与JSON字段一致。

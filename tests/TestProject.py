@@ -39,6 +39,7 @@ from inc.lib.DpdGmp import (
     CouplingAwareDpdGmp,
     DpdGmp,
 )
+from inc.lib.DpdLms import DpdLms
 from inc.lib.DpdIlc import (
     CalculateIterationMetrics,
     FitMimoGmpPredistorter,
@@ -327,6 +328,9 @@ def CheckModuleResponsibilityBoundaries() -> None:
     dpdGmpSource = (
         projectRoot / "inc" / "lib" / "DpdGmp.py"
     ).read_text(encoding="utf-8")
+    dpdLmsSource = (
+        projectRoot / "inc" / "lib" / "DpdLms.py"
+    ).read_text(encoding="utf-8")
 
     assert not (projectRoot / "inc" / "SigProcess.py").exists()
     assert not (
@@ -337,6 +341,7 @@ def CheckModuleResponsibilityBoundaries() -> None:
         "Channel.py",
         "DpdIlc.py",
         "DpdGmp.py",
+        "DpdLms.py",
         "Fec.py",
         "PaModel.py",
         "WaveGenWifi.py",
@@ -353,6 +358,7 @@ def CheckModuleResponsibilityBoundaries() -> None:
     assert "class SigProc:" in signalProcessorSource
     assert "class PowerCalibration:" in signalProcessorSource
     assert "class DpdGmp:" in dpdGmpSource
+    assert "class DpdLms(DpdGmp):" in dpdLmsSource
     assert "from .DpdIlc import BuildFeatureSpecs" in dpdGmpSource
     assert "class PowerCalibration:" not in paSource
     assert "def BuildCsdPhaseMatrix(" in frameProcessorSource
@@ -375,6 +381,7 @@ def CheckModuleResponsibilityBoundaries() -> None:
         "from lib.Analysis import Analysis; "
         "from lib.Channel import Channel; "
         "from lib.DpdGmp import DpdGmp; "
+        "from lib.DpdLms import DpdLms; "
         "from lib.DpdIlc import RunFrequencyDomainIlc; "
         "from lib.Fec import EncodeDescriptorLdpc; "
         "from lib.WaveGenWifi import WaveGenWifi; "
@@ -454,6 +461,12 @@ def CheckBenchmarkSeparation() -> None:
         "RunDpdGmpBenchmark",
         "SaveDpdGmpBenchmarkResults",
         "PrintDpdGmpBenchmarkResults",
+        "DpdLmsBenchmarkConfig",
+        "DpdLmsBenchmarkResult",
+        "BuildDpdLmsTarget",
+        "RunDpdLmsBenchmark",
+        "SaveDpdLmsBenchmarkResult",
+        "PrintDpdLmsBenchmarkResult",
         "ChannelAnalysisBenchmarkConfig",
         "ChannelDpdStageResult",
         "ChannelDpdImprovement",
@@ -527,6 +540,10 @@ def CheckBenchmarkSeparation() -> None:
     )
     assert (
         "J类：通道测量与耦合感知 DPD-GMP"
+        in benchmarkDocument
+    )
+    assert (
+        "L类：DPD-LMS逐样点更新与漂移跟踪"
         in benchmarkDocument
     )
 
@@ -4193,6 +4210,240 @@ def CheckPaCharacterizationBenchmark() -> None:
         assert requiredText in paAnalysisDocument
 
 
+def CheckDpdLmsModelAndBenchmark() -> None:
+    """Verify sample updates, commit modes, synchronization, and tracking.
+
+    Processing details:
+        Algorithm: Compare causal sample-built GMP rows against the batch
+        feature matrix, recover a known complex linear-plus-cubic mapping with
+        frame-commit NLMS, prove that shadow coefficients change before active
+        coefficients, exercise strict LMS sample commit and running scales,
+        accept a longer delayed indirect feedback capture, preserve fixed-point
+        public codes and unknown-key warnings, then run the compact
+        stationary/drift benchmark and require its artifacts and documented
+        implementation distinctions.
+
+    Returns:
+        result: None. Assertions identify adaptive DPD regressions.
+    """
+
+    randomGenerator = np.random.default_rng(733)
+    referenceSignal = (
+        randomGenerator.standard_normal(4096)
+        + 1j * randomGenerator.standard_normal(4096)
+    )
+    referenceSignal *= 0.25 / np.sqrt(
+        np.mean(np.abs(referenceSignal) ** 2)
+    )
+    targetSignal = (
+        (1.03 + 0.01j) * referenceSignal
+        + (0.18 - 0.04j)
+        * referenceSignal
+        * np.abs(referenceSignal) ** 2
+    )
+    featureProbe = DpdLms(
+        parameters={
+            "nonlinearOrders": (1, 3, 5),
+            "memoryDepth": 3,
+            "crossMemoryDepth": 2,
+            "width": 0,
+        }
+    )
+    probeReference = referenceSignal[:128]
+    batchFeatureMatrix = featureProbe.BuildBasisChunk(
+        probeReference,
+        0,
+        probeReference.size,
+    )
+    featureProbe.BeginFrame(probeReference)
+    sampleFeatureMatrix = np.vstack(
+        tuple(
+            featureProbe.BuildFeatureVector(
+                complex(referenceSample)
+            )
+            for referenceSample in probeReference
+        )
+    )
+    assert np.allclose(
+        sampleFeatureMatrix,
+        batchFeatureMatrix,
+        atol=1.0e-14,
+    )
+
+    frameDpd = DpdLms(
+        parameters={
+            "nonlinearOrders": (1, 3),
+            "memoryDepth": 1,
+            "crossMemoryDepth": 0,
+            "learningRate": 0.10,
+            "featureScaleMode": "frame",
+            "coefficientCommitMode": "frame",
+            "leakageFactor": 0.0,
+            "maximumOutputMagnitude": None,
+            "width": 0,
+        }
+    )
+    activeBeforeSample = frameDpd.GetCoefficients()
+    frameDpd.BeginFrame(referenceSignal)
+    frameDpd.UpdateSample(
+        complex(referenceSignal[0]),
+        complex(targetSignal[0]),
+    )
+    assert np.array_equal(
+        frameDpd.GetCoefficients(),
+        activeBeforeSample,
+    )
+    assert not np.array_equal(
+        frameDpd.GetAdaptiveCoefficients(),
+        activeBeforeSample,
+    )
+    frameDpd.ResetCoefficients()
+    trainingResult = frameDpd.UpdateFromLabels(
+        referenceSignal,
+        targetSignal,
+    )
+    assert trainingResult.sampleCount == referenceSignal.size
+    assert trainingResult.updateCount == referenceSignal.size
+    assert trainingResult.afterNmseDb < -100.0
+    assert trainingResult.afterNmseDb < (
+        trainingResult.beforeNmseDb - 40.0
+    )
+    assert trainingResult.coefficientsCommitted is True
+    assert frameDpd.GetLastLmsTrainingResult() == trainingResult
+    recoveredCoefficients = frameDpd.GetCoefficients()
+    assert np.allclose(
+        recoveredCoefficients,
+        np.asarray((1.03 + 0.01j, 0.18 - 0.04j)),
+        atol=2.0e-4,
+    )
+
+    sampleDpd = DpdLms(
+        parameters={
+            "nonlinearOrders": (1, 3),
+            "memoryDepth": 1,
+            "crossMemoryDepth": 0,
+            "adaptationMode": "lms",
+            "learningRate": 0.001,
+            "featureScaleMode": "running",
+            "coefficientCommitMode": "sample",
+            "leakageFactor": 0.0,
+            "maximumOutputMagnitude": None,
+            "width": 0,
+        }
+    )
+    sampleActiveBefore = sampleDpd.GetCoefficients()
+    sampleDpd.BeginFrame()
+    sampleDpd.UpdateSample(
+        complex(referenceSignal[0]),
+        complex(targetSignal[0]),
+    )
+    assert not np.array_equal(
+        sampleDpd.GetCoefficients(),
+        sampleActiveBefore,
+    )
+
+    indirectDpd = DpdLms(
+        parameters={
+            "nonlinearOrders": (1,),
+            "memoryDepth": 1,
+            "crossMemoryDepth": 0,
+            "learningRate": 0.05,
+            "featureScaleMode": "frame",
+            "coefficientCommitMode": "frame",
+            "leakageFactor": 0.0,
+            "maximumOutputMagnitude": None,
+            "width": 0,
+        }
+    )
+    delayedFeedback = np.concatenate(
+        (
+            np.zeros(17, dtype=np.complex128),
+            referenceSignal,
+            np.zeros(11, dtype=np.complex128),
+        )
+    )
+    indirectResult = indirectDpd.UpdateIndirect(
+        referenceSignal,
+        delayedFeedback,
+        sampleRateHz=80.0e6,
+    )
+    assert indirectResult.sampleCount == referenceSignal.size
+    assert indirectResult.afterNmseDb < -100.0
+
+    fixedFormat = FixedPoint(16)
+    fixedReference = fixedFormat.EncodeComplex(referenceSignal)
+    fixedTarget = fixedFormat.EncodeComplex(targetSignal)
+    fixedDpd = DpdLms(
+        parameters={
+            "nonlinearOrders": (1, 3),
+            "memoryDepth": 1,
+            "crossMemoryDepth": 0,
+            "learningRate": 0.10,
+            "featureScaleMode": "frame",
+            "coefficientCommitMode": "frame",
+            "leakageFactor": 0.0,
+            "maximumOutputMagnitude": None,
+            "width": 16,
+        }
+    )
+    fixedDpd.UpdateFromLabels(fixedReference, fixedTarget)
+    fixedOutput = fixedDpd.Process(fixedReference)
+    assert fixedOutput.dtype == np.complex128
+    assert np.array_equal(fixedOutput.real, np.rint(fixedOutput.real))
+    assert np.array_equal(fixedOutput.imag, np.rint(fixedOutput.imag))
+
+    with warnings.catch_warnings(record=True) as warningRecords:
+        warnings.simplefilter("always")
+        warnedDpd = DpdLms(
+            parameters={
+                "width": 0,
+                "unknownLmsOption": 5,
+            }
+        )
+    assert warnedDpd.width == 0
+    assert any(
+        "unknownLmsOption" in str(warningRecord.message)
+        for warningRecord in warningRecords
+    )
+
+    from tests.BenchMark import (
+        DpdLmsBenchmarkConfig,
+        RunDpdLmsBenchmark,
+    )
+
+    with TemporaryDirectory() as temporaryDirectory:
+        outputDirectory = Path(temporaryDirectory)
+        benchmarkResult = RunDpdLmsBenchmark(
+            DpdLmsBenchmarkConfig(
+                numSamples=1024,
+                seed=739,
+                outputDirectory=outputDirectory,
+            )
+        )
+        assert benchmarkResult.updateCountPerFrame == 1024
+        assert benchmarkResult.trackingImprovementDb > 20.0
+        assert (
+            benchmarkResult.lmsAfterTrackingNmseDb
+            < benchmarkResult.lmsBeforeTrackingNmseDb
+        )
+        assert (
+            outputDirectory / "dpd_lms_benchmark.csv"
+        ).exists()
+        assert (
+            outputDirectory / "dpd_lms_benchmark.json"
+        ).exists()
+
+    for documentName, requiredText in (
+        ("DPD-LMS.md", "逐样点更新"),
+        ("DpdLms.md", "SmallestLMS.py"),
+        ("BenchMark.md", "DPD-LMS逐样点"),
+    ):
+        documentText = (
+            GetProjectRoot() / "doc" / documentName
+        ).read_text(encoding="utf-8")
+        assert requiredText in documentText
+
+
 def CheckDpdGmpModelAndBenchmark() -> None:
     """Verify DpdGmp training modes and every staged performance artifact.
 
@@ -4582,6 +4833,7 @@ def RunTests() -> None:
     CheckMseEvmConvergence()
     CheckTwoToneIlcAnalysis()
     CheckPaCharacterizationBenchmark()
+    CheckDpdLmsModelAndBenchmark()
     CheckDpdGmpModelAndBenchmark()
     CheckChannelAnalysisAndCoupledDpd()
     print("All DPD-ILC project checks passed.")

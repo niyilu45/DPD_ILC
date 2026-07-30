@@ -58,6 +58,7 @@ from inc.lib.DpdGmp import (
     DpdGmp,
     DpdGmpTrainingResult,
 )
+from inc.lib.DpdLms import DpdLms
 from inc.utils.Draw import Draw
 from inc.lib.DpdIlc import (
     FitGmpPredistorter,
@@ -6174,11 +6175,345 @@ def PrintBenchmarkResults(rows: List[BenchmarkRow]) -> None:
         )
 
 
+@dataclass(frozen=True)
+class DpdLmsBenchmarkConfig:
+    """Configure deterministic stationary and drifting GMP-label tests."""
+
+    numSamples: int = 8192
+    seed: int = 907
+    learningRate: float = 0.10
+    outputDirectory: Path = Path("results/dpd_lms_benchmark")
+
+    def Validate(self) -> None:
+        """Validate sample count, seed, step size, and output path.
+
+        Processing details:
+            Algorithm: Require enough chronological samples to expose LMS
+            convergence, an integer random seed, a finite NLMS step in the
+            theoretical open interval from zero to two, and a Path output.
+
+        Returns:
+            result: None. Invalid benchmark settings raise an exception.
+        """
+
+        if (
+            not isinstance(self.numSamples, int)
+            or isinstance(self.numSamples, bool)
+            or self.numSamples < 512
+        ):
+            raise ValueError("numSamples must be an integer at least 512")
+        if (
+            not isinstance(self.seed, int)
+            or isinstance(self.seed, bool)
+        ):
+            raise TypeError("seed must be an integer")
+        if (
+            not isinstance(self.learningRate, (int, float))
+            or isinstance(self.learningRate, bool)
+            or not np.isfinite(self.learningRate)
+            or not 0.0 < float(self.learningRate) < 2.0
+        ):
+            raise ValueError("learningRate must be finite in (0, 2)")
+        if not isinstance(self.outputDirectory, Path):
+            raise TypeError("outputDirectory must be a pathlib.Path")
+
+
+@dataclass(frozen=True)
+class DpdLmsBenchmarkResult:
+    """Store batch, sample-adaptive, and PA-drift tracking comparisons."""
+
+    sampleCount: int
+    updateCountPerFrame: int
+    batchStationaryNmseDb: float
+    lmsStationaryNmseDb: float
+    staleBatchDriftNmseDb: float
+    lmsBeforeTrackingNmseDb: float
+    lmsAfterTrackingNmseDb: float
+    trackingImprovementDb: float
+
+    def ToDict(self) -> Dict[str, object]:
+        """Return one flat auditable LMS comparison record.
+
+        Processing details:
+            Algorithm: Copy immutable counts and NMSE values without
+            retraining or changing improvement signs.
+
+        Returns:
+            result: Serialization-ready benchmark dictionary.
+        """
+
+        return {
+            "sampleCount": self.sampleCount,
+            "updateCountPerFrame": self.updateCountPerFrame,
+            "batchStationaryNmseDb": self.batchStationaryNmseDb,
+            "lmsStationaryNmseDb": self.lmsStationaryNmseDb,
+            "staleBatchDriftNmseDb": self.staleBatchDriftNmseDb,
+            "lmsBeforeTrackingNmseDb": (
+                self.lmsBeforeTrackingNmseDb
+            ),
+            "lmsAfterTrackingNmseDb": self.lmsAfterTrackingNmseDb,
+            "trackingImprovementDb": self.trackingImprovementDb,
+        }
+
+
+def BuildDpdLmsTarget(
+    referenceSignal: np.ndarray,
+    linearCoefficient: complex,
+    cubicCoefficient: complex,
+) -> np.ndarray:
+    """Create one known memoryless GMP label stream.
+
+    Processing details:
+        Algorithm: Apply a complex first-order term plus a complex cubic
+        envelope term so both batch regression and chronological NLMS see the
+        same exact two-feature target without PA or synchronization ambiguity.
+
+    Args:
+        referenceSignal: Normalized finite complex training vector.
+        linearCoefficient: Known coefficient multiplying the direct sample.
+        cubicCoefficient: Known coefficient multiplying x times magnitude
+            squared.
+
+    Returns:
+        result: Exact complex target vector for the controlled benchmark.
+    """
+
+    complexReference = np.asarray(
+        referenceSignal, dtype=np.complex128
+    ).reshape(-1)
+    return (
+        complex(linearCoefficient) * complexReference
+        + complex(cubicCoefficient)
+        * complexReference
+        * np.abs(complexReference) ** 2
+    )
+
+
+def SaveDpdLmsBenchmarkResult(
+    result: DpdLmsBenchmarkResult,
+    config: DpdLmsBenchmarkConfig,
+) -> Tuple[Path, Path]:
+    """Save identical LMS benchmark values to CSV and JSON.
+
+    Processing details:
+        Algorithm: Create the configured directory, flatten the immutable
+        result once, write one CSV row, and store configuration plus the same
+        result dictionary in JSON for reproducible comparison.
+
+    Args:
+        result: Completed stationary and drift benchmark.
+        config: Exact controls used to generate the result.
+
+    Returns:
+        result: CSV and JSON artifact paths in that order.
+    """
+
+    outputDirectory = Path(config.outputDirectory)
+    outputDirectory.mkdir(parents=True, exist_ok=True)
+    csvPath = outputDirectory / "dpd_lms_benchmark.csv"
+    jsonPath = outputDirectory / "dpd_lms_benchmark.json"
+    resultRow = result.ToDict()
+    with csvPath.open("w", newline="", encoding="utf-8-sig") as csvFile:
+        csvWriter = csv.DictWriter(
+            csvFile,
+            fieldnames=list(resultRow),
+        )
+        csvWriter.writeheader()
+        csvWriter.writerow(resultRow)
+    with jsonPath.open("w", encoding="utf-8") as jsonFile:
+        json.dump(
+            {
+                "configuration": {
+                    "numSamples": config.numSamples,
+                    "seed": config.seed,
+                    "learningRate": config.learningRate,
+                },
+                "result": resultRow,
+            },
+            jsonFile,
+            indent=2,
+            ensure_ascii=False,
+        )
+    return csvPath, jsonPath
+
+
+def PrintDpdLmsBenchmarkResult(
+    result: DpdLmsBenchmarkResult,
+) -> None:
+    """Print batch accuracy and sample-adaptive drift tracking.
+
+    Processing details:
+        Algorithm: Display the stored stationary NMSE values, stale-model
+        drift errors, post-tracking error, update count, and positive tracking
+        improvement without recalculating any metric.
+
+    Args:
+        result: Completed LMS benchmark result.
+
+    Returns:
+        result: None. A compact deterministic table is printed.
+    """
+
+    print("\nDPD-LMS sample-update benchmark")
+    print(
+        f"Batch stationary NMSE:       "
+        f"{result.batchStationaryNmseDb:9.3f} dB"
+    )
+    print(
+        f"NLMS stationary NMSE:        "
+        f"{result.lmsStationaryNmseDb:9.3f} dB"
+    )
+    print(
+        f"Stale batch drift NMSE:       "
+        f"{result.staleBatchDriftNmseDb:9.3f} dB"
+    )
+    print(
+        f"NLMS before tracking NMSE:    "
+        f"{result.lmsBeforeTrackingNmseDb:9.3f} dB"
+    )
+    print(
+        f"NLMS after tracking NMSE:     "
+        f"{result.lmsAfterTrackingNmseDb:9.3f} dB"
+    )
+    print(
+        f"Tracking improvement:         "
+        f"{result.trackingImprovementDb:9.3f} dB"
+    )
+    print(
+        f"Coefficient updates per frame: "
+        f"{result.updateCountPerFrame}"
+    )
+
+
+def RunDpdLmsBenchmark(
+    config: Optional[DpdLmsBenchmarkConfig] = None,
+) -> DpdLmsBenchmarkResult:
+    """Compare batch GMP fitting with chronological NLMS and drift tracking.
+
+    Processing details:
+        Algorithm: Generate one deterministic normalized complex frame, build
+        exact stationary and changed two-term GMP labels, fit a batch ridge
+        model and one sample-adaptive model on the stationary frame, measure
+        both before PA drift, evaluate stale coefficients on changed labels,
+        run one chronological NLMS tracking pass, require material improvement,
+        then save and print the auditable result.
+
+    Args:
+        config: Optional benchmark controls. None uses internal defaults.
+
+    Returns:
+        result: Stationary accuracy and drift-tracking NMSE comparison.
+    """
+
+    if config is None:
+        config = DpdLmsBenchmarkConfig()
+    config.Validate()
+    randomGenerator = np.random.default_rng(config.seed)
+    referenceSignal = (
+        randomGenerator.standard_normal(config.numSamples)
+        + 1j
+        * randomGenerator.standard_normal(config.numSamples)
+    )
+    referenceSignal *= 0.25 / np.sqrt(
+        np.mean(np.abs(referenceSignal) ** 2)
+    )
+    stationaryTarget = BuildDpdLmsTarget(
+        referenceSignal,
+        1.03 + 0.01j,
+        0.18 - 0.04j,
+    )
+    driftTarget = BuildDpdLmsTarget(
+        referenceSignal,
+        0.97 - 0.02j,
+        0.30 + 0.06j,
+    )
+    commonParameters = {
+        "nonlinearOrders": (1, 3),
+        "memoryDepth": 1,
+        "crossMemoryDepth": 0,
+        "maximumOutputMagnitude": None,
+        "width": 0,
+    }
+    batchDpd = DpdGmp(
+        parameters={
+            **commonParameters,
+            "ridgeFactor": 1.0e-10,
+        }
+    )
+    batchDpd.Fit(referenceSignal, stationaryTarget)
+    batchStationaryNmseDb = batchDpd.CalculateNmse(
+        referenceSignal,
+        stationaryTarget,
+    )
+    staleBatchDriftNmseDb = batchDpd.CalculateNmse(
+        referenceSignal,
+        driftTarget,
+    )
+    lmsDpd = DpdLms(
+        parameters={
+            **commonParameters,
+            "adaptationMode": "nlms",
+            "learningRate": config.learningRate,
+            "featureScaleMode": "frame",
+            "coefficientCommitMode": "frame",
+            "leakageFactor": 0.0,
+        }
+    )
+    stationaryTraining = lmsDpd.UpdateFromLabels(
+        referenceSignal,
+        stationaryTarget,
+    )
+    lmsStationaryNmseDb = lmsDpd.CalculateNmse(
+        referenceSignal,
+        stationaryTarget,
+    )
+    lmsBeforeTrackingNmseDb = lmsDpd.CalculateNmse(
+        referenceSignal,
+        driftTarget,
+    )
+    driftTraining = lmsDpd.UpdateFromLabels(
+        referenceSignal,
+        driftTarget,
+    )
+    lmsAfterTrackingNmseDb = lmsDpd.CalculateNmse(
+        referenceSignal,
+        driftTarget,
+    )
+    trackingImprovementDb = (
+        lmsBeforeTrackingNmseDb - lmsAfterTrackingNmseDb
+    )
+    if trackingImprovementDb <= 20.0:
+        raise AssertionError(
+            "sample NLMS did not materially track the changed GMP target"
+        )
+    if (
+        stationaryTraining.updateCount != config.numSamples
+        or driftTraining.updateCount != config.numSamples
+    ):
+        raise AssertionError(
+            "updateDecimation=1 must update every nonzero sample"
+        )
+    result = DpdLmsBenchmarkResult(
+        sampleCount=config.numSamples,
+        updateCountPerFrame=driftTraining.updateCount,
+        batchStationaryNmseDb=batchStationaryNmseDb,
+        lmsStationaryNmseDb=lmsStationaryNmseDb,
+        staleBatchDriftNmseDb=staleBatchDriftNmseDb,
+        lmsBeforeTrackingNmseDb=lmsBeforeTrackingNmseDb,
+        lmsAfterTrackingNmseDb=lmsAfterTrackingNmseDb,
+        trackingImprovementDb=trackingImprovementDb,
+    )
+    SaveDpdLmsBenchmarkResult(result, config)
+    PrintDpdLmsBenchmarkResult(result)
+    return result
+
+
 def ParseBenchmarkArguments() -> Union[
     BenchmarkConfig,
     TwoToneBenchmarkConfig,
     PaCharacterizationConfig,
     DpdGmpBenchmarkConfig,
+    DpdLmsBenchmarkConfig,
     ChannelAnalysisBenchmarkConfig,
 ]:
     """Parse Wi-Fi, PA, DPD-GMP, or channel benchmark command-line options.
@@ -6225,6 +6560,15 @@ def ParseBenchmarkArguments() -> Union[
         help=(
             "Run the staged PA-analysis-driven DPD-GMP benchmark with "
             "Wi-Fi and two-tone comparisons"
+        ),
+    )
+    modeGroup.add_argument(
+        "--dpd-lms",
+        dest="dpdLms",
+        action="store_true",
+        help=(
+            "Compare batch GMP fitting with sample-by-sample NLMS "
+            "stationary accuracy and coefficient tracking"
         ),
     )
     modeGroup.add_argument(
@@ -6330,7 +6674,14 @@ def ParseBenchmarkArguments() -> Union[
         choices=("wiener", "gmp", "doherty"),
         default="wiener",
     )
-    argumentParser.add_argument("--seed", type=int, default=101)
+    argumentParser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Override the selected scenario's deterministic default seed"
+        ),
+    )
     argumentParser.add_argument(
         "--power-start-dbm",
         dest="powerStartDbm",
@@ -6411,7 +6762,11 @@ def ParseBenchmarkArguments() -> Union[
             ),
             mcs=arguments.mcs,
             numDataSymbols=arguments.numDataSymbols,
-            seed=arguments.seed,
+            seed=(
+                517
+                if arguments.seed is None
+                else arguments.seed
+            ),
             outputPowerDbm=arguments.outputPowerDbm,
             maximumOutputPowerDbm=arguments.maximumOutputPowerDbm,
             loadResistanceOhm=arguments.loadResistanceOhm,
@@ -6425,6 +6780,27 @@ def ParseBenchmarkArguments() -> Union[
         )
         channelConfig.Validate()
         return channelConfig
+    if arguments.dpdLms:
+        dpdLmsOutputDirectory = (
+            Path("results/dpd_lms_benchmark")
+            if arguments.outputDirectory is None
+            else arguments.outputDirectory
+        )
+        dpdLmsConfig = DpdLmsBenchmarkConfig(
+            numSamples=(
+                8192
+                if arguments.toneNumSamples is None
+                else arguments.toneNumSamples
+            ),
+            seed=(
+                907
+                if arguments.seed is None
+                else arguments.seed
+            ),
+            outputDirectory=dpdLmsOutputDirectory,
+        )
+        dpdLmsConfig.Validate()
+        return dpdLmsConfig
     if arguments.dpdGmp:
         dpdGmpOutputDirectory = (
             Path("results/dpd_gmp_benchmark")
@@ -6506,7 +6882,11 @@ def ParseBenchmarkArguments() -> Union[
                 else arguments.numIterations
             ),
             paModelName=arguments.paModelName,
-            seed=arguments.seed,
+            seed=(
+                211
+                if arguments.seed is None
+                else arguments.seed
+            ),
             outputDirectory=twoToneOutputDirectory,
         )
         twoToneConfig.Validate()
@@ -6534,7 +6914,7 @@ def ParseBenchmarkArguments() -> Union[
             else arguments.numIterations
         ),
         paModelName=arguments.paModelName,
-        seed=arguments.seed,
+        seed=101 if arguments.seed is None else arguments.seed,
         powerStartDbm=arguments.powerStartDbm,
         powerStopDbm=arguments.powerStopDbm,
         powerPointCount=arguments.powerPointCount,
@@ -6561,6 +6941,8 @@ def Main() -> int:
     config = ParseBenchmarkArguments()
     if isinstance(config, ChannelAnalysisBenchmarkConfig):
         RunChannelAnalysisBenchmark(config)
+    elif isinstance(config, DpdLmsBenchmarkConfig):
+        RunDpdLmsBenchmark(config)
     elif isinstance(config, DpdGmpBenchmarkConfig):
         RunDpdGmpBenchmark(config)
     elif isinstance(config, PaCharacterizationConfig):

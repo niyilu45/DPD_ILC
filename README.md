@@ -21,6 +21,8 @@
 - [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
 - [DPD-GMP补偿与系数更新原理](doc/DPD-GMP.md)：GMP主/交叉记忆基函数、峰值/多功率加权、列归一化岭回归和增量系数更新。
 - [DpdGmp程序使用手册](doc/DpdGmp.md)：完整参数、直接/ILC/间接学习、多片段训练、定点接口和基准用法。
+- [DPD-LMS逐样点补偿原理](doc/DPD-LMS.md)：复数LMS/NLMS推导、逐列尺度、因果样点状态、影子/活动系数、逐样点与批量岭回归的实现差异。
+- [DpdLms程序使用手册](doc/DpdLms.md)：完整参数、逐样点和整帧回放接口、间接学习、定点调用、最小移植程序和Benchmark。
 - [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、当前工作点局部Jacobian、公共复增益与20 dBm GMP发散案例。
 - [全工程函数与物理原理覆盖审计](doc/FunctionPrinciples.md)：逐项索引 `main.py` 与 `inc` 中全部函数，区分物理模型、数值实现和工程编排，并链接到对应推导。
 
@@ -39,11 +41,13 @@ python -m pip install -r requirements.txt
 ```text
 main.py                 命令行主程序
 SmallestSISO.py         浮点与16位定点SISO EHT/GMP/ILC对比示例
+SmallestLMS.py          不依赖整帧训练器的逐样点GMP-NLMS最小移植参考
 inc/lib/Analysis.py         模拟功率、SNR、EVM、IRR、ACLR、逐轮ILC性能分析及结果输出
 inc/lib/Channel.py          PA前后多通道耦合、联合功率校准及forward/fb采样链路
 inc/lib/ChannelAnalyse.py   MIMO冲激响应、平坦度、耦合、群时延和条件数测量
 inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签部署模型
 inc/lib/DpdGmp.py           SISO普通/增广GMP及测量驱动的耦合感知MIMO DPD
+inc/lib/DpdLms.py           GMP-LMS/NLMS逐样点影子系数更新与帧/样点提交
 inc/lib/Fec.py              55/90短块LDPC矩阵构造、系统编码和软输入译码
 inc/lib/PaModel.py          SISO/MIMO Wiener、GMP和Doherty非线性PA
 inc/lib/ParseWifi.py        接收帧描述解析、包起点检测与参考波形恢复
@@ -64,6 +68,8 @@ doc/PaAnalyse.md        三种PA特性及PA分析驱动的DPD-GMP逐项改进对
 doc/ChannelAnalyse.md   通道测量原理、用例和耦合感知DPD前后性能
 doc/DPD-GMP.md          GMP DPD物理模型和系数更新推导
 doc/DpdGmp.md           DpdGmp类参数、方法和完整用例
+doc/DPD-LMS.md          GMP-LMS/NLMS逐样点更新推导和批量实现差异
+doc/DpdLms.md           DpdLms参数、逐样点移植示例和间接学习用法
 doc/FAQ.md              小信号逆响应、局部逆、公共增益和高功率GMP常见问题
 doc/Fec.md              FEC物理原理、数学推导、接口约束和调用示例
 doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整示例
@@ -80,6 +86,7 @@ from inc.lib.Analysis import Analysis
 from inc.lib.Channel import Channel
 from inc.lib.ChannelAnalyse import ChannelAnalyse
 from inc.lib.DpdGmp import AugmentedDpdGmp, CouplingAwareDpdGmp, DpdGmp
+from inc.lib.DpdLms import DpdLms
 from inc.lib.Fec import EncodeDescriptorLdpc
 from inc.lib.ParseWifi import ParseWifi
 from inc.lib.WaveGenWifi import WaveGenWifi
@@ -739,6 +746,60 @@ flowchart TD
 
 完整公式、参数边界和示例分别见 [DPD-GMP补偿原理](doc/DPD-GMP.md)、[DpdGmp程序使用手册](doc/DpdGmp.md) 与 [Channel测量及耦合感知DPD](doc/ChannelAnalyse.md)。
 
+### `inc/lib/DpdLms.py`
+
+`DpdLms`继承 `DpdGmp` 的main、lagging、leading GMP结构，但不使用批量正规方程更新。每个时间样点只构造一行GMP特征，用更新前影子系数预测目标，然后执行一次复数LMS或NLMS更新。默认使用影子系数逐样点变化、活动部署系数帧末一次提交，避免Wi-Fi帧内的时变系数产生额外频谱。
+
+新增参数：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `adaptationMode` | `"nlms"` | 选择普通LMS或NLMS。 |
+| `learningRate` | `0.05` | 逐样点更新步长；不同于批量的 `coefficientLearningRate`。 |
+| `normalizationEpsilon` | `1e-6` | 特征尺度与NLMS分母保护。 |
+| `leakageFactor` | `1e-7` | 把长期漂移缓慢拉回恒等DPD。 |
+| `featureScaleMode` | `"frame"` | `"frame"`先统计一帧尺度；`"running"`使用指数功率。 |
+| `featurePowerForgettingFactor` | `0.999` | 运行特征功率遗忘因子。 |
+| `updateDecimation` | `1` | 1表示每个有效样点都更新。 |
+| `coefficientCommitMode` | `"frame"` | 帧末提交；`"sample"`每个样点后立即生效。 |
+| `maximumSampleUpdateNorm` | `0.05` | 单样点系数步进范数上限；`None`关闭。 |
+| `maximumSampleWeight` | `8.0` | 峰值或外部权重上限。 |
+
+最小逐样点调用：
+
+```python
+from inc.lib.DpdLms import DpdLms
+
+
+dpdLms = DpdLms(
+    parameters={
+        "nonlinearOrders": (1, 3),
+        "memoryDepth": 1,
+        "crossMemoryDepth": 0,
+        "learningRate": 0.10,
+        "featureScaleMode": "frame",
+        "coefficientCommitMode": "frame",
+        "maximumOutputMagnitude": None,
+        "width": 0,
+    }
+)
+
+dpdLms.BeginFrame(referenceSignal)
+for referenceSample, targetSample in zip(
+    referenceSignal,
+    targetSignal,
+):
+    dpdLms.UpdateSample(
+        complex(referenceSample),
+        complex(targetSample),
+    )
+dpdLms.CommitCoefficients()
+
+predistortedSignal = dpdLms.Process(referenceSignal)
+```
+
+`UpdateFromLabels`虽然接收完整数组，内部仍按时间顺序调用逐样点更新，只把完整数组用于公开边界解码、帧尺度统计和更新前后固定NMSE。`UpdateIndirect`允许反馈记录与PA输入长度不同，先由 `SigProc` 对整帧估计时延、CFO、SFO和公共复增益，再逐样点训练后置逆。完整推导、逐样点与批量程序差异、数值保护和移植时序见 [DPD-LMS.md](doc/DPD-LMS.md)，接口与 `SmallestLMS.py` 示例见 [DpdLms.md](doc/DpdLms.md)。
+
 ### `tests/BenchMark.py`
 
 ```mermaid
@@ -752,6 +813,7 @@ flowchart TD
     benchmark --> power["全方法功率-EVM扫描"]
     paCharacterization["PaCharacterizationConfig"] --> paSweep["三种PA频响、间隔与功率扫描"]
     dpdGmpConfig["DpdGmpBenchmarkConfig"] --> dpdStages["基础/记忆扩展/峰值/正则/多功率DPD-GMP"]
+    dpdLmsConfig["DpdLmsBenchmarkConfig"] --> dpdLmsCompare["Batch静态拟合 / Sample NLMS静态拟合 / 漂移跟踪"]
     channelConfig["ChannelAnalysisBenchmarkConfig"] --> channelMeasure["PA前/后平坦度、耦合、时延、条件数"]
     channelMeasure --> coupledDpd["Independent / Post-deembedded / Coupling-aware DPD"]
     nominal --> algorithms["调用 DpdIlc 中的可复用算法"]
@@ -766,6 +828,7 @@ flowchart TD
     paAdvice --> dpdStages
     dpdStages --> dpdMetrics["同功率EVM/ACLR/IM3 + 标签NMSE + 条件数"]
     dpdMetrics --> dpdReport["逐项前后比较CSV / JSON / 四联PNG"]
+    dpdLmsCompare --> dpdLmsReport["逐样点更新数 + 静态/漂移NMSE CSV / JSON"]
     coupledDpd --> channelReport["通道路径/频响CSV + DPD前后JSON/PNG"]
     paAdvice --> paReport["PA特性与建议CSV / JSON / 四张PNG"]
 ```
@@ -2476,10 +2539,16 @@ DPD-GMP分阶段改进基准：
 python tests\BenchMark.py --dpd-gmp
 ```
 
+DPD-LMS逐样点更新与漂移跟踪基准：
+
+```powershell
+python tests\BenchMark.py --dpd-lms
+```
+
 通道测量与耦合感知DPD基准：
 
 ```powershell
 python tests\BenchMark.py --channel-analyse
 ```
 
-验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善、多方法功率-EVM和双音IMD输出、Wiener/GMP/Doherty的频响/间隔记忆/动态迟滞/多输出功率图表、DpdGmp基础补偿/结构扩展/峰值加权/正则化/多功率训练，以及PA前后MIMO通道平坦度、耦合参数、群时延、条件数和测量驱动耦合感知DPD的目标指标回归。
+验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善、多方法功率-EVM和双音IMD输出、Wiener/GMP/Doherty的频响/间隔记忆/动态迟滞/多输出功率图表、DpdGmp基础补偿/结构扩展/峰值加权/正则化/多功率训练、DpdLms逐样点系数更新/帧提交/样点提交/漂移跟踪，以及PA前后MIMO通道平坦度、耦合参数、群时延、条件数和测量驱动耦合感知DPD的目标指标回归。

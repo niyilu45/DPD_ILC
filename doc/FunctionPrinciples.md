@@ -496,3 +496,25 @@ flowchart LR
 | `AugmentedDpdGmp.GetDirectCoefficients`, `AugmentedDpdGmp.GetImageCoefficients` | E | 分别返回直接支路与镜像支路系数副本，便于诊断而不允许外部静默修改模型。 | DpdGmp §17 |
 | `Analysis.CalculateIrr`, `Analysis.CalculatePreparedIrr` | P/N | 在统一同步和公共复增益补偿后联合拟合直接项与共轭项，以两项功率之比计算 IRR；微小岭项保护病态参考。 | Analysis §5.11 |
 | `Draw.CreateIqGmpComparisonFigure`, `Draw.SaveIqGmpComparison` | E | 绘制并保存普通 GMP 与增广 GMP 的同功率 EVM、IRR 双面板曲线，不重新训练模型或计算指标。 | ChannelAnalyse §16 |
+
+## 17. DPD-LMS逐样点更新函数索引
+
+| 函数或方法 | 类型 | 原理或职责 | 对应文档 |
+|---|---|---|---|
+| `DpdLmsTrainingResult.ToDict` | E | 序列化样点数、实际更新次数、三种NMSE、系数步进和提交状态，不重新计算训练。 | DpdLms §1.2 |
+| `DpdLms.__init__` | E/N | 扩展DpdGmp类内默认值，通过ChainMap叠加逐样点配置，建立活动/影子恒等系数及匹配GMP结构的历史、尺度和统计数组。 | DpdLms §1–§2 |
+| `DpdLms.ValidateLmsParameters` | E | 校验LMS/NLMS模式、步长、分母、泄漏、尺度、遗忘、抽取、提交、权重和步进保护边界。 | DpdLms §2 |
+| `DpdLms.UpdateParameters`, `DpdLms.SynchronizeStructure` | E | 事务式应用本地或活动映射修改；结构改变时同时重建活动系数、影子系数、历史和尺度，防止旧系数错配新特征。 | DpdLms §10 |
+| `DpdLms.InitializeAdaptiveState`, `DpdLms.ResetAdaptiveState` | E/N | 根据最大GMP因果时延分配历史，初始化帧/运行特征尺度、恒等先验和在线误差统计；可选择从活动系数恢复影子。 | DPD-LMS §6、§8 |
+| `DpdLms.ResetCoefficients`, `DpdLms.SetCoefficients` | E | 同步修改活动和影子完整向量，并清除所有可能跨帧泄漏的自适应状态。 | DpdLms §3 |
+| `DpdLms.CalculateFeatureScale`, `DpdLms.PrepareFeatureScale` | N | 分块统计每个GMP特征的帧RMS，设置数值下限，不构造正规矩阵或改变系数。 | DPD-LMS §5.1 |
+| `DpdLms.BeginFrame` | E/N | 清除独立帧因果历史和在线统计；帧模式安装冻结尺度，运行模式初始化指数特征功率。 | DpdLms §4、DPD-LMS §5 |
+| `DpdLms.BuildFeatureVector` | P/N | 从最新样点位于索引0的有限历史构造一行main、lagging和leading GMP特征，与批量BuildGmpBasisChunk的零填充和延迟定义一致。 | DPD-LMS §2、§6 |
+| `DpdLms.ResolveFeatureScale` | N | 帧模式返回冻结RMS；运行模式按遗忘因子更新逐特征指数功率并转换尺度。 | DPD-LMS §5.2 |
+| `DpdLms.UpdateSampleFloating` | P/N | 用更新前影子系数预测一个样点，计算复误差，在归一化坐标中执行LMS/NLMS、恒等泄漏和步进投影，再按配置进行样点提交。 | DPD-LMS §3–§8 |
+| `DpdLms.UpdateSample` | E/N | 对一个公开浮点或定点复样点各解码/编码一次，把内部更新保持在归一化浮点域。 | DpdLms §4、§9 |
+| `DpdLms.CommitCoefficients` | E | 校验后原子复制完整影子向量为活动部署向量，避免帧模式暴露部分更新。 | DPD-LMS §8 |
+| `DpdLms.EvaluateNmseWithCoefficients` | N | 用固定指定系数分块推理并应用部署限幅，计算显式权重标签NMSE，不执行自适应。 | DPD-LMS §11.1 |
+| `DpdLms.UpdateFromLabels` | P/N/E | 完成边界解码、权重和帧尺度准备后，严格按时间顺序逐样点更新；帧末提交并分别报告固定前、在线和固定后NMSE。 | DpdLms §5–§6 |
+| `DpdLms.UpdateIndirect` | P/N/E | 先用SigProc对任意长度反馈采集做整帧时延、CFO、SFO和公共增益补偿，再以对齐PA输出为特征输入、实际PA输入为目标逐点训练后置逆。 | DPD-LMS §9、DpdLms §7 |
+| `DpdLms.GetAdaptiveCoefficients`, `DpdLms.GetLastLmsTrainingResult` | E | 返回影子系数副本或最近不可变训练摘要，不允许调用方静默修改模型。 | DpdLms §1、§3 |
