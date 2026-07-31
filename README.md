@@ -23,7 +23,7 @@
 - [DpdGmp程序使用手册](doc/DpdGmp.md)：完整参数、直接/ILC/间接学习、多片段训练、定点接口和基准用法。
 - [DPD-LMS逐样点补偿原理](doc/DPD-LMS.md)：复数LMS/NLMS推导、逐列尺度、因果样点状态、影子/活动系数、逐样点与批量岭回归的实现差异。
 - [DpdLms程序使用手册](doc/DpdLms.md)：完整参数、逐样点和整帧回放接口、间接学习、定点调用、最小移植程序和Benchmark。
-- [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、当前工作点局部Jacobian、公共复增益、20 dBm GMP发散案例，以及仪表整段采集下的逐样点DPD训练。
+- [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、当前工作点局部Jacobian、公共复增益、20 dBm GMP发散案例、仪表整段采集下的逐样点DPD训练，以及史密斯圆图阅读、观测信息和RF/DPD改善方案。
 - [全工程函数与物理原理覆盖审计](doc/FunctionPrinciples.md)：逐项索引 `main.py` 与 `inc` 中全部函数，区分物理模型、数值实现和工程编排，并链接到对应推导。
 
 安装依赖：
@@ -70,7 +70,7 @@ doc/DPD-GMP.md          GMP DPD物理模型和系数更新推导
 doc/DpdGmp.md           DpdGmp类参数、方法和完整用例
 doc/DPD-LMS.md          GMP-LMS/NLMS逐样点更新推导和批量实现差异
 doc/DpdLms.md           DpdLms参数、逐样点移植示例和间接学习用法
-doc/FAQ.md              小信号逆响应、局部逆、公共增益、高功率GMP和仪表整段采集逐样点训练常见问题
+doc/FAQ.md              小信号逆响应、局部逆、公共增益、高功率GMP、逐样点训练和史密斯圆图常见问题
 doc/Fec.md              FEC物理原理、数学推导、接口约束和调用示例
 doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整示例
 ```
