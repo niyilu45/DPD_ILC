@@ -560,7 +560,91 @@ A_{\mathrm{FS}}\frac{q}{2^{W-1}}.
 
 当 `Channel` 直接作为ILC被控对象时，每一轮会得到新的独立噪声样本。这更接近真实反馈接收机，但也会使逐轮MSE或EVM出现随机波动。固定 `randomSeed` 只保证整次仿真的噪声序列可复现，并不让每轮重复同一段噪声；调用 `ResetRandomGenerator` 才会从序列起点重新开始。
 
-## 5. 参数表
+## 5. 参数作用位置与可观测量示意图
+
+本节的图片是“参数对应关系示意图”，不是参数遍历曲线，也不代表某一台真实仪表或芯片的指标极限。它们回答三个工程问题：
+
+1. 参数作用在 PA 前、PA 后、前向采样还是反馈采样的哪个位置。
+2. 改变参数后，最先应该在幅度、相位、时延、频谱、星座或功率闭环的哪个可观测量中寻找变化。
+3. 哪些参数描述物理链路，哪些参数只控制数值求解、测量口径或公开定点接口。
+
+### 5.1 参数在链路中的作用位置
+
+![Channel 参数作用位置图](./images/channel_parameter/channel_parameter_location_map.png)
+
+图示说明：
+
+- 主信号从左向右依次经过功率校准、PA 前耦合、逐路 PA、PA 后耦合和公共固定移相。
+- `sampleMode="forward"` 在公共移相后进入仪表前向采样支路，不经过任何 `fb...` 参数。
+- `sampleMode="fb"` 才会继续经过反馈增益/FIR、非线性/限幅、时延/CFO/SFO、I/Q 不平衡/DC 和反馈 ADC。
+- 三种白噪声配置位于所选采样支路的末端，因此它们描述接收或采样噪声，而不是 PA 本身的非线性。
+- `width` 只定义公开输入输出的整数码位宽；图中所有物理模块仍在内部浮点域计算。
+- 功率校准参数控制“如何寻找 PA 输入预设值”，不会改变 PA、耦合网络或反馈接收机的物理模型。
+
+### 5.2 参数与可观测现象的对应关系
+
+![Channel 参数到可观测现象的关系](./images/channel_parameter/channel_parameter_effects.png)
+
+图中各分区的含义如下。
+
+| 分区 | 参数组 | 最直接的可观测现象 |
+|---|---|---|
+| A | `sourceChain`、`destinationChain`、`gainDb`、`firTaps` | 耦合方向、耦合幅度、带内纹波和陷波 |
+| B | 耦合路径 `phaseDegrees`、`integerDelaySamples`、`fractionalDelaySamples` | 中心相位和随频率变化的相位斜率 |
+| C | `fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees`、`fbDcOffset` | 星座椭圆化、共轭镜像和星座中心偏移 |
+| D | `fbThirdOrderCoefficient`、`fbClipAmplitude`、`fbAdcWidth`、`fbAdcFullScale` | AM/AM 弯曲、硬限幅和量化台阶 |
+| E | 反馈时延、CFO、SFO 和 `sampleRateHz` | 波形横向平移、逐样点相位旋转和时间轴伸缩 |
+| F | 有效突发检测与三种噪声配置 | 功率统计窗口、噪声底、SNR 和 EVM |
+| G | 目标功率与校准求解参数 | 输出功率收敛速度、稳态误差和 MIMO 联合收敛性 |
+
+### 5.3 调参方向与物理含义
+
+下表中的“增大”均指参数数值增大；对于负 dB 耦合增益，`-20 dB` 大于 `-40 dB`，因此代表更强耦合。
+
+| 参数 | 数值增大时的主要变化 | 不应误解为 |
+|---|---|---|
+| 耦合 `gainDb` | 泄漏幅度增大，非对角频响更接近主通道 | 不会单独产生额外时延 |
+| 耦合 `phaseDegrees` | 整条泄漏路径发生固定复旋转 | 理想固定相位不会改变路径幅度 |
+| `integerDelaySamples` | 路径后移整数样点，频域相位斜率变陡 | 理想时延不会制造幅频纹波 |
+| `fractionalDelaySamples` | 增加不足一个样点的时延和连续相位斜率 | 不是简单的固定相位偏置 |
+| `firTaps` | 决定频率选择性、记忆长度、纹波和可能的陷波 | 不能只用一个中心增益概括 |
+| `sourceChain` / `destinationChain` | 改变泄漏的方向和 MIMO 拓扑 | 它们不表示耦合强度 |
+| 公共 `phaseDegrees` | 所选观测信号整体旋转 `-90`、`0` 或 `90` 度 | 不改变功率、噪声或非线性 |
+| `fbGainDb` | 反馈链路整体幅度变化 | 不等于 PA 增益变化 |
+| `fbPhaseDegrees` | 反馈链路整体相位变化 | 不等于 PA AM/PM |
+| `fbFirTaps` | 反馈链路出现幅频纹波和群时延变化 | 不属于 PA 记忆效应 |
+| `fbIntegerDelaySamples` | 反馈采样整体后移整数样点 | 不改变原始 PA 输出 |
+| `fbFractionalDelaySamples` | 增加分数样点时延 | 不等于 SFO |
+| `fbCarrierFrequencyOffsetHz` | 每个样点累积相位，星座随时间旋转 | 不只是一个固定相位 |
+| `fbSamplingFrequencyOffsetPpm` | 反馈时间轴逐渐伸缩，帧越长累计偏差越大 | 不只是一个固定延迟 |
+| `fbIqGainImbalanceDb` | I/Q 两轴尺度不一致，镜像泄漏增强 | 不是公共复增益 |
+| `fbIqPhaseImbalanceDegrees` | I/Q 正交性变差，星座倾斜并产生镜像 | 不是公共相位旋转 |
+| `fbDcOffset` | 星座中心平移并在零频出现直流分量 | 不会随信号幅度同比缩放 |
+| `fbThirdOrderCoefficient` | 反馈接收机三阶弯曲和互调增强 | 不应被训练器误认为 PA 三阶项 |
+| `fbClipAmplitude` | 阈值减小时更早进入硬限幅 | 不是平滑的 PA 压缩 |
+| `fbAdcWidth` | 位宽增大时量化步长减小、量化噪声下降 | 不会恢复已经被模拟限幅的信息 |
+| `fbAdcFullScale` | 满量程增大时更不易削顶，但同位宽下量化步长变粗 | 不是“越大越精确” |
+| `noiseAmpMv` | 毫伏 RMS 增大时噪声底上升 | 不能与另两种噪声控制同时启用 |
+| `noisePwrDbm` | dBm 噪声功率增大时噪声底上升 | 其换算依赖 `loadResistanceOhm` |
+| `noiseSnrDb` | 数值增大时添加的噪声减小，EVM 通常改善 | 它不是噪声功率本身 |
+| `randomSeed` | 只改变或复现噪声样本实现 | 不改变理论噪声方差 |
+| `sampleRateHz` | 改变 Hz、ppm、秒与样点之间的换算 | 不会自动改变 PA 或耦合增益 |
+| `activePowerThresholdDb` | 阈值升高时有效功率统计更集中在突发高幅区 | 不是接收机检测灵敏度模型 |
+| `activeGapToleranceSamples` | 数值增大时会闭合更长的突发内部低幅间隙 | 不会补回真实缺失样点 |
+| `loadResistanceOhm` | 改变电压、瓦特和 dBm 的换算关系 | 不改变归一化样本本身 |
+| `maximumOutputPowerDbm` | 改变归一化 PA 输出 RMS 等于 1 时代表的物理功率 | 不是每次调用的目标功率 |
+| `calibrationToleranceDb` | 数值增大时更容易提前停止，但允许更大功率误差 | 不改变目标值 |
+| `maximumCalibrationIterations` | 数值增大时允许更多闭环尝试 | 不保证病态耦合下一定收敛 |
+| `calibrationLearningRate` | 数值增大时单轮校正更激进 | 过大可能来回振荡 |
+| `maximumDriveAdjustmentDb` | 数值增大时单轮允许更大的驱动修正 | 不会提高 PA 的物理饱和功率 |
+| `jointPowerCalibration` | 在 MIMO 耦合下选择联合或逐链求解策略 | 它不是耦合开关 |
+| `calibrationProbeStepDb` | 增大时 Jacobian 探测更明显，但局部线性近似变粗 | 不是实际输出功率步进 |
+| `calibrationRegularization` | 增大时联合求解更稳定、更新更保守 | 过大可能留下功率偏差 |
+| `width` | `0` 为物理浮点幅值；正整数使用对应满量程整数 I/Q 码 | 内部 PA 和信道计算仍是浮点 |
+
+调用 `Process(inputSignal, outputPowerDbm=...)` 时，`outputPowerDbm` 才是本次运行希望每路 PA 达到的实际输出功率；它不是构造参数。图中 G 区把它作为闭环目标单独画出，是为了避免与 `maximumOutputPowerDbm` 混淆。
+
+## 6. 参数表
 
 构造接口：
 
@@ -655,7 +739,7 @@ Channel(
 | `ResolveSnrNoiseRmsPerChain(inputSignal)` | 内部归一化SISO/MIMO信号 | 返回按有效突发SNR推导的逐链复噪声总RMS |
 | `ResetRandomGenerator()` | 无 | 按当前种子重放接收噪声序列 |
 
-## 6. 典型使用方式
+## 7. 典型使用方式
 
 先根据已有信号选择入口：
 
@@ -674,7 +758,7 @@ Channel(
 | I/Q是定点整数码 | 所有模块使用相同正 `width` | 取决于所选入口 |
 | MIMO samples×chains矩阵 | `Process` 绑定 `MimoPaModel` | 是 |
 
-### 6.1 只验证固定移相
+### 7.1 只验证固定移相
 
 不绑定PA时仍可使用 `ProcessPaOutput`。下面把一段已知PA输出旋转90度，不添加噪声：
 
@@ -704,7 +788,7 @@ assert np.allclose(receivedSignal, 1j * paOutputSignal)
 
 若 `phaseDegrees=-90`，结果为 `-1j * paOutputSignal`；若为0，则在无噪声条件下返回等值副本。
 
-### 6.2 完整PA到前向仪表采样链路
+### 7.2 完整PA到前向仪表采样链路
 
 ```python
 import numpy as np
@@ -756,7 +840,7 @@ flowchart LR
 
 图示说明：`width=0` 时解码和编码是等值复制；`width>0` 时公开I/Q为整数码，但PA、移相和噪声仍在内部归一化浮点域计算。
 
-### 6.3 前向仪表与板载反馈路径对比
+### 7.3 前向仪表与板载反馈路径对比
 
 推荐用两个Channel共享同一个PA模型：fb路径作为ILC训练观测，forward路径作为独立黄金参考和最终评价。已经得到一次干净PA输出时，用 `ProcessPaOutput` 分路可以避免PA被重复运行：
 
@@ -819,7 +903,7 @@ forwardCaptureFromSameObject = feedbackChannel.ProcessPaOutput(
 
 forward模式会完整跳过所有 `fb...` 非理想，但公共 `phaseDegrees` 和三种互斥噪声控制仍然生效。
 
-### 6.4 用户只提供原始波形与目标输出功率
+### 7.4 用户只提供原始波形与目标输出功率
 
 普通用户不需要主动创建 `PowerCalibration`，也不需要先归一化原始波形。把任意初始幅度的波形和目标dBm直接交给 `Channel.Process`：
 
@@ -888,7 +972,7 @@ flowchart TD
 
 图示说明：闭环每次都重新缩放原始波形并真实运行PA，不是在PA输出后乘常数伪造功率。有效区检测会排除前后补零和长静默。功率误差只由干净PA输出决定；相位和接收噪声在收敛后只执行一次，不会改变隐藏的PA输入预设。
 
-### 6.5 毫伏、dBm和SNR三种噪声配置
+### 7.5 毫伏、dBm和SNR三种噪声配置
 
 在50 Ω端口上，10 mV复包络总RMS约等于 `-26.9897 dBm`。使用相同随机种子时，下面两个Channel会产生同一段噪声：
 
@@ -960,9 +1044,9 @@ snrOutput = snrChannel.ProcessPaOutput(paddedSignal)
 
 这里的30 dB针对 `activeSignal` 所在的开启区间。前1000个和后2000个零样点不会降低信号RMS，也不会导致噪声被错误配置得过小。实际使用时三个噪声参数只能选择一个。
 
-### 6.6 Channel输出直接送入Analysis
+### 7.6 Channel输出直接送入Analysis
 
-继续使用6.4节得到的 `referenceSignal`、`wifiWaveform` 和 `receivedSignal`：
+继续使用7.4节得到的 `referenceSignal`、`wifiWaveform` 和 `receivedSignal`：
 
 ```python
 from inc.lib.Analysis import Analysis
@@ -987,7 +1071,7 @@ print(metrics["aclrWorstDb"])
 
 固定移相会由Analysis的公共复增益步骤补偿；随机噪声、PA非线性和记忆失真仍会进入SNR和EVM残差。`Analysis` 的独立使用方式见 [Analysis.md §11](./Analysis.md)。
 
-### 6.7 16位定点接口
+### 7.7 16位定点接口
 
 定点模式下，输入输出容器仍是 `numpy.complex128`，但每个I/Q分量都是整数码：
 
@@ -1031,7 +1115,7 @@ assert np.array_equal(
 
 10 mV不会被直接当成整数码10。Channel先把物理电压转换为内部归一化RMS，生成浮点噪声，最后统一编码为16位整数码。
 
-### 6.8 运行时更新参数和复现噪声
+### 7.8 运行时更新参数和复现噪声
 
 调用方传入的 `parameters` 字典保持活动状态；修改已识别键后，下一次处理会读取新值。`UpdateParameters` 可写入最高优先级覆盖：
 
@@ -1073,7 +1157,7 @@ assert np.array_equal(
 
 固定种子保证整次仿真的噪声序列可复现，但连续两次 `Process` 默认会消耗不同的随机样值。只有调用 `ResetRandomGenerator()` 才会从同一种子起点重放。
 
-### 6.9 MIMO矩阵
+### 7.9 MIMO矩阵
 
 Channel保留 `samples × chains` 形状，并对每个元素加入独立白噪声。绑定 `MimoPaModel` 后可以处理完整多链矩阵：
 
@@ -1167,7 +1251,7 @@ print(channel.GetLastCalibrationMetrics())
 
 当前公共 `phaseDegrees` 和fb接收机参数仍由所有链共用；耦合路径自身的增益、相位、FIR及时延则可以逐方向独立配置。噪声样值在各链之间独立，`noiseSnrDb` 按各路有效信号RMS分别设置强度。
 
-## 7. `SmallestSISO.py`中的设置
+## 8. `SmallestSISO.py`中的设置
 
 最小SISO示例使用：
 
@@ -1197,7 +1281,7 @@ channel = Channel(
 5. 最佳ILC输入再次通过同一个 `Channel.Process(..., outputPowerDbm=20.0)` 复测目标工作点。
 6. 输出字典同时保留Channel参数与内部PA功率闭环结果，避免把接收噪声功率误解为PA发射功率。
 
-## 8. Channel 特性测量与 DPD 联动
+## 9. Channel 特性测量与 DPD 联动
 
 `Channel` 负责施加已配置的 PA 前/后耦合，但不会读取这些配置并自动宣称它们是“测量结果”。独立的 `ChannelAnalyse` 使用逐路探测恢复：
 

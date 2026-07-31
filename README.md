@@ -603,7 +603,7 @@ flowchart TD
 - `noiseAmpMv` 定义复包络总RMS毫伏数；`noisePwrDbm` 定义端口噪声功率；`noiseSnrDb` 定义每路有效突发信号功率与复噪声功率之比。三者默认都是 `None`，只能选择一个非 `None` 控制量。
 - 相位只允许 `-90`、`0`、`90` 度，默认0度不旋转。圆对称复噪声的I/Q分量各承担总方差的一半。
 - 浮点和定点公开数据类型都为 `numpy.complex128`；定点模式输出I/Q整数码，物理噪声的电压换算只发生在模块内部。
-- 完整公式、参数约束和功率校准接线见 [Channel.md](doc/Channel.md)。
+- 完整公式、参数约束和功率校准接线见 [Channel.md](doc/Channel.md)。参数在链路中的作用位置，以及参数对幅相、星座、时频、噪声和功率收敛的影响见 [Channel 参数示意图](doc/Channel.md#5-参数作用位置与可观测量示意图)。
 
 ### `inc/lib/ChannelAnalyse.py`
 
@@ -625,7 +625,7 @@ flowchart TD
 
 `ChannelAnalyse.Measure` 不读取 `Channel` 的路径配置，而是只通过可调用的被测网络和实际输出恢复响应。`AnalyzeImpulseResponses` 还能直接消费仪表去卷积后、形状为“时延×目标×源”的冲激响应。`ChannelPathMeasurement` 以字典形式输出每条方向路径的中心增益、中心相位、平坦度和群时延；`ChannelMeasurementResult` 另外保存完整频响、最差耦合和带内条件数。
 
-完整参数、测量参考面、实际接线、误差来源和使用示例见 [ChannelAnalyse.md](doc/ChannelAnalyse.md)。
+完整参数、测量参考面、实际接线、误差来源和使用示例见 [ChannelAnalyse.md](doc/ChannelAnalyse.md)。测量窗口和频域指标与各配置参数的对应关系见 [ChannelAnalyse 参数示意图](doc/ChannelAnalyse.md#61-参数如何对应测量窗口和频域结果)。
 
 ### `inc/lib/DpdIlc.py`
 
