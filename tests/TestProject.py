@@ -61,6 +61,8 @@ from inc.lib.PaModel import (
     GMPConfig,
     MimoPaModel,
     PaModel,
+    ThermalConfig,
+    ThermalNetwork,
     WienerConfig,
 )
 from inc.lib.ParseWifi import (
@@ -879,6 +881,7 @@ def CheckDocumentationApiConsistency() -> None:
                 "wienerConfig",
                 "gmpConfig",
                 "dohertyConfig",
+                "thermalConfig",
                 "parameters",
                 "width",
                 "parameterOverrides",
@@ -886,6 +889,7 @@ def CheckDocumentationApiConsistency() -> None:
             (
                 "PaModel(modelName=None, wienerConfig=None, "
                 "gmpConfig=None, dohertyConfig=None, "
+                "thermalConfig=None, "
                 "parameters=None, width=None, "
                 "**parameterOverrides)"
             ),
@@ -3332,6 +3336,168 @@ def CheckFixedPointInterfaces() -> None:
             )
 
 
+def CheckPaThermalModel() -> None:
+    """Verify thermal power, duty cycle, drift, idle cooling, and calibration.
+
+    Processing details:
+        Algorithm: Compare static and Foster state behavior, confirm higher
+        duty cycle produces more heat, prove reference-temperature calibration
+        does not advance thermal time, and verify repeated fixed-drive test
+        frames heat the PA while its output power is allowed to drift.
+
+    Returns:
+        result: None. Assertions identify thermal state or workflow failures.
+    """
+
+    thermalConfig = ThermalConfig(
+        enabled=True,
+        modelName="single_rc",
+        sampleRateHz=100.0e3,
+        thermalResistancesCPerW=(20.0,),
+        thermalTimeConstantsSec=(0.02,),
+        thermalUpdateIntervalSamples=100,
+        idleDissipatedPowerW=0.0,
+        referenceOutputPowerDbm=25.0,
+        gainTemperatureCoefficientDbPerC=-0.08,
+        maximumJunctionTemperatureC=150.0,
+    )
+    thermalNetwork = ThermalNetwork(thermalConfig)
+    assert np.isclose(thermalNetwork.CurrentTemperatureC(), 25.0)
+    heatedTemperature = thermalNetwork.Advance(1.0, 0.02)
+    assert heatedTemperature > 25.0
+    cooledTemperature = thermalNetwork.Advance(0.0, 0.02)
+    assert 25.0 < cooledTemperature < heatedTemperature
+    staticConfig = replace(
+        thermalConfig,
+        modelName="static",
+        initialJunctionTemperatureC=55.0,
+    )
+    staticNetwork = ThermalNetwork(staticConfig)
+    staticNetwork.Advance(10.0, 1.0)
+    assert np.isclose(staticNetwork.CurrentTemperatureC(), 55.0)
+    fosterConfig = replace(
+        thermalConfig,
+        modelName="foster",
+        thermalResistancesCPerW=(2.0, 8.0, 20.0),
+        thermalTimeConstantsSec=(50.0e-6, 5.0e-3, 0.5),
+    )
+    fosterNetwork = ThermalNetwork(fosterConfig)
+    fosterNetwork.Advance(1.0, 0.01)
+    assert 25.0 < fosterNetwork.CurrentTemperatureC() < 55.0
+
+    for modelName in ("wiener", "gmp", "doherty"):
+        wrappedPa = PaModel(
+            parameters={
+                "modelName": modelName,
+                "thermalConfig": thermalConfig,
+                "width": 0,
+            }
+        )
+        wrappedOutput = wrappedPa.Process(
+            np.full(500, 0.25 + 0.05j)
+        )
+        assert np.all(np.isfinite(wrappedOutput))
+        assert wrappedPa.GetThermalMetrics()[
+            "endingJunctionTemperatureC"
+        ] > 25.0
+
+    continuousPa = PaModel(
+        parameters={
+            "modelName": "wiener",
+            "thermalConfig": thermalConfig,
+            "width": 0,
+        }
+    )
+    burstPa = PaModel(
+        parameters={
+            "modelName": "wiener",
+            "thermalConfig": thermalConfig,
+            "width": 0,
+        }
+    )
+    continuousInput = np.full(2000, 0.45 + 0.0j)
+    burstInput = continuousInput.copy()
+    burstInput[1000:] = 0.0
+    continuousPa.Process(continuousInput)
+    burstPa.Process(burstInput)
+    continuousMetrics = continuousPa.GetThermalMetrics()
+    burstMetrics = burstPa.GetThermalMetrics()
+    assert np.isclose(continuousMetrics["activeSampleDutyCycle"], 1.0)
+    assert np.isclose(burstMetrics["activeSampleDutyCycle"], 0.5)
+    assert (
+        continuousMetrics["endingJunctionTemperatureC"]
+        > burstMetrics["endingJunctionTemperatureC"]
+    )
+
+    thermalPa = PaModel(
+        parameters={
+            "modelName": "wiener",
+            "thermalConfig": thermalConfig,
+            "width": 0,
+        }
+    )
+    thermalChannel = Channel(
+        paModel=thermalPa,
+        parameters={
+            "sampleRateHz": thermalConfig.sampleRateHz,
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "width": 0,
+        },
+    )
+    rawInput = np.full(2000, 0.35 + 0.0j)
+    frozenInput = thermalChannel.PrepareThermalTest(
+        rawInput,
+        calibrationOutputPowerDbm=20.0,
+        initialJunctionTemperatureC=25.0,
+        ambientTemperatureC=25.0,
+    )
+    calibrationMetrics = thermalPa.GetThermalMetrics()
+    assert np.isclose(calibrationMetrics["junctionTemperatureC"], 25.0)
+    assert np.isclose(calibrationMetrics["elapsedTimeSec"], 0.0)
+    firstOutput = thermalChannel.Process(frozenInput)
+    firstRms = float(np.sqrt(np.mean(np.abs(firstOutput) ** 2)))
+    firstMetrics = thermalChannel.GetThermalMetrics()
+    secondOutput = thermalChannel.Process(frozenInput)
+    secondRms = float(np.sqrt(np.mean(np.abs(secondOutput) ** 2)))
+    secondMetrics = thermalChannel.GetThermalMetrics()
+    assert secondMetrics["endingJunctionTemperatureC"] > firstMetrics[
+        "endingJunctionTemperatureC"
+    ]
+    assert secondRms < firstRms
+    assert secondMetrics["elapsedTimeSec"] > firstMetrics["elapsedTimeSec"]
+    temperatureBeforeIdle = secondMetrics["endingJunctionTemperatureC"]
+    thermalChannel.AdvanceThermalIdle(0.05)
+    assert (
+        thermalChannel.GetThermalMetrics()["junctionTemperatureC"]
+        < temperatureBeforeIdle
+    )
+
+    mimoThermalPa = MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "paParametersPerChain": (
+                {"modelName": "wiener", "thermalConfig": thermalConfig},
+                {"modelName": "wiener", "thermalConfig": thermalConfig},
+            ),
+            "thermalCouplingCPerW": (
+                (0.0, 2.0),
+                (3.0, 0.0),
+            ),
+            "width": 0,
+        }
+    )
+    mimoThermalInput = np.column_stack(
+        (continuousInput, 0.2 * continuousInput)
+    )
+    mimoThermalPa.Process(mimoThermalInput)
+    mimoMetrics = mimoThermalPa.GetThermalMetrics()["chains"]
+    assert mimoMetrics[0]["averageDissipatedPowerW"] > mimoMetrics[1][
+        "averageDissipatedPowerW"
+    ]
+    assert mimoThermalPa.paModels[1]._externalTemperatureOffsetC > 0.0
+
+
 def CheckChannelModel() -> None:
     """Verify both sample modes, feedback impairments, noise, and fixed point.
 
@@ -4815,6 +4981,7 @@ def RunTests() -> None:
     CheckInternalDefaultConfiguration()
     CheckUnknownConfigurationWarnings()
     CheckFixedPointInterfaces()
+    CheckPaThermalModel()
     CheckChannelModel()
     CheckWifiFormats()
     CheckWifiBandwidths()

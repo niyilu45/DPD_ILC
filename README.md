@@ -7,7 +7,7 @@
 - [Wi-Fi 帧生成物理原理与推导](doc/WaveGenWifi.md)：复基带、OFDM 正交性、QAM 归一化、MCS、循环前缀、VHT/HE/EHT 字段和 PAPR。
 - [双音信号生成物理原理与用法](doc/WaveGenTwoTone.md)：复基带双音、奇数阶互调频率、RMS/定点边界和ILC带宽。
 - [FEC编码译码原理与用法](doc/Fec.md)：55/90短块LDPC校验矩阵、系统编码、软输入normalized min-sum译码和调用示例。
-- [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、GMP、Doherty载波/峰值双支路、频谱再生和IQ失衡。
+- [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、GMP、Doherty、频谱再生、IQ失衡，以及由功率和占空比驱动的静态/单RC/Foster电热模型、参数图和开环输出漂移。
 - [PA双音特性分析](doc/PaAnalyse.md)：小信号频响、双音间隔记忆、动态AM-AM/AM-PM迟滞、IM3/IM5/IM7、输出功率扫描及逐PA的DPD优化建议。
 - [PA到接收端Channel物理原理与用法](doc/Channel.md)：PA前/后多通道耦合、前向仪表/板载反馈采样、反馈链路非理想和联合功率校准。
 - [Channel特性测量与耦合感知DPD](doc/ChannelAnalyse.md)：平坦度、耦合增益/相位、群时延、条件数、测量接线以及耦合感知DPD-GMP前后对比。
@@ -523,6 +523,11 @@ flowchart TD
     select -->|doherty| doherty["DohertyPA"]
     pa --> paProcess["PaModel.Process"]
     pa --> paGain["PaModel.SmallSignalGain"]
+    thermalConfig["ThermalConfig.Validate"] --> thermal["ThermalNetwork"]
+    paProcess --> heat["耗散功率与占空比"]
+    heat --> thermal
+    thermal --> drift["温度增益/相位/饱和/非线性漂移"]
+    drift --> paProcess
     paProcess --> wienerProcess["WienerPA.Process"]
     paProcess --> gmpProcess["GMPPA.Process"]
     paProcess --> dohertyProcess["Carrier + Peaking + 负载调制"]
@@ -565,6 +570,7 @@ flowchart TD
 - `WienerPA.Process` 依次执行线性记忆滤波、Rapp AM-AM 压缩和 AM-PM 相位旋转。
 - `GMPPA.Process` 使用 `DelaySignal` 构造主项、滞后包络项和超前包络项；未提供系数时由 `DefaultGmpCoefficients` 创建稳定的默认模型。
 - `DohertyPA.Process` 持续驱动Carrier支路，在包络越过门限时平滑开启Peaking支路，并加入支路时延、复合成和简化负载调制；两条支路可分别选择Wiener或GMP。
+- 可选 `ThermalConfig` 把输出功率、效率和占空比映射为耗散功率；单RC或Foster网络推进结温，再调制Wiener、GMP或Doherty输出。功率校准自动暂停热网络，正式温度测试冻结驱动并允许输出功率自然漂移。
 - `IQImbalancePA` 在已有 PA 输出上增加共轭镜像，用于测试增广 ILC；`AddAwgn` 模拟反馈接收链噪声。
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
 - `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。它反复改变PA输入并测量真实输出，直到目标误差进入容限，不在PA输出端追加常数增益。
@@ -1200,8 +1206,8 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 ### `PaModel` 参数
 
 当前构造函数签名为
-`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, parameters=None, width=None, **parameterOverrides)`。
-四个常用模型参数既可以直接传入，也可以放入 `parameters` 映射；直接参数优先级更高。
+`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。
+五个常用模型参数既可以直接传入，也可以放入 `parameters` 映射；直接参数优先级更高。
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -1211,6 +1217,7 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 | `wienerConfig` | `WienerConfig` 或 `None` | `None` | Wiener 模式的配置；`None` 使用默认配置。 |
 | `gmpConfig` | `GMPConfig` 或 `None` | `None` | GMP 模式的配置；`None` 使用默认配置。 |
 | `dohertyConfig` | `DohertyConfig` 或 `None` | `None` | Doherty载波/峰值双支路配置；`None`使用默认架构。 |
+| `thermalConfig` | `ThermalConfig` 或 `None` | `None` | 可选PA自热、占空比、热网络和温度电参数漂移；`None`保持原有无热行为。 |
 
 `WienerConfig` 支持：
 
@@ -1254,6 +1261,8 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 Wiener、GMP、Doherty 的静态增益曲线定义、1 dB 压缩点推导、每一个配置值对曲线的移动或变形方式、外部 dBm 工作点与模型曲线的区别，以及恒包络扫幅示例，见
 [PaModel.md：配置时如何读取和调节增益曲线](doc/PaModel.md#49-配置时如何读取和调节增益曲线)。
 
+`ThermalConfig` 支持静态温度角、单RC和多极点Foster。完整参数、不同热模型优缺点、耗散功率/效率公式、功率与占空比示意图，以及“无热校准一次、冻结驱动、开环观察功率漂移”的推荐用法见 [PaModel电热模型](doc/PaModel.md#13-pa电热模型功率占空比与输出漂移)。温度测试使用 `channel.PrepareThermalTest(...)` 获取冻结输入，之后调用 `channel.Process(frozenInput)`，不能每帧再次传 `outputPowerDbm`。
+
 `MimoPaModel(parameters=None, width=None, **parameterOverrides)` 在构造函数内部使用 `ChainMap` 管理以下参数：
 
 | 参数 | 默认值 | 说明 |
@@ -1266,6 +1275,7 @@ Wiener、GMP、Doherty 的静态增益曲线定义、1 dB 压缩点推导、每�
 | `targetOutputPowerDbmPerChain` | `None` | 每路绝对输出功率 dBm 或 `None`；整个参数为 `None` 时全部禁用。 |
 | `loadResistanceOhm` | `50.0` | 绝对 dBm 目标与实测输出功率换算所用的端口电阻。 |
 | `maximumOutputPowerDbm` | `25.0` | 每路允许的最高目标输出功率。 |
+| `thermalCouplingCPerW` | `None` | 可选“受热链×热源链”互热阻矩阵，单位摄氏度/W；对角线由代码置零。 |
 | `targetOutputRmsPerChain` | `None` | 旧接口：每路复包络输出 RMS 电压或 `None`；同一链不能同时设置 RMS 与 dBm 目标。 |
 
 `Process(inputSignal)` 对输入矩阵逐列处理；`ProcessChain(inputSignal, chainIndex)` 供单路测量或 ILC 使用；`SetOutputPowerDb`、`SetTargetOutputPowerDbm` 可在运行时只修改一路；`GetOutputPowerDbmPerChain` 返回最近一次矩阵处理测得的各路绝对功率。`SetTargetOutputRms` 和 `GetOutputRmsPerChain` 仅作为旧接口保留。
@@ -1327,6 +1337,8 @@ Channel(paModel=None, parameters=None, width=None, **parameterOverrides)
 | `width` | `16` | 外部I/Q位宽；`0`为浮点，正值返回整数码。 |
 
 `Process(inputSignal, outputPowerDbm=None)` 执行“PA前耦合→不同PA→PA后耦合→采样”完整链路。提供目标时先完成PA自身输出功率闭环；存在PA前耦合时默认联合调节全部输入。`outputPowerDbm` 可以是SISO/全部链共同标量，也可以是按列排列的MIMO序列。`ProcessPaOutput(paOutputSignal)` 接收尚未经过PA后耦合的各PA输出。反馈专用参数只在 `sampleMode="fb"` 时生效，forward模式可作为独立仪表黄金评价路径。完整路径字段、物理公式和示例见 [Channel.md](doc/Channel.md)。
+
+温度测试采用两阶段接口：`PrepareThermalTest(inputSignal, calibrationOutputPowerDbm, initialJunctionTemperatureC=None, ambientTemperatureC=None)` 在暂停热网络的条件下只校准一次并返回冻结输入；后续 `Process(frozenInput)` 开环推进结温，绝不重新稳定输出功率。`AdvanceThermalIdle(idleTimeSec)` 推进帧间冷却或偏置加热，`GetThermalMetrics()` 返回结温、耗散、占空比、自然漂移后的输出功率和累计时间。详见 [Channel两阶段温度测试](doc/Channel.md#10-两阶段pa温度测试)。
 
 ### `SigProc` 参数与方法
 

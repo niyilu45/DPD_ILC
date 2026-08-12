@@ -777,7 +777,121 @@ class Channel:
         """
 
         powerCalibration = self.ConfigurePowerCalibration(outputPowerDbm)
-        return powerCalibration.Calibrate(inputSignal)
+        suspendMethod = (
+            None
+            if self.paModel is None
+            else getattr(self.paModel, "SuspendThermalModel", None)
+        )
+        restoreMethod = (
+            None
+            if self.paModel is None
+            else getattr(self.paModel, "RestoreThermalModel", None)
+        )
+        thermalSnapshot = (
+            suspendMethod() if callable(suspendMethod) else None
+        )
+        try:
+            calibratedInput = powerCalibration.Calibrate(inputSignal)
+        finally:
+            if callable(restoreMethod):
+                restoreMethod(thermalSnapshot)
+        return calibratedInput
+
+    def PrepareThermalTest(
+        self,
+        inputSignal: np.ndarray,
+        calibrationOutputPowerDbm: Union[
+            float, Sequence[float], np.ndarray
+        ],
+        initialJunctionTemperatureC: Optional[
+            Union[float, Sequence[float]]
+        ] = None,
+        ambientTemperatureC: Optional[float] = None,
+    ) -> np.ndarray:
+        """Calibrate once without heating and freeze the resulting PA drive.
+
+        Processing details:
+            Algorithm: Suspend the bound SISO or MIMO PA thermal network,
+            execute the existing dBm closed loop using only reference electrical
+            parameters, copy the converged public PA input, restore thermal
+            modeling without accepting any calibration heat, optionally reset
+            the requested starting temperatures, and return the frozen drive.
+
+        Args:
+            inputSignal: Arbitrarily scaled public SISO or MIMO waveform.
+            calibrationOutputPowerDbm: Reference-temperature target dBm value.
+            initialJunctionTemperatureC: Optional scalar or per-chain test start.
+            ambientTemperatureC: Optional shared ambient test temperature.
+
+        Returns:
+            result: Frozen public PA-input waveform for open-loop thermal tests.
+        """
+
+        if self.paModel is None:
+            raise RuntimeError("PrepareThermalTest requires a bound PA model")
+        self.CalibratePaInput(
+            inputSignal,
+            calibrationOutputPowerDbm,
+        )
+        calibratedInput = np.array(
+            self.GetLastPaInput(), dtype=np.complex128, copy=True
+        )
+        if (
+            initialJunctionTemperatureC is not None
+            or ambientTemperatureC is not None
+        ):
+            resetMethod = getattr(self.paModel, "ResetThermalState", None)
+            if not callable(resetMethod):
+                raise RuntimeError(
+                    "bound PA does not support thermal-state reset"
+                )
+            resetMethod(
+                initialJunctionTemperatureC,
+                ambientTemperatureC,
+            )
+        return calibratedInput
+
+    def AdvanceThermalIdle(
+        self,
+        idleTimeSec: float,
+    ) -> object:
+        """Advance the bound PA through a physical idle interval.
+
+        Processing details:
+            Algorithm: Delegate the nonnegative gap to the PA thermal model so
+            idle bias power and cooling evolve without emitting an RF waveform.
+
+        Args:
+            idleTimeSec: Physical frame-to-frame idle interval in seconds.
+
+        Returns:
+            result: Junction temperature or per-chain temperature tuple.
+        """
+
+        if self.paModel is None:
+            raise RuntimeError("AdvanceThermalIdle requires a bound PA model")
+        advanceMethod = getattr(self.paModel, "AdvanceIdle", None)
+        if not callable(advanceMethod):
+            raise RuntimeError("bound PA does not support thermal idle advance")
+        return advanceMethod(idleTimeSec)
+
+    def GetThermalMetrics(self) -> Dict[str, object]:
+        """Return thermal diagnostics from the bound PA without reprocessing.
+
+        Processing details:
+            Algorithm: Delegate to the PA thermal observer and copy the result
+            so callers can log temperature, heat, duty cycle, and elapsed time.
+
+        Returns:
+            result: Ordinary diagnostic dictionary for SISO or MIMO operation.
+        """
+
+        if self.paModel is None:
+            raise RuntimeError("GetThermalMetrics requires a bound PA model")
+        metricsMethod = getattr(self.paModel, "GetThermalMetrics", None)
+        if not callable(metricsMethod):
+            return {"enabled": False}
+        return dict(metricsMethod())
 
     def GetLastPaInput(self) -> np.ndarray:
         """Return the most recent internally calibrated public PA input.

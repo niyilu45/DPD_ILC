@@ -1319,3 +1319,51 @@ postMeasurement = channelAnalyzer.Measure(
 真实硬件必须在对应参考面采集；只有最终端口输出时，一般不能唯一分离 PA 前耦合、PA 非线性和 PA 后耦合。`CouplingAwareDpdGmp` 可以使用上述测量结果修改训练目标并预消除 DAC 侧耦合。
 
 完整测量推导、参数表、实验接线边界、Benchmark 和修改前后性能见 [ChannelAnalyse.md](./ChannelAnalyse.md)。
+
+## 10. 两阶段PA温度测试
+
+热测试与普通“每次都保证目标dBm”的功率扫描不同。`PrepareThermalTest` 首先暂停PA热网络，在参考温度下调用现有闭环一次，随后返回冻结的PA输入；校准过程不产生虚假热量。正式测试只调用不带 `outputPowerDbm` 的 `Process`：
+
+```mermaid
+flowchart LR
+    raw["任意原始波形"] --> suspend["暂停PA热网络"]
+    suspend --> calibrate["一次功率闭环<br/>达到参考温度目标dBm"]
+    calibrate --> frozen["冻结PA输入"]
+    frozen --> reset["设置起始结温与环境温度"]
+    reset --> frame["Process(frozenInput)<br/>开环真实发射"]
+    frame --> drift["结温、增益、相位与输出功率自然漂移"]
+    drift --> idle["AdvanceThermalIdle<br/>帧间冷却或偏置加热"]
+    idle --> frame
+```
+
+```python
+frozenInput = channel.PrepareThermalTest(
+    rawSignal,
+    calibrationOutputPowerDbm=22.0,
+    initialJunctionTemperatureC=25.0,
+    ambientTemperatureC=25.0,
+)
+
+for frameIndex in range(100):
+    receivedSignal = channel.Process(frozenInput)
+    metrics = channel.GetThermalMetrics()
+    print(
+        frameIndex,
+        metrics["junctionTemperatureC"],
+        metrics["outputPowerDbm"],
+    )
+    channel.AdvanceThermalIdle(1.0e-3)
+```
+
+三个热接口的作用为：
+
+| 接口 | 是否执行功率闭环 | 是否推进热状态 | 作用 |
+|---|---|---|---|
+| `PrepareThermalTest(...)` | 是，仅一次 | 否 | 得到参考温度下冻结驱动并设置测试起始温度 |
+| `Process(frozenInput)` | 否 | 是 | 真实发射一帧，输出功率允许随温度变化 |
+| `AdvanceThermalIdle(idleTimeSec)` | 否 | 是 | RF关闭时按偏置耗散和热网络推进时间 |
+| `GetThermalMetrics()` | 否 | 否 | 读取结温、耗散、占空比、有效RF区输出功率和时间；补零不计入输出功率 |
+
+直接调用 `CalibratePaInput` 也会自动暂停并恢复热网络，因此任何功率校准试探都不会改变结温。但温度测试推荐使用 `PrepareThermalTest`，因为它把“校准一次、冻结驱动、复位温度”组合为不易误用的入口。
+
+热源、Foster方程、不同热模型优缺点、全部 `ThermalConfig` 参数和MIMO互热矩阵见 [PaModel.md第13节](./PaModel.md#13-pa电热模型功率占空比与输出漂移)。

@@ -1,4 +1,4 @@
-# 功率放大器模型：Wiener、GMP与Doherty的物理原理
+# 功率放大器模型：Wiener、GMP、Doherty与电热特性的物理原理
 
 本文解释 `inc/lib/PaModel.py` 中功率放大器（Power Amplifier，PA）模型的物理意义、数学来源、参数作用和适用边界。工程支持三类模型：
 
@@ -6,7 +6,7 @@
 - **GMP 模型**：主记忆多项式加包络超前/滞后交叉项，表达能力更强；
 - **Doherty 模型**：载波PA和峰值PA并联，通过包络门控、支路时延、复合成与简化负载调制描述Doherty架构。
 
-> 这三种都是复基带“行为模型”，描述输入波形和输出波形之间的关系。它们不是晶体管电路模型，不能直接预测漏极电压、电流、结温、效率或器件可靠性。
+> Wiener、GMP和Doherty是复基带“行为电模型”。可选 `ThermalConfig` 在它们外面增加耗散功率、结温和温度参数漂移；它是可辨识的系统级电热模型，不等同于晶体管级可靠性仿真。
 
 ---
 
@@ -1242,6 +1242,16 @@ classDiagram
         +width
         +Process(inputSignal)
         +SmallSignalGain()
+        +ResetThermalState(temperatureC)
+        +AdvanceIdle(idleTimeSec)
+        +GetThermalMetrics()
+    }
+    class ThermalConfig
+    class ThermalNetwork {
+        +Reset(junctionTemperatureC, ambientTemperatureC)
+        +Advance(dissipatedPowerW, durationSec)
+        +CurrentTemperatureC()
+        +GetMetrics()
     }
     class PowerCalibration {
         +DbmToRms(powerDbm)
@@ -1284,6 +1294,8 @@ classDiagram
         +GetOutputPowerDbmPerChain()
     }
     MimoPaModel o-- PaModel : one per transmit chain
+    PaModel --> ThermalConfig : optional
+    PaModel o-- ThermalNetwork : thermal state
     MimoPaModel --> PowerCalibration : absolute dBm calibration
     PaModel --> WienerPA : modelName=wiener
     PaModel --> GMPPA : modelName=gmp
@@ -1347,7 +1359,7 @@ dohertyOutput = paModel.Process(inputSignal)
 ```
 
 `PaModel` 的公开构造签名为
-`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收I/Q整数码，解码成归一化浮点后使用Wiener、GMP或Doherty模型计算，最后把结果编码回整数码。公开返回容器始终是 `numpy.complex128`：
+`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收I/Q整数码，解码成归一化浮点后使用Wiener、GMP或Doherty模型计算，最后把结果编码回整数码。公开返回容器始终是 `numpy.complex128`：
 
 ```python
 from inc.lib.PaModel import PaModel
@@ -1407,7 +1419,313 @@ mimoPaModel.SetTargetOutputPowerDbm(
 
 ---
 
-## 13. 使用边界和常见误解
+## 13. PA电热模型：功率、占空比与输出漂移
+
+### 13.1 完整因果链路
+
+![PA电热参数作用位置](./images/pa_thermal/thermal_parameter_map.png)
+
+图示说明：现有 Wiener、GMP 或 Doherty 仍先计算基础电响应；归一化输出通过参考dBm和效率模型换成耗散功率，热网络将其积累为结温，结温再调制下一热更新区间的增益、相位、饱和尺度和非线性强度。这个慢反馈形成电热记忆。
+
+本工程严格区分两个阶段：
+
+1. **功率校准阶段**：`Channel.CalibratePaInput` 和 `Channel.PrepareThermalTest` 都会暂停热网络，所有试探使用参考温度电参数，校准不会增加热时间或结温。
+2. **开环温度测试阶段**：冻结校准得到的PA输入，调用 `Channel.Process(frozenInput)` 时不再传 `outputPowerDbm`。热网络随实际发射推进，输出功率可以随温度自然变化。
+
+因此温度测试中禁止每帧重新调用：
+
+```python
+channel.Process(rawSignal, outputPowerDbm=22.0)
+```
+
+这会重新标定驱动，掩盖需要观察的热增益和输出功率漂移。
+
+### 13.2 常见热模型的优缺点比较
+
+| 热模型 | 主要优点 | 主要缺点 | 参数获取 | 本工程状态与推荐场景 |
+|---|---|---|---|---|
+| 静态温度角 | 最简单；适合25、85、125摄氏度等温箱定点比较 | 不由信号功率和占空比产生动态温升；没有热迟滞 | 温箱稳态测量 | `modelName="static"`；用于温度角，不用于自热瞬态 |
+| 单RC | 参数少、计算快、容易从一次阶跃拟合 | 只能表达一个时间尺度，难以同时拟合芯片快热和散热器慢热 | 一条指数阶跃曲线 | `modelName="single_rc"`；适合最小验证或只有一个时间常数的数据 |
+| 多极点Foster | 多个并行RC可直接拟合瞬态热阻；速度快；适合行为仿真 | RC支路不一一对应真实物理层，外推边界依赖测量质量 | 热瞬态或数据手册瞬态热阻曲线 | `modelName="foster"`；默认推荐，也是本工程完整动态实现 |
+| Cauer梯形网络 | 节点可对应芯片、封装、PCB和散热器；适合层间热流解释 | 参数提取和Foster/Cauer转换更复杂；测量不足时不唯一 | 结构热仿真或分层测温 | 当前未直接实现；可先离线转成等效Foster接入 |
+| 温度条件化GMP | 直接拟合不同结温下的复系数，能描述真实AM-AM、AM-PM和记忆漂移 | 需要多个温度、功率和波形数据集；系数插值可能病态 | 多温度同步I/Q采集 | 当前用低阶温度漂移层近似；高精度版本可替换 `ApplyTemperatureDrift` |
+| 神经网络电热模型 | 可表达强非线性、复杂迟滞和多状态耦合 | 数据量大、可解释性弱、外推和稳定性难保证 | 大规模带温度标签训练集 | 不作为首版默认；适合Foster加GMP仍无法达到NMSE目标时 |
+
+![不同热模型和参数影响](./images/pa_thermal/thermal_model_effects.png)
+
+图A说明单RC只有一个拐点，多极点Foster可同时呈现快、中、慢时间尺度，静态角只规定某个温度而没有因果升温曲线。图B说明静态偏置热始终存在，有效RF占空比提高会增加平均耗散功率。图C说明驱动冻结以后，结温上升可以导致输出功率自然漂移。这些曲线只用于说明参数关系，不是器件测量结果或标准限值。
+
+### 13.3 热源和效率模型
+
+物理耗散功率为：
+
+```math
+P_{\mathrm{diss}}(t)
+=
+P_{\mathrm{DC}}(t)
++
+P_{\mathrm{RF,in}}(t)
+-
+P_{\mathrm{RF,out}}(t).
+```
+
+当前行为模型没有漏极电压和电流，因此用效率近似：
+
+```math
+P_{\mathrm{diss}}(t)
+=
+P_{\mathrm{idle}}
++
+P_{\mathrm{RF,out}}(t)
+\left(
+\frac{1}{\eta(t)}-1
+\right).
+```
+
+`referenceOutputPowerDbm` 规定归一化输出功率1对应的物理功率：
+
+```math
+P_{\mathrm{RF,out}}[n]
+=
+10^{(P_{\mathrm{ref,dBm}}-30)/10}
+\left|y[n]\right|^2.
+```
+
+`efficiencyModelName="constant"` 直接使用 `peakDrainEfficiency`。`"power_dependent"` 使用平滑功率相关效率：
+
+```math
+\eta(P)
+=
+\eta_{\min}
++
+(\eta_{\max}-\eta_{\min})
+\frac{P/P_{\mathrm{knee}}}
+{1+P/P_{\mathrm{knee}}}.
+```
+
+这不是某个工艺的固定效率曲线。应使用实测DC电压、电流和RF输出功率拟合 `minimumDrainEfficiency`、`peakDrainEfficiency` 和 `efficiencyKneeOutputPowerDbm`。
+
+### 13.4 占空比为何自然进入温度
+
+长时间平均耗散近似为：
+
+```math
+\overline{P}_{\mathrm{diss}}
+=
+D P_{\mathrm{on}}
++
+(1-D)P_{\mathrm{idle}},
+```
+
+其中 $D$ 是RF有效样点占空比。与RF输出功率校准不同，温度计算不会删除补零和帧间静默：静默样点仍消耗时间，并按 `idleDissipatedPowerW` 加热或冷却。因此相同有效功率下：
+
+- 占空比更高，平均耗散通常更高；
+- 突发更长，快速热节点更接近稳态；
+- 空闲更长，结温下降更多；
+- 相同占空比但不同脉冲周期可以具有不同峰值温度和温度纹波。
+
+`activePowerThresholdDb` 只用于区分RF开启和空闲，以便选择耗散公式并输出 `activeSampleDutyCycle`，不是删除热时间的门限。
+
+### 13.5 单RC与Foster热网络
+
+每个Foster支路满足：
+
+```math
+\tau_i
+\frac{d\theta_i(t)}{dt}
++
+\theta_i(t)
+=
+R_i P_{\mathrm{diss}}(t).
+```
+
+在一个热更新区间内把耗散功率视为常数，代码使用精确零阶保持解：
+
+```math
+\theta_i[n+1]
+=
+a_i\theta_i[n]
++
+R_i(1-a_i)P_{\mathrm{diss}}[n],
+```
+
+```math
+a_i
+=
+\exp
+\left(
+-\frac{\Delta t}{\tau_i}
+\right).
+```
+
+总结温为：
+
+```math
+T_j[n]
+=
+T_{\mathrm{ambient}}
++
+\sum_i\theta_i[n].
+```
+
+`thermalResistancesCPerW` 决定稳态温升；`thermalTimeConstantsSec` 决定达到稳态的速度。两者必须一一对应。`thermalUpdateIntervalSamples` 只决定每隔多少RF样点更新一次慢热状态：减小它可提高帧内温漂分辨率但增加计算量；它不改变物理时间常数。
+
+### 13.6 温度怎样修改现有电模型
+
+当前首版采用可解释的公共温度漂移层。复增益为：
+
+```math
+G(T)
+=
+10^{k_G(T-T_{\mathrm{ref}})/20}
+\exp
+\left[
+j k_{\phi}(T-T_{\mathrm{ref}})
+\right].
+```
+
+其中 `gainTemperatureCoefficientDbPerC` 以dB/摄氏度配置，`phaseTemperatureCoefficientDegreesPerC` 在代码中先从度转换为弧度。
+
+饱和尺度和额外非线性强度分别由：
+
+```math
+s(T)
+=
+1
++
+k_s(T-T_{\mathrm{ref}}),
+```
+
+```math
+q(T)
+=
+\max
+\left[
+0,
+k_q(T-T_{\mathrm{ref}})
+\right]
+```
+
+控制。基础输出 $y_0$ 最终变为：
+
+```math
+y_T
+=
+G(T)
+\frac{y_0}
+{1+q(T)|y_0/s(T)|^2}.
+```
+
+因此它可以直接包裹：
+
+- Wiener：温度调制整体增益、相位、饱和和压缩；
+- GMP：温度调制完整GMP输出，相当于低阶温度条件化系数近似；
+- Doherty：温度调制载波/峰值合成后的公共电热漂移。
+
+如果要精确描述Doherty两支路温差，应把carrier和peaking拆为两个独立 `PaModel` 热节点，再拟合各自耗散和合成参数。本实现优先保证与当前统一Doherty接口兼容。
+
+### 13.7 `ThermalConfig`完整参数
+
+| 参数 | 默认值 | 单位 | 物理作用 |
+|---|---:|---:|---|
+| `enabled` | `False` | 无 | 总开关；关闭时与原PA行为一致 |
+| `modelName` | `"foster"` | 无 | `static`、`single_rc`或`foster` |
+| `sampleRateHz` | `80e6` | Hz | 把样点数转换为真实发热时间 |
+| `ambientTemperatureC` | `25` | 摄氏度 | 环境或冷板温度 |
+| `initialJunctionTemperatureC` | `25` | 摄氏度 | 新热网络的起始结温 |
+| `referenceTemperatureC` | `25` | 摄氏度 | 温度系数等于零偏移时的电模型温度 |
+| `thermalResistancesCPerW` | `(2,8,20)` | 摄氏度/W | 各Foster支路稳态热阻 |
+| `thermalTimeConstantsSec` | `(50e-6,5e-3,0.5)` | s | 各支路快、中、慢热时间常数 |
+| `thermalUpdateIntervalSamples` | `256` | sample | 帧内热状态更新粒度 |
+| `idleDissipatedPowerW` | `0.15` | W | RF关闭时的偏置耗散 |
+| `efficiencyModelName` | `"power_dependent"` | 无 | 常效率或功率相关效率 |
+| `peakDrainEfficiency` | `0.45` | 比例 | 高功率效率上界参数 |
+| `minimumDrainEfficiency` | `0.10` | 比例 | 低功率效率下界参数 |
+| `efficiencyKneeOutputPowerDbm` | `15` | dBm | 效率曲线过渡功率 |
+| `referenceOutputPowerDbm` | `25` | dBm | 归一化输出功率1对应的物理RF功率 |
+| `activePowerThresholdDb` | `-60` | dB | 相对峰值的RF开启判定门限 |
+| `gainTemperatureCoefficientDbPerC` | `-0.012` | dB/摄氏度 | 结温升高时的增益漂移 |
+| `phaseTemperatureCoefficientDegreesPerC` | `0.03` | 度/摄氏度 | 结温升高时的公共相位漂移 |
+| `saturationTemperatureCoefficientPerC` | `-0.0015` | 1/摄氏度 | 饱和尺度漂移 |
+| `nonlinearityTemperatureCoefficientPerC` | `0.002` | 1/摄氏度 | 额外压缩强度漂移 |
+| `maximumJunctionTemperatureC` | `150` | 摄氏度 | 仿真安全上限；超过即停止 |
+
+这些默认值只用于展示方向，绝不代表某个GaN、LDMOS或GaAs器件。正式测试必须由热瞬态、DC效率和多温度I/Q数据提取。
+
+### 13.8 MIMO热耦合
+
+`MimoPaModel.parameters["thermalCouplingCPerW"]` 可配置链数乘链数的非负矩阵。行表示受热PA，列表示热源PA：
+
+```math
+\Delta\mathbf T_{\mathrm{mutual}}
+=
+\mathbf R_{\mathrm{th,mutual}}
+\mathbf P_{\mathrm{diss}}.
+```
+
+对角线强制为零，因为每个 `PaModel` 已经通过自己的Foster网络计算自热。当前互热矩阵是逐帧低速稳态近似：本帧测得的逐链平均耗散决定下一帧的相邻温升。若需要互热本身也具有多个时间常数，应把每个非对角路径扩展为独立Foster网络。
+
+### 13.9 推荐调用方式
+
+```python
+import numpy as np
+
+from inc.lib.Channel import Channel
+from inc.lib.PaModel import PaModel, ThermalConfig
+
+
+thermalConfig = ThermalConfig(
+    enabled=True,
+    modelName="foster",
+    sampleRateHz=80.0e6,
+    ambientTemperatureC=25.0,
+    initialJunctionTemperatureC=25.0,
+    thermalResistancesCPerW=(2.0, 8.0, 20.0),
+    thermalTimeConstantsSec=(50.0e-6, 5.0e-3, 0.5),
+    idleDissipatedPowerW=0.15,
+    gainTemperatureCoefficientDbPerC=-0.012,
+)
+paModel = PaModel(
+    parameters={
+        "modelName": "gmp",
+        "thermalConfig": thermalConfig,
+        "width": 0,
+    }
+)
+channel = Channel(
+    paModel=paModel,
+    parameters={
+        "sampleRateHz": 80.0e6,
+        "maximumOutputPowerDbm": 25.0,
+        "width": 0,
+    },
+)
+
+# Calibration ignores temperature and returns one frozen drive waveform.
+frozenInput = channel.PrepareThermalTest(
+    rawSignal,
+    calibrationOutputPowerDbm=22.0,
+    initialJunctionTemperatureC=25.0,
+    ambientTemperatureC=25.0,
+)
+
+frameRecords = []
+for frameIndex in range(20):
+    receivedSignal = channel.Process(frozenInput)
+    frameRecords.append(
+        {
+            "frameIndex": frameIndex,
+            **channel.GetThermalMetrics(),
+        }
+    )
+    channel.AdvanceThermalIdle(idleTimeSec=1.0e-3)
+
+assert np.array_equal(frozenInput, frozenInput.copy())
+```
+
+测试阶段没有提供 `outputPowerDbm`，所以不会重新调整输入。`GetThermalMetrics()` 可返回结温、平均耗散、RF占空比、有效RF区输出功率和累计物理时间；有效区定义与 `activePowerThresholdDb` 一致，因此前后补零不会把输出功率读数拉低。EVM、ACLR仍由独立 `Analysis` 使用每帧输出计算。
+
+## 14. 使用边界和常见误解
 
 1. **行为拟合好不等于电路正确**：相同输入范围内波形拟合好，不能推出器件效率、稳定性或可靠性。
 2. **外推风险**：模型只应在训练/设定的幅度、带宽和温度范围内使用；高阶多项式在范围外可能快速发散。
@@ -1418,9 +1736,11 @@ mimoPaModel.SetTargetOutputPowerDbm(
 
 ---
 
-## 14. 参考资料
+## 15. 参考资料
 
 - [C. Rapp, “Effects of HPA-Nonlinearity on a 4-DPSK/OFDM-Signal,” 1991](https://elib.dlr.de/33776/)
 - [D. R. Morgan 等, “A Generalized Memory Polynomial Model for Digital Predistortion of RF Power Amplifiers,” IEEE TSP, 2006](https://doi.org/10.1109/TSP.2006.879264)
+- [Y. Mancuso 与 R. Quéré, “Behavioral Thermal Modeling for Microwave Power Amplifier Design,” IEEE TMTT, 2007](https://doi.org/10.1109/TMTT.2007.907715)
+- [S. A. Bassam 等, “Black-box Modeling and Compensation of Bursty Communication Signals in RF Power Amplifiers with Power-Dependent Parameters,” 2014](https://arxiv.org/abs/1410.8119)
 
 本工程的 Rapp AM-AM、有界 AM-PM 和默认 GMP 系数是面向教学与算法比较的组合实现；具体公式和默认值以 `inc/lib/PaModel.py` 为准。
