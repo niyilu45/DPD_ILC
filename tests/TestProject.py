@@ -749,6 +749,41 @@ def CheckDocumentationMathCompatibility() -> None:
             )
 
 
+def CheckDocumentationImageLinks() -> None:
+    """Verify that every repository-local Markdown image can render on GitHub.
+
+    Processing details:
+        Algorithm: Scan README and principle documents for Markdown image
+        targets, ignore explicit web URLs, strip optional anchors, resolve each
+        path relative to its source document, and require a nonempty file.
+
+    Returns:
+        result: None. Missing or empty image assets fail before publication.
+    """
+
+    documentPaths = [GetProjectRoot() / "README.md"]
+    documentPaths.extend(
+        sorted((GetProjectRoot() / "doc").glob("*.md"))
+    )
+    imagePattern = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+    checkedImageCount = 0
+    for documentPath in documentPaths:
+        markdownText = documentPath.read_text(encoding="utf-8")
+        for rawTarget in imagePattern.findall(markdownText):
+            imageTarget = rawTarget.strip().split("#", 1)[0]
+            if imageTarget.startswith(("http://", "https://", "data:")):
+                continue
+            imagePath = (documentPath.parent / imageTarget).resolve()
+            assert imagePath.is_file(), (
+                f"missing Markdown image in {documentPath}: {imageTarget}"
+            )
+            assert imagePath.stat().st_size > 0, (
+                f"empty Markdown image in {documentPath}: {imageTarget}"
+            )
+            checkedImageCount += 1
+    assert checkedImageCount >= 19
+
+
 def CheckDocumentationApiConsistency() -> None:
     """Verify runnable Markdown snippets and documented Analysis arguments.
 
@@ -4977,6 +5012,7 @@ def RunTests() -> None:
     CheckBenchmarkSeparation()
     CheckFunctionPrincipleCoverage()
     CheckDocumentationMathCompatibility()
+    CheckDocumentationImageLinks()
     CheckDocumentationApiConsistency()
     CheckInternalDefaultConfiguration()
     CheckUnknownConfigurationWarnings()

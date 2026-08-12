@@ -1261,7 +1261,7 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 Wiener、GMP、Doherty 的静态增益曲线定义、1 dB 压缩点推导、每一个配置值对曲线的移动或变形方式、外部 dBm 工作点与模型曲线的区别，以及恒包络扫幅示例，见
 [PaModel.md：配置时如何读取和调节增益曲线](doc/PaModel.md#49-配置时如何读取和调节增益曲线)。
 
-`ThermalConfig` 支持静态温度角、单RC和多极点Foster。完整参数、不同热模型优缺点、耗散功率/效率公式、功率与占空比示意图，以及“无热校准一次、冻结驱动、开环观察功率漂移”的推荐用法见 [PaModel电热模型](doc/PaModel.md#13-pa电热模型功率占空比与输出漂移)。温度测试使用 `channel.PrepareThermalTest(...)` 获取冻结输入，之后调用 `channel.Process(frozenInput)`，不能每帧再次传 `outputPowerDbm`。
+`ThermalConfig` 支持静态温度角、单RC和多极点Foster。完整内容见 [PaModel电热模型](doc/PaModel.md#13-pa电热模型功率占空比与输出漂移)：其中分别推导了静态角、单RC、Foster、Cauer、温度条件化GMP和神经网络电热模型，并直接展示热阻、时间常数、Foster支路、更新间隔、效率上下界、效率膝点、占空比、空闲功耗、温度电参数和MIMO互热的参数效果图。温度测试使用 `channel.PrepareThermalTest(...)` 获取冻结输入，之后调用 `channel.Process(frozenInput)`，不能每帧再次传 `outputPowerDbm`。
 
 `MimoPaModel(parameters=None, width=None, **parameterOverrides)` 在构造函数内部使用 `ChainMap` 管理以下参数：
 

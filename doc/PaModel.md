@@ -1421,6 +1421,32 @@ mimoPaModel.SetTargetOutputPowerDbm(
 
 ## 13. PA电热模型：功率、占空比与输出漂移
 
+PA的“热”不是给电模型附加一个随机温度误差，而是一条有明确能量来源、时间尺度和反馈方向的慢动态链。晶体管把直流能量的一部分变成RF输出，其余主要变成热；热量经过芯片、封装、PCB和散热器逐级扩散，结温再改变器件跨导、阈值、电容、膝点和饱和能力。因此，相同瞬时输入幅度在“冷机”和“热机”状态下可以产生不同输出，这就是电热记忆。
+
+从能量与信号的角度，可以把本工程的模型分成四层：
+
+```mermaid
+flowchart LR
+    waveform["RF波形<br/>功率、PAPR、占空比、突发周期"] --> electrical["Wiener / GMP / Doherty<br/>快速电记忆"]
+    electrical --> heat["效率与耗散估计<br/>RF功率映射到瓦特"]
+    heat --> network["静态 / 单RC / Foster<br/>瓦特和时间映射到结温"]
+    network --> drift["增益、相位、饱和和非线性漂移"]
+    drift --> electrical
+    network --> metrics["结温、耗散、输出功率、EVM、ACLR"]
+```
+
+四层的物理时间尺度不同：
+
+| 现象 | 常见时间尺度 | 本工程中的位置 | 能否由短波形直接识别 |
+|---|---:|---|---|
+| 瞬时AM-AM、AM-PM | 亚采样到若干采样 | Wiener/GMP/Doherty电模型 | 可以 |
+| 匹配网络与偏置电记忆 | 数ns到数us | FIR或GMP记忆项 | 可以，但需要足够带宽 |
+| 芯片和封装快热 | 数us到数ms | Foster快速支路 | 需要连续突发或功率阶跃 |
+| PCB、底板和散热器慢热 | 数ms到数s以上 | Foster慢速支路 | 需要更长采集和明确空闲时间 |
+| 环境温度变化 | 秒到分钟 | `ambientTemperatureC`外部边界 | 一般需要温箱或温度记录 |
+
+因此不能把GMP的几个采样点记忆深度当成热记忆。采样点GMP负责快速电效应，Foster状态负责跨帧保留的慢温度效应；两者可以同时存在。
+
 ### 13.1 完整因果链路
 
 ![PA电热参数作用位置](./images/pa_thermal/thermal_parameter_map.png)
@@ -1442,6 +1468,304 @@ channel.Process(rawSignal, outputPowerDbm=22.0)
 
 ### 13.2 常见热模型的优缺点比较
 
+#### 13.2.1 所有集总热模型的共同物理起点
+
+真实器件内部温度由热传导方程决定：
+
+```math
+\rho c_p
+\frac{\partial T}{\partial t}
+=
+\nabla
+\left(
+k\nabla T
+\right)
++
+q_v.
+```
+
+其中，`rho`表示材料密度，`cp`表示比热容，`k`表示导热系数，`qv`表示单位体积热源。这个偏微分方程能够描述芯片不同位置的温度，但需要器件几何、材料和边界条件；行为级DPD仿真通常没有这些信息，也不适合在每个RF样点上运行三维热仿真。
+
+集总热模型把空间温度场压缩成少量状态。热—电类比为：
+
+| 热学量 | 电学类比 | 单位 |
+|---|---|---|
+| 温差 | 电压 | 摄氏度或K |
+| 热流率、耗散功率 | 电流 | W |
+| 热阻 | 电阻 | 摄氏度/W |
+| 热容 | 电容 | J/摄氏度 |
+| 环境温度 | 参考电位 | 摄氏度 |
+
+热阻和热容定义为：
+
+```math
+R_{\mathrm{th}}
+=
+\frac{\Delta T}{P_{\mathrm{heat}}},
+```
+
+```math
+C_{\mathrm{th}}
+=
+\frac{\Delta E_{\mathrm{heat}}}{\Delta T}.
+```
+
+两者乘积给出热时间常数：
+
+```math
+\tau
+=
+R_{\mathrm{th}}C_{\mathrm{th}}.
+```
+
+本节后续模型的区别，本质上是“保留多少温度状态、这些状态怎样连接，以及输出波形怎样依赖这些状态”。
+
+#### 13.2.2 静态温度角模型
+
+静态温度角不求解发热过程，而是直接指定测试期间的结温：
+
+```math
+T_j(t)
+=
+T_{\mathrm{corner}}.
+```
+
+代码中 `modelName="static"` 使用 `initialJunctionTemperatureC` 作为该温度角。`Advance`仍会累计物理时间，但不会根据耗散功率改变温度。它相当于假设温箱、热台或理想温控器已经把PA固定在目标温度。
+
+典型辨识流程是分别在25、85和125摄氏度等稳态温度下采集同一功率、同一波形的I/Q数据，然后拟合每个温度角的增益、相位、AM-AM和AM-PM。静态温度角能回答“同一PA在不同温度下有什么差异”，但不能回答“波形需要发射多久才升到该温度”。
+
+优点是最简单、结果易复现、适合电参数温度系数验证；缺点是没有功率到温度的因果关系、没有冷却、没有占空比效应，也没有热迟滞。若用户只给一个固定温度且不关心升温过程，应优先使用它。
+
+#### 13.2.3 单RC热模型
+
+单RC把整个器件和散热路径压缩成一个结温状态。能量平衡为：
+
+```math
+C_{\mathrm{th}}
+\frac{dT_j(t)}{dt}
+=
+P_{\mathrm{diss}}(t)
+-
+\frac{T_j(t)-T_{\mathrm{ambient}}}
+{R_{\mathrm{th}}}.
+```
+
+令温升为：
+
+```math
+\theta(t)
+=
+T_j(t)-T_{\mathrm{ambient}},
+```
+
+可得到：
+
+```math
+\tau
+\frac{d\theta(t)}{dt}
++
+\theta(t)
+=
+R_{\mathrm{th}}P_{\mathrm{diss}}(t).
+```
+
+当耗散功率从0阶跃到常数 `P0` 时：
+
+```math
+\theta(t)
+=
+R_{\mathrm{th}}P_0
+\left(
+1-e^{-t/\tau}
+\right).
+```
+
+断开发热后的冷却过程为：
+
+```math
+\theta(t)
+=
+\theta(0)e^{-t/\tau}.
+```
+
+因此 `Rth`决定最终温升，`tau`决定上升与冷却速度。代码用 `modelName="single_rc"` 并要求 `thermalResistancesCPerW` 和 `thermalTimeConstantsSec` 各只有一个值。
+
+单RC适合热阶跃近似为一条指数曲线的器件，也适合先验证功率—温度—输出漂移闭环是否正确。它的局限是把芯片、封装、PCB和散热器混成一个状态；如果实测曲线在对数时间轴上有多个膝点，单RC不可能同时拟合快热和慢热。
+
+#### 13.2.4 Foster多支路热模型
+
+Foster模型把测得的瞬态热阻表示成多个一阶模态的和。第 `i` 个状态满足：
+
+```math
+\tau_i
+\frac{d\theta_i(t)}{dt}
++
+\theta_i(t)
+=
+R_iP_{\mathrm{diss}}(t).
+```
+
+总结温为：
+
+```math
+T_j(t)
+=
+T_{\mathrm{ambient}}
++
+\sum_{i=1}^{K}\theta_i(t).
+```
+
+单位功率阶跃对应的瞬态热阻为：
+
+```math
+Z_{\mathrm{th}}(t)
+=
+\sum_{i=1}^{K}
+R_i
+\left(
+1-e^{-t/\tau_i}
+\right).
+```
+
+每个模态可以解释为一个快、中或慢时间尺度，但Foster并联支路通常不应直接解释为某一层真实材料。例如最快支路可能主要反映芯片内部扩散，最慢支路可能主要反映散热器，但拟合出来的支路是数学模态，不保证与物理层一一对应。
+
+本工程 `modelName="foster"` 对每个更新区间使用精确零阶保持离散解：
+
+```math
+\theta_i[n+1]
+=
+e^{-\Delta t/\tau_i}\theta_i[n]
++
+R_i
+\left(
+1-e^{-\Delta t/\tau_i}
+\right)
+P_{\mathrm{diss}}[n].
+```
+
+它同时支持帧内加热、跨帧状态保持与 `AdvanceIdle` 冷却，是当前工程推荐的动态热模型。优点是易从热瞬态曲线拟合、少量状态即可覆盖多个数量级时间；缺点是支路缺少直接空间含义，在改变散热结构或边界条件后不能可靠外推。
+
+#### 13.2.5 Cauer梯形热网络
+
+Cauer模型用串联热阻和对地热容形成梯形网络。节点可按顺序代表结区、芯片、封装、PCB和散热器。以三个温度节点为例，第一节点满足：
+
+```math
+C_1
+\frac{dT_1}{dt}
+=
+P_{\mathrm{diss}}
+-
+\frac{T_1-T_2}{R_1},
+```
+
+中间节点满足：
+
+```math
+C_2
+\frac{dT_2}{dt}
+=
+\frac{T_1-T_2}{R_1}
+-
+\frac{T_2-T_3}{R_2},
+```
+
+最后节点通过最后一级热阻与环境连接：
+
+```math
+C_3
+\frac{dT_3}{dt}
+=
+\frac{T_2-T_3}{R_2}
+-
+\frac{T_3-T_{\mathrm{ambient}}}{R_3}.
+```
+
+热量必须依次经过各节点，所以Cauer网络更接近真实分层热流，适合研究更换散热器、PCB铜层或界面材料的影响。其代价是参数提取更复杂；只测一个结温输出时，多组内部参数可能产生相近曲线，必须结合结构热仿真或多个温度传感点。
+
+当前代码没有直接实现Cauer状态更新。若只有结温瞬态数据，可先把拟合的Cauer网络转换成等效Foster极点后使用；若要观察封装或PCB内部节点温度，则应新增专门的Cauer网络类，不能用一个Foster支路名称假装成物理层。
+
+#### 13.2.6 温度条件化GMP电热模型
+
+RC、Foster和Cauer负责预测温度，但还需要把温度连接到RF输出。比当前公共漂移层更高精度的方法，是让GMP系数直接依赖结温：
+
+```math
+y(n)
+=
+\sum_{p,m}
+c_{p,m}(T_j)
+x(n-m)
+\left|x(n-m)\right|^{p-1}
++
+y_{\mathrm{cross}}(n,T_j).
+```
+
+最简单的系数温度模型为一次插值：
+
+```math
+c_{p,m}(T_j)
+=
+c_{p,m,0}
++
+c_{p,m,1}
+\left(
+T_j-T_{\mathrm{ref}}
+\right).
+```
+
+也可以在若干温度角分别训练GMP系数，再按温度插值。这样不仅公共增益会变化，不同阶次、不同记忆延迟和交叉项都能拥有独立温度斜率，因此能表示温度相关AM-AM、AM-PM和非线性记忆。
+
+它的优点是RF波形拟合精度高，适合给DPD生成温度相关训练数据；缺点是参数数目约随温度基函数数量成倍增加，要求多温度、同参考面、同功率定义的I/Q数据。温度与输入包络高度相关时，普通最小二乘还可能无法区分“电记忆项”和“温度项”，需要多种突发周期与占空比来提高可辨识性。
+
+当前 `ApplyTemperatureDrift` 是温度条件化GMP的低阶近似：它在完整Wiener/GMP/Doherty输出外统一施加增益、相位、饱和和附加压缩。若实测表明不同GMP阶次具有明显不同的温度斜率，才建议升级为逐系数温度条件化。
+
+#### 13.2.7 神经网络电热模型
+
+神经网络模型把当前波形、历史包络、温度或隐状态共同映射到输出。例如状态空间形式为：
+
+```math
+\mathbf h[n+1]
+=
+F
+\left(
+\mathbf h[n],
+x[n],
+P_{\mathrm{diss}}[n]
+\right),
+```
+
+```math
+y[n]
+=
+G
+\left(
+x[n],
+\mathbf h[n]
+\right).
+```
+
+隐状态可以由循环神经网络、门控单元或神经常微分方程实现。若同时输入物理Foster温度，网络只学习Foster没有解释的RF残差，通常比完全黑盒方式更节省数据，这类结构可称为物理引导混合模型。
+
+优势是能表示强非线性、多时间尺度、复杂迟滞和难以手写的温度相关记忆；风险是需要大量覆盖功率、带宽、温度、占空比和突发周期的数据，且可能在训练范围外发散。对于DPD闭环，网络还必须保证因果性、数值有界和可实时计算。推荐顺序是先使用Foster加现有漂移层，再尝试温度条件化GMP，只有两者验证误差仍不满足要求时才使用神经网络。
+
+#### 13.2.8 模型之间的选择关系
+
+```mermaid
+flowchart TD
+    start{"是否需要动态升温和冷却？"}
+    start -->|否| static["静态温度角"]
+    start -->|是| knee{"热阶跃是否只有一个明显膝点？"}
+    knee -->|是| single["单RC"]
+    knee -->|否| physical{"是否必须解释芯片、封装、PCB内部节点？"}
+    physical -->|否| foster["多支路Foster"]
+    physical -->|是| cauer["Cauer或三维热仿真"]
+    foster --> residual{"不同温度下RF残差是否仍有结构？"}
+    residual -->|较弱| drift["公共温度漂移层"]
+    residual -->|阶次相关| tgmp["温度条件化GMP"]
+    residual -->|强迟滞且难参数化| neural["物理引导神经网络"]
+```
+
+这不是按复杂度越高越好的排序。模型选择应以独立验证集上的结温误差、输出功率漂移、对齐后EVM/NMSE和带外误差为依据，并优先保留参数可辨识、能够解释且足够简单的结构。
+
 | 热模型 | 主要优点 | 主要缺点 | 参数获取 | 本工程状态与推荐场景 |
 |---|---|---|---|---|
 | 静态温度角 | 最简单；适合25、85、125摄氏度等温箱定点比较 | 不由信号功率和占空比产生动态温升；没有热迟滞 | 温箱稳态测量 | `modelName="static"`；用于温度角，不用于自热瞬态 |
@@ -1451,9 +1775,9 @@ channel.Process(rawSignal, outputPowerDbm=22.0)
 | 温度条件化GMP | 直接拟合不同结温下的复系数，能描述真实AM-AM、AM-PM和记忆漂移 | 需要多个温度、功率和波形数据集；系数插值可能病态 | 多温度同步I/Q采集 | 当前用低阶温度漂移层近似；高精度版本可替换 `ApplyTemperatureDrift` |
 | 神经网络电热模型 | 可表达强非线性、复杂迟滞和多状态耦合 | 数据量大、可解释性弱、外推和稳定性难保证 | 大规模带温度标签训练集 | 不作为首版默认；适合Foster加GMP仍无法达到NMSE目标时 |
 
-![不同热模型和参数影响](./images/pa_thermal/thermal_model_effects.png)
+![不同热模型和参数影响概览](./images/pa_thermal/thermal_model_effects.png)
 
-图A说明单RC只有一个拐点，多极点Foster可同时呈现快、中、慢时间尺度，静态角只规定某个温度而没有因果升温曲线。图B说明静态偏置热始终存在，有效RF占空比提高会增加平均耗散功率。图C说明驱动冻结以后，结温上升可以导致输出功率自然漂移。这些曲线只用于说明参数关系，不是器件测量结果或标准限值。
+这是一张总览图：图A说明单RC只有一个拐点，多极点Foster可同时呈现快、中、慢时间尺度，静态角只规定某个温度而没有因果升温曲线；图B说明静态偏置热始终存在，有效RF占空比提高会增加平均耗散功率；图C说明驱动冻结以后，结温上升可以导致输出功率自然漂移。后续各节给出按参数逐项变化的高清效果图。所有曲线都用于说明参数关系，不是器件测量结果或标准限值。
 
 ### 13.3 热源和效率模型
 
@@ -1504,6 +1828,34 @@ P_{\mathrm{RF,out}}[n]
 ```
 
 这不是某个工艺的固定效率曲线。应使用实测DC电压、电流和RF输出功率拟合 `minimumDrainEfficiency`、`peakDrainEfficiency` 和 `efficiencyKneeOutputPowerDbm`。
+
+#### 13.3.1 热源参数效果图
+
+![热源参数效果图](./images/pa_thermal/thermal_heat_source_parameter_effects.png)
+
+四幅子图分别对应代码中的四组直接参数：
+
+- **图A：`minimumDrainEfficiency`与`peakDrainEfficiency`**。提高低功率效率会主要压低低功率区的估算热量；提高峰值效率会主要压低高功率区热量。效率越高，同一RF输出所需要转换成热的功率越少。
+- **图B：`efficiencyKneeOutputPowerDbm`**。膝点提高会把效率上升区向右移动，因此同一个中等输出功率会被认为效率更低、发热更多。膝点不是PA的1 dB压缩点，而是本热源效率曲线的过渡位置。
+- **图C：`referenceOutputPowerDbm`**。它规定归一化波形的物理瓦特标尺。波形数值完全不变时，提高这个参数会提高估计RF瓦特数和耗散功率，因此它必须与Channel使用的满量程功率定义一致。
+- **图D：`idleDissipatedPowerW`与占空比**。占空比为0时只剩空闲偏置耗散；占空比为100%时由开启耗散主导。提高空闲耗散会显著影响低占空比和长帧间隔场景，但不会改变RF开启时设置的目标输出功率。
+
+如果能够同步测量漏极电压和电流，推荐先直接计算：
+
+```math
+P_{\mathrm{DC}}(n)
+=
+V_{\mathrm{DD}}(n) I_{\mathrm{DD}}(n),
+```
+
+```math
+\eta(n)
+=
+\frac{P_{\mathrm{RF,out}}(n)}
+{P_{\mathrm{DC}}(n)},
+```
+
+再拟合效率参数。若没有DC测量，只凭I/Q波形不能唯一确定耗散功率，此时热参数只能作为假设或由温度漂移间接辨识。
 
 ### 13.4 占空比为何自然进入温度
 
@@ -1570,6 +1922,65 @@ T_{\mathrm{ambient}}
 
 `thermalResistancesCPerW` 决定稳态温升；`thermalTimeConstantsSec` 决定达到稳态的速度。两者必须一一对应。`thermalUpdateIntervalSamples` 只决定每隔多少RF样点更新一次慢热状态：减小它可提高帧内温漂分辨率但增加计算量；它不改变物理时间常数。
 
+#### 13.5.1 热网络参数效果图
+
+![热网络参数效果图](./images/pa_thermal/thermal_network_parameter_effects.png)
+
+- **图A：只改变热阻**。对于1 W恒定耗散，最终温升就是热阻的数值；热阻翻倍，稳态温升翻倍。热阻控制纵轴终点，不负责定义到达终点的速度。
+- **图B：只改变时间常数**。三条曲线最终都达到30摄氏度温升，但时间常数越大，到达稳态越慢。单RC在一个时间常数时达到最终温升的约63.2%。
+- **图C：改变Foster支路分配**。总热阻相同并不代表瞬态相同。快速支路决定突发刚开始时的陡升，中速支路影响帧或子帧尺度，慢速支路决定长时间热浸泡。
+- **图D：改变 `thermalUpdateIntervalSamples` 对应的更新时间**。粗更新会出现台阶，但每个台阶仍使用精确零阶保持解；只要平均耗散估计合理，它不会有意改变稳态温升。若更新间隔已经接近最小热时间常数，帧内峰值温度和非线性漂移会被低估。
+
+单RC参数可由一次已知耗散功率阶跃近似提取。稳态热阻为：
+
+```math
+R_{\mathrm{th}}
+=
+\frac{T_{j,\infty}-T_{j,0}}
+{P_{\mathrm{diss,step}}}.
+```
+
+时间常数可从63.2%交点读取：
+
+```math
+T_j(\tau)-T_{j,0}
+=
+0.632
+\left(
+T_{j,\infty}-T_{j,0}
+\right).
+```
+
+多极点Foster不应逐个凭感觉设置。可对测得的瞬态热阻曲线做非负拟合：
+
+```math
+Z_{\mathrm{th}}(t)
+=
+\sum_{i=1}^{K}
+R_i
+\left(
+1-e^{-t/\tau_i}
+\right).
+```
+
+拟合时建议先在对数时间轴观察有几个明显膝点，再逐步增加支路数；若增加支路后验证误差不再明显下降，应停止增加，避免多个相近时间常数互相抵消。工程上可先令热更新时间满足：
+
+```math
+\Delta t_{\mathrm{thermal}}
+\mathrel{\leq}
+\frac{\tau_{\min}}{10}.
+```
+
+换算成配置样点数为：
+
+```math
+N_{\mathrm{update}}
+\mathrel{\leq}
+\frac{f_s\tau_{\min}}{10}.
+```
+
+这是分辨最快热节点的经验起点，不是稳定性限制；代码的指数更新本身在更大步长下仍保持数值稳定。
+
 ### 13.6 温度怎样修改现有电模型
 
 当前首版采用可解释的公共温度漂移层。复增益为：
@@ -1624,6 +2035,33 @@ G(T)
 
 如果要精确描述Doherty两支路温差，应把carrier和peaking拆为两个独立 `PaModel` 热节点，再拟合各自耗散和合成参数。本实现优先保证与当前统一Doherty接口兼容。
 
+#### 13.6.1 温度到电参数的效果图
+
+![温度到电参数效果图](./images/pa_thermal/thermal_electrical_parameter_effects.png)
+
+- **图A：`gainTemperatureCoefficientDbPerC`**。该参数直接规定每升高1摄氏度增益改变多少dB。冻结PA输入时，若压缩深度变化不大，输出功率漂移的一阶近似就是同样的dB斜率。
+- **图B：`phaseTemperatureCoefficientDegreesPerC`**。正值表示温度升高时公共相位正向旋转，负值相反。若Analysis启用公共复增益补偿，这一项会被大部分消除，因此它可能在原始MSE中明显、在对齐后EVM中不明显。
+- **图C：`saturationTemperatureCoefficientPerC`**。负值使饱和尺度随温度降低，压缩膝点向较小幅度移动；正值则反向。它会改变峰值样点，通常比公共增益更容易恶化EVM和ACLR。
+- **图D：`nonlinearityTemperatureCoefficientPerC`**。低幅样点接近不变，高幅样点优先被压缩，因此它改变的是波形形状，而不只是整体增益。该参数过大时会与基础Wiener/GMP高阶项重复计入非线性。
+
+公共增益和相位漂移主要构成可校正线性项：
+
+```math
+y(n,T)
+\mathrel{\approx}
+g(T)y_0(n).
+```
+
+而饱和和非线性温漂产生与包络相关的残差：
+
+```math
+e_{\mathrm{thermal}}(n,T)
+=
+y(n,T)-g(T)y_0(n).
+```
+
+因此判断温度模型是否真的影响调制质量时，应同时记录：未补偿输出功率与相位、复增益补偿后的EVM/NMSE、ACLR或双音IMD。只观察输出功率无法区分公共增益下降和非线性增强；只观察对齐后EVM又可能漏掉系统预算关心的绝对增益漂移。
+
 ### 13.7 `ThermalConfig`完整参数
 
 | 参数 | 默认值 | 单位 | 物理作用 |
@@ -1652,6 +2090,50 @@ G(T)
 
 这些默认值只用于展示方向，绝不代表某个GaN、LDMOS或GaAs器件。正式测试必须由热瞬态、DC效率和多温度I/Q数据提取。
 
+#### 13.7.1 参数增大时会发生什么
+
+| 参数增大 | 曲线或状态的直接变化 | 常见可观测结果 | 主要辨识数据 |
+|---|---|---|---|
+| `sampleRateHz` | 同样样点数代表更短物理时间 | 每帧温升变小，但真实相同持续时间不应改变 | 仪表实际采样率 |
+| `ambientTemperatureC` | 整条结温轨迹向上移动 | 冷启动温度更高，更早进入热压缩 | 环境、底板或温箱温度 |
+| `initialJunctionTemperatureC` | 只改变瞬态起点 | 前几帧输出不同，足够长时间后趋于同一稳态 | 测试开始时结温估计 |
+| `referenceTemperatureC` | 改变“零电漂移”的基准点 | 同一结温对应的增益/相位偏移变化 | 基础PA系数提取时温度 |
+| `thermalResistancesCPerW` | 对应支路的最终温升增大 | 稳态增益和输出功率漂移增大 | 已知功率阶跃的稳态温升 |
+| `thermalTimeConstantsSec` | 对应支路响应变慢 | 热迟滞变长、冷却变慢，但最终温升不变 | 功率阶跃上升与冷却曲线 |
+| `thermalUpdateIntervalSamples` | 可见温度台阶变粗 | 过大时漏掉帧内热纹波 | 最小时间常数与采样率 |
+| `idleDissipatedPowerW` | RF关闭阶段平衡温度升高 | 长空闲后不再完全冷却到环境温度 | 静态偏置DC功率 |
+| `minimumDrainEfficiency` | 低功率耗散降低 | 低输出功率和低占空比温升下降 | 低功率DC/RF效率 |
+| `peakDrainEfficiency` | 高功率耗散降低 | 高输出功率温升下降 | 接近额定输出的DC/RF效率 |
+| `efficiencyKneeOutputPowerDbm` | 效率转折向高功率移动 | 中功率区效率降低、热量增加 | 效率随输出功率扫描 |
+| `referenceOutputPowerDbm` | 同一归一化样值映射到更多瓦特 | 所有RF开启区的估算热量增加 | 端口满量程和阻抗标定 |
+| `activePowerThresholdDb` | 更多低幅样点被判为空闲 | 估算占空比与耗散可能降低 | 波形开启区定义与噪声底 |
+| `gainTemperatureCoefficientDbPerC` | 增益随温度的dB斜率变得更正 | 冻结驱动下输出功率随温度上升 | 多温度小信号增益 |
+| `phaseTemperatureCoefficientDegreesPerC` | 公共相位斜率变得更正 | 原始MSE和相位漂移增加 | 多温度复增益相位 |
+| `saturationTemperatureCoefficientPerC` | 饱和尺度随温度的斜率变得更正 | 热压缩减弱；负值增大绝对值则更早压缩 | 多温度AM-AM膝点 |
+| `nonlinearityTemperatureCoefficientPerC` | 高幅附加压缩增强 | EVM、ACLR和IMD通常恶化 | 多温度对齐后非线性残差 |
+| `maximumJunctionTemperatureC` | 只放宽仿真停止上限 | 不改变上限以内的任何曲线 | 器件额定值和降额策略 |
+
+注意“增大”是数值方向。例如 `gainTemperatureCoefficientDbPerC` 从 `-0.025` 增大到 `-0.005`，意味着负温漂变弱；不能只比较绝对值。
+
+#### 13.7.2 采样、门限、参考点和安全上限效果图
+
+![热配置边界参数效果图](./images/pa_thermal/thermal_boundary_parameter_effects.png)
+
+- **图A：`sampleRateHz`和 `thermalUpdateIntervalSamples`**共同决定一次热更新对应的真实时间。更新样点数不变时，采样率越高，物理更新时间越短；因此把同一配置直接搬到不同采样率会改变热过程。
+- **图B：`activePowerThresholdDb`**相对于当前波形峰值判定RF开启区。门限提高会把更多低包络样点当成空闲并使用 `idleDissipatedPowerW`；门限过低则可能把噪声底或数值残留当成RF开启。
+- **图C：`referenceTemperatureC`**移动所有温度电系数的零交点，但不改变热网络预测的真实结温。它应等于基础Wiener/GMP/Doherty系数采集或拟合时的温度。
+- **图D：`maximumJunctionTemperatureC`**只是仿真停止边界，不会剪切、压低或稳定其下的结温曲线。降低上限只会使同一发热轨迹更早报错，不能代替功率降额或温控模型。
+
+时间换算关系为：
+
+```math
+\Delta t_{\mathrm{thermal}}
+=
+\frac{N_{\mathrm{update}}}{f_s}.
+```
+
+如果波形包含前后补零，门限判定会让这些样点使用空闲耗散，但样点所对应的时间仍完整推进。这样补零既不会虚构RF输出功率，又能正确表示实际静默时间。
+
 ### 13.8 MIMO热耦合
 
 `MimoPaModel.parameters["thermalCouplingCPerW"]` 可配置链数乘链数的非负矩阵。行表示受热PA，列表示热源PA：
@@ -1664,6 +2146,31 @@ G(T)
 ```
 
 对角线强制为零，因为每个 `PaModel` 已经通过自己的Foster网络计算自热。当前互热矩阵是逐帧低速稳态近似：本帧测得的逐链平均耗散决定下一帧的相邻温升。若需要互热本身也具有多个时间常数，应把每个非对角路径扩展为独立Foster网络。
+
+#### 13.8.1 运行条件和互热参数效果图
+
+![运行条件和互热参数效果图](./images/pa_thermal/thermal_operating_parameter_effects.png)
+
+- **图A**比较相同50%占空比、不同突发周期。平均耗散相同不保证峰值结温和温度纹波相同，因为快速热节点能否在一次开启或关闭期间充分响应取决于脉冲周期。
+- **图B**显示环境温度是结温的外部基线。环境温度变化不会改变热阻和时间常数，但会改变同一耗散下的绝对结温及电参数漂移。
+- **图C**显示初始结温只改变起始状态。当测试持续时间不足时，初始条件会显著影响结果；不能把不同预热状态的数据直接比较。
+- **图D**显示 `thermalCouplingCPerW` 的基本含义：相邻PA耗散功率乘互热阻，就是受热PA的附加温升。当前实现按本帧功率更新下一帧温度偏移，适合慢速板级互热，不用于描述采样级串扰。
+
+两路PA的例子为：
+
+```math
+\Delta T_1
+=
+R_{12}P_{\mathrm{diss},2},
+```
+
+```math
+\Delta T_2
+=
+R_{21}P_{\mathrm{diss},1}.
+```
+
+`R12`与`R21`不必相等，因为芯片位置、铜皮、散热器压力和气流方向可能不对称。若测得互热存在明显上升和冷却时间常数，当前稳态矩阵只能拟合最终温升，后续应把每条非对角路径扩展为动态Foster支路。
 
 ### 13.9 推荐调用方式
 
