@@ -951,7 +951,395 @@ Channel(
 
 与其他主类相同，默认值都定义在构造函数内部，并通过 `ChainMap` 与调用方配置合并。未知参数会产生警告、被忽略，并且不会中止处理；已识别但数值非法的参数仍会抛出异常。
 
-### 6.9 主要接口
+### 6.9 配置值如何进入模型，以及怎样选择
+
+配置参数可分为四类，不能用同一种方式选择：
+
+1. `sampleRateHz`、负载阻抗、实际时延、CFO、SFO和耦合系数属于**测量量**，应优先填写仪器或板级实测结果。
+2. Tx/FB I/Q、反馈非线性、ADC和噪声属于**非理想强度**，仿真时可用“理想、典型、压力”三级场景。
+3. 功率校准学习率、容差、探测步长和正则化属于**数值求解参数**，应根据收敛曲线调整，不能解释成射频器件指标。
+4. `width`、`fbAdcWidth` 和 `fbAdcFullScale` 属于**接口与量化参数**，应匹配真实数字链路，同时保留足够峰值余量。
+
+下面给出的“典型”数值是仿真起点，不是802.11强制限值，也不是所有芯片的统一规格。真实硬件应使用测量值替换。
+
+公共参数先决定整条链路的解释方式：
+
+- `sampleMode="forward"` 选择空口/仪表参考面，`"fb"` 选择板载反馈参考面；它不是失真强度数值，而是决定哪些FB模块会被执行。
+- `sampleRateHz` 必须等于波形真实采样率。错误配置为真实值的两倍时，同一个 `fbCarrierFrequencyOffsetHz` 产生的逐样点相位会少一半，所有以样点表示的时延也会被错误解释成一半的物理时间。
+- 公共 `phaseDegrees` 使输出乘以 $\exp(j\theta)$；`90 degree` 对应乘以 $j$，`-90 degree` 对应乘以 $-j$，功率不变。默认 `0 degree` 最适合不需要外部移相器的场景。
+- 公开接口 `width=0` 适合算法浮点归因；`width=12...16` 适合验证定点边界，其中默认16 bit通常作为高精度定点起点。正位宽的归一化LSB为 $2^{-(W-1)}$，位宽每减少1 bit，量化步长翻倍。
+
+#### 6.9.1 Tx与FB I/Q参数如何影响IRR
+
+增益误差 $g$ 和正交误差 $\phi$ 先变成直接系数 $\alpha$ 与镜像系数 $\beta$。当误差较小时：
+
+```math
+\beta
+\approx
+\frac{\ln(10)}{40}g
++
+j\frac{\phi}{2},
+```
+
+其中 $g$ 使用dB数值，$\phi$ 必须转换为弧度。忽略DC和其他失真时：
+
+```math
+\mathit{IRR}_{\mathrm{dB}}
+\approx
+-20\log_{10}|\beta|.
+```
+
+因此增益误差和相位误差不是简单相加，而是在复平面内形成镜像向量。下面分别只打开一种误差，便于理解单个配置值的影响。
+
+| I/Q增益误差绝对值 | 近似镜像幅度 | 单项IRR | 使用建议 |
+|---:|---:|---:|---|
+| `0 dB` | 0 | 理想无穷大 | 理想基线 |
+| `0.1 dB` | 0.00576 | 约44.8 dB | 轻微误差 |
+| `0.3 dB` | 0.0173 | 约35.3 dB | 典型仿真起点 |
+| `0.5 dB` | 0.0288 | 约30.8 dB | 明显镜像 |
+| `1.0 dB` | 0.0576 | 约24.8 dB | 压力测试 |
+
+| I/Q正交误差绝对值 | 近似镜像幅度 | 单项IRR | 使用建议 |
+|---:|---:|---:|---|
+| `0 degree` | 0 | 理想无穷大 | 理想基线 |
+| `1 degree` | 0.00873 | 约41.2 dB | 轻微误差 |
+| `2 degree` | 0.0175 | 约35.2 dB | 典型仿真起点 |
+| `3 degree` | 0.0262 | 约31.6 dB | 明显镜像 |
+| `5 degree` | 0.0436 | 约27.2 dB | 压力测试 |
+
+同时配置增益和相位误差时，应使用完整的 $\alpha$、$\beta$ 公式重新计算，不能把两行IRR直接相加。Tx与FB使用相同换算，但作用位置不同：
+
+- `txIq...` 在PA之前，镜像继续进入PA并产生共轭非线性级联；数值增大时，forward和fb的IRR、EVM都可能变差。
+- `fbIq...` 在PA之后，只污染fb观测；数值增大时，forward不变而fb的IRR、EVM变差。
+
+直流参数的影响由它相对有效信号RMS的比例决定：
+
+```math
+L_{\mathrm{DC,dBc}}
+\approx
+20\log_{10}
+\left(
+\frac{|d|}{x_{\mathrm{RMS}}}
+\right).
+```
+
+若内部有效信号RMS约为1，则 `|txDcOffset|=0.001`、`0.01`、`0.03` 分别约对应 -60 dBc、-40 dBc、-30.5 dBc 的直流分量。建议的仿真分级为：
+
+| 场景 | I/Q增益误差 | 正交误差 | DC幅度 |
+|---|---:|---:|---:|
+| 理想隔离 | `0 dB` | `0 degree` | `0` |
+| 轻微误差 | `0.1...0.3 dB` | `1...2 degree` | 信号RMS的 `0.1%...0.3%` |
+| 明显误差 | `0.3...0.7 dB` | `2...4 degree` | 信号RMS的 `0.3%...1%` |
+| 压力测试 | `0.7...1.5 dB` | `4...8 degree` | 信号RMS的 `1%...3%` |
+
+#### 6.9.2 PA前后耦合参数如何产生影响
+
+耦合路径的 `gainDb` 先转换为电压比例：
+
+```math
+c
+=
+10^{g_{\mathrm{cpl}}/20}.
+```
+
+| `gainDb` | 泄漏电压比例 | 泄漏功率比例 | 场景解释 |
+|---:|---:|---:|---|
+| `-50 dB` | 0.316% | 0.001% | 很弱，接近隔离良好 |
+| `-40 dB` | 1.00% | 0.01% | 轻微耦合 |
+| `-30 dB` | 3.16% | 0.10% | 推荐的可见耦合起点 |
+| `-20 dB` | 10.0% | 1.00% | 强耦合压力测试 |
+| `-10 dB` | 31.6% | 10.0% | 极强，联合逆可能病态 |
+
+路径的完整频响为：
+
+```math
+C(f)
+=
+10^{g_{\mathrm{cpl}}/20}
+\exp(j\theta)
+H_{\mathrm{FIR}}(f)
+\exp
+\left[
+-j2\pi f
+\frac{D+\delta}{f_s}
+\right].
+```
+
+因此各字段的作用分别为：
+
+- `phaseDegrees` 旋转整条耦合路径，不改变单独路径的功率；多条路径叠加时会通过相长或相消改变总幅度。
+- `integerDelaySamples=D` 和 `fractionalDelaySamples=delta` 产生随频率线性变化的相位。采样率80 MS/s时，1个样点是12.5 ns，0.25个样点是3.125 ns。
+- `firTaps` 决定额外频率选择性；最终耦合强度不是只看 `gainDb`，而是看 $10^{g/20}|H_{\mathrm{FIR}}(f)|$。
+- `prePaCouplingPaths` 的泄漏会进入PA非线性，因此可产生跨通道非线性交调；`postPaCouplingPaths` 只混合已经形成的PA输出。
+
+如果没有实测数据，建议先用 `-30 dB`、1至3个样点时延和 `firTaps=None` 验证算法；再用 `-20 dB`、不同方向时延和轻微FIR纹波做压力测试。`-10 dB`附近通常不再是“微弱串扰”，应同时检查MIMO频响矩阵条件数和逆补偿峰值。
+
+#### 6.9.3 FB增益、时延、CFO和SFO如何产生影响
+
+反馈线性路径可简化为：
+
+```math
+v_{\mathrm{fb}}(n)
+=
+10^{G_{\mathrm{fb}}/20}
+\exp(j\theta_{\mathrm{fb}})
+\left(h_{\mathrm{fb}}*y\right)(n).
+```
+
+- `fbGainDb` 每增加6.02 dB，反馈电压约翻倍。它应调到ADC既不削顶又充分使用码宽，而不是越大越好。
+- `fbPhaseDegrees` 只增加固定相位，可被公共复增益对齐消除；它本身不等于PA的AM-PM。
+- `fbFirTaps` 同时改变幅频平坦度和群时延。单位抽头适合理想基线；第二、第三抽头幅度为主抽头的2%至10%可作为轻度频响失真起点。
+- `fbIntegerDelaySamples` 应填写实测整数时延；`fbFractionalDelaySamples` 表示余下不足一个样点的时延，`0.1...0.3`适合验证分数同步能力。
+
+CFO在观测时间 $T$ 内产生的累计相位为：
+
+```math
+\Delta\varphi
+=
+2\pi\Delta f T.
+```
+
+| CFO | 100微秒内累计相位 | 影响 |
+|---:|---:|---|
+| `100 Hz` | 3.6 degree | 轻微公共相位漂移 |
+| `1 kHz` | 36 degree | 帧内明显旋转 |
+| `5 kHz` | 180 degree | 压力测试 |
+| `10 kHz` | 360 degree | 一帧内完整旋转 |
+
+SFO经过 $N$ 个样点后的累计采样位置偏差近似为：
+
+```math
+\Delta n
+=
+N\epsilon_{\mathrm{ppm}}10^{-6}.
+```
+
+| SFO | 经过100000个样点的漂移 | 使用建议 |
+|---:|---:|---|
+| `1 ppm` | 0.1 sample | 轻微误差 |
+| `5 ppm` | 0.5 sample | 典型验证起点 |
+| `10 ppm` | 1 sample | 明显长帧漂移 |
+| `50 ppm` | 5 samples | 压力测试 |
+
+共用参考时钟或本振的反馈链可从接近0开始；独立仪表应填写实际CFO/SFO估计值。盲目设置很大的CFO或SFO会让同步误差主导EVM，掩盖DPD本身的改善。
+
+#### 6.9.4 FB非线性、限幅和ADC如何产生影响
+
+反馈三阶模型为：
+
+```math
+v_3(n)
+=
+v(n)
++
+c_3v(n)|v(n)|^2.
+```
+
+三阶项相对线性项的幅度约为 $|c_3|A^2$，所以输入幅度翻倍时，相对三阶失真增大约12.04 dB。若峰值幅度 $A=1$：
+
+| `|fbThirdOrderCoefficient|` | 三阶项相对幅度 | 场景解释 |
+|---:|---:|---|
+| `0` | 无 | 理想反馈接收机 |
+| `0.01` | -40.0 dB | 轻微非线性 |
+| `0.05` | -26.0 dB | 明显非线性 |
+| `0.10` | -20.0 dB | 压力测试 |
+
+系数实部为负时主要表现为压缩，虚部主要形成幅度相关相位。该参数只模拟FB接收机，不能用来代替PA模型的GMP系数。
+
+`fbClipAmplitude` 对应 $A_{\mathrm{clip}}$，并采用径向硬限幅：
+
+```math
+v_{\mathrm{clip}}
+=
+\min
+\left(
+1,
+\frac{A_{\mathrm{clip}}}{|v|}
+\right)v.
+```
+
+要禁用限幅应使用 `None`。要模拟正常接收机，可把阈值设到无噪反馈峰值的1.05至1.2倍；要做削顶压力测试，可把阈值设到有效样本99.9%分位幅度附近或更低。固定写 `0.9` 是否合适取决于该参考面的实际归一化幅度。
+
+反馈ADC每个I/Q分量的量化步长为：
+
+```math
+\Delta_{\mathrm{ADC}}
+=
+\frac{A_{\mathrm{FS}}}{2^{W-1}}.
+```
+
+当 `fbAdcFullScale=1` 时：
+
+| `fbAdcWidth` | 归一化量化步长 | 理想满幅正弦SNR近似 | 使用建议 |
+|---:|---:|---:|---|
+| `8` | 0.0078125 | 49.9 dB | 粗量化压力测试 |
+| `10` | 0.001953 | 62.0 dB | 低成本链路 |
+| `12` | 0.000488 | 74.0 dB | 常用仿真起点 |
+| `14` | 0.000122 | 86.0 dB | 较高精度反馈 |
+| `16` | 0.0000305 | 98.1 dB | 高精度数值参考 |
+
+OFDM具有峰均比且通常保留回退，实际量化SNR会低于表中的满幅正弦近似。`fbAdcFullScale` 太小会削顶，太大又会增大量化步长；建议先调 `fbGainDb`，使I/Q分量99.9%分位约占满量程的70%至85%，再选择12至14 bit作为常规仿真，8 bit用于压力测试。
+
+#### 6.9.5 噪声配置如何限制EVM
+
+三种噪声参数互斥：
+
+- `noiseAmpMv` 直接指定实测复包络总RMS电压，适合已知仪表噪声幅度。
+- `noisePwrDbm` 通过 `loadResistanceOhm` 换算电压，适合已知端口噪声功率。
+- `noiseSnrDb` 根据每路有效突发功率自动反推噪声，最适合算法仿真。
+
+功率与电压换算为：
+
+```math
+V_{n,\mathrm{RMS}}
+=
+\sqrt{
+R
+10^{(P_{n,\mathrm{dBm}}-30)/10}
+}.
+```
+
+`noiseAmpMv=10` 直接表示复噪声总RMS为10 mV；I与Q各自的RMS为 $10/\sqrt{2}$ mV。相同的毫伏数在不同 `maximumOutputPowerDbm` 标尺下对应不同归一化噪声幅度，所以只有在端口阻抗和满量程功率都匹配时才能跨工程复用。
+
+当EVM主要受白噪声限制时：
+
+```math
+\mathrm{EVM}_{\mathrm{dB,floor}}
+\approx
+-\mathrm{SNR}_{\mathrm{dB}}.
+```
+
+| `noiseSnrDb` | 仅噪声造成的EVM地板近似 | 场景解释 |
+|---:|---:|---|
+| `45 dB` | `-45 dB` | 高质量反馈 |
+| `40 dB` | `-40 dB` | 推荐的功能验证起点 |
+| `30 dB` | `-30 dB` | 噪声明显 |
+| `25 dB` | `-25 dB` | 压力测试 |
+| `20 dB` | `-20 dB` | 噪声可能掩盖DPD改善 |
+
+`randomSeed` 不改变理论噪声功率，只决定随机样本。调试和方法对比应固定种子；蒙特卡洛统计应使用多个不同种子并报告均值和离散程度。
+
+#### 6.9.6 功率校准参数如何改变收敛
+
+未形成上下界时，单路驱动更新近似为：
+
+```math
+\Delta d_k
+=
+\mathrm{clip}
+\left[
+\mu
+\left(
+P_{\mathrm{target}}-P_k
+\right),
+-\Delta d_{\max},
+\Delta d_{\max}
+\right].
+```
+
+形成目标上下界后，代码改用二分中点。MIMO联合校准则用有限差分Jacobian和正则化局部逆：
+
+```math
+\Delta\boldsymbol{d}
+=
+\mu
+\left(
+\boldsymbol{J}^{T}\boldsymbol{J}
++
+\lambda\boldsymbol{I}
+\right)^{-1}
+\boldsymbol{J}^{T}
+\boldsymbol{e}.
+```
+
+| 参数 | 推荐起点 | 数值增大后的影响 |
+|---|---:|---|
+| `loadResistanceOhm` | 使用端口实值，射频系统通常50 Ω | 同样电压被换算为更小功率；不是调优旋钮 |
+| `maximumOutputPowerDbm` | 使用PA模型满量程对应功率，当前默认25 dBm | 同样归一化RMS代表更高物理功率 |
+| `outputPowerDbm`调用参数 | 通常比极限低3至8 dB；0至3 dB回退用于压缩压力测试 | 越接近极限，压缩、EVM和校准难度通常越大 |
+| `calibrationToleranceDb` | `0.1...0.25 dB` | 更容易提前停止，但稳态功率误差允许更大 |
+| `maximumCalibrationIterations` | `40...80`，默认60 | 只增加最大尝试次数，不保证病态场景收敛 |
+| `calibrationLearningRate` | `0.5...0.8`；强耦合可降到 `0.3...0.5` | 更新更快，但过大可能振荡或跨过局部单调区 |
+| `maximumDriveAdjustmentDb` | `3...6 dB`；近饱和可收紧到 `1...3 dB` | 单步更激进，过大可能跳入深压缩区 |
+| `jointPowerCalibration` | `None` | 自动在存在PA前耦合时启用联合求解 |
+| `calibrationProbeStepDb` | `0.03...0.1 dB`，默认0.05 dB | 探测信号更明显，但局部线性近似变粗 |
+| `calibrationRegularization` | 良态时 `1e-6`；病态时尝试 `1e-4...1e-2` | 联合解更稳定、更保守，但过大会留下功率误差 |
+| `activePowerThresholdDb` | 干净突发 `-60 dB`；高噪采集可提高到 `-50...-40 dB` | 排除更多低幅样点，过高会错误删除OFDM有效低幅样点 |
+| `activeGapToleranceSamples` | `8...32`，默认16 | 填补更长的短低幅空洞；过大会把真实静默区计入有效突发 |
+
+有效样点门限的实际比较为：
+
+```math
+|x(n)|^2
+>
+P_{\mathrm{peak}}
+10^{T_{\mathrm{active}}/10}.
+```
+
+因此 `activePowerThresholdDb=-60` 表示保留功率高于峰值百万分之一的样点，而不是接收机灵敏度为 -60 dBm。
+
+#### 6.9.7 三套可直接使用的仿真起点
+
+下面三套配置用于算法归因，不代表硬件统一规格。`sampleRateHz`、ADC满量程和功率相关值仍应按实际波形修改。
+
+```python
+idealChannelParameters = {
+    "sampleMode": "forward",
+    "sampleRateHz": 80.0e6,
+    "txIqGainImbalanceDb": 0.0,
+    "txIqPhaseImbalanceDegrees": 0.0,
+    "txDcOffset": 0.0 + 0.0j,
+    "noiseSnrDb": None,
+    "width": 0,
+}
+
+typicalFeedbackParameters = {
+    "sampleMode": "fb",
+    "sampleRateHz": 80.0e6,
+    "txIqGainImbalanceDb": 0.3,
+    "txIqPhaseImbalanceDegrees": 2.0,
+    "txDcOffset": 0.001 + 0.001j,
+    "fbIntegerDelaySamples": 12,
+    "fbFractionalDelaySamples": 0.2,
+    "fbCarrierFrequencyOffsetHz": 500.0,
+    "fbSamplingFrequencyOffsetPpm": 5.0,
+    "fbIqGainImbalanceDb": 0.3,
+    "fbIqPhaseImbalanceDegrees": 2.0,
+    "fbDcOffset": 0.002 - 0.001j,
+    "fbThirdOrderCoefficient": -0.01 + 0.003j,
+    "fbAdcWidth": 14,
+    "fbAdcFullScale": 1.0,
+    "noiseSnrDb": 40.0,
+    "width": 0,
+}
+
+stressFeedbackParameters = {
+    "sampleMode": "fb",
+    "sampleRateHz": 80.0e6,
+    "txIqGainImbalanceDb": 1.0,
+    "txIqPhaseImbalanceDegrees": 5.0,
+    "txDcOffset": 0.01 + 0.005j,
+    "fbIntegerDelaySamples": 40,
+    "fbFractionalDelaySamples": 0.3,
+    "fbCarrierFrequencyOffsetHz": 5000.0,
+    "fbSamplingFrequencyOffsetPpm": 50.0,
+    "fbIqGainImbalanceDb": 1.0,
+    "fbIqPhaseImbalanceDegrees": 5.0,
+    "fbDcOffset": 0.01 - 0.005j,
+    "fbThirdOrderCoefficient": -0.10 + 0.03j,
+    "fbClipAmplitude": 0.8,
+    "fbAdcWidth": 8,
+    "fbAdcFullScale": 1.0,
+    "noiseSnrDb": 25.0,
+    "width": 0,
+}
+```
+
+推荐的调试顺序是一次只打开一个模块：先用理想链验证DPD，再单独加入Tx I/Q、耦合、FB同步、FB I/Q、ADC和噪声。若一次同时打开全部压力参数，只能观察“系统变差”，无法判断是哪一个配置值造成主要退化。
+
+可直接运行的Tx/FB I/Q、DC、固定温度角、动态热阻和占空比隔离场景见 [Example.md](./Example.md)。
+
+### 6.10 主要接口
 
 主要接口为：
 

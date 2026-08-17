@@ -2232,6 +2232,8 @@ assert np.array_equal(frozenInput, frozenInput.copy())
 
 测试阶段没有提供 `outputPowerDbm`，所以不会重新调整输入。`GetThermalMetrics()` 可返回结温、平均耗散、RF占空比、有效RF区输出功率和累计物理时间；有效区定义与 `activePowerThresholdDb` 一致，因此前后补零不会把输出功率读数拉低。EVM、ACLR仍由独立 `Analysis` 使用每帧输出计算。
 
+固定温度角、不同单RC热阻和25%/50%/100%占空比的最小隔离系统、可运行代码及实测对比表见 [Example.md](./Example.md)。
+
 ## 14. 使用边界和常见误解
 
 1. **行为拟合好不等于电路正确**：相同输入范围内波形拟合好，不能推出器件效率、稳定性或可靠性。

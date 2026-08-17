@@ -23,6 +23,7 @@
 - [DpdGmp程序使用手册](doc/DpdGmp.md)：完整参数、直接/ILC/间接学习、多片段训练、定点接口和基准用法。
 - [DPD-LMS逐样点补偿原理](doc/DPD-LMS.md)：复数LMS/NLMS推导、逐列尺度、因果样点状态、影子/活动系数、逐样点与批量岭回归的实现差异。
 - [DpdLms程序使用手册](doc/DpdLms.md)：完整参数、逐样点和整帧回放接口、间接学习、定点调用、最小移植程序和Benchmark。
+- [最小系统隔离测试示例](doc/Example.md)：分别隔离Tx/FB I/Q、固定温度角、动态自热、热阻和占空比，并比较理想、典型与压力参数配置。
 - [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、当前工作点局部Jacobian、公共复增益、20 dBm GMP发散案例、仪表整段采集下的逐样点DPD训练，以及史密斯圆图阅读、观测信息和RF/DPD改善方案。
 - [全工程函数与物理原理覆盖审计](doc/FunctionPrinciples.md)：逐项索引 `main.py` 与 `inc` 中全部函数，区分物理模型、数值实现和工程编排，并链接到对应推导。
 
@@ -1377,6 +1378,22 @@ Channel参数按物理模块分类如下，避免把真实Tx失真和FB观测误
 | `jointPowerCalibration` | `None` | 有PA前耦合时自动选择联合校准。 |
 | `calibrationProbeStepDb` / `calibrationRegularization` | `0.05` / `1e-6` | MIMO Jacobian探测和正则化。 |
 | `activePowerThresholdDb` / `activeGapToleranceSamples` | `-60.0` / `16` | 有效突发检测门限和短间隙闭合。 |
+
+#### Channel配置值影响速查
+
+| 模块 | 推荐仿真起点 | 配置值怎样产生影响 |
+| --- | --- | --- |
+| Tx I/Q | `0.3 dB`、`2 degree` | 增益和相位误差变成共轭镜像系数并在PA前注入；约对应35 dB量级的单项IRR，forward与fb都会变差。 |
+| FB I/Q | `0.3 dB`、`2 degree` | 使用相同镜像公式，但只污染fb观测；forward结果不变。 |
+| 通道耦合 | `-30 dB` | 电压泄漏为 `10^(-30/20)=3.16%`；PA前耦合还会进入非线性。 |
+| FB CFO | `500 Hz`功能验证、`5 kHz`压力测试 | 累计相位为 `2π·CFO·观测时间`；帧越长旋转越明显。 |
+| FB SFO | `5 ppm`功能验证、`50 ppm`压力测试 | 经过N点累计漂移约 `N·ppm·1e-6` 个样点。 |
+| FB三阶项 | `-0.01+0.003j` | 相对三阶幅度按 `|c3|·A²` 增长；信号幅度翻倍时相对失真约增加12 dB。 |
+| FB ADC | `12...14 bit` | 位宽每增加1 bit，理想量化SNR约改善6 dB；满量程过小削顶、过大量化变粗。 |
+| 接收噪声 | `noiseSnrDb=40` | 仅白噪声限制下，EVM地板约为 `-40 dB`。 |
+| 功率校准 | 容差 `0.1...0.25 dB`、学习率 `0.5...0.8` | 学习率增大可加快更新但可能振荡；容差增大更易停止但允许更大功率误差。 |
+
+完整的推导、分级数值表、DC泄漏、耦合比例、CFO/SFO累计误差、ADC步长和三套可直接使用的配置见 [Channel配置值选择说明](doc/Channel.md#69-配置值如何进入模型以及怎样选择)。
 
 `Process(inputSignal, outputPowerDbm=None)` 执行“Tx I/Q→PA前耦合→不同PA→PA后耦合→采样”完整链路。Tx I/Q参数同时影响forward和fb；FB I/Q参数只在 `sampleMode="fb"` 时生效。`ProcessPaOutput(paOutputSignal)` 从已有PA输出开始，因此不会重复Tx I/Q。详细参考面、系数公式、分类参数表和Tx/FB对比示例见 [Channel.md](doc/Channel.md)。
 
