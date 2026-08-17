@@ -192,14 +192,16 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `Channel.__init__`, `Channel.Width`, `Channel.SampleMode`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层，未知配置警告后忽略；把采样模式规范为forward或fb，并校验公共相位/噪声、PA前后耦合、反馈链参数、联合功率闭环、随机种子和公开位宽 | Channel §1、§5 |
+| `Channel.__init__`, `Channel.Width`, `Channel.SampleMode`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层，未知配置警告后忽略；把采样模式规范为forward或fb，并校验Tx I/Q、公共相位/噪声、PA前后耦合、反馈链参数、联合功率闭环、随机种子和公开位宽 | Channel §1、§5–§6 |
 | `Channel.SetPaModel` | E | 绑定必须提供公开Process入口的PA对象，并在PA更换时清除私有功率校准状态 | Channel §1、§6 |
 | `Channel.ResolveCouplingPaths`, `Channel.HasPrePaCoupling` | P/E | 把每条源链到目的链的复增益、整数/分数时延和FIR规范为有限参数，并判断PA输入功率是否存在链间耦合依赖 | Channel §1.3、§5 |
 | `Channel.ApplyCouplingPath`, `Channel.ApplyMimoCoupling` | P/N | 对单条串扰路径依次执行FIR、分数时延、整数时延和复系数，再把所有间接路径与隐含单位直通路径线性叠加 | Channel §1.3 |
-| `Channel.ApplyPrePaCoupling`, `Channel.ApplyPostPaCoupling` | P/N | 分别在非线性PA之前和干净PA输出之后应用不同耦合矩阵；前者改变PA实际激励，后者只改变观测到的多路叠加 | Channel §1.3 |
-| `Channel.ProcessBoundPaFloating`, `Channel.ProcessPaBankForCalibration` | P/N/E | 在内部浮点域运行绑定PA；校准回调固定采用“PA前耦合→各路PA”，并返回尚未经过PA后耦合和接收噪声的逐PA输出 | Channel §1.3–§1.4、§6 |
+| `Channel.ResolveIqImbalanceCoefficients`, `Channel.ApplyIqImbalanceStage` | P/N | 把I/Q增益比和正交相位误差精确换算为直接项与共轭镜像项，再以统一广义线性方程叠加Tx或FB的DC偏置 | Channel §1.2.1、§4.4、§6.2、§6.5 |
+| `Channel.TransmitterIqCoefficients`, `Channel.FeedbackIqCoefficients`, `Channel.ApplyTransmitterIqImbalance` | P/N/E | 分别返回Tx/FB的直接与镜像系数，并在PA前对数字发送波形执行Tx调制器I/Q非理想；Tx误差同时进入forward和fb观测 | Channel §1.2.1、§6.2、§6.5 |
+| `Channel.ApplyPrePaCoupling`, `Channel.ApplyPostPaCoupling` | P/N | 分别在Tx I/Q之后、非线性PA之前和干净PA输出之后应用不同耦合矩阵；前者改变PA实际激励，后者只改变观测到的多路叠加 | Channel §1.3 |
+| `Channel.ProcessBoundPaFloating`, `Channel.ProcessPaBankForCalibration` | P/N/E | 在内部浮点域运行绑定PA；校准回调固定采用“Tx I/Q→PA前耦合→各路PA”，并返回尚未经过PA后耦合和接收噪声的逐PA输出 | Channel §1.3–§1.4、§6 |
 | `Channel.ResolveCalibrationTargets`, `Channel.ConfigurePowerCalibration` | P/E | 把SISO共同目标或MIMO逐链dBm序列规范化，并配置内部 `PowerCalibration`；存在PA前耦合时默认启用有限差分雅可比联合功率闭环 | Channel §1.4、§5–§6.3 |
-| `Channel.CalibratePaInput`, `Channel.GetLastPaInput`, `Channel.GetLastPaOutput`, `Channel.GetLastCalibrationMetrics` | P/N/E | 对任意初始幅度原始波形执行隐藏PA输入闭环，排除补零/长静默，缓存收敛PA输入与干净输出，并提供不暴露驱动预设的诊断字典 | Channel §1、§6.3、§6.8 |
+| `Channel.CalibratePaInput`, `Channel.GetLastPaInput`, `Channel.GetLastTransmitterOutput`, `Channel.GetLastActualPaInput`, `Channel.GetLastPaOutput`, `Channel.GetLastCalibrationMetrics` | P/N/E | 对任意初始幅度原始波形执行隐藏功率闭环，分别保留Tx I/Q前数字输入、Tx I/Q后输出、耦合后真实PA输入与干净PA输出，避免不同参考面混淆 | Channel §1、§6.2、§6.3、§6.8 |
 | `Channel.PrepareThermalTest`, `Channel.AdvanceThermalIdle`, `Channel.GetThermalMetrics` | P/N/E | 暂停热网络完成一次参考温度功率校准并冻结PA输入；测试阶段不再闭环稳功率，只推进真实发射和空闲热状态并报告输出漂移 | Channel §10、PaModel §13.6–§13.7 |
 | `GenerateThermalFigures.ConfigurePlotStyle`, `GenerateThermalFigures.CalculateStepRise`, `GenerateThermalFigures.CalculateEfficiency`, `GenerateThermalFigures.SimulatePulseTemperature`, `GenerateThermalFigures.SaveThermalNetworkEffects`, `GenerateThermalFigures.SaveHeatSourceEffects`, `GenerateThermalFigures.SaveElectricalDriftEffects`, `GenerateThermalFigures.SaveOperatingScenarioEffects`, `GenerateThermalFigures.SaveBoundaryParameterEffects`, `GenerateThermalFigures.GenerateThermalFigures` | P/N/V | 由RC/Foster解析式、效率方程、脉冲热状态和温度电参数方程可重复生成PaModel §13中的五组参数效果图 | PaModel §13.3–§13.8 |
 | `Channel.SynchronizeRandomGenerator`, `Channel.ResetRandomGenerator` | N/E | 在外部活动参数改变种子时同步随机状态，并支持从固定种子重放同一白噪声序列 | Channel §4–§5 |
@@ -211,14 +213,14 @@ flowchart LR
 | `Channel.ResolveFeedbackFirTaps`, `Channel.ApplyFeedbackLinearResponse` | P/N | 将可选反馈FIR规范为非空有限复抽头，并按每链执行因果卷积、反馈电压增益和附加相位 | Channel §1.2、§4.1 |
 | `Channel.ApplyFeedbackNonlinearity` | P/N | 使用 $v+c_3|v|^2v$ 模拟观察接收机三阶AM-AM/AM-PM，并可执行保持相位的复包络径向限幅 | Channel §4.2 |
 | `Channel.ApplyFeedbackTimingAndFrequency` | P/N | 通过插值模拟分数时延和SFO，补入整数时延，再按真实采样率施加CFO相位斜坡 | Channel §4.3 |
-| `Channel.ApplyFeedbackIqImbalance` | P/N | 分别改变I/Q增益并引入正交相位泄漏，随后加入复直流偏置；该镜像误差不能由单一公共复增益完全消除 | Channel §4.4 |
+| `Channel.ApplyFeedbackIqImbalance` | P/N | 在fb观测链使用独立的I/Q直接项、共轭镜像项和复直流偏置；forward模式完全跳过该接收机误差 | Channel §4.4、§6.3 |
 | `Channel.ApplyFeedbackAdc` | P/N | 对反馈接收机内部I/Q分量执行独立满量程限幅、舍入与有限位宽量化，再解码回内部浮点域 | Channel §4.5 |
 | `Channel.ApplyFeedbackAnalogImpairments` | P/E | 依次组合反馈增益/FIR、非线性/限幅、时频偏和I/Q/DC，保证可重复的物理处理顺序 | Channel §1.2、§4 |
 | `Channel.FeedbackDirectSmallSignalGain` | P/N | 返回反馈FIR直流和、反馈增益/相位及I/Q直通分量组成的小信号复增益；不把镜像、DC、噪声和量化当成确定性标量增益 | Channel §4、§4.6 |
 | `Channel.ApplyChannelEffects` | P/E | 先执行公共相位；forward模式跳过全部fb专用参数，fb模式执行完整反馈模拟链；随后加入公共AWGN，最后仅在fb模式执行反馈ADC | Channel §1–§4 |
 | `Channel.ProcessPaOutput` | E/N | 把已有逐PA公开输出解码后先执行PA后耦合，再执行一次forward/fb采样链路并编码；功率闭环因此不包含接收噪声或PA后串扰 | Channel §1、§1.3、§6.2 |
-| `Channel.ProcessFloating`, `Channel.Process` | P/N/E | `Process(inputSignal, outputPowerDbm)` 按“PA前耦合→逐路PA→PA后耦合→采样链”运行；给定目标时先联合或独立闭环调整PA输入，收敛后只采样一次，并在定点公开模式返回整数I/Q码 | Channel §1、§1.3–§1.4、§3.4、§6.2–§6.4 |
-| `Channel.SmallSignalGain` | P/N | forward模式返回PA小信号增益与公共相位；fb模式再乘反馈直通小信号系数；零均值噪声、DC、镜像和量化不伪装成标量增益 | Channel §2、§4 |
+| `Channel.ProcessFloating`, `Channel.Process` | P/N/E | `Process(inputSignal, outputPowerDbm)` 按“Tx I/Q→PA前耦合→逐路PA→PA后耦合→采样链”运行；给定目标时先联合或独立闭环调整Tx数字输入，收敛后只采样一次，并在定点公开模式返回整数I/Q码 | Channel §1、§1.3–§1.4、§3.4、§6.2–§6.4 |
+| `Channel.SmallSignalGain` | P/N | forward模式返回Tx I/Q直接系数、PA小信号增益与公共相位之积；fb模式再乘反馈直通小信号系数；DC、镜像、噪声和量化不伪装成标量增益 | Channel §2、§4、§6.2、§6.5 |
 
 ### 4.2 `ChannelAnalyse.py`：MIMO通道测量
 

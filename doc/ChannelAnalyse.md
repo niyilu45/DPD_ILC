@@ -1967,11 +1967,38 @@ $\mathbf{H}_{d}$ 是直接通道矩阵，$\mathbf{H}_{i}$ 是镜像通道矩阵�
 
 ### 15.3 如何区分发射端 IQ 不平衡与反馈接收机 IQ 不平衡
 
-- 前向仪表和反馈接收机都看到相同镜像：优先怀疑发射链。
-- 只有反馈接收机看到镜像：优先校准反馈链，不能让 DPD 预补偿该测量误差。
+工程中应固定两个独立参考面：forward仪表测量真实发射链，fb采样还包含板载反馈接收机。对应Channel参数不能混用：
+
+| 物理模块 | Channel参数 | forward可见 | fb可见 | 是否允许DPD补偿 |
+|---|---|---:|---:|---|
+| Tx I/Q调制器 | `txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees`、`txDcOffset` | 是 | 是 | 可以，但需要增广模型 |
+| FB I/Q解调器 | `fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees`、`fbDcOffset` | 否 | 是 | 不应直接补偿，应先校准或去嵌入 |
+
+- 前向仪表和反馈接收机都看到相同镜像：优先怀疑Tx发射链。
+- 只有反馈接收机看到镜像：优先校准FB链，不能让DPD预补偿该测量误差。
 - IRR 随 PA 输出功率变化：可能是 PA 非线性与 IQ 支路的级联效应。
 - IRR 与输出功率无关但随频率变化：更像调制器、滤波器或接收机的频率选择性 IQ 失衡。
 - 更换独立接收机后镜像系数相位翻转或大幅变化：说明参考面尚未固定。
+
+推荐使用同一段激励做成对采集。先由forward记录拟合Tx与PA级联的直接/镜像响应，再对fb记录去除相同的forward响应，剩余的widely-linear项归因于FB接收机。简化窄带模型可写成：
+
+```math
+y_{\mathrm{fwd}}
+=
+a_{\mathrm{tx}}x+b_{\mathrm{tx}}x^*,
+```
+
+```math
+y_{\mathrm{fb}}
+=
+a_{\mathrm{fb}}y_{\mathrm{fwd}}
++
+b_{\mathrm{fb}}y_{\mathrm{fwd}}^*.
+```
+
+第一步用 $[x,\ x^*]$ 回归得到Tx级联系数；第二步用 $[y_{\mathrm{fwd}},\ y_{\mathrm{fwd}}^*]$ 回归得到FB系数。若只拿fb记录直接对 $x$ 回归，估计值会把Tx与FB两处镜像卷积在一起，无法判断DPD应该补偿哪一部分。
+
+在仿真中可以用 `Channel.GetLastPaInput()`、`GetLastTransmitterOutput()` 与 `GetLastActualPaInput()`分别观察Tx I/Q前、Tx I/Q后和PA耦合后的三个参考面；实际硬件则需要forward仪表或已知IRR更高的独立接收机完成同样的参考面分离。
 
 ## 16. 检测后的 DPD 推荐与增广 GMP 仿真
 

@@ -197,19 +197,22 @@ flowchart TD
     paModel --> paImplementation["每路 WienerPA / GMPPA / DohertyPA"]
     rawReference --> channel["Channel.Process：原始波形 + 目标输出dBm"]
     paModel --> channel
-    channel --> preCoupling["PA前 Hpre(z)：方向相关FIR与时延"]
+    channel --> txIq["Tx I/Q调制器：直接项、镜像项与DC"]
+    txIq --> preCoupling["PA前 Hpre(z)：方向相关FIR与时延"]
     preCoupling --> powerCalibration["PowerCalibration：逐链或联合Jacobian更新隐藏驱动"]
     paImplementation --> powerCalibration
-    powerCalibration --> reference["Channel缓存的收敛PA输入参考矩阵 S"]
+    powerCalibration --> reference["Channel缓存Tx前、Tx后和耦合后参考矩阵"]
     powerCalibration --> calibratedBaseline["容限内的各PA自身基线输出"]
     calibratedBaseline --> postCoupling["PA后 Hpost(z)：混合非线性输出"]
     postCoupling --> channelEffects["Channel公共移相"]
     channelEffects --> sampleMode{"sampleMode"}
     sampleMode -->|forward| forwardCapture["前向仪表采样<br/>跳过fb专用非理想"]
-    sampleMode -->|fb| feedbackCapture["板载反馈链路<br/>频响/时频偏/IQ/非线性/ADC"]
-    forwardCapture --> receiverNoise["物理白噪声"]
-    feedbackCapture --> receiverNoise
-    receiverNoise --> receivedBaseline["所选采样端baseline"]
+    sampleMode -->|fb| feedbackCapture["板载反馈模拟链<br/>频响/非线性/时频偏/FB IQ"]
+    forwardCapture --> forwardNoise["前向物理白噪声"]
+    feedbackCapture --> feedbackNoise["反馈物理白噪声"]
+    feedbackNoise --> feedbackAdc["FB ADC"]
+    forwardNoise --> receivedBaseline["所选采样端baseline"]
+    feedbackAdc --> receivedBaseline
 
     start --> frequencyIlc["SISO 或逐 PA RunMimoFrequencyDomainIlc"]
     reference --> frequencyIlc
@@ -271,7 +274,7 @@ flowchart TD
 
 1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `WaveGenWifi`、`PaModel`、`Analysis` 和 `Draw`；需要接收链路影响时再构造 `Channel`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
 2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
-3. 普通用户只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`。Channel先把隐藏驱动预设经过PA前耦合送入不同的PA，并对各PA自身输出计算有效突发功率。没有PA前耦合时使用逐链闭环；存在耦合时自动用有限差分功率Jacobian联合更新全部驱动。收敛后只执行一次PA后耦合、公共移相以及 `sampleMode` 选择的采样路径。`GetLastPaInput`、`GetLastPaOutput` 和 `GetLastCalibrationMetrics` 只用于诊断。
+3. 普通用户只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`。Channel先把隐藏数字Tx预设经过Tx I/Q调制器和PA前耦合送入不同的PA，并对各PA自身输出计算有效突发功率。没有PA前耦合时使用逐链闭环；存在耦合时自动用有限差分功率Jacobian联合更新全部驱动。收敛后只执行一次PA后耦合、公共移相以及 `sampleMode` 选择的采样路径。`GetLastPaInput`、`GetLastTransmitterOutput`、`GetLastActualPaInput`、`GetLastPaOutput` 和 `GetLastCalibrationMetrics` 只用于诊断。
 4. `sampleMode="forward"` 表示VSA等前向仪表直接观测主路，全部 `fb...` 参数被忽略；`sampleMode="fb"` 表示板载反馈接收机，能够配置反馈增益/FIR、时延、CFO/SFO、I/Q不平衡、DC、三阶失真、限幅和ADC。仪表闭环ILC可直接把forward Channel作为plant；板载闭环ILC把fb Channel作为plant，但最终EVM/ACLR应由独立forward Channel评价。
 5. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮真实输入、plant反馈输出和原生MSE。现有 `RunMimoFrequencyDomainIlc` 是逐PA独立算法，只适用于关闭或忽略跨通道耦合；启用PA前/后耦合后的联合补偿需要完整矩阵频响或Jacobian的MIMO ILC，文档不会把逐链结果误写成联合补偿结果。
 5. `Analysis` 使用三条互相独立的路径。显式参考模式直接保存 `referenceSignal` 与 `WifiWaveform`；发送波形辅助模式对NumPy数组或 `WifiWaveform.samples` 做互相关，直接截取公共区间，绝不解析Descriptor、恢复seed或重新生成参考；只有盲分析模式才调用 `ParseWifi` 恢复包起点、格式、MCS、FFT/GI、空间结构和参考样值。三条路径之后共用 `SigProc`；具备Wi-Fi元数据时再用 `FrameProcess` 计算严格子载波EVM。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
@@ -571,7 +574,7 @@ flowchart TD
 - `GMPPA.Process` 使用 `DelaySignal` 构造主项、滞后包络项和超前包络项；未提供系数时由 `DefaultGmpCoefficients` 创建稳定的默认模型。
 - `DohertyPA.Process` 持续驱动Carrier支路，在包络越过门限时平滑开启Peaking支路，并加入支路时延、复合成和简化负载调制；两条支路可分别选择Wiener或GMP。
 - 可选 `ThermalConfig` 把输出功率、效率和占空比映射为耗散功率；单RC或Foster网络推进结温，再调制Wiener、GMP或Doherty输出。功率校准自动暂停热网络，正式温度测试冻结驱动并允许输出功率自然漂移。
-- `IQImbalancePA` 在已有 PA 输出上增加共轭镜像，用于测试增广 ILC；`AddAwgn` 模拟反馈接收链噪声。
+- `IQImbalancePA` 在被包装PA的输出上增加共轭镜像，只是用于增广ILC归因测试的参考面无关代数包装器；真实Tx与FB两处I/Q误差应分别使用Channel的 `txIq...` 与 `fbIq...` 参数。`AddAwgn` 模拟反馈接收链噪声。
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
 - `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。它反复改变PA输入并测量真实输出，直到目标误差进入容限，不在PA输出端追加常数增益。
 - `MimoPaModel` 不在链间引入隐含耦合：每一列进入独立 `PaModel`。`ProcessChain` 是单路 ILC 看到的真实 plant；相对 dB 与绝对 dBm 功率设置均在该路径中生效。
@@ -583,18 +586,23 @@ flowchart TD
     raw["原始公开波形"] --> process["Process(inputSignal, outputPowerDbm)"]
     target["共同或逐链目标dBm"] --> process
     process --> calibration["内部PowerCalibration"]
-    calibration --> pre["PA前耦合 Hpre(z)"]
+    calibration --> txIq["Tx I/Q不平衡与DC"]
+    txIq --> pre["PA前耦合 Hpre(z)"]
     pre --> pa["不同参数的多路PaModel"]
     pa --> detector["有效突发PA输出功率"]
     detector -. "误差超限" .-> calibration
     detector --> post["PA后耦合 Hpost(z)"]
     post --> phase["ApplyPhaseRotation<br/>-90° / 0° / +90°"]
     phase --> mode{"sampleMode"}
-    mode -->|forward| forward["前向仪表采样<br/>忽略fb专用参数"]
-    mode -->|fb| feedback["反馈接收机非理想<br/>FIR/时频偏/IQ/非线性/ADC"]
-    forward --> noise["AddNoise<br/>noiseAmpMv / noisePwrDbm / noiseSnrDb"]
-    feedback --> noise
-    noise --> encode["FixedPoint公开边界编码"]
+    mode -->|forward| forwardNoise["前向仪表 + AddNoise<br/>忽略fb专用参数"]
+    mode -->|fb| fbLinear["FB增益/相位/FIR"]
+    fbLinear --> fbNonlinear["FB三阶非线性/限幅"]
+    fbNonlinear --> fbSync["FB时延/CFO/SFO"]
+    fbSync --> fbIq["FB I/Q与DC"]
+    fbIq --> fbNoise["AddNoise"]
+    fbNoise --> fbAdc["FB ADC"]
+    forwardNoise --> encode["FixedPoint公开边界编码"]
+    fbAdc --> encode
     encode --> receiver["公开接收波形"]
     paOutput["已有公开PA输出"] --> paDecode["ProcessPaOutput解码"]
     paDecode --> post
@@ -602,7 +610,7 @@ flowchart TD
 
 **图示说明：**
 
-- 推荐调用 `Process(rawSignal, outputPowerDbm=20.0)`。用户只给原始波形和PA目标输出功率；Channel先施加PA前耦合并反复运行PA。存在PA前串扰时自动用功率Jacobian联合调整各路输入，收敛后再执行一次PA后耦合与所选采样路径。
+- 推荐调用 `Process(rawSignal, outputPowerDbm=20.0)`。用户只给原始波形和PA目标输出功率；Channel每次试探都依次执行Tx I/Q、PA前耦合和PA。存在PA前串扰时自动用功率Jacobian联合调整各路Tx数字输入，收敛后再执行一次PA后耦合与所选采样路径。
 - `Process(rawSignal)` 保留不校准功率的单次链路，供ILC plant等内部循环使用；`ProcessPaOutput` 用于已有PA输出，不会再次运行PA。
 - `sampleMode="forward"` 模拟前向VSA/仪表采样，并忽略全部 `fb...` 配置；`sampleMode="fb"` 模拟板载反馈接收机，并依次加入反馈频响、时频偏、I/Q与DC误差、接收机非线性、限幅和ADC量化。
 - `prePaCouplingPaths` 和 `postPaCouplingPaths` 使用逐方向路径配置，每条路径具有独立增益、相位、复FIR、整数和分数时延；0到1与1到0无需对称。
@@ -1194,7 +1202,9 @@ receivedWaveform = channel.Process(
     inputWaveform,
     outputPowerDbm=22.0,
 )
-paInputWaveform = channel.GetLastPaInput()
+digitalTxInputWaveform = channel.GetLastPaInput()
+txModulatorOutput = channel.GetLastTransmitterOutput()
+actualPaInputWaveform = channel.GetLastActualPaInput()
 paOutputWaveform = channel.GetLastPaOutput()
 calibrationMetrics = channel.GetLastCalibrationMetrics()
 ```
@@ -1298,45 +1308,79 @@ PA 辅助接口还包括：
 Channel(paModel=None, parameters=None, width=None, **parameterOverrides)
 ```
 
+Channel参数按物理模块分类如下，避免把真实Tx失真和FB观测误差混为一类。
+
+#### Channel公共采样与接口参数
+
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `sampleMode` | `"forward"` | `"forward"`选择前向仪表采样；`"fb"`选择板载反馈接收机。 |
-| `sampleRateHz` | `1.0` | 采样率，反馈CFO使用该值换算逐样点相位。 |
-| `phaseDegrees` | `0` | 固定相位旋转，仅允许 `-90`、`0` 或 `90` 度。 |
-| `noiseAmpMv` | `None` | 复包络总RMS噪声幅度，单位mV。 |
-| `noisePwrDbm` | `None` | 端口总噪声功率，单位dBm。 |
-| `noiseSnrDb` | `None` | 每路有效突发信号功率与复噪声功率之比，单位dB；MIMO逐列独立计算噪声RMS。 |
-| `fbGainDb` | `0.0` | fb模式的反馈耦合与接收机电压增益，单位dB。 |
-| `fbPhaseDegrees` | `0.0` | fb模式附加相位，允许任意有限角度。 |
-| `fbFirTaps` | `None` | fb模式因果复FIR；`None`表示单位抽头。 |
-| `fbIntegerDelaySamples` | `0` | fb模式非负整数时延。 |
-| `fbFractionalDelaySamples` | `0.0` | fb模式分数时延，范围为 `[-0.5, 0.5)`。 |
-| `fbCarrierFrequencyOffsetHz` | `0.0` | fb模式载波频偏，单位Hz。 |
-| `fbSamplingFrequencyOffsetPpm` | `0.0` | fb模式采样频偏，单位ppm。 |
-| `fbIqGainImbalanceDb` | `0.0` | fb模式I/Q增益不平衡，单位dB。 |
-| `fbIqPhaseImbalanceDegrees` | `0.0` | fb模式I/Q正交相位误差。 |
-| `fbDcOffset` | `0+0j` | fb模式复直流偏置。 |
-| `fbThirdOrderCoefficient` | `0+0j` | fb模式接收机三阶复非线性系数。 |
-| `fbClipAmplitude` | `None` | fb模式复包络径向限幅；正数启用。 |
-| `fbAdcWidth` | `None` | fb模式内部ADC位宽，支持2至32；与公开接口 `width` 相互独立。 |
-| `fbAdcFullScale` | `1.0` | fb模式内部ADC的I/Q分量满量程。 |
-| `prePaCouplingPaths` | `None` | PA前串扰路径序列；每条路径配置源/目标链、增益、相位、FIR和时延。 |
-| `postPaCouplingPaths` | `None` | PA后串扰路径序列；格式与PA前路径相同。 |
-| `loadResistanceOhm` | `50.0` | 噪声功率与RMS电压换算使用的阻抗。 |
-| `maximumOutputPowerDbm` | `25.0` | 内部归一化PA输出RMS等于1所代表的功率。 |
-| `calibrationToleranceDb` | `0.25` | Channel内部PA输出功率闭环允许的最大误差，单位dB。 |
-| `maximumCalibrationIterations` | `60` | 内部功率闭环最多运行PA的次数。 |
-| `calibrationLearningRate` | `0.8` | 尚未括住目标时的dB域驱动修正比例。 |
-| `maximumDriveAdjustmentDb` | `6.0` | 单轮隐藏PA输入预设的最大调整量。 |
-| `jointPowerCalibration` | `None` | `None`在存在PA前耦合时自动启用联合Jacobian校准；布尔值可强制选择。 |
-| `calibrationProbeStepDb` | `0.05` | 联合校准估计功率Jacobian的逐路dB扰动。 |
-| `calibrationRegularization` | `1e-6` | 联合功率更新的正则化系数。 |
-| `activePowerThresholdDb` | `-60.0` | 有效突发相对峰值功率门限。 |
-| `activeGapToleranceSamples` | `16` | 有效区内部允许填充的短低幅间隔。 |
-| `randomSeed` | `1701` | 固定非负整数使整次噪声序列可复现；`None` 使用系统熵。 |
-| `width` | `16` | 外部I/Q位宽；`0`为浮点，正值返回整数码。 |
+| `sampleMode` | `"forward"` | 选择前向仪表或板载反馈采样。 |
+| `sampleRateHz` | `1.0` | CFO、SFO、时延和物理时间换算所用采样率。 |
+| `phaseDegrees` | `0` | PA后的公共固定移相，仅允许 `-90`、`0`、`90` 度。 |
+| `width` | `16` | 公开I/Q位宽；`0`为浮点，正值为整数码。 |
 
-`Process(inputSignal, outputPowerDbm=None)` 执行“PA前耦合→不同PA→PA后耦合→采样”完整链路。提供目标时先完成PA自身输出功率闭环；存在PA前耦合时默认联合调节全部输入。`outputPowerDbm` 可以是SISO/全部链共同标量，也可以是按列排列的MIMO序列。`ProcessPaOutput(paOutputSignal)` 接收尚未经过PA后耦合的各PA输出。反馈专用参数只在 `sampleMode="fb"` 时生效，forward模式可作为独立仪表黄金评价路径。完整路径字段、物理公式和示例见 [Channel.md](doc/Channel.md)。
+#### Channel Tx I/Q调制器参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `txIqGainImbalanceDb` | `0.0` | PA前Tx I/Q增益比误差；forward与fb均受影响。 |
+| `txIqPhaseImbalanceDegrees` | `0.0` | PA前Tx正交相位误差。 |
+| `txDcOffset` | `0+0j` | PA前Tx复直流或LO泄漏项。 |
+
+#### Channel PA耦合参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `prePaCouplingPaths` | `None` | Tx I/Q之后、PA之前的多通道串扰路径。 |
+| `postPaCouplingPaths` | `None` | PA之后、采样分支之前的串扰路径。 |
+
+#### Channel FB线性与同步参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `fbGainDb` / `fbPhaseDegrees` | `0.0` | fb接收链公共增益和相位。 |
+| `fbFirTaps` | `None` | fb因果复FIR；`None`为单位抽头。 |
+| `fbIntegerDelaySamples` / `fbFractionalDelaySamples` | `0` / `0.0` | fb整数和分数时延。 |
+| `fbCarrierFrequencyOffsetHz` | `0.0` | fb载波频偏。 |
+| `fbSamplingFrequencyOffsetPpm` | `0.0` | fb采样频偏。 |
+
+#### Channel FB I/Q解调器参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `fbIqGainImbalanceDb` | `0.0` | 只污染fb观测的I/Q增益比误差。 |
+| `fbIqPhaseImbalanceDegrees` | `0.0` | 只污染fb观测的正交相位误差。 |
+| `fbDcOffset` | `0+0j` | fb接收机复直流偏置。 |
+
+#### Channel FB非线性与ADC参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `fbThirdOrderCoefficient` | `0+0j` | fb接收机三阶复非线性。 |
+| `fbClipAmplitude` | `None` | fb复包络径向限幅。 |
+| `fbAdcWidth` / `fbAdcFullScale` | `None` / `1.0` | fb内部ADC位宽和I/Q满量程。 |
+
+#### Channel接收噪声参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `noiseAmpMv` / `noisePwrDbm` / `noiseSnrDb` | `None` | 三种互斥噪声强度配置。 |
+| `randomSeed` | `1701` | 固定非负整数使噪声序列可复现。 |
+
+#### Channel功率检测与校准参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `loadResistanceOhm` / `maximumOutputPowerDbm` | `50.0` / `25.0` | 归一化幅度与物理dBm标尺。 |
+| `calibrationToleranceDb` / `maximumCalibrationIterations` | `0.25` / `60` | 功率误差容限与最大迭代数。 |
+| `calibrationLearningRate` / `maximumDriveAdjustmentDb` | `0.8` / `6.0` | dB域更新比例与单轮最大调整。 |
+| `jointPowerCalibration` | `None` | 有PA前耦合时自动选择联合校准。 |
+| `calibrationProbeStepDb` / `calibrationRegularization` | `0.05` / `1e-6` | MIMO Jacobian探测和正则化。 |
+| `activePowerThresholdDb` / `activeGapToleranceSamples` | `-60.0` / `16` | 有效突发检测门限和短间隙闭合。 |
+
+`Process(inputSignal, outputPowerDbm=None)` 执行“Tx I/Q→PA前耦合→不同PA→PA后耦合→采样”完整链路。Tx I/Q参数同时影响forward和fb；FB I/Q参数只在 `sampleMode="fb"` 时生效。`ProcessPaOutput(paOutputSignal)` 从已有PA输出开始，因此不会重复Tx I/Q。详细参考面、系数公式、分类参数表和Tx/FB对比示例见 [Channel.md](doc/Channel.md)。
+
+诊断接口的参考面也彼此独立：`GetLastPaInput()`为兼容旧名称而保留，返回Tx I/Q之前的数字输入；`GetLastTransmitterOutput()`返回Tx I/Q之后、PA前耦合之前的波形；`GetLastActualPaInput()`返回耦合后真正进入PA的波形。不要把三者混作同一个DPD训练标签。
 
 温度测试采用两阶段接口：`PrepareThermalTest(inputSignal, calibrationOutputPowerDbm, initialJunctionTemperatureC=None, ambientTemperatureC=None)` 在暂停热网络的条件下只校准一次并返回冻结输入；后续 `Process(frozenInput)` 开环推进结温，绝不重新稳定输出功率。`AdvanceThermalIdle(idleTimeSec)` 推进帧间冷却或偏置加热，`GetThermalMetrics()` 返回结温、耗散、占空比、自然漂移后的输出功率和累计时间。详见 [Channel两阶段温度测试](doc/Channel.md#10-两阶段pa温度测试)。
 
@@ -1909,7 +1953,7 @@ receivedSignal = channel.Process(
     waveform.samples,
     outputPowerDbm=outputPowerDbmPerChain,
 )
-referenceSignal = channel.GetLastPaInput()
+referenceSignal = channel.GetLastPaInput()  # Digital target before Tx I/Q.
 
 resultAnalysis = Analysis(referenceSignal, waveform)
 resultAnalysis.AnalyzeStages({"MIMO PA + Channel": receivedSignal})

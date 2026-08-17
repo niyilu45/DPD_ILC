@@ -1,10 +1,10 @@
-"""Model coupled PA inputs/outputs and forward or feedback sampling paths.
+"""Model transmitter, coupled PA, and forward or feedback sampling paths.
 
-The channel can apply causal complex coupling paths before a multi-chain PA
-bank and after its nonlinear outputs. It then selects either a forward
-instrument observation or a nonideal embedded feedback receiver. Public
-fixed-point boundaries use raw integer I/Q codes while every physical
-operation remains floating point.
+The channel can apply transmitter I/Q imbalance, causal complex coupling paths
+before a multi-chain PA bank, and coupling after its nonlinear outputs. It then
+selects either a forward instrument observation or a nonideal embedded feedback
+receiver with an independent I/Q imbalance. Public fixed-point boundaries use
+raw integer I/Q codes while every physical operation remains floating point.
 """
 
 from collections import ChainMap
@@ -89,6 +89,9 @@ class Channel:
                 "noiseAmpMv": None,
                 "noisePwrDbm": None,
                 "noiseSnrDb": None,
+                "txIqGainImbalanceDb": 0.0,
+                "txIqPhaseImbalanceDegrees": 0.0,
+                "txDcOffset": 0.0 + 0.0j,
                 "fbGainDb": 0.0,
                 "fbPhaseDegrees": 0.0,
                 "fbFirTaps": None,
@@ -147,6 +150,8 @@ class Channel:
         self.paModel: Optional[Any] = None
         self._paProcessMethod: Optional[Any] = None
         self._powerCalibration: Optional[PowerCalibration] = None
+        self._lastTransmitterOutput: Optional[np.ndarray] = None
+        self._lastActualPaInput: Optional[np.ndarray] = None
         self._activeRandomSeed: Optional[int] = None
         self._randomGenerator = np.random.default_rng()
         self.ValidateParameters()
@@ -315,23 +320,25 @@ class Channel:
         ):
             raise ValueError("noiseSnrDb must be finite or None")
 
-        for feedbackParameterName in (
+        for realImpairmentParameterName in (
+            "txIqGainImbalanceDb",
+            "txIqPhaseImbalanceDegrees",
             "fbGainDb",
             "fbPhaseDegrees",
             "fbCarrierFrequencyOffsetHz",
             "fbIqGainImbalanceDb",
             "fbIqPhaseImbalanceDegrees",
         ):
-            feedbackParameterValue = self.parameters[
-                feedbackParameterName
+            impairmentParameterValue = self.parameters[
+                realImpairmentParameterName
             ]
             if (
-                not isinstance(feedbackParameterValue, (int, float))
-                or isinstance(feedbackParameterValue, bool)
-                or not np.isfinite(feedbackParameterValue)
+                not isinstance(impairmentParameterValue, (int, float))
+                or isinstance(impairmentParameterValue, bool)
+                or not np.isfinite(impairmentParameterValue)
             ):
                 raise ValueError(
-                    f"{feedbackParameterName} must be finite"
+                    f"{realImpairmentParameterName} must be finite"
                 )
         fbSamplingFrequencyOffsetPpm = self.parameters[
             "fbSamplingFrequencyOffsetPpm"
@@ -394,6 +401,7 @@ class Channel:
                     "one-dimensional sequence or None"
                 )
         for complexParameterName in (
+            "txDcOffset",
             "fbDcOffset",
             "fbThirdOrderCoefficient",
         ):
@@ -611,6 +619,8 @@ class Channel:
         self.paModel = paModel
         self._paProcessMethod = paProcessMethod
         self._powerCalibration = None
+        self._lastTransmitterOutput = None
+        self._lastActualPaInput = None
 
     @staticmethod
     def ResolveCalibrationTargets(
@@ -758,22 +768,23 @@ class Channel:
         inputSignal: np.ndarray,
         outputPowerDbm: Union[float, Sequence[float], np.ndarray],
     ) -> np.ndarray:
-        """Generate a hidden-drive PA input that meets requested output dBm.
+        """Generate a hidden digital Tx input that meets requested output dBm.
 
         Processing details:
             Algorithm: Configure the private closed loop, normalize only the
             active part of the caller's arbitrary waveform, repeatedly send a
-            newly scaled input through the bound PA, measure actual active PA
-            output power, and update the input preset until every chain falls
-            inside the configured tolerance. Padding and long idle intervals
-            are excluded by the active-region detector.
+            newly scaled digital input through Tx I/Q impairment, pre-PA
+            coupling, and the bound PA, measure actual active PA output power,
+            and update the preset until every chain falls inside the configured
+            tolerance. Padding and long idle intervals are excluded by the
+            active-region detector.
 
         Args:
             inputSignal: Arbitrarily scaled public SISO or MIMO waveform.
             outputPowerDbm: Shared target dBm or one target per PA chain.
 
         Returns:
-            result: Public PA-input waveform accepted by the closed loop.
+            result: Public digital waveform accepted before Tx I/Q impairment.
         """
 
         powerCalibration = self.ConfigurePowerCalibration(outputPowerDbm)
@@ -808,14 +819,15 @@ class Channel:
         ] = None,
         ambientTemperatureC: Optional[float] = None,
     ) -> np.ndarray:
-        """Calibrate once without heating and freeze the resulting PA drive.
+        """Calibrate once without heating and freeze the digital Tx drive.
 
         Processing details:
             Algorithm: Suspend the bound SISO or MIMO PA thermal network,
             execute the existing dBm closed loop using only reference electrical
-            parameters, copy the converged public PA input, restore thermal
-            modeling without accepting any calibration heat, optionally reset
-            the requested starting temperatures, and return the frozen drive.
+            parameters, copy the converged public digital input before Tx I/Q,
+            restore thermal modeling without accepting any calibration heat,
+            optionally reset the requested starting temperatures, and return
+            the frozen drive. A later Process call reapplies the Tx I/Q stage.
 
         Args:
             inputSignal: Arbitrarily scaled public SISO or MIMO waveform.
@@ -824,7 +836,7 @@ class Channel:
             ambientTemperatureC: Optional shared ambient test temperature.
 
         Returns:
-            result: Frozen public PA-input waveform for open-loop thermal tests.
+            result: Frozen public digital Tx input for open-loop thermal tests.
         """
 
         if self.paModel is None:
@@ -894,14 +906,16 @@ class Channel:
         return dict(metricsMethod())
 
     def GetLastPaInput(self) -> np.ndarray:
-        """Return the most recent internally calibrated public PA input.
+        """Return the latest calibrated digital input before Tx I/Q error.
 
         Processing details:
             Algorithm: Delegate to the private calibration helper and return
-            its defensive copy without exposing the hidden dB drive preset.
+            its defensive copy. For compatibility the historical method name
+            is retained, but the returned waveform is now explicitly the
+            digital Channel input before the Tx I/Q and coupling modules.
 
         Returns:
-            result: Last converged waveform sent to the bound PA.
+            result: Last converged digital transmitter-input waveform.
         """
 
         if self._powerCalibration is None:
@@ -909,6 +923,40 @@ class Channel:
                 "calibrated Process must run before GetLastPaInput"
             )
         return self._powerCalibration.GetLastPaInput()
+
+    def GetLastTransmitterOutput(self) -> np.ndarray:
+        """Return the latest waveform after Tx I/Q but before PA coupling.
+
+        Processing details:
+            Algorithm: Return a defensive copy of the waveform cached whenever
+            the normal or calibration path evaluates the transmitter I/Q stage.
+
+        Returns:
+            result: Tx modulator output before ``prePaCouplingPaths``.
+        """
+
+        if self._lastTransmitterOutput is None:
+            raise RuntimeError(
+                "Process must run before GetLastTransmitterOutput"
+            )
+        return self._lastTransmitterOutput.copy()
+
+    def GetLastActualPaInput(self) -> np.ndarray:
+        """Return the latest physical PA input after Tx I/Q and coupling.
+
+        Processing details:
+            Algorithm: Return a defensive copy cached after transmitter I/Q
+            impairment and all configured pre-PA inter-chain coupling paths.
+
+        Returns:
+            result: Actual waveform matrix or vector presented to the PA bank.
+        """
+
+        if self._lastActualPaInput is None:
+            raise RuntimeError(
+                "Process must run before GetLastActualPaInput"
+            )
+        return self._lastActualPaInput.copy()
 
     def GetLastPaOutput(self) -> np.ndarray:
         """Return the clean PA output measured by the last calibration.
@@ -1330,6 +1378,151 @@ class Channel:
             )
         return outputMatrix[:, 0] if inputWasVector else outputMatrix
 
+    def ResolveIqImbalanceCoefficients(
+        self,
+        gainImbalanceDb: float,
+        phaseImbalanceDegrees: float,
+    ) -> Tuple[complex, complex]:
+        """Convert I/Q gain and quadrature errors to a widely-linear pair.
+
+        Processing details:
+            Algorithm: Apply reciprocal half-gain changes to I and Q, rotate
+            the imperfect Q axis by the configured quadrature error, and
+            algebraically rewrite the real I/Q mapping as ``alpha*x +
+            beta*conj(x)``. The direct coefficient is alpha and the image
+            coefficient is beta.
+
+        Args:
+            gainImbalanceDb: I-to-Q gain ratio error in decibels.
+            phaseImbalanceDegrees: Departure from ideal quadrature in degrees.
+
+        Returns:
+            result: Direct and conjugate-image complex coefficients.
+        """
+
+        iGain = np.power(10.0, float(gainImbalanceDb) / 40.0)
+        qGain = np.power(10.0, -float(gainImbalanceDb) / 40.0)
+        phaseErrorRadians = np.deg2rad(float(phaseImbalanceDegrees))
+        directCoefficient = 0.5 * (
+            iGain
+            + qGain * np.cos(phaseErrorRadians)
+            + 1j * qGain * np.sin(phaseErrorRadians)
+        )
+        imageCoefficient = 0.5 * (
+            iGain
+            - qGain * np.cos(phaseErrorRadians)
+            + 1j * qGain * np.sin(phaseErrorRadians)
+        )
+        return complex(directCoefficient), complex(imageCoefficient)
+
+    def ApplyIqImbalanceStage(
+        self,
+        inputSignal: np.ndarray,
+        gainImbalanceDb: float,
+        phaseImbalanceDegrees: float,
+        dcOffset: complex,
+        stageName: str,
+    ) -> np.ndarray:
+        """Apply one configured transmitter or feedback I/Q impairment stage.
+
+        Processing details:
+            Algorithm: Resolve direct and image coefficients, combine the
+            original waveform with its complex conjugate, add one normalized
+            complex DC offset, and reject numeric overflow without changing
+            SISO-vector or samples-by-chains matrix shape.
+
+        Args:
+            inputSignal: Normalized complex waveform entering the I/Q stage.
+            gainImbalanceDb: I-to-Q gain ratio error in decibels.
+            phaseImbalanceDegrees: Departure from ideal quadrature in degrees.
+            dcOffset: Normalized complex LO-leakage or receiver DC term.
+            stageName: Human-readable stage name used in error diagnostics.
+
+        Returns:
+            result: Same-shape waveform containing direct, image, and DC terms.
+        """
+
+        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        directCoefficient, imageCoefficient = (
+            self.ResolveIqImbalanceCoefficients(
+                gainImbalanceDb,
+                phaseImbalanceDegrees,
+            )
+        )
+        iqOutput = (
+            directCoefficient * complexInput
+            + imageCoefficient * np.conj(complexInput)
+            + complex(dcOffset)
+        )
+        if not np.all(np.isfinite(iqOutput)):
+            raise ValueError(
+                f"{stageName} I/Q imbalance exceeded the numeric range"
+            )
+        return np.asarray(iqOutput, dtype=np.complex128)
+
+    def TransmitterIqCoefficients(self) -> Tuple[complex, complex]:
+        """Return configured Tx direct and conjugate-image coefficients.
+
+        Processing details:
+            Algorithm: Validate the live Channel configuration and convert the
+            transmitter gain and phase mismatch parameters to the exact
+            widely-linear coefficient pair used before PA-input coupling.
+
+        Returns:
+            result: Tx direct coefficient followed by Tx image coefficient.
+        """
+
+        self.ValidateParameters()
+        return self.ResolveIqImbalanceCoefficients(
+            float(self.parameters["txIqGainImbalanceDb"]),
+            float(self.parameters["txIqPhaseImbalanceDegrees"]),
+        )
+
+    def FeedbackIqCoefficients(self) -> Tuple[complex, complex]:
+        """Return configured feedback direct and image coefficients.
+
+        Processing details:
+            Algorithm: Validate the live Channel configuration and convert the
+            feedback receiver gain and phase mismatch parameters to the exact
+            widely-linear coefficient pair used before feedback DC addition.
+
+        Returns:
+            result: Feedback direct coefficient followed by image coefficient.
+        """
+
+        self.ValidateParameters()
+        return self.ResolveIqImbalanceCoefficients(
+            float(self.parameters["fbIqGainImbalanceDb"]),
+            float(self.parameters["fbIqPhaseImbalanceDegrees"]),
+        )
+
+    def ApplyTransmitterIqImbalance(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply Tx modulator I/Q mismatch and DC offset before every PA.
+
+        Processing details:
+            Algorithm: Use the common widely-linear I/Q stage with the ``tx``
+            parameters before PA-input coupling. This impairment therefore
+            changes the physical PA drive, PA nonlinear products, clean
+            forward observation, feedback observation, and power calibration.
+
+        Args:
+            inputSignal: Digital transmitter waveform before RF modulation.
+
+        Returns:
+            result: Same-shape waveform emitted by the nonideal Tx I/Q stage.
+        """
+
+        self.ValidateParameters()
+        return self.ApplyIqImbalanceStage(
+            inputSignal,
+            float(self.parameters["txIqGainImbalanceDb"]),
+            float(self.parameters["txIqPhaseImbalanceDegrees"]),
+            complex(self.parameters["txDcOffset"]),
+            "transmitter",
+        )
+
     def ApplyPrePaCoupling(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
@@ -1341,7 +1534,7 @@ class Channel:
             leakage from the other physical input chains.
 
         Args:
-            inputSignal: Normalized PA-bank input vector or matrix.
+            inputSignal: Tx-modulator output vector or samples-by-chains matrix.
 
         Returns:
             result: Same-shape actual drive presented to the PA bank.
@@ -1790,10 +1983,9 @@ class Channel:
         """Apply I/Q gain/phase mismatch and complex receiver DC offset.
 
         Processing details:
-            Algorithm: Split the complex envelope into I and Q, apply
-            reciprocal half-gain factors so their ratio equals
-            ``fbIqGainImbalanceDb``, leak I into Q according to the quadrature
-            phase error, recombine the components, and add ``fbDcOffset``.
+            Algorithm: Use the shared widely-linear I/Q stage with the
+            feedback receiver gain mismatch, quadrature phase error, and DC
+            offset. This stage is called only by ``sampleMode="fb"``.
 
         Args:
             inputSignal: Feedback waveform after timing and frequency errors.
@@ -1803,32 +1995,13 @@ class Channel:
         """
 
         self.ValidateParameters()
-        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
-        gainImbalanceDb = float(
-            self.parameters["fbIqGainImbalanceDb"]
+        return self.ApplyIqImbalanceStage(
+            inputSignal,
+            float(self.parameters["fbIqGainImbalanceDb"]),
+            float(self.parameters["fbIqPhaseImbalanceDegrees"]),
+            complex(self.parameters["fbDcOffset"]),
+            "feedback",
         )
-        iGain = np.power(10.0, gainImbalanceDb / 40.0)
-        qGain = np.power(10.0, -gainImbalanceDb / 40.0)
-        phaseErrorRadians = np.deg2rad(
-            float(self.parameters["fbIqPhaseImbalanceDegrees"])
-        )
-        inputI = complexInput.real
-        inputQ = complexInput.imag
-        outputI = iGain * inputI
-        outputQ = qGain * (
-            np.cos(phaseErrorRadians) * inputQ
-            + np.sin(phaseErrorRadians) * inputI
-        )
-        iqOutput = (
-            outputI
-            + 1j * outputQ
-            + complex(self.parameters["fbDcOffset"])
-        )
-        if not np.all(np.isfinite(iqOutput)):
-            raise ValueError(
-                "feedback I/Q imbalance exceeded the numeric range"
-            )
-        return np.asarray(iqOutput, dtype=np.complex128)
 
     def ApplyFeedbackAdc(
         self, inputSignal: np.ndarray
@@ -1924,19 +2097,7 @@ class Channel:
             )
         )
         firDcResponse = np.sum(self.ResolveFeedbackFirTaps())
-        gainImbalanceDb = float(
-            self.parameters["fbIqGainImbalanceDb"]
-        )
-        iGain = np.power(10.0, gainImbalanceDb / 40.0)
-        qGain = np.power(10.0, -gainImbalanceDb / 40.0)
-        phaseErrorRadians = np.deg2rad(
-            float(self.parameters["fbIqPhaseImbalanceDegrees"])
-        )
-        directIqCoefficient = 0.5 * (
-            iGain
-            + qGain * np.cos(phaseErrorRadians)
-            + 1j * qGain * np.sin(phaseErrorRadians)
-        )
+        directIqCoefficient, _ = self.FeedbackIqCoefficients()
         return complex(
             feedbackGain
             * feedbackPhase
@@ -2055,14 +2216,15 @@ class Channel:
     def ProcessPaBankForCalibration(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
-        """Evaluate pre-PA coupling and the PA bank at the public boundary.
+        """Evaluate Tx I/Q, pre-PA coupling, and PA at the public boundary.
 
         Processing details:
-            Algorithm: Decode the trial waveform once, apply PA-input
-            cross-coupling, evaluate every nonlinear PA, and encode the clean
-            per-PA outputs. Post-PA coupling and receiver effects are excluded
-            so ``outputPowerDbm`` continues to mean each physical PA's own
-            output power. The joint calibrator accounts for pre-PA coupling.
+            Algorithm: Decode the trial waveform once, apply transmitter I/Q
+            mismatch and PA-input cross-coupling, evaluate every nonlinear PA,
+            and encode the clean per-PA outputs. Post-PA coupling and receiver
+            effects are excluded so ``outputPowerDbm`` continues to mean each
+            physical PA's own output power. Calibration therefore includes Tx
+            modulator loss and image drive but excludes feedback receiver error.
 
         Args:
             inputSignal: Public SISO or samples-by-chains calibration trial.
@@ -2075,23 +2237,31 @@ class Channel:
         normalizedInput = interfaceFormat.DecodeComplex(
             self.ValidateSignal(inputSignal, "inputSignal")
         )
-        actualPaInput = self.ApplyPrePaCoupling(normalizedInput)
+        transmitterOutput = self.ApplyTransmitterIqImbalance(
+            normalizedInput
+        )
+        actualPaInput = self.ApplyPrePaCoupling(transmitterOutput)
+        self._lastTransmitterOutput = np.array(
+            transmitterOutput, dtype=np.complex128, copy=True
+        )
+        self._lastActualPaInput = np.array(
+            actualPaInput, dtype=np.complex128, copy=True
+        )
         normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
         return interfaceFormat.EncodeComplex(normalizedPaOutput)
 
     def ProcessFloating(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
-        """Evaluate coupled PA inputs, PA outputs, and the selected sampler.
+        """Evaluate Tx I/Q, coupled PA paths, and the selected sampler.
 
         Processing details:
-            Algorithm: Apply additive complex FIR coupling before the PA bank,
-            evaluate all configured nonlinear branches simultaneously, apply
-            additive coupling between their clean outputs, and finally run
-            the forward-instrument or embedded-feedback receive path.
+            Algorithm: Apply Tx I/Q mismatch, additive complex FIR coupling
+            before the PA bank, all nonlinear branches, output coupling, and
+            finally the forward-instrument or embedded-feedback receive path.
 
         Args:
-            inputSignal: Normalized PA-bank input vector or matrix.
+            inputSignal: Normalized digital Tx input vector or matrix.
 
         Returns:
             result: Normalized floating receiver-input waveform.
@@ -2100,7 +2270,16 @@ class Channel:
         normalizedInput = self.ValidateSignal(
             inputSignal, "inputSignal"
         )
-        actualPaInput = self.ApplyPrePaCoupling(normalizedInput)
+        transmitterOutput = self.ApplyTransmitterIqImbalance(
+            normalizedInput
+        )
+        actualPaInput = self.ApplyPrePaCoupling(transmitterOutput)
+        self._lastTransmitterOutput = np.array(
+            transmitterOutput, dtype=np.complex128, copy=True
+        )
+        self._lastActualPaInput = np.array(
+            actualPaInput, dtype=np.complex128, copy=True
+        )
         normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
         coupledPaOutput = self.ApplyPostPaCoupling(
             normalizedPaOutput
@@ -2114,18 +2293,19 @@ class Channel:
             Union[float, Sequence[float], np.ndarray]
         ] = None,
     ) -> np.ndarray:
-        """Evaluate the complete PA-to-receiver path at the public boundary.
+        """Evaluate the complete transmitter-to-receiver path at the boundary.
 
         Processing details:
             Algorithm: When ``outputPowerDbm`` is provided, first run the
-            private closed loop that repeatedly adjusts only the PA input and
-            observes clean PA output until its active-region power converges.
+            private closed loop that repeatedly adjusts the digital Tx input
+            before I/Q impairment and observes clean PA output until its
+            active-region power converges.
             Apply the selected sampling path exactly once to the cached
             accepted PA output. When the target is None, preserve the direct
             one-pass PA-to-sampler behavior required by iterative algorithms.
 
         Args:
-            inputSignal: Public PA input vector or samples-by-chains matrix.
+            inputSignal: Public digital Tx vector or samples-by-chains matrix.
             outputPowerDbm: Optional shared target dBm or per-chain sequence.
 
         Returns:
@@ -2146,11 +2326,10 @@ class Channel:
         """Return the deterministic direct small-signal sampling-path gain.
 
         Processing details:
-            Algorithm: Query the bound PA's small-signal complex gain and
-            multiply it by the common phase. In feedback mode also multiply
-            by the feedback direct small-signal coefficient. AWGN has zero
-            mean and does not contribute deterministic gain; time-varying and
-            nonanalytic effects are described by the feedback diagnostics.
+            Algorithm: Multiply the Tx I/Q direct coefficient, bound PA's
+            small-signal gain, and common phase. In feedback mode also multiply
+            by the feedback I/Q and linear-path direct coefficient. Image and
+            DC terms are intentionally excluded from this one-scalar result.
 
         Returns:
             result: Complex direct small-signal gain for the selected mode.
@@ -2171,8 +2350,13 @@ class Channel:
         phaseRadians = np.deg2rad(
             float(cast(float, self.parameters["phaseDegrees"]))
         )
+        transmitterDirectCoefficient, _ = (
+            self.TransmitterIqCoefficients()
+        )
         selectedPathGain = complex(
-            smallSignalGainMethod() * np.exp(1j * phaseRadians)
+            transmitterDirectCoefficient
+            * smallSignalGainMethod()
+            * np.exp(1j * phaseRadians)
         )
         if self.sampleMode == "fb":
             selectedPathGain *= self.FeedbackDirectSmallSignalGain()

@@ -569,7 +569,16 @@ J_k^\dagger e_k.
 
 ## Q2：DPD 能改善 IRR 吗？
 
-可以，但前提是 DPD 的模型结构能够产生与 IQ 镜像方向相反的共轭分量。
+可以，但必须先区分Tx发射端I/Q不平衡和FB反馈接收端I/Q不平衡，而且DPD模型必须能产生与镜像方向相反的共轭分量。
+
+### Tx与FB两种I/Q不平衡的处理边界
+
+| 类型 | 工程参数 | 是否改变真实PA激励/空口 | 推荐处理 |
+|---|---|---:|---|
+| Tx I/Q | `txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees`、`txDcOffset` | 是 | 可用模拟校准或增广GMP联合补偿 |
+| FB I/Q | `fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees`、`fbDcOffset` | 否，只污染fb观测 | 先做接收机校准或去嵌入，不应由发射DPD直接补偿 |
+
+在本工程中，Tx I/Q位于PA之前，对 `sampleMode="forward"` 和 `sampleMode="fb"` 都生效；FB I/Q只在 `sampleMode="fb"` 生效。若板载fb的EVM/IRR改善但forward仪表变差，通常意味着训练器正在补偿FB接收机自身误差。
 
 若链路可近似为
 

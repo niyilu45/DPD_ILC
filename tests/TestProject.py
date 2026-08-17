@@ -3537,11 +3537,12 @@ def CheckChannelModel() -> None:
     """Verify both sample modes, feedback impairments, noise, and fixed point.
 
     Processing details:
-        Algorithm: Prove forward sampling bypasses embedded receiver defects,
-        exercise deterministic feedback gain/FIR/delay/CFO and combined
-        nonlinear/IQ/ADC effects, compare amplitude and power noise controls,
-        verify active-burst SNR for SISO/MIMO, require repeatable random state,
-        validate hidden PA power calibration, and reject invalid settings.
+        Algorithm: Prove transmitter I/Q error precedes the PA while forward
+        sampling bypasses embedded feedback I/Q error, exercise deterministic
+        feedback gain/FIR/delay/CFO and combined nonlinear/IQ/ADC effects,
+        compare amplitude and power noise controls, verify active-burst SNR for
+        SISO/MIMO, require repeatable random state, validate hidden PA power
+        calibration, and reject invalid settings.
 
     Returns:
         result: None. Assertions enforce the documented channel contract.
@@ -3600,6 +3601,79 @@ def CheckChannelModel() -> None:
     assert np.array_equal(
         idealFeedbackChannel.ProcessPaOutput(testSignal),
         testSignal,
+    )
+
+    # Tx I/Q imbalance is a physical forward-path impairment before the PA,
+    # while feedback I/Q imbalance is an observation-only receiver defect.
+    txPaModel = PaModel(modelName="wiener", width=0)
+    txIqChannel = Channel(
+        paModel=txPaModel,
+        parameters={
+            "sampleMode": "forward",
+            "txIqGainImbalanceDb": 1.2,
+            "txIqPhaseImbalanceDegrees": 5.0,
+            "txDcOffset": 0.015 - 0.01j,
+            "fbIqGainImbalanceDb": 6.0,
+            "fbIqPhaseImbalanceDegrees": 20.0,
+            "fbDcOffset": 0.2 + 0.1j,
+            "width": 0,
+        },
+    )
+    txDirectCoefficient, txImageCoefficient = (
+        txIqChannel.TransmitterIqCoefficients()
+    )
+    expectedTxOutput = (
+        txDirectCoefficient * testSignal
+        + txImageCoefficient * np.conj(testSignal)
+        + (0.015 - 0.01j)
+    )
+    assert np.allclose(
+        txIqChannel.ApplyTransmitterIqImbalance(testSignal),
+        expectedTxOutput,
+    )
+    expectedForwardOutput = txPaModel.Process(expectedTxOutput)
+    assert np.allclose(
+        txIqChannel.Process(testSignal),
+        expectedForwardOutput,
+    )
+    assert np.allclose(
+        txIqChannel.GetLastTransmitterOutput(), expectedTxOutput
+    )
+    assert np.allclose(
+        txIqChannel.GetLastActualPaInput(), expectedTxOutput
+    )
+    assert np.allclose(
+        txIqChannel.SmallSignalGain(),
+        txDirectCoefficient * txPaModel.SmallSignalGain(),
+    )
+    assert np.allclose(
+        txIqChannel.ProcessPaOutput(txPaModel.Process(testSignal)),
+        txPaModel.Process(testSignal),
+    )
+
+    combinedIqChannel = Channel(
+        paModel=txPaModel,
+        parameters={
+            "sampleMode": "fb",
+            "txIqGainImbalanceDb": 1.2,
+            "txIqPhaseImbalanceDegrees": 5.0,
+            "txDcOffset": 0.015 - 0.01j,
+            "fbIqGainImbalanceDb": -0.8,
+            "fbIqPhaseImbalanceDegrees": -3.0,
+            "fbDcOffset": -0.02 + 0.005j,
+            "width": 0,
+        },
+    )
+    combinedTxOutput = combinedIqChannel.ApplyTransmitterIqImbalance(
+        testSignal
+    )
+    combinedPaOutput = txPaModel.Process(combinedTxOutput)
+    expectedCombinedIqOutput = combinedIqChannel.ApplyFeedbackIqImbalance(
+        combinedPaOutput
+    )
+    assert np.allclose(
+        combinedIqChannel.Process(testSignal),
+        expectedCombinedIqOutput,
     )
 
     linearFeedbackInput = np.asarray(
@@ -3937,6 +4011,8 @@ def CheckChannelModel() -> None:
         parameters={
             "maximumOutputPowerDbm": 25.0,
             "calibrationToleranceDb": 0.10,
+            "txIqGainImbalanceDb": 0.7,
+            "txIqPhaseImbalanceDegrees": 2.5,
             "width": 0,
         },
     )
@@ -3957,6 +4033,10 @@ def CheckChannelModel() -> None:
         calibratedChannel.GetLastPaOutput(),
     )
     assert calibratedChannel.GetLastPaInput().shape == rawBurst.shape
+    assert not np.allclose(
+        calibratedChannel.GetLastPaInput(),
+        calibratedChannel.GetLastActualPaInput(),
+    )
 
     # A target sequence jointly calibrates different PA families while weak
     # pre-PA coupling makes every drive affect both measured output powers.
@@ -4062,6 +4142,9 @@ def CheckChannelModel() -> None:
             "noiseSnrDb": 30.0,
         },
         {"noiseSnrDb": np.nan},
+        {"txIqGainImbalanceDb": np.inf},
+        {"txIqPhaseImbalanceDegrees": "invalid"},
+        {"txDcOffset": complex(np.nan, 0.0)},
         {"fbIntegerDelaySamples": -1},
         {"fbFractionalDelaySamples": 0.5},
         {"fbSamplingFrequencyOffsetPpm": 1.0e6},
