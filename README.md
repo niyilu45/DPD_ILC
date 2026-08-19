@@ -9,7 +9,7 @@
 - [FEC编码译码原理与用法](doc/Fec.md)：55/90短块LDPC校验矩阵、系统编码、软输入normalized min-sum译码和调用示例。
 - [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、GMP、Doherty、频谱再生、IQ失衡，以及由功率和占空比驱动的静态/单RC/Foster电热模型、参数图和开环输出漂移。
 - [PA双音特性分析](doc/PaAnalyse.md)：小信号频响、双音间隔记忆、动态AM-AM/AM-PM迟滞、IM3/IM5/IM7、输出功率扫描及逐PA的DPD优化建议。
-- [PA到接收端Channel物理原理与用法](doc/Channel.md)：PA前/后多通道耦合、前向仪表/板载反馈采样、反馈链路非理想和联合功率校准。
+- [PA到接收端Channel物理原理与用法](doc/Channel.md)：I/Q正交调制背景与镜像产生推导、Tx/FB失衡边界、PA前/后多通道耦合、前向仪表/板载反馈采样、反馈链路非理想和联合功率校准。
 - [Channel特性测量与耦合感知DPD](doc/ChannelAnalyse.md)：平坦度、耦合增益/相位、群时延、条件数、测量接线以及耦合感知DPD-GMP前后对比。
 - [信号同步、补偿与功率标定原理](doc/SigProc.md)：整数/分数时延、载波频偏、采样频偏、Lanczos-sinc 重采样、复增益补偿和 dBm/RMS 换算。
 - [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
@@ -24,7 +24,7 @@
 - [DPD-LMS逐样点补偿原理](doc/DPD-LMS.md)：复数LMS/NLMS推导、逐列尺度、因果样点状态、影子/活动系数、逐样点与批量岭回归的实现差异。
 - [DpdLms程序使用手册](doc/DpdLms.md)：完整参数、逐样点和整帧回放接口、间接学习、定点调用、最小移植程序和Benchmark。
 - [最小系统隔离测试示例](doc/Example.md)：分别隔离Tx/FB I/Q、固定温度角、动态自热、热阻和占空比，并比较理想、典型与压力参数配置。
-- [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、当前工作点局部Jacobian、公共复增益、20 dBm GMP发散案例、仪表整段采集下的逐样点DPD训练，以及史密斯圆图阅读、观测信息和RF/DPD改善方案。
+- [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、IRR用途/原理/计算与场景、普通/增广GMP的镜像补偿边界、仪表整段采集下的逐样点DPD训练，以及史密斯圆图阅读、观测信息和RF/DPD改善方案。
 - [全工程函数与物理原理覆盖审计](doc/FunctionPrinciples.md)：逐项索引 `main.py` 与 `inc` 中全部函数，区分物理模型、数值实现和工程编排，并链接到对应推导。
 
 安装依赖：
@@ -71,7 +71,7 @@ doc/DPD-GMP.md          GMP DPD物理模型和系数更新推导
 doc/DpdGmp.md           DpdGmp类参数、方法和完整用例
 doc/DPD-LMS.md          GMP-LMS/NLMS逐样点更新推导和批量实现差异
 doc/DpdLms.md           DpdLms参数、逐样点移植示例和间接学习用法
-doc/FAQ.md              小信号逆响应、局部逆、公共增益、高功率GMP、逐样点训练和史密斯圆图常见问题
+doc/FAQ.md              小信号逆响应、IRR诊断与计算、增广GMP、逐样点训练和史密斯圆图常见问题
 doc/Fec.md              FEC物理原理、数学推导、接口约束和调用示例
 doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整示例
 ```
