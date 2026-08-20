@@ -3240,6 +3240,7 @@ def CheckUnknownConfigurationWarnings() -> None:
             "unknownPathSetting",
         ),
     )
+    strictErrorTexts = {}
     for caseName, strictConstructor, expectedUnknownName in (
         strictConstructorCases
     ):
@@ -3247,12 +3248,41 @@ def CheckUnknownConfigurationWarnings() -> None:
             strictConstructor()
         except TypeError as error:
             errorText = str(error)
+            strictErrorTexts[caseName] = errorText
             assert expectedUnknownName in errorText
             assert "case-sensitive" in errorText
+            assert "highest to lowest similarity" in errorText
         else:
             raise AssertionError(
                 f"Channel {caseName} must reject unknown names"
             )
+
+    validChannelParameterNames = tuple(
+        Channel(parameters={"width": 0}).GetParameters()
+    )
+    topLevelRankingText = strictErrorTexts[
+        "constructor mapping"
+    ].split("txiqgainimbalancedb: ", 1)[1].splitlines()[0]
+    rankedTopLevelNames = tuple(topLevelRankingText.split(", "))
+    assert rankedTopLevelNames[0] == "txIqGainImbalanceDb"
+    assert len(rankedTopLevelNames) == len(validChannelParameterNames)
+    assert set(rankedTopLevelNames) == set(validChannelParameterNames)
+
+    rankedPathNames = tuple(
+        strictErrorTexts["nested coupling path"]
+        .split("unknownPathSetting: ", 1)[1]
+        .splitlines()[0]
+        .split(", ")
+    )
+    assert set(rankedPathNames) == {
+        "sourceChain",
+        "destinationChain",
+        "gainDb",
+        "phaseDegrees",
+        "integerDelaySamples",
+        "fractionalDelaySamples",
+        "firTaps",
+    }
 
     strictUpdateChannel = Channel(parameters={"width": 0})
     try:
@@ -4239,8 +4269,10 @@ def CheckChannelModel() -> None:
     for invalidParameters in invalidConfigurations:
         try:
             Channel(parameters=invalidParameters)
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as error:
+            assert "Allowed" in str(error), (
+                f"missing allowed range for {invalidParameters!r}: {error}"
+            )
         else:
             raise AssertionError(
                 f"invalid channel configuration accepted: "

@@ -8,6 +8,7 @@ raw integer I/Q codes while every physical operation remains floating point.
 """
 
 from collections import ChainMap
+from difflib import SequenceMatcher
 from types import MappingProxyType
 from typing import (
     Any,
@@ -136,9 +137,11 @@ class Channel:
         )
         if unknownExternalNames:
             raise TypeError(
-                "Channel received unknown configuration parameter(s): "
-                + ", ".join(unknownExternalNames)
-                + ". Parameter names are case-sensitive."
+                self.FormatUnknownParameterError(
+                    "Channel",
+                    unknownExternalNames,
+                    tuple(self.defaultParameters),
+                )
             )
         unknownOverrideNames = FindUnknownParameterNames(
             directOverrides,
@@ -146,9 +149,11 @@ class Channel:
         )
         if unknownOverrideNames:
             raise TypeError(
-                "Channel received unknown configuration parameter(s): "
-                + ", ".join(unknownOverrideNames)
-                + ". Parameter names are case-sensitive."
+                self.FormatUnknownParameterError(
+                    "Channel",
+                    unknownOverrideNames,
+                    tuple(self.defaultParameters),
+                )
             )
         recognizedOverrides = {
             str(parameterName): parameterValue
@@ -205,6 +210,57 @@ class Channel:
 
     sampleMode = SampleMode
 
+    @staticmethod
+    def FormatUnknownParameterError(
+        ownerName: str,
+        unknownParameterNames: Tuple[str, ...],
+        supportedParameterNames: Tuple[str, ...],
+    ) -> str:
+        """Build a closest-first error for unknown configuration names.
+
+        Processing details:
+            Algorithm: Compare names case-insensitively with Ratcliff-Obershelp
+            sequence similarity, use length difference and lexical order as
+            deterministic tie breakers, and list every supported name for
+            each unknown name from highest to lowest relationship.
+
+        Args:
+            ownerName: Configuration owner and optional nested-path context.
+            unknownParameterNames: Unsupported caller-provided names.
+            supportedParameterNames: Complete legal vocabulary for the owner.
+
+        Returns:
+            result: Multi-line TypeError message with closest candidates first.
+        """
+
+        candidateSections = []
+        for unknownParameterName in unknownParameterNames:
+            foldedUnknownName = unknownParameterName.casefold()
+            rankedParameterNames = sorted(
+                supportedParameterNames,
+                key=lambda supportedName: (
+                    -SequenceMatcher(
+                        None,
+                        foldedUnknownName,
+                        supportedName.casefold(),
+                    ).ratio(),
+                    abs(len(supportedName) - len(unknownParameterName)),
+                    supportedName.casefold(),
+                    supportedName,
+                ),
+            )
+            candidateSections.append(
+                f"{unknownParameterName}: "
+                + ", ".join(rankedParameterNames)
+            )
+        return (
+            f"{ownerName} received unknown configuration parameter(s): "
+            + ", ".join(unknownParameterNames)
+            + ". Parameter names are case-sensitive. All supported "
+            "parameter names ordered from highest to lowest similarity:\n"
+            + "\n".join(candidateSections)
+        )
+
     def GetParameters(self) -> Dict[str, object]:
         """Return one flattened snapshot of all effective channel settings.
 
@@ -240,10 +296,11 @@ class Channel:
         )
         if unknownParameterNames:
             raise TypeError(
-                "Channel.UpdateParameters received unknown configuration "
-                "parameter(s): "
-                + ", ".join(unknownParameterNames)
-                + ". Parameter names are case-sensitive."
+                self.FormatUnknownParameterError(
+                    "Channel.UpdateParameters",
+                    unknownParameterNames,
+                    tuple(self.defaultParameters),
+                )
             )
         recognizedOverrides = {
             str(parameterName): parameterValue
@@ -290,10 +347,11 @@ class Channel:
                     else "external parameter"
                 )
                 raise TypeError(
-                    f"Channel {layerName} layer contains unknown "
-                    "configuration parameter(s): "
-                    + ", ".join(unknownParameterNames)
-                    + ". Parameter names are case-sensitive."
+                    self.FormatUnknownParameterError(
+                        f"Channel {layerName} layer",
+                        unknownParameterNames,
+                        tuple(self.defaultParameters),
+                    )
                 )
 
         sampleMode = self.parameters["sampleMode"]
@@ -302,7 +360,8 @@ class Channel:
             or sampleMode.strip().lower() not in ("forward", "fb")
         ):
             raise ValueError(
-                "sampleMode must be either 'forward' or 'fb'"
+                "sampleMode has an invalid value. Allowed values: "
+                "'forward' or 'fb'."
             )
         sampleRateHz = self.parameters["sampleRateHz"]
         if (
@@ -312,7 +371,8 @@ class Channel:
             or float(sampleRateHz) <= 0.0
         ):
             raise ValueError(
-                "sampleRateHz must be finite and positive"
+                "sampleRateHz has an invalid value. Allowed range: "
+                "finite real number in (0, +inf) Hz."
             )
 
         phaseDegrees = self.parameters["phaseDegrees"]
@@ -323,7 +383,8 @@ class Channel:
             or float(phaseDegrees) not in (-90.0, 0.0, 90.0)
         ):
             raise ValueError(
-                "phaseDegrees must be exactly -90, 0, or 90"
+                "phaseDegrees has an invalid value. Allowed values: "
+                "-90, 0, or 90 degrees."
             )
 
         noiseAmpMv = self.parameters["noiseAmpMv"]
@@ -339,8 +400,9 @@ class Channel:
         )
         if configuredNoiseControls > 1:
             raise ValueError(
-                "noiseAmpMv, noisePwrDbm, and noiseSnrDb are mutually "
-                "exclusive"
+                "noise controls have an invalid combination. Allowed "
+                "combination: at most one of noiseAmpMv, noisePwrDbm, and "
+                "noiseSnrDb may be non-None."
             )
         if noiseAmpMv is not None and (
             not isinstance(noiseAmpMv, (int, float))
@@ -349,20 +411,27 @@ class Channel:
             or float(noiseAmpMv) < 0.0
         ):
             raise ValueError(
-                "noiseAmpMv must be finite, nonnegative, or None"
+                "noiseAmpMv has an invalid value. Allowed range: None or "
+                "a finite real number in [0, +inf) mV RMS."
             )
         if noisePwrDbm is not None and (
             not isinstance(noisePwrDbm, (int, float))
             or isinstance(noisePwrDbm, bool)
             or not np.isfinite(noisePwrDbm)
         ):
-            raise ValueError("noisePwrDbm must be finite or None")
+            raise ValueError(
+                "noisePwrDbm has an invalid value. Allowed range: None or "
+                "any finite real number in (-inf, +inf) dBm."
+            )
         if noiseSnrDb is not None and (
             not isinstance(noiseSnrDb, (int, float))
             or isinstance(noiseSnrDb, bool)
             or not np.isfinite(noiseSnrDb)
         ):
-            raise ValueError("noiseSnrDb must be finite or None")
+            raise ValueError(
+                "noiseSnrDb has an invalid value. Allowed range: None or "
+                "any finite real number in (-inf, +inf) dB."
+            )
 
         for realImpairmentParameterName in (
             "txIqGainImbalanceDb",
@@ -382,7 +451,9 @@ class Channel:
                 or not np.isfinite(impairmentParameterValue)
             ):
                 raise ValueError(
-                    f"{realImpairmentParameterName} must be finite"
+                    f"{realImpairmentParameterName} has an invalid value. "
+                    "Allowed range: any finite real number in "
+                    "(-inf, +inf)."
                 )
         fbSamplingFrequencyOffsetPpm = self.parameters[
             "fbSamplingFrequencyOffsetPpm"
@@ -398,8 +469,8 @@ class Channel:
             < 1.0e6
         ):
             raise ValueError(
-                "fbSamplingFrequencyOffsetPpm must be finite and "
-                "strictly between -1000000 and 1000000"
+                "fbSamplingFrequencyOffsetPpm has an invalid value. Allowed "
+                "range: finite real number in (-1000000, 1000000) ppm."
             )
         fbIntegerDelaySamples = self.parameters[
             "fbIntegerDelaySamples"
@@ -410,7 +481,8 @@ class Channel:
             or fbIntegerDelaySamples < 0
         ):
             raise ValueError(
-                "fbIntegerDelaySamples must be a nonnegative integer"
+                "fbIntegerDelaySamples has an invalid value. Allowed range: "
+                "integer in [0, +inf) samples."
             )
         fbFractionalDelaySamples = self.parameters[
             "fbFractionalDelaySamples"
@@ -424,13 +496,16 @@ class Channel:
             < 0.5
         ):
             raise ValueError(
-                "fbFractionalDelaySamples must be in [-0.5, 0.5)"
+                "fbFractionalDelaySamples has an invalid value. Allowed "
+                "range: finite real number in [-0.5, 0.5) samples."
             )
         fbFirTaps = self.parameters["fbFirTaps"]
         if fbFirTaps is not None:
             if isinstance(fbFirTaps, (str, bytes)):
                 raise TypeError(
-                    "fbFirTaps must be a numeric sequence or None"
+                    "fbFirTaps has an invalid type. Allowed values: None or "
+                    "a nonempty one-dimensional sequence of finite complex "
+                    "numbers."
                 )
             firTapArray = np.asarray(
                 fbFirTaps, dtype=np.complex128
@@ -441,8 +516,9 @@ class Channel:
                 or not np.all(np.isfinite(firTapArray))
             ):
                 raise ValueError(
-                    "fbFirTaps must be a finite nonempty "
-                    "one-dimensional sequence or None"
+                    "fbFirTaps has an invalid value. Allowed values: None or "
+                    "a nonempty one-dimensional sequence of finite complex "
+                    "numbers."
                 )
         for complexParameterName in (
             "txDcOffset",
@@ -460,8 +536,8 @@ class Channel:
                 or isinstance(complexParameterValue, bool)
             ):
                 raise TypeError(
-                    f"{complexParameterName} must be a finite complex "
-                    "scalar"
+                    f"{complexParameterName} has an invalid type. Allowed "
+                    "values: finite int, float, or complex scalar."
                 )
             resolvedComplexValue = complex(complexParameterValue)
             if not (
@@ -469,7 +545,8 @@ class Channel:
                 and np.isfinite(resolvedComplexValue.imag)
             ):
                 raise ValueError(
-                    f"{complexParameterName} must be finite"
+                    f"{complexParameterName} has an invalid value. Allowed "
+                    "range: finite real and imaginary components."
                 )
         fbClipAmplitude = self.parameters["fbClipAmplitude"]
         if fbClipAmplitude is not None and (
@@ -479,7 +556,8 @@ class Channel:
             or float(fbClipAmplitude) <= 0.0
         ):
             raise ValueError(
-                "fbClipAmplitude must be finite, positive, or None"
+                "fbClipAmplitude has an invalid value. Allowed range: None "
+                "or a finite real number in (0, +inf)."
             )
         fbAdcWidth = self.parameters["fbAdcWidth"]
         if fbAdcWidth is not None and (
@@ -488,7 +566,8 @@ class Channel:
             or not 2 <= fbAdcWidth <= 32
         ):
             raise ValueError(
-                "fbAdcWidth must be an integer from 2 through 32 or None"
+                "fbAdcWidth has an invalid value. Allowed range: None or an "
+                "integer in [2, 32] bits."
             )
         fbAdcFullScale = self.parameters["fbAdcFullScale"]
         if (
@@ -498,7 +577,8 @@ class Channel:
             or float(fbAdcFullScale) <= 0.0
         ):
             raise ValueError(
-                "fbAdcFullScale must be finite and positive"
+                "fbAdcFullScale has an invalid value. Allowed range: finite "
+                "real number in (0, +inf)."
             )
         self.ResolveCouplingPaths("prePaCouplingPaths")
         self.ResolveCouplingPaths("postPaCouplingPaths")
@@ -511,7 +591,8 @@ class Channel:
             or float(loadResistanceOhm) <= 0.0
         ):
             raise ValueError(
-                "loadResistanceOhm must be finite and positive"
+                "loadResistanceOhm has an invalid value. Allowed range: "
+                "finite real number in (0, +inf) ohms."
             )
         maximumOutputPowerDbm = self.parameters[
             "maximumOutputPowerDbm"
@@ -522,7 +603,8 @@ class Channel:
             or not np.isfinite(maximumOutputPowerDbm)
         ):
             raise ValueError(
-                "maximumOutputPowerDbm must be finite"
+                "maximumOutputPowerDbm has an invalid value. Allowed range: "
+                "any finite real number in (-inf, +inf) dBm."
             )
 
         calibrationToleranceDb = self.parameters[
@@ -535,7 +617,8 @@ class Channel:
             or float(calibrationToleranceDb) <= 0.0
         ):
             raise ValueError(
-                "calibrationToleranceDb must be finite and positive"
+                "calibrationToleranceDb has an invalid value. Allowed range: "
+                "finite real number in (0, +inf) dB."
             )
         maximumCalibrationIterations = self.parameters[
             "maximumCalibrationIterations"
@@ -546,7 +629,8 @@ class Channel:
             or maximumCalibrationIterations < 1
         ):
             raise ValueError(
-                "maximumCalibrationIterations must be a positive integer"
+                "maximumCalibrationIterations has an invalid value. Allowed "
+                "range: integer in [1, +inf)."
             )
         calibrationLearningRate = self.parameters[
             "calibrationLearningRate"
@@ -558,7 +642,8 @@ class Channel:
             or not 0.0 < float(calibrationLearningRate) <= 1.0
         ):
             raise ValueError(
-                "calibrationLearningRate must be in the interval (0, 1]"
+                "calibrationLearningRate has an invalid value. Allowed "
+                "range: finite real number in (0, 1]."
             )
         maximumDriveAdjustmentDb = self.parameters[
             "maximumDriveAdjustmentDb"
@@ -570,7 +655,8 @@ class Channel:
             or float(maximumDriveAdjustmentDb) <= 0.0
         ):
             raise ValueError(
-                "maximumDriveAdjustmentDb must be finite and positive"
+                "maximumDriveAdjustmentDb has an invalid value. Allowed "
+                "range: finite real number in (0, +inf) dB."
             )
         jointPowerCalibration = self.parameters[
             "jointPowerCalibration"
@@ -580,7 +666,8 @@ class Channel:
             and not isinstance(jointPowerCalibration, bool)
         ):
             raise TypeError(
-                "jointPowerCalibration must be a boolean or None"
+                "jointPowerCalibration has an invalid value. Allowed values: "
+                "True, False, or None."
             )
         calibrationProbeStepDb = self.parameters[
             "calibrationProbeStepDb"
@@ -592,7 +679,8 @@ class Channel:
             or float(calibrationProbeStepDb) <= 0.0
         ):
             raise ValueError(
-                "calibrationProbeStepDb must be finite and positive"
+                "calibrationProbeStepDb has an invalid value. Allowed range: "
+                "finite real number in (0, +inf) dB."
             )
         calibrationRegularization = self.parameters[
             "calibrationRegularization"
@@ -604,7 +692,8 @@ class Channel:
             or float(calibrationRegularization) <= 0.0
         ):
             raise ValueError(
-                "calibrationRegularization must be finite and positive"
+                "calibrationRegularization has an invalid value. Allowed "
+                "range: finite real number in (0, +inf)."
             )
         activePowerThresholdDb = self.parameters[
             "activePowerThresholdDb"
@@ -616,7 +705,8 @@ class Channel:
             or float(activePowerThresholdDb) >= 0.0
         ):
             raise ValueError(
-                "activePowerThresholdDb must be finite and negative"
+                "activePowerThresholdDb has an invalid value. Allowed range: "
+                "finite real number in (-inf, 0) dB."
             )
         activeGapToleranceSamples = self.parameters[
             "activeGapToleranceSamples"
@@ -627,7 +717,8 @@ class Channel:
             or activeGapToleranceSamples < 0
         ):
             raise ValueError(
-                "activeGapToleranceSamples must be a nonnegative integer"
+                "activeGapToleranceSamples has an invalid value. Allowed "
+                "range: integer in [0, +inf) samples."
             )
 
         randomSeed = self.parameters["randomSeed"]
@@ -637,9 +728,20 @@ class Channel:
             or int(randomSeed) < 0
         ):
             raise ValueError(
-                "randomSeed must be a nonnegative integer or None"
+                "randomSeed has an invalid value. Allowed range: None or an "
+                "integer in [0, +inf)."
             )
-        FixedPoint(self.width)
+        width = self.parameters["width"]
+        if (
+            not isinstance(width, int)
+            or isinstance(width, bool)
+            or not 0 <= width <= 53
+        ):
+            raise ValueError(
+                "width has an invalid value. Allowed range: integer in "
+                "[0, 53] bits, where 0 selects floating-point mode."
+            )
+        FixedPoint(width)
 
     def SetPaModel(self, paModel: Any) -> None:
         """Bind the PA evaluated before the channel impairments.
@@ -691,17 +793,24 @@ class Channel:
         ):
             scalarTarget = float(outputPowerDbm)
             if not np.isfinite(scalarTarget):
-                raise ValueError("outputPowerDbm must be finite")
+                raise ValueError(
+                    "outputPowerDbm has an invalid value. Allowed range: "
+                    "any finite real scalar in (-inf, +inf) dBm, or a "
+                    "nonempty one-dimensional sequence of such values."
+                )
             return scalarTarget, None
         if isinstance(outputPowerDbm, (str, bytes)):
             raise TypeError(
-                "outputPowerDbm must be a real scalar or numeric sequence"
+                "outputPowerDbm has an invalid type. Allowed values: any "
+                "finite real scalar, or a nonempty one-dimensional sequence "
+                "of finite real values in dBm."
             )
         targetArray = np.asarray(outputPowerDbm, dtype=object)
         if targetArray.ndim != 1 or targetArray.size == 0:
             raise ValueError(
-                "outputPowerDbm sequence must be nonempty and "
-                "one-dimensional"
+                "outputPowerDbm has an invalid sequence shape. Allowed "
+                "values: a finite real scalar, or a nonempty "
+                "one-dimensional sequence of finite real values in dBm."
             )
         targetValues = []
         for targetValue in targetArray:
@@ -713,12 +822,16 @@ class Channel:
                 or isinstance(targetValue, (bool, np.bool_))
             ):
                 raise TypeError(
-                    "every outputPowerDbm target must be a real number"
+                    "outputPowerDbm contains an invalid element type. Every "
+                    "element must be a finite real number in (-inf, +inf) "
+                    "dBm."
                 )
             floatingTarget = float(targetValue)
             if not np.isfinite(floatingTarget):
                 raise ValueError(
-                    "every outputPowerDbm target must be finite"
+                    "outputPowerDbm contains an invalid element value. Every "
+                    "element must be a finite real number in (-inf, +inf) "
+                    "dBm."
                 )
             targetValues.append(floatingTarget)
         targetTuple = tuple(targetValues)
@@ -1136,7 +1249,8 @@ class Channel:
             "postPaCouplingPaths",
         ):
             raise ValueError(
-                "parameterName must select pre- or post-PA coupling paths"
+                "parameterName has an invalid value. Allowed values: "
+                "'prePaCouplingPaths' or 'postPaCouplingPaths'."
             )
         rawPaths = self.parameters[parameterName]
         if rawPaths is None:
@@ -1145,7 +1259,8 @@ class Channel:
             rawPaths, Sequence
         ):
             raise TypeError(
-                f"{parameterName} must be a sequence of mappings or None"
+                f"{parameterName} has an invalid type. Allowed values: None "
+                "or a sequence of coupling-path mappings."
             )
         pathDefaults: Mapping[str, object] = MappingProxyType(
             {
@@ -1162,7 +1277,9 @@ class Channel:
         for pathIndex, rawPath in enumerate(rawPaths):
             if not isinstance(rawPath, Mapping):
                 raise TypeError(
-                    f"{parameterName}[{pathIndex}] must be a mapping"
+                    f"{parameterName}[{pathIndex}] has an invalid type. "
+                    "Allowed value: a mapping containing supported path "
+                    "fields."
                 )
             unknownPathNames = FindUnknownParameterNames(
                 rawPath,
@@ -1170,10 +1287,11 @@ class Channel:
             )
             if unknownPathNames:
                 raise TypeError(
-                    f"Channel.{parameterName}[{pathIndex}] contains unknown "
-                    "configuration parameter(s): "
-                    + ", ".join(unknownPathNames)
-                    + ". Parameter names are case-sensitive."
+                    self.FormatUnknownParameterError(
+                        f"Channel.{parameterName}[{pathIndex}]",
+                        unknownPathNames,
+                        tuple(pathDefaults),
+                    )
                 )
             recognizedPath = {
                 str(pathName): pathValue
@@ -1196,7 +1314,8 @@ class Channel:
                 ):
                     raise ValueError(
                         f"{parameterName}[{pathIndex}].{indexName} "
-                        "must be a nonnegative integer"
+                        "has an invalid value. Allowed range: integer in "
+                        "[0, +inf)."
                     )
                 if (
                     chainCount is not None
@@ -1204,12 +1323,15 @@ class Channel:
                 ):
                     raise IndexError(
                         f"{parameterName}[{pathIndex}].{indexName} "
-                        "is outside the waveform chain range"
+                        "is outside the waveform chain range. Allowed range: "
+                        f"integer in [0, {chainCount - 1}]."
                     )
             if int(sourceChain) == int(destinationChain):
                 raise ValueError(
-                    f"{parameterName}[{pathIndex}] must connect two "
-                    "different chains; direct paths are implicit identities"
+                    f"{parameterName}[{pathIndex}] has identical source and "
+                    "destination chains. Allowed values: two different "
+                    "nonnegative chain indices; direct paths are implicit "
+                    "identities."
                 )
             for scalarName in ("gainDb", "phaseDegrees"):
                 scalarValue = resolvedPath[scalarName]
@@ -1220,7 +1342,8 @@ class Channel:
                 ):
                     raise ValueError(
                         f"{parameterName}[{pathIndex}].{scalarName} "
-                        "must be finite"
+                        "has an invalid value. Allowed range: any finite real "
+                        "number in (-inf, +inf)."
                     )
             integerDelay = resolvedPath["integerDelaySamples"]
             if (
@@ -1230,7 +1353,8 @@ class Channel:
             ):
                 raise ValueError(
                     f"{parameterName}[{pathIndex}]."
-                    "integerDelaySamples must be nonnegative"
+                    "integerDelaySamples has an invalid value. Allowed range: "
+                    "integer in [0, +inf) samples."
                 )
             fractionalDelay = resolvedPath[
                 "fractionalDelaySamples"
@@ -1243,14 +1367,16 @@ class Channel:
             ):
                 raise ValueError(
                     f"{parameterName}[{pathIndex}]."
-                    "fractionalDelaySamples must be in [-0.5, 0.5)"
+                    "fractionalDelaySamples has an invalid value. Allowed "
+                    "range: finite real number in [-0.5, 0.5) samples."
                 )
             firTaps = resolvedPath["firTaps"]
             if firTaps is not None:
                 if isinstance(firTaps, (str, bytes)):
                     raise TypeError(
-                        f"{parameterName}[{pathIndex}].firTaps must "
-                        "be a numeric sequence or None"
+                        f"{parameterName}[{pathIndex}].firTaps has an invalid "
+                        "type. Allowed values: None or a nonempty "
+                        "one-dimensional sequence of finite complex numbers."
                     )
                 firArray = np.asarray(
                     firTaps, dtype=np.complex128
@@ -1261,8 +1387,9 @@ class Channel:
                     or not np.all(np.isfinite(firArray))
                 ):
                     raise ValueError(
-                        f"{parameterName}[{pathIndex}].firTaps must "
-                        "be a finite nonempty vector or None"
+                        f"{parameterName}[{pathIndex}].firTaps has an invalid "
+                        "value. Allowed values: None or a nonempty "
+                        "one-dimensional sequence of finite complex numbers."
                     )
                 resolvedPath["firTaps"] = tuple(
                     complex(value) for value in firArray

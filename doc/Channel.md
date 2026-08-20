@@ -1162,7 +1162,9 @@ Channel(
 | `activePowerThresholdDb` | `-60.0` | dB | 相对峰值的有效突发功率门限 |
 | `activeGapToleranceSamples` | `16` | sample | 有效区内部允许闭合的短低幅空洞 |
 
-默认值都定义在构造函数内部，并通过 `ChainMap` 与调用方配置合并。Channel采用严格、区分大小写的参数策略：构造函数映射、直接关键字、`UpdateParameters`、运行期修改的外部活动映射以及耦合路径子字段只要包含未知名称，都会立即抛出 `TypeError`，不会回退到默认值继续运行。已识别但类型错误或数值非法的参数仍分别抛出 `TypeError` 或 `ValueError`。
+默认值都定义在构造函数内部，并通过 `ChainMap` 与调用方配置合并。Channel采用严格、区分大小写的参数策略：构造函数映射、直接关键字、`UpdateParameters`、运行期修改的外部活动映射以及耦合路径子字段只要包含未知名称，都会立即抛出 `TypeError`，不会回退到默认值继续运行。
+
+未知名称报错会针对每个错误名称列出全部合法名称，并使用不区分大小写的字符串序列相似度从高到低排序；长度差和字典序只用于相似度相同时的稳定排序。因此拼写最接近的候选位于首位，但完整合法参数表仍保留在同一条异常信息中。已识别但类型错误或数值非法时，`TypeError` 或 `ValueError` 会显示允许的数据类型、离散集合、数值区间或互斥组合。
 
 例如下面的全小写名称不是合法参数：
 
@@ -1187,6 +1189,18 @@ channel = Channel(
     }
 )
 ```
+
+例如 `txiqgainimbalancedb` 的候选列表以 `txIqGainImbalanceDb` 开头，后面继续按相关度列出其余全部Channel参数。若名称正确但值错误：
+
+```python
+channel = Channel(
+    parameters={
+        "fbFractionalDelaySamples": 0.5,
+    }
+)
+```
+
+异常会明确显示允许范围为 `[-0.5, 0.5)` sample。集合参数会显示全部允许值，例如 `sampleMode` 只允许 `"forward"` 或 `"fb"`；互斥参数会显示允许组合，例如三个噪声控制量最多只能有一个非 `None`。
 
 ### 6.9 配置值如何进入模型，以及怎样选择
 
@@ -1590,6 +1604,7 @@ stressFeedbackParameters = {
 | `GetLastPaOutput()` | 无 | 返回最近一次内部闭环接受的干净PA输出 |
 | `GetLastCalibrationMetrics()` | 无 | 返回目标、实测dBm、误差和迭代次数字典 |
 | `ProcessPaOutput(paOutputSignal)` | 已有各PA自身输出 | 不运行PA或功率闭环，执行PA后耦合及所选采样路径 |
+| `FormatUnknownParameterError(ownerName, unknownNames, supportedNames)` | 配置上下文、错误名称、全部合法名称 | 对每个错误名称按相关度降序列出全部合法名称并生成严格模式异常文本 |
 | `ResolveCouplingPaths(parameterName, chainCount=None)` | 路径参数名、可选链数 | 拒绝未知子键并规范、校验耦合路径 |
 | `ApplyCouplingPath(sourceSignal, couplingPath)` | 单路源信号、规范路径 | 应用FIR、整数/分数时延、增益与相位 |
 | `ApplyMimoCoupling(inputSignal, parameterName)` | 多路矩阵、路径参数名 | 保留直通并累加所有非对角耦合 |

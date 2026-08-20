@@ -1818,7 +1818,7 @@ channel = Channel(
 )
 ```
 
-参数名称区分大小写，正确名称为 `txIqGainImbalanceDb`。`UpdateParameters()`、运行期加入外部活动字典的未知键以及耦合路径中的未知字段使用相同规则。
+参数名称区分大小写，正确名称为 `txIqGainImbalanceDb`。异常信息会把该名称排在首位，并在其后按相似度从高到低列出其余全部合法Channel参数；`UpdateParameters()`、运行期加入外部活动字典的未知键以及耦合路径中的未知字段使用相同规则。名称正确但配置值非法时，异常会显示允许类型、离散值、数值区间或参数互斥条件。
 
 ```python
 from inc.lib.Analysis import Analysis
