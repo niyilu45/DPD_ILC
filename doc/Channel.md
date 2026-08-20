@@ -1093,7 +1093,7 @@ Channel(
 | `fractionalDelaySamples` | `0.0` | 分数时延，范围 `[-0.5,0.5)` |
 | `firTaps` | `None` | 可选非空有限复FIR；`None`为单位抽头 |
 
-路径中的未知字段会单独发出警告并忽略；已识别但非法的索引、时延、增益或FIR仍然报错。
+路径中的未知字段会立即抛出 `TypeError`，不会继续使用路径默认值；已识别但非法的索引、时延、增益或FIR仍然报错。
 
 ### 6.4 FB线性、同步与振荡器模块
 
@@ -1162,7 +1162,31 @@ Channel(
 | `activePowerThresholdDb` | `-60.0` | dB | 相对峰值的有效突发功率门限 |
 | `activeGapToleranceSamples` | `16` | sample | 有效区内部允许闭合的短低幅空洞 |
 
-与其他主类相同，默认值都定义在构造函数内部，并通过 `ChainMap` 与调用方配置合并。未知参数会产生警告、被忽略，并且不会中止处理；已识别但数值非法的参数仍会抛出异常。
+默认值都定义在构造函数内部，并通过 `ChainMap` 与调用方配置合并。Channel采用严格、区分大小写的参数策略：构造函数映射、直接关键字、`UpdateParameters`、运行期修改的外部活动映射以及耦合路径子字段只要包含未知名称，都会立即抛出 `TypeError`，不会回退到默认值继续运行。已识别但类型错误或数值非法的参数仍分别抛出 `TypeError` 或 `ValueError`。
+
+例如下面的全小写名称不是合法参数：
+
+```python
+from inc.lib.Channel import Channel
+
+channel = Channel(
+    parameters={
+        "txiqgainimbalancedb": 0.5,
+        "txiqphaseimbalancedegrees": 2.0,
+    }
+)
+```
+
+构造函数会立即报告这两个未知名称。正确写法是：
+
+```python
+channel = Channel(
+    parameters={
+        "txIqGainImbalanceDb": 0.5,
+        "txIqPhaseImbalanceDegrees": 2.0,
+    }
+)
+```
 
 ### 6.9 配置值如何进入模型，以及怎样选择
 
@@ -1566,7 +1590,7 @@ stressFeedbackParameters = {
 | `GetLastPaOutput()` | 无 | 返回最近一次内部闭环接受的干净PA输出 |
 | `GetLastCalibrationMetrics()` | 无 | 返回目标、实测dBm、误差和迭代次数字典 |
 | `ProcessPaOutput(paOutputSignal)` | 已有各PA自身输出 | 不运行PA或功率闭环，执行PA后耦合及所选采样路径 |
-| `ResolveCouplingPaths(parameterName, chainCount=None)` | 路径参数名、可选链数 | 过滤未知子键并规范、校验耦合路径 |
+| `ResolveCouplingPaths(parameterName, chainCount=None)` | 路径参数名、可选链数 | 拒绝未知子键并规范、校验耦合路径 |
 | `ApplyCouplingPath(sourceSignal, couplingPath)` | 单路源信号、规范路径 | 应用FIR、整数/分数时延、增益与相位 |
 | `ApplyMimoCoupling(inputSignal, parameterName)` | 多路矩阵、路径参数名 | 保留直通并累加所有非对角耦合 |
 | `ResolveIqImbalanceCoefficients(gainImbalanceDb, phaseImbalanceDegrees)` | I/Q增益与正交误差 | 返回广义线性直接系数和共轭镜像系数 |

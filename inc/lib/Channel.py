@@ -26,15 +26,13 @@ import numpy as np
 # ``lib`` package entry points without relying on a parent that may not exist.
 if __package__ and "." in __package__:
     from ..utils.ConfigUtils import (
-        FilterRecognizedParameters,
-        RecognizedParameterView,
+        FindUnknownParameterNames,
     )
     from ..utils.FixedPoint import FixedPoint
     from ..utils.SigProc import PowerCalibration
 else:
     from utils.ConfigUtils import (
-        FilterRecognizedParameters,
-        RecognizedParameterView,
+        FindUnknownParameterNames,
     )
     from utils.FixedPoint import FixedPoint
     from utils.SigProc import PowerCalibration
@@ -75,7 +73,8 @@ class Channel:
                 internal 16-bit default, zero selects floating point, and a
                 positive value selects signed integer I/Q codes.
             parameterOverrides: Highest-priority local configuration values.
-                Unsupported names produce a warning and are ignored.
+                Unsupported names raise ``TypeError`` because Channel uses a
+                strict, case-sensitive public configuration vocabulary.
 
         Returns:
             result: None. The configured channel is ready for processing.
@@ -128,20 +127,33 @@ class Channel:
             directOverrides["width"] = width
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
-        externalParameters: Mapping[str, object] = (
-            {}
-            if parameters is None
-            else RecognizedParameterView(
-                parameters,
-                self.defaultParameters,
-                "Channel",
-            )
+        externalParameters: Mapping[object, object] = (
+            {} if parameters is None else parameters
         )
-        recognizedOverrides = FilterRecognizedParameters(
+        unknownExternalNames = FindUnknownParameterNames(
+            externalParameters,
+            self.defaultParameters,
+        )
+        if unknownExternalNames:
+            raise TypeError(
+                "Channel received unknown configuration parameter(s): "
+                + ", ".join(unknownExternalNames)
+                + ". Parameter names are case-sensitive."
+            )
+        unknownOverrideNames = FindUnknownParameterNames(
             directOverrides,
             self.defaultParameters,
-            "Channel",
         )
+        if unknownOverrideNames:
+            raise TypeError(
+                "Channel received unknown configuration parameter(s): "
+                + ", ".join(unknownOverrideNames)
+                + ". Parameter names are case-sensitive."
+            )
+        recognizedOverrides = {
+            str(parameterName): parameterValue
+            for parameterName, parameterValue in directOverrides.items()
+        }
         self.parameters: ChainMap[str, object] = ChainMap(
             recognizedOverrides,
             externalParameters,
@@ -204,15 +216,16 @@ class Channel:
             result: Ordinary dictionary containing every supported setting.
         """
 
+        self.ValidateParameters()
         return dict(self.parameters)
 
     def UpdateParameters(self, **parameterOverrides: object) -> None:
         """Apply validated high-priority channel overrides transactionally.
 
         Processing details:
-            Algorithm: Filter unsupported keys with a warning, update the
-            local ChainMap layer, validate the complete resolved state, and
-            restore the prior state when any recognized value is invalid.
+            Algorithm: Reject unsupported names before changing state, update
+            the local ChainMap layer, validate the complete resolved state,
+            and restore the prior state when any recognized value is invalid.
 
         Args:
             parameterOverrides: Supported values to replace locally.
@@ -221,11 +234,21 @@ class Channel:
             result: None. Valid updates affect subsequent channel calls.
         """
 
-        recognizedOverrides = FilterRecognizedParameters(
+        unknownParameterNames = FindUnknownParameterNames(
             parameterOverrides,
             self.defaultParameters,
-            "Channel.UpdateParameters",
         )
+        if unknownParameterNames:
+            raise TypeError(
+                "Channel.UpdateParameters received unknown configuration "
+                "parameter(s): "
+                + ", ".join(unknownParameterNames)
+                + ". Parameter names are case-sensitive."
+            )
+        recognizedOverrides = {
+            str(parameterName): parameterValue
+            for parameterName, parameterValue in parameterOverrides.items()
+        }
         previousOverrides = dict(self.parameters.maps[0])
         previousSeed = self._activeRandomSeed
         self.parameters.maps[0].update(recognizedOverrides)
@@ -243,14 +266,35 @@ class Channel:
         """Validate phase, noise, physical scaling, seed, and interface width.
 
         Processing details:
-            Algorithm: Restrict phase to minus 90, zero, or plus 90 degrees;
-            enforce mutual exclusion of the three noise controls; check all
-            physical scalars for finite values and valid domains; then use
+            Algorithm: Reject unknown names in both live caller layers,
+            restrict phase to minus 90, zero, or plus 90 degrees, enforce
+            mutual exclusion of the three noise controls, check all physical
+            scalars for finite values and valid domains, then use
             ``FixedPoint`` as the authoritative width validator.
 
         Returns:
             result: None. Invalid recognized settings raise an exception.
         """
+
+        for layerIndex, parameterLayer in enumerate(
+            self.parameters.maps[:2]
+        ):
+            unknownParameterNames = FindUnknownParameterNames(
+                parameterLayer,
+                self.defaultParameters,
+            )
+            if unknownParameterNames:
+                layerName = (
+                    "local override"
+                    if layerIndex == 0
+                    else "external parameter"
+                )
+                raise TypeError(
+                    f"Channel {layerName} layer contains unknown "
+                    "configuration parameter(s): "
+                    + ", ".join(unknownParameterNames)
+                    + ". Parameter names are case-sensitive."
+                )
 
         sampleMode = self.parameters["sampleMode"]
         if (
@@ -1072,10 +1116,10 @@ class Channel:
 
         Processing details:
             Algorithm: Accept only the pre- or post-PA path parameter, replace
-            None with no coupling, filter unknown nested keys with warnings,
-            validate source/destination indices, gain, phase, causal integer
-            delay, bounded fractional delay, and an optional finite complex
-            FIR, then return defensive ordinary dictionaries. The direct path
+            None with no coupling, reject unknown nested keys, validate
+            source/destination indices, gain, phase, causal integer delay,
+            bounded fractional delay, and an optional finite complex FIR,
+            then return defensive ordinary dictionaries. The direct path
             remains an implicit identity and every configured path is added
             to its destination.
 
@@ -1120,11 +1164,21 @@ class Channel:
                 raise TypeError(
                     f"{parameterName}[{pathIndex}] must be a mapping"
                 )
-            recognizedPath = FilterRecognizedParameters(
+            unknownPathNames = FindUnknownParameterNames(
                 rawPath,
                 pathDefaults,
-                f"Channel.{parameterName}[{pathIndex}]",
             )
+            if unknownPathNames:
+                raise TypeError(
+                    f"Channel.{parameterName}[{pathIndex}] contains unknown "
+                    "configuration parameter(s): "
+                    + ", ".join(unknownPathNames)
+                    + ". Parameter names are case-sensitive."
+                )
+            recognizedPath = {
+                str(pathName): pathValue
+                for pathName, pathValue in rawPath.items()
+            }
             resolvedPath = {
                 **pathDefaults,
                 **recognizedPath,

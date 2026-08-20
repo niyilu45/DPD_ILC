@@ -3096,16 +3096,16 @@ def CheckMseEvmConvergence() -> None:
 
 
 def CheckUnknownConfigurationWarnings() -> None:
-    """Verify unknown configuration keys warn, disappear, and do not stop work.
+    """Verify tolerant classes warn while Channel rejects unknown names.
 
     Processing details:
         Algorithm: Exercise constructor mappings, direct keyword overrides,
-        live external edits, and update methods across every ChainMap-backed
-        public class; capture warnings and confirm recognized settings remain
-        operational.
+        live external edits, and update methods across tolerant ChainMap-backed
+        classes; then verify Channel fails fast for every top-level and nested
+        unknown-name entry path.
 
     Returns:
-        result: None. Assertions enforce nonfatal unknown-key behavior.
+        result: None. Assertions enforce each class's documented policy.
     """
 
     externalWifiParameters = {
@@ -3168,15 +3168,6 @@ def CheckUnknownConfigurationWarnings() -> None:
         )
         resultAnalysis.Analyze(waveform.samples)
 
-        channel = Channel(
-            parameters={
-                "width": 0,
-                "unknownChannelSetting": 1,
-            }
-        )
-        channel.UpdateParameters(unknownChannelUpdate=2)
-        channel.ProcessPaOutput(waveform.samples)
-
         resultDraw = Draw(
             parameters={"unknownDrawSetting": 1}
         )
@@ -3198,8 +3189,6 @@ def CheckUnknownConfigurationWarnings() -> None:
         "unknownSignalSetting",
         "unknownParserSetting",
         "unknownAnalysisSetting",
-        "unknownChannelSetting",
-        "unknownChannelUpdate",
         "unknownDrawSetting",
     )
     for unknownName in expectedUnknownNames:
@@ -3214,8 +3203,80 @@ def CheckUnknownConfigurationWarnings() -> None:
     assert "unknownSignalSetting" not in signalProcessor.GetParameters()
     assert "unknownParserSetting" not in wifiParser.GetParameters()
     assert "unknownAnalysisSetting" not in resultAnalysis.GetParameters()
-    assert "unknownChannelSetting" not in channel.GetParameters()
     assert "unknownDrawSetting" not in resultDraw.GetParameters()
+
+    strictConstructorCases = (
+        (
+            "constructor mapping",
+            lambda: Channel(
+                parameters={
+                    "width": 0,
+                    "txiqgainimbalancedb": 0.5,
+                }
+            ),
+            "txiqgainimbalancedb",
+        ),
+        (
+            "constructor keyword",
+            lambda: Channel(
+                width=0,
+                unknownChannelKeyword=1,
+            ),
+            "unknownChannelKeyword",
+        ),
+        (
+            "nested coupling path",
+            lambda: Channel(
+                parameters={
+                    "prePaCouplingPaths": (
+                        {
+                            "sourceChain": 0,
+                            "destinationChain": 1,
+                            "unknownPathSetting": 1,
+                        },
+                    ),
+                }
+            ),
+            "unknownPathSetting",
+        ),
+    )
+    for caseName, strictConstructor, expectedUnknownName in (
+        strictConstructorCases
+    ):
+        try:
+            strictConstructor()
+        except TypeError as error:
+            errorText = str(error)
+            assert expectedUnknownName in errorText
+            assert "case-sensitive" in errorText
+        else:
+            raise AssertionError(
+                f"Channel {caseName} must reject unknown names"
+            )
+
+    strictUpdateChannel = Channel(parameters={"width": 0})
+    try:
+        strictUpdateChannel.UpdateParameters(
+            unknownChannelUpdate=2
+        )
+    except TypeError as error:
+        assert "unknownChannelUpdate" in str(error)
+    else:
+        raise AssertionError(
+            "Channel.UpdateParameters must reject unknown names"
+        )
+
+    liveChannelParameters = {"width": 0}
+    liveStrictChannel = Channel(parameters=liveChannelParameters)
+    liveChannelParameters["lateUnknownChannelSetting"] = 3
+    try:
+        liveStrictChannel.GetParameters()
+    except TypeError as error:
+        assert "lateUnknownChannelSetting" in str(error)
+    else:
+        raise AssertionError(
+            "Channel must reject unknown names added to a live mapping"
+        )
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

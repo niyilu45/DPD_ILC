@@ -301,6 +301,9 @@ flowchart LR
     view --> mapping["__getitem__ / __iter__ / __len__"]
     mapping --> chainMap["各业务类内部ChainMap"]
     filter --> chainMap
+    channelCaller["Channel构造/更新/活动字典"] --> channelFind["FindUnknownParameterNames"]
+    channelFind --> channelReject["未知名称：TypeError"]
+    channelFind --> channelMap["全部已知：Channel ChainMap"]
 ```
 
 **图示说明：**
@@ -308,6 +311,7 @@ flowchart LR
 - 构造函数直接关键字和 `UpdateParameters` 通过 `FilterRecognizedParameters` 复制已识别键；未知键由 `WarnUnknownParameters` 一次汇总报告并被忽略。
 - `RecognizedParameterView` 不复制调用方外部字典，因此保留运行期间修改配置的动态语义；视图只向 `ChainMap` 暴露已识别键。
 - 外部字典后来加入新的未知键时，`WarnForNewUnknownParameters` 在下一次访问时报告该键。相同未知名称不会在每个采样点重复刷屏。
+- `Channel` 是严格模式例外：它直接使用 `FindUnknownParameterNames` 检查构造、更新、活动字典和耦合路径，发现未知名称立即抛出 `TypeError`，不会警告后继续。
 - 该模块只处理配置编排，不参与 Wi-Fi、PA、ILC、EVM 或功率计算。
 
 ### `inc/lib/WaveGenWifi.py`
@@ -1771,9 +1775,9 @@ x[n]-\frac{\bar y_k[n]}{\hat g_k}.
 
 调用方省略的键会自动从对应类的内部默认层读取。外部字典仍是活动映射：构造实例后继续修改它，下一次 `Generate()`、`Process()`、分析计算或绘图会读取新值。
 
-### 配置容错：未知键警告后忽略
+### 一般配置容错与Channel严格模式
 
-所有面向用户的 `ChainMap` 配置入口采用统一规则：
+除 `Channel` 外，面向用户的 `ChainMap` 配置入口采用以下容错规则：
 
 - 未知配置键通过标准 `UserWarning` 报告；
 - 未知键不会写入有效参数层，也不会中断函数；
@@ -1801,6 +1805,20 @@ print(warningRecords[0].message)
 ```
 
 这里 `mcs=9` 正常生效，`unsupportedOption` 被忽略，波形仍会生成。该策略适合长时间 benchmark 和仪表联调：拼写错误或旧版本遗留键不会让整批任务停止，但警告仍会明确记录配置问题。
+
+`Channel` 涉及PA功率标定、Tx/FB参考面和射频非理想配置，错误名称可能让测试在错误物理条件下继续，因此采用严格策略。以下调用会立即抛出 `TypeError`：
+
+```python
+from inc.lib.Channel import Channel
+
+channel = Channel(
+    parameters={
+        "txiqgainimbalancedb": 0.5,
+    }
+)
+```
+
+参数名称区分大小写，正确名称为 `txIqGainImbalanceDb`。`UpdateParameters()`、运行期加入外部活动字典的未知键以及耦合路径中的未知字段使用相同规则。
 
 ```python
 from inc.lib.Analysis import Analysis
