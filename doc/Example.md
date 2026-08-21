@@ -649,3 +649,75 @@ for activeDutyCycle in (0.25, 0.50, 1.00):
 5. 温漂正式阶段不能再次传入 `outputPowerDbm`。
 6. 检查温度系数是否非零；只有热网络升温而电参数不随温度变化时，波形可能几乎不变。
 7. 一次只恢复一个被关闭的模块，直到找到趋势改变的来源。
+
+## 10. 最小系统E：单独验证Rapp无记忆PA
+
+### 10.1 为什么需要这个场景
+
+Rapp是本工程新增的严格无记忆固态PA模型。它只让当前输出依赖当前输入：
+
+```math
+y[n]
+=
+\frac{G x[n]}
+{\left(1+\left(\frac{|x[n]|}{A_{\mathrm{sat}}}\right)^{2p}\right)^{1/(2p)}}.
+```
+
+因此，只要两段波形在第 $n$ 点的复数值相同，不论此前样点如何变化，Rapp都必须给出完全相同的 $y[n]$。这个场景的目的不是证明Rapp“没有非线性”，而是把**静态压缩**和**动态记忆**拆开：Rapp可以产生明显IM3、IM5和IM7，但不应产生真正的频率响应起伏、群时延或动态迟滞。
+
+### 10.2 三档膝点平滑度对比
+
+固定 `linearGain=1.0`、`saturationAmplitude=1.0`，只改变 `rappSmoothness`：
+
+| `rappSmoothness` | 适合的对照目的 | $|x|=0.5$增益压缩 | $|x|=1.0$增益压缩 | $|x|=1.4$增益压缩 |
+|---:|---|---:|---:|---:|
+| 1.5 | 很软的膝点，较早出现渐进压缩 | -0.341 dB | -2.007 dB | -3.822 dB |
+| 3.0 | 推荐默认值，代表常见平滑SSPA | -0.022 dB | -1.003 dB | -3.103 dB |
+| 8.0 | 接近硬限幅，用于压力测试 | 约0 dB | -0.376 dB | -2.925 dB |
+
+这些数值是相对于小信号线性增益 $G$ 的压缩量。`rappSmoothness` 越大，膝点前越接近直线、膝点附近转折越突然；它不会引入记忆或AM-PM。
+
+### 10.3 最小可运行代码：相同当前样点、不同历史
+
+```python
+import numpy as np
+
+from inc.lib.PaModel import PaModel, RappConfig, WienerConfig
+
+
+sampleCount = 256
+comparisonIndex = 128
+firstHistory = np.zeros(sampleCount, dtype=np.complex128)
+secondHistory = np.zeros(sampleCount, dtype=np.complex128)
+
+# Only the preceding sample is different.  The compared current sample is exact.
+firstHistory[comparisonIndex - 1] = 0.9 + 0.2j
+secondHistory[comparisonIndex - 1] = -0.3 + 0.7j
+firstHistory[comparisonIndex] = 0.6 - 0.1j
+secondHistory[comparisonIndex] = firstHistory[comparisonIndex]
+
+rappPa = PaModel(
+    modelName="rapp",
+    rappConfig=RappConfig(
+        linearGain=1.0,
+        saturationAmplitude=1.0,
+        rappSmoothness=3.0,
+    ),
+    width=0,
+)
+wienerPa = PaModel(
+    modelName="wiener",
+    wienerConfig=WienerConfig(linearTaps=(0.90 + 0.0j, 0.10 + 0.0j)),
+    width=0,
+)
+
+rappFirst = rappPa.Process(firstHistory)
+rappSecond = rappPa.Process(secondHistory)
+wienerFirst = wienerPa.Process(firstHistory)
+wienerSecond = wienerPa.Process(secondHistory)
+
+print("Rapp context difference:", abs(rappFirst[comparisonIndex] - rappSecond[comparisonIndex]))
+print("Wiener context difference:", abs(wienerFirst[comparisonIndex] - wienerSecond[comparisonIndex]))
+```
+
+预期结果：Rapp差值处于浮点舍入误差量级；Wiener差值明显非零，因为其第二个 `linearTaps` 抽头显式使用 $x[n-1]$。进一步运行 `RunPaCharacterizationBenchmark` 时，还应看到Rapp的频响起伏、群时延和动态迟滞接近零，而其互调随输出功率升高而恶化。这样才能确认测试链既能发现静态非线性，也不会把无记忆模型误判成有记忆。

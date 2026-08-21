@@ -641,7 +641,7 @@ Save convergence histories and power-EVM data
 | `maximumOutputPowerDbm` | 25 | 25 | 每路PA额定极限输出功率和0 dB回退参考点 |
 | `loadResistanceOhm` | 50 | 50 | dBm与复包络RMS电压换算 |
 | `numIterations` | 10 | 6 | 每种ILC记录轮数 |
-| `paModelName` | wiener | wiener | 被测PA模型；可选Wiener、GMP或Doherty |
+| `paModelName` | wiener | wiener | 被测PA模型；可选Rapp、Wiener、GMP或Doherty |
 | `seed` | 101 | 101 | 训练帧及方法种子基准；允许0至926，验证帧使用 `seed + 97` |
 | `powerStartDbm` | 10 | 10 | 每路输出功率扫描起点，单位dBm |
 | `powerStopDbm` | 25 | 25 | 每路输出功率扫描终点，单位dBm |
@@ -1707,7 +1707,7 @@ flowchart TD
     config["TwoToneBenchmarkConfig.Validate"] --> generator["WaveGenTwoTone.Generate"]
     generator --> raw["原始双音"]
     raw --> calibration["PowerCalibration闭环"]
-    calibration --> pa["Wiener、GMP或Doherty PA"]
+    calibration --> pa["Rapp、Wiener、GMP或Doherty PA"]
     pa --> baseline["20 dBm baseline"]
     baseline --> analysis["TwoToneAnalysis：IM3/IM5/IM7"]
     calibration --> methods["七种适用SISO ILC"]
@@ -1839,7 +1839,7 @@ rows = RunTwoToneIlcBenchmark(
 
 ---
 
-## 29. H类：Wiener/GMP/Doherty PA双音特性
+## 29. H类：Rapp/Wiener/GMP/Doherty PA双音特性
 
 ### 29.1 分类目的
 
@@ -1849,7 +1849,7 @@ H类不运行ILC，专门回答PA本身的三个问题：
 2. IM3、侧带不对称和动态迟滞是否随双音间隔变化；
 3. IM3、IM5、IM7与动态AM-AM/AM-PM迟滞如何随实际输出功率变化。
 
-它与G类的区别是：G类固定一个PA并比较ILC方法，H类固定测试方法并比较Wiener、GMP和Doherty三种PA。完整公式、参数、参考数值和四张结果图见[PA双音特性分析](./PaAnalyse.md)。
+它与G类的区别是：G类固定一个PA并比较ILC方法，H类固定测试方法并比较Rapp、Wiener、GMP和Doherty四种PA。Rapp提供严格无记忆对照，用来验证频响、间隔依赖和动态迟滞测量是否能区分静态非线性与记忆。完整公式、参数、参考数值和四张结果图见[PA双音特性分析](./PaAnalyse.md)。
 
 ### 29.2 控制变量和对比
 
@@ -1865,7 +1865,7 @@ H类不运行ILC，专门回答PA本身的三个问题：
 
 ```mermaid
 flowchart TD
-    config["PaCharacterizationConfig.Validate"] --> models["Wiener、GMP、Doherty"]
+    config["PaCharacterizationConfig.Validate"] --> models["Rapp、Wiener、GMP、Doherty"]
     models --> frequency["共同小信号输入下扫描中心频率"]
     models --> spacing["20 dBm下扫描双音间隔"]
     models --> power["固定间隔扫描10至25 dBm"]
@@ -1893,7 +1893,7 @@ python tests/BenchMark.py --pa-analyse
 python tests/BenchMark.py --pa-analyse --sample-rate-hz 200000000 --tone-samples 16384 --width 0 --output-power-dbm 20 --maximum-output-power-dbm 25 --load-resistance-ohm 50 --output-dir results/pa_characterization
 ```
 
-`--pa-analyse`始终比较三种PA，`--pa`只用于Wi-Fi或G类双音ILC，不会缩小H类被测PA集合。
+`--pa-analyse`始终比较四种PA，`--pa`只用于Wi-Fi或G类双音ILC，不会缩小H类被测PA集合。
 
 ### 29.5 输出和预期
 
@@ -1903,11 +1903,12 @@ python tests/BenchMark.py --pa-analyse --sample-rate-hz 200000000 --tone-samples
 | `pa_memory_effect.csv/.png` | 对比间隔敏感度、上下侧不对称和动态迟滞 |
 | `pa_power_sweep.csv`、`pa_power_characteristics.png` | 对比10至25 dBm工作点变化 |
 | `pa_nonlinearity_comparison.png` | 对比20 dBm标称IM3/IM5/IM7 |
-| `pa_dpd_recommendations.csv` | 三种PA在五类测试后的15条DPD结构、参数、训练和验收建议 |
+| `pa_dpd_recommendations.csv` | 四种PA在五类测试后的20条DPD结构、参数、训练和验收建议 |
 | `pa_characterization_summary.csv`、`pa_characterization.json` | 保存汇总、全部可复现原始点和建议 |
 
 默认预期不是“某一种架构在所有指标上必然最好”，而是：
 
+- Rapp频响、群时延、侧带不对称和动态迟滞接近0，但互调仍随输出功率进入压缩而恶化；
 - Wiener与Doherty在Peaking关闭的小信号区频响接近；
 - GMP的记忆抽头和包络交叉项带来更明显的间隔依赖、侧带不对称和动态迟滞；
 - 接近25 dBm时，各模型进入不同压缩状态，互调和迟滞明显依赖输出功率；
@@ -1917,7 +1918,8 @@ python tests/BenchMark.py --pa-analyse --sample-rate-hz 200000000 --tone-samples
 
 ### 29.6 H类验收清单
 
-- [ ] 三种PA使用相同采样率、双音定义、端口阻抗和额定功率；
+- [ ] 四种PA使用相同采样率、双音定义、端口阻抗和额定功率；
+- [ ] Rapp的增益波纹、群时延、相位曲率和动态AM-PM接近0，作为无记忆基线；
 - [ ] 频响分支使用相同小信号输入，而不是逐频点同输出功率；
 - [ ] 记忆分支各间隔点的实测输出功率误差不超过0.25 dB；
 - [ ] 功率分支覆盖10、15、20、23、25 dBm并保存目标与实测值；

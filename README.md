@@ -1,13 +1,13 @@
 # DPD-ILC VHT/HE/EHT Wi-Fi与双音仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Wiener、GMP或Doherty PA、闭环输出功率校准和全部适用ILC更新律。MIMO Channel还可在PA前后加入方向不对称、具有独立FIR和时延的通道耦合。Wi-Fi路径输出功率、SNR、EVM、IRR、ACLR和功率-EVM曲线；双音路径既能比较所有SISO ILC的IM3/IM5/IM7，也能独立扫描三种PA的频率响应、记忆效应和10至25 dBm输出功率特性。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Rapp、Wiener、GMP或Doherty PA、闭环输出功率校准和全部适用ILC更新律。MIMO Channel还可在PA前后加入方向不对称、具有独立FIR和时延的通道耦合。Wi-Fi路径输出功率、SNR、EVM、IRR、ACLR和功率-EVM曲线；双音路径既能比较所有SISO ILC的IM3/IM5/IM7，也能独立扫描四种PA的频率响应、记忆效应和10至25 dBm输出功率特性。
 
 ## 理论文档
 
 - [Wi-Fi 帧生成物理原理与推导](doc/WaveGenWifi.md)：复基带、OFDM 正交性、QAM 归一化、MCS、循环前缀、VHT/HE/EHT 字段和 PAPR。
-- [双音信号生成物理原理与用法](doc/WaveGenTwoTone.md)：复基带双音、奇数阶互调频率、RMS/定点边界和ILC带宽。
+- [双音信号生成物理原理与用法](doc/WaveGenTwoTone.md)：复基带双音、等功率/不等功率选择、固定间隔位置移动、奇数阶互调频率、RMS/定点边界和ILC带宽。
 - [FEC编码译码原理与用法](doc/Fec.md)：55/90短块LDPC校验矩阵、系统编码、软输入normalized min-sum译码和调用示例。
-- [PA 模型物理原理与推导](doc/PaModel.md)：Wiener、GMP、Doherty、频谱再生、IQ失衡，以及由功率和占空比驱动的静态/单RC/Foster电热模型、参数图和开环输出漂移。
+- [PA 模型物理原理与推导](doc/PaModel.md)：Rapp无记忆SSPA、Wiener、GMP、Doherty、频谱再生、IQ失衡，以及由功率和占空比驱动的静态/单RC/Foster电热模型、参数图和开环输出漂移。
 - [PA双音特性分析](doc/PaAnalyse.md)：小信号频响、双音间隔记忆、动态AM-AM/AM-PM迟滞、IM3/IM5/IM7、输出功率扫描及逐PA的DPD优化建议。
 - [PA到接收端Channel物理原理与用法](doc/Channel.md)：I/Q正交调制背景与镜像产生推导、Tx/FB失衡边界、PA前/后多通道耦合、前向仪表/板载反馈采样、反馈链路非理想和联合功率校准。
 - [Channel特性测量与耦合感知DPD](doc/ChannelAnalyse.md)：平坦度、耦合增益/相位、群时延、条件数、测量接线以及耦合感知DPD-GMP前后对比。
@@ -16,7 +16,7 @@
 - [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：10 bit seed、短块LDPC、历史CRC兼容、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
 - [Wi-Fi 元数据契约](doc/WifiMetadata.md)：`MCSInfo` 与 `WifiWaveform` 的字段、数组形状和模块边界。
 - [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
-- [双音IM分析与ILC比较](doc/TwoToneAnalysis.md)：精确频率投影、IM3/IM5/IM7 dBc、逐轮选择和全方法Benchmark。
+- [双音IM分析与ILC比较](doc/TwoToneAnalysis.md)：精确频率投影、IM3/IM5/IM7专用接口、dBc与绝对dBFS、逐轮选择和全方法Benchmark。
 - [定点接口原理与用法](doc/FixedPoint.md)：浮点旁路、公开整数码、内部缩放、舍入、饱和，以及 WaveGenWifi、PaModel、Analysis 的统一数据边界。
 - [DPD-ILC 原理与算法](doc/DPD-ILC.md)：各类 ILC 更新律、部署模型和工程实践。
 - [DPD-GMP补偿与系数更新原理](doc/DPD-GMP.md)：GMP主/交叉记忆基函数、峰值/多功率加权、列归一化岭回归和增量系数更新。
@@ -24,7 +24,7 @@
 - [DPD-LMS逐样点补偿原理](doc/DPD-LMS.md)：复数LMS/NLMS推导、逐列尺度、因果样点状态、影子/活动系数、逐样点与批量岭回归的实现差异。
 - [DpdLms程序使用手册](doc/DpdLms.md)：完整参数、逐样点和整帧回放接口、间接学习、定点调用、最小移植程序和Benchmark。
 - [最小系统隔离测试示例](doc/Example.md)：分别隔离Tx/FB I/Q、固定温度角、动态自热、热阻和占空比，并比较理想、典型与压力参数配置。
-- [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、IRR用途/原理/计算与场景、普通/增广GMP的镜像补偿边界、仪表整段采集下的逐样点DPD训练，以及史密斯圆图阅读、观测信息和RF/DPD改善方案。
+- [DPD-ILC 常见问题](doc/FAQ.md)：低功率小信号逆响应、IRR用途/原理/计算与场景、普通/增广GMP的镜像补偿边界、仪表整段采集下的逐样点DPD训练、史密斯圆图，以及整段FFT与分段加窗Welch功率谱的公式、泄漏/方差/分辨率取舍和工程选择。
 - [全工程函数与物理原理覆盖审计](doc/FunctionPrinciples.md)：逐项索引 `main.py` 与 `inc` 中全部函数，区分物理模型、数值实现和工程编排，并链接到对应推导。
 
 安装依赖：
@@ -50,7 +50,7 @@ inc/lib/DpdIlc.py           全部可复用 ILC 更新律、SISO/MIMO 与标签�
 inc/lib/DpdGmp.py           SISO普通/增广GMP及测量驱动的耦合感知MIMO DPD
 inc/lib/DpdLms.py           GMP-LMS/NLMS逐样点影子系数更新与帧/样点提交
 inc/lib/Fec.py              55/90短块LDPC矩阵构造、系统编码和软输入译码
-inc/lib/PaModel.py          SISO/MIMO Wiener、GMP和Doherty非线性PA
+inc/lib/PaModel.py          SISO/MIMO Rapp、Wiener、GMP和Doherty非线性PA
 inc/lib/ParseWifi.py        接收帧描述解析、包起点检测与参考波形恢复
 inc/lib/WaveGenWifi.py      WaveGenWifi 类、VHT/HE/EHT 波形、别名归一化与 MCS 调制
 inc/lib/WaveGenTwoTone.py   WaveGenTwoTone 类、双音波形及IM3/IM5/IM7频率元数据
@@ -65,13 +65,13 @@ inc/__init__.py         公共接口汇总
 tests/TestProject.py    自包含验证脚本
 tests/BenchMark.py      分类ILC基准、PA双音特性测试、结果保存和曲线比较
 doc/BenchMark.md        各 benchmark 场景的构造、预期和参考仿真结果
-doc/PaAnalyse.md        三种PA特性及PA分析驱动的DPD-GMP逐项改进对比
+doc/PaAnalyse.md        四种PA特性及PA分析驱动的DPD-GMP逐项改进对比
 doc/ChannelAnalyse.md   通道测量原理、用例和耦合感知DPD前后性能
 doc/DPD-GMP.md          GMP DPD物理模型和系数更新推导
 doc/DpdGmp.md           DpdGmp类参数、方法和完整用例
 doc/DPD-LMS.md          GMP-LMS/NLMS逐样点更新推导和批量实现差异
 doc/DpdLms.md           DpdLms参数、逐样点移植示例和间接学习用法
-doc/FAQ.md              小信号逆响应、IRR诊断与计算、增广GMP、逐样点训练和史密斯圆图常见问题
+doc/FAQ.md              小信号逆响应、IRR、增广GMP、逐样点训练、史密斯圆图和FFT/Welch功率谱常见问题
 doc/Fec.md              FEC物理原理、数学推导、接口约束和调用示例
 doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整示例
 ```
@@ -253,7 +253,7 @@ flowchart TD
     frameProcess --> analysisMethod
     analysis --> analysisMethod
     analysisMethod --> metrics["汇总输出功率 / SNR / EVM / ACLR"]
-    analysisMethod --> mimoMetrics["逐 PA 功率/SNR/ACLR + 逐空间流 EVM"]
+    analysisMethod --> mimoMetrics["逐 PA 功率/SNR/IRR/ACLR + 逐空间流 EVM"]
     analysisMethod --> powerCurve["多方法功率-EVM 扫描"]
     metrics --> console["控制台表格"]
     metrics --> files["CSV / JSON / 收敛历史"]
@@ -526,6 +526,7 @@ flowchart TD
     caller["调用方"] --> pa["构造 PaModel 实例"]
     caller --> mimo["构造 MimoPaModel 实例"]
     pa --> select{"modelName"}
+    select -->|rapp| rapp["RappPA：严格无记忆SSPA"]
     select -->|wiener| wiener["WienerPA"]
     select -->|gmp| gmp["GMPPA"]
     select -->|doherty| doherty["DohertyPA"]
@@ -536,11 +537,16 @@ flowchart TD
     heat --> thermal
     thermal --> drift["温度增益/相位/饱和/非线性漂移"]
     drift --> paProcess
+    paProcess --> rappProcess["RappPA.Process：逐样点AM-AM"]
     paProcess --> wienerProcess["WienerPA.Process"]
     paProcess --> gmpProcess["GMPPA.Process"]
     paProcess --> dohertyProcess["Carrier + Peaking + 负载调制"]
+    paGain --> rappGain["RappPA.SmallSignalGain"]
     paGain --> wienerGain["WienerPA.SmallSignalGain"]
     paGain --> gmpGain["GMPPA.SmallSignalGain"]
+
+    rappConfig["RappConfig.Validate"] --> rapp
+    rappProcess --> asComplex
 
     wienerConfig["WienerConfig.Validate"] --> wiener
     wienerProcess --> asComplex["AsComplexVector"]
@@ -573,12 +579,13 @@ flowchart TD
 
 **图示说明：**
 
-- 调用方创建 `PaModel(modelName="wiener"、"gmp" 或 "doherty")`；统一类根据名称持有对应实现和配置对象。
+- 调用方创建 `PaModel(modelName="rapp"、"wiener"、"gmp" 或 "doherty")`；统一类根据名称持有对应实现和配置对象。
 - `PaModel.Process` 与 `PaModel.SmallSignalGain` 将调用委托给当前实现，因此主程序和 ILC 无须包含模型类型分支。
+- `RappPA.Process` 使用经典SSPA软压缩曲线逐样点映射，保留输入相位，不持有FIR、时延或包络历史，是严格无记忆对照模型。
 - `WienerPA.Process` 依次执行线性记忆滤波、Rapp AM-AM 压缩和 AM-PM 相位旋转。
 - `GMPPA.Process` 使用 `DelaySignal` 构造主项、滞后包络项和超前包络项；未提供系数时由 `DefaultGmpCoefficients` 创建稳定的默认模型。
 - `DohertyPA.Process` 持续驱动Carrier支路，在包络越过门限时平滑开启Peaking支路，并加入支路时延、复合成和简化负载调制；两条支路可分别选择Wiener或GMP。
-- 可选 `ThermalConfig` 把输出功率、效率和占空比映射为耗散功率；单RC或Foster网络推进结温，再调制Wiener、GMP或Doherty输出。功率校准自动暂停热网络，正式温度测试冻结驱动并允许输出功率自然漂移。
+- 可选 `ThermalConfig` 把输出功率、效率和占空比映射为耗散功率；单RC或Foster网络推进结温，再调制Rapp、Wiener、GMP或Doherty输出。功率校准自动暂停热网络，正式温度测试冻结驱动并允许输出功率自然漂移。
 - `IQImbalancePA` 在被包装PA的输出上增加共轭镜像，只是用于增广ILC归因测试的参考面无关代数包装器；真实Tx与FB两处I/Q误差应分别使用Channel的 `txIq...` 与 `fbIq...` 参数。`AddAwgn` 模拟反馈接收链噪声。
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
 - `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。它反复改变PA输入并测量真实输出，直到目标误差进入容限，不在PA输出端追加常数增益。
@@ -830,7 +837,7 @@ flowchart TD
     benchmark --> iq["IQ镜像增广场景"]
     benchmark --> heldout["独立验证帧标签部署"]
     benchmark --> power["全方法功率-EVM扫描"]
-    paCharacterization["PaCharacterizationConfig"] --> paSweep["三种PA频响、间隔与功率扫描"]
+    paCharacterization["PaCharacterizationConfig"] --> paSweep["四种PA频响、间隔与功率扫描"]
     dpdGmpConfig["DpdGmpBenchmarkConfig"] --> dpdStages["基础/记忆扩展/峰值/正则/多功率DPD-GMP"]
     dpdLmsConfig["DpdLmsBenchmarkConfig"] --> dpdLmsCompare["Batch静态拟合 / Sample NLMS静态拟合 / 漂移跟踪"]
     channelConfig["ChannelAnalysisBenchmarkConfig"] --> channelMeasure["PA前/后平坦度、耦合、时延、条件数"]
@@ -1070,7 +1077,7 @@ flowchart LR
 | `--format` | `VHT/11ac`、`HE/11ax`、`EHT/11be`，也接受 `802.11ac/ax/be` | `EHT` | 输入不区分大小写并规范化为 VHT、HE 或 EHT。 |
 | `--bandwidth` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
 | `--mcs` | VHT：`0–9`；HE：`0–11`；EHT：`0–13` | `9` | 调制编码方案索引；默认值对三种格式都有效。 |
-| `--pa` | `wiener`、`gmp`、`doherty` | `wiener` | 非线性 PA 模型；Doherty使用载波与峰值双支路默认配置。 |
+| `--pa` | `rapp`、`wiener`、`gmp`、`doherty` | `wiener` | 非线性 PA 模型；Rapp为无记忆SSPA，Doherty使用载波与峰值双支路默认配置。 |
 | `--tx-antennas` | `1–8` | `1` | VHT/HE/EHT 物理发射链及独立 PA 数量。 |
 | `--spatial-streams` | 正整数且不大于发射链数 | `1` | 独立空间流数，VHT/HE/EHT 最大 8。 |
 | `--spatial-mapping` | `direct`、`dft` | `direct` | 空间流到发射链的正交映射。自定义矩阵通过 Python API 设置。 |
@@ -1221,18 +1228,27 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 ### `PaModel` 参数
 
 当前构造函数签名为
-`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。
-五个常用模型参数既可以直接传入，也可以放入 `parameters` 映射；直接参数优先级更高。
+`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。
+模型参数既可以直接传入，也可以放入 `parameters` 映射；直接参数优先级更高。
 
 | 参数 | 类型或可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `PaModel` 构造函数内部的不可变默认参数补齐。 |
 | `width` | 非负整数 | `16` | PA输入、输出I/Q接口位宽；`0`为浮点，正数返回I/Q整数码，容器仍为 `complex128`。 |
-| `modelName` | `"wiener"`、`"gmp"`、`"doherty"`，不区分大小写 | `"wiener"` | 选择内部PA实现。 |
+| `modelName` | `"rapp"`、`"wiener"`、`"gmp"`、`"doherty"`，不区分大小写 | `"wiener"` | 选择内部PA实现。 |
+| `rappConfig` | `RappConfig` 或 `None` | `None` | 无记忆Rapp模式配置；`None`使用默认配置。 |
 | `wienerConfig` | `WienerConfig` 或 `None` | `None` | Wiener 模式的配置；`None` 使用默认配置。 |
 | `gmpConfig` | `GMPConfig` 或 `None` | `None` | GMP 模式的配置；`None` 使用默认配置。 |
 | `dohertyConfig` | `DohertyConfig` 或 `None` | `None` | Doherty载波/峰值双支路配置；`None`使用默认架构。 |
 | `thermalConfig` | `ThermalConfig` 或 `None` | `None` | 可选PA自热、占空比、热网络和温度电参数漂移；`None`保持原有无热行为。 |
+
+`RappConfig` 支持：
+
+| 参数 | 默认值 | 约束或含义 |
+| --- | --- | --- |
+| `linearGain` | `1.0` | 有限正数；小信号电压增益。 |
+| `saturationAmplitude` | `1.0` | 有限正数；输入压缩膝点幅度标尺。 |
+| `rappSmoothness` | `3.0` | 有限正数；软压缩过渡平滑度，常用起点为2至3。 |
 
 `WienerConfig` 支持：
 
@@ -1273,7 +1289,7 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 | `loadModulationStrength` | `0.10` | Carrier包络相关简化负载调制强度。 |
 
 `PaModel.Process(inputSignal)` 返回 PA 复基带输出；`SmallSignalGain()` 返回当前模型的 DC 小信号复增益。
-Wiener、GMP、Doherty 的静态增益曲线定义、1 dB 压缩点推导、每一个配置值对曲线的移动或变形方式、外部 dBm 工作点与模型曲线的区别，以及恒包络扫幅示例，见
+Rapp、Wiener、GMP、Doherty 的静态增益曲线定义、1 dB 压缩点推导、每一个配置值对曲线的移动或变形方式、外部 dBm 工作点与模型曲线的区别，以及恒包络扫幅示例，见
 [PaModel.md：配置时如何读取和调节增益曲线](doc/PaModel.md#49-配置时如何读取和调节增益曲线)。
 
 `ThermalConfig` 支持静态温度角、单RC和多极点Foster。完整内容见 [PaModel电热模型](doc/PaModel.md#13-pa电热模型功率占空比与输出漂移)：其中分别推导了静态角、单RC、Foster、Cauer、温度条件化GMP和神经网络电热模型，并直接展示热阻、时间常数、Foster支路、更新间隔、效率上下界、效率膝点、占空比、空闲功耗、温度电参数和MIMO互热的参数效果图。温度测试使用 `channel.PrepareThermalTest(...)` 获取冻结输入，之后调用 `channel.Process(frozenInput)`，不能每帧再次传 `outputPowerDbm`。
@@ -1478,7 +1494,7 @@ Channel参数按物理模块分类如下，避免把真实Tx失真和FB观测误
 
 发送参考可以包含帧外前后补零，也可以长于实际PA输入或接收捕获。Parser不会把发送长度大于接收长度视为错误，而是在公共有效区间内估计有符号时延。若裁剪删除的只是帧外补零，性能指标保持不变；若裁剪切入OFDM帧内部，缺失样点无法恢复并会反映到EVM中。
 
-当接收数组是 `PaModel.Process(...)` 的输出时，Parser会分别用每个描述OFDM符号的已知导频估计复增益，撤销跨符号交织，再对90 bit短块LDPC码字执行软输入归一化min-sum译码。因此典型20 dBm输出下的Wiener、GMP和Doherty输出可以直接使用 `Analysis(paOutput).Analyze()`。Parser仍可读取旧版magic加CRC描述。若PA已进入严重饱和、描述字段相关度低于门限，任何无参考解析都不能可靠恢复随机种子；此时应使用 `Analysis(paOutput, transmittedSignal=transmitSamples)`，其中 `transmitSamples` 可以是原始NumPy发送数组或 `WifiWaveform`。
+当接收数组是 `PaModel.Process(...)` 的输出时，Parser会分别用每个描述OFDM符号的已知导频估计复增益，撤销跨符号交织，再对90 bit短块LDPC码字执行软输入归一化min-sum译码。因此典型20 dBm输出下的Rapp、Wiener、GMP和Doherty输出可以直接使用 `Analysis(paOutput).Analyze()`。Parser仍可读取旧版magic加CRC描述。若PA已进入严重饱和、描述字段相关度低于门限，任何无参考解析都不能可靠恢复随机种子；此时应使用 `Analysis(paOutput, transmittedSignal=transmitSamples)`，其中 `transmitSamples` 可以是原始NumPy发送数组或 `WifiWaveform`。
 
 后一种发送辅助调用不会把 `transmitSamples` 交给Parser。Analysis直接对发送与接收样值做互相关并将公共区间作为Reference，因此Descriptor、seed、MCS、GI和重生成步骤全部被绕过。
 
@@ -1594,7 +1610,11 @@ assert resultAnalysis.width == 16
 | `CalculateSnr(measuredSignal)` | 待测输出 | 返回数据字段 SNR，单位 dB。 |
 | `CalculateEvmAlignedMse(measuredSignal)` | 待测输出 | 返回与 EVM 接收链完全一致的归一化 MSE；该值等于 RMS EVM 的平方。 |
 | `CalculateEvm(measuredSignal)` | 待测输出 | 返回 `(evmDb, evmPercent)`。 |
-| `CalculateIrr(measuredSignal)` | 待测输出 | 对同步后的直接/共轭分量做联合最小二乘，返回 IRR dB。 |
+| `MeasureIrr(measuredSignal=None)` | 可选待测输出 | 对同步后的直接/共轭分量做联合最小二乘，返回含总IRR、逐链IRR、镜像幅度比、复系数分量、残差和条件数的普通字典；发送辅助和盲模式可省略输入。 |
+| `CalculateIrr(measuredSignal=None)` | 可选待测输出 | 兼容简洁接口，只返回 `MeasureIrr` 中的总IRR dB。 |
+| `MeasurePreparedIrr(preparedSignal)` | 已同步输出 | 不重复同步，返回完整IRR测量字典。 |
+| `AnalyzeTwoTone(measuredSignal, waveform, ...)` | PA输出和 `TwoToneWaveform` | 一次返回双音基波、IM3/IM5/IM7、综合最差互调和输出功率字典。 |
+| `CalculateIm3/CalculateIm5/CalculateIm7(measuredSignal, waveform, ...)` | PA输出和 `TwoToneWaveform` | 分别返回该阶上下侧频率、dBc、绝对dBFS和较差侧指标。 |
 | `CalculateAclr(measuredSignal)` | 待测输出 | 返回 `(aclrLowerDb, aclrUpperDb, aclrWorstDb)`。 |
 | `DemodulateWifiData(measuredSignal)` | 待测输出 | 返回 VHT/HE/EHT 数据子载波星座。 |
 | `AnalyzeIlcHistory(ilcHistory)` | SISO原生ILC历史 | 逐轮计算输出功率/SNR/EVM/ACLR，并返回EVM最佳轮及完整 `ILCPerformanceIteration` 历史。 |
@@ -1607,7 +1627,7 @@ assert resultAnalysis.width == 16
 | `AnalyzePowerEvmCurve(outputPowerDbmValues, methodEvaluators)` | 递增输出dBm点、`{方法名: 求值器}` 映射 | 按输出回退驱动PA，把每种方法标定到相同输出功率后计算EVM。 |
 | `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取实例解析后的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
 
-`Analyze` 返回字典的固定键包括 `outputPowerDbm`、`snrDb`、`evmDb`、`evmPercent`、`irrDb`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。SISO的 `outputPowerDbm` 是单端口功率；MIMO的该字段是所有独立PA端口在线性功率域求和后的结果，每路值位于 `GetLastMimoMetrics()["outputPowerDbmPerChain"]`。`ILCPerformanceIteration` 把RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存同一普通指标字典。`PowerEvmCurve` 保存 `outputPowerDbmValues`、`driveScaleValues`、`targetOutputRmsValues` 以及各方法的EVM数组。
+`Analyze` 返回字典的固定键包括 `outputPowerDbm`、`snrDb`、`evmDb`、`evmPercent`、`irrDb`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。SISO的 `outputPowerDbm` 是单端口功率；MIMO的该字段是所有独立PA端口在线性功率域求和后的结果，每路功率和IRR分别位于 `GetLastMimoMetrics()["outputPowerDbmPerChain"]` 与 `GetLastMimoMetrics()["irrDbPerChain"]`。需要IRR拟合质量时使用 `MeasureIrr()`，其结果还包含镜像幅度比、拟合残差和回归条件数。`ILCPerformanceIteration` 把RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存同一普通指标字典。`PowerEvmCurve` 保存 `outputPowerDbmValues`、`driveScaleValues`、`targetOutputRmsValues` 以及各方法的EVM数组。
 
 ### `Draw` 参数与方法
 
@@ -2315,6 +2335,8 @@ WaveGenTwoTone(parameters=None, width=None, **parameterOverrides)
 
 `Generate()` 返回 `TwoToneWaveform`。该对象除了 `samples`，还保存精确基波频率、采样率、位宽和 `ilcBandwidthHz`；`IntermodulationFrequencies(3/5/7)` 返回对应的下侧、上侧互调频率。
 
+`toneAmplitudes=(1.0, 1.0)` 适合标准PA线性度、IP3和DPD公平对比；不等幅配置适合强阻塞加弱有用信号、非对称载波聚合和交叉调制。幅度比换成功率差使用 `20*log10(A2/A1)`。保持双音间隔不变而整体移动中心频率，在理想平坦无记忆PA中不会改变互调dBc；实际变化可用于暴露PA/通道频响、记忆相位、IQ不平衡和DPD带宽边缘。完整推导见[双音生成文档第4节](doc/WaveGenTwoTone.md#4-两个单音什么时候使用相同功率什么时候使用不同功率)。
+
 ### `TwoToneAnalysis` 参数和结果
 
 构造函数为：
@@ -2342,6 +2364,8 @@ TwoToneAnalysis(waveform, parameters=None, width=None, **parameterOverrides)
 | `im7LowerDbc`, `im7UpperDbc`, `im7WorstDbc` | IM7下侧、上侧和较差侧 |
 | `worstIntermodulationDbc` | IM3/IM5/IM7较差侧中的最大值 |
 | `outputPowerDbm` | 去除暂态后的实际PA平均输出功率 |
+
+上层程序也可以通过 `Analysis.AnalyzeTwoTone(...)` 一次取得全部指标，或通过 `Analysis.CalculateIm3(...)`、`Analysis.CalculateIm5(...)`、`Analysis.CalculateIm7(...)` 分别取得单阶结果。单阶结果还包含 `lowerFrequencyHz`、`upperFrequencyHz`、`lowerProductDbfs` 和 `upperProductDbfs`，便于不等功率双音场景同时比较相对抑制度与绝对干扰电平。
 
 ### 典型的单方法ILC调用
 
@@ -2414,9 +2438,9 @@ python tests\BenchMark.py --two-tone --sample-rate-hz 100000000 --tone-lower-hz 
 
 完整物理推导见[双音生成文档](doc/WaveGenTwoTone.md)和[双音IM分析文档](doc/TwoToneAnalysis.md)。
 
-### 三种PA的双音特性Benchmark
+### 四种PA的双音特性Benchmark
 
-该模式不运行ILC，而是在共同条件下独立测试Wiener、GMP和Doherty。频响分支使用相同低RMS输入，避免功率闭环掩盖增益起伏；记忆分支在20 dBm共同实测输出功率下扫描双音间隔；功率分支固定4 MHz双音间隔并扫描10、15、20、23、25 dBm。
+该模式不运行ILC，而是在共同条件下独立测试Rapp、Wiener、GMP和Doherty。Rapp提供无记忆参考；频响分支使用相同低RMS输入，避免功率闭环掩盖增益起伏；记忆分支在20 dBm共同实测输出功率下扫描双音间隔；功率分支固定4 MHz双音间隔并扫描10、15、20、23、25 dBm。
 
 `PaCharacterizationConfig` 支持以下全部参数：
 
@@ -2436,7 +2460,7 @@ python tests\BenchMark.py --two-tone --sample-rate-hz 100000000 --tone-lower-hz 
 | `maximumOutputPowerDbm` | `25.0` | 归一化满量程PA输出功率。 |
 | `loadResistanceOhm` | `50.0` | dBm与复包络RMS换算端口。 |
 | `width` | `0` | PA特性模式默认浮点；正数为公开定点I/Q码。 |
-| `paModelNames` | `("wiener","gmp","doherty")` | 被测PA集合。 |
+| `paModelNames` | `("rapp","wiener","gmp","doherty")` | 被测PA集合。 |
 | `runDpdGmpBenchmark` | `True` | 特性分析结束后在`dpd_gmp`子目录运行逐项DPD-GMP性能验证。 |
 | `outputDirectory` | `results/pa_characterization` | CSV、JSON和PNG输出目录。 |
 
@@ -2479,7 +2503,7 @@ print(
 )
 ```
 
-输出包括频响、双音间隔记忆、20 dBm标称互调和随实测输出功率变化的四张PNG，以及每个原始点的CSV/JSON。`pa_dpd_recommendations.csv`进一步按“PA模型×测试类别”保存实测依据、DPD结构、初始配置、训练策略和验收条件；默认三种PA、五类测试共15条建议。默认还在`dpd_gmp`子目录保存基础补偿、结构扩展、峰值加权、正则化和多功率训练的改进前后数据及四联图。完整公式、流程、参考数值、逐测试优化建议和图表见[PA双音特性分析](doc/PaAnalyse.md)。
+输出包括频响、双音间隔记忆、20 dBm标称互调和随实测输出功率变化的四张PNG，以及每个原始点的CSV/JSON。`pa_dpd_recommendations.csv`进一步按“PA模型×测试类别”保存实测依据、DPD结构、初始配置、训练策略和验收条件；默认四种PA、五类测试共20条建议。默认还在`dpd_gmp`子目录保存基础补偿、结构扩展、峰值加权、正则化和多功率训练的改进前后数据及四联图。完整公式、流程、参考数值、逐测试优化建议和图表见[PA双音特性分析](doc/PaAnalyse.md)。
 
 ### DPD-GMP分阶段性能Benchmark
 
@@ -2618,7 +2642,7 @@ python tests\BenchMark.py
 python tests\BenchMark.py --two-tone
 ```
 
-三种PA的频响、记忆和输出功率特性基准：
+四种PA的频响、记忆和输出功率特性基准：
 
 ```powershell
 python tests\BenchMark.py --pa-analyse
@@ -2642,4 +2666,4 @@ python tests\BenchMark.py --dpd-lms
 python tests\BenchMark.py --channel-analyse
 ```
 
-验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善、多方法功率-EVM和双音IMD输出、Wiener/GMP/Doherty的频响/间隔记忆/动态迟滞/多输出功率图表、DpdGmp基础补偿/结构扩展/峰值加权/正则化/多功率训练、DpdLms逐样点系数更新/帧提交/样点提交/漂移跟踪，以及PA前后MIMO通道平坦度、耦合参数、群时延、条件数和测量驱动耦合感知DPD的目标指标回归。
+验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善、多方法功率-EVM和双音IMD输出、Rapp/Wiener/GMP/Doherty的频响/间隔记忆/动态迟滞/多输出功率图表、DpdGmp基础补偿/结构扩展/峰值加权/正则化/多功率训练、DpdLms逐样点系数更新/帧提交/样点提交/漂移跟踪，以及PA前后MIMO通道平坦度、耦合参数、群时延、条件数和测量驱动耦合感知DPD的目标指标回归。

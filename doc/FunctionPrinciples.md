@@ -156,8 +156,10 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `WienerConfig.Validate`, `GMPConfig.Validate`, `DohertyConfig.Validate` | E | 检查饱和幅度、阶次、记忆、分支模型、峰值支路开启门限、合路系数和系数合法性 | PaModel §3.6、§4、§4.8 |
-| `WienerPA.__init__`, `GMPPA.__init__`, `DohertyPA.__init__`, `DohertyPA.BuildBranchModel` | E | 保存已验证模型参数；Doherty按配置为载波支路和峰值支路分别构造Wiener或GMP内核 | PaModel §3、§4、§4.8 |
+| `RappConfig.Validate`, `WienerConfig.Validate`, `GMPConfig.Validate`, `DohertyConfig.Validate` | E | 检查无记忆Rapp增益/饱和/平滑度，以及Wiener、GMP、Doherty的阶次、记忆、分支开启、合路和系数合法性 | PaModel §2.2、§3.6、§4、§4.8 |
+| `RappPA.__init__`, `WienerPA.__init__`, `GMPPA.__init__`, `DohertyPA.__init__`, `DohertyPA.BuildBranchModel` | E | 保存已验证模型参数；Rapp不创建任何历史状态，Doherty按配置为载波支路和峰值支路分别构造Wiener或GMP内核 | PaModel §2.2、§3、§4、§4.8 |
+| `RappPA.Process` | P/N | 对每个复样点独立执行经典Rapp SSPA AM-AM软压缩并原样保留相位；无FIR、时延、历史包络或状态 | PaModel §2.2.2–§2.2.3 |
+| `RappPA.SmallSignalGain` | P/N | 取零幅度极限，返回正实数 `linearGain` | PaModel §2.2.4 |
 | `WienerPA.Process` | P/N | FIR 线性记忆→Rapp AM-AM→幅度相关 AM-PM | PaModel §3.1–§3.4 |
 | `WienerPA.SmallSignalGain` | P/N | 取零幅度极限，返回线性 FIR 直流复增益 | PaModel §3.5 |
 | `GMPPA.Process` | P/N | 计算主、滞后包络和超前包络 GMP 支路 | PaModel §4.2–§4.6 |
@@ -165,7 +167,7 @@ flowchart LR
 | `DohertyPA.PeakingActivation` | P/N | 对输入包络执行带有限过渡宽度的平滑峰值支路开启函数，避免硬开关产生不连续谱再生 | PaModel §4.8 |
 | `DohertyPA.Process` | P/N | 组合连续工作的载波支路、包络门控的峰值支路、支路时延/复合路系数及简化负载调制 | PaModel §4.8 |
 | `DohertyPA.SmallSignalGain` | P/N | 在零包络极限关闭峰值支路，只返回载波支路与载波合路系数构成的复增益 | PaModel §4.8 |
-| `PaModel.__init__`, `PaModel.ResolveConfiguration`, `PaModel.SynchronizeModel` | E | ChainMap 覆盖解析、未知键警告后忽略，并构造选定 Wiener、GMP或Doherty 内核 | PaModel §12 |
+| `PaModel.__init__`, `PaModel.ResolveConfiguration`, `PaModel.SynchronizeModel` | E | ChainMap 覆盖解析、未知键警告后忽略，并构造选定Rapp、Wiener、GMP或Doherty内核 | PaModel §12 |
 | `PaModel.ModelName`, `PaModel.Width`, `PaModel.GetParameters`, `PaModel.UpdateParameters` | E | 查询或更新配置；更新后重建模型以保持状态一致 | PaModel §12、FixedPoint §6 |
 | `PaModel.Process`, `PaModel.SmallSignalGain` | E/P | 统一分派到选定物理 PA 的同名计算 | PaModel §9、§12 |
 | `ThermalConfig.Validate` | P/E | 校验静态、单RC或Foster热网络、耗散功率效率模型、参考功率和温度漂移系数 | PaModel §13 |
@@ -395,6 +397,8 @@ flowchart LR
 | `Analysis.IntegrateAclr` | P/N | 等宽主/邻道 PSD 积分并取较差邻道 | Analysis §6.1、§6.3 |
 | `Analysis.CalculateAclr`, `Analysis.CalculatePreparedAclr`, `Analysis.CalculatePreparedAclrPerChain` | P/N | 数据字段 Welch PSD 的汇总/逐链 ACLR | Analysis §6、§9.3 |
 | `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让输出功率/SNR/EVM/ACLR共用一次同步结果并保存阶段映射 | Analysis §1、§3.1 |
+| `Analysis.AnalyzeTwoTone` | P/E | 把PA输出和双音精确频率元数据委托给 `TwoToneAnalysis`，一次返回基波、IM3/IM5/IM7及输出功率字典，不进入Wi-Fi解析路径 | Analysis §11.4、TwoToneAnalysis §2、§8.1 |
+| `Analysis.CalculateIntermodulationOrder`, `Analysis.CalculateIm3`, `Analysis.CalculateIm5`, `Analysis.CalculateIm7` | P/E | 选择3、5或7阶互调，返回上下侧物理频率、同侧基波归一化dBc以及绝对互调dBFS；非法阶次直接拒绝 | TwoToneAnalysis §4、§8.1 |
 | `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO对齐输出，复制反馈同步估计，并在Analysis中按严格EVM选择最佳实测轮 | DpdIlc §7、Analysis §5.10 |
 | `Analysis.AnalyzeMimoIlcHistory` | P/E | 按轮组合各PA链输出，以完整MIMO空间解映射统一计算性能并在Analysis中选择最佳轮 | Analysis §9 |
 | `Analysis.AnalyzePowerEvmCurve` | P/E | 把每个方法求值器视为完整“DPD+PA”被测对象，在共同目标dBm点反复更新输入并重新运行方法，直到PA实测有效突发输出进入容限；不对方法输出做后级缩放，因此EVM对应真实压缩工作点 | Analysis §8 |
@@ -450,7 +454,8 @@ flowchart LR
 | `BenchMark.MeasurePaPowerSweep` | P/N | 固定双音间隔、逐点闭环到目标dBm，测量互调和动态迟滞随实测功率变化 | PaAnalyse §6 |
 | `BenchMark.SummarizePaCharacterization` | N/E | 由原始点汇总增益起伏、群时延、相位曲率、间隔敏感度和标称互调 | PaAnalyse §2、§11 |
 | `BenchMark.BuildPaDpdRecommendations` | E/P | 根据实测频响、记忆、迟滞、互调和功率拐点，为每种PA的每类测试生成DPD结构、初始参数、训练和验收建议 | PaAnalyse §2.4、§3.4、§4.1、§5.1、§6.1 |
-| `BenchMark.RunPaCharacterizationBenchmark` | E/P | 对Wiener、GMP和Doherty运行共同频响、记忆与功率扫描并调用独立绘图层 | PaAnalyse §7 |
+| `BenchMark.RunPaCharacterizationBenchmark` | E/P | 对Rapp、Wiener、GMP和Doherty运行共同频响、记忆与功率扫描；Rapp作为无记忆零频响/零迟滞对照，并调用独立绘图层 | PaAnalyse §7 |
+| `GeneratePaModelFigures.CalculateRappGain`, `ConfigureAxes`, `PlotRappPanel`, `PlotWienerPanel`, `PlotGmpPanel`, `PlotDohertyPanel`, `GeneratePaModelFigures` | P | 由各模型的参数关系生成非遍历式增益曲线示意图；图中直接标注Rapp膝点、Wiener线性记忆、GMP包络记忆和Doherty双工作区 | PaModel §4.9 |
 | `BenchMark.SavePaCharacterizationResults`, `BenchMark.PrintPaCharacterizationResults`, `BenchMark.PrintPaDpdRecommendations` | E | 保存或打印既有PA特性与DPD建议，不修改测量值 | PaAnalyse §9–§10 |
 | `ChannelAnalysisBenchmarkConfig.Validate` | E | 校验Wi-Fi、通道测量、输出功率、位宽和ILC标签预算 | BenchMark §31 |
 | `ChannelDpdStageResult.ToDict`, `ChannelDpdImprovement.ToDict`, `ChannelAnalysisBenchmarkResult.ToDict` | E | 序列化通道测量、DPD阶段、改善和训练诊断，不重新计算 | ChannelAnalyse §11–§13 |
@@ -490,7 +495,7 @@ flowchart LR
 | `FixedPoint.QuantizeCodes` | N/E | Round and saturate public I/Q integer codes independently; `complex128` is only the common storage container. | [FixedPoint.md](./FixedPoint.md) |
 | `FixedPoint.EncodeComplex` | N | Multiply normalized physical components by $2^{W-1}$ and map them to signed integer codes. | [FixedPoint.md](./FixedPoint.md) |
 | `FixedPoint.DecodeComplex` | N | Divide public integer codes by $2^{W-1}$ only at an internal floating-processing boundary. | [FixedPoint.md](./FixedPoint.md) |
-| `PaModel.ProcessFloating` | P/E | Evaluate the Wiener, GMP, or Doherty PA after code decoding without applying a second interface conversion. | [PaModel.md](./PaModel.md) |
+| `PaModel.ProcessFloating` | P/E | Evaluate the Rapp, Wiener, GMP, or Doherty PA after code decoding without applying a second interface conversion. | [PaModel.md](./PaModel.md) |
 | `MimoPaModel.ProcessChainFloating` | P/E | Apply one chain's input gain, nonlinear PA, output gain, and optional power calibration in normalized floating units. | [PaModel.md](./PaModel.md) |
 | `IQImbalancePA.Width`, `IQImbalancePA.ProcessFloating` | P/E | Inherit the wrapped PA width and evaluate direct plus conjugate image paths in floating units. | [PaModel.md](./PaModel.md) |
 | `DpdIlc.ResolvePaWidth` | E | Read the PA interface width and preserve width zero for third-party floating PA models. | [DpdIlc.md](./DpdIlc.md) |
@@ -505,7 +510,7 @@ flowchart LR
 | `DpdGmp.BuildBasisChunk` | P/N | 按活动 main、lagging 和 leading 规格构造直接 GMP 基矩阵；子类通过覆盖此入口复用同一个归一化岭回归求解器。 | DPD-GMP §16 |
 | `AugmentedDpdGmp.RebuildStructure`, `AugmentedDpdGmp.BuildBasisChunk` | P/N/E | 联合编号直接 GMP 基与其共轭副本；共轭支路保留阶数、信号时延和包络交叉时延，用于表达 IQ 镜像及其非线性记忆。 | DPD-GMP §16 |
 | `AugmentedDpdGmp.GetDirectCoefficients`, `AugmentedDpdGmp.GetImageCoefficients` | E | 分别返回直接支路与镜像支路系数副本，便于诊断而不允许外部静默修改模型。 | DpdGmp §17 |
-| `Analysis.CalculateIrr`, `Analysis.CalculatePreparedIrr` | P/N | 在统一同步和公共复增益补偿后联合拟合直接项与共轭项，以两项功率之比计算 IRR；微小岭项保护病态参考。 | Analysis §5.11 |
+| `Analysis.MeasureIrr`, `Analysis.MeasurePreparedIrr`, `Analysis.CalculateIrr`, `Analysis.CalculatePreparedIrr` | P/N | 在统一同步和公共复增益补偿后联合拟合直接项与共轭项，以两项功率之比计算总IRR和逐链IRR；完整测量字典同时给出系数、镜像幅度比、残差与条件数，微小岭项保护数值求解。 | Analysis §15 |
 | `Draw.CreateIqGmpComparisonFigure`, `Draw.SaveIqGmpComparison` | E | 绘制并保存普通 GMP 与增广 GMP 的同功率 EVM、IRR 双面板曲线，不重新训练模型或计算指标。 | ChannelAnalyse §16 |
 
 ## 17. DPD-LMS逐样点更新函数索引

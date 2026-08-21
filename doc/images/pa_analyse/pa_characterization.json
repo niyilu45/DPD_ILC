@@ -38,12 +38,123 @@
     "loadResistanceOhm": 50.0,
     "width": 0,
     "paModelNames": [
+      "rapp",
       "wiener",
       "gmp",
       "doherty"
-    ]
+    ],
+    "runDpdGmpBenchmark": true,
+    "dpdGmpResultDirectory": "dpd_gmp"
   },
   "frequencyResponse": [
+    {
+      "modelName": "rapp",
+      "frequencyHz": -41000000.0,
+      "gainDb": -9.919992249584645e-08,
+      "phaseDegrees": 1.5333717098340835e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": -39000000.0,
+      "gainDb": -9.919992153151898e-08,
+      "phaseDegrees": -4.925031348356106e-15
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": -31000000.0,
+      "gainDb": -9.919992153151898e-08,
+      "phaseDegrees": 1.5255965362684768e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": -29000000.0,
+      "gainDb": -9.919992056719149e-08,
+      "phaseDegrees": -2.0484798601840203e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": -21000000.0,
+      "gainDb": -9.919992153151898e-08,
+      "phaseDegrees": 1.638783888146851e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": -19000000.0,
+      "gainDb": -9.919991863853654e-08,
+      "phaseDegrees": -5.0853217875622755e-15
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": -11000000.0,
+      "gainDb": -9.919992153151898e-08,
+      "phaseDegrees": 1.4775094045070527e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": -9000000.0,
+      "gainDb": -9.919992346017392e-08,
+      "phaseDegrees": -1.3939742816674012e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": -1000000.0,
+      "gainDb": -9.919992153151898e-08,
+      "phaseDegrees": 1.242149581228283e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": 1000000.0,
+      "gainDb": -9.919992153151898e-08,
+      "phaseDegrees": -1.794216061774187e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": 9000000.0,
+      "gainDb": -9.919992346017392e-08,
+      "phaseDegrees": 1.3939742816674012e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": 11000000.0,
+      "gainDb": -9.919992153151898e-08,
+      "phaseDegrees": -1.4775094045070527e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": 19000000.0,
+      "gainDb": -9.919991863853654e-08,
+      "phaseDegrees": 5.0853217875622755e-15
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": 21000000.0,
+      "gainDb": -9.919992153151898e-08,
+      "phaseDegrees": -1.638783888146851e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": 29000000.0,
+      "gainDb": -9.919992056719149e-08,
+      "phaseDegrees": 2.0484798601840203e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": 31000000.0,
+      "gainDb": -9.919992153151898e-08,
+      "phaseDegrees": -1.5255965362684768e-14
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": 39000000.0,
+      "gainDb": -9.919992153151898e-08,
+      "phaseDegrees": 4.925031348356106e-15
+    },
+    {
+      "modelName": "rapp",
+      "frequencyHz": 41000000.0,
+      "gainDb": -9.919992249584645e-08,
+      "phaseDegrees": -1.5333717098340835e-14
+    },
     {
       "modelName": "wiener",
       "frequencyHz": -41000000.0,
@@ -371,6 +482,72 @@
   ],
   "memoryEffect": [
     {
+      "modelName": "rapp",
+      "toneSpacingHz": 500000.0,
+      "outputPowerDbm": 19.850748216936708,
+      "im3LowerDbc": -38.095651195206635,
+      "im3UpperDbc": -38.095651195206635,
+      "im3WorstDbc": -38.095651195206635,
+      "im5WorstDbc": -48.41718957577707,
+      "im7WorstDbc": -69.72328766752116,
+      "im3AsymmetryDb": 0.0
+    },
+    {
+      "modelName": "rapp",
+      "toneSpacingHz": 1000000.0,
+      "outputPowerDbm": 19.806765648913217,
+      "im3LowerDbc": -38.099414263200565,
+      "im3UpperDbc": -38.09941426320056,
+      "im3WorstDbc": -38.09941426320056,
+      "im5WorstDbc": -48.416440913541905,
+      "im7WorstDbc": -69.72517684770145,
+      "im3AsymmetryDb": 7.105427357601002e-15
+    },
+    {
+      "modelName": "rapp",
+      "toneSpacingHz": 2000000.0,
+      "outputPowerDbm": 19.82702142749028,
+      "im3LowerDbc": -38.101995519200756,
+      "im3UpperDbc": -38.101995519200756,
+      "im3WorstDbc": -38.101995519200756,
+      "im5WorstDbc": -48.41928377058909,
+      "im7WorstDbc": -69.72582595498089,
+      "im3AsymmetryDb": 0.0
+    },
+    {
+      "modelName": "rapp",
+      "toneSpacingHz": 4000000.0,
+      "outputPowerDbm": 19.817757830090333,
+      "im3LowerDbc": -38.111667206894666,
+      "im3UpperDbc": -38.111667206894666,
+      "im3WorstDbc": -38.111667206894666,
+      "im5WorstDbc": -48.42800175682197,
+      "im7WorstDbc": -69.7279037573548,
+      "im3AsymmetryDb": 0.0
+    },
+    {
+      "modelName": "rapp",
+      "toneSpacingHz": 8000000.0,
+      "outputPowerDbm": 19.816880543769656,
+      "im3LowerDbc": -38.12648267949572,
+      "im3UpperDbc": -38.12648267949572,
+      "im3WorstDbc": -38.12648267949572,
+      "im5WorstDbc": -48.4414294573616,
+      "im7WorstDbc": -69.73113329939943,
+      "im3AsymmetryDb": 0.0
+    },
+    {
+      "modelName": "rapp",
+      "toneSpacingHz": 12000000.0,
+      "outputPowerDbm": 19.816846766786128,
+      "im3LowerDbc": -38.12189897646698,
+      "im3UpperDbc": -38.12189897646698,
+      "im3WorstDbc": -38.12189897646698,
+      "im5WorstDbc": -48.437275472407904,
+      "im7WorstDbc": -69.73013046514716,
+      "im3AsymmetryDb": 0.0
+    },
+    {
       "modelName": "wiener",
       "toneSpacingHz": 500000.0,
       "outputPowerDbm": 20.12724130241525,
@@ -571,6 +748,56 @@
   ],
   "powerSweep": [
     {
+      "modelName": "rapp",
+      "targetOutputPowerDbm": 10.0,
+      "measuredOutputPowerDbm": 9.999454421564721,
+      "im3WorstDbc": -97.17427542750684,
+      "im5WorstDbc": -106.71551533930665,
+      "im7WorstDbc": -123.62285172441594,
+      "dynamicGainHysteresisDb": 2.408425849892047e-09,
+      "dynamicPhaseHysteresisDegrees": 9.988744741649122e-18
+    },
+    {
+      "modelName": "rapp",
+      "targetOutputPowerDbm": 15.0,
+      "measuredOutputPowerDbm": 14.993337757379262,
+      "im3WorstDbc": -67.20265446057775,
+      "im5WorstDbc": -76.77087184352558,
+      "im7WorstDbc": -93.7899847939533,
+      "dynamicGainHysteresisDb": 7.616111185468844e-08,
+      "dynamicPhaseHysteresisDegrees": 9.988744741649296e-18
+    },
+    {
+      "modelName": "rapp",
+      "targetOutputPowerDbm": 20.0,
+      "measuredOutputPowerDbm": 19.817757830090333,
+      "im3WorstDbc": -38.111667206894666,
+      "im5WorstDbc": -48.42800175682197,
+      "im7WorstDbc": -69.7279037573548,
+      "dynamicGainHysteresisDb": 2.4084109384613362e-06,
+      "dynamicPhaseHysteresisDegrees": 9.988744741649122e-18
+    },
+    {
+      "modelName": "rapp",
+      "targetOutputPowerDbm": 23.0,
+      "measuredOutputPowerDbm": 22.769149048492622,
+      "im3WorstDbc": -19.65694162812555,
+      "im5WorstDbc": -41.30390696242224,
+      "im7WorstDbc": -42.318004162081316,
+      "dynamicGainHysteresisDb": 5.304418199230329e-05,
+      "dynamicPhaseHysteresisDegrees": 9.988744741648862e-18
+    },
+    {
+      "modelName": "rapp",
+      "targetOutputPowerDbm": 25.0,
+      "measuredOutputPowerDbm": 24.753344221601218,
+      "im3WorstDbc": -9.743848343554513,
+      "im5WorstDbc": -14.58439902154489,
+      "im7WorstDbc": -18.11541895527302,
+      "dynamicGainHysteresisDb": 0.4398657931411654,
+      "dynamicPhaseHysteresisDegrees": 9.98874474164947e-18
+    },
+    {
       "modelName": "wiener",
       "targetOutputPowerDbm": 10.0,
       "measuredOutputPowerDbm": 10.062972346825108,
@@ -723,6 +950,20 @@
   ],
   "summaries": [
     {
+      "modelName": "rapp",
+      "averageGainDb": -9.919992142437147e-08,
+      "gainRippleDb": 4.8216373787583744e-15,
+      "groupDelayNs": 2.844139462768002e-16,
+      "phaseNonlinearityDegrees": 4.690816040194e-14,
+      "im3SpacingVariationDb": 0.030831484289087996,
+      "maximumIm3AsymmetryDb": 7.105427357601002e-15,
+      "dynamicGainHysteresisDb": 2.4084109384613362e-06,
+      "dynamicPhaseHysteresisDegrees": 9.988744741649122e-18,
+      "nominalIm3Dbc": -38.111667206894666,
+      "nominalIm5Dbc": -48.42800175682197,
+      "nominalIm7Dbc": -69.7279037573548
+    },
+    {
       "modelName": "wiener",
       "averageGainDb": 0.31523197417795384,
       "gainRippleDb": 0.28508509623890266,
@@ -766,6 +1007,51 @@
     }
   ],
   "recommendations": [
+    {
+      "modelName": "rapp",
+      "testName": "frequency_response",
+      "measuredEvidence": "Gain ripple=0.000 dB, group delay=0.000 ns, residual phase=0.000 deg.",
+      "dpdArchitecture": "Memoryless LUT or odd-order polynomial with no delayed basis terms; add an FIR only for an external measured path.",
+      "dpdConfiguration": "Start with 1 complex FIR taps; normalize the center tap and regularize the remaining tap energy.",
+      "trainingStrategy": "Verify the low-drive response is flat and zero-delay, then skip linear equalizer identification and train only the static AM-AM inverse.",
+      "acceptanceCriteria": "On an independent frequency sweep, require residual gain ripple <=0.10 dB and residual phase curvature <=0.50 deg before nonlinear training is accepted."
+    },
+    {
+      "modelName": "rapp",
+      "testName": "memory_effect",
+      "measuredEvidence": "Memory severity=weak; IM3 spacing variation=0.031 dB and maximum sideband asymmetry=0.000 dB.",
+      "dpdArchitecture": "Strictly memoryless LUT or polynomial inverse; delayed GMP terms are unnecessary unless another system block adds measured memory.",
+      "dpdConfiguration": "Use main memory depth 1 and cross-memory depth 0; retain only same-sample amplitude basis terms.",
+      "trainingStrategy": "Train with at least the minimum, nominal, and maximum tested tone spacings using equal output-power weighting; select memory depth on a held-out spacing.",
+      "acceptanceCriteria": "Require residual IM3 spacing variation <0.50 dB and upper/lower IM3 asymmetry <0.50 dB without worsening IM5 or IM7 by more than 1 dB."
+    },
+    {
+      "modelName": "rapp",
+      "testName": "dynamic_hysteresis",
+      "measuredEvidence": "Dynamic AM-AM RMS=0.000 dB and dynamic AM-PM RMS=0.000 deg.",
+      "dpdArchitecture": "Use one static inverse curve because equal-amplitude rising and falling samples have the same output by construction.",
+      "dpdConfiguration": "Set memory depth 1, cross-memory depth 0, and disable any recurrent or envelope-state branch.",
+      "trainingStrategy": "Balance rising and falling envelope samples in every amplitude bin; do not let dense low-amplitude samples dominate the regression.",
+      "acceptanceCriteria": "Require dynamic AM-AM RMS <0.10 dB and dynamic AM-PM RMS <1.0 deg on a held-out two-tone phase and spacing."
+    },
+    {
+      "modelName": "rapp",
+      "testName": "nominal_nonlinearity",
+      "measuredEvidence": "Nonlinearity severity=mild at 20.0 dBm: IM3=-38.11, IM5=-48.43, IM7=-69.73 dBc.",
+      "dpdArchitecture": "Monotonic memoryless LUT or low-order odd polynomial that approximates the inverse Rapp AM-AM curve below saturation.",
+      "dpdConfiguration": "Start with an amplitude LUT or orders (1,3,5,7), memory depth 1, cross-depth 0, and no conjugate branch.",
+      "trainingStrategy": "Fit uniformly populated amplitude bins across the usable range and stop below the near-saturation region where the inverse slope becomes ill conditioned.",
+      "acceptanceCriteria": "Require at least 10 dB IM3 improvement at equal output power, no IM5/IM7 regression larger than 1 dB, and no increase in peak input beyond the configured limit."
+    },
+    {
+      "modelName": "rapp",
+      "testName": "output_power",
+      "measuredEvidence": "First strong-distortion point=22.77 dBm (IM3=-19.66 dBc); IM3 power trend=monotonic.",
+      "dpdArchitecture": "One memoryless inverse spanning all invertible power points; use a power-indexed LUT only if deployment changes the Rapp parameters themselves.",
+      "dpdConfiguration": "Use 10, 15, 20, 23, 25 dBm as validation anchors for one shared static curve, and enforce a drive ceiling before the measured saturation knee.",
+      "trainingStrategy": "Train and validate every configured output-power point, up-weight the detected knee and maximum-power point, and interpolate coefficients only inside the measured range.",
+      "acceptanceCriteria": "At every power point require improved EVM and worst-side ACLR on Wi-Fi plus non-regressing IM3/IM5/IM7 on two-tone; reject improvements caused by PA-output rescaling."
+    },
     {
       "modelName": "wiener",
       "testName": "frequency_response",

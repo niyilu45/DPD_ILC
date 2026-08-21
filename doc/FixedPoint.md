@@ -206,7 +206,7 @@ flowchart LR
 flowchart LR
     publicInput["公开整数码"] --> decode["FixedPoint.DecodeComplex"]
     decode --> pre["浮点PA前耦合<br/>复系数/FIR/时延"]
-    pre --> pa["各路浮点PA<br/>Wiener/GMP/Doherty"]
+    pre --> pa["各路浮点PA<br/>Rapp/Wiener/GMP/Doherty"]
     pa --> post["浮点PA后耦合<br/>复系数/FIR/时延"]
     post --> phase["浮点相位旋转"]
     phase --> mode{"sampleMode"}

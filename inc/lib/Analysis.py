@@ -1,4 +1,4 @@
-"""Object-oriented SNR, EVM, IRR, and ACLR analysis for Wi-Fi simulations."""
+"""Object-oriented Wi-Fi and delegated two-tone RF performance analysis."""
 
 import csv
 import json
@@ -22,6 +22,8 @@ from typing import (
 import numpy as np
 
 from .ParseWifi import ParsedWifiFrame, ParseWifi
+from .TwoToneAnalysis import TwoToneAnalysis, TwoToneMetrics
+from .WaveGenTwoTone import TwoToneWaveform
 
 # Cross-package imports support ``inc.lib`` from the repository root and
 # ``lib`` when the caller places the ``inc`` directory on sys.path.
@@ -73,10 +75,44 @@ class SignalMetrics(TypedDict):
     outputPowerDbm: float
 
 
+class IrrMeasurement(TypedDict):
+    """Define the ordinary dictionary returned by ``MeasureIrr``.
+
+    Coefficient powers are dimensionless fitted-model quantities rather than
+    RF watts. Per-chain tuples preserve the conducted-port reference plane.
+    """
+
+    irrDb: float
+    irrDbPerChain: Tuple[float, ...]
+    desiredCoefficientPower: float
+    imageCoefficientPower: float
+    imageAmplitudeRatio: float
+    directCoefficientRealPerChain: Tuple[float, ...]
+    directCoefficientImagPerChain: Tuple[float, ...]
+    imageCoefficientRealPerChain: Tuple[float, ...]
+    imageCoefficientImagPerChain: Tuple[float, ...]
+    residualPowerRatio: float
+    regressionConditionNumberPerChain: Tuple[float, ...]
+
+
+class IntermodulationOrderMetrics(TypedDict):
+    """Define one ordinary-dictionary IM3, IM5, or IM7 result."""
+
+    nonlinearOrder: int
+    lowerFrequencyHz: float
+    upperFrequencyHz: float
+    lowerProductDbfs: float
+    upperProductDbfs: float
+    lowerDbc: float
+    upperDbc: float
+    worstDbc: float
+
+
 class MimoSignalMetrics(TypedDict):
     """Define ordinary-dictionary MIMO detail keys."""
 
     snrDbPerChain: Tuple[float, ...]
+    irrDbPerChain: Tuple[float, ...]
     evmDbPerSpatialStream: Tuple[float, ...]
     evmPercentPerSpatialStream: Tuple[float, ...]
     aclrLowerDbPerChain: Tuple[float, ...]
@@ -248,8 +284,11 @@ class Analysis:
         ``resultAnalysis = Analysis(referenceSignal, waveform)``
         ``resultAnalysis = Analysis(None, waveform)``
         ``metrics = resultAnalysis.Analyze(paOutput)``
+        ``irrMeasurement = resultAnalysis.MeasureIrr(paOutput)``
         ``receiveAnalysis = Analysis(receivedWifiFrame)``
         ``metrics = receiveAnalysis.Analyze()``
+        ``imMetrics = Analysis.AnalyzeTwoTone(paOutput, toneWaveform)``
+        ``im3Metrics = Analysis.CalculateIm3(paOutput, toneWaveform)``
     """
 
     def __init__(
@@ -1327,40 +1366,99 @@ class Analysis:
         )
         return float(evmDb), float(evmPercent)
 
-    def CalculateIrr(self, measuredSignal: np.ndarray) -> float:
+    def MeasureIrr(
+        self,
+        measuredSignal: Optional[np.ndarray] = None,
+    ) -> IrrMeasurement:
+        """Measure IRR and return widely linear fit diagnostics as a dictionary.
+
+        Processing details:
+            Algorithm: Select explicit samples or the stored assisted/blind
+            capture, run timing, carrier-frequency, sampling-clock, and common
+            complex-gain compensation once, then delegate the direct/conjugate
+            coefficient fit to ``MeasurePreparedIrr``.
+
+        Args:
+            measuredSignal: Optional measured samples. Omit this value in
+                transmit-assisted and blind modes; explicit-reference mode
+                requires it because no received capture is stored.
+
+        Returns:
+            result: Ordinary dictionary containing aggregate and per-chain
+                IRR, fitted coefficient powers, image amplitude ratio,
+                coefficient components, normalized residual, and condition
+                numbers.
+        """
+
+        selectedSignal = measuredSignal
+        if selectedSignal is None:
+            if self.defaultMeasuredSignal is None:
+                raise ValueError(
+                    "measuredSignal is required when Analysis was constructed "
+                    "in explicit-reference mode"
+                )
+            selectedSignal = self.defaultMeasuredSignal
+        preparedSignal = self.PrepareMeasuredSignal(selectedSignal)
+        return self.MeasurePreparedIrr(preparedSignal)
+
+    def CalculateIrr(
+        self,
+        measuredSignal: Optional[np.ndarray] = None,
+    ) -> float:
         """Calculate image-rejection ratio after common synchronization.
 
         Processing details:
-            Algorithm: Run the standard timing, frequency, sampling-clock,
-            and common complex-gain compensation once, then estimate the
-            desired and conjugate response coefficients on the data field.
+            Algorithm: Call ``MeasureIrr`` and return only its aggregate dB
+            value. This compact interface is retained for existing callers;
+            new measurement code can use ``MeasureIrr`` for diagnostics.
 
         Args:
-            measuredSignal: Measured or simulated complex samples.
+            measuredSignal: Optional measured samples. Omit in assisted or
+                blind mode and provide it in explicit-reference mode.
 
         Returns:
             result: Aggregate direct-to-image power ratio in decibels.
         """
 
-        preparedSignal = self.PrepareMeasuredSignal(measuredSignal)
-        return self.CalculatePreparedIrr(preparedSignal)
+        return float(self.MeasureIrr(measuredSignal)["irrDb"])
 
     def CalculatePreparedIrr(self, preparedSignal: np.ndarray) -> float:
-        """Estimate IRR with a regularized widely linear least-squares fit.
+        """Calculate only IRR from an already compensated signal.
 
         Processing details:
-            Algorithm: Fit each measured chain to ``a*x + b*conj(x)`` on the
-            useful data field, accumulate ``|a|^2`` as desired-path power and
-            ``|b|^2`` as image-path power, and report their decibel ratio.
-            A tiny scale-relative ridge protects nearly real or otherwise
-            poorly conditioned reference captures without biasing ordinary
-            circular Wi-Fi signals.
+            Algorithm: Call ``MeasurePreparedIrr`` without repeating signal
+            synchronization and return its aggregate dB value.
 
         Args:
             preparedSignal: Signal returned by ``PrepareMeasuredSignal``.
 
         Returns:
-            result: Image-rejection ratio in dB; larger is better.
+            result: Aggregate image-rejection ratio in dB.
+        """
+
+        return float(self.MeasurePreparedIrr(preparedSignal)["irrDb"])
+
+    def MeasurePreparedIrr(
+        self,
+        preparedSignal: np.ndarray,
+    ) -> IrrMeasurement:
+        """Estimate IRR and fit quality with regularized widely linear LS.
+
+        Processing details:
+            Algorithm: Fit each measured chain to ``a*x + b*conj(x)`` on the
+            useful data field, accumulate ``|a|^2`` as desired-path power and
+            ``|b|^2`` as image-path power, calculate aggregate and per-chain
+            ratios, retain complex coefficient components, and quantify the
+            unexplained residual and regression conditioning. A tiny
+            scale-relative ridge protects the solve without materially
+            biasing ordinary circular Wi-Fi or nonzero complex-tone signals.
+
+        Args:
+            preparedSignal: Signal returned by ``PrepareMeasuredSignal``.
+
+        Returns:
+            result: Ordinary dictionary containing the IRR result and
+                measurement-quality diagnostics.
         """
 
         complexMeasured = self.ValidatePreparedSignal(preparedSignal)
@@ -1381,6 +1479,13 @@ class Analysis:
         )
         directPower = 0.0
         imagePower = 0.0
+        residualPower = 0.0
+        measuredPower = 0.0
+        perChainIrrDb = []
+        directCoefficients = []
+        imageCoefficients = []
+        conditionNumbers = []
+        numericFloor = np.finfo(float).tiny
         for chainIndex in range(referenceMatrix.shape[1]):
             referenceData = referenceMatrix[dataSlice, chainIndex].reshape(-1)
             measuredData = measuredMatrix[dataSlice, chainIndex].reshape(-1)
@@ -1392,7 +1497,7 @@ class Analysis:
             )
             diagonalScale = max(
                 float(np.mean(np.real(np.diag(normalMatrix)))),
-                np.finfo(float).tiny,
+                numericFloor,
             )
             regularizedMatrix = normalMatrix + (
                 1.0e-12
@@ -1403,16 +1508,67 @@ class Analysis:
                 regularizedMatrix,
                 regressionMatrix.conj().T @ measuredData,
             )
-            directPower += float(np.abs(coefficients[0]) ** 2)
-            imagePower += float(np.abs(coefficients[1]) ** 2)
-        numericFloor = np.finfo(float).tiny
-        return float(
+            directCoefficient = complex(coefficients[0])
+            imageCoefficient = complex(coefficients[1])
+            chainDirectPower = float(np.abs(directCoefficient) ** 2)
+            chainImagePower = float(np.abs(imageCoefficient) ** 2)
+            fittedSignal = regressionMatrix @ coefficients
+            directPower += chainDirectPower
+            imagePower += chainImagePower
+            residualPower += float(
+                np.sum(np.abs(measuredData - fittedSignal) ** 2)
+            )
+            measuredPower += float(np.sum(np.abs(measuredData) ** 2))
+            perChainIrrDb.append(
+                float(
+                    10.0
+                    * np.log10(
+                        max(chainDirectPower, numericFloor)
+                        / max(chainImagePower, numericFloor)
+                    )
+                )
+            )
+            directCoefficients.append(directCoefficient)
+            imageCoefficients.append(imageCoefficient)
+            conditionNumbers.append(
+                float(np.linalg.cond(regressionMatrix))
+            )
+        aggregateIrrDb = float(
             10.0
             * np.log10(
                 max(directPower, numericFloor)
                 / max(imagePower, numericFloor)
             )
         )
+        imageAmplitudeRatio = float(
+            np.sqrt(
+                max(imagePower, 0.0)
+                / max(directPower, numericFloor)
+            )
+        )
+        return {
+            "irrDb": aggregateIrrDb,
+            "irrDbPerChain": tuple(perChainIrrDb),
+            "desiredCoefficientPower": float(directPower),
+            "imageCoefficientPower": float(imagePower),
+            "imageAmplitudeRatio": imageAmplitudeRatio,
+            "directCoefficientRealPerChain": tuple(
+                float(value.real) for value in directCoefficients
+            ),
+            "directCoefficientImagPerChain": tuple(
+                float(value.imag) for value in directCoefficients
+            ),
+            "imageCoefficientRealPerChain": tuple(
+                float(value.real) for value in imageCoefficients
+            ),
+            "imageCoefficientImagPerChain": tuple(
+                float(value.imag) for value in imageCoefficients
+            ),
+            "residualPowerRatio": float(
+                residualPower / max(measuredPower, numericFloor)
+            ),
+            "regressionConditionNumberPerChain": tuple(conditionNumbers),
+        }
 
     def CalculatePreparedSnrPerChain(
         self, preparedSignal: np.ndarray
@@ -1767,7 +1923,8 @@ class Analysis:
         ) = self.CalculateOutputPower(complexMeasured)
         snrDb = self.CalculatePreparedSnr(complexMeasured)
         evmDb, evmPercent = self.CalculatePreparedEvm(complexMeasured)
-        irrDb = self.CalculatePreparedIrr(complexMeasured)
+        irrMeasurement = self.MeasurePreparedIrr(complexMeasured)
+        irrDb = irrMeasurement["irrDb"]
         (
             aclrLowerDb,
             aclrUpperDb,
@@ -1791,6 +1948,7 @@ class Analysis:
             ) = self.CalculatePreparedAclrPerChain(complexMeasured)
             self.lastMimoMetrics = {
                 "snrDbPerChain": perChainSnrDb,
+                "irrDbPerChain": irrMeasurement["irrDbPerChain"],
                 "evmDbPerSpatialStream": perStreamEvmDb,
                 "evmPercentPerSpatialStream": perStreamEvmPercent,
                 "aclrLowerDbPerChain": perChainAclrLowerDb,
@@ -1810,6 +1968,218 @@ class Analysis:
             "aclrWorstDb": float(aclrWorstDb),
             "outputPowerDbm": float(outputPowerDbm),
         }
+
+    @staticmethod
+    def AnalyzeTwoTone(
+        measuredSignal: np.ndarray,
+        waveform: TwoToneWaveform,
+        parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
+        **parameterOverrides: object,
+    ) -> TwoToneMetrics:
+        """Calculate fundamentals, IM3, IM5, IM7, and output power.
+
+        Processing details:
+            Algorithm: Construct the dedicated metadata-aware
+            ``TwoToneAnalysis`` implementation and delegate exact-frequency
+            windowed projection to it. This keeps the main Analysis namespace
+            convenient without duplicating spectral estimation or coupling
+            the ordinary Wi-Fi ``Analyze`` path to two-tone metadata.
+
+        Args:
+            measuredSignal: Floating or fixed-point PA output waveform.
+            waveform: Two-tone metadata containing exact tone frequencies.
+            parameters: Optional TwoToneAnalysis parameter mapping.
+            width: Optional public I/Q width override.
+            parameterOverrides: Highest-priority TwoToneAnalysis settings.
+
+        Returns:
+            result: Ordinary dictionary containing both fundamentals, paired
+                IM3, IM5, IM7 values in dBc, worst IM, and output power.
+        """
+
+        toneAnalysis = TwoToneAnalysis(
+            waveform,
+            parameters=parameters,
+            width=width,
+            **parameterOverrides,
+        )
+        return toneAnalysis.Analyze(measuredSignal)
+
+    @staticmethod
+    def CalculateIntermodulationOrder(
+        measuredSignal: np.ndarray,
+        waveform: TwoToneWaveform,
+        nonlinearOrder: int,
+        parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
+        **parameterOverrides: object,
+    ) -> IntermodulationOrderMetrics:
+        """Calculate one paired IM3, IM5, or IM7 measurement.
+
+        Processing details:
+            Algorithm: Reuse ``AnalyzeTwoTone`` for one consistent spectral
+            pass, select the requested lower, upper, and worse-side dBc
+            fields, recover absolute product dBFS by adding each dBc result to
+            its same-side fundamental dBFS, and attach exact product
+            frequencies from immutable waveform metadata.
+
+        Args:
+            measuredSignal: Floating or fixed-point PA output waveform.
+            waveform: Two-tone metadata containing exact tone frequencies.
+            nonlinearOrder: Supported odd order 3, 5, or 7.
+            parameters: Optional TwoToneAnalysis parameter mapping.
+            width: Optional public I/Q width override.
+            parameterOverrides: Highest-priority TwoToneAnalysis settings.
+
+        Returns:
+            result: Ordinary dictionary with order, product frequencies,
+                absolute dBFS levels, same-side dBc values, and worst dBc.
+        """
+
+        if (
+            not isinstance(nonlinearOrder, int)
+            or isinstance(nonlinearOrder, bool)
+            or nonlinearOrder not in (3, 5, 7)
+        ):
+            raise ValueError(
+                "nonlinearOrder has an invalid value. Allowed values: "
+                "3, 5, or 7."
+            )
+        completeMetrics: Mapping[str, float] = Analysis.AnalyzeTwoTone(
+            measuredSignal,
+            waveform,
+            parameters=parameters,
+            width=width,
+            **parameterOverrides,
+        )
+        metricPrefix = f"im{nonlinearOrder}"
+        lowerDbc = float(completeMetrics[f"{metricPrefix}LowerDbc"])
+        upperDbc = float(completeMetrics[f"{metricPrefix}UpperDbc"])
+        lowerFrequencyHz, upperFrequencyHz = (
+            waveform.IntermodulationFrequencies(nonlinearOrder)
+        )
+        return {
+            "nonlinearOrder": nonlinearOrder,
+            "lowerFrequencyHz": float(lowerFrequencyHz),
+            "upperFrequencyHz": float(upperFrequencyHz),
+            "lowerProductDbfs": float(
+                completeMetrics["fundamentalLowerDbfs"] + lowerDbc
+            ),
+            "upperProductDbfs": float(
+                completeMetrics["fundamentalUpperDbfs"] + upperDbc
+            ),
+            "lowerDbc": lowerDbc,
+            "upperDbc": upperDbc,
+            "worstDbc": float(
+                completeMetrics[f"{metricPrefix}WorstDbc"]
+            ),
+        }
+
+    @staticmethod
+    def CalculateIm3(
+        measuredSignal: np.ndarray,
+        waveform: TwoToneWaveform,
+        parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
+        **parameterOverrides: object,
+    ) -> IntermodulationOrderMetrics:
+        """Calculate lower, upper, and worse-side third-order IM metrics.
+
+        Processing details:
+            Algorithm: Delegate to ``CalculateIntermodulationOrder`` with
+            nonlinear order three so frequency, dBFS, and dBc conventions
+            remain identical to the combined two-tone result.
+
+        Args:
+            measuredSignal: Floating or fixed-point PA output waveform.
+            waveform: Two-tone metadata containing exact tone frequencies.
+            parameters: Optional TwoToneAnalysis parameter mapping.
+            width: Optional public I/Q width override.
+            parameterOverrides: Highest-priority TwoToneAnalysis settings.
+
+        Returns:
+            result: Ordinary dictionary containing the paired IM3 result.
+        """
+
+        return Analysis.CalculateIntermodulationOrder(
+            measuredSignal,
+            waveform,
+            3,
+            parameters=parameters,
+            width=width,
+            **parameterOverrides,
+        )
+
+    @staticmethod
+    def CalculateIm5(
+        measuredSignal: np.ndarray,
+        waveform: TwoToneWaveform,
+        parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
+        **parameterOverrides: object,
+    ) -> IntermodulationOrderMetrics:
+        """Calculate lower, upper, and worse-side fifth-order IM metrics.
+
+        Processing details:
+            Algorithm: Delegate to ``CalculateIntermodulationOrder`` with
+            nonlinear order five so frequency, dBFS, and dBc conventions
+            remain identical to the combined two-tone result.
+
+        Args:
+            measuredSignal: Floating or fixed-point PA output waveform.
+            waveform: Two-tone metadata containing exact tone frequencies.
+            parameters: Optional TwoToneAnalysis parameter mapping.
+            width: Optional public I/Q width override.
+            parameterOverrides: Highest-priority TwoToneAnalysis settings.
+
+        Returns:
+            result: Ordinary dictionary containing the paired IM5 result.
+        """
+
+        return Analysis.CalculateIntermodulationOrder(
+            measuredSignal,
+            waveform,
+            5,
+            parameters=parameters,
+            width=width,
+            **parameterOverrides,
+        )
+
+    @staticmethod
+    def CalculateIm7(
+        measuredSignal: np.ndarray,
+        waveform: TwoToneWaveform,
+        parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
+        **parameterOverrides: object,
+    ) -> IntermodulationOrderMetrics:
+        """Calculate lower, upper, and worse-side seventh-order IM metrics.
+
+        Processing details:
+            Algorithm: Delegate to ``CalculateIntermodulationOrder`` with
+            nonlinear order seven so frequency, dBFS, and dBc conventions
+            remain identical to the combined two-tone result.
+
+        Args:
+            measuredSignal: Floating or fixed-point PA output waveform.
+            waveform: Two-tone metadata containing exact tone frequencies.
+            parameters: Optional TwoToneAnalysis parameter mapping.
+            width: Optional public I/Q width override.
+            parameterOverrides: Highest-priority TwoToneAnalysis settings.
+
+        Returns:
+            result: Ordinary dictionary containing the paired IM7 result.
+        """
+
+        return Analysis.CalculateIntermodulationOrder(
+            measuredSignal,
+            waveform,
+            7,
+            parameters=parameters,
+            width=width,
+            **parameterOverrides,
+        )
 
     def AnalyzeStages(
         self, stageSignals: Mapping[str, np.ndarray]
@@ -2104,7 +2474,7 @@ class Analysis:
             Mapping[str, MimoSignalMetrics]
         ] = None,
     ) -> None:
-        """Print per-chain SNR/ACLR and per-stream EVM result tables.
+        """Print per-chain SNR/IRR/ACLR and per-stream EVM result tables.
 
         Processing details:
             Algorithm: Expand immutable metric tuples into readable rows,
@@ -2129,7 +2499,7 @@ class Analysis:
             print(f"\n{stageName} - conducted PA-chain metrics")
             print(
                 f"{'PA':<8} {'Pout(dBm)':>10} {'SNR(dB)':>10} "
-                f"{'ACLR-L':>10} "
+                f"{'IRR(dB)':>10} {'ACLR-L':>10} "
                 f"{'ACLR-U':>10} {'ACLR-W':>10}"
             )
             for chainIndex, snrDb in enumerate(
@@ -2139,6 +2509,7 @@ class Analysis:
                     f"PA {chainIndex + 1:<5} "
                     f"{metrics['outputPowerDbmPerChain'][chainIndex]:>10.2f} "
                     f"{snrDb:>10.2f} "
+                    f"{metrics['irrDbPerChain'][chainIndex]:>10.2f} "
                     f"{metrics['aclrLowerDbPerChain'][chainIndex]:>10.2f} "
                     f"{metrics['aclrUpperDbPerChain'][chainIndex]:>10.2f} "
                     f"{metrics['aclrWorstDbPerChain'][chainIndex]:>10.2f}"

@@ -61,6 +61,8 @@ from inc.lib.PaModel import (
     GMPConfig,
     MimoPaModel,
     PaModel,
+    RappConfig,
+    RappPA,
     ThermalConfig,
     ThermalNetwork,
     WienerConfig,
@@ -529,7 +531,7 @@ def CheckBenchmarkSeparation() -> None:
         "同场景部署模型优缺点对比",
         "功率维度的优缺点对比",
         "G类：双音IM3/IM5/IM7场景",
-        "H类：Wiener/GMP/Doherty PA双音特性",
+        "H类：Rapp/Wiener/GMP/Doherty PA双音特性",
         "逐PA、逐测试DPD优化建议",
     )
     for sectionTitle in requiredDocumentSections:
@@ -913,6 +915,7 @@ def CheckDocumentationApiConsistency() -> None:
             PaModel,
             (
                 "modelName",
+                "rappConfig",
                 "wienerConfig",
                 "gmpConfig",
                 "dohertyConfig",
@@ -922,7 +925,8 @@ def CheckDocumentationApiConsistency() -> None:
                 "parameterOverrides",
             ),
             (
-                "PaModel(modelName=None, wienerConfig=None, "
+                "PaModel(modelName=None, rappConfig=None, "
+                "wienerConfig=None, "
                 "gmpConfig=None, dohertyConfig=None, "
                 "thermalConfig=None, "
                 "parameters=None, width=None, "
@@ -1363,6 +1367,8 @@ def CheckMimoSpatialStructure() -> None:
             len(mimoMetrics["outputPowerDbmPerChain"])
             == transmitCount
         )
+        assert len(mimoMetrics["irrDbPerChain"]) == transmitCount
+        assert min(mimoMetrics["irrDbPerChain"]) > 200.0
         aggregatePowerMilliwatt = sum(
             10.0 ** (powerDbm / 10.0)
             for powerDbm in mimoMetrics["outputPowerDbmPerChain"]
@@ -1587,16 +1593,46 @@ def CheckIdealMetrics() -> None:
     iqReference /= np.sqrt(np.mean(np.abs(iqReference) ** 2))
     imageCoefficient = 0.05 * np.exp(1j * 0.3)
     iqMeasured = iqReference + imageCoefficient * np.conj(iqReference)
-    iqMetrics = Analysis(
+    iqAnalysis = Analysis(
         iqMeasured,
         parameters={
             "width": 0,
             "sampleRateHz": 80.0e6,
         },
         transmittedSignal=iqReference,
-    ).Analyze()
+    )
+    iqMetrics = iqAnalysis.Analyze()
+    irrMeasurement = iqAnalysis.MeasureIrr()
     expectedIrrDb = 20.0 * np.log10(1.0 / np.abs(imageCoefficient))
     assert abs(iqMetrics["irrDb"] - expectedIrrDb) < 0.1
+    assert abs(irrMeasurement["irrDb"] - expectedIrrDb) < 0.1
+    assert abs(iqAnalysis.CalculateIrr() - expectedIrrDb) < 0.1
+    assert np.isclose(
+        irrMeasurement["imageAmplitudeRatio"],
+        np.abs(imageCoefficient),
+        atol=1.0e-5,
+    )
+    assert irrMeasurement["irrDbPerChain"] == (
+        irrMeasurement["irrDb"],
+    )
+    assert (
+        irrMeasurement["regressionConditionNumberPerChain"][0]
+        < 1.1
+    )
+    assert irrMeasurement["residualPowerRatio"] < 1.0e-5
+    assert set(irrMeasurement) == {
+        "irrDb",
+        "irrDbPerChain",
+        "desiredCoefficientPower",
+        "imageCoefficientPower",
+        "imageAmplitudeRatio",
+        "directCoefficientRealPerChain",
+        "directCoefficientImagPerChain",
+        "imageCoefficientRealPerChain",
+        "imageCoefficientImagPerChain",
+        "residualPowerRatio",
+        "regressionConditionNumberPerChain",
+    }
 
 
 def CheckSignalProcessingCompensation() -> None:
@@ -2272,6 +2308,102 @@ def CheckDohertyPaModel() -> None:
         else:
             raise AssertionError(
                 "invalid Doherty configuration accepted: "
+                f"{invalidOverrides!r}"
+            )
+
+
+def CheckRappPaModel() -> None:
+    """Verify the classic Rapp PA is nonlinear but strictly memoryless.
+
+    Processing details:
+        Algorithm: Compare the implementation with the closed-form AM-AM
+        equation, prove that phase and sample order are preserved, show that
+        surrounding samples cannot change a selected output, exercise the
+        facade and fixed-point boundary, and reject every nonpositive or
+        nonfinite physical parameter.
+
+    Returns:
+        result: None. Assertions enforce the memoryless Rapp contract.
+    """
+
+    rappConfig = RappConfig(
+        linearGain=1.2,
+        saturationAmplitude=0.9,
+        rappSmoothness=2.5,
+    )
+    rappPa = RappPA(rappConfig)
+    inputMagnitudes = np.asarray(
+        (0.0, 0.05, 0.25, 0.75, 1.5), dtype=float
+    )
+    inputPhases = np.asarray(
+        (0.0, 0.2, -0.7, 1.1, -2.0), dtype=float
+    )
+    inputSignal = inputMagnitudes * np.exp(1j * inputPhases)
+    outputSignal = rappPa.Process(inputSignal)
+    expectedMagnitude = (
+        rappConfig.linearGain
+        * inputMagnitudes
+        / (
+            1.0
+            + (
+                inputMagnitudes / rappConfig.saturationAmplitude
+            )
+            ** (2.0 * rappConfig.rappSmoothness)
+        )
+        ** (1.0 / (2.0 * rappConfig.rappSmoothness))
+    )
+    assert np.allclose(np.abs(outputSignal), expectedMagnitude)
+    nonzeroMask = inputMagnitudes > 0.0
+    assert np.allclose(
+        np.angle(outputSignal[nonzeroMask]),
+        inputPhases[nonzeroMask],
+    )
+    assert np.isclose(rappPa.SmallSignalGain(), 1.2 + 0.0j)
+
+    # Replacing every neighboring sample must not alter the same-index output.
+    probeIndex = 2
+    changedContext = np.asarray(inputSignal, dtype=np.complex128).copy()
+    changedContext[:probeIndex] = 0.8 - 0.3j
+    changedContext[probeIndex + 1:] = -0.4 + 0.6j
+    changedOutput = rappPa.Process(changedContext)
+    assert changedOutput[probeIndex] == outputSignal[probeIndex]
+
+    facadePa = PaModel(
+        parameters={
+            "modelName": "rapp",
+            "rappConfig": rappConfig,
+            "width": 0,
+        }
+    )
+    assert facadePa.modelName == "rapp"
+    assert np.allclose(facadePa.Process(inputSignal), outputSignal)
+    fixedFormat = FixedPoint(16)
+    fixedInput = fixedFormat.EncodeComplex(0.5 * inputSignal)
+    fixedPa = PaModel(
+        parameters={
+            "modelName": "rapp",
+            "rappConfig": rappConfig,
+            "width": 16,
+        }
+    )
+    fixedOutput = fixedPa.Process(fixedInput)
+    assert np.array_equal(fixedOutput.real, np.rint(fixedOutput.real))
+    assert np.array_equal(fixedOutput.imag, np.rint(fixedOutput.imag))
+
+    invalidConfigurations = (
+        {"linearGain": 0.0},
+        {"saturationAmplitude": 0.0},
+        {"rappSmoothness": 0.0},
+        {"linearGain": float("nan")},
+    )
+    for invalidOverrides in invalidConfigurations:
+        try:
+            RappPA(RappConfig(**invalidOverrides))
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(
+                "invalid Rapp configuration accepted: "
                 f"{invalidOverrides!r}"
             )
 
@@ -3511,7 +3643,7 @@ def CheckPaThermalModel() -> None:
     fosterNetwork.Advance(1.0, 0.01)
     assert 25.0 < fosterNetwork.CurrentTemperatureC() < 55.0
 
-    for modelName in ("wiener", "gmp", "doherty"):
+    for modelName in ("rapp", "wiener", "gmp", "doherty"):
         wrappedPa = PaModel(
             parameters={
                 "modelName": modelName,
@@ -4372,6 +4504,117 @@ def CheckTwoToneIlcAnalysis() -> None:
     baselineOutput = powerCalibration.GetLastPaOutput()
     baselineMetrics = resultAnalysis.Analyze(baselineOutput)
     assert -40.0 < baselineMetrics["im3WorstDbc"] < -20.0
+
+    facadeMetrics = Analysis.AnalyzeTwoTone(
+        baselineOutput,
+        floatingWaveform,
+        parameters={
+            "settlingSamples": 64,
+            "width": 0,
+        },
+    )
+    for metricName, metricValue in baselineMetrics.items():
+        assert np.isclose(facadeMetrics[metricName], metricValue)
+
+    orderMethods = (
+        (3, Analysis.CalculateIm3),
+        (5, Analysis.CalculateIm5),
+        (7, Analysis.CalculateIm7),
+    )
+    for nonlinearOrder, orderMethod in orderMethods:
+        orderMetrics = orderMethod(
+            baselineOutput,
+            floatingWaveform,
+            parameters={
+                "settlingSamples": 64,
+                "width": 0,
+            },
+        )
+        expectedPrefix = f"im{nonlinearOrder}"
+        expectedFrequenciesHz = (
+            floatingWaveform.IntermodulationFrequencies(nonlinearOrder)
+        )
+        assert set(orderMetrics) == {
+            "nonlinearOrder",
+            "lowerFrequencyHz",
+            "upperFrequencyHz",
+            "lowerProductDbfs",
+            "upperProductDbfs",
+            "lowerDbc",
+            "upperDbc",
+            "worstDbc",
+        }
+        assert orderMetrics["nonlinearOrder"] == nonlinearOrder
+        assert np.isclose(
+            orderMetrics["lowerFrequencyHz"],
+            expectedFrequenciesHz[0],
+        )
+        assert np.isclose(
+            orderMetrics["upperFrequencyHz"],
+            expectedFrequenciesHz[1],
+        )
+        assert np.isclose(
+            orderMetrics["lowerDbc"],
+            baselineMetrics[f"{expectedPrefix}LowerDbc"],
+        )
+        assert np.isclose(
+            orderMetrics["upperDbc"],
+            baselineMetrics[f"{expectedPrefix}UpperDbc"],
+        )
+        assert np.isclose(
+            orderMetrics["worstDbc"],
+            baselineMetrics[f"{expectedPrefix}WorstDbc"],
+        )
+        assert np.isclose(
+            orderMetrics["lowerProductDbfs"],
+            baselineMetrics["fundamentalLowerDbfs"]
+            + baselineMetrics[f"{expectedPrefix}LowerDbc"],
+        )
+        assert np.isclose(
+            orderMetrics["upperProductDbfs"],
+            baselineMetrics["fundamentalUpperDbfs"]
+            + baselineMetrics[f"{expectedPrefix}UpperDbc"],
+        )
+
+    try:
+        Analysis.CalculateIntermodulationOrder(
+            baselineOutput,
+            floatingWaveform,
+            9,
+            parameters={"settlingSamples": 64, "width": 0},
+        )
+    except ValueError as error:
+        assert "3, 5, or 7" in str(error)
+    else:
+        raise AssertionError("unsupported IM order must be rejected")
+
+    unequalWaveform = WaveGenTwoTone(
+        parameters={
+            "sampleRateHz": 100.0e6,
+            "toneFrequenciesHz": (-2.0e6, 2.0e6),
+            "toneAmplitudes": (1.0, 0.5),
+            "numSamples": 4096,
+            "rmsLevel": 0.25,
+            "width": 0,
+        }
+    ).Generate()
+    unequalCubicOutput = unequalWaveform.samples + (
+        0.01
+        * unequalWaveform.samples
+        * np.abs(unequalWaveform.samples) ** 2
+    )
+    unequalIm3 = Analysis.CalculateIm3(
+        unequalCubicOutput,
+        unequalWaveform,
+        parameters={"settlingSamples": 0, "width": 0},
+    )
+    expectedProductImbalanceDb = 20.0 * np.log10(2.0)
+    assert np.isclose(
+        unequalIm3["lowerProductDbfs"]
+        - unequalIm3["upperProductDbfs"],
+        expectedProductImbalanceDb,
+        atol=0.1,
+    )
     ilcResult = RunComplexGainIlc(
         referenceSignal,
         paModel,
@@ -4429,7 +4672,7 @@ def CheckPaCharacterizationBenchmark() -> None:
     """Verify multi-model two-tone PA feature sweeps and all artifacts.
 
     Processing details:
-        Algorithm: Run a compact Wiener/GMP/Doherty frequency and tone-spacing
+        Algorithm: Run a compact Rapp/Wiener/GMP/Doherty frequency and tone-spacing
         sweep, require the expected point counts and finite summary metrics,
         verify equal-power nonlinear measurements, require five complete
         measurement-backed DPD recommendations per model, and check all CSV,
@@ -4462,17 +4705,17 @@ def CheckPaCharacterizationBenchmark() -> None:
                 outputDirectory=outputDirectory,
             )
         )
-        assert len(result.frequencyResponse) == 18
-        assert len(result.memoryEffect) == 9
-        assert len(result.powerSweep) == 6
-        assert len(result.summaries) == 3
-        assert len(result.recommendations) == 15
+        assert len(result.frequencyResponse) == 24
+        assert len(result.memoryEffect) == 12
+        assert len(result.powerSweep) == 8
+        assert len(result.summaries) == 4
+        assert len(result.recommendations) == 20
         resultDocument = result.ToDict()
-        assert len(resultDocument["powerSweep"]) == 6
-        assert len(resultDocument["recommendations"]) == 15
+        assert len(resultDocument["powerSweep"]) == 8
+        assert len(resultDocument["recommendations"]) == 20
         assert tuple(
             summary.modelName for summary in result.summaries
-        ) == ("wiener", "gmp", "doherty")
+        ) == ("rapp", "wiener", "gmp", "doherty")
         for summary in result.summaries:
             summaryValues = tuple(
                 value
@@ -4496,7 +4739,19 @@ def CheckPaCharacterizationBenchmark() -> None:
                 )
                 <= 0.25
             )
-        for modelName in ("wiener", "gmp", "doherty"):
+        rappSummary = next(
+            summary
+            for summary in result.summaries
+            if summary.modelName == "rapp"
+        )
+        assert rappSummary.gainRippleDb < 1.0e-6
+        assert abs(rappSummary.groupDelayNs) < 1.0e-6
+        assert rappSummary.phaseNonlinearityDegrees < 1.0e-6
+        assert rappSummary.im3SpacingVariationDb < 0.10
+        assert rappSummary.maximumIm3AsymmetryDb < 0.10
+        assert rappSummary.dynamicGainHysteresisDb < 0.10
+        assert rappSummary.dynamicPhaseHysteresisDegrees < 0.10
+        for modelName in ("rapp", "wiener", "gmp", "doherty"):
             assert tuple(
                 powerPoint.targetOutputPowerDbm
                 for powerPoint in result.powerSweep
@@ -4545,7 +4800,7 @@ def CheckPaCharacterizationBenchmark() -> None:
                 outputDirectory / "pa_characterization.json"
             ).read_text(encoding="utf-8")
         )
-        assert len(recommendationDocument["recommendations"]) == 15
+        assert len(recommendationDocument["recommendations"]) == 20
         dpdGmpDirectory = outputDirectory / "dpd_gmp"
         for artifactName in (
             "dpd_gmp_stage_metrics.csv",
@@ -5205,6 +5460,7 @@ def RunTests() -> None:
     CheckSignalProcessingCompensation()
     CheckPowerEvmCurve()
     CheckGuardIntervals()
+    CheckRappPaModel()
     CheckDohertyPaModel()
     CheckIlcImprovement()
     CheckIlcFeedbackSynchronization()

@@ -1335,6 +1335,8 @@ ACLR（Adjacent Channel Leakage Ratio）比较主信道功率和邻道功率：
 
 Hann 窗降低矩形截断带来的频谱旁瓣泄漏；分段平均降低估计方差。代价是频率分辨率和统计独立性存在折中。
 
+整段单次FFT与分段加窗Welch方法在分辨率、旁瓣、栅栏损失、估计方差、ENBW、内存和计算量上的完整公式与选择示例见 [FAQ Q7](./FAQ.md#q7计算功率谱时整段fft与分段加窗fft有什么区别)。
+
 ### 6.3 频带功率和 ACLR
 
 在离散频率网格上，三个频带功率近似为 PSD 样点求和：
@@ -1651,6 +1653,7 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 | 字段 | 索引对象 | 含义 |
 |---|---|---|
 | `snrDbPerChain` | 物理 PA 链 | 每链校正后 SNR |
+| `irrDbPerChain` | 物理 PA 链 | 每链直接分量与共轭镜像分量的功率比 |
 | `aclrLowerDbPerChain` | 物理 PA 链 | 每链下邻道 ACLR |
 | `aclrUpperDbPerChain` | 物理 PA 链 | 每链上邻道 ACLR |
 | `aclrWorstDbPerChain` | 物理 PA 链 | 每链较差邻道 ACLR |
@@ -1723,7 +1726,9 @@ ILC 每轮收敛结果另外输出：
 | OFDM 数据解调 | `Analysis.DemodulateWifiData` |
 | EVM 对齐 MSE | `Analysis.CalculateEvmAlignedMse` |
 | RMS EVM | `Analysis.CalculateEvm` |
-| IQ 镜像抑制度 | `Analysis.CalculateIrr` |
+| IQ 镜像抑制度与拟合诊断 | `Analysis.MeasureIrr` / `Analysis.CalculateIrr` |
+| 双音全部互调指标 | `Analysis.AnalyzeTwoTone` |
+| 单独IM3、IM5、IM7 | `Analysis.CalculateIm3` / `CalculateIm5` / `CalculateIm7` |
 | Welch PSD | `AveragePeriodogram` |
 | ACLR | `Analysis.CalculateAclr` |
 | 指标字典汇总 | `Analysis.Analyze` |
@@ -1966,7 +1971,25 @@ metrics = resultAnalysis.Analyze()
 print(metrics)
 ```
 
-这时没有 `WifiWaveform`，所以EVM是公共时域样值归一化误差，不是802.11数据子载波EVM。如果目标是读取双音IM3、IM5、IM7谱线，应改用 `TwoToneAnalysis`；两个分析类回答的是不同问题。
+这时没有 `WifiWaveform`，所以EVM是公共时域样值归一化误差，不是802.11数据子载波EVM。若目标是读取双音IM3、IM5、IM7谱线，可以继续从主 `Analysis` 类调用静态双音接口：
+
+```python
+allImMetrics = Analysis.AnalyzeTwoTone(
+    receivedSignal,
+    twoToneWaveform,
+    parameters={"maximumOutputPowerDbm": 25.0, "width": 0},
+)
+im3Metrics = Analysis.CalculateIm3(receivedSignal, twoToneWaveform)
+im5Metrics = Analysis.CalculateIm5(receivedSignal, twoToneWaveform)
+im7Metrics = Analysis.CalculateIm7(receivedSignal, twoToneWaveform)
+
+print(allImMetrics["worstIntermodulationDbc"])
+print(im3Metrics["lowerDbc"], im3Metrics["upperDbc"])
+print(im5Metrics["lowerProductDbfs"], im5Metrics["upperProductDbfs"])
+print(im7Metrics["worstDbc"])
+```
+
+这里有意保留两类互不混淆的调用：实例 `Analyze()` 计算已知发送波形的时域EVM、SNR、功率和ACLR；静态 `AnalyzeTwoTone()` 及三个单阶方法使用 `TwoToneWaveform` 的精确频率元数据计算互调。静态入口内部委托给 `TwoToneAnalysis`，不解析Wi-Fi描述字段。
 
 ### 11.5 多个测试阶段的横向比较与保存
 
@@ -2151,11 +2174,12 @@ mimoMetrics = resultAnalysis.GetLastMimoMetrics()
 print(metrics)
 print(mimoMetrics["outputPowerDbmPerChain"])
 print(mimoMetrics["snrDbPerChain"])
+print(mimoMetrics["irrDbPerChain"])
 print(mimoMetrics["evmDbPerSpatialStream"])
 print(mimoMetrics["aclrWorstDbPerChain"])
 ```
 
-这里的 `outputPowerDbmPerChain`、`snrDbPerChain` 和 `aclrWorstDbPerChain` 按物理PA链索引；`evmDbPerSpatialStream` 在撤销CSD和空间映射后按空间流索引。
+这里的 `outputPowerDbmPerChain`、`snrDbPerChain`、`irrDbPerChain` 和 `aclrWorstDbPerChain` 按物理PA链索引；`evmDbPerSpatialStream` 在撤销CSD和空间映射后按空间流索引。
 
 ### 11.9 只有接收文件的盲分析速查
 
@@ -2554,7 +2578,51 @@ y'[n]
 
 因此公共复增益会改变两个拟合系数的绝对值，却不会改变 IRR。同步仍然必须先做，因为未补偿时延、CFO 或 SFO 会把结构性镜像能量扩散到残差中并降低估计可信度。
 
-### 15.5 API 与结果字典
+### 15.5 工程中怎样测量IRR
+
+本工程使用**已知发送参考的广义线性测量法**。它既适用于Wi-Fi，也适用于任意NumPy复波形或非零频率复单音，并且不依赖ILC、DPD或PA模型。推荐测量步骤为：
+
+1. 明确参考面。测Tx I/Q时使用PA输出或forward仪表采样；测FB接收机时使用fb采样。两者不能混在同一结论里。
+2. 保存实际送入待测链路的复数发送波形 `transmittedSignal`。它可以被裁剪、前后补零，不需要额外提供Wi-Fi配置。
+3. 同时采集接收波形，保留足够的前后保护样点。`Analysis` 使用互相关寻找两路公共区间，不要求两个数组长度相等。
+4. 先补偿整数时延、分数时延、CFO、SFO和公共复增益，再在同一有效区间拟合 $x$ 与 $x^*$ 两列。
+5. 由拟合的直接系数 $hat a$ 和镜像系数 $hat b$ 计算IRR，并检查条件数和拟合残差，避免把不可辨识或模型失配的数据误当成有效IRR。
+
+仪表或芯片导出的两路NumPy波形可以直接测量：
+
+```python
+from inc.lib.Analysis import Analysis
+
+
+irrAnalyzer = Analysis(
+    receivedSignal,
+    transmittedSignal=transmittedSignal,
+    sampleRateHz=160.0e6,
+    width=0,
+)
+irrMeasurement = irrAnalyzer.MeasureIrr()
+
+print("IRR:", irrMeasurement["irrDb"], "dB")
+print("Image amplitude ratio:", irrMeasurement["imageAmplitudeRatio"])
+print("Fit residual ratio:", irrMeasurement["residualPowerRatio"])
+print(
+    "Regression condition:",
+    irrMeasurement["regressionConditionNumberPerChain"],
+)
+```
+
+若使用复单音，必须令音调位于非零基带频率：
+
+```math
+x[n]=A\exp\left(j2\pi f_0 n/f_s\right),
+\qquad f_0\ne0.
+```
+
+此时直接项位于 $+f_0$，共轭镜像项位于 $-f_0$。不要使用DC复常数或纯实波形，因为这时 $x=x^*$，两列无法区分；对应的回归条件数会很大。Wi-Fi随机复星座通常天然具有较好的可辨识性。
+
+对真实硬件，建议先把PA置于小信号近线性区测量基础Tx/FB IRR，再逐步扫描频率、输出功率和温度。若IRR只在高功率下降，可能包含PA与I/Q失衡级联形成的共轭非线性；一个常数 $hat b$ 只能给出综合诊断，不能完整替代频率相关或高阶增广模型。
+
+### 15.6 API 与结果字典
 
 完整分析会直接返回 `irrDb`：
 
@@ -2573,7 +2641,7 @@ print(metrics["evmDb"])
 print(metrics["irrDb"])
 ```
 
-只需要 IRR 时可使用：
+只需要一个IRR数值时保留兼容接口：
 
 ```python
 resultAnalysis = Analysis(
@@ -2584,9 +2652,32 @@ resultAnalysis = Analysis(
 irrDb = resultAnalysis.CalculateIrr(measuredSignal)
 ```
 
-`CalculateIrr` 自己执行一次同步；若调用方已经通过 `PrepareMeasuredSignal` 得到校正波形，应调用 `CalculatePreparedIrr`，避免重复估计。
+需要判断测量质量时使用字典接口：
 
-### 15.6 结果判断和限制
+```python
+irrMeasurement = resultAnalysis.MeasureIrr(measuredSignal)
+
+print(irrMeasurement["irrDb"])
+print(irrMeasurement["irrDbPerChain"])
+print(irrMeasurement["imageAmplitudeRatio"])
+print(irrMeasurement["residualPowerRatio"])
+```
+
+| `MeasureIrr`字段 | 含义 | 判断方法 |
+|---|---|---|
+| `irrDb` | 全部物理链直接系数功率和与镜像系数功率和之比 | 越大越好 |
+| `irrDbPerChain` | 每条传导链独立IRR | 用于定位某一路I/Q异常 |
+| `desiredCoefficientPower` | $\sum_i\lvert\hat a_i\rvert^2$ | 无量纲拟合量，不是瓦特 |
+| `imageCoefficientPower` | $\sum_i\lvert\hat b_i\rvert^2$ | 无量纲拟合量，不是瓦特 |
+| `imageAmplitudeRatio` | $\sqrt{\sum_i\lvert\hat b_i\rvert^2/\sum_i\lvert\hat a_i\rvert^2}$ | SISO且只有镜像误差时近似等于线性EVM |
+| `directCoefficientRealPerChain`、`directCoefficientImagPerChain` | 每链 $hat a_i$ 的实部和虚部 | 公共增益补偿后通常接近 $1+j0$ |
+| `imageCoefficientRealPerChain`、`imageCoefficientImagPerChain` | 每链 $hat b_i$ 的实部和虚部 | 可用于构造I/Q或增广DPD校准初值 |
+| `residualPowerRatio` | $a x+b x^*$ 无法解释的残差功率/测量功率 | 较大时IRR不是完整失真描述 |
+| `regressionConditionNumberPerChain` | 每链 $[x,x^*]$ 回归矩阵条件数 | 接近1最好；很大表示参考不可辨识或数据不足 |
+
+`CalculateIrr`和`MeasureIrr`都会执行一次同步；若调用方已经通过 `PrepareMeasuredSignal` 得到校正波形，应分别调用 `CalculatePreparedIrr` 或 `MeasurePreparedIrr`，避免重复估计。发送辅助和盲模式可以省略 `measuredSignal`；显式Reference模式没有保存接收波形，因此必须传入。
+
+### 15.7 结果判断和限制
 
 - IRR 高而 EVM 差：主要问题可能是 PA 非线性、记忆、噪声或削顶。
 - IRR 低且 EVM 约等于 IRR 的负值：IQ 镜像很可能是 EVM 主导项。

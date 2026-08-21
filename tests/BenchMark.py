@@ -184,12 +184,13 @@ class BenchmarkConfig:
         if self.numIterations < 1:
             raise ValueError("numIterations must be positive")
         if self.paModelName.lower() not in (
+            "rapp",
             "wiener",
             "gmp",
             "doherty",
         ):
             raise ValueError(
-                "paModelName must be 'wiener', 'gmp', or 'doherty'"
+                "paModelName must be 'rapp', 'wiener', 'gmp', or 'doherty'"
             )
         if (
             not isinstance(self.seed, int)
@@ -293,12 +294,13 @@ class TwoToneBenchmarkConfig:
             }
         )
         if self.paModelName.lower() not in (
+            "rapp",
             "wiener",
             "gmp",
             "doherty",
         ):
             raise ValueError(
-                "paModelName must be 'wiener', 'gmp', or 'doherty'"
+                "paModelName must be 'rapp', 'wiener', 'gmp', or 'doherty'"
             )
         if (
             not isinstance(self.numIterations, int)
@@ -398,6 +400,7 @@ class PaCharacterizationConfig:
     loadResistanceOhm: float = 50.0
     width: int = 0
     paModelNames: Tuple[str, ...] = (
+        "rapp",
         "wiener",
         "gmp",
         "doherty",
@@ -565,14 +568,14 @@ class PaCharacterizationConfig:
         if (
             not self.paModelNames
             or any(
-                modelName not in ("wiener", "gmp", "doherty")
+                modelName not in ("rapp", "wiener", "gmp", "doherty")
                 for modelName in normalizedModelNames
             )
             or len(set(normalizedModelNames))
             != len(normalizedModelNames)
         ):
             raise ValueError(
-                "paModelNames must contain unique Wiener, GMP, or "
+                "paModelNames must contain unique Rapp, Wiener, GMP, or "
                 "Doherty names"
             )
         for centerFrequencyHz in (
@@ -1391,7 +1394,7 @@ def MeasurePaFrequencyResponse(
 
     Args:
         config: Validated characterization controls.
-        modelName: Wiener, GMP, or Doherty model family.
+        modelName: Rapp, Wiener, GMP, or Doherty model family.
 
     Returns:
         result: Ordered exact-frequency gain and unwrapped-phase points.
@@ -1516,7 +1519,7 @@ def MeasurePaMemoryEffect(
 
     Args:
         config: Validated characterization controls.
-        modelName: Wiener, GMP, or Doherty model family.
+        modelName: Rapp, Wiener, GMP, or Doherty model family.
 
     Returns:
         result: Ordered spacing points plus dynamic gain and phase hysteresis.
@@ -1624,7 +1627,7 @@ def MeasurePaPowerSweep(
 
     Args:
         config: Validated characterization controls and power sweep.
-        modelName: Wiener, GMP, or Doherty model family.
+        modelName: Rapp, Wiener, GMP, or Doherty model family.
 
     Returns:
         result: Ordered controlled-power PA feature points.
@@ -1832,6 +1835,7 @@ def BuildPaDpdRecommendations(
     }
     recommendations = []
     minimumLinearTapsByModel = {
+        "rapp": 1,
         "wiener": 5,
         "gmp": 7,
         "doherty": 5,
@@ -1920,6 +1924,10 @@ def BuildPaDpdRecommendations(
             )
         )
         frequencyArchitecture = {
+            "rapp": (
+                "Memoryless LUT or odd-order polynomial with no delayed "
+                "basis terms; add an FIR only for an external measured path."
+            ),
             "wiener": (
                 "Short complex FIR pre-equalizer followed by a "
                 "memory-polynomial nonlinear stage."
@@ -1934,6 +1942,11 @@ def BuildPaDpdRecommendations(
             ),
         }[modelName]
         frequencyTraining = {
+            "rapp": (
+                "Verify the low-drive response is flat and zero-delay, then "
+                "skip linear equalizer identification and train only the "
+                "static AM-AM inverse."
+            ),
             "wiener": (
                 "Estimate the inverse linear response at low drive, freeze "
                 "the FIR, then identify nonlinear coefficients at nominal "
@@ -1974,6 +1987,11 @@ def BuildPaDpdRecommendations(
             )
         )
         memoryArchitecture = {
+            "rapp": (
+                "Strictly memoryless LUT or polynomial inverse; delayed GMP "
+                "terms are unnecessary unless another system block adds "
+                "measured memory."
+            ),
             "wiener": (
                 "Memory polynomial after the linear FIR; add GMP cross terms "
                 "only if validation exposes spacing-dependent residual IM."
@@ -1988,6 +2006,10 @@ def BuildPaDpdRecommendations(
             ),
         }[modelName]
         memoryConfiguration = {
+            "rapp": (
+                "Use main memory depth 1 and cross-memory depth 0; retain "
+                "only same-sample amplitude basis terms."
+            ),
             "wiener": (
                 "Use odd orders (1,3,5,7), main memory depth 3, and zero "
                 "cross-memory depth initially."
@@ -2026,6 +2048,10 @@ def BuildPaDpdRecommendations(
             )
         )
         dynamicArchitecture = {
+            "rapp": (
+                "Use one static inverse curve because equal-amplitude rising "
+                "and falling samples have the same output by construction."
+            ),
             "wiener": (
                 "Keep the static nonlinear inverse and short memory "
                 "polynomial unless the dynamic loop grows at deployment "
@@ -2041,6 +2067,10 @@ def BuildPaDpdRecommendations(
             ),
         }[modelName]
         dynamicConfiguration = {
+            "rapp": (
+                "Set memory depth 1, cross-memory depth 0, and disable any "
+                "recurrent or envelope-state branch."
+            ),
             "wiener": (
                 "Start with depth 2-3 and strong ridge regularization on all "
                 "delayed nonlinear terms."
@@ -2078,6 +2108,10 @@ def BuildPaDpdRecommendations(
             )
         )
         nonlinearArchitecture = {
+            "rapp": (
+                "Monotonic memoryless LUT or low-order odd polynomial that "
+                "approximates the inverse Rapp AM-AM curve below saturation."
+            ),
             "wiener": (
                 "Odd-order memory polynomial or GMP with the measured linear "
                 "FIR handled separately."
@@ -2092,6 +2126,10 @@ def BuildPaDpdRecommendations(
             ),
         }[modelName]
         nonlinearConfiguration = {
+            "rapp": (
+                "Start with an amplitude LUT or orders (1,3,5,7), memory "
+                "depth 1, cross-depth 0, and no conjugate branch."
+            ),
             "wiener": (
                 "Start with orders (1,3,5,7), depth 3, and remove order 7 "
                 "only if held-out IM7 remains below the target."
@@ -2106,6 +2144,11 @@ def BuildPaDpdRecommendations(
             ),
         }[modelName]
         nonlinearTrainingStrategy = {
+            "rapp": (
+                "Fit uniformly populated amplitude bins across the usable "
+                "range and stop below the near-saturation region where the "
+                "inverse slope becomes ill conditioned."
+            ),
             "wiener": (
                 "Identify at nominal power, then add maximum-power samples "
                 "with peak-aware weighting; optimize waveform error and "
@@ -2145,6 +2188,11 @@ def BuildPaDpdRecommendations(
             )
         )
         powerArchitecture = {
+            "rapp": (
+                "One memoryless inverse spanning all invertible power points; "
+                "use a power-indexed LUT only if deployment changes the Rapp "
+                "parameters themselves."
+            ),
             "wiener": (
                 "Power-conditioned memory polynomial with coefficient "
                 "interpolation between linear and compression regions."
@@ -2163,6 +2211,11 @@ def BuildPaDpdRecommendations(
             for powerDbm in config.powerSweepDbm
         )
         powerConfiguration = {
+            "rapp": (
+                f"Use {configuredPowerText} dBm as validation anchors for one "
+                "shared static curve, and enforce a drive ceiling before the "
+                "measured saturation knee."
+            ),
             "wiener": (
                 f"Use coefficient anchors at {configuredPowerText} dBm; "
                 "apply stronger peak projection above the detected knee "
@@ -6671,7 +6724,7 @@ def ParseBenchmarkArguments() -> Union[
     argumentParser.add_argument(
         "--pa",
         dest="paModelName",
-        choices=("wiener", "gmp", "doherty"),
+        choices=("rapp", "wiener", "gmp", "doherty"),
         default="wiener",
     )
     argumentParser.add_argument(

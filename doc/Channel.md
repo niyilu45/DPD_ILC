@@ -10,7 +10,7 @@ flowchart LR
     target["用户目标输出功率 dBm"] --> calibration
     calibration --> txIq["Tx I/Q调制器<br/>增益/相位不平衡与DC"]
     txIq --> preCoupling["PA前耦合 Hpre(z)"]
-    preCoupling --> pa["每路独立PA<br/>Wiener/GMP/Doherty"]
+    preCoupling --> pa["每路独立PA<br/>Rapp/Wiener/GMP/Doherty"]
     pa --> paOutput["各PA自身输出 yPA(n)"]
     paOutput --> detector["有效突发功率检测"]
     detector -. "误差超出容差时反馈" .-> calibration
@@ -415,7 +415,7 @@ x_j(n)
 h^{\mathrm{pre}}_{j,i}(k)x_i(n-k).
 ```
 
-每一路再经过自己配置的Wiener、GMP或Doherty PA：
+每一路再经过自己配置的Rapp、Wiener、GMP或Doherty PA：
 
 ```math
 y_j(n)=F_j\{u_j(n)\}.

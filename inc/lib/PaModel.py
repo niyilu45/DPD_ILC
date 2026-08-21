@@ -1,9 +1,12 @@
 """Power-amplifier behavioral models used by the DPD-ILC simulation.
 
-Callers construct ``PaModel`` with ``modelName="wiener"``, ``"gmp"``, or
-``"doherty"`` and then call ``Process``. Three nonlinear model families are
+Callers construct ``PaModel`` with ``modelName="rapp"``, ``"wiener"``,
+``"gmp"``, or ``"doherty"`` and then call ``Process``. Four nonlinear model
+families are
 provided internally:
 
+* ``RappPA`` applies the classic memoryless solid-state PA AM-AM curve and
+  preserves input phase, providing a deliberate zero-memory reference model.
 * ``WienerPA`` applies a linear memory filter followed by a smooth Rapp
   AM-AM characteristic and a saturating AM-PM characteristic.
 * ``GMPPA`` implements the generalized memory polynomial main, lagging,
@@ -377,6 +380,124 @@ class ThermalNetwork:
             ),
             "elapsedTimeSec": float(self.elapsedTimeSec),
         }
+
+
+@dataclass(frozen=True)
+class RappConfig:
+    """Configure the classic memoryless Rapp solid-state PA model."""
+
+    linearGain: float = 1.0
+    saturationAmplitude: float = 1.0
+    rappSmoothness: float = 3.0
+
+    def Validate(self) -> None:
+        """Validate the memoryless Rapp AM-AM parameters.
+
+        Processing details:
+            Algorithm: Require every scalar to be a finite real number and
+            require positive gain, saturation amplitude, and smoothness so
+            the AM-AM curve remains monotonic, bounded, and well defined.
+
+        Returns:
+            result: None. Invalid settings raise a descriptive exception.
+        """
+
+        for parameterName, parameterValue in (
+            ("linearGain", self.linearGain),
+            ("saturationAmplitude", self.saturationAmplitude),
+            ("rappSmoothness", self.rappSmoothness),
+        ):
+            if (
+                not isinstance(parameterValue, (int, float))
+                or isinstance(parameterValue, bool)
+                or not np.isfinite(parameterValue)
+                or float(parameterValue) <= 0.0
+            ):
+                raise ValueError(
+                    f"{parameterName} must be finite and positive"
+                )
+
+
+class RappPA:
+    """Implement a phase-preserving memoryless solid-state PA model."""
+
+    def __init__(self, config: RappConfig = RappConfig()) -> None:
+        """Initialize the classic Rapp model from validated settings.
+
+        Processing details:
+            Algorithm: Validate and retain the immutable configuration. No
+            delay line, filter state, or envelope state is created because
+            every output sample depends only on the same-index input sample.
+
+        Args:
+            config: Memoryless AM-AM gain, saturation, and smoothness values.
+
+        Returns:
+            result: None. The model is ready for independent sample mapping.
+        """
+
+        config.Validate()
+        self.config = config
+
+    def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Apply the memoryless Rapp AM-AM law without AM-PM rotation.
+
+        Processing details:
+            Algorithm: Convert each complex sample to magnitude and phase,
+            evaluate the Rapp compression denominator independently at that
+            same sample, and restore the unchanged input phase. A logarithmic
+            denominator calculation prevents avoidable overflow for large
+            finite floating-point inputs while preserving zero exactly.
+
+        Args:
+            inputSignal: One-dimensional normalized complex input waveform.
+
+        Returns:
+            result: Same-length complex output with no delay or stored state.
+        """
+
+        complexInput = AsComplexVector(inputSignal)
+        inputMagnitude = np.abs(complexInput)
+        outputMagnitude = np.zeros(inputMagnitude.shape, dtype=float)
+        positiveMask = inputMagnitude > 0.0
+        if np.any(positiveMask):
+            positiveMagnitude = inputMagnitude[positiveMask]
+            logarithmicRatio = np.log(
+                positiveMagnitude / float(self.config.saturationAmplitude)
+            )
+            twiceSmoothness = 2.0 * float(
+                self.config.rappSmoothness
+            )
+            logarithmicDenominator = np.logaddexp(
+                0.0,
+                twiceSmoothness * logarithmicRatio,
+            ) / twiceSmoothness
+            logarithmicOutput = (
+                np.log(float(self.config.linearGain))
+                + np.log(positiveMagnitude)
+                - logarithmicDenominator
+            )
+            outputMagnitude[positiveMask] = np.exp(logarithmicOutput)
+
+        # The original Rapp SSPA model has zero AM-PM conversion, so the
+        # output phase is exactly the input phase for every nonzero sample.
+        outputSignal = outputMagnitude * np.exp(1j * np.angle(complexInput))
+        if not np.all(np.isfinite(outputSignal)):
+            raise ValueError("Rapp PA output exceeded the numeric range")
+        return np.asarray(outputSignal, dtype=np.complex128)
+
+    def SmallSignalGain(self) -> complex:
+        """Return the real small-signal gain of the memoryless Rapp curve.
+
+        Processing details:
+            Algorithm: Use the zero-amplitude limit of the Rapp denominator,
+            which equals one and therefore leaves ``linearGain`` unchanged.
+
+        Returns:
+            result: Positive real gain represented as a complex scalar.
+        """
+
+        return complex(float(self.config.linearGain), 0.0)
 
 
 @dataclass(frozen=True)
@@ -935,7 +1056,7 @@ class DohertyPA:
 
 
 class PaModel:
-    """Configure and operate one Wiener, GMP, or Doherty nonlinear PA model.
+    """Configure and operate one Rapp, Wiener, GMP, or Doherty PA model.
 
     The facade gives every caller the same object-oriented construction and
     processing interface while retaining the dedicated model implementations.
@@ -948,6 +1069,7 @@ class PaModel:
     def __init__(
         self,
         modelName: Optional[str] = None,
+        rappConfig: Optional[RappConfig] = None,
         wienerConfig: Optional[WienerConfig] = None,
         gmpConfig: Optional[GMPConfig] = None,
         dohertyConfig: Optional[DohertyConfig] = None,
@@ -965,6 +1087,7 @@ class PaModel:
 
         Args:
             modelName: Selected PA model family name.
+            rappConfig: Optional memoryless Rapp configuration.
             wienerConfig: Optional Wiener configuration; None selects built-in values.
             gmpConfig: Optional GMP configuration; None selects built-in values.
             dohertyConfig: Optional carrier/peaking Doherty configuration.
@@ -982,6 +1105,7 @@ class PaModel:
         self.defaultParameters: Mapping[str, object] = MappingProxyType(
             {
                 "modelName": "wiener",
+                "rappConfig": None,
                 "wienerConfig": None,
                 "gmpConfig": None,
                 "dohertyConfig": None,
@@ -992,6 +1116,8 @@ class PaModel:
         directOverrides = dict(parameterOverrides)
         if modelName is not None:
             directOverrides["modelName"] = modelName
+        if rappConfig is not None:
+            directOverrides["rappConfig"] = rappConfig
         if wienerConfig is not None:
             directOverrides["wienerConfig"] = wienerConfig
         if gmpConfig is not None:
@@ -1031,6 +1157,7 @@ class PaModel:
         self._activeConfiguration: Optional[
             Tuple[
                 str,
+                Optional[RappConfig],
                 Optional[WienerConfig],
                 Optional[GMPConfig],
                 Optional[DohertyConfig],
@@ -1050,7 +1177,7 @@ class PaModel:
             result: str. The computed value described by the summary, with documented units, shape, and normalization.
         """
 
-        normalizedName, _, _, _ = self.ResolveConfiguration()
+        normalizedName, _, _, _, _ = self.ResolveConfiguration()
         return normalizedName
 
     modelName = ModelName
@@ -1240,6 +1367,7 @@ class PaModel:
         self,
     ) -> Tuple[
         str,
+        Optional[RappConfig],
         Optional[WienerConfig],
         Optional[GMPConfig],
         Optional[DohertyConfig],
@@ -1250,18 +1378,24 @@ class PaModel:
             Algorithm: Resolve values according to state and ChainMap precedence, keeping caller-owned configuration behavior explicit.
 
         Returns:
-            result: Tuple[str, Optional[WienerConfig], Optional[GMPConfig]]. The computed value described by the summary, with documented units, shape, and normalization.
+            result: Model name followed by optional Rapp, Wiener, GMP, and
+                Doherty configurations in deterministic order.
         """
 
         rawModelName = self.parameters["modelName"]
         if not isinstance(rawModelName, str):
             raise TypeError("modelName must be a string")
         normalizedName = rawModelName.strip().lower()
-        if normalizedName not in ("wiener", "gmp", "doherty"):
+        if normalizedName not in ("rapp", "wiener", "gmp", "doherty"):
             raise ValueError(
-                "modelName must be 'wiener', 'gmp', or 'doherty'"
+                "modelName must be 'rapp', 'wiener', 'gmp', or 'doherty'"
             )
 
+        rawRappConfig = self.parameters["rappConfig"]
+        if rawRappConfig is not None and not isinstance(
+            rawRappConfig, RappConfig
+        ):
+            raise TypeError("rappConfig must be a RappConfig or None")
         rawWienerConfig = self.parameters["wienerConfig"]
         if rawWienerConfig is not None and not isinstance(
             rawWienerConfig, WienerConfig
@@ -1283,6 +1417,7 @@ class PaModel:
         self.ResolveThermalConfig()
         return (
             normalizedName,
+            cast(Optional[RappConfig], rawRappConfig),
             cast(Optional[WienerConfig], rawWienerConfig),
             cast(Optional[GMPConfig], rawGmpConfig),
             cast(Optional[DohertyConfig], rawDohertyConfig),
@@ -1303,11 +1438,16 @@ class PaModel:
             return
         (
             normalizedName,
+            rappConfig,
             wienerConfig,
             gmpConfig,
             dohertyConfig,
         ) = selectedConfiguration
-        if normalizedName == "wiener":
+        if normalizedName == "rapp":
+            selectedModel = RappPA(
+                RappConfig() if rappConfig is None else rappConfig
+            )
+        elif normalizedName == "wiener":
             selectedModel = WienerPA(
                 WienerConfig() if wienerConfig is None else wienerConfig
             )
@@ -1352,7 +1492,7 @@ class PaModel:
 
         Processing details:
             Algorithm: Validate finite normalized complex samples and pass
-            them to the active Wiener, GMP, or Doherty calculation without
+            them to the active Rapp, Wiener, GMP, or Doherty calculation without
             applying the public fixed-point encoding. This method is used by
             internal algorithms such as ILC after they have crossed the public
             boundary.
@@ -1383,7 +1523,7 @@ class PaModel:
         """Evaluate the electrical model at one fixed junction temperature.
 
         Processing details:
-            Algorithm: Run the unchanged Wiener, GMP, or Doherty base model,
+            Algorithm: Run the unchanged Rapp, Wiener, GMP, or Doherty base model,
             then apply temperature-dependent complex gain, saturation-like
             envelope scaling, and nonlinear phase without advancing heat.
 
@@ -1836,7 +1976,7 @@ class PaModel:
 class MimoPaModel:
     """Operate independent nonlinear PA models on all transmit chains.
 
-    Each chain can select its own Wiener, GMP, or Doherty configuration, input
+    Each chain can select its own Rapp, Wiener, GMP, or Doherty configuration, input
     drive, relative output power, and optional absolute output-power target in
     dBm. A legacy RMS-voltage target remains available for compatibility.
     This class intentionally owns only the independent nonlinear PA bank;

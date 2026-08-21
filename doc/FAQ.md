@@ -808,7 +808,17 @@ resultAnalysis = Analysis(
 irrDb = resultAnalysis.CalculateIrr(measuredSignal)
 ```
 
-`CalculateIrr` 会先执行同步；已经调用 `PrepareMeasuredSignal` 得到校正波形时，应改用 `CalculatePreparedIrr`，避免重复同步。
+工程测量更推荐读取完整字典：
+
+```python
+irrMeasurement = resultAnalysis.MeasureIrr(measuredSignal)
+print(irrMeasurement["irrDb"])
+print(irrMeasurement["imageAmplitudeRatio"])
+print(irrMeasurement["residualPowerRatio"])
+print(irrMeasurement["regressionConditionNumberPerChain"])
+```
+
+`CalculateIrr` 与 `MeasureIrr` 都会先执行同步；已经调用 `PrepareMeasuredSignal` 得到校正波形时，应改用 `CalculatePreparedIrr` 或 `MeasurePreparedIrr`，避免重复同步。条件数很大说明 $x$ 与 $x^*$ 难以区分，残差较大说明常数直接项/镜像项不能解释主要失真，此时不应只看IRR数值。
 
 仿真时还可以直接读取 `Channel` 使用的理论 Tx 系数：
 
@@ -1781,3 +1791,332 @@ C
 ### 9. 一句话总结
 
 史密斯圆图先用“半径”读反射强度，再用“方向”读阻抗性质，最后用“扫频轨迹”读谐振、带宽和电长度；普通接口以圆心为匹配目标，PA 内部端口则应以负载牵引得到的最佳负载为目标。硬件先解决参考面、稳定性、严重失配和耦合，再在真实负载与功率下重新训练 DPD。
+
+## Q7：计算功率谱时，整段FFT与分段加窗FFT有什么区别？
+
+### 简要回答
+
+整段单次FFT优先保留频率分辨率，适合确定性单音、很近的杂散或需要分开相邻谱线的场景；分段、加窗、重叠并平均的Welch方法牺牲一部分频率分辨率，换取更低频谱泄漏和更小的随机估计方差，更适合Wi-Fi、噪声底、ACLR和不同DPD方法的稳定比较。
+
+这不是“哪个FFT更准确”的简单问题，而是三项资源之间的交换：
+
+```text
+长记录长度 N
+    ├── 全部用于频率分辨率：整段单次FFT
+    └── 分给多个统计样本：分段Welch平均
+
+窗函数
+    ├── 矩形窗：主瓣窄、旁瓣高
+    └── Hann窗：主瓣宽、旁瓣低
+```
+
+本工程 `Analysis.AveragePeriodogram` 用于ACLR时选择第二条路线：最多取 `maxSegmentLength` 点、向下取2的整数次幂、使用Hann窗、50%重叠并平均。双音IM3、IM5和IM7则使用已知频率处的精确复数投影，不依赖最近FFT栅格。这两种选择分别服务于“随机宽带功率谱”和“确定性窄带谱线”。
+
+### 1. 整段单次FFT的数学定义
+
+设复基带记录为 $x[n]$，总长度为 $N$，采样率为 $f_s$。整段DFT为
+
+```math
+X_N[k]
+=
+\sum_{n=0}^{N-1}
+x[n]
+\exp\left(-j2\pi kn/N\right),
+\qquad k=0,1,\ldots,N-1.
+```
+
+若不显式加窗，相当于乘以长度为 $N$ 的矩形窗。对应的双边周期图功率谱密度估计为
+
+```math
+\widehat S_{\mathrm{rect}}[k]
+=
+\frac{|X_N[k]|^2}{Nf_s}.
+```
+
+频率栅格间隔为
+
+```math
+\Delta f_{\mathrm{full}}
+=
+\frac{f_s}{N}.
+```
+
+$N$ 越长，频率栅格越密，两个相邻窄带分量越有可能被分开。这是整段FFT最直接的优势。
+
+但是有限记录相当于在时域截断信号。时域相乘对应频域卷积，因此周期图的平均形状不是“真实功率谱本身”，而是与窗函数功率响应卷积：
+
+```math
+\mathbb E
+\left\{
+\widehat S(f)
+\right\}
+\approx
+S_x(f)
+*
+\frac{|W(f)|^2}
+{f_s\sum_n |w[n]|^2}.
+```
+
+这里 $W(f)$ 是窗函数 $w[n]$ 的频率响应，星号表示频域卷积。矩形窗的主瓣较窄，但第一旁瓣只比主瓣低约13.3 dB；一个很强且没有正好落在FFT栅格上的载波，可能通过旁瓣把能量泄漏到许多频点，掩盖邻近弱杂散或抬高邻道估计。
+
+### 2. 为什么整段FFT的曲线仍然可能很“毛”
+
+对确定性单音，长FFT可以给出清楚的谱线；但Wi-Fi OFDM、调制信号和噪声通常被看作随机过程。单次周期图的每个频点只有一次随机功率样本。即使 $N$ 很大，其近似相对方差仍可写为
+
+```math
+\mathrm{Var}
+\left\{
+\widehat S_{\mathrm{rect}}(f)
+\right\}
+\approx
+S_x^2(f).
+```
+
+因此标准差与谱值本身处于同一数量级。增加 $N$ 会让频率栅格更细，却不会像多次独立平均那样使每个频点的相对随机起伏自动趋近于零。这就是“整段FFT频率分辨率很好，但噪声谱看起来仍很抖”的原因。
+
+这里必须区分：
+
+- **FFT点数增加**：主要增加频率采样密度；
+- **有效观测时间增加**：提高分辨相近真实频率的能力；
+- **独立或近似独立的功率谱平均次数增加**：降低随机方差；
+- **末尾补零**：只在原有频谱之间插值，不增加真实分辨率，也不增加独立统计信息。
+
+### 3. 分段加窗FFT，也就是Welch方法
+
+把总记录分成长度为 $L$ 的片段，相邻片段起点间隔为 $D$。可用片段数为
+
+```math
+K
+=
+1+
+\left\lfloor
+\frac{N-L}{D}
+\right\rfloor.
+```
+
+第 $r$ 段加窗后的DFT为
+
+```math
+X_r[k]
+=
+\sum_{n=0}^{L-1}
+w[n]
+x[n+rD]
+\exp\left(-j2\pi kn/L\right).
+```
+
+定义窗能量
+
+```math
+U
+=
+\sum_{n=0}^{L-1}|w[n]|^2.
+```
+
+Welch功率谱密度估计为
+
+```math
+\widehat S_{\mathrm{Welch}}[k]
+=
+\frac{1}{K}
+\sum_{r=0}^{K-1}
+\frac{|X_r[k]|^2}{f_s U}.
+```
+
+其中除以 $U$ 是功率归一化，避免不同窗函数仅仅因为自身能量不同而改变结果。若最终只计算主信道功率与邻信道功率的比值，所有频点共同的 $1/f_s$ 和频率积分步长会相消；本工程 `AveragePeriodogram` 因此保留相对功率标尺，ACLR比值不受影响。
+
+若各段完全独立，Welch估计的方差近似为
+
+```math
+\mathrm{Var}
+\left\{
+\widehat S_{\mathrm{Welch}}(f)
+\right\}
+\approx
+\frac{S_x^2(f)}{K}.
+```
+
+其相对标准差约为
+
+```math
+\frac{\sigma_{\widehat S}}{S_x}
+\approx
+\frac{1}{\sqrt K}.
+```
+
+重叠片段并不完全独立，所以实际有效平均次数 $K_{\mathrm{eff}}$ 小于片段数 $K$。可用近似关系表达：
+
+```math
+K_{\mathrm{eff}}
+\approx
+\frac{K}
+{1+2\sum_{m=1}^{K-1}
+\left(1-m/K\right)\rho_m^2},
+```
+
+其中 $\rho_m$ 表示相隔 $m$ 段的加窗数据相关程度。50%重叠配合Hann窗是一种常用折中：它重用矩形截断时权重很低的边缘样点，提高数据利用率，同时不会像过高重叠那样制造大量几乎重复的片段。
+
+### 4. 加窗究竟改善了什么，又牺牲了什么
+
+窗函数通过压低记录两端，使首尾截断不连续减小。代价是主瓣变宽，即强谱线的能量被分布到更宽的频率范围。
+
+| 性质 | 矩形窗 | Hann窗 |
+|---|---:|---:|
+| 峰值到第一零点的宽度 | 约 $f_s/N$ | 约 $2f_s/L$ |
+| 完整主瓣宽度 | 约 $2f_s/N$ | 约 $4f_s/L$ |
+| 第一旁瓣 | 约 -13.3 dB | 约 -31.5 dB |
+| 最大栅栏损失 | 约 3.92 dB | 约 1.42 dB |
+| 等效噪声带宽 | $f_s/N$ | 约 $1.5f_s/L$ |
+
+栅栏损失指单音恰好位于两个FFT栅格中间时，直接读取最高一个频点所得到的幅度损失。等效噪声带宽为
+
+```math
+B_{\mathrm{ENBW}}
+=
+f_s
+\frac{\sum_n w^2[n]}
+{\left(\sum_n w[n]\right)^2}.
+```
+
+因此Hann窗不是无条件“更准”：它用更宽的主瓣换取更低旁瓣和更小栅栏损失。两个距离非常近的等幅音调可能在矩形长FFT中可分辨，却在较短Hann分段中合成一个宽峰；另一方面，一个强载波旁边的弱杂散，可能在矩形窗高旁瓣下被掩盖，却能在Hann窗下显现。
+
+### 5. 频带功率不能只读取一个FFT点
+
+对带宽为 $B$ 的主信道或邻信道，正确方法是对频带内PSD积分：
+
+```math
+P_B
+=
+\int_B S_x(f)\,df
+\approx
+\sum_{k\in B}
+\widehat S[k]\Delta f.
+```
+
+ACLR再由两个积分功率形成：
+
+```math
+\mathrm{ACLR}_{\mathrm{dB}}
+=
+10\log_{10}
+\frac{P_{\mathrm{main}}}
+{P_{\mathrm{adjacent}}}.
+```
+
+只比较单个FFT峰值会同时受到窗函数主瓣、音调是否落在栅格上和FFT长度影响，不适合代表宽带Wi-Fi功率。对确定性单音幅度，还要区分两种归一化：PSD或噪声功率使用窗能量 $U$，谱线复幅度则应使用相干增益
+
+```math
+G_{\mathrm{coherent}}
+=
+\frac{1}{L}
+\sum_{n=0}^{L-1}w[n].
+```
+
+把噪声功率归一化和单音幅度归一化混用，会造成稳定的幅度偏差。
+
+### 6. 一个数值例子
+
+假设采样率为160 MHz，总记录长度为1048576点。整段FFT的栅格间隔为
+
+```math
+\Delta f_{\mathrm{full}}
+=
+\frac{160\times10^6}{1048576}
+\approx
+152.59\ \mathrm{Hz}.
+```
+
+若Welch片段长度取16384点、Hann窗、50%重叠，则
+
+```math
+\Delta f_{\mathrm{Welch}}
+=
+\frac{160\times10^6}{16384}
+=
+9765.625\ \mathrm{Hz},
+```
+
+```math
+K
+=
+1+
+\left\lfloor
+\frac{1048576-16384}{8192}
+\right\rfloor
+=
+127.
+```
+
+整段FFT拥有约64倍更密的频率栅格，适合分开非常接近的谱线。Welch得到127个重叠片段；若先忽略片段相关性，其随机谱标准差约降到单次周期图的
+
+```math
+\frac{1}{\sqrt{127}}
+\approx
+8.9\%.
+```
+
+真实标准差会因50%重叠而略高，但仍远小于一次周期图。代价是Hann分段的完整主瓣宽度约为39.1 kHz，不能再声称具有152.59 Hz的真实分辨能力。
+
+### 7. 优缺点对比
+
+| 比较项 | 整段单次FFT | 分段加窗Welch FFT |
+|---|---|---|
+| 频率栅格 | 最密，$f_s/N$ | 较疏，$f_s/L$ |
+| 相近谱线分辨 | 最好，尤其记录长且相干采样时 | 受分段长度和窗主瓣限制 |
+| 随机谱方差 | 高，曲线容易抖动 | 通过多段平均显著降低 |
+| 截断泄漏 | 无窗时较严重 | Hann窗旁瓣较低 |
+| 强载波旁弱杂散 | 可能被矩形窗旁瓣掩盖 | 通常更容易观察，但极近杂散可能落入宽主瓣 |
+| 噪声底和ACLR | 单次结果波动较大 | 更稳定，适合方法间比较 |
+| 瞬态时间信息 | 整段混合在一起 | 可先看各段再决定是否平均，能发现时变性 |
+| 平稳性要求 | 默认整段代表同一过程 | 平均前应确认各段属于同一工作状态 |
+| 内存 | 需要保存和变换全部 $N$ 点 | 可按长度 $L$ 流式处理 |
+| 计算量 | 约 $N\log_2N$ | 约 $K L\log_2L$；重叠会增加运算 |
+| 最适合 | 精确音调、近端杂散、频率与相位估计 | OFDM平均谱、噪声底、ACLR、DPD方法比较 |
+
+### 8. 最小代码对比
+
+以下示例使用同一复基带数组分别计算整段矩形窗周期图和工程内置Welch相对功率谱：
+
+```python
+import numpy as np
+
+from inc.lib.Analysis import AveragePeriodogram
+
+
+sampleCount = samples.size
+fullFrequencyHz = np.fft.fftshift(
+    np.fft.fftfreq(sampleCount, d=1.0 / sampleRateHz)
+)
+fullSpectrum = np.fft.fftshift(np.fft.fft(samples))
+fullPeriodogram = np.abs(fullSpectrum) ** 2 / sampleCount
+
+welchFrequencyHz, welchPeriodogram = AveragePeriodogram(
+    samples,
+    sampleRateHz,
+    maxSegmentLength=16384,
+)
+```
+
+这两个数组的FFT长度、频率间隔和窗函数不同，不能逐点相减来判断“误差”。正确比较方式包括：
+
+- 比较同一物理频带积分后的功率或ACLR；
+- 比较噪声底均值和重复采集方差；
+- 比较两个近邻谱线是否仍能分开；
+- 比较强载波旁的泄漏旁瓣；
+- 若需要绝对PSD每Hz单位，再对两者使用一致的 $f_s$、窗能量和频率步长归一化。
+
+### 9. 在DPD和PA测试中怎样选择
+
+推荐按测量对象选择，而不是全工程固定一种方法：
+
+1. **Wi-Fi ACLR、噪声底、功率谱包络**：使用Welch。保持所有对比方法的片段长度、窗、重叠率、有效数据字段和采样率完全一致。
+2. **双音IM3、IM5、IM7**：已知理论频率时，优先使用本工程 `TwoToneAnalysis` 的精确频率投影；它避免把音调强行归入最近FFT点。
+3. **两个非常接近的杂散**：使用更长片段或整段加窗FFT。若只把短FFT补零到很长，图会更平滑，但不会获得新的分辨能力。
+4. **测量随机噪声地板**：增加有效平均次数比单纯增加FFT点数更重要；同时记录窗的ENBW，才能把每Hz噪声密度与每个FFT点功率区分开。
+5. **突发Wi-Fi或有占空比信号**：先提取同一种有效信号区间，再做Welch。把大量前后补零一起平均会改变占空比功率定义并人为压低谱线。
+6. **观察温漂、功率爬升或DPD系数变化**：不要立刻平均全部片段。应先保存逐段功率谱或瀑布图，确认过程近似平稳后再平均。
+7. **法规或仪表一致性测量**：还必须匹配规定的RBW、VBW、检测器、窗/滤波器、扫频时间和积分带宽；普通FFT或本工程ACLR不能自动等同于认证仪表结果。
+
+### 10. 一句话总结
+
+整段FFT把整条记录主要用于“看得更细”，Welch把同一记录主要用于“看得更稳”；窗函数再用更宽主瓣换取更低泄漏。确定性窄带谱线优先长记录或精确频率投影，随机宽带功率、噪声底和ACLR优先分段加窗平均，任何比较都必须保持记录区间、窗、分段长度和归一化方式一致。

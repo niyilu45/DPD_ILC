@@ -13,6 +13,8 @@
 
 所有结果由 `Analyze(measuredSignal)` 以普通Python字典返回。
 
+主分析类 `Analysis` 还提供 `AnalyzeTwoTone`、`CalculateIm3`、`CalculateIm5` 和 `CalculateIm7` 静态入口。这些入口内部委托给 `TwoToneAnalysis`，不会复制另一套频谱算法，也不会把双音逻辑混入Wi-Fi的实例 `Analyze()` 路径。
+
 ## 2. 为什么不用最近FFT格点
 
 若音调频率不是有限记录FFT分辨率的整数倍，把功率直接读取到最近FFT格点会产生栅栏误差。工程使用已知物理频率的加窗复投影。设去掉首尾暂态后的记录为 $y[n]$，窗函数为 $w[n]$，需要测量的频率为 $f$，则复幅度估计为
@@ -97,6 +99,35 @@ IM5和IM7只需把频率替换为对应产品位置。一个阶次的较差侧�
 ```
 
 dBc通常为负数。数值越负，互调相对于基波越小，性能越好。例如从-30 dBc降到-45 dBc表示改善15 dB。
+
+### 4.1 不等功率双音为什么还要看绝对dBFS
+
+等功率双音中，两个基波相同，左右互调的dBc可以直接对称比较。不等功率双音中，本工程仍采用“同侧互调除以同侧基波”的定义：下侧互调相对于下侧基波，上侧互调相对于上侧基波。此时只看dBc可能掩盖两个互调产物的绝对电平差异，因此还应计算
+
+```math
+L_{\mathrm{IM,L,dBFS}}
+=
+L_{f_1,\mathrm{dBFS}}
++
+L_{\mathrm{IM,L,dBc}},
+```
+
+```math
+L_{\mathrm{IM,U,dBFS}}
+=
+L_{f_2,\mathrm{dBFS}}
++
+L_{\mathrm{IM,U,dBc}}.
+```
+
+`Analysis.CalculateIm3`、`CalculateIm5` 和 `CalculateIm7` 会同时返回 `lowerProductDbfs`、`upperProductDbfs` 与两侧dBc。因此推荐：
+
+- 对称PA、IP3或不同DPD方法的公平基准采用等功率双音；
+- 强阻塞加弱有用信号、非对称载波聚合或交叉调制场景采用不等功率双音；
+- 不等功率测试同时报告基波dBFS、互调dBc和互调绝对dBFS；
+- 扫描功率比例时固定总输入或实际PA输出功率，避免把总功率变化误判为功率比例效应。
+
+双音功率比例和固定间隔移动位置的完整推导见 [WaveGenTwoTone.md第4节](./WaveGenTwoTone.md#4-两个单音什么时候使用相同功率什么时候使用不同功率)。
 
 三种阶次的综合选择值为
 
@@ -212,6 +243,39 @@ print(metrics["im3WorstDbc"])
 print(metrics["im5WorstDbc"])
 print(metrics["im7WorstDbc"])
 ```
+
+### 8.1 通过主Analysis类分别读取IM3、IM5和IM7
+
+当上层程序希望统一从 `Analysis` 导入测量接口时，可以直接传入PA输出和 `TwoToneWaveform`：
+
+```python
+from inc.lib.Analysis import Analysis
+
+allMetrics = Analysis.AnalyzeTwoTone(
+    paOutput,
+    toneWaveform,
+    parameters={"maximumOutputPowerDbm": 25.0, "width": 0},
+)
+im3Metrics = Analysis.CalculateIm3(paOutput, toneWaveform)
+im5Metrics = Analysis.CalculateIm5(paOutput, toneWaveform)
+im7Metrics = Analysis.CalculateIm7(paOutput, toneWaveform)
+
+print(allMetrics["worstIntermodulationDbc"])
+print(im3Metrics["worstDbc"], im3Metrics["lowerProductDbfs"])
+print(im5Metrics["worstDbc"], im5Metrics["lowerProductDbfs"])
+print(im7Metrics["worstDbc"], im7Metrics["lowerProductDbfs"])
+```
+
+每个单阶字典包含：
+
+| 字段 | 含义 |
+|---|---|
+| `nonlinearOrder` | 3、5或7 |
+| `lowerFrequencyHz`, `upperFrequencyHz` | 该阶下侧和上侧互调物理频率 |
+| `lowerDbc`, `upperDbc`, `worstDbc` | 同侧基波归一化后的互调指标 |
+| `lowerProductDbfs`, `upperProductDbfs` | 两个互调产物的绝对归一化电平 |
+
+一次需要全部阶次时优先调用 `AnalyzeTwoTone`，只执行一轮投影。三个专用方法更适合只验收某一阶指标或把单阶结果送入自动测试接口。
 
 ## 9. 单一ILC逐轮分析示例
 

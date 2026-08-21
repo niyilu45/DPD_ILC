@@ -1,12 +1,13 @@
-# 功率放大器模型：Wiener、GMP、Doherty与电热特性的物理原理
+# 功率放大器模型：Rapp、Wiener、GMP、Doherty与电热特性的物理原理
 
-本文解释 `inc/lib/PaModel.py` 中功率放大器（Power Amplifier，PA）模型的物理意义、数学来源、参数作用和适用边界。工程支持三类模型：
+本文解释 `inc/lib/PaModel.py` 中功率放大器（Power Amplifier，PA）模型的物理意义、数学来源、参数作用和适用边界。工程支持四类模型：
 
+- **Rapp 模型**：面向固态功率放大器的经典无记忆AM-AM模型；输出样点只依赖同一时刻输入样点；
 - **Wiener 模型**：线性记忆滤波器后接无记忆非线性，直观、参数少；
 - **GMP 模型**：主记忆多项式加包络超前/滞后交叉项，表达能力更强；
 - **Doherty 模型**：载波PA和峰值PA并联，通过包络门控、支路时延、复合成与简化负载调制描述Doherty架构。
 
-> Wiener、GMP和Doherty是复基带“行为电模型”。可选 `ThermalConfig` 在它们外面增加耗散功率、结温和温度参数漂移；它是可辨识的系统级电热模型，不等同于晶体管级可靠性仿真。
+> Rapp、Wiener、GMP和Doherty是复基带“行为电模型”。可选 `ThermalConfig` 在它们外面增加耗散功率、结温和温度参数漂移；它是可辨识的系统级电热模型，不等同于晶体管级可靠性仿真。
 
 ---
 
@@ -104,6 +105,155 @@ R\cdot10^{-3}\cdot10^{P_{\mathrm{dBm}}/10}
 - `-10 dBm` 对应约 `0.070711 V RMS`。
 
 这个阻抗标定非常重要。若只把旧的归一化RMS数值改写成“dBm”标签而不引入 $R$，得到的不是绝对功率。当前主程序和功率-EVM横轴使用每路PA输出功率：默认工作点20 dBm、默认额定极限25 dBm。
+
+---
+
+## 2.2 Rapp无记忆固态PA模型
+
+### 2.2.1 为什么选择Rapp，而不是把模型只叫作“无记忆模型”
+
+“无记忆”只描述输出不依赖过去样点，并不是唯一的模型名称。常见经典名称包括：
+
+- **Rapp模型**：为固态功率放大器SSPA描述平滑AM-AM压缩，经典形式不包含AM-PM；
+- **Saleh模型**：主要为行波管功率放大器TWTA描述AM-AM和AM-PM。
+
+本工程面向Wi-Fi和一般固态射频PA，因此新增模型采用 `modelName="rapp"`，对应类为 `RappPA`，配置类为 `RappConfig`。Rapp模型作为“没有频响、没有时延、没有动态迟滞”的基线，特别适合把纯静态非线性与Wiener、GMP、Doherty中的记忆或架构效应分开。
+
+原始Rapp SSPA公式可见IEEE 802.16工作组的[系统损伤模型提案](https://www.ieee802.org/16/tg1/phy/pres/802161pp-00_15.pdf)。Saleh模型的来源和TWTA适用对象见[Saleh 1981年IEEE论文](https://doi.org/10.1109/TCOM.1981.1094911)。
+
+### 2.2.2 数学模型
+
+令输入复包络为
+
+```math
+x[n]=r[n]\exp(j\theta[n]).
+```
+
+工程使用带显式小信号增益的Rapp幅度函数：
+
+```math
+A_{\mathrm{out}}(r)
+=
+\frac{G r}
+{\left[
+1+\left(r/A_{\mathrm{sat}}\right)^{2p}
+\right]^{1/(2p)}}.
+```
+
+完整复输出为
+
+```math
+y[n]
+=
+A_{\mathrm{out}}(r[n])\exp(j\theta[n]).
+```
+
+这里：
+
+- $G$ 对应 `linearGain`，决定原点附近的电压增益；
+- $A_{\mathrm{sat}}$ 对应 `saturationAmplitude`，决定压缩膝点的输入幅度标尺；
+- $p$ 对应 `rappSmoothness`，决定压缩过渡的平滑程度。
+
+经典Rapp模型保持输入相位，所以
+
+```math
+\angle y[n]-\angle x[n]=0.
+```
+
+它只产生AM-AM，不产生AM-PM。若测试需要幅度相关相位，应使用Wiener、GMP或其他含复系数的模型。
+
+### 2.2.3 为什么它严格无记忆
+
+无记忆的数学定义是存在一个静态函数 $F$，满足
+
+```math
+y[n]=F(x[n]).
+```
+
+Rapp输出没有 $x[n-1]$、延迟抽头、滤波器状态、历史包络或支路时延。因此只改变 $x[k]$ 且 $k\ne n$ 时，$y[n]$ 不变：
+
+```math
+\frac{\partial y[n]}{\partial x[k]}=0,
+\qquad k\ne n.
+```
+
+这带来四个可直接验收的结果：
+
+1. 小信号频响在所有基带频率上相同，增益波纹为0；
+2. 相位响应为常数，群时延为0；
+3. 相同输出功率下改变双音间隔，理想IM3、IM5、IM7不会系统性变化；
+4. 相同瞬时幅度的包络上升点与下降点输出相同，动态AM-AM和AM-PM迟滞为0。
+
+有限记录、窗泄漏、频率投影误差和幅度分箱会留下很小的非零数值，因此Benchmark使用接近0的容差，而不是要求浮点结果逐位等于0。
+
+### 2.2.4 小信号、压缩和饱和极限
+
+当 $r$ 很小时，分母接近1：
+
+```math
+A_{\mathrm{out}}(r)\approx Gr.
+```
+
+当 $r$ 很大时：
+
+```math
+A_{\mathrm{out}}(r)\rightarrow GA_{\mathrm{sat}}.
+```
+
+相对于小信号增益的压缩量为
+
+```math
+C_{\mathrm{dB}}(r)
+=
+-\frac{10}{p}
+\log_{10}
+\left[
+1+\left(r/A_{\mathrm{sat}}\right)^{2p}
+\right].
+```
+
+当 $r=A_{\mathrm{sat}}$ 时，压缩量为
+
+```math
+C_{\mathrm{dB}}(A_{\mathrm{sat}})
+=
+-\frac{3.0103}{p}\ {\rm dB}.
+```
+
+默认 $p=3$，所以 `saturationAmplitude` 对应的位置约为1.003 dB压缩点。
+
+### 2.2.5 参数范围、推荐值和具体影响
+
+| 参数 | 代码约束 | 建议起点 | 增大后发生什么 |
+|---|---|---:|---|
+| `linearGain` | 有限且大于0 | `1.0` | 小信号增益提高，渐近饱和输出也同比提高；膝点在输入幅度轴上的位置不变 |
+| `saturationAmplitude` | 有限且大于0 | `1.0` | 压缩膝点右移，渐近饱和输出同比提高；小信号斜率不变 |
+| `rappSmoothness` | 有限且大于0 | `2`至`3` | 线性增益保持更久、膝点更陡；过大时更接近硬限幅并增加高阶谱再生 |
+
+经验上，`rappSmoothness=2`至`3`适合作为常见SSPA软压缩起点；更小值模拟更早、更圆滑的压缩，更大值适合研究接近硬限幅的边界。模型参数必须根据实测AM-AM曲线拟合，默认值不代表某一具体器件。
+
+### 2.2.6 最小调用示例
+
+```python
+import numpy as np
+
+from inc.lib.PaModel import PaModel, RappConfig
+
+
+paInput = 0.7 * np.exp(1j * np.linspace(0.0, 2.0 * np.pi, 4096))
+rappPa = PaModel(
+    parameters={
+        "modelName": "rapp",
+        "rappConfig": RappConfig(
+            linearGain=1.0,
+            saturationAmplitude=1.0,
+            rappSmoothness=3.0,
+        ),
+        "width": 0,
+    }
+)
+paOutput = rappPa.Process(paInput)
+```
 
 ---
 
@@ -626,9 +776,30 @@ C_{\mathrm{dB}}(r)
 
 ![PA增益曲线参数影响](./images/pa_model/pa_gain_parameter_effects.png)
 
-**图 6 说明**：Wiener 图把 `linearGain`、`saturationAmplitude` 和 `rappSmoothness` 分别映射到低功率增益、压缩膝点及膝点陡峭度；GMP 图把一阶、三阶和更高阶系数映射到低、中、高幅度曲线区域，并用阴影表示记忆参数引起的动态轨迹宽度；Doherty 图把 Carrier 区、Peaking 开启门限、开启过渡宽度、高功率增益抬升和最终压缩区分开标注。绿色文字对应不会简单移动静态曲线、却会改变频响、AM-PM、迟滞或支路抵消的参数。
+**图 6 说明**：Rapp图把三个静态参数分别映射到低功率增益、膝点位置和膝点陡峭度，并明确标出“无频响、无迟滞、无AM-PM”；Wiener图在相同压缩核心外增加FIR与AM-PM；GMP图把一阶、三阶和更高阶系数映射到低、中、高幅度曲线区域，并用阴影表示记忆参数引起的动态轨迹宽度；Doherty图把Carrier区、Peaking开启门限、开启过渡宽度、高功率增益抬升和最终压缩区分开标注。绿色文字对应不会简单移动静态曲线、却会改变频响、AM-PM、迟滞或支路抵消的参数。
 
-### 4.9.2 Wiener 曲线的精确参数关系
+### 4.9.2 Rapp曲线的精确参数关系
+
+Rapp没有前置FIR，外部输入幅度 $r$ 直接进入静态压缩函数：
+
+```math
+G_{v,\mathrm{Rapp}}(r)
+=
+\frac{G}
+{\left[1+\left(r/A_{\mathrm{sat}}\right)^{2p}\right]^{1/(2p)}}.
+```
+
+因此：
+
+| Rapp配置 | 是否改变小信号增益 | 对曲线的具体影响 | 不会产生的效果 |
+|---|---|---|---|
+| `linearGain` | 是 | 整条增益曲线上移或下移，饱和输出按相同比例变化 | 不产生频率选择性、时延或AM-PM |
+| `saturationAmplitude` | 否 | 膝点沿输入幅度轴左右移动，并改变饱和输出幅度 | 不改变原点附近斜率 |
+| `rappSmoothness` | 否 | 控制软压缩到硬膝点的曲率 | 不改变小信号增益和最终饱和上限 |
+
+Rapp参数和Wiener压缩核心参数名称相同，但二者不能混为一谈：Rapp没有 `linearTaps` 和 `ampmCoefficient`，所以它的频响、群时延、动态迟滞和AM-PM理论值均为0。它最适合作为PA测试中识别“纯静态非线性”的对照组。
+
+### 4.9.3 Wiener 曲线的精确参数关系
 
 Wiener 模型先经过 FIR。令某个频率处的外部输入幅度为 $A$，FIR 频率响应为 $H$, 则进入 Rapp 非线性模块的幅度为
 
@@ -702,7 +873,7 @@ A_C
 - 想只增加 AM-PM 而保持 AM-AM 不变，只修改 `ampmCoefficient`；
 - 想模拟带内不同子载波具有不同增益和压缩点，应修改 `linearTaps`，而不是只修改 `linearGain`。
 
-### 4.9.3 GMP 曲线由哪些系数决定
+### 4.9.4 GMP 曲线由哪些系数决定
 
 对已经越过启动暂态的恒包络输入
 
@@ -791,7 +962,7 @@ GMP 最重要的使用边界是：**具有记忆时不存在一条能完整描�
 
 这些动态测试在 [PaAnalyse.md](./PaAnalyse.md) 中给出。
 
-### 4.9.4 Doherty 曲线为什么有两个膝点
+### 4.9.5 Doherty 曲线为什么有两个膝点
 
 忽略支路时延并把两条支路的复电压增益记为 $G_c(r)$ 和 $G_p(r)$。Doherty 的稳态总复增益近似为
 
@@ -828,7 +999,7 @@ G_p\left(g_p a(r)r\right).
 
 `peakingDelaySamples` 是一个典型例子：静态 AM-AM 曲线可能看不出它的影响，但 Wi-Fi EVM、带内平坦度和 ACLR 会变差。因此不能只凭一张静态增益曲线判断 Doherty 配置是否合理。
 
-### 4.9.5 哪些外部配置只移动工作点，不改变 PA 方程
+### 4.9.6 哪些外部配置只移动工作点，不改变 PA 方程
 
 工程还存在若干与功率有关的配置。它们和 PA 曲线参数必须分开理解：
 
@@ -843,10 +1014,13 @@ G_p\left(g_p a(r)r\right).
 
 例如把 `outputPowerDbm` 从 15 dBm 改为 22 dBm，不是把 `linearGain` 改大，而是由 Channel 自动增加 PA 驱动，使波形在同一条增益曲线上向压缩区移动。因此输出功率升高时，测得增益、EVM 和 ACLR 可以同时恶化。
 
-### 4.9.6 典型调参目标与推荐配置
+### 4.9.7 典型调参目标与推荐配置
 
 | 目标 | 首选配置 | 调整方向 | 同时检查 |
 |---|---|---|---|
+| 提高Rapp小信号增益 | `linearGain` | 增大 | 饱和输出同步提高 |
+| 把Rapp压缩点右移 | `saturationAmplitude` | 增大 | 膝点和饱和幅度同步变化 |
+| 让Rapp膝点更硬 | `rappSmoothness` | 增大 | IM5、IM7和接近饱和时的可逆性 |
 | 提高 Wiener 小信号增益 | `linearGain` | 增大 | 饱和输出也会同倍增加 |
 | 把 Wiener 压缩点右移 | `saturationAmplitude` | 增大 | 输出归一化标尺和目标 dBm 的映射 |
 | 让 Wiener 膝点更硬 | `rappSmoothness` | 增大 | 高 PAPR 波形峰值是否突然剪切 |
@@ -865,7 +1039,22 @@ from inc.lib.PaModel import (
     DohertyConfig,
     GMPConfig,
     PaModel,
+    RappConfig,
     WienerConfig,
+)
+
+
+# Build a strictly memoryless SSPA reference with no AM-PM or delay.
+rappPa = PaModel(
+    parameters={
+        "modelName": "rapp",
+        "rappConfig": RappConfig(
+            linearGain=1.0,
+            saturationAmplitude=1.0,
+            rappSmoothness=3.0,
+        ),
+        "width": 0,
+    }
 )
 
 
@@ -924,7 +1113,7 @@ dohertyPa = PaModel(
 )
 ```
 
-### 4.9.7 用当前配置直接测出增益曲线
+### 4.9.8 用当前配置直接测出增益曲线
 
 下面的最小示例不依赖 Wi-Fi、ILC 或 Analysis，只使用恒包络扫幅直接测量当前 PA 对象的静态增益。每个幅度生成 64 个相同复样本，并取最后一个样本，以避开 FIR 和整数支路时延的启动暂态。
 
@@ -1083,19 +1272,19 @@ w_I,w_Q\sim\mathcal N\left(0,\frac{P_n}{2}\right).
 
 ---
 
-## 9. 三类模型的选择
+## 9. 四类模型的选择
 
-| 对比项 | Wiener | GMP | Doherty |
-|---|---|---|---|
-| 结构 | FIR后接静态非线性 | 多阶、多延迟、交叉包络基函数并联 | Carrier与Peaking两条行为PA并联合成 |
-| 参数数量 | 少 | 较多 | 取决于两条支路模型 |
-| 物理直觉 | 很直观 | 需要基函数理解 | 直接对应双支路开启和合成 |
-| 动态非线性表达力 | 中等、结构受限 | 强 | 两支路可各自使用Wiener或GMP |
-| 系数辨识 | 非线性参数拟合可能较复杂 | 对系数线性，可最小二乘 | 需要分别辨识支路及开启/合成参数 |
-| 计算量 | 较低 | 随阶次/记忆/交叉深度增加 | 约为两条所选支路之和 |
-| 适合用途 | 算法原理验证、可解释压缩曲线 | 宽带PA行为拟合、DPD基函数验证 | Doherty架构、支路失配和开启区研究 |
+| 对比项 | Rapp | Wiener | GMP | Doherty |
+|---|---|---|---|---|
+| 结构 | 单样点静态AM-AM | FIR后接静态非线性 | 多阶、多延迟、交叉包络基函数并联 | Carrier与Peaking两条行为PA并联合成 |
+| 参数数量 | 最少，3个 | 少 | 较多 | 取决于两条支路模型 |
+| 物理直觉 | 纯SSPA软压缩 | 很直观 | 需要基函数理解 | 直接对应双支路开启和合成 |
+| 动态非线性表达力 | 无 | 中等、结构受限 | 强 | 两支路可各自使用Wiener或GMP |
+| 系数辨识 | 静态AM-AM拟合 | 非线性参数拟合可能较复杂 | 对系数线性，可最小二乘 | 需要分别辨识支路及开启/合成参数 |
+| 计算量 | 最低 | 较低 | 随阶次/记忆/交叉深度增加 | 约为两条所选支路之和 |
+| 适合用途 | 无记忆基线、静态压缩和算法归因 | 算法原理验证、可解释压缩曲线 | 宽带PA行为拟合、DPD基函数验证 | Doherty架构、支路失配和开启区研究 |
 
-建议：先用Wiener观察ILC收敛和压缩机制，再用GMP检查宽带动态非线性，最后用Doherty研究载波/峰值支路切换、失配和合成对DPD的影响。
+建议：先用Rapp隔离纯静态压缩，再用Wiener观察简单线性记忆和AM-PM，再用GMP检查宽带动态非线性，最后用Doherty研究载波/峰值支路切换、失配和合成对DPD的影响。
 
 ---
 
@@ -1119,7 +1308,7 @@ z_m[n]
 =b_m\,f_m\!\left(a_m x_m[n]\right),
 ```
 
-其中 $f_m(\cdot)$ 可以是该路自己的Wiener、GMP或Doherty模型，输入和输出幅度标尺分别为
+其中 $f_m(\cdot)$ 可以是该路自己的Rapp、Wiener、GMP或Doherty模型，输入和输出幅度标尺分别为
 
 ```math
 a_m=10^{G_{\mathrm{in},m}/20},
@@ -1141,7 +1330,7 @@ $r_m$ 是复包络 RMS。比如 `outputPowerDbPerChain=(0,-3,-6)` 会让三路�
 flowchart LR
     matrix["输入矩阵 X"] --> split["按列拆分"]
     split --> in0["输入 dB：aₘ"]
-    in0 --> pa0["独立 fₘ：Wiener/GMP/Doherty"]
+    in0 --> pa0["独立 fₘ：Rapp/Wiener/GMP/Doherty"]
     pa0 --> out0["输出 dB：bₘ"]
     out0 --> target{"启用绝对 dBm?"}
     target -->|否| column["zₘ"]
@@ -1262,6 +1451,11 @@ classDiagram
         +GetParameters()
         +UpdateParameters()
     }
+    class RappConfig
+    class RappPA {
+        +Process(inputSignal)
+        +SmallSignalGain()
+    }
     class WienerConfig
     class WienerPA {
         +Process(inputSignal)
@@ -1297,9 +1491,11 @@ classDiagram
     PaModel --> ThermalConfig : optional
     PaModel o-- ThermalNetwork : thermal state
     MimoPaModel --> PowerCalibration : absolute dBm calibration
+    PaModel --> RappPA : modelName=rapp
     PaModel --> WienerPA : modelName=wiener
     PaModel --> GMPPA : modelName=gmp
     PaModel --> DohertyPA : modelName=doherty
+    RappPA --> RappConfig
     WienerPA --> WienerConfig
     GMPPA --> GMPConfig
     DohertyPA --> DohertyConfig
@@ -1308,7 +1504,7 @@ classDiagram
     IQImbalancePA o-- PaModel : wraps
 ```
 
-**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Wiener、GMP或Doherty。Doherty的Carrier和Peaking又各自选择Wiener或GMP。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
+**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Rapp、Wiener、GMP或Doherty。Doherty的Carrier和Peaking又各自选择Wiener或GMP。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
 
 如果需要区分实验室前向仪表与板载反馈接收机，应把同一份干净PA输出交给两个独立Channel。`sampleMode="forward"` 跳过反馈专用非理想，用于最终主路EVM/ACLR评价；`sampleMode="fb"` 可增加反馈FIR、时频偏、I/Q/DC、接收机非线性、限幅和ADC量化，用于模拟板载闭环。反馈链参数属于观察接收机，不属于PA模型系数，不能写入Wiener或GMP来混合拟合。
 
@@ -1317,19 +1513,29 @@ from inc.lib.PaModel import (
     DohertyConfig,
     GMPConfig,
     PaModel,
+    RappConfig,
     WienerConfig,
 )
 
 paOverrides = {
-    "modelName": "wiener",
+    "modelName": "rapp",
     "width": 16,
+    "rappConfig": RappConfig(
+        saturationAmplitude=1.0,
+        rappSmoothness=3.0,
+    ),
+}
+paModel = PaModel(parameters=paOverrides)
+rappOutput = paModel.Process(inputSignal)
+
+paOverrides.update({
+    "modelName": "wiener",
     "wienerConfig": WienerConfig(
         saturationAmplitude=1.0,
         rappSmoothness=3.0,
         ampmCoefficient=0.18,
     ),
-}
-paModel = PaModel(parameters=paOverrides)
+})
 wienerOutput = paModel.Process(inputSignal)
 
 paOverrides.update(
@@ -1359,7 +1565,7 @@ dohertyOutput = paModel.Process(inputSignal)
 ```
 
 `PaModel` 的公开构造签名为
-`PaModel(modelName=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收I/Q整数码，解码成归一化浮点后使用Wiener、GMP或Doherty模型计算，最后把结果编码回整数码。公开返回容器始终是 `numpy.complex128`：
+`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收I/Q整数码，解码成归一化浮点后使用Rapp、Wiener、GMP或Doherty模型计算，最后把结果编码回整数码。公开返回容器始终是 `numpy.complex128`：
 
 ```python
 from inc.lib.PaModel import PaModel
@@ -1396,9 +1602,9 @@ mimoPaModel = MimoPaModel(
     parameters={"width": 16},
     numTransmitChains=4,
     paParametersPerChain=(
+        {"modelName": "rapp"},
         {"modelName": "wiener"},
         {"modelName": "doherty"},
-        {"modelName": "gmp"},
         {"modelName": "gmp"},
     ),
     targetOutputPowerDbmPerChain=(22.0, 21.0, 20.0, 19.0),
@@ -1427,7 +1633,7 @@ PA的“热”不是给电模型附加一个随机温度误差，而是一条有
 
 ```mermaid
 flowchart LR
-    waveform["RF波形<br/>功率、PAPR、占空比、突发周期"] --> electrical["Wiener / GMP / Doherty<br/>快速电记忆"]
+    waveform["RF波形<br/>功率、PAPR、占空比、突发周期"] --> electrical["Rapp / Wiener / GMP / Doherty<br/>静态非线性或快速电记忆"]
     electrical --> heat["效率与耗散估计<br/>RF功率映射到瓦特"]
     heat --> network["静态 / 单RC / Foster<br/>瓦特和时间映射到结温"]
     network --> drift["增益、相位、饱和和非线性漂移"]
@@ -1439,7 +1645,7 @@ flowchart LR
 
 | 现象 | 常见时间尺度 | 本工程中的位置 | 能否由短波形直接识别 |
 |---|---:|---|---|
-| 瞬时AM-AM、AM-PM | 亚采样到若干采样 | Wiener/GMP/Doherty电模型 | 可以 |
+| 瞬时AM-AM、AM-PM | 亚采样到若干采样 | Rapp/Wiener/GMP/Doherty电模型 | 可以 |
 | 匹配网络与偏置电记忆 | 数ns到数us | FIR或GMP记忆项 | 可以，但需要足够带宽 |
 | 芯片和封装快热 | 数us到数ms | Foster快速支路 | 需要连续突发或功率阶跃 |
 | PCB、底板和散热器慢热 | 数ms到数s以上 | Foster慢速支路 | 需要更长采集和明确空闲时间 |
@@ -1451,7 +1657,7 @@ flowchart LR
 
 ![PA电热参数作用位置](./images/pa_thermal/thermal_parameter_map.png)
 
-图示说明：现有 Wiener、GMP 或 Doherty 仍先计算基础电响应；归一化输出通过参考dBm和效率模型换成耗散功率，热网络将其积累为结温，结温再调制下一热更新区间的增益、相位、饱和尺度和非线性强度。这个慢反馈形成电热记忆。
+图示说明：现有Rapp、Wiener、GMP或Doherty仍先计算基础电响应；归一化输出通过参考dBm和效率模型换成耗散功率，热网络将其积累为结温，结温再调制下一热更新区间的增益、相位、饱和尺度和非线性强度。即使基础Rapp电模型严格无记忆，外接热网络后，结温状态也会让整个电热系统具有慢记忆。
 
 本工程严格区分两个阶段：
 
@@ -1716,7 +1922,7 @@ T_j-T_{\mathrm{ref}}
 
 它的优点是RF波形拟合精度高，适合给DPD生成温度相关训练数据；缺点是参数数目约随温度基函数数量成倍增加，要求多温度、同参考面、同功率定义的I/Q数据。温度与输入包络高度相关时，普通最小二乘还可能无法区分“电记忆项”和“温度项”，需要多种突发周期与占空比来提高可辨识性。
 
-当前 `ApplyTemperatureDrift` 是温度条件化GMP的低阶近似：它在完整Wiener/GMP/Doherty输出外统一施加增益、相位、饱和和附加压缩。若实测表明不同GMP阶次具有明显不同的温度斜率，才建议升级为逐系数温度条件化。
+当前 `ApplyTemperatureDrift` 是温度条件化GMP的低阶近似：它在完整Rapp/Wiener/GMP/Doherty输出外统一施加增益、相位、饱和和附加压缩。若实测表明不同GMP阶次具有明显不同的温度斜率，才建议升级为逐系数温度条件化。
 
 #### 13.2.7 神经网络电热模型
 
@@ -2121,7 +2327,7 @@ y(n,T)-g(T)y_0(n).
 
 - **图A：`sampleRateHz`和 `thermalUpdateIntervalSamples`**共同决定一次热更新对应的真实时间。更新样点数不变时，采样率越高，物理更新时间越短；因此把同一配置直接搬到不同采样率会改变热过程。
 - **图B：`activePowerThresholdDb`**相对于当前波形峰值判定RF开启区。门限提高会把更多低包络样点当成空闲并使用 `idleDissipatedPowerW`；门限过低则可能把噪声底或数值残留当成RF开启。
-- **图C：`referenceTemperatureC`**移动所有温度电系数的零交点，但不改变热网络预测的真实结温。它应等于基础Wiener/GMP/Doherty系数采集或拟合时的温度。
+- **图C：`referenceTemperatureC`**移动所有温度电系数的零交点，但不改变热网络预测的真实结温。它应等于基础Rapp/Wiener/GMP/Doherty系数采集或拟合时的温度。
 - **图D：`maximumJunctionTemperatureC`**只是仿真停止边界，不会剪切、压低或稳定其下的结温曲线。降低上限只会使同一发热轨迹更早报错，不能代替功率降额或温控模型。
 
 时间换算关系为：
@@ -2252,4 +2458,4 @@ assert np.array_equal(frozenInput, frozenInput.copy())
 - [Y. Mancuso 与 R. Quéré, “Behavioral Thermal Modeling for Microwave Power Amplifier Design,” IEEE TMTT, 2007](https://doi.org/10.1109/TMTT.2007.907715)
 - [S. A. Bassam 等, “Black-box Modeling and Compensation of Bursty Communication Signals in RF Power Amplifiers with Power-Dependent Parameters,” 2014](https://arxiv.org/abs/1410.8119)
 
-本工程的 Rapp AM-AM、有界 AM-PM 和默认 GMP 系数是面向教学与算法比较的组合实现；具体公式和默认值以 `inc/lib/PaModel.py` 为准。
+本工程的独立Rapp PA遵循经典无记忆SSPA假设；Wiener中的Rapp AM-AM、有界AM-PM和默认GMP系数是面向教学与算法比较的组合实现。具体公式和默认值以 `inc/lib/PaModel.py` 为准。

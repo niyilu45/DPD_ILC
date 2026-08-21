@@ -15,6 +15,8 @@ from .lib.PaModel import (
     GMPPA,
     MimoPaModel,
     PaModel,
+    RappConfig,
+    RappPA,
     WienerPA,
 )
 from .utils.SigProc import (
@@ -27,6 +29,8 @@ from .lib.Analysis import (
     Analysis,
     ILCAnalysisResult,
     ILCPerformanceIteration,
+    IntermodulationOrderMetrics,
+    IrrMeasurement,
     MimoSignalMetrics,
     PowerEvmCurve,
     SignalMetrics,

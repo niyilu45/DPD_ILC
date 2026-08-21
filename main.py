@@ -171,9 +171,9 @@ def Main() -> int:
     argumentParser.add_argument(
         "--pa",
         dest="paModelName",
-        choices=("wiener", "gmp", "doherty"),
+        choices=("rapp", "wiener", "gmp", "doherty"),
         default=None,
-        help="Nonlinear PA model family: Wiener, GMP, or Doherty",
+        help="Nonlinear PA model family: Rapp, Wiener, GMP, or Doherty",
     )
     argumentParser.add_argument(
         "--tx-antennas",
