@@ -13,7 +13,7 @@
 
 所有结果由 `Analyze(measuredSignal)` 以普通Python字典返回。
 
-主分析类 `Analysis` 还提供 `AnalyzeTwoTone`、`CalculateIm3`、`CalculateIm5` 和 `CalculateIm7` 静态入口。这些入口内部委托给 `TwoToneAnalysis`，不会复制另一套频谱算法，也不会把双音逻辑混入Wi-Fi的实例 `Analyze()` 路径。
+主分析类 `Analysis` 还提供 `AnalyzeTwoTone`、`CalculateIm3`、`CalculateIm5` 和 `CalculateIm7` 静态入口。这些入口内部委托给 `TwoToneAnalysis`，不会复制另一套频谱算法，也不会把双音逻辑混入Wi-Fi的实例 `Analyze()` 路径。静态入口既接受原有的 `TwoToneWaveform`，也接受NumPy数组或Python列表；原始样值模式必须同时给出物理 `sampleRateHz` 与两个 `toneFrequenciesHz`，因为仅凭一段复样值无法可靠推断音调的真实频率标尺。
 
 ## 2. 为什么不用最近FFT格点
 
@@ -261,6 +261,9 @@ im5Metrics = Analysis.CalculateIm5(paOutput, toneWaveform)
 im7Metrics = Analysis.CalculateIm7(paOutput, toneWaveform)
 
 print(allMetrics["worstIntermodulationDbc"])
+print(allMetrics["im3LowerDbc"], allMetrics["im3UpperDbc"])
+print(allMetrics["im5LowerDbc"], allMetrics["im5UpperDbc"])
+print(allMetrics["im7LowerDbc"], allMetrics["im7UpperDbc"])
 print(im3Metrics["worstDbc"], im3Metrics["lowerProductDbfs"])
 print(im5Metrics["worstDbc"], im5Metrics["lowerProductDbfs"])
 print(im7Metrics["worstDbc"], im7Metrics["lowerProductDbfs"])
@@ -276,6 +279,54 @@ print(im7Metrics["worstDbc"], im7Metrics["lowerProductDbfs"])
 | `lowerProductDbfs`, `upperProductDbfs` | 两个互调产物的绝对归一化电平 |
 
 一次需要全部阶次时优先调用 `AnalyzeTwoTone`，只执行一轮投影。三个专用方法更适合只验收某一阶指标或把单阶结果送入自动测试接口。
+
+### 8.2 直接使用NumPy数组或Python列表
+
+若发送端来自仪表、真实芯片或其他仿真器，不必先构造 `TwoToneWaveform`。可直接提供PA输出样值；也可以提供原始发送样值作为第二个位置参数。原始数组本身只用于建立样点数和定点接口元数据，IM测量仍由明确给出的频率完成精确投影，不会把发送数组重新生成为“理想参考”。
+
+```python
+from inc.lib.Analysis import Analysis
+
+
+rawMetrics = Analysis.AnalyzeTwoTone(
+    paOutput.tolist(),
+    transmittedTwoToneSamples.tolist(),
+    sampleRateHz=100.0e6,
+    toneFrequenciesHz=(-2.0e6, 2.0e6),
+    parameters={
+        "settlingSamples": 256,
+        "maximumOutputPowerDbm": 25.0,
+        "width": 0,
+    },
+)
+
+# A separate transmit array is optional when only spectrum metrics are needed.
+standaloneMetrics = Analysis.AnalyzeTwoTone(
+    paOutput,
+    sampleRateHz=100.0e6,
+    toneFrequenciesHz=(-2.0e6, 2.0e6),
+    parameters={"width": 0},
+)
+im3Metrics = Analysis.CalculateIm3(
+    paOutput.tolist(),
+    sampleRateHz=100.0e6,
+    toneFrequenciesHz=(-2.0e6, 2.0e6),
+    parameters={"width": 0},
+)
+
+print(rawMetrics["im3LowerDbc"], rawMetrics["im3UpperDbc"])
+print(rawMetrics["im5LowerDbc"], rawMetrics["im5UpperDbc"])
+print(rawMetrics["im7LowerDbc"], rawMetrics["im7UpperDbc"])
+```
+
+原始样值模式的规则如下：
+
+- `sampleRateHz` 和 `toneFrequenciesHz` 是必填物理量；缺少任一项会报错，而不是猜测错误频率；
+- `AnalyzeTwoTone` 对IM3、IM5和IM7均同时返回 `LowerDbc` 与 `UpperDbc`；每一阶的 `WorstDbc` 只是两侧中的较差者，不能替代两侧原始结果；
+- 两个基波必须不同，且IM3、IM5和IM7理论位置都必须位于复Nyquist范围内；
+- 原始发送数组和PA输出必须具有相同长度；
+- 浮点样值默认 `width=0`；整数I/Q码必须在 `width` 参数或 `parameters["width"]` 中提供正确位宽；
+- `TwoToneWaveform` 模式仍是最完整的调用方式。若同时提供它和 `sampleRateHz`、`toneFrequenciesHz` 或 `width`，这些值必须一致，避免把一个频率标签应用到另一段波形。
 
 ## 9. 单一ILC逐轮分析示例
 

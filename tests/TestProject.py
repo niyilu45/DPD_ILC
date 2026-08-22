@@ -4516,6 +4516,82 @@ def CheckTwoToneIlcAnalysis() -> None:
     for metricName, metricValue in baselineMetrics.items():
         assert np.isclose(facadeMetrics[metricName], metricValue)
 
+    rawNumpyMetrics = Analysis.AnalyzeTwoTone(
+        baselineOutput,
+        floatingWaveform.samples,
+        sampleRateHz=floatingWaveform.sampleRateHz,
+        toneFrequenciesHz=floatingWaveform.toneFrequenciesHz,
+        parameters={
+            "settlingSamples": 64,
+            "width": 0,
+        },
+    )
+    rawListMetrics = Analysis.AnalyzeTwoTone(
+        baselineOutput.tolist(),
+        floatingWaveform.samples.tolist(),
+        sampleRateHz=floatingWaveform.sampleRateHz,
+        toneFrequenciesHz=list(floatingWaveform.toneFrequenciesHz),
+        parameters={
+            "settlingSamples": 64,
+            "width": 0,
+        },
+    )
+    standaloneRawMetrics = Analysis.AnalyzeTwoTone(
+        baselineOutput.tolist(),
+        sampleRateHz=floatingWaveform.sampleRateHz,
+        toneFrequenciesHz=floatingWaveform.toneFrequenciesHz,
+        parameters={
+            "settlingSamples": 64,
+            "width": 0,
+        },
+    )
+    for rawMetrics in (
+        rawNumpyMetrics,
+        rawListMetrics,
+        standaloneRawMetrics,
+    ):
+        for metricName, metricValue in baselineMetrics.items():
+            assert np.isclose(rawMetrics[metricName], metricValue)
+        for metricName in (
+            "im3LowerDbc",
+            "im3UpperDbc",
+            "im5LowerDbc",
+            "im5UpperDbc",
+            "im7LowerDbc",
+            "im7UpperDbc",
+        ):
+            assert metricName in rawMetrics
+
+    rawIm3 = Analysis.CalculateIm3(
+        baselineOutput.tolist(),
+        sampleRateHz=floatingWaveform.sampleRateHz,
+        toneFrequenciesHz=list(floatingWaveform.toneFrequenciesHz),
+        parameters={
+            "settlingSamples": 64,
+            "width": 0,
+        },
+    )
+    assert np.isclose(rawIm3["worstDbc"], baselineMetrics["im3WorstDbc"])
+    fixedRawMetrics = Analysis.AnalyzeTwoTone(
+        fixedWaveform.samples.tolist(),
+        sampleRateHz=fixedWaveform.sampleRateHz,
+        toneFrequenciesHz=fixedWaveform.toneFrequenciesHz,
+        parameters={
+            "settlingSamples": 64,
+            "width": 16,
+        },
+    )
+    assert np.isfinite(fixedRawMetrics["im3WorstDbc"])
+    try:
+        Analysis.AnalyzeTwoTone(
+            baselineOutput.tolist(),
+            parameters={"settlingSamples": 64, "width": 0},
+        )
+    except ValueError as error:
+        assert "sampleRateHz and toneFrequenciesHz" in str(error)
+    else:
+        raise AssertionError("raw two-tone input must require physical metadata")
+
     orderMethods = (
         (3, Analysis.CalculateIm3),
         (5, Analysis.CalculateIm5),

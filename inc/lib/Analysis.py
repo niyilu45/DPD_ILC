@@ -1970,27 +1970,224 @@ class Analysis:
         }
 
     @staticmethod
+    def BuildTwoToneWaveform(
+        measuredSignal: Union[np.ndarray, Sequence[complex]],
+        waveform: Optional[
+            Union[TwoToneWaveform, np.ndarray, Sequence[complex]]
+        ] = None,
+        sampleRateHz: Optional[float] = None,
+        toneFrequenciesHz: Optional[Sequence[float]] = None,
+        ilcBandwidthHz: Optional[float] = None,
+        width: Optional[int] = None,
+    ) -> TwoToneWaveform:
+        """Resolve metadata-rich or raw two-tone inputs into one waveform.
+
+        Processing details:
+            Algorithm: Retain a supplied ``TwoToneWaveform`` unchanged. For
+            a NumPy array or Python list, require physical sample rate and two
+            distinct tone frequencies, validate finite one-dimensional samples
+            and Nyquist-safe IM3/IM5/IM7 locations, estimate descriptive tone
+            amplitude and phase fields, and construct the minimal immutable
+            metadata object required by ``TwoToneAnalysis``. When no separate
+            raw reference is supplied, the measured samples provide only the
+            record length and public-format metadata; they are not treated as
+            an ideal PA reference.
+
+        Args:
+            measuredSignal: Measured floating or fixed-point output samples.
+            waveform: Optional ``TwoToneWaveform`` or raw NumPy/list record.
+                Omit it to analyze a standalone raw measured record.
+            sampleRateHz: Required physical sample rate for raw-record mode.
+            toneFrequenciesHz: Required pair of distinct fundamental
+                frequencies in hertz for raw-record mode.
+            ilcBandwidthHz: Optional descriptive ILC bandwidth for raw mode.
+                ``None`` derives a conservative bandwidth from IM7 locations.
+            width: Optional public I/Q width for raw mode. ``None`` selects
+                floating-point samples; metadata-rich mode inherits its width.
+
+        Returns:
+            result: Existing or newly constructed immutable two-tone metadata.
+        """
+
+        if isinstance(waveform, TwoToneWaveform):
+            if sampleRateHz is not None and not np.isclose(
+                float(sampleRateHz), waveform.sampleRateHz
+            ):
+                raise ValueError(
+                    "sampleRateHz must match the supplied TwoToneWaveform"
+                )
+            if toneFrequenciesHz is not None:
+                suppliedFrequencies = tuple(toneFrequenciesHz)
+                if len(suppliedFrequencies) != 2 or not np.allclose(
+                    suppliedFrequencies,
+                    waveform.toneFrequenciesHz,
+                ):
+                    raise ValueError(
+                        "toneFrequenciesHz must match the supplied "
+                        "TwoToneWaveform"
+                    )
+            if ilcBandwidthHz is not None and not np.isclose(
+                float(ilcBandwidthHz), waveform.ilcBandwidthHz
+            ):
+                raise ValueError(
+                    "ilcBandwidthHz must match the supplied TwoToneWaveform"
+                )
+            if width is not None and FixedPoint(width).width != waveform.width:
+                raise ValueError(
+                    "width must match the supplied TwoToneWaveform"
+                )
+            return waveform
+
+        rawMetadataSignal = measuredSignal if waveform is None else waveform
+        if sampleRateHz is None or toneFrequenciesHz is None:
+            raise ValueError(
+                "raw NumPy/list two-tone input requires sampleRateHz and "
+                "toneFrequenciesHz"
+            )
+        if (
+            not isinstance(sampleRateHz, (int, float))
+            or isinstance(sampleRateHz, bool)
+            or not np.isfinite(sampleRateHz)
+            or float(sampleRateHz) <= 0.0
+        ):
+            raise ValueError("sampleRateHz must be finite and positive")
+        frequencyValues = tuple(toneFrequenciesHz)
+        if (
+            len(frequencyValues) != 2
+            or any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not np.isfinite(value)
+                for value in frequencyValues
+            )
+            or frequencyValues[0] == frequencyValues[1]
+        ):
+            raise ValueError(
+                "toneFrequenciesHz must contain two distinct finite values"
+            )
+        interfaceFormat = FixedPoint(0 if width is None else width)
+        resolvedWidth = interfaceFormat.width
+        try:
+            rawSamples = np.asarray(
+                rawMetadataSignal,
+                dtype=np.complex128,
+            )
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "raw two-tone waveform must be a NumPy array or Python list"
+            ) from error
+        if rawSamples.ndim != 1 or rawSamples.size < 64:
+            raise ValueError(
+                "raw two-tone waveform must be a one-dimensional record with "
+                "at least 64 samples"
+            )
+        if not np.all(np.isfinite(rawSamples)):
+            raise ValueError("raw two-tone waveform must contain finite samples")
+        decodedSamples = interfaceFormat.DecodeComplex(rawSamples).reshape(-1)
+        sortedFrequenciesHz = tuple(
+            float(value) for value in sorted(frequencyValues)
+        )
+        nyquistHz = 0.5 * float(sampleRateHz)
+        for nonlinearOrder in (3, 5, 7):
+            outerCoefficient = (nonlinearOrder + 1) // 2
+            innerCoefficient = (nonlinearOrder - 1) // 2
+            productFrequenciesHz = (
+                outerCoefficient * sortedFrequenciesHz[0]
+                - innerCoefficient * sortedFrequenciesHz[1],
+                outerCoefficient * sortedFrequenciesHz[1]
+                - innerCoefficient * sortedFrequenciesHz[0],
+            )
+            if any(
+                abs(frequencyHz) >= nyquistHz
+                for frequencyHz in productFrequenciesHz
+            ):
+                raise ValueError(
+                    f"IM{nonlinearOrder} products must lie inside complex Nyquist"
+                )
+        sampleIndices = np.arange(decodedSamples.size, dtype=float)
+        toneCoefficients = tuple(
+            complex(
+                np.mean(
+                    decodedSamples
+                    * np.exp(
+                        -1j
+                        * 2.0
+                        * np.pi
+                        * frequencyHz
+                        * sampleIndices
+                        / float(sampleRateHz)
+                    )
+                )
+            )
+            for frequencyHz in sortedFrequenciesHz
+        )
+        derivedBandwidthHz = 2.2 * max(
+            abs(4.0 * sortedFrequenciesHz[0] - 3.0 * sortedFrequenciesHz[1]),
+            abs(4.0 * sortedFrequenciesHz[1] - 3.0 * sortedFrequenciesHz[0]),
+        )
+        resolvedIlcBandwidthHz = (
+            derivedBandwidthHz
+            if ilcBandwidthHz is None
+            else float(ilcBandwidthHz)
+        )
+        if (
+            not np.isfinite(resolvedIlcBandwidthHz)
+            or resolvedIlcBandwidthHz <= 0.0
+            or resolvedIlcBandwidthHz >= float(sampleRateHz)
+        ):
+            raise ValueError(
+                "ilcBandwidthHz must be finite, positive, and smaller than "
+                "sampleRateHz"
+            )
+        waveformRms = float(np.sqrt(np.mean(np.abs(decodedSamples) ** 2)))
+        return TwoToneWaveform(
+            samples=rawSamples.copy(),
+            sampleRateHz=float(sampleRateHz),
+            toneFrequenciesHz=sortedFrequenciesHz,
+            toneAmplitudes=tuple(
+                float(abs(value)) for value in toneCoefficients
+            ),
+            tonePhasesDegrees=tuple(
+                float(np.rad2deg(np.angle(value)))
+                for value in toneCoefficients
+            ),
+            numSamples=int(rawSamples.size),
+            rmsLevel=waveformRms,
+            width=resolvedWidth,
+            ilcBandwidthHz=resolvedIlcBandwidthHz,
+        )
+
+    @staticmethod
     def AnalyzeTwoTone(
-        measuredSignal: np.ndarray,
-        waveform: TwoToneWaveform,
+        measuredSignal: Union[np.ndarray, Sequence[complex]],
+        waveform: Optional[
+            Union[TwoToneWaveform, np.ndarray, Sequence[complex]]
+        ] = None,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
+        sampleRateHz: Optional[float] = None,
+        toneFrequenciesHz: Optional[Sequence[float]] = None,
+        ilcBandwidthHz: Optional[float] = None,
         **parameterOverrides: object,
     ) -> TwoToneMetrics:
         """Calculate fundamentals, IM3, IM5, IM7, and output power.
 
         Processing details:
-            Algorithm: Construct the dedicated metadata-aware
-            ``TwoToneAnalysis`` implementation and delegate exact-frequency
-            windowed projection to it. This keeps the main Analysis namespace
-            convenient without duplicating spectral estimation or coupling
-            the ordinary Wi-Fi ``Analyze`` path to two-tone metadata.
+            Algorithm: Resolve metadata-rich or raw NumPy/list input into a
+            ``TwoToneWaveform``, construct the dedicated metadata-aware
+            ``TwoToneAnalysis`` implementation, and delegate exact-frequency
+            windowed projection without coupling the ordinary Wi-Fi ``Analyze``
+            path to two-tone metadata.
 
         Args:
-            measuredSignal: Floating or fixed-point PA output waveform.
-            waveform: Two-tone metadata containing exact tone frequencies.
+            measuredSignal: Floating or fixed-point PA output NumPy/list data.
+            waveform: Optional metadata-rich waveform or raw NumPy/list record.
             parameters: Optional TwoToneAnalysis parameter mapping.
-            width: Optional public I/Q width override.
+            width: Optional public I/Q width override for raw records.
+            sampleRateHz: Required sample rate when ``waveform`` is raw or
+                omitted; it must match metadata-rich input when supplied.
+            toneFrequenciesHz: Required two-tone frequencies for raw mode.
+            ilcBandwidthHz: Optional raw-mode descriptive bandwidth.
             parameterOverrides: Highest-priority TwoToneAnalysis settings.
 
         Returns:
@@ -1998,8 +2195,19 @@ class Analysis:
                 IM3, IM5, IM7 values in dBc, worst IM, and output power.
         """
 
+        metadataWidth = width
+        if metadataWidth is None and parameters is not None:
+            metadataWidth = parameters.get("width")
+        resolvedWaveform = Analysis.BuildTwoToneWaveform(
+            measuredSignal,
+            waveform=waveform,
+            sampleRateHz=sampleRateHz,
+            toneFrequenciesHz=toneFrequenciesHz,
+            ilcBandwidthHz=ilcBandwidthHz,
+            width=metadataWidth,
+        )
         toneAnalysis = TwoToneAnalysis(
-            waveform,
+            resolvedWaveform,
             parameters=parameters,
             width=width,
             **parameterOverrides,
@@ -2008,28 +2216,36 @@ class Analysis:
 
     @staticmethod
     def CalculateIntermodulationOrder(
-        measuredSignal: np.ndarray,
-        waveform: TwoToneWaveform,
-        nonlinearOrder: int,
+        measuredSignal: Union[np.ndarray, Sequence[complex]],
+        waveform: Optional[
+            Union[TwoToneWaveform, np.ndarray, Sequence[complex]]
+        ] = None,
+        nonlinearOrder: int = 3,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
+        sampleRateHz: Optional[float] = None,
+        toneFrequenciesHz: Optional[Sequence[float]] = None,
+        ilcBandwidthHz: Optional[float] = None,
         **parameterOverrides: object,
     ) -> IntermodulationOrderMetrics:
         """Calculate one paired IM3, IM5, or IM7 measurement.
 
         Processing details:
-            Algorithm: Reuse ``AnalyzeTwoTone`` for one consistent spectral
-            pass, select the requested lower, upper, and worse-side dBc
-            fields, recover absolute product dBFS by adding each dBc result to
-            its same-side fundamental dBFS, and attach exact product
-            frequencies from immutable waveform metadata.
+            Algorithm: Resolve metadata-rich or raw NumPy/list input once,
+            reuse ``AnalyzeTwoTone`` for one consistent spectral pass, select
+            the requested lower, upper, and worse-side dBc fields, recover
+            absolute product dBFS by adding each dBc result to its same-side
+            fundamental dBFS, and attach exact product frequencies.
 
         Args:
-            measuredSignal: Floating or fixed-point PA output waveform.
-            waveform: Two-tone metadata containing exact tone frequencies.
+            measuredSignal: Floating or fixed-point PA output NumPy/list data.
+            waveform: Optional metadata-rich waveform or raw NumPy/list record.
             nonlinearOrder: Supported odd order 3, 5, or 7.
             parameters: Optional TwoToneAnalysis parameter mapping.
             width: Optional public I/Q width override.
+            sampleRateHz: Required sample rate for raw or omitted waveform.
+            toneFrequenciesHz: Required fundamental pair for raw mode.
+            ilcBandwidthHz: Optional raw-mode descriptive bandwidth.
             parameterOverrides: Highest-priority TwoToneAnalysis settings.
 
         Returns:
@@ -2046,9 +2262,20 @@ class Analysis:
                 "nonlinearOrder has an invalid value. Allowed values: "
                 "3, 5, or 7."
             )
+        metadataWidth = width
+        if metadataWidth is None and parameters is not None:
+            metadataWidth = parameters.get("width")
+        resolvedWaveform = Analysis.BuildTwoToneWaveform(
+            measuredSignal,
+            waveform=waveform,
+            sampleRateHz=sampleRateHz,
+            toneFrequenciesHz=toneFrequenciesHz,
+            ilcBandwidthHz=ilcBandwidthHz,
+            width=metadataWidth,
+        )
         completeMetrics: Mapping[str, float] = Analysis.AnalyzeTwoTone(
             measuredSignal,
-            waveform,
+            resolvedWaveform,
             parameters=parameters,
             width=width,
             **parameterOverrides,
@@ -2057,7 +2284,7 @@ class Analysis:
         lowerDbc = float(completeMetrics[f"{metricPrefix}LowerDbc"])
         upperDbc = float(completeMetrics[f"{metricPrefix}UpperDbc"])
         lowerFrequencyHz, upperFrequencyHz = (
-            waveform.IntermodulationFrequencies(nonlinearOrder)
+            resolvedWaveform.IntermodulationFrequencies(nonlinearOrder)
         )
         return {
             "nonlinearOrder": nonlinearOrder,
@@ -2078,10 +2305,15 @@ class Analysis:
 
     @staticmethod
     def CalculateIm3(
-        measuredSignal: np.ndarray,
-        waveform: TwoToneWaveform,
+        measuredSignal: Union[np.ndarray, Sequence[complex]],
+        waveform: Optional[
+            Union[TwoToneWaveform, np.ndarray, Sequence[complex]]
+        ] = None,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
+        sampleRateHz: Optional[float] = None,
+        toneFrequenciesHz: Optional[Sequence[float]] = None,
+        ilcBandwidthHz: Optional[float] = None,
         **parameterOverrides: object,
     ) -> IntermodulationOrderMetrics:
         """Calculate lower, upper, and worse-side third-order IM metrics.
@@ -2092,10 +2324,13 @@ class Analysis:
             remain identical to the combined two-tone result.
 
         Args:
-            measuredSignal: Floating or fixed-point PA output waveform.
-            waveform: Two-tone metadata containing exact tone frequencies.
+            measuredSignal: Floating or fixed-point PA output NumPy/list data.
+            waveform: Optional metadata-rich waveform or raw NumPy/list record.
             parameters: Optional TwoToneAnalysis parameter mapping.
             width: Optional public I/Q width override.
+            sampleRateHz: Required sample rate for raw or omitted waveform.
+            toneFrequenciesHz: Required fundamental pair for raw mode.
+            ilcBandwidthHz: Optional raw-mode descriptive bandwidth.
             parameterOverrides: Highest-priority TwoToneAnalysis settings.
 
         Returns:
@@ -2108,15 +2343,23 @@ class Analysis:
             3,
             parameters=parameters,
             width=width,
+            sampleRateHz=sampleRateHz,
+            toneFrequenciesHz=toneFrequenciesHz,
+            ilcBandwidthHz=ilcBandwidthHz,
             **parameterOverrides,
         )
 
     @staticmethod
     def CalculateIm5(
-        measuredSignal: np.ndarray,
-        waveform: TwoToneWaveform,
+        measuredSignal: Union[np.ndarray, Sequence[complex]],
+        waveform: Optional[
+            Union[TwoToneWaveform, np.ndarray, Sequence[complex]]
+        ] = None,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
+        sampleRateHz: Optional[float] = None,
+        toneFrequenciesHz: Optional[Sequence[float]] = None,
+        ilcBandwidthHz: Optional[float] = None,
         **parameterOverrides: object,
     ) -> IntermodulationOrderMetrics:
         """Calculate lower, upper, and worse-side fifth-order IM metrics.
@@ -2127,10 +2370,13 @@ class Analysis:
             remain identical to the combined two-tone result.
 
         Args:
-            measuredSignal: Floating or fixed-point PA output waveform.
-            waveform: Two-tone metadata containing exact tone frequencies.
+            measuredSignal: Floating or fixed-point PA output NumPy/list data.
+            waveform: Optional metadata-rich waveform or raw NumPy/list record.
             parameters: Optional TwoToneAnalysis parameter mapping.
             width: Optional public I/Q width override.
+            sampleRateHz: Required sample rate for raw or omitted waveform.
+            toneFrequenciesHz: Required fundamental pair for raw mode.
+            ilcBandwidthHz: Optional raw-mode descriptive bandwidth.
             parameterOverrides: Highest-priority TwoToneAnalysis settings.
 
         Returns:
@@ -2143,15 +2389,23 @@ class Analysis:
             5,
             parameters=parameters,
             width=width,
+            sampleRateHz=sampleRateHz,
+            toneFrequenciesHz=toneFrequenciesHz,
+            ilcBandwidthHz=ilcBandwidthHz,
             **parameterOverrides,
         )
 
     @staticmethod
     def CalculateIm7(
-        measuredSignal: np.ndarray,
-        waveform: TwoToneWaveform,
+        measuredSignal: Union[np.ndarray, Sequence[complex]],
+        waveform: Optional[
+            Union[TwoToneWaveform, np.ndarray, Sequence[complex]]
+        ] = None,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
+        sampleRateHz: Optional[float] = None,
+        toneFrequenciesHz: Optional[Sequence[float]] = None,
+        ilcBandwidthHz: Optional[float] = None,
         **parameterOverrides: object,
     ) -> IntermodulationOrderMetrics:
         """Calculate lower, upper, and worse-side seventh-order IM metrics.
@@ -2162,10 +2416,13 @@ class Analysis:
             remain identical to the combined two-tone result.
 
         Args:
-            measuredSignal: Floating or fixed-point PA output waveform.
-            waveform: Two-tone metadata containing exact tone frequencies.
+            measuredSignal: Floating or fixed-point PA output NumPy/list data.
+            waveform: Optional metadata-rich waveform or raw NumPy/list record.
             parameters: Optional TwoToneAnalysis parameter mapping.
             width: Optional public I/Q width override.
+            sampleRateHz: Required sample rate for raw or omitted waveform.
+            toneFrequenciesHz: Required fundamental pair for raw mode.
+            ilcBandwidthHz: Optional raw-mode descriptive bandwidth.
             parameterOverrides: Highest-priority TwoToneAnalysis settings.
 
         Returns:
@@ -2178,6 +2435,9 @@ class Analysis:
             7,
             parameters=parameters,
             width=width,
+            sampleRateHz=sampleRateHz,
+            toneFrequenciesHz=toneFrequenciesHz,
+            ilcBandwidthHz=ilcBandwidthHz,
             **parameterOverrides,
         )
 

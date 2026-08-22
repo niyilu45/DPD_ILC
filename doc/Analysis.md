@@ -1989,7 +1989,20 @@ print(im5Metrics["lowerProductDbfs"], im5Metrics["upperProductDbfs"])
 print(im7Metrics["worstDbc"])
 ```
 
-这里有意保留两类互不混淆的调用：实例 `Analyze()` 计算已知发送波形的时域EVM、SNR、功率和ACLR；静态 `AnalyzeTwoTone()` 及三个单阶方法使用 `TwoToneWaveform` 的精确频率元数据计算互调。静态入口内部委托给 `TwoToneAnalysis`，不解析Wi-Fi描述字段。
+这里有意保留两类互不混淆的调用：实例 `Analyze()` 计算已知发送波形的时域EVM、SNR、功率和ACLR；静态 `AnalyzeTwoTone()` 及三个单阶方法使用双音精确频率元数据计算互调。静态入口内部委托给 `TwoToneAnalysis`，不解析Wi-Fi描述字段。
+
+若只有仪表或芯片导出的NumPy数组/Python列表，也可以不构造 `TwoToneWaveform`：
+
+```python
+rawImMetrics = Analysis.AnalyzeTwoTone(
+    receivedSignal.tolist(),
+    sampleRateHz=twoToneWaveform.sampleRateHz,
+    toneFrequenciesHz=twoToneWaveform.toneFrequenciesHz,
+    parameters={"maximumOutputPowerDbm": 25.0, "width": 0},
+)
+```
+
+在这种原始样值模式中，`sampleRateHz` 和 `toneFrequenciesHz` 必须提供；`width` 为正数时，列表或数组应保存该位宽的整数I/Q码。详细接口边界和完整示例见 [TwoToneAnalysis.md §8.2](./TwoToneAnalysis.md#82-直接使用numpy数组或python列表)。
 
 ### 11.5 多个测试阶段的横向比较与保存
 

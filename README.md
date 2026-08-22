@@ -1613,8 +1613,9 @@ assert resultAnalysis.width == 16
 | `MeasureIrr(measuredSignal=None)` | 可选待测输出 | 对同步后的直接/共轭分量做联合最小二乘，返回含总IRR、逐链IRR、镜像幅度比、复系数分量、残差和条件数的普通字典；发送辅助和盲模式可省略输入。 |
 | `CalculateIrr(measuredSignal=None)` | 可选待测输出 | 兼容简洁接口，只返回 `MeasureIrr` 中的总IRR dB。 |
 | `MeasurePreparedIrr(preparedSignal)` | 已同步输出 | 不重复同步，返回完整IRR测量字典。 |
-| `AnalyzeTwoTone(measuredSignal, waveform, ...)` | PA输出和 `TwoToneWaveform` | 一次返回双音基波、IM3/IM5/IM7、综合最差互调和输出功率字典。 |
-| `CalculateIm3/CalculateIm5/CalculateIm7(measuredSignal, waveform, ...)` | PA输出和 `TwoToneWaveform` | 分别返回该阶上下侧频率、dBc、绝对dBFS和较差侧指标。 |
+| `BuildTwoToneWaveform(measuredSignal, waveform=None, ...)` | `TwoToneWaveform`或原始NumPy/list | 将已有元数据直接返回；原始样值模式校验物理频率并构造分析所需元数据。 |
+| `AnalyzeTwoTone(measuredSignal, waveform=None, ...)` | PA输出和 `TwoToneWaveform`或NumPy/list | 一次返回双音基波、IM3/IM5/IM7的上下侧dBc、每阶较差侧、综合最差互调和输出功率字典；原始样值必须提供 `sampleRateHz` 与 `toneFrequenciesHz`。 |
+| `CalculateIm3/CalculateIm5/CalculateIm7(measuredSignal, waveform=None, ...)` | PA输出和 `TwoToneWaveform`或NumPy/list | 分别返回该阶上下侧频率、dBc、绝对dBFS和较差侧指标；支持与 `AnalyzeTwoTone` 相同的原始样值参数。 |
 | `CalculateAclr(measuredSignal)` | 待测输出 | 返回 `(aclrLowerDb, aclrUpperDb, aclrWorstDb)`。 |
 | `DemodulateWifiData(measuredSignal)` | 待测输出 | 返回 VHT/HE/EHT 数据子载波星座。 |
 | `AnalyzeIlcHistory(ilcHistory)` | SISO原生ILC历史 | 逐轮计算输出功率/SNR/EVM/ACLR，并返回EVM最佳轮及完整 `ILCPerformanceIteration` 历史。 |
