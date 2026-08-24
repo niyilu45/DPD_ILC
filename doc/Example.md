@@ -19,7 +19,7 @@
 2. 所有对比使用同一个随机种子、同一段输入波形和同一参考面。
 3. I/Q测试使用单位PA，排除PA压缩、记忆和温度影响。
 4. Tx I/Q测试使用forward参考面，FB I/Q测试直接从已知PA输出进入 `ProcessPaOutput`。
-5. 温漂测试只在参考温度校准一次，然后冻结数字输入；正式测试不再传入 `outputPowerDbm`。
+5. 温漂测试只需重复调用 `Channel.Process(rawSignal, outputPowerDbm=...)`；函数内部暂停温度影响做参考校准，恢复原热状态后真实发射一次，不会闭环稳定当前热态输出。
 6. 参数比较至少包含理想、轻微和压力三档，并给出预期单调趋势。
 7. 理想双精度结果可能显示数百dB IRR或极小EVM，这只代表数值残差，不代表真实仪器动态范围。
 
@@ -321,7 +321,7 @@ DC增大时EVM按约20对数规律变差，但IRR仍可能很高，因为DC不�
 
 ### 5.1 测试目的
 
-固定温度角不模拟自热过程，只回答“同一冻结驱动在不同结温下输出怎样变化”。它最适合隔离温度到电参数的映射：
+固定温度角不模拟自热过程，只回答“同一参考温度校准驱动在不同结温下输出怎样变化”。它最适合隔离温度到电参数的映射；示例由 `Channel.Process` 在内部完成无热校准和恢复后真实处理：
 
 ```math
 T_j
@@ -333,7 +333,81 @@ y(n,T_j).
 
 本例使用25、55和85摄氏度三点。温度系数故意设置得较明显，用于确认趋势，不代表具体器件规格。
 
-### 5.2 公共温度测试工具
+### 5.2 三种热模型的推荐起始配置
+
+`ThermalConfig.Recommended` 会同时设置全部21个热参数并执行合法性校验。下面三套配置都能直接送入 `PaModel`；`sampleRateHz` 必须替换成实际波形采样率：
+
+```python
+from inc.lib.PaModel import ThermalConfig
+
+
+staticThermalConfig = ThermalConfig.Recommended(
+    "static",
+    sampleRateHz=80.0e6,
+)
+singleRcThermalConfig = ThermalConfig.Recommended(
+    "single_rc",
+    sampleRateHz=80.0e6,
+)
+fosterThermalConfig = ThermalConfig.Recommended(
+    "foster",
+    sampleRateHz=80.0e6,
+)
+
+print(staticThermalConfig)
+print(singleRcThermalConfig)
+print(fosterThermalConfig)
+```
+
+关键动态参数分别为：
+
+| 模型 | 推荐热阻 | 推荐时间常数 | 预期行为 |
+|---|---|---|---|
+| `static` | `(1.0,)`占位 | `(1.0,)`占位 | 固定在55摄氏度；推荐另扫25/55/85摄氏度 |
+| `single_rc` | `(20.0,)` 摄氏度/W | `(20e-3,)` s | 一条平滑指数升温和冷却曲线 |
+| `foster` | `(2.0,8.0,20.0)` 摄氏度/W | `(50e-6,5e-3,0.5)` s | 同时包含快、中、慢热响应 |
+
+以下是最小Foster运行例。用户只调用Channel主入口，不需要关闭温度模型或显式执行功率校准：
+
+```python
+from inc.lib.Channel import Channel
+from inc.lib.PaModel import PaModel, ThermalConfig
+
+
+fosterThermalConfig = ThermalConfig.Recommended(
+    "foster",
+    sampleRateHz=80.0e6,
+)
+fosterPa = PaModel(
+    parameters={
+        "modelName": "gmp",
+        "thermalConfig": fosterThermalConfig,
+        "width": 0,
+    }
+)
+fosterChannel = Channel(
+    paModel=fosterPa,
+    parameters={
+        "sampleRateHz": 80.0e6,
+        "maximumOutputPowerDbm": 25.0,
+        "width": 0,
+    },
+)
+
+for frameIndex in range(20):
+    receivedSignal = fosterChannel.Process(
+        rawSignal,
+        outputPowerDbm=20.0,
+    )
+    print(frameIndex, fosterChannel.GetThermalMetrics())
+    fosterChannel.AdvanceThermalIdle(1.0e-3)
+```
+
+全部公共参数、四个温度电系数、敏感性范围和实测替换规则见 [PaModel.md的完整推荐表](./PaModel.md#1371-三种已实现模型的完整推荐值)。
+
+### 5.3 压力对比使用的公共温度测试工具
+
+下面的固定温度和动态热阻场景故意放大温度电参数，以便自动测试在短记录内稳定观察到趋势。这组放大值不能代替上面的工程推荐起点。
 
 ```python
 import numpy as np
@@ -402,11 +476,11 @@ def CreateThermalChannel(
     )
 ```
 
-### 5.3 固定温度角对比代码
+### 5.4 固定温度角对比代码
 
 ```python
 def RunStaticTemperatureComparison() -> dict:
-    """Compare the same frozen drive at three fixed temperatures."""
+    """Compare one hidden reference calibration at fixed temperatures."""
 
     sampleRateHz = 100.0e3
     rawSignal = GenerateThermalProbe(2000, 2027)
@@ -422,13 +496,10 @@ def RunStaticTemperatureComparison() -> dict:
             thermalResistanceCPerW=20.0,
             thermalTimeConstantSec=0.02,
         )
-        frozenInput = channel.PrepareThermalTest(
+        outputSignals[temperatureC] = channel.Process(
             rawSignal,
-            calibrationOutputPowerDbm=20.0,
-            initialJunctionTemperatureC=temperatureC,
-            ambientTemperatureC=25.0,
+            outputPowerDbm=20.0,
         )
-        outputSignals[temperatureC] = channel.Process(frozenInput)
         thermalMetrics[temperatureC] = channel.GetThermalMetrics()
 
     coldReference = outputSignals[25.0]
@@ -470,12 +541,9 @@ for temperatureC, metrics in staticTemperatureResults.items():
 
 ### 6.1 测试边界
 
-动态自热测试必须严格分成两个阶段：
+动态自热测试仍包含“无热参考校准”和“真实温度发射”两个物理阶段，但它们已经封装在一次 `Channel.Process(rawSignal, outputPowerDbm=...)` 调用内部。用户不用关闭温度模型、调用校准器或管理 `frozenInput`。
 
-1. 在参考温度进行一次功率校准，得到 `frozenInput`；校准过程暂停热网络。
-2. 重复调用 `Process(frozenInput)`，不再传 `outputPowerDbm`，允许输出随温度自然漂移。
-
-如果每帧重新传入目标功率，Channel会重新调整驱动，把温度造成的增益变化抵消，测试就不再是开环温漂测试。
+每帧传入的 `outputPowerDbm` 只约束暂停温度影响后的参考电模型。Channel随后恢复本帧开始前的结温和累计时间，并用收敛输入真实发射一次；它不会围绕当前热态输出重新稳定功率。因此连续调用仍会得到自然温升和输出漂移。
 
 ### 6.2 比较不同热阻
 
@@ -485,7 +553,7 @@ for temperatureC, metrics in staticTemperatureResults.items():
 def RunThermalResistanceScenario(
     thermalResistanceCPerW: float,
 ) -> dict:
-    """Measure eight fixed-drive frames for one thermal resistance."""
+    """Measure eight internally calibrated thermal frames."""
 
     sampleRateHz = 100.0e3
     rawSignal = GenerateThermalProbe(2000, 2027)
@@ -496,19 +564,18 @@ def RunThermalResistanceScenario(
         thermalResistanceCPerW=thermalResistanceCPerW,
         thermalTimeConstantSec=0.02,
     )
-    frozenInput = channel.PrepareThermalTest(
+    firstOutput = channel.Process(
         rawSignal,
-        calibrationOutputPowerDbm=20.0,
-        initialJunctionTemperatureC=25.0,
-        ambientTemperatureC=25.0,
+        outputPowerDbm=20.0,
     )
-
-    firstOutput = channel.Process(frozenInput)
     firstMetrics = channel.GetThermalMetrics()
     lastOutput = firstOutput
     lastMetrics = firstMetrics
     for _ in range(7):
-        lastOutput = channel.Process(frozenInput)
+        lastOutput = channel.Process(
+            rawSignal,
+            outputPowerDbm=20.0,
+        )
         lastMetrics = channel.GetThermalMetrics()
 
     driftMetrics = Analysis(
@@ -568,14 +635,11 @@ def RunDutyCycleScenario(activeDutyCycle: float) -> dict:
         thermalResistanceCPerW=20.0,
         thermalTimeConstantSec=0.02,
     )
-    frozenInput = channel.PrepareThermalTest(
-        rawSignal,
-        calibrationOutputPowerDbm=20.0,
-        initialJunctionTemperatureC=25.0,
-        ambientTemperatureC=25.0,
-    )
     for _ in range(8):
-        channel.Process(frozenInput)
+        channel.Process(
+            rawSignal,
+            outputPowerDbm=20.0,
+        )
 
     thermalMetrics = channel.GetThermalMetrics()
     return {
@@ -602,7 +666,11 @@ for activeDutyCycle in (0.25, 0.50, 1.00):
 | 50% | 49.95% | 26.22摄氏度 | 19.78 dBm | 0.081 W |
 | 100% | 99.95% | 28.13摄氏度 | 19.58 dBm | 0.157 W |
 
-占空比越高，平均耗散越大、结温越高，冻结驱动下的输出功率下降越明显。若每种占空比都重新闭环维持20 dBm，输出功率差异会被校准器隐藏，因此不能这样测试自然温漂。
+占空比越高，平均耗散越大、结温越高，同一参考温度目标下的真实输出功率下降越明显。示例每帧都传入20 dBm，但Channel只在暂停温度影响的参考电模型上校准，不会闭环追踪当前热态输出，因此不会隐藏自然温漂。只有另行构造一个根据热态实测功率持续修正驱动的外部控制环，才会把这种功率差异抵消。
+
+### 6.4 从实际PA测量得到上述参数
+
+本章示例用于隔离参数影响，不应从仿真曲线反向猜测真实器件参数。实际工程应同步测量结温、DC电压电流、输入/输出RF功率和I/Q，先拟合热源效率，再拟合单RC或Foster，最后在已知结温下拟合增益、相位、饱和尺度和附加非线性温度系数。完整仪表连接、测试时序、NumPy拟合函数、static/单RC/Foster回填例和留出数据验收方法见 [PA温度特性测量、模型辨识与参数回填](./PaThermalMeasurement.md)。
 
 ## 7. 参数对比时应该记录哪些结果
 
@@ -646,7 +714,7 @@ for activeDutyCycle in (0.25, 0.50, 1.00):
 2. 确认 `width=0`，先排除公开定点量化；验证通过后再单独加入定点系统。
 3. 确认Analysis使用 `transmittedSignal=referenceSignal`，没有进入盲Descriptor解析。
 4. Tx I/Q必须通过 `Process`，FB I/Q必须通过fb模式或 `ProcessPaOutput`；不要混淆参考面。
-5. 温漂正式阶段不能再次传入 `outputPowerDbm`。
+5. 温漂阶段可以继续传入 `outputPowerDbm`；当前Channel只在暂停温度影响的参考面校准，恢复原热状态后真实处理一次，不会闭环稳定当前热态输出。
 6. 检查温度系数是否非零；只有热网络升温而电参数不随温度变化时，波形可能几乎不变。
 7. 一次只恢复一个被关闭的模块，直到找到趋势改变的来源。
 

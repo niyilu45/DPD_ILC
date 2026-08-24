@@ -33,7 +33,7 @@ flowchart LR
 - `sampleMode="forward"` 是默认值，表示用校准仪表直接观测PA主路输出。所有 `fb...` 参数都被保留但不生效，因此不会把板载反馈接收机失真混入PA/DPD评价，但Tx I/Q不平衡仍然存在。
 - `sampleMode="fb"` 表示通过板载反馈接收链采样；只有此模式会执行 `fbGainDb`、`fbFirTaps`、时延、CFO/SFO、I/Q不平衡、反馈非线性、限幅、DC和ADC量化。
 - `prePaCouplingPaths` 在Tx I/Q调制器之后、PA非线性之前，把其他通道的延迟复泄漏叠加到每个PA输入；`postPaCouplingPaths` 在非线性之后混合各PA输出。两者都与forward/fb选择无关。
-- `Channel.Process(rawSignal, outputPowerDbm=...)` 是推荐入口。用户只提供任意初始幅度的原始波形和目标PA输出功率；Channel内部调整PA输入、反复观测PA输出并收敛，然后只对最终PA输出执行一次所选采样路径。
+- `Channel.Process(rawSignal, outputPowerDbm=...)` 是推荐入口。用户只提供任意初始幅度的原始波形和参考温度目标PA输出功率；Channel内部保存并暂停热状态，调整PA输入并反复观测参考温度输出。收敛后恢复原热状态，再用收敛输入执行一次真实PA发射和所选采样路径，因此校准试探不发热，而返回波形仍包含温漂。
 - `Channel.Process(rawSignal)` 保留无功率校准的单次PA→采样路径，主要供ILC每轮plant调用。
 - `Channel.ProcessPaOutput` 接收各PA已经产生但尚未经过输出耦合的矩阵，不再次运行PA，依次执行PA后耦合和所选采样路径。
 - 功率闭环由Channel私有持有的 `PowerCalibration` 完成。普通用户不需要构造、配置或调用校准器。
@@ -1596,13 +1596,14 @@ stressFeedbackParameters = {
 
 | 方法 | 参数 | 返回值或作用 |
 |---|---|---|
-| `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 有目标时内部闭环校准PA输入，随后执行 `sampleMode` 选择的采样路径；`None`时只执行一次PA与采样 |
-| `CalibratePaInput(inputSignal, outputPowerDbm)` | 原始波形、目标功率 | 高级诊断入口；闭环调整Tx I/Q之前的数字输入并返回收敛值 |
+| `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 有目标时自动保存热状态、无热校准、恢复热状态并真实处理一次；`None`时直接执行一次PA与采样 |
+| `CalibratePaInput(inputSignal, outputPowerDbm)` | 原始波形、目标功率 | 高级诊断入口；自动暂停并恢复热状态，闭环调整Tx I/Q之前的数字输入并返回参考温度收敛值，但不执行正式热态发射 |
 | `GetLastPaInput()` | 无 | 兼容名称；返回最近一次收敛的Tx I/Q之前数字波形 |
 | `GetLastTransmitterOutput()` | 无 | 返回Tx I/Q之后、PA前耦合之前的波形 |
 | `GetLastActualPaInput()` | 无 | 返回Tx I/Q和PA前耦合之后真正进入PA的波形 |
-| `GetLastPaOutput()` | 无 | 返回最近一次内部闭环接受的干净PA输出 |
-| `GetLastCalibrationMetrics()` | 无 | 返回目标、实测dBm、误差和迭代次数字典 |
+| `GetLastPaOutput()` | 无 | 返回最近一次无热参考闭环接受的干净PA输出；启用温度模型后不等于正式热态返回波形 |
+| `GetLastCalibrationMetrics()` | 无 | 返回无热参考校准的目标、实测dBm、误差和迭代次数字典；真实热态功率读取 `GetThermalMetrics()` |
+| `PrepareThermalTest(...)` | 原始波形、参考目标及可选起始温度 | 高级兼容入口；显式生成冻结输入并可复位结温，普通调用不需要使用 |
 | `ProcessPaOutput(paOutputSignal)` | 已有各PA自身输出 | 不运行PA或功率闭环，执行PA后耦合及所选采样路径 |
 | `FormatUnknownParameterError(ownerName, unknownNames, supportedNames)` | 配置上下文、错误名称、全部合法名称 | 对每个错误名称按相关度降序列出全部合法名称并生成严格模式异常文本 |
 | `ResolveCouplingPaths(parameterName, chainCount=None)` | 路径参数名、可选链数 | 拒绝未知子键并规范、校验耦合路径 |
@@ -1634,8 +1635,8 @@ stressFeedbackParameters = {
 |---|---|---|
 | 校准仪表采样PA主路 | `sampleMode="forward"` | 取决于Process入口 |
 | 板载反馈接收机采样 | `sampleMode="fb"`并配置 `fb...` 参数 | 取决于Process入口 |
-| 原始波形和目标PA输出功率 | `Channel.Process(rawSignal, outputPowerDbm=20.0)` | 内部闭环多次，收敛后返回 |
-| MIMO原始矩阵和逐链目标 | `Channel.Process(rawMatrix, outputPowerDbm=(22.0, 21.0))` | 有PA前耦合时联合闭环 |
+| 原始波形和目标PA输出功率 | `Channel.Process(rawSignal, outputPowerDbm=20.0)` | 内部无热闭环多次，恢复热状态后真实PA一次 |
+| MIMO原始矩阵和逐链目标 | `Channel.Process(rawMatrix, outputPowerDbm=(22.0, 21.0))` | 有PA前耦合时无热联合闭环，随后各PA真实处理一次 |
 | 已有精确PA输入，不需要设定功率 | `Channel.Process(paInputSignal)` | 一次 |
 | 已有PA输出或仪器PA采集 | `Channel.ProcessPaOutput(paOutputSignal)` | 否 |
 | 只验证移相 | `ProcessPaOutput`，三个噪声参数均为 `None` | 否 |
@@ -1837,7 +1838,7 @@ receivedSignal = channel.Process(
 referenceSignal = channel.GetLastPaInput()
 txModulatorOutput = channel.GetLastTransmitterOutput()
 actualPaInput = channel.GetLastActualPaInput()
-cleanPaOutput = channel.GetLastPaOutput()
+referenceCalibrationPaOutput = channel.GetLastPaOutput()
 calibrationMetrics = channel.GetLastCalibrationMetrics()
 print(calibrationMetrics)
 ```
@@ -1848,20 +1849,22 @@ print(calibrationMetrics)
 flowchart TD
     original["用户原始波形<br/>无需预归一化"] --> process["Channel.Process"]
     target["用户目标 20 dBm"] --> process
-    process --> calibration["内部PowerCalibration<br/>隐藏输入缩放预设"]
+    process --> suspend["保存并暂停热状态"]
+    suspend --> calibration["内部PowerCalibration<br/>隐藏输入缩放预设"]
     calibration --> txIq["Tx I/Q调制器"]
     txIq --> preCoupling["PA前耦合"]
-    preCoupling --> pa["PA"]
+    preCoupling --> pa["参考温度PA"]
     pa --> detector["有效突发功率检测"]
     detector --> decision{"误差在容差内？"}
     decision -->|否| calibration
-    decision -->|是| cleanOutput["缓存干净PA输出"]
-    cleanOutput --> phase["固定移相"]
+    decision -->|是| restore["恢复原结温与热时间"]
+    restore --> livePa["收敛输入通过真实温度PA一次"]
+    livePa --> phase["PA后耦合与固定移相"]
     phase --> noise["AddNoise"]
     noise --> receiver["返回接收波形"]
 ```
 
-图示说明：闭环每次都重新缩放原始波形并真实运行PA，不是在PA输出后乘常数伪造功率。有效区检测会排除前后补零和长静默。功率误差只由干净PA输出决定；相位和接收噪声在收敛后只执行一次，不会改变隐藏的PA输入预设。
+图示说明：闭环每次都重新缩放原始波形并在暂停热网络后运行参考温度PA，不是在PA输出后乘常数伪造功率。有效区检测会排除前后补零和长静默。功率误差只由无热参考PA输出决定；进入容差后先恢复校准前的结温和累计时间，再用收敛输入执行一次真实温度PA、PA后耦合、相位和接收噪声。`GetLastPaOutput()` 与 `GetLastCalibrationMetrics()`保留的是无热参考闭环观测；本次真实输出功率由 `GetThermalMetrics()` 报告。
 
 ### 7.5 毫伏、dBm和SNR三种噪声配置
 
@@ -2273,21 +2276,54 @@ postMeasurement = channelAnalyzer.Measure(
 
 完整测量推导、参数表、实验接线边界、Benchmark 和修改前后性能见 [ChannelAnalyse.md](./ChannelAnalyse.md)。
 
-## 10. 两阶段PA温度测试
+## 10. Channel内置无热校准与温度测试
 
-热测试与普通“每次都保证目标dBm”的功率扫描不同。`PrepareThermalTest` 首先暂停PA热网络，在参考温度下调用现有闭环一次，随后返回冻结的PA输入；校准过程不产生虚假热量。正式测试只调用不带 `outputPowerDbm` 的 `Process`：
+普通用户不需要调用 `SuspendThermalModel`、`RestoreThermalModel`、`CalibratePaInput` 或 `PrepareThermalTest`。只要把原始波形和参考温度目标功率传给 `Channel.Process`，函数内部就完成一个不可见的热状态事务：
 
 ```mermaid
 flowchart LR
-    raw["任意原始波形"] --> suspend["暂停PA热网络"]
-    suspend --> calibrate["一次功率闭环<br/>达到参考温度目标dBm"]
-    calibrate --> frozen["冻结PA输入"]
-    frozen --> reset["设置起始结温与环境温度"]
-    reset --> frame["Process(frozenInput)<br/>开环真实发射"]
-    frame --> drift["结温、增益、相位与输出功率自然漂移"]
-    drift --> idle["AdvanceThermalIdle<br/>帧间冷却或偏置加热"]
-    idle --> frame
+    raw["任意原始波形与目标dBm"] --> snapshot["保存当前结温、热支路与累计时间"]
+    snapshot --> suspend["暂停温度影响"]
+    suspend --> calibrate["参考温度功率闭环"]
+    calibrate --> restore["原样恢复热状态"]
+    restore --> frame["收敛输入真实发射一帧"]
+    frame --> drift["结温推进，输出功率自然漂移"]
+    drift --> idle["可选AdvanceThermalIdle"]
+    idle --> snapshot
 ```
+
+```python
+for frameIndex in range(100):
+    receivedSignal = channel.Process(
+        rawSignal,
+        outputPowerDbm=22.0,
+    )
+    thermalMetrics = channel.GetThermalMetrics()
+    calibrationMetrics = channel.GetLastCalibrationMetrics()
+    print(
+        frameIndex,
+        calibrationMetrics["measuredOutputPowerDbmPerChain"][0],
+        thermalMetrics["outputPowerDbm"],
+        thermalMetrics["junctionTemperatureC"],
+    )
+    channel.AdvanceThermalIdle(1.0e-3)
+```
+
+上例虽然每帧都给出 `outputPowerDbm=22.0`，但该值只约束暂停温度影响后的参考电模型，不会围绕当前热态输出闭环。若PA升温后增益下降，`GetLastCalibrationMetrics()`仍会显示参考校准接近22 dBm，而 `GetThermalMetrics()["outputPowerDbm"]` 会自然低于22 dBm。每次校准的多轮试探不推进热时间；只有恢复状态后的正式一帧和显式空闲间隔推进热网络。
+
+主要热接口的边界为：
+
+| 接口 | 是否执行参考校准 | 是否推进热状态 | 普通用户是否需要调用 |
+|---|---|---|---|
+| `Process(rawSignal, outputPowerDbm=...)` | 是，内部自动暂停温度影响 | 是，仅正式发射一次 | 是，推荐的唯一主入口 |
+| `Process(calibratedInput)` | 否 | 是 | 只在调用方已经拥有精确驱动时使用 |
+| `PrepareThermalTest(...)` | 是，内部自动暂停温度影响 | 否 | 否；仅用于显式冻结输入或复位起始温度的高级实验 |
+| `AdvanceThermalIdle(idleTimeSec)` | 否 | 是 | 需要模拟帧间空闲时调用 |
+| `GetThermalMetrics()` | 否 | 否 | 可选诊断 |
+
+`CalibratePaInput` 使用 `try/finally` 保存并恢复热状态；绑定的第三方PA如果实现热事务，必须同时提供 `SuspendThermalModel` 和 `RestoreThermalModel`，只提供其中一个会在改变状态前报错。`GetLastPaOutput()` 和 `GetLastCalibrationMetrics()`属于无热参考校准面；公开返回的 `receivedSignal` 与 `GetThermalMetrics()`属于恢复温度后的正式发射面，两组功率不同是预期行为。
+
+需要严格复用同一冻结数字输入、同时显式复位起始结温时，仍可使用兼容接口：
 
 ```python
 frozenInput = channel.PrepareThermalTest(
@@ -2296,27 +2332,10 @@ frozenInput = channel.PrepareThermalTest(
     initialJunctionTemperatureC=25.0,
     ambientTemperatureC=25.0,
 )
-
 for frameIndex in range(100):
     receivedSignal = channel.Process(frozenInput)
-    metrics = channel.GetThermalMetrics()
-    print(
-        frameIndex,
-        metrics["junctionTemperatureC"],
-        metrics["outputPowerDbm"],
-    )
-    channel.AdvanceThermalIdle(1.0e-3)
 ```
 
-三个热接口的作用为：
-
-| 接口 | 是否执行功率闭环 | 是否推进热状态 | 作用 |
-|---|---|---|---|
-| `PrepareThermalTest(...)` | 是，仅一次 | 否 | 得到参考温度下冻结驱动并设置测试起始温度 |
-| `Process(frozenInput)` | 否 | 是 | 真实发射一帧，输出功率允许随温度变化 |
-| `AdvanceThermalIdle(idleTimeSec)` | 否 | 是 | RF关闭时按偏置耗散和热网络推进时间 |
-| `GetThermalMetrics()` | 否 | 否 | 读取结温、耗散、占空比、有效RF区输出功率和时间；补零不计入输出功率 |
-
-直接调用 `CalibratePaInput` 也会自动暂停并恢复热网络，因此任何功率校准试探都不会改变结温。但温度测试推荐使用 `PrepareThermalTest`，因为它把“校准一次、冻结驱动、复位温度”组合为不易误用的入口。
+这条高级路径与主入口采用同一个无热校准事务，不要求调用方手工关闭或恢复温度影响。
 
 热源、Foster方程、不同热模型优缺点、全部 `ThermalConfig` 参数和MIMO互热矩阵见 [PaModel.md第13节](./PaModel.md#13-pa电热模型功率占空比与输出漂移)。

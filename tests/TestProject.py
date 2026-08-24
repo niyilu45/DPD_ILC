@@ -3600,12 +3600,66 @@ def CheckPaThermalModel() -> None:
     Processing details:
         Algorithm: Compare static and Foster state behavior, confirm higher
         duty cycle produces more heat, prove reference-temperature calibration
-        does not advance thermal time, and verify repeated fixed-drive test
-        frames heat the PA while its output power is allowed to drift.
+        does not advance thermal time, and verify the public Channel.Process
+        entry automatically performs cold calibration before one live thermal
+        transmission while output power remains free to drift between frames.
 
     Returns:
         result: None. Assertions identify thermal state or workflow failures.
     """
+
+    recommendedStatic = ThermalConfig.Recommended(
+        "static",
+        sampleRateHz=100.0e3,
+    )
+    recommendedSingleRc = ThermalConfig.Recommended(
+        "single_rc",
+        sampleRateHz=100.0e3,
+    )
+    recommendedFoster = ThermalConfig.Recommended(
+        "foster",
+        sampleRateHz=100.0e3,
+        ambientTemperatureC=30.0,
+        initialJunctionTemperatureC=30.0,
+    )
+    assert recommendedStatic.enabled
+    assert recommendedStatic.modelName == "static"
+    assert recommendedStatic.initialJunctionTemperatureC == 55.0
+    assert recommendedStatic.thermalResistancesCPerW == (1.0,)
+    assert recommendedStatic.thermalTimeConstantsSec == (1.0,)
+    assert recommendedSingleRc.thermalResistancesCPerW == (20.0,)
+    assert recommendedSingleRc.thermalTimeConstantsSec == (20.0e-3,)
+    assert recommendedFoster.thermalResistancesCPerW == (
+        2.0,
+        8.0,
+        20.0,
+    )
+    assert recommendedFoster.thermalTimeConstantsSec == (
+        50.0e-6,
+        5.0e-3,
+        0.5,
+    )
+    assert recommendedFoster.ambientTemperatureC == 30.0
+    assert recommendedFoster.initialJunctionTemperatureC == 30.0
+    for invalidModelName in ("single", "cauer"):
+        try:
+            ThermalConfig.Recommended(invalidModelName)
+        except ValueError as error:
+            assert "'static', 'single_rc', or 'foster'" in str(error)
+        else:
+            raise AssertionError(
+                f"invalid recommended thermal model accepted: "
+                f"{invalidModelName}"
+            )
+    try:
+        ThermalConfig.Recommended(
+            "foster",
+            unknownThermalParameter=1.0,
+        )
+    except TypeError as error:
+        assert "Supported parameters" in str(error)
+    else:
+        raise AssertionError("unknown recommended thermal parameter accepted")
 
     thermalConfig = ThermalConfig(
         enabled=True,
@@ -3704,19 +3758,44 @@ def CheckPaThermalModel() -> None:
         },
     )
     rawInput = np.full(2000, 0.35 + 0.0j)
-    frozenInput = thermalChannel.PrepareThermalTest(
+    firstOutput = thermalChannel.Process(
         rawInput,
-        calibrationOutputPowerDbm=20.0,
-        initialJunctionTemperatureC=25.0,
-        ambientTemperatureC=25.0,
+        outputPowerDbm=20.0,
     )
-    calibrationMetrics = thermalPa.GetThermalMetrics()
-    assert np.isclose(calibrationMetrics["junctionTemperatureC"], 25.0)
-    assert np.isclose(calibrationMetrics["elapsedTimeSec"], 0.0)
-    firstOutput = thermalChannel.Process(frozenInput)
     firstRms = float(np.sqrt(np.mean(np.abs(firstOutput) ** 2)))
     firstMetrics = thermalChannel.GetThermalMetrics()
-    secondOutput = thermalChannel.Process(frozenInput)
+    firstCalibrationMetrics = (
+        thermalChannel.GetLastCalibrationMetrics()
+    )
+    assert firstCalibrationMetrics["converged"]
+    assert abs(
+        firstCalibrationMetrics[
+            "measuredOutputPowerDbmPerChain"
+        ][0]
+        - 20.0
+    ) <= 0.05
+    assert (
+        firstMetrics["outputPowerDbm"]
+        < firstCalibrationMetrics[
+            "measuredOutputPowerDbmPerChain"
+        ][0]
+    )
+    assert not np.allclose(
+        firstOutput,
+        thermalChannel.GetLastPaOutput(),
+    )
+    assert np.isclose(firstMetrics["elapsedTimeSec"], 0.02)
+    assert firstMetrics["endingJunctionTemperatureC"] > 25.0
+
+    # Supplying the same reference target again must not close a loop around
+    # the current hot output. Calibration is repeated with temperature effects
+    # suspended, the hot snapshot is restored, and only the real frame advances
+    # thermal time. Consequently the fixed reference drive still exhibits
+    # temperature-dependent output drift.
+    secondOutput = thermalChannel.Process(
+        rawInput,
+        outputPowerDbm=20.0,
+    )
     secondRms = float(np.sqrt(np.mean(np.abs(secondOutput) ** 2)))
     secondMetrics = thermalChannel.GetThermalMetrics()
     assert secondMetrics["endingJunctionTemperatureC"] > firstMetrics[
@@ -3724,6 +3803,7 @@ def CheckPaThermalModel() -> None:
     ]
     assert secondRms < firstRms
     assert secondMetrics["elapsedTimeSec"] > firstMetrics["elapsedTimeSec"]
+    assert np.isclose(secondMetrics["elapsedTimeSec"], 0.04)
     temperatureBeforeIdle = secondMetrics["endingJunctionTemperatureC"]
     thermalChannel.AdvanceThermalIdle(0.05)
     assert (
@@ -4260,6 +4340,158 @@ def CheckChannelModel() -> None:
         calibratedChannel.GetLastPaInput(),
         calibratedChannel.GetLastActualPaInput(),
     )
+
+    # Third-party thermal PA adapters must expose an atomic suspend/restore
+    # pair. Reject an incomplete adapter before its suspend method can mutate
+    # state, and restore a complete adapter even when calibration processing
+    # raises an exception.
+    class IncompleteThermalPa:
+        """Expose one invalid half of the thermal transaction interface."""
+
+        def __init__(self) -> None:
+            """Initialize an observable unsuspended state.
+
+            Processing details:
+                Algorithm: Store one Boolean marker so the test can prove that
+                Channel validates the complete transaction interface before
+                invoking the available suspend method.
+
+            Returns:
+                result: None. The synthetic PA starts unsuspended.
+            """
+
+            self.suspended = False
+
+        def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+            """Return the supplied signal unchanged.
+
+            Processing details:
+                Algorithm: Convert the trial waveform to the public complex
+                type without modifying its samples, providing the minimum PA
+                processing contract required by Channel.
+
+            Args:
+                inputSignal: Calibration trial waveform.
+
+            Returns:
+                result: Complex copy or view of the supplied waveform.
+            """
+
+            return np.asarray(inputSignal, dtype=np.complex128)
+
+        def SuspendThermalModel(self) -> bool:
+            """Mutate state if Channel incorrectly accepts this adapter.
+
+            Processing details:
+                Algorithm: Mark the adapter suspended and return a trivial
+                snapshot. Correct Channel validation rejects the adapter before
+                this deliberately incomplete transaction can run.
+
+            Returns:
+                result: True as a synthetic prior thermal-state snapshot.
+            """
+
+            self.suspended = True
+            return True
+
+    incompleteThermalPa = IncompleteThermalPa()
+    incompleteThermalChannel = Channel(
+        paModel=incompleteThermalPa,
+        parameters={"width": 0},
+    )
+    try:
+        incompleteThermalChannel.Process(
+            rawBurst,
+            outputPowerDbm=18.0,
+        )
+    except TypeError as error:
+        assert "SuspendThermalModel and RestoreThermalModel" in str(error)
+    else:
+        raise AssertionError("an incomplete PA thermal interface was accepted")
+    assert not incompleteThermalPa.suspended
+
+    class FailingThermalPa:
+        """Raise during calibration to verify transactional restoration."""
+
+        def __init__(self) -> None:
+            """Initialize one active thermal-state marker.
+
+            Processing details:
+                Algorithm: Record an active Boolean state and a restoration
+                counter so the test can audit the Channel finally block after
+                an intentional PA observation failure.
+
+            Returns:
+                result: None. The synthetic thermal state starts active.
+            """
+
+            self.thermalActive = True
+            self.restoreCount = 0
+
+        def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+            """Represent a failed instrument or PA observation.
+
+            Processing details:
+                Algorithm: Raise a deterministic RuntimeError whenever the
+                calibration loop attempts to evaluate the synthetic PA.
+
+            Args:
+                inputSignal: Unused calibration trial waveform.
+
+            Returns:
+                result: No waveform is returned because processing fails.
+            """
+
+            raise RuntimeError("intentional calibration observation failure")
+
+        def SuspendThermalModel(self) -> bool:
+            """Save and suspend the synthetic thermal-state marker.
+
+            Processing details:
+                Algorithm: Copy the active marker, clear it during calibration,
+                and return the copy as the complete synthetic snapshot.
+
+            Returns:
+                result: Boolean thermal state that existed before calibration.
+            """
+
+            thermalSnapshot = self.thermalActive
+            self.thermalActive = False
+            return thermalSnapshot
+
+        def RestoreThermalModel(self, thermalSnapshot: bool) -> None:
+            """Restore the marker and count the completed transaction.
+
+            Processing details:
+                Algorithm: Replace the active marker with the supplied snapshot
+                and increment a counter exactly once per restoration call.
+
+            Args:
+                thermalSnapshot: Boolean state returned by suspension.
+
+            Returns:
+                result: None. The synthetic thermal state is restored.
+            """
+
+            self.thermalActive = thermalSnapshot
+            self.restoreCount += 1
+
+    failingThermalPa = FailingThermalPa()
+    failingThermalChannel = Channel(
+        paModel=failingThermalPa,
+        parameters={"width": 0},
+    )
+    try:
+        failingThermalChannel.Process(
+            rawBurst,
+            outputPowerDbm=18.0,
+        )
+    except RuntimeError as error:
+        assert "intentional calibration observation failure" in str(error)
+    else:
+        raise AssertionError("a failing PA calibration unexpectedly completed")
+    assert failingThermalPa.thermalActive
+    assert failingThermalPa.restoreCount == 1
 
     # A target sequence jointly calibrates different PA families while weak
     # pre-PA coupling makes every drive affect both measured output powers.

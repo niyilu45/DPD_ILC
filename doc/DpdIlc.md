@@ -167,7 +167,7 @@ baselineOutput = channel.Process(
 referenceSignal = channel.GetLastPaInput()
 ```
 
-对调用方公开的工作点是 `paOutputPowerDbm`。20 dBm相对25 dBm额定极限的5 dB回退只作为第一次驱动预设。Channel内部会把重新缩放的数字Tx输入依次送入Tx I/Q、PA前耦合与 `paModel`，对PA输出的有效Wi-Fi突发测量功率，再更新预设并重试；`GetLastPaInput()` 为兼容旧名称保留，返回Tx I/Q之前的收敛数字输入，`GetLastActualPaInput()` 返回Tx I/Q和PA前耦合之后真正进入PA的波形，`GetLastPaOutput()` 返回移相和噪声之前的最后一次PA实测输出。整个过程不对PA输出做后级常数缩放，因此EVM和ACLR反映实际压缩工作点。
+对调用方公开的工作点是 `paOutputPowerDbm`。20 dBm相对25 dBm额定极限的5 dB回退只作为第一次驱动预设。Channel内部会保存并暂停PA热状态，把重新缩放的数字Tx输入依次送入Tx I/Q、PA前耦合与参考温度 `paModel`，对PA输出的有效Wi-Fi突发测量功率，再更新预设并重试；收敛后恢复原热状态，并用收敛输入真实处理一次。`GetLastPaInput()` 为兼容旧名称保留，返回Tx I/Q之前的收敛数字输入；`GetLastActualPaInput()` 返回正式处理时Tx I/Q和PA前耦合之后真正进入PA的波形；`GetLastPaOutput()` 返回无热参考校准的最后一次PA观测。整个过程不对PA输出做后级常数缩放，因此返回波形的EVM和ACLR反映恢复温度后的实际压缩工作点。
 
 #### 4.3.1 前向仪表和板载反馈如何接入ILC
 

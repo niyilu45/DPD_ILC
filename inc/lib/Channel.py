@@ -933,8 +933,10 @@ class Channel:
             newly scaled digital input through Tx I/Q impairment, pre-PA
             coupling, and the bound PA, measure actual active PA output power,
             and update the preset until every chain falls inside the configured
-            tolerance. Padding and long idle intervals are excluded by the
-            active-region detector.
+            tolerance. Before those trials, suspend and snapshot any active PA
+            thermal network; restore the exact temperature and elapsed-time
+            state in a finally block after calibration. Padding and long idle
+            intervals are excluded by the active-region detector.
 
         Args:
             inputSignal: Arbitrarily scaled public SISO or MIMO waveform.
@@ -945,6 +947,10 @@ class Channel:
         """
 
         powerCalibration = self.ConfigurePowerCalibration(outputPowerDbm)
+        # Calibration must identify the reference-temperature electrical
+        # operating point. Preserve the complete live thermal state so the
+        # repeated trial waveforms neither heat the PA nor compensate its
+        # current temperature-dependent gain drift.
         suspendMethod = (
             None
             if self.paModel is None
@@ -955,6 +961,11 @@ class Channel:
             if self.paModel is None
             else getattr(self.paModel, "RestoreThermalModel", None)
         )
+        if callable(suspendMethod) != callable(restoreMethod):
+            raise TypeError(
+                "a bound PA thermal transaction must expose both "
+                "SuspendThermalModel and RestoreThermalModel, or neither"
+            )
         thermalSnapshot = (
             suspendMethod() if callable(suspendMethod) else None
         )
@@ -1116,14 +1127,17 @@ class Channel:
         return self._lastActualPaInput.copy()
 
     def GetLastPaOutput(self) -> np.ndarray:
-        """Return the clean PA output measured by the last calibration.
+        """Return the reference-temperature PA output from calibration.
 
         Processing details:
-            Algorithm: Return the cached converged PA observation before
-            phase rotation and receiver noise, avoiding another PA evaluation.
+            Algorithm: Return the cached converged PA observation measured
+            while thermal effects were suspended, before phase rotation and
+            receiver noise. A temperature-aware ``Process`` call subsequently
+            evaluates the accepted drive once more after thermal restoration,
+            so this diagnostic is intentionally not that live PA waveform.
 
         Returns:
-            result: Last clean public PA output waveform.
+            result: Last clean reference-calibration PA output waveform.
         """
 
         if self._powerCalibration is None:
@@ -1133,11 +1147,13 @@ class Channel:
         return self._powerCalibration.GetLastPaOutput()
 
     def GetLastCalibrationMetrics(self) -> Dict[str, object]:
-        """Return the latest target, measured power, error, and iteration data.
+        """Return reference-calibration power, error, and iteration data.
 
         Processing details:
             Algorithm: Delegate to the private calibration helper while
             preserving its ordinary dictionary result and hidden drive state.
+            Thermal live-output power remains available through
+            ``GetThermalMetrics`` instead of overwriting this reference result.
 
         Returns:
             result: Dictionary describing the converged PA power loop.
@@ -2480,10 +2496,12 @@ class Channel:
             Algorithm: When ``outputPowerDbm`` is provided, first run the
             private closed loop that repeatedly adjusts the digital Tx input
             before I/Q impairment and observes clean PA output until its
-            active-region power converges.
-            Apply the selected sampling path exactly once to the cached
-            accepted PA output. When the target is None, preserve the direct
-            one-pass PA-to-sampler behavior required by iterative algorithms.
+            reference-temperature active-region power converges while the PA
+            thermal state is suspended. Restore that state, then pass the
+            converged input through the complete live PA and sampling path
+            exactly once so temperature drift remains visible in the returned
+            waveform. When the target is None, preserve the direct one-pass
+            PA-to-sampler behavior required by iterative algorithms.
 
         Args:
             inputSignal: Public digital Tx vector or samples-by-chains matrix.
@@ -2493,12 +2511,19 @@ class Channel:
             result: Public receiver waveform with matching shape and type.
         """
 
+        processingInput = inputSignal
         if outputPowerDbm is not None:
-            self.CalibratePaInput(inputSignal, outputPowerDbm)
-            return self.ProcessPaOutput(self.GetLastPaOutput())
+            processingInput = self.CalibratePaInput(
+                inputSignal,
+                outputPowerDbm,
+            )
+            # CalibratePaInput has already restored the PA's original thermal
+            # state. Re-evaluate the accepted drive once so this public call
+            # represents a real temperature-aware transmission rather than the
+            # cold calibration observation cached by PowerCalibration.
         interfaceFormat = FixedPoint(self.width)
         normalizedInput = interfaceFormat.DecodeComplex(
-            self.ValidateSignal(inputSignal, "inputSignal")
+            self.ValidateSignal(processingInput, "inputSignal")
         )
         normalizedOutput = self.ProcessFloating(normalizedInput)
         return interfaceFormat.EncodeComplex(normalizedOutput)

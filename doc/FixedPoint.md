@@ -200,7 +200,7 @@ flowchart LR
 
 ### 7.3 Channel
 
-`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码。提供目标功率时，内部 `PowerCalibration` 每轮以同一公开位宽产生PA输入码，随后在浮点域执行PA前耦合和各路PA，并测量解码后的有效突发功率；收敛后只对最后一次逐PA输出执行PA后耦合与 `sampleMode` 选择的采样路径，再编码返回。目标为 `None` 时，`Channel.Process` 只解码一次并执行单次耦合PA与采样链路。`Channel.ProcessPaOutput` 用于已有逐PA输出，同样只解码和编码一次，并从PA后耦合开始处理。
+`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码。提供目标功率时，Channel先保存并暂停PA热状态，内部 `PowerCalibration` 每轮以同一公开位宽产生PA输入码，随后在浮点域执行PA前耦合和参考温度各路PA，并测量解码后的有效突发功率；收敛后恢复原热状态，把收敛输入码重新解码并通过真实温度PA、PA后耦合与 `sampleMode` 采样路径一次，再编码返回。这样校准量化误差被正确计入，校准试探不发热，正式返回波形仍包含温漂。目标为 `None` 时，`Channel.Process` 只解码一次并执行单次耦合PA与采样链路。`Channel.ProcessPaOutput` 用于已有逐PA输出，同样只解码和编码一次，并从PA后耦合开始处理。
 
 ```mermaid
 flowchart LR

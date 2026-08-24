@@ -170,6 +170,7 @@ flowchart LR
 | `PaModel.__init__`, `PaModel.ResolveConfiguration`, `PaModel.SynchronizeModel` | E | ChainMap 覆盖解析、未知键警告后忽略，并构造选定Rapp、Wiener、GMP或Doherty内核 | PaModel §12 |
 | `PaModel.ModelName`, `PaModel.Width`, `PaModel.GetParameters`, `PaModel.UpdateParameters` | E | 查询或更新配置；更新后重建模型以保持状态一致 | PaModel §12、FixedPoint §6 |
 | `PaModel.Process`, `PaModel.SmallSignalGain` | E/P | 统一分派到选定物理 PA 的同名计算 | PaModel §9、§12 |
+| `ThermalConfig.Recommended` | P/E | 为静态、单RC和三支Foster生成完整可运行的25 dBm级仿真起始配置，应用调用方实测覆盖后执行全部字段校验；推荐值不是器件规格 | PaModel §13.7.1–§13.7.6、PaThermalMeasurement §1–§12 |
 | `ThermalConfig.Validate` | P/E | 校验静态、单RC或Foster热网络、耗散功率效率模型、参考功率和温度漂移系数 | PaModel §13 |
 | `ThermalNetwork.__init__`, `ThermalNetwork.ResolveBranches`, `ThermalNetwork.Reset`, `ThermalNetwork.CurrentTemperatureC`, `ThermalNetwork.Advance`, `ThermalNetwork.GetMetrics` | P/N/E | 用RC热阻抗的精确零阶保持离散解积累或释放热量，保存环境温度、各热节点温升和物理时间 | PaModel §13.2–§13.4 |
 | `PaModel.ResolveThermalConfig`, `PaModel.SynchronizeThermalModel`, `PaModel.SuspendThermalModel`, `PaModel.RestoreThermalModel` | E/N | 解析可选热模型并提供无热功率校准所需的暂停/恢复事务；校准试探不推进真实热时间 | PaModel §13.6 |
@@ -203,8 +204,8 @@ flowchart LR
 | `Channel.ApplyPrePaCoupling`, `Channel.ApplyPostPaCoupling` | P/N | 分别在Tx I/Q之后、非线性PA之前和干净PA输出之后应用不同耦合矩阵；前者改变PA实际激励，后者只改变观测到的多路叠加 | Channel §1.3 |
 | `Channel.ProcessBoundPaFloating`, `Channel.ProcessPaBankForCalibration` | P/N/E | 在内部浮点域运行绑定PA；校准回调固定采用“Tx I/Q→PA前耦合→各路PA”，并返回尚未经过PA后耦合和接收噪声的逐PA输出 | Channel §1.3–§1.4、§6 |
 | `Channel.ResolveCalibrationTargets`, `Channel.ConfigurePowerCalibration` | P/E | 把SISO共同目标或MIMO逐链dBm序列规范化，并配置内部 `PowerCalibration`；存在PA前耦合时默认启用有限差分雅可比联合功率闭环 | Channel §1.4、§5–§6.3 |
-| `Channel.CalibratePaInput`, `Channel.GetLastPaInput`, `Channel.GetLastTransmitterOutput`, `Channel.GetLastActualPaInput`, `Channel.GetLastPaOutput`, `Channel.GetLastCalibrationMetrics` | P/N/E | 对任意初始幅度原始波形执行隐藏功率闭环，分别保留Tx I/Q前数字输入、Tx I/Q后输出、耦合后真实PA输入与干净PA输出，避免不同参考面混淆 | Channel §1、§6.2、§6.3、§6.8 |
-| `Channel.PrepareThermalTest`, `Channel.AdvanceThermalIdle`, `Channel.GetThermalMetrics` | P/N/E | 暂停热网络完成一次参考温度功率校准并冻结PA输入；测试阶段不再闭环稳功率，只推进真实发射和空闲热状态并报告输出漂移 | Channel §10、PaModel §13.6–§13.7 |
+| `Channel.CalibratePaInput`, `Channel.GetLastPaInput`, `Channel.GetLastTransmitterOutput`, `Channel.GetLastActualPaInput`, `Channel.GetLastPaOutput`, `Channel.GetLastCalibrationMetrics` | P/N/E | 对任意初始幅度原始波形自动保存并暂停热状态，执行参考温度隐藏功率闭环后在 `finally` 中原样恢复；分别保留Tx I/Q前后、耦合后PA输入和无热校准输出参考面 | Channel §1、§6.2、§6.3、§6.8、§10 |
+| `Channel.PrepareThermalTest`, `Channel.AdvanceThermalIdle`, `Channel.GetThermalMetrics` | P/N/E | 普通流程由 `Process(rawSignal, outputPowerDbm)` 自动完成无热校准与恢复后真实发射；这些高级接口仅用于显式冻结/复位起始温度、推进空闲热状态和报告自然输出漂移 | Channel §10、PaModel §13.6–§13.7 |
 | `GenerateThermalFigures.ConfigurePlotStyle`, `GenerateThermalFigures.CalculateStepRise`, `GenerateThermalFigures.CalculateEfficiency`, `GenerateThermalFigures.SimulatePulseTemperature`, `GenerateThermalFigures.SaveThermalNetworkEffects`, `GenerateThermalFigures.SaveHeatSourceEffects`, `GenerateThermalFigures.SaveElectricalDriftEffects`, `GenerateThermalFigures.SaveOperatingScenarioEffects`, `GenerateThermalFigures.SaveBoundaryParameterEffects`, `GenerateThermalFigures.GenerateThermalFigures` | P/N/V | 由RC/Foster解析式、效率方程、脉冲热状态和温度电参数方程可重复生成PaModel §13中的五组参数效果图 | PaModel §13.3–§13.8 |
 | `Channel.SynchronizeRandomGenerator`, `Channel.ResetRandomGenerator` | N/E | 在外部活动参数改变种子时同步随机状态，并支持从固定种子重放同一白噪声序列 | Channel §4–§5 |
 | `Channel.ValidateSignal` | N/E | 保留SISO向量或MIMO矩阵形状，并拒绝空、非有限或不支持维度的波形 | Channel §1、§6 |
@@ -221,7 +222,7 @@ flowchart LR
 | `Channel.FeedbackDirectSmallSignalGain` | P/N | 返回反馈FIR直流和、反馈增益/相位及I/Q直通分量组成的小信号复增益；不把镜像、DC、噪声和量化当成确定性标量增益 | Channel §4、§4.6 |
 | `Channel.ApplyChannelEffects` | P/E | 先执行公共相位；forward模式跳过全部fb专用参数，fb模式执行完整反馈模拟链；随后加入公共AWGN，最后仅在fb模式执行反馈ADC | Channel §1–§4 |
 | `Channel.ProcessPaOutput` | E/N | 把已有逐PA公开输出解码后先执行PA后耦合，再执行一次forward/fb采样链路并编码；功率闭环因此不包含接收噪声或PA后串扰 | Channel §1、§1.3、§6.2 |
-| `Channel.ProcessFloating`, `Channel.Process` | P/N/E | `Process(inputSignal, outputPowerDbm)` 按“Tx I/Q→PA前耦合→逐路PA→PA后耦合→采样链”运行；给定目标时先联合或独立闭环调整Tx数字输入，收敛后只采样一次，并在定点公开模式返回整数I/Q码 | Channel §1、§1.3–§1.4、§3.4、§6.2–§6.4 |
+| `Channel.ProcessFloating`, `Channel.Process` | P/N/E | `Process(inputSignal, outputPowerDbm)` 给定目标时先在暂停热状态下联合或独立闭环调整Tx数字输入，随后恢复结温并按“Tx I/Q→PA前耦合→真实温度逐路PA→PA后耦合→采样链”只正式处理一次；定点公开模式返回整数I/Q码 | Channel §1、§1.3–§1.4、§3.4、§6.2–§6.4、§10 |
 | `Channel.SmallSignalGain` | P/N | forward模式返回Tx I/Q直接系数、PA小信号增益与公共相位之积；fb模式再乘反馈直通小信号系数；DC、镜像、噪声和量化不伪装成标量增益 | Channel §2、§4、§6.2、§6.5 |
 
 ### 4.2 `ChannelAnalyse.py`：MIMO通道测量

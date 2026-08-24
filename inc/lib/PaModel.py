@@ -78,6 +78,102 @@ class ThermalConfig:
     nonlinearityTemperatureCoefficientPerC: float = 0.0020
     maximumJunctionTemperatureC: float = 150.0
 
+    @classmethod
+    def Recommended(
+        cls,
+        modelName: str,
+        sampleRateHz: float = 80.0e6,
+        **parameterOverrides: object,
+    ) -> "ThermalConfig":
+        """Build one complete, valid thermal-model starting profile.
+
+        Processing details:
+            Algorithm: Select model-specific resistance and time-constant
+            vectors for a static temperature point, one-RC trend model, or
+            three-branch Foster model; combine them with a common 25 dBm-class
+            demonstration heat-source and electrical-drift profile; apply
+            explicit caller overrides; construct the immutable configuration;
+            and validate every field before returning it. These values are
+            simulation starting points rather than device specifications.
+
+        Args:
+            modelName: ``"static"``, ``"single_rc"``, or ``"foster"``.
+            sampleRateHz: Actual public waveform sample rate in hertz.
+            parameterOverrides: Optional explicit replacements for any
+                ThermalConfig dataclass field other than the selected model
+                name and sample rate.
+
+        Returns:
+            result: Validated enabled ThermalConfig with model-specific values.
+        """
+
+        if not isinstance(modelName, str):
+            raise TypeError("modelName must be a string")
+        normalizedModelName = modelName.strip().lower()
+        modelProfiles: Mapping[str, Mapping[str, object]] = {
+            "static": {
+                "initialJunctionTemperatureC": 55.0,
+                "thermalResistancesCPerW": (1.0,),
+                "thermalTimeConstantsSec": (1.0,),
+            },
+            "single_rc": {
+                "initialJunctionTemperatureC": 25.0,
+                "thermalResistancesCPerW": (20.0,),
+                "thermalTimeConstantsSec": (20.0e-3,),
+            },
+            "foster": {
+                "initialJunctionTemperatureC": 25.0,
+                "thermalResistancesCPerW": (2.0, 8.0, 20.0),
+                "thermalTimeConstantsSec": (50.0e-6, 5.0e-3, 0.5),
+            },
+        }
+        if normalizedModelName not in modelProfiles:
+            raise ValueError(
+                "modelName has an invalid value. Allowed values: "
+                "'static', 'single_rc', or 'foster'."
+            )
+        supportedNames = tuple(cls.__dataclass_fields__)
+        unknownNames = tuple(
+            parameterName
+            for parameterName in parameterOverrides
+            if parameterName not in supportedNames
+        )
+        if unknownNames:
+            raise TypeError(
+                "unknown ThermalConfig parameter(s): "
+                + ", ".join(sorted(unknownNames))
+                + ". Supported parameters: "
+                + ", ".join(supportedNames)
+            )
+        commonParameters: Dict[str, object] = {
+            "enabled": True,
+            "modelName": normalizedModelName,
+            "sampleRateHz": sampleRateHz,
+            "ambientTemperatureC": 25.0,
+            "referenceTemperatureC": 25.0,
+            "thermalUpdateIntervalSamples": 256,
+            "idleDissipatedPowerW": 0.15,
+            "efficiencyModelName": "power_dependent",
+            "peakDrainEfficiency": 0.45,
+            "minimumDrainEfficiency": 0.10,
+            "efficiencyKneeOutputPowerDbm": 15.0,
+            "referenceOutputPowerDbm": 25.0,
+            "activePowerThresholdDb": -60.0,
+            "gainTemperatureCoefficientDbPerC": -0.012,
+            "phaseTemperatureCoefficientDegreesPerC": 0.03,
+            "saturationTemperatureCoefficientPerC": -0.0015,
+            "nonlinearityTemperatureCoefficientPerC": 0.0020,
+            "maximumJunctionTemperatureC": 150.0,
+        }
+        resolvedParameters = {
+            **commonParameters,
+            **modelProfiles[normalizedModelName],
+            **parameterOverrides,
+        }
+        recommendedConfig = cls(**resolvedParameters)
+        recommendedConfig.Validate()
+        return recommendedConfig
+
     def Validate(self) -> None:
         """Validate thermal topology, physical units, and drift coefficients.
 

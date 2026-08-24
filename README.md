@@ -8,6 +8,7 @@
 - [双音信号生成物理原理与用法](doc/WaveGenTwoTone.md)：复基带双音、等功率/不等功率选择、固定间隔位置移动、奇数阶互调频率、RMS/定点边界和ILC带宽。
 - [FEC编码译码原理与用法](doc/Fec.md)：55/90短块LDPC校验矩阵、系统编码、软输入normalized min-sum译码和调用示例。
 - [PA 模型物理原理与推导](doc/PaModel.md)：Rapp无记忆SSPA、Wiener、GMP、Doherty、频谱再生、IQ失衡，以及由功率和占空比驱动的静态/单RC/Foster电热模型、参数图和开环输出漂移。
+- [PA温度特性实测、模型辨识与参数回填](doc/PaThermalMeasurement.md)：测试台、TSEP/结温参考面、耗散功率、效率、static/单RC/Foster拟合、温度电参数、MIMO互热和完整数值例。
 - [PA双音特性分析](doc/PaAnalyse.md)：小信号频响、双音间隔记忆、动态AM-AM/AM-PM迟滞、IM3/IM5/IM7、输出功率扫描及逐PA的DPD优化建议。
 - [PA到接收端Channel物理原理与用法](doc/Channel.md)：I/Q正交调制背景与镜像产生推导、Tx/FB失衡边界、PA前/后多通道耦合、前向仪表/板载反馈采样、反馈链路非理想和联合功率校准。
 - [Channel特性测量与耦合感知DPD](doc/ChannelAnalyse.md)：平坦度、耦合增益/相位、群时延、条件数、测量接线以及耦合感知DPD-GMP前后对比。
@@ -66,6 +67,7 @@ tests/TestProject.py    自包含验证脚本
 tests/BenchMark.py      分类ILC基准、PA双音特性测试、结果保存和曲线比较
 doc/BenchMark.md        各 benchmark 场景的构造、预期和参考仿真结果
 doc/PaAnalyse.md        四种PA特性及PA分析驱动的DPD-GMP逐项改进对比
+doc/PaThermalMeasurement.md 实际PA温度测量、热模型辨识、参数回填和独立验证
 doc/ChannelAnalyse.md   通道测量原理、用例和耦合感知DPD前后性能
 doc/DPD-GMP.md          GMP DPD物理模型和系数更新推导
 doc/DpdGmp.md           DpdGmp类参数、方法和完整用例
@@ -275,7 +277,7 @@ flowchart TD
 
 1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `WaveGenWifi`、`PaModel`、`Analysis` 和 `Draw`；需要接收链路影响时再构造 `Channel`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
 2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
-3. 普通用户只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`。Channel先把隐藏数字Tx预设经过Tx I/Q调制器和PA前耦合送入不同的PA，并对各PA自身输出计算有效突发功率。没有PA前耦合时使用逐链闭环；存在耦合时自动用有限差分功率Jacobian联合更新全部驱动。收敛后只执行一次PA后耦合、公共移相以及 `sampleMode` 选择的采样路径。`GetLastPaInput`、`GetLastTransmitterOutput`、`GetLastActualPaInput`、`GetLastPaOutput` 和 `GetLastCalibrationMetrics` 只用于诊断。
+3. 普通用户只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`。Channel先保存并暂停PA热状态，再把隐藏数字Tx预设经过Tx I/Q调制器和PA前耦合送入不同的PA，并对各PA自身输出计算参考温度有效突发功率。没有PA前耦合时使用逐链闭环；存在耦合时自动用有限差分功率Jacobian联合更新全部驱动。收敛后Channel恢复原结温与热时间，用收敛输入执行一次真实PA发射，再进入PA后耦合、公共移相和 `sampleMode` 采样路径。因此校准试探不发热，而返回波形仍包含温漂。`GetLastPaInput`、`GetLastTransmitterOutput`、`GetLastActualPaInput`、`GetLastPaOutput` 和 `GetLastCalibrationMetrics` 只用于诊断，其中后两项描述无热参考校准观测。
 4. `sampleMode="forward"` 表示VSA等前向仪表直接观测主路，全部 `fb...` 参数被忽略；`sampleMode="fb"` 表示板载反馈接收机，能够配置反馈增益/FIR、时延、CFO/SFO、I/Q不平衡、DC、三阶失真、限幅和ADC。仪表闭环ILC可直接把forward Channel作为plant；板载闭环ILC把fb Channel作为plant，但最终EVM/ACLR应由独立forward Channel评价。
 5. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR，只保存每轮真实输入、plant反馈输出和原生MSE。现有 `RunMimoFrequencyDomainIlc` 是逐PA独立算法，只适用于关闭或忽略跨通道耦合；启用PA前/后耦合后的联合补偿需要完整矩阵频响或Jacobian的MIMO ILC，文档不会把逐链结果误写成联合补偿结果。
 5. `Analysis` 使用三条互相独立的路径。显式参考模式直接保存 `referenceSignal` 与 `WifiWaveform`；发送波形辅助模式对NumPy数组或 `WifiWaveform.samples` 做互相关，直接截取公共区间，绝不解析Descriptor、恢复seed或重新生成参考；只有盲分析模式才调用 `ParseWifi` 恢复包起点、格式、MCS、FFT/GI、空间结构和参考样值。三条路径之后共用 `SigProc`；具备Wi-Fi元数据时再用 `FrameProcess` 计算严格子载波EVM。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
@@ -532,7 +534,7 @@ flowchart TD
     select -->|doherty| doherty["DohertyPA"]
     pa --> paProcess["PaModel.Process"]
     pa --> paGain["PaModel.SmallSignalGain"]
-    thermalConfig["ThermalConfig.Validate"] --> thermal["ThermalNetwork"]
+    thermalConfig["ThermalConfig.Recommended / Validate"] --> thermal["ThermalNetwork"]
     paProcess --> heat["耗散功率与占空比"]
     heat --> thermal
     thermal --> drift["温度增益/相位/饱和/非线性漂移"]
@@ -585,7 +587,7 @@ flowchart TD
 - `WienerPA.Process` 依次执行线性记忆滤波、Rapp AM-AM 压缩和 AM-PM 相位旋转。
 - `GMPPA.Process` 使用 `DelaySignal` 构造主项、滞后包络项和超前包络项；未提供系数时由 `DefaultGmpCoefficients` 创建稳定的默认模型。
 - `DohertyPA.Process` 持续驱动Carrier支路，在包络越过门限时平滑开启Peaking支路，并加入支路时延、复合成和简化负载调制；两条支路可分别选择Wiener或GMP。
-- 可选 `ThermalConfig` 把输出功率、效率和占空比映射为耗散功率；单RC或Foster网络推进结温，再调制Rapp、Wiener、GMP或Doherty输出。功率校准自动暂停热网络，正式温度测试冻结驱动并允许输出功率自然漂移。
+- 可选 `ThermalConfig` 把输出功率、效率和占空比映射为耗散功率；单RC或Foster网络推进结温，再调制Rapp、Wiener、GMP或Doherty输出。`Channel.Process(rawSignal, outputPowerDbm=...)` 自动完成“保存热状态→无热参考校准→恢复热状态→真实发射”，调用方无须关闭温度模型或单独调用校准函数，正式返回波形的功率仍可随温度自然漂移。
 - `IQImbalancePA` 在被包装PA的输出上增加共轭镜像，只是用于增广ILC归因测试的参考面无关代数包装器；真实Tx与FB两处I/Q误差应分别使用Channel的 `txIq...` 与 `fbIq...` 参数。`AddAwgn` 模拟反馈接收链噪声。
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
 - `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。它反复改变PA输入并测量真实输出，直到目标误差进入容限，不在PA输出端追加常数增益。
@@ -597,13 +599,17 @@ flowchart TD
 flowchart TD
     raw["原始公开波形"] --> process["Process(inputSignal, outputPowerDbm)"]
     target["共同或逐链目标dBm"] --> process
-    process --> calibration["内部PowerCalibration"]
+    process --> suspend["保存并暂停PA热状态"]
+    suspend --> calibration["内部PowerCalibration"]
     calibration --> txIq["Tx I/Q不平衡与DC"]
     txIq --> pre["PA前耦合 Hpre(z)"]
-    pre --> pa["不同参数的多路PaModel"]
+    pre --> pa["参考温度多路PaModel"]
     pa --> detector["有效突发PA输出功率"]
     detector -. "误差超限" .-> calibration
-    detector --> post["PA后耦合 Hpost(z)"]
+    detector --> restore["恢复原结温与热时间"]
+    restore --> liveTx["收敛输入执行一次Tx I/Q与PA前耦合"]
+    liveTx --> livePa["真实温度PA发射一次"]
+    livePa --> post["PA后耦合 Hpost(z)"]
     post --> phase["ApplyPhaseRotation<br/>-90° / 0° / +90°"]
     phase --> mode{"sampleMode"}
     mode -->|forward| forwardNoise["前向仪表 + AddNoise<br/>忽略fb专用参数"]
@@ -622,7 +628,7 @@ flowchart TD
 
 **图示说明：**
 
-- 推荐调用 `Process(rawSignal, outputPowerDbm=20.0)`。用户只给原始波形和PA目标输出功率；Channel每次试探都依次执行Tx I/Q、PA前耦合和PA。存在PA前串扰时自动用功率Jacobian联合调整各路Tx数字输入，收敛后再执行一次PA后耦合与所选采样路径。
+- 推荐调用 `Process(rawSignal, outputPowerDbm=20.0)`。用户只给原始波形和参考温度目标输出功率；Channel内部暂停热状态并完成Tx I/Q、PA前耦合和PA功率闭环，存在PA前串扰时自动用功率Jacobian联合调整各路Tx数字输入。随后恢复原热状态，用收敛输入真实执行一次完整PA与所选采样路径，因此功率校准不产生虚假热量，也不会把正式温漂闭环抵消。
 - `Process(rawSignal)` 保留不校准功率的单次链路，供ILC plant等内部循环使用；`ProcessPaOutput` 用于已有PA输出，不会再次运行PA。
 - `sampleMode="forward"` 模拟前向VSA/仪表采样，并忽略全部 `fb...` 配置；`sampleMode="fb"` 模拟板载反馈接收机，并依次加入反馈频响、时频偏、I/Q与DC误差、接收机非线性、限幅和ADC量化。
 - `prePaCouplingPaths` 和 `postPaCouplingPaths` 使用逐方向路径配置，每条路径具有独立增益、相位、复FIR、整数和分数时延；0到1与1到0无需对称。
@@ -1217,11 +1223,11 @@ receivedWaveform = channel.Process(
 digitalTxInputWaveform = channel.GetLastPaInput()
 txModulatorOutput = channel.GetLastTransmitterOutput()
 actualPaInputWaveform = channel.GetLastActualPaInput()
-paOutputWaveform = channel.GetLastPaOutput()
+referenceCalibrationPaOutput = channel.GetLastPaOutput()
 calibrationMetrics = channel.GetLastCalibrationMetrics()
 ```
 
-MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.0, 21.0, 20.0, 19.0))`。只有开发新的PA测量适配器或单独调试功率检测器时，才需要直接使用底层的 `PowerCalibration.Calibrate(inputSignal)`。
+MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.0, 21.0, 20.0, 19.0))`。只有开发新的PA测量适配器或单独调试功率检测器时，才需要直接使用底层的 `PowerCalibration.Calibrate(inputSignal)`。启用温度模型时，`referenceCalibrationPaOutput` 和 `calibrationMetrics` 属于暂停温度影响后的参考校准面；函数返回的 `receivedWaveform` 才经过恢复温度后的真实PA，实际热态输出功率从 `channel.GetThermalMetrics()` 读取。
 
 例如在 50 Ω 端口上，`0 dBm = 1 mW` 对应约 `0.223607 V RMS`。对于带占空比的记录，本工程报告Wi-Fi突发开启期间的平均功率：若有效突发占整段采集的50%，整段平均会额外低3.01 dB，但该关断时间不会进入校准或Analysis的RMS分母。完整门限、短空洞闭合和定点搜索公式见 [SigProc.md](doc/SigProc.md#131-有效信号区间与占空比)。
 
@@ -1292,7 +1298,19 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 Rapp、Wiener、GMP、Doherty 的静态增益曲线定义、1 dB 压缩点推导、每一个配置值对曲线的移动或变形方式、外部 dBm 工作点与模型曲线的区别，以及恒包络扫幅示例，见
 [PaModel.md：配置时如何读取和调节增益曲线](doc/PaModel.md#49-配置时如何读取和调节增益曲线)。
 
-`ThermalConfig` 支持静态温度角、单RC和多极点Foster。完整内容见 [PaModel电热模型](doc/PaModel.md#13-pa电热模型功率占空比与输出漂移)：其中分别推导了静态角、单RC、Foster、Cauer、温度条件化GMP和神经网络电热模型，并直接展示热阻、时间常数、Foster支路、更新间隔、效率上下界、效率膝点、占空比、空闲功耗、温度电参数和MIMO互热的参数效果图。温度测试使用 `channel.PrepareThermalTest(...)` 获取冻结输入，之后调用 `channel.Process(frozenInput)`，不能每帧再次传 `outputPowerDbm`。
+`ThermalConfig` 支持静态温度角、单RC和多极点Foster。完整内容见 [PaModel电热模型](doc/PaModel.md#13-pa电热模型功率占空比与输出漂移)：其中分别推导了静态角、单RC、Foster、Cauer、温度条件化GMP和神经网络电热模型，并直接展示热阻、时间常数、Foster支路、更新间隔、效率上下界、效率膝点、占空比、空闲功耗、温度电参数和MIMO互热的参数效果图。普通温度测试直接调用 `channel.Process(rawSignal, outputPowerDbm=...)`；Channel内部自动隔离校准热量并在恢复温度后真实发射。只有需要显式重设起始结温或复用冻结驱动的高级可重复实验才调用 `PrepareThermalTest(...)`。
+
+三种已实现热模型均提供可直接运行的完整推荐预设；推荐值是25 dBm级行为仿真的起点，正式器件仍应由热瞬态、DC效率和多温度I/Q实测替换：
+
+| 调用 | 关键模型推荐值 | 适用场景 |
+|---|---|---|
+| `ThermalConfig.Recommended("static", sampleRateHz=...)` | 固定结温 `55` 摄氏度；建议另扫 `25/55/85`；R与时间常数使用不参与动态的 `(1.0,)` 占位 | 温箱定点或固定温度敏感性 |
+| `ThermalConfig.Recommended("single_rc", sampleRateHz=...)` | `R=(20.0,)` 摄氏度/W，`tau=(20e-3,)` s | 最小动态自热验证和单膝点热瞬态 |
+| `ThermalConfig.Recommended("foster", sampleRateHz=...)` | `R=(2.0,8.0,20.0)` 摄氏度/W，`tau=(50e-6,5e-3,0.5)` s | 快、中、慢多时间尺度；默认动态推荐 |
+
+三套预设还完整设置 `enabled=True`、真实 `sampleRateHz`、25摄氏度环境与参考温度、256样点热更新、0.15 W空闲耗散、10%至45%功率相关效率、15 dBm效率膝点、25 dBm物理参考输出、-60 dB活动门限、四个温度电参数系数和150摄氏度仿真停止上限。全部21个字段的逐模型推荐值、敏感性范围、替换规则、MIMO互热起点，以及Cauer/温度条件化GMP/神经电热扩展建议见 [ThermalConfig完整推荐表](doc/PaModel.md#1371-三种已实现模型的完整推荐值)。仅修改 `modelName="single_rc"` 不会自动把默认三支Foster向量变成单支，因此应使用 `Recommended` 或同时显式配置单元素R/时间常数向量。
+
+把推荐起点替换为真实器件参数时，请按“校准温度参考面与RF/DC功率 → 拟合空闲耗散和效率 → 拟合单RC或Foster热网络 → 拟合四个温度电参数 → 用留出功率、占空比和温度点验证”的顺序执行。完整接线、TSEP标定、NumPy拟合代码和一套测量值回填示例见 [PA温度特性实测与模型辨识](doc/PaThermalMeasurement.md)。
 
 `MimoPaModel(parameters=None, width=None, **parameterOverrides)` 在构造函数内部使用 `ChainMap` 管理以下参数：
 
@@ -1419,7 +1437,7 @@ Channel参数按物理模块分类如下，避免把真实Tx失真和FB观测误
 
 诊断接口的参考面也彼此独立：`GetLastPaInput()`为兼容旧名称而保留，返回Tx I/Q之前的数字输入；`GetLastTransmitterOutput()`返回Tx I/Q之后、PA前耦合之前的波形；`GetLastActualPaInput()`返回耦合后真正进入PA的波形。不要把三者混作同一个DPD训练标签。
 
-温度测试采用两阶段接口：`PrepareThermalTest(inputSignal, calibrationOutputPowerDbm, initialJunctionTemperatureC=None, ambientTemperatureC=None)` 在暂停热网络的条件下只校准一次并返回冻结输入；后续 `Process(frozenInput)` 开环推进结温，绝不重新稳定输出功率。`AdvanceThermalIdle(idleTimeSec)` 推进帧间冷却或偏置加热，`GetThermalMetrics()` 返回结温、耗散、占空比、自然漂移后的输出功率和累计时间。详见 [Channel两阶段温度测试](doc/Channel.md#10-两阶段pa温度测试)。
+温度测试的推荐入口仍是 `Process(inputSignal, outputPowerDbm=...)`：每次调用都在内部暂停热网络完成参考温度校准，原样恢复结温与累计热时间后只真实发射一次。该目标不会闭环追踪当前热态输出，所以自然功率漂移仍会保留。`PrepareThermalTest(...)` 仅作为显式冻结驱动和复位测试温度的高级兼容入口；`AdvanceThermalIdle(idleTimeSec)` 推进帧间冷却或偏置加热，`GetThermalMetrics()` 返回结温、耗散、占空比、自然漂移后的输出功率和累计时间。详见 [Channel内置无热校准与温度测试](doc/Channel.md#10-channel内置无热校准与温度测试)。
 
 ### `SigProc` 参数与方法
 

@@ -1435,7 +1435,10 @@ classDiagram
         +AdvanceIdle(idleTimeSec)
         +GetThermalMetrics()
     }
-    class ThermalConfig
+    class ThermalConfig {
+        +Recommended(modelName, sampleRateHz, overrides)
+        +Validate()
+    }
     class ThermalNetwork {
         +Reset(junctionTemperatureC, ambientTemperatureC)
         +Advance(dissipatedPowerW, durationSec)
@@ -1504,7 +1507,7 @@ classDiagram
     IQImbalancePA o-- PaModel : wraps
 ```
 
-**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Rapp、Wiener、GMP或Doherty。Doherty的Carrier和Peaking又各自选择Wiener或GMP。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
+**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Rapp、Wiener、GMP或Doherty。Doherty的Carrier和Peaking又各自选择Wiener或GMP。`ThermalConfig.Recommended` 为static、single_rc和foster返回完整可运行的模型专用起点，`Validate` 继续负责物理边界校验。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
 
 如果需要区分实验室前向仪表与板载反馈接收机，应把同一份干净PA输出交给两个独立Channel。`sampleMode="forward"` 跳过反馈专用非理想，用于最终主路EVM/ACLR评价；`sampleMode="fb"` 可增加反馈FIR、时频偏、I/Q/DC、接收机非线性、限幅和ADC量化，用于模拟板载闭环。反馈链参数属于观察接收机，不属于PA模型系数，不能写入Wiener或GMP来混合拟合。
 
@@ -1659,18 +1662,21 @@ flowchart LR
 
 图示说明：现有Rapp、Wiener、GMP或Doherty仍先计算基础电响应；归一化输出通过参考dBm和效率模型换成耗散功率，热网络将其积累为结温，结温再调制下一热更新区间的增益、相位、饱和尺度和非线性强度。即使基础Rapp电模型严格无记忆，外接热网络后，结温状态也会让整个电热系统具有慢记忆。
 
-本工程严格区分两个阶段：
+本工程在 `Channel.Process(rawSignal, outputPowerDbm=...)` 内部严格分离两个阶段，调用方只看见一次函数调用：
 
-1. **功率校准阶段**：`Channel.CalibratePaInput` 和 `Channel.PrepareThermalTest` 都会暂停热网络，所有试探使用参考温度电参数，校准不会增加热时间或结温。
-2. **开环温度测试阶段**：冻结校准得到的PA输入，调用 `Channel.Process(frozenInput)` 时不再传 `outputPowerDbm`。热网络随实际发射推进，输出功率可以随温度自然变化。
+1. **无热参考校准阶段**：Channel保存当前热支路、结温和累计时间，暂停温度影响，并让所有闭环试探只使用参考温度电参数。校准不会增加真实热时间或结温，也不会根据当前热态增益修正驱动。
+2. **正式温度处理阶段**：Channel原样恢复校准前热状态，再用收敛输入真实发射一次。热网络只在这次正式处理期间推进，输出功率可以随温度自然变化。
 
-因此温度测试中禁止每帧重新调用：
+因此普通温度测试可以直接重复调用：
 
 ```python
-channel.Process(rawSignal, outputPowerDbm=22.0)
+receivedSignal = channel.Process(
+    rawSignal,
+    outputPowerDbm=22.0,
+)
 ```
 
-这会重新标定驱动，掩盖需要观察的热增益和输出功率漂移。
+这里的22 dBm是参考温度校准目标，不是当前热态输出的闭环设定值。升温后的实际功率应读取 `Channel.GetThermalMetrics()["outputPowerDbm"]`；它允许偏离22 dBm。需要明确冻结并复用数字驱动或复位起始温度时，才使用高级兼容接口 `PrepareThermalTest`。
 
 ### 13.2 常见热模型的优缺点比较
 
@@ -2294,9 +2300,135 @@ y(n,T)-g(T)y_0(n).
 | `nonlinearityTemperatureCoefficientPerC` | `0.002` | 1/摄氏度 | 额外压缩强度漂移 |
 | `maximumJunctionTemperatureC` | `150` | 摄氏度 | 仿真安全上限；超过即停止 |
 
-这些默认值只用于展示方向，绝不代表某个GaN、LDMOS或GaAs器件。正式测试必须由热瞬态、DC效率和多温度I/Q数据提取。
+类字段默认值首先保证 `foster` 配置完整，但 `enabled=False`；它们不是所有模型都能直接复用的推荐。例如只把 `modelName` 改为 `single_rc` 会因为默认存在三组热阻和时间常数而校验失败。普通用户应优先调用 `ThermalConfig.Recommended(modelName, sampleRateHz=...)` 获取一套完整、已校验的模型起始值。
 
-#### 13.7.1 参数增大时会发生什么
+下面所有“推荐值”都是本工程针对约25 dBm归一化行为PA设计的**可运行仿真起点**，不是GaN、LDMOS或GaAs器件规格。封装、PCB、散热器、偏置和环境会共同改变热阻与温度；正式测试必须由热瞬态、DC效率和多温度I/Q数据替换这些起点。Analog Devices的RF热管理说明也强调热流路径必须包含封装、PCB和散热边界，不能只复制一个通用热阻；器件允许结温则必须以具体数据手册为准。
+
+#### 13.7.1 三种已实现模型的完整推荐值
+
+| 参数 | `static`推荐起点 | `single_rc`推荐起点 | `foster`推荐起点 | 使用说明 |
+|---|---|---|---|---|
+| `enabled` | `True` | `True` | `True` | 只有显式打开才产生温度影响 |
+| `modelName` | `"static"` | `"single_rc"` | `"foster"` | 必须使用代码支持的精确名称 |
+| `sampleRateHz` | 实际波形采样率；示例 `80e6` | 实际波形采样率；示例 `80e6` | 实际波形采样率；示例 `80e6` | 不能按信号带宽或过采样倍数猜测 |
+| `ambientTemperatureC` | `25.0` | `25.0` | `25.0` | 正式仿真改为冷板、壳体或环境实测值 |
+| `initialJunctionTemperatureC` | `55.0`；推荐另扫 `25/55/85` | 冷启动 `25.0` | 冷启动 `25.0` | 动态模型冷启动通常等于环境温度 |
+| `referenceTemperatureC` | `25.0` | `25.0` | `25.0` | 必须等于基础PA系数提取温度 |
+| `thermalResistancesCPerW` | `(1.0,)`占位 | `(20.0,)` | `(2.0, 8.0, 20.0)` | 静态模型不由热阻推进；动态模型必须实测替换 |
+| `thermalTimeConstantsSec` | `(1.0,)`占位 | `(20.0e-3,)` | `(50.0e-6, 5.0e-3, 0.5)` | Foster三项分别作为快、中、慢起点 |
+| `thermalUpdateIntervalSamples` | `256` | `256` | `256` | 80 MHz时为3.2微秒，能分辨50微秒快速支路 |
+| `idleDissipatedPowerW` | `0.15` | `0.15` | `0.15` | 无静态偏置的理想模型可设为 `0.0` |
+| `efficiencyModelName` | `"power_dependent"` | `"power_dependent"` | `"power_dependent"` | 静态模型中只影响耗散诊断，不改变固定结温 |
+| `peakDrainEfficiency` | `0.45` | `0.45` | `0.45` | 高输出功率效率起点 |
+| `minimumDrainEfficiency` | `0.10` | `0.10` | `0.10` | 低输出功率效率起点，不得超过峰值效率 |
+| `efficiencyKneeOutputPowerDbm` | `15.0` | `15.0` | `15.0` | 推荐先取参考输出功率减10 dB |
+| `referenceOutputPowerDbm` | `25.0` | `25.0` | `25.0` | 应与Channel的 `maximumOutputPowerDbm` 一致 |
+| `activePowerThresholdDb` | `-60.0` | `-60.0` | `-60.0` | 纯仿真波形起点；真实采集按噪声底调整 |
+| `gainTemperatureCoefficientDbPerC` | `-0.012` | `-0.012` | `-0.012` | 每升高1摄氏度的公共增益dB斜率 |
+| `phaseTemperatureCoefficientDegreesPerC` | `0.03` | `0.03` | `0.03` | 符号必须由实测相位随温度方向决定 |
+| `saturationTemperatureCoefficientPerC` | `-0.0015` | `-0.0015` | `-0.0015` | 负值表示升温后压缩膝点降低 |
+| `nonlinearityTemperatureCoefficientPerC` | `0.0020` | `0.0020` | `0.0020` | 正值表示升温后附加包络压缩增强 |
+| `maximumJunctionTemperatureC` | `150.0` | `150.0` | `150.0` | 正式值取器件额定结温与项目降额上限中的较小者 |
+
+`static` 的热阻和时间常数是数据结构校验所需的正数占位值；该模型始终保持 `initialJunctionTemperatureC`，不会由功率、效率、热阻或时间常数生成动态升温。推荐的 `55` 摄氏度只是中间温度角；常规对比使用 `25/55/85` 摄氏度，只有器件额定范围允许时才增加更高压力温度角。
+
+三套推荐配置可直接构造：
+
+```python
+from inc.lib.PaModel import ThermalConfig
+
+
+staticThermalConfig = ThermalConfig.Recommended(
+    "static",
+    sampleRateHz=80.0e6,
+)
+singleRcThermalConfig = ThermalConfig.Recommended(
+    "single_rc",
+    sampleRateHz=80.0e6,
+)
+fosterThermalConfig = ThermalConfig.Recommended(
+    "foster",
+    sampleRateHz=80.0e6,
+)
+
+# Measured values can replace any recommended starting field explicitly.
+measuredSingleRcConfig = ThermalConfig.Recommended(
+    "single_rc",
+    sampleRateHz=80.0e6,
+    thermalResistancesCPerW=(12.5,),
+    thermalTimeConstantsSec=(8.0e-3,),
+    peakDrainEfficiency=0.52,
+)
+```
+
+#### 13.7.2 推荐范围与替换规则
+
+模型和时间离散参数建议如下：
+
+| 参数 | 推荐起点或对比档位 | 何时必须替换 | 过小或过大的后果 |
+|---|---|---|---|
+| `thermalResistancesCPerW`，单RC | `(20.0,)`；趋势检查 `(5.0,) / (20.0,) / (40.0,)` | 有稳态温升与耗散功率测量时 | 太小低估稳态温升；太大夸大热压缩 |
+| `thermalTimeConstantsSec`，单RC | `(0.02,)`；趋势检查 `(0.005,) / (0.02,) / (0.1,)` | 有功率阶跃升温或冷却曲线时 | 太小使PA几乎瞬时升温；太大使短测试看不到变化 |
+| `thermalResistancesCPerW`，Foster | `(2.0, 8.0, 20.0)` | 有瞬态热阻曲线时执行非负多指数拟合 | 总和决定长期温升，分配决定各时间尺度幅度 |
+| `thermalTimeConstantsSec`，Foster | `(50e-6, 5e-3, 0.5)` | 有快、中、慢热瞬态测量时 | 支路过密会病态，缺少快支路会漏掉突发内温漂 |
+| `sampleRateHz` | 与送入PA的样值采样率完全一致 | 任何采样率变化后 | 错误采样率会按同比例缩放全部热时间 |
+| `thermalUpdateIntervalSamples` | `256`；每个最小时间常数至少10个更新点 | 改变采样率或最小时间常数后 | 太大低估快速温度纹波；太小只增加计算量 |
+
+更新时间应满足：
+
+```math
+\frac{N_{\mathrm{update}}}{f_s}
+\le
+\frac{\tau_{\min}}{10}.
+```
+
+温度边界参数建议如下：
+
+| 参数 | 推荐起点 | 工程替换规则 |
+|---|---|---|
+| `ambientTemperatureC` | `25.0` | 使用实际冷板、壳体或环境传感器值；温箱扫描逐点修改 |
+| `initialJunctionTemperatureC` | 动态冷启动等于环境温度；静态角使用 `25/55/85` | 预热设备使用测试开始时估计或测得结温 |
+| `referenceTemperatureC` | `25.0` | 等于基础Rapp/Wiener/GMP/Doherty系数采集温度，不等于任意环境温度 |
+| `maximumJunctionTemperatureC` | 无器件资料时仿真起点 `150.0` | 使用数据手册额定结温并加入项目降额；该值是停止边界，不是温控器 |
+
+热源与效率参数建议如下：
+
+| 参数 | 推荐起点 | 推荐范围或实测方法 |
+|---|---|---|
+| `idleDissipatedPowerW` | `0.15 W` | 理想无偏置可用 `0`；真实值用RF关闭时的直流电压乘电流 |
+| `efficiencyModelName` | `"power_dependent"` | 只有效率随功率近似平坦时才选 `"constant"` |
+| `minimumDrainEfficiency` | `0.10` | 低功率DC/RF扫描拟合；行为压力检查可用 `0.05...0.20` |
+| `peakDrainEfficiency` | `0.45` | 接近额定输出实测；行为检查可用 `0.35...0.60`，且必须大于等于最小效率 |
+| `efficiencyKneeOutputPowerDbm` | `15 dBm` | 初值取 `referenceOutputPowerDbm - 10 dB`，再由效率曲线转折拟合 |
+| `referenceOutputPowerDbm` | `25 dBm` | 必须等于归一化输出功率1所代表的实际端口功率，并与Channel满量程定义一致 |
+| `activePowerThresholdDb` | 纯仿真 `-60 dB` | 真实采集把门限放在噪声底以上约6至10 dB，并检查占空比是否符合帧结构 |
+
+温度到电参数的推荐值是用于确认趋势的温和起点：
+
+| 参数 | 推荐起点 | 建议敏感性范围 | 必须使用的辨识数据 |
+|---|---:|---:|---|
+| `gainTemperatureCoefficientDbPerC` | `-0.012` | `-0.005...-0.030` | 多温度小信号或线性区增益 |
+| `phaseTemperatureCoefficientDegreesPerC` | `0.03` | `-0.10...0.10` | 同一参考面多温度复增益相位 |
+| `saturationTemperatureCoefficientPerC` | `-0.0015` | `-0.0005...-0.0030` | 多温度AM-AM膝点或饱和尺度 |
+| `nonlinearityTemperatureCoefficientPerC` | `0.0020` | `0.0005...0.0050` | 多温度复增益对齐后EVM、ACLR或IMD残差 |
+
+这些范围用于敏感性扫描，不是代码合法范围。特别是相位系数的符号、增益系数是否始终为负、饱和尺度是否随温度下降，都必须由被测PA决定。若只想验证热网络而不希望电响应漂移，可把四个温度系数全部设为 `0.0`。
+
+MIMO互热参数 `thermalCouplingCPerW` 不属于 `ThermalConfig`，但同样需要推荐起点：无测量时使用 `None`，表示不假设互热；两路功能演示可使用非对角 `2.0` 摄氏度/W；`5...10` 摄氏度/W只作为明显压力测试。正式值由“加热源链的耗散功率”和“相邻受热链的稳态温升”相除得到，并保持对角线为零。
+
+#### 13.7.3 尚未直接实现模型的建议辨识起点
+
+下表覆盖前文讨论但尚不能填入 `ThermalConfig.modelName` 的扩展模型。它们是后续实现或离线拟合的初始化建议，不能直接传给当前代码。
+
+| 模型 | 建议参数起点 | 推荐数据与验收 |
+|---|---|---|
+| Cauer梯形网络 | `3`个热节点；时间尺度先覆盖 `50e-6/5e-3/0.5 s`；总热阻由稳态温升除以耗散功率给出 | 用结构热仿真或分层测温拟合；必须通过网络综合把Foster转换成Cauer，不能直接把并联Foster支路当作物理层 |
+| 温度条件化GMP | 温度点 `25/55/85` 摄氏度；奇数阶 `(1,3,5,7)`；主记忆深度 `3`；滞后和超前包络各 `1`；一次温度基函数；岭系数 `1e-6...1e-4` | 至少覆盖3个功率和3种占空比；独立温度验证集要求EVM、ACLR和IMD同时不退化 |
+| 物理引导神经电热模型 | 保留3支Foster物理状态；单层GRU或状态网络宽度 `24`；按热更新区间形成 `64...256`步序列；学习率 `1e-3`；梯度裁剪 `1.0` | 只学习Foster与温度条件化GMP的残差；使用未见功率、温度和突发周期验证有界性与外推趋势 |
+
+推荐的复杂度升级顺序是 `single_rc` → `foster` → 温度条件化GMP → 物理引导神经网络。只有当前层级在独立数据上的结温、输出功率、EVM和带外残差仍具有稳定结构时，才增加下一层参数。
+
+#### 13.7.4 参数增大时会发生什么
 
 | 参数增大 | 曲线或状态的直接变化 | 常见可观测结果 | 主要辨识数据 |
 |---|---|---|---|
@@ -2321,7 +2453,7 @@ y(n,T)-g(T)y_0(n).
 
 注意“增大”是数值方向。例如 `gainTemperatureCoefficientDbPerC` 从 `-0.025` 增大到 `-0.005`，意味着负温漂变弱；不能只比较绝对值。
 
-#### 13.7.2 采样、门限、参考点和安全上限效果图
+#### 13.7.5 采样、门限、参考点和安全上限效果图
 
 ![热配置边界参数效果图](./images/pa_thermal/thermal_boundary_parameter_effects.png)
 
@@ -2339,6 +2471,10 @@ y(n,T)-g(T)y_0(n).
 ```
 
 如果波形包含前后补零，门限判定会让这些样点使用空闲耗散，但样点所对应的时间仍完整推进。这样补零既不会虚构RF输出功率，又能正确表示实际静默时间。
+
+#### 13.7.6 如何用实测结果替换推荐值
+
+推荐值只用于把仿真流程跑通，不能代表具体器件。实际PA应先统一结温、冷板或壳体边界与RF/DC功率参考面，再按“热源效率 → 单RC/Foster热网络 → 四个温度电参数 → MIMO互热”的顺序辨识；不要同时自由调整热阻和增益温度系数去拟合同一条输出功率曲线。测试台连接、TSEP和红外测温边界、耗散功率定义、单RC/Foster非负拟合、效率拟合、三温度点I/Q回归、完整 `ThermalConfig` 回填和独立验证见 [PA温度特性测量、模型辨识与参数回填](./PaThermalMeasurement.md)。
 
 ### 13.8 MIMO热耦合
 
@@ -2414,29 +2550,27 @@ channel = Channel(
     },
 )
 
-# Calibration ignores temperature and returns one frozen drive waveform.
-frozenInput = channel.PrepareThermalTest(
-    rawSignal,
-    calibrationOutputPowerDbm=22.0,
-    initialJunctionTemperatureC=25.0,
-    ambientTemperatureC=25.0,
-)
-
 frameRecords = []
 for frameIndex in range(20):
-    receivedSignal = channel.Process(frozenInput)
+    # Channel internally suspends thermal effects for reference calibration,
+    # restores the prior temperature, and then transmits one live frame.
+    receivedSignal = channel.Process(
+        rawSignal,
+        outputPowerDbm=22.0,
+    )
     frameRecords.append(
         {
             "frameIndex": frameIndex,
+            "referenceCalibration": (
+                channel.GetLastCalibrationMetrics()
+            ),
             **channel.GetThermalMetrics(),
         }
     )
     channel.AdvanceThermalIdle(idleTimeSec=1.0e-3)
-
-assert np.array_equal(frozenInput, frozenInput.copy())
 ```
 
-测试阶段没有提供 `outputPowerDbm`，所以不会重新调整输入。`GetThermalMetrics()` 可返回结温、平均耗散、RF占空比、有效RF区输出功率和累计物理时间；有效区定义与 `activePowerThresholdDb` 一致，因此前后补零不会把输出功率读数拉低。EVM、ACLR仍由独立 `Analysis` 使用每帧输出计算。
+调用方没有关闭温度模型，也没有显式构造功率校准器。每帧的内部校准使用同一个参考温度目标，不追踪当前热态输出；校准试探不推进热时间，恢复后的真实发射只推进一帧。`GetLastCalibrationMetrics()` 报告参考校准结果，`GetThermalMetrics()` 报告结温、平均耗散、RF占空比、自然漂移后的有效RF区输出功率和累计物理时间。有效区定义与 `activePowerThresholdDb` 一致，因此前后补零不会把输出功率读数拉低。EVM、ACLR仍由独立 `Analysis` 使用每帧输出计算。
 
 固定温度角、不同单RC热阻和25%/50%/100%占空比的最小隔离系统、可运行代码及实测对比表见 [Example.md](./Example.md)。
 
@@ -2457,5 +2591,8 @@ assert np.array_equal(frozenInput, frozenInput.copy())
 - [D. R. Morgan 等, “A Generalized Memory Polynomial Model for Digital Predistortion of RF Power Amplifiers,” IEEE TSP, 2006](https://doi.org/10.1109/TSP.2006.879264)
 - [Y. Mancuso 与 R. Quéré, “Behavioral Thermal Modeling for Microwave Power Amplifier Design,” IEEE TMTT, 2007](https://doi.org/10.1109/TMTT.2007.907715)
 - [S. A. Bassam 等, “Black-box Modeling and Compensation of Bursty Communication Signals in RF Power Amplifiers with Power-Dependent Parameters,” 2014](https://arxiv.org/abs/1410.8119)
+- [Analog Devices AN-1604, “Thermal Management Calculations for RF Amplifiers in LFCSP and Flange Packages”](https://www.analog.com/en/resources/app-notes/an-1604.html)
+- [Analog Devices AN-2591, “When It Comes to Long-Term Reliability of RF Amplifier ICs, Focus First on Die Junction Temperature”](https://www.analog.com/en/resources/app-notes/an-2591.html)
+- [Qorvo, “GaN Thermal Analysis for High-Performance Systems”](https://www.qorvo.com/-/media/files/qorvopublic/white-papers/qorvo-gan-thermal-analysis-for-high-performance-systems-white-paper.pdf)
 
 本工程的独立Rapp PA遵循经典无记忆SSPA假设；Wiener中的Rapp AM-AM、有界AM-PM和默认GMP系数是面向教学与算法比较的组合实现。具体公式和默认值以 `inc/lib/PaModel.py` 为准。
