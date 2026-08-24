@@ -101,7 +101,7 @@ flowchart LR
 |---|---|---|---|
 | `Fec.BuildDescriptorLdpcMatrices`, `Fec.TripleScore` | N | 确定性构造35×90稀疏校验矩阵；内部邻域评分先避免四环对应的重复行对，再平衡校验节点度数 | Fec §3 |
 | `Fec.EncodeDescriptorLdpc` | N | 对55 bit信息执行系统短码LDPC累加编码，生成90 bit零综合码字 | Fec §4、§6.2 |
-| `Fec.DecodeDescriptorLdpc` | N | 对90个软BPSK值执行纯NumPy normalized min-sum迭代译码；兼容Python 3.9至3.12 | Fec §5、§6.3 |
+| `Fec.DecodeDescriptorLdpc` | N | 对90个软BPSK值执行纯NumPy normalized min-sum迭代译码；每个校验节点一次求最小/第二小幅度并向量化生成全部外信息，避免逐边删除数组且保持重复最小值语义；兼容Python 3.9至3.12 | Fec §5、§6.3，Performance §7.1 |
 
 ### 3.2 `inc/lib/ParseWifi.py`：接收帧解析与参考恢复
 
@@ -111,7 +111,7 @@ flowchart LR
 |---|---|---|---|
 | `ParseWifi.IntegerToBits`, `ParseWifi.BitsToInteger` | N | 在固定宽度整数与MSB优先比特序列之间无损转换 | ParseWifi §3 |
 | `ParseWifi.CalculateDescriptorCrc` | N | 按CRC-16-CCITT多项式验证描述字段的时序、采样率和内容 | ParseWifi §3.3 |
-| `ParseWifi.DescriptorLdpcPhysicalLayout` | P/N | 在两个52音调描述符号中各放置七个已知BPSK导频，并把LDPC码字偶/奇位分散到不同符号 | ParseWifi §3.4 |
+| `ParseWifi.CachedDescriptorLdpcPhysicalLayout`, `ParseWifi.DescriptorLdpcPhysicalLayout` | P/N | 在两个52音调描述符号中各放置七个已知BPSK导频，并把LDPC码字偶/奇位分散到不同符号；前者只缓存不可变布局字节，后者每次返回以这些字节为底层所有者的新只读NumPy视图，外部不能污染缓存 | ParseWifi §3.4，Performance §7.2 |
 | `ParseWifi.DecodeWifiDescriptorPayload`, `ParseWifi.BuildDecodedDescriptorParameters` | E/N | 恢复55 bit新版载荷并统一校验格式、带宽、MCS、GI、空间流、映射和10 bit随机种子 | ParseWifi §3.2、§5.3 |
 | `ParseWifi.BuildWifiDescriptorBits`, `ParseWifi.DecodeWifiDescriptorBits` | E/N | 打包新版LDPC描述或自动分派新版LDPC/旧版CRC硬判决恢复 | ParseWifi §3 |
 | `ParseWifi.DecodeLegacyWifiDescriptorBits` | E/N | 保留对历史32 bit seed、CRC-16顺序描述波形的接收兼容 | ParseWifi §3.5 |
@@ -162,7 +162,7 @@ flowchart LR
 | `RappPA.SmallSignalGain` | P/N | 取零幅度极限，返回正实数 `linearGain` | PaModel §2.2.4 |
 | `WienerPA.Process` | P/N | FIR 线性记忆→Rapp AM-AM→幅度相关 AM-PM | PaModel §3.1–§3.4 |
 | `WienerPA.SmallSignalGain` | P/N | 取零幅度极限，返回线性 FIR 直流复增益 | PaModel §3.5 |
-| `GMPPA.Process` | P/N | 计算主、滞后包络和超前包络 GMP 支路 | PaModel §4.2–§4.6 |
+| `GMPPA.Process` | P/N | 计算主、滞后包络和超前包络GMP支路；每次调用只构造一次实际系数需要的唯一延迟波形及delay/order包络幂，并保持原支路与系数累加顺序 | PaModel §4.2–§4.6，Performance §5 |
 | `GMPPA.SmallSignalGain` | P/N | 只保留一阶主支路得到小信号增益 | PaModel §4.7 |
 | `DohertyPA.PeakingActivation` | P/N | 对输入包络执行带有限过渡宽度的平滑峰值支路开启函数，避免硬开关产生不连续谱再生 | PaModel §4.8 |
 | `DohertyPA.Process` | P/N | 组合连续工作的载波支路、包络门控的峰值支路、支路时延/复合路系数及简化负载调制 | PaModel §4.8 |
@@ -205,11 +205,11 @@ flowchart LR
 | `Channel.SetPaModel` | E | 绑定必须提供公开Process入口的PA对象，并在PA更换时清除私有功率校准状态 | Channel §1、§6 |
 | `Channel.ResolveCouplingPaths`, `Channel.HasPrePaCoupling` | P/E | 把每条源链到目的链的复增益、整数/分数时延和FIR规范为有限参数，并判断PA输入功率是否存在链间耦合依赖 | Channel §1.3、§5 |
 | `Channel.ApplyCouplingPath`, `Channel.ApplyMimoCoupling` | P/N | 对单条串扰路径依次执行FIR、分数时延、整数时延和复系数，再把所有间接路径与隐含单位直通路径线性叠加 | Channel §1.3 |
-| `Channel.ResolveIqImbalanceCoefficients`, `Channel.ApplyIqImbalanceStage` | P/N | 把I/Q增益比和正交相位误差精确换算为直接项与共轭镜像项，再以统一广义线性方程叠加Tx或FB的DC偏置 | Channel §1.2.1、§4.4、§6.2、§6.5 |
+| `Channel.ResolveIqImbalanceCoefficients`, `Channel.ApplyIqImbalanceStage` | P/N | 把I/Q增益比和正交相位误差精确换算为直接项与共轭镜像项，再以统一广义线性方程叠加Tx或FB的DC偏置；增益0 dB、相位0度且DC为0时返回独立副本 | Channel §1.2.1、§4.4、§6.2、§6.5，Performance §6 |
 | `Channel.TransmitterIqCoefficients`, `Channel.FeedbackIqCoefficients`, `Channel.ApplyTransmitterIqImbalance` | P/N/E | 分别返回Tx/FB的直接与镜像系数；各自enabled为False时报告理想系数对。Tx开启时在PA前执行增益/相位/DC非理想并同时进入forward和fb，关闭时返回数值相同的复数副本 | Channel §1.2.1、§4.4、§6.2、§6.5 |
 | `Channel.ApplyPrePaCoupling`, `Channel.ApplyPostPaCoupling` | P/N | 分别在Tx I/Q之后、非线性PA之前和干净PA输出之后应用不同耦合矩阵；前者改变PA实际激励，后者只改变观测到的多路叠加 | Channel §1.3 |
 | `Channel.ProcessBoundPaFloating`, `Channel.ProcessPaBankForCalibration` | P/N/E | 在内部浮点域运行绑定PA；兼容校准回调采用“已提交模拟驱动→Tx I/Q→PA前耦合→各路PA”，并返回尚未经过PA后耦合和接收噪声的逐PA输出 | Channel §1.3–§1.4、§6 |
-| `Channel.ResolveCalibrationDriveDbPerChain`, `Channel.ApplyCalibrationDrive`, `Channel.SetCalibrationDriveDb`, `Channel.ProcessCalibrationDrive` | P/N/E | 在公开码解码后、Tx I/Q与PA前耦合之前校验和应用逐链模拟驱动；探测迭代不改状态，收敛时原子提交，校准参考面排除PA后耦合与接收链 | Channel §1.4、§5–§6.3 |
+| `Channel.ResolveCalibrationDriveDbPerChain`, `Channel.ApplyCalibrationDrive`, `Channel.SetCalibrationDriveDb`, `Channel.ProcessCalibrationDrive` | P/N/E | 在公开码解码后、Tx I/Q与PA前耦合之前校验和应用逐链模拟驱动；所有drive为0 dB时返回独立副本；探测迭代不改状态，收敛时原子提交，校准参考面排除PA后耦合与接收链 | Channel §1.4、§5–§6.3，Performance §6 |
 | `Channel.ResolveCalibrationTargets`, `Channel.ConfigurePowerCalibration` | P/E | 把SISO共同目标或MIMO逐链dBm序列规范化，并配置内部 `PowerCalibration`；存在PA前耦合时默认启用有限差分雅可比联合功率闭环 | Channel §1.4、§5–§6.3 |
 | `Channel.CalibratePaInput`, `Channel.GetLastPaInput`, `Channel.GetLastTransmitterOutput`, `Channel.GetLastActualPaInput`, `Channel.GetLastPaOutput`, `Channel.GetLastCalibrationMetrics` | P/N/E | 对任意初始幅度原始波形配置目标并调用 `PowerCalibration.Calibrate` 的统一热事务与参考温度功率闭环；分别保留Tx I/Q前后、耦合后PA输入和无热校准输出参考面 | Channel §1、§6.2、§6.3、§6.8、§10 |
 | `Channel.SuspendThermalModel`, `Channel.RestoreThermalModel` | E/N | 把 `PowerCalibration` 的暂停/恢复事务代理到实际绑定PA；要求协议成对出现，无热对象使用 `None` 快照，实时 `enabled=False` 由PA保持为硬关闭 | Channel §6.10、§10、PaModel §13.7 |
@@ -220,10 +220,10 @@ flowchart LR
 | `Channel.ValidateSignal` | N/E | 保留SISO向量或MIMO矩阵形状，并拒绝空、非有限或不支持维度的波形 | Channel §1、§6 |
 | `Channel.ResolveNoiseRmsVolts`, `Channel.ResolveNoiseRmsNormalized` | P/N | 把毫伏或dBm噪声换成复包络总RMS电压，再按PA满量程dBm映射到内部归一化单位 | Channel §3.2–§3.3、§3.5 |
 | `Channel.ResolveSnrNoiseRmsPerChain` | P/N | 按逐链有效突发信号RMS与 `10^{-SNR/20}` 计算复噪声总RMS，排除补零和长占空比静默 | Channel §3.4 |
-| `Channel.ApplyPhaseRotation` | P/N | 计算PA输出乘以单位复指数，当前相位仅为-90、0或+90度 | Channel §2 |
+| `Channel.ApplyPhaseRotation` | P/N | 计算PA输出乘以单位复指数，当前相位仅为-90、0或+90度；0度时返回独立副本 | Channel §2，Performance §6 |
 | `Channel.AddNoise` | P/N | 在毫伏、绝对dBm或有效突发SNR三种互斥控制中选择一种，生成I/Q各占总方差一半的圆对称复白高斯噪声并叠加到旋转后波形 | Channel §3.1–§3.5 |
-| `Channel.ResolveFeedbackFirTaps`, `Channel.ApplyFeedbackLinearResponse` | P/N | 将可选反馈FIR规范为非空有限复抽头，并按每链执行因果卷积、反馈电压增益和附加相位 | Channel §1.2、§4.1 |
-| `Channel.ApplyFeedbackNonlinearity` | P/N | 使用 $v+c_3|v|^2v$ 模拟观察接收机三阶AM-AM/AM-PM，并可执行保持相位的复包络径向限幅 | Channel §4.2 |
+| `Channel.ResolveFeedbackFirTaps`, `Channel.ApplyFeedbackLinearResponse` | P/N | 将可选反馈FIR规范为非空有限复抽头，并按每链执行因果卷积、反馈电压增益和附加相位；单抽头1、0 dB和0度时返回独立副本 | Channel §1.2、§4.1，Performance §6 |
+| `Channel.ApplyFeedbackNonlinearity` | P/N | 使用 $v+c_3|v|^2v$ 模拟观察接收机三阶AM-AM/AM-PM，并可执行保持相位的复包络径向限幅；三阶系数为0且无限幅时返回独立副本 | Channel §4.2，Performance §6 |
 | `Channel.ApplyFeedbackTimingAndFrequency` | P/N | 通过插值模拟分数时延和SFO，补入整数时延，再按真实采样率施加CFO相位斜坡 | Channel §4.3 |
 | `Channel.ApplyFeedbackIqImbalance` | P/N/E | 仅在fb模式且 `fbIqImbalanceEnabled=True` 时使用独立的I/Q直接项、共轭镜像项和复直流偏置；False时增益/相位/DC整级旁路，forward模式始终跳过该接收机误差 | Channel §4.4、§6.5 |
 | `Channel.ApplyFeedbackAdc` | P/N | 对反馈接收机内部I/Q分量执行独立满量程限幅、舍入与有限位宽量化，再解码回内部浮点域 | Channel §4.5 |
@@ -352,7 +352,7 @@ flowchart LR
 | `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.MaximumOutputPowerDbm`, `PowerCalibration.Width`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate`, `PowerCalibration.SetPaModel` | E | 用ChainMap保存50 Ω端口、默认25 dBm额定输出极限、统一/逐链目标dBm、独立或联合闭环参数、有效区检测阈值和公开I/Q位宽；绑定对象或绑定方法并从协议所有者发现位宽、成对drive接口和成对热事务接口，普通lambda不隐式代理闭包热状态，活动校准事务期间拒绝重绑 | SigProc §13 |
 | `PowerCalibration.DbmToRms`, `PowerCalibration.RmsToDbm` | P/N | 按 $P=V_{\mathrm{RMS}}^2/R$ 在绝对 dBm 功率与复包络 RMS 电压之间双向换算 | SigProc §13 |
 | `PowerCalibration.OutputPowerToDriveScale`, `PowerCalibration.NormalizedRmsToOutputPowerDbm` | P | 在目标dBm与相对额定满量程的归一化RMS之间双向换算 | SigProc §13 |
-| `PowerCalibration.FindActiveSampleMask`, `PowerCalibration.CalculateActiveRmsPerChain` | P/N | 以逐链峰值相对门限识别突发有效样点，闭合短过零间隙，但排除前后补零和长占空比静默区，再按有效样点能量计算RMS | SigProc §13.1 |
+| `PowerCalibration.FindActiveSampleMask`, `PowerCalibration.CalculateActiveRmsPerChain` | P/N | 以逐链峰值相对门限识别突发有效样点，按布尔转换定位完整False区间并只闭合短过零间隙，排除前后补零和长占空比静默区，再按有效样点能量计算RMS | SigProc §13.1，Performance §3.3 |
 | `PowerCalibration.PrepareDrivePreset`, `PowerCalibration.EvaluateDrivePreset` | P/N/E | 浮点模式直接缩放波形；支持协议的定点plant固定生成带数字余量的合法公开码，并把剩余逐链增益放到解码后模拟驱动，再运行真实plant和测量有效输出功率 | SigProc §13.2–§13.3 |
 | `PowerCalibration.Calibrate` | P/N/E | 局部捕获原owner的成对热方法，统一执行“热暂停→纯电闭环→`finally` 向同一owner恢复”；拒绝嵌套校准和事务中重绑，直接绑定热PA或Channel都不让trial推进温度，实时禁用配置不能被旧快照复活 | SigProc §13.2–§13.4 |
 | `PowerCalibration.CalibrateElectricalOnly` | P/N/E | 仅供 `Calibrate` 事务内调用的数值内核：无耦合时用有界dB修正/二分，有PA前耦合时用功率Jacobian联合更新，仅在收敛后提交drive；事务外调用硬性抛出 `RuntimeError`，防止绕过热隔离 | SigProc §13.2–§13.3 |
@@ -362,11 +362,12 @@ flowchart LR
 | `SignalProcessingResult.ToDict`, `SignalOverlapResult.ToDict` | E | 只序列化估计标量或重叠坐标，不重新计算同步与相关 | SigProc §9 |
 | `SigProc.__init__`, `SigProc.ValidateSignal`, `SigProc.GetParameters`, `SigProc.UpdateParameters`, `SigProc.ValidateParameters` | E | 保存参考、解析ChainMap、警告并忽略未知键、检查已识别配置的单位和有限性 | SigProc §9–§10 |
 | `SigProc.ResolveMaximumIntegerDelay` | N/E | 把自动/外部时延边界转换为有限相关搜索半径 | SigProc §3、§12 |
-| `SigProc.EstimateSignalOverlap` | P/N | 对可能裁剪、补零或不等长的发送与接收波形搜索有符号时延，以逐链能量归一化互相关确定公共区间 | SigProc §3.3 |
-| `SigProc.EstimateIntegerDelay` | P/N | FFT 互相关并按重叠能量归一化，最大相关峰给出整数时延 | SigProc §3 |
+| `SigProc.CalculateRangeEnergies` | N | 条件良好时使用累计差并估计消减上界；仅对可疑半开区间用成对二叉树累加互不重叠的非负局部功率和，避免强突发后小噪声窗口发生灾难性消减 | SigProc §3.3，Performance §3.1–§3.2 |
+| `SigProc.EstimateSignalOverlap` | P/N | 对可能裁剪、补零或不等长的发送与接收波形搜索有符号时延；三段FFT批量生成完整/正探针/负探针相关，分层区间树生成逐候选能量，Cauchy-Schwarz约束抑制零窗舍入伪峰，并保持分数、重叠长度和最早测量起点的并列次序 | SigProc §3.3，Performance §3.2 |
+| `SigProc.EstimateIntegerDelay` | P/N | FFT互相关后向量化生成搜索半径内全部重叠边界，并用分层区间树计算能量；`argmax`在升序lag上保持原来的第一个并列峰语义 | SigProc §3，Performance §3.1 |
 | `SigProc.ExtractIntegerAligned` | N | 按估计时延提取重叠样点并对缺失位置补零 | SigProc §3 |
 | `SigProc.EstimateCarrierFrequencyOffset` | P/N | 分块复增益相位随时间的斜率估计 CFO | SigProc §4.1 |
-| `SigProc.CompensateCarrierFrequencyOffset` | P/N | 乘 $e^{-j2\pi\hat f n/f_s}$ 撤销载波相位斜率 | SigProc §4.2 |
+| `SigProc.CompensateCarrierFrequencyOffset` | P/N | 乘 $e^{-j2\pi\hat f n/f_s}$ 撤销载波相位斜率；频偏严格为0 Hz时直接返回独立副本 | SigProc §4.2，Performance §3.4 |
 | `SigProc.RefineCorrelationPeak` | N | 对相关峰邻点做抛物线插值得到亚采样峰位置 | SigProc §5 |
 | `SigProc.EstimateTimingOffsets` | P/N | 多窗口局部相关位置的截距给分数时延、斜率给 SFO | SigProc §5–§6 |
 | `SigProc.InterpolateSignal` | N/P | 加窗 sinc/Lanczos 重采样，实现分数时延和采样率校正 | SigProc §7 |
@@ -393,7 +394,7 @@ flowchart LR
 |---|---|---|---|
 | `Analysis.Analyze`, `Analysis.GetLastMimoMetrics` | E | 直接返回普通指标字典，调用方使用固定键读取模拟输出功率、SNR、EVM、ACLR和MIMO明细 | Analysis §3.1、§10 |
 | `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把曲线或逐轮记录转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
-| `Analysis.AveragePeriodogram` | N/P | Hann 窗、50% 重叠的 Welch PSD 平均 | Analysis §6.2 |
+| `Analysis.AveragePeriodogram` | N/P | Hann窗、50%重叠的Welch PSD平均；先按原顺序累计未移位功率，最后只执行一次固定频率bin移位 | Analysis §6.2，Performance §4.2 |
 | `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考，Reference为`None`时复用`WifiWaveform.samples`；发送辅助直接相关并截取公共区间，可从兼容 `parseParameters` 转交采样率/带宽但不调用Parser；仅盲模式调用ParseWifi；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§2、§11、ParseWifi §8 |
 | `Analysis.GetParsedWifiFrame`, `Analysis.GetAnalysisMode`, `Analysis.Width`, `Analysis.GetSignalOverlapResult` | E | 返回盲模式解析结果、三态路径名、位宽或发送辅助重叠坐标；未产生对应结果时返回 `None` | Analysis §1、§11、ParseWifi §8、SigProc §3.3、FixedPoint §6 |
 | `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc` | Analysis §2、§9 |
@@ -405,15 +406,16 @@ flowchart LR
 | `Analysis.CalculateEvm`, `Analysis.CalculatePreparedEvm` | P/N | 数据星座 RMS EVM 及 dB/% 换算 | Analysis §5.2 |
 | `Analysis.CalculateEvmAlignedMse`, `Analysis.CalculatePreparedEvmAlignedMse` | P/N | 与 EVM 接收链一致的归一化符号 MSE，严格等于 EVM² | Analysis §5.8 |
 | `Analysis.CalculatePreparedSnrPerChain` | P/N | 每条物理 PA 链独立能量比 | Analysis §9.2 |
-| `Analysis.CalculatePreparedEvmPerSpatialStream` | P/N | 空间解映射后逐流星座误差能量比 | Analysis §9.1 |
+| `Analysis.CalculatePreparedEvmPerSpatialStream` | P/N | 空间解映射后逐流星座误差能量比；一次MIMO `Analyze`内与汇总EVM共享参考和测量网格，但下一次公开调用重新解调以响应公开参考或元数据修改 | Analysis §9.1，Performance §4.1–§4.2 |
 | `Analysis.IntegrateAclr` | P/N | 等宽主/邻道 PSD 积分并取较差邻道 | Analysis §6.1、§6.3 |
-| `Analysis.CalculateAclr`, `Analysis.CalculatePreparedAclr`, `Analysis.CalculatePreparedAclrPerChain` | P/N | 数据字段 Welch PSD 的汇总/逐链 ACLR | Analysis §6、§9.3 |
-| `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让输出功率/SNR/EVM/ACLR共用一次同步结果并保存阶段映射 | Analysis §1、§3.1 |
+| `Analysis.CalculatePreparedAclrDetails` | P/N | 对每条物理链只计算一次数据字段Welch PSD，由同一组频谱同时积分逐链ACLR并在功率域求和后积分汇总ACLR | Analysis §6、§9.3，Performance §4.2 |
+| `Analysis.CalculateAclr`, `Analysis.CalculatePreparedAclr`, `Analysis.CalculatePreparedAclrPerChain` | P/N | 数据字段Welch PSD的汇总/逐链ACLR，并统一复用 `CalculatePreparedAclrDetails` 的频谱实现 | Analysis §6、§9.3，Performance §4.2 |
+| `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让输出功率/SNR/EVM/ACLR共用一次同步结果并保存阶段映射；MIMO汇总/逐流EVM共享一次测量解调，汇总/逐链ACLR共享每链一次PSD | Analysis §1、§3.1，Performance §4 |
 | `Analysis.BuildTwoToneWaveform`, `Analysis.AnalyzeTwoTone` | P/E | 保留已有双音频率元数据，或从原始NumPy/list样值、采样率和两个明确频率构造受验证元数据；省略位宽时把整数且超出归一化范围的记录识别为默认16位，其余raw记录按浮点处理，浮点发送元数据也允许自动识别典型16位接收码，显式接收位宽可不同于发送元数据位宽；随后一次返回基波、IM3/IM5/IM7及模拟输出功率字典，不进入Wi-Fi解析路径 | Analysis §11.4、TwoToneAnalysis §2、§5、§8.1–§8.2 |
 | `Analysis.CalculateIntermodulationOrder`, `Analysis.CalculateIm3`, `Analysis.CalculateIm5`, `Analysis.CalculateIm7` | P/E | 选择3、5或7阶互调，接受元数据或原始NumPy/list输入，返回上下侧物理频率、同侧基波归一化dBc、绝对互调dBFS及同一次分析的 `outputPowerDbm`；非法阶次或缺失原始样值物理频率直接拒绝 | TwoToneAnalysis §4–§5、§8.1–§8.2 |
-| `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO对齐输出，复制反馈同步估计，并在Analysis中按严格EVM选择最佳实测轮 | DpdIlc §7、Analysis §5.10 |
+| `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO对齐输出，复制反馈同步估计，并在Analysis中按严格EVM在线维护最佳实测轮；直接复用该轮已算指标且只保留最佳输入/输出副本，不做第二次最佳轮分析 | DpdIlc §7、Analysis §5.10，Performance §4.3 |
 | `Analysis.AnalyzeMimoIlcHistory` | P/E | 按轮组合各PA链输出，以完整MIMO空间解映射统一计算性能并在Analysis中选择最佳轮 | Analysis §9 |
-| `Analysis.AnalyzePowerEvmCurve` | P/E | 把每个方法求值器视为完整“DPD+PA”被测对象，在共同目标dBm点反复更新输入并重新运行方法，直到PA实测有效突发输出进入容限；不对方法输出做后级缩放，因此EVM对应真实压缩工作点 | Analysis §8 |
+| `Analysis.AnalyzePowerEvmCurve` | P/E | 把每个方法求值器视为完整“DPD+PA”被测对象，在共同目标dBm点反复更新输入并重新运行方法，直到PA实测有效突发输出进入容限；不对方法输出做后级缩放，只调用EVM路径而不附带计算SNR/IRR/ACLR，因此EVM仍对应真实压缩工作点 | Analysis §8，Performance §4.3 |
 | `Analysis.SavePowerEvmCurveData`, `Analysis.Print`, `Analysis.PrintMimo`, `Analysis.Save`, `Analysis.SaveConvergence`, `Analysis.PrintConvergence` | E | 展示/序列化既有结果，不改变物理指标 | Analysis §10–§11 |
 
 ## 9. `Draw.py`：图形函数

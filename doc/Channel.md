@@ -4,6 +4,8 @@
 
 `inc/lib/Channel.py` 描述PA前多通道耦合、独立非线性PA、PA后耦合、外部仪表采样和板载反馈接收机。`sampleMode` 决定耦合后的PA输出进入哪条采样路径：
 
+精确理想的I/Q级、0度公共移相、单位FB线性响应、无FB三阶/限幅和0 dB模拟drive现在使用独立数组旁路；非理想配置、随机噪声、热状态和闭环校准仍在每次调用中真实执行。旁路条件、状态边界和参考耗时见 [Performance.md](./Performance.md#6-channel理想级旁路)。
+
 ```mermaid
 flowchart LR
     raw["用户原始波形"] --> active["有效突发检测<br/>逐链单位RMS归一化"]

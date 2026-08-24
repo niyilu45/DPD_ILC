@@ -2,6 +2,8 @@
 
 本文对应 `inc/utils/SigProc.py`。该模块位于“测量/仿真输出”和“性能指标计算”之间，专门处理整数时延、分数时延、载波频偏、采样频偏、公共复增益和 dBm/RMS 功率标定。`Analysis` 只消费校正后的信号并计算 SNR、EVM、ACLR，避免把同步误差错误地解释为 PA 非线性。
 
+整数lag搜索现已批量向量化，并保留第一个并列峰的选择语义；不等长重叠搜索使用三段FFT相关、无全局差分的分层区间能量与Cauchy-Schwarz边界；有效突发短空洞按连续False区间处理；0 Hz CFO使用独立副本快路径。公式、等价性边界和参考耗时见 [Performance.md](./Performance.md#3-sigproc同步路径)。
+
 ---
 
 ## 1. 统一信号模型
@@ -161,6 +163,8 @@ C(d)=
 ```math
 \rho(d)=\sqrt{C(d)}.
 ```
+
+窗口能量由 `CalculateRangeEnergies()` 计算。数值条件良好时它使用快速累计差，同时估计减法的浮点消减上界；只有可疑范围才构造二叉成对求和树，把区间拆成若干互不重叠的局部节点直接相加。因此普通波形保持向量化速度，强突发之后即使只有极低幅噪声，也不会因为两个大数相减丢失尾部窗口的有效数字。三段FFT相关仍负责批量计算分子，Cauchy-Schwarz上界负责限制FFT舍入误差。
 
 由于分子和分母具有相同的幅度平方量纲，公共复增益和每链固定功率缩放不会改变理想情况下的相关置信度。若多个候选得分相同，算法依次偏好更长公共区间和更早的接收起点。结果保存为 `SignalOverlapResult`：
 
@@ -375,6 +379,7 @@ z[n]=\frac{z_0[n]}{\hat g}.
 classDiagram
     class SigProc {
         +Process(measuredSignal, estimationSlice)
+        +CalculateRangeEnergies(powerValues, rangeStarts, rangeStops)
         +EstimateSignalOverlap(measuredSignal, referenceSignal, ...)
         +EstimateIntegerDelay(measuredSignal)
         +EstimateCarrierFrequencyOffset(integerAlignedSignal)

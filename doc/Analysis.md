@@ -9,6 +9,8 @@
 
 > **重要定义**：进入指标计算前，`Analysis` 会调用 `SigProc` 消除整数/分数时延、载波频偏、采样频偏和最佳公共复增益。这里的 SNR 是校正后理想信号功率与全部残差功率之比；残差仍包含随机噪声、PA 非线性、记忆失真和同步估计残差，因此不一定等于仪器意义上的纯热噪声 SNR。
 
+> **性能说明**：一次MIMO `Analyze()`中，汇总/逐流EVM共享各一次参考和测量解调，汇总/逐链ACLR共享每链一次PSD；功率-EVM扫描只计算EVM，ILC最佳轮直接复用逐轮已算指标。公开参考、Wi-Fi元数据、测量波形及最终metrics都不会跨调用缓存，避免调用方修改对象后得到陈旧结果。优化原理、典型耗时和使用建议见 [Performance.md](./Performance.md)。
+
 ---
 
 ## 1. 分析流程
@@ -1171,7 +1173,7 @@ P_{\mathrm{NL},k}
 =20\log_{10}(\mathrm{EVM}_{\mathrm{rms}}).
 ```
 
-代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子。`DpdIlc` 在迭代期间完全不调用该方法，但会先调用独立的 `SigProc`，把每轮反馈同步并除去公共复增益，再使用该参考域波形计算原生MSE和ILC更新。`ILCIteration` 保存原生MSE、当前输入、参考域对齐输出以及本轮同步估计。ILC结束后，`Analysis.AnalyzeIlcHistory` 对每轮对齐输出调用普通 `Analyze`，把SNR、EVM、ACLR和原生MSE合并为 `ILCPerformanceIteration`，并在分析层按严格EVM选择最佳轮。MIMO对应使用 `AnalyzeMimoIlcHistory`，它先按轮组合全部PA链，再执行完整空间解映射。
+代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子。`DpdIlc` 在迭代期间完全不调用该方法，但会先调用独立的 `SigProc`，把每轮反馈同步并除去公共复增益，再使用该参考域波形计算原生MSE和ILC更新。`ILCIteration` 保存原生MSE、当前输入、参考域对齐输出以及本轮同步估计。ILC结束后，`Analysis.AnalyzeIlcHistory` 对每轮对齐输出调用普通 `Analyze`，把SNR、EVM、ACLR和原生MSE合并为 `ILCPerformanceIteration`，并在分析层按严格EVM在线维护最佳轮。该轮已经得到的metrics会直接复用，只复制当前最佳输入和输出，不在循环结束后再次分析最佳波形。MIMO对应使用 `AnalyzeMimoIlcHistory`，它先按轮组合全部PA链，再执行完整空间解映射。
 
 ```mermaid
 flowchart LR
@@ -1335,6 +1337,8 @@ ACLR（Adjacent Channel Leakage Ratio）比较主信道功率和邻道功率：
 
 Hann 窗降低矩形截断带来的频谱旁瓣泄漏；分段平均降低估计方差。代价是频率分辨率和统计独立性存在折中。
 
+实现先按分段先后顺序累加未移位FFT的功率，全部分段平均完成后才对最终PSD执行一次 `fftshift`。频率bin的排列与原实现相同，而每个bin内部的浮点加法次序不变；只是避免对每一段重复执行同一个固定数组置换。
+
 整段单次FFT与分段加窗Welch方法在分辨率、旁瓣、栅栏损失、估计方差、ENBW、内存和计算量上的完整公式与选择示例见 [FAQ Q7](./FAQ.md#q7计算功率谱时整段fft与分段加窗fft有什么区别)。
 
 ### 6.3 频带功率和 ACLR
@@ -1371,6 +1375,8 @@ P_{\mathrm{upper}}=\sum_{k\in\mathcal B_{\mathrm{upper}}}\hat P[k].
 ```
 
 因为较小的比值对应较严重的邻道泄漏。
+
+`CalculatePreparedAclrDetails()`是汇总与逐链ACLR的统一内核：每条物理链只生成一次Welch PSD，同一链谱直接用于逐链积分，并在功率域与其他链谱相加后计算汇总值。`CalculatePreparedAclr()`和 `CalculatePreparedAclrPerChain()`继续保留已有接口并委托给该内核。完整复用关系见 [Performance.md](./Performance.md#42-mimo一次解调与每链一次psd)。
 
 ### 6.4 本 ACLR 与标准一致性测量的区别
 
@@ -1499,6 +1505,8 @@ A_{i,\mathrm{target}}
 ### 8.3 公平比较原则
 
 对每个输出功率点和每种方法，分析器都独立闭环到相同的PA实测输出功率。不同方法最终需要的输入预设可以不同，这正是非线性增益和DPD行为的一部分。闭环结束后直接把PA实测波形交给相同的 `CalculateEvm`，不做后级幅度重标定。这样曲线差异来自补偿方法在同一实际输出功率下的失真，而不是占空比、输入帧、随机种子或指标定义不同。
+
+这条曲线接口只消费EVM，因此每个方法/功率点不再附带运行输出功率报告、SNR、IRR和ACLR计算。功率闭环自己的有效区功率测量仍必须保留，EVM的同步和星座定义也没有简化；省略的只是曲线结果不使用的指标。
 
 ```mermaid
 flowchart LR
@@ -1647,6 +1655,8 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 ```
 
 再对该方向的合成波形计算 ACLR。
+
+程序中 `Analyze()`调用 `CalculatePreparedAclrDetails()`一次得到逐链和汇总结果，不会先算汇总频谱、再为逐链结果重复相同FFT。一次MIMO调用也只分别解调一次本轮参考和测量波形；两者都不跨公开调用缓存，因此直接修改参考、Wi-Fi元数据或测量数组会在下一次分析中生效。
 
 ### 9.4 MIMO明细字典
 

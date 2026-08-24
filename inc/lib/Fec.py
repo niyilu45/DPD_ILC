@@ -218,22 +218,37 @@ def DecodeDescriptorLdpc(
             )
             incomingMagnitudes = np.abs(incomingMessages)
             totalSign = float(np.prod(incomingSigns))
-            for localIndex, variableIndex in enumerate(variableIndices):
-                otherMagnitudes = np.delete(
-                    incomingMagnitudes,
-                    localIndex,
+            if incomingMagnitudes.size <= 1:
+                extrinsicMinimums = np.zeros(
+                    incomingMagnitudes.shape, dtype=float
                 )
-                minimumMagnitude = (
-                    float(np.min(otherMagnitudes))
-                    if otherMagnitudes.size
-                    else 0.0
+            else:
+                # Every outgoing check message needs the minimum magnitude of
+                # all other edges. One smallest/second-smallest reduction gives
+                # every result at once and replaces one np.delete allocation
+                # per Tanner-graph edge. Repeated minima retain the smallest
+                # value because removing one occurrence leaves another.
+                twoSmallest = np.partition(
+                    incomingMagnitudes, 1
+                )[:2]
+                minimumMagnitude = float(twoSmallest[0])
+                secondMinimumMagnitude = float(twoSmallest[1])
+                extrinsicMinimums = np.full(
+                    incomingMagnitudes.shape,
+                    minimumMagnitude,
+                    dtype=float,
                 )
-                checkToVariable[checkIndex, variableIndex] = (
-                    0.5
-                    * totalSign
-                    * incomingSigns[localIndex]
-                    * minimumMagnitude
-                )
+                minimumMask = incomingMagnitudes == minimumMagnitude
+                if np.count_nonzero(minimumMask) == 1:
+                    extrinsicMinimums[minimumMask] = (
+                        secondMinimumMagnitude
+                    )
+            checkToVariable[checkIndex, variableIndices] = (
+                0.5
+                * totalSign
+                * incomingSigns
+                * extrinsicMinimums
+            )
         posteriorLlr = channelLlr + np.sum(
             checkToVariable,
             axis=0,

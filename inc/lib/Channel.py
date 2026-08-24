@@ -1989,6 +1989,15 @@ class Channel:
         """
 
         complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        if (
+            float(gainImbalanceDb) == 0.0
+            and float(phaseImbalanceDegrees) == 0.0
+            and complex(dcOffset) == 0.0 + 0.0j
+        ):
+            # An enabled but ideal I/Q stage is physically an identity. Keep
+            # the public method's independent-array behavior while avoiding a
+            # conjugate array and three full-waveform arithmetic passes.
+            return complexInput.copy()
         directCoefficient, imageCoefficient = (
             self.ResolveIqImbalanceCoefficients(
                 gainImbalanceDb,
@@ -2270,6 +2279,8 @@ class Channel:
         phaseRadians = np.deg2rad(
             float(cast(float, self.parameters["phaseDegrees"]))
         )
+        if phaseRadians == 0.0:
+            return complexInput.copy()
         phaseFactor = np.exp(1j * phaseRadians)
         return np.asarray(
             complexInput * phaseFactor, dtype=np.complex128
@@ -2369,6 +2380,17 @@ class Channel:
             else complexInput
         )
         firTaps = self.ResolveFeedbackFirTaps()
+        feedbackGainDb = float(self.parameters["fbGainDb"])
+        feedbackPhaseDegrees = float(
+            self.parameters["fbPhaseDegrees"]
+        )
+        if (
+            firTaps.size == 1
+            and firTaps[0] == 1.0 + 0.0j
+            and feedbackGainDb == 0.0
+            and feedbackPhaseDegrees == 0.0
+        ):
+            return complexInput.copy()
         filteredMatrix = np.empty_like(inputMatrix)
         for chainIndex in range(inputMatrix.shape[1]):
             filteredMatrix[:, chainIndex] = np.convolve(
@@ -2379,12 +2401,12 @@ class Channel:
         with np.errstate(over="ignore", invalid="ignore"):
             feedbackGain = np.power(
                 10.0,
-                float(self.parameters["fbGainDb"]) / 20.0,
+                feedbackGainDb / 20.0,
             )
         feedbackPhase = np.exp(
             1j
             * np.deg2rad(
-                float(self.parameters["fbPhaseDegrees"])
+                feedbackPhaseDegrees
             )
         )
         linearOutput = filteredMatrix * feedbackGain * feedbackPhase
@@ -2422,12 +2444,17 @@ class Channel:
         thirdOrderCoefficient = complex(
             self.parameters["fbThirdOrderCoefficient"]
         )
+        clipAmplitudeValue = self.parameters["fbClipAmplitude"]
+        if (
+            thirdOrderCoefficient == 0.0 + 0.0j
+            and clipAmplitudeValue is None
+        ):
+            return complexInput.copy()
         nonlinearOutput = complexInput + (
             thirdOrderCoefficient
             * np.abs(complexInput) ** 2
             * complexInput
         )
-        clipAmplitudeValue = self.parameters["fbClipAmplitude"]
         if clipAmplitudeValue is not None:
             clipAmplitude = float(clipAmplitudeValue)
             outputMagnitude = np.abs(nonlinearOutput)
@@ -2935,6 +2962,8 @@ class Channel:
             selectedDriveValues,
             chainCount,
         )
+        if all(driveValue == 0.0 for driveValue in resolvedDriveDb):
+            return normalizedInput.copy()
         with np.errstate(over="ignore", invalid="ignore"):
             driveScale = np.power(
                 10.0, np.asarray(resolvedDriveDb, dtype=float) / 20.0

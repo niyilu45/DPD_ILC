@@ -13,6 +13,7 @@ post-FEC payload symbols instead of a complete MAC/FEC/PHY protocol stack.
 
 from collections import ChainMap
 from dataclasses import dataclass
+from functools import lru_cache
 from types import MappingProxyType
 from typing import (
     Callable,
@@ -157,20 +158,22 @@ def CalculateDescriptorCrc(payloadBits: np.ndarray) -> int:
     return crcValue
 
 
-def DescriptorLdpcPhysicalLayout(
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return pilot and code-bit positions for two descriptor symbols.
+@lru_cache(maxsize=1)
+def CachedDescriptorLdpcPhysicalLayout(
+) -> Tuple[bytes, bytes, bytes, bytes]:
+    """Build an immutable byte representation of the descriptor layout.
 
     Processing details:
         Algorithm: Place seven known BPSK pilots across each 52-tone symbol,
-        retain the remaining 90 positions for the LDPC codeword, and map even
-        and odd codeword indices into different OFDM symbols. The distribution
-        gives each symbol an independent complex-gain estimate and prevents
-        one symbol-local PA error burst from corrupting a contiguous field.
+        retain the remaining 90 positions for the LDPC codeword, map even and
+        odd codeword indices into different OFDM symbols, serialize the four
+        deterministic arrays into immutable bytes, and cache only those bytes.
+        A caller therefore cannot re-enable NumPy write access and corrupt the
+        layout shared by later parser candidates.
 
     Returns:
-        result: Pilot positions, pilot bits, nonpilot physical positions, and
-            the codeword-index order stored at those nonpilot positions.
+        result: Immutable byte strings for pilot positions, pilot bits,
+            nonpilot positions, and stored codeword-index order.
     """
 
     pilotPositionsPerSymbol = np.array(
@@ -197,11 +200,42 @@ def DescriptorLdpcPhysicalLayout(
         np.arange(0, 90, 2, dtype=np.int64),
         np.arange(1, 90, 2, dtype=np.int64),
     ]
+    return tuple(
+        layoutArray.tobytes()
+        for layoutArray in (
+            pilotPositions,
+            pilotBits,
+            codePhysicalPositions,
+            codewordOrder,
+        )
+    )
+
+
+def DescriptorLdpcPhysicalLayout(
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return safe read-only views of the descriptor physical layout.
+
+    Processing details:
+        Algorithm: Reuse immutable cached bytes and create fresh NumPy views
+        for each call. The views retain a bytes owner, so callers cannot make
+        them writable or modify the layout observed by later parser calls.
+
+    Returns:
+        result: Pilot positions, pilot bits, nonpilot physical positions, and
+            the codeword-index order stored at those nonpilot positions.
+    """
+
+    (
+        pilotPositionBytes,
+        pilotBitBytes,
+        codePositionBytes,
+        codewordOrderBytes,
+    ) = CachedDescriptorLdpcPhysicalLayout()
     return (
-        pilotPositions,
-        pilotBits,
-        codePhysicalPositions,
-        codewordOrder,
+        np.frombuffer(pilotPositionBytes, dtype=np.int64),
+        np.frombuffer(pilotBitBytes, dtype=np.uint8),
+        np.frombuffer(codePositionBytes, dtype=np.int64),
+        np.frombuffer(codewordOrderBytes, dtype=np.int64),
     )
 
 

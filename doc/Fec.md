@@ -12,6 +12,8 @@
 
 该LDPC码用于提高工程描述字段中格式、MCS、空间结构和10 bit seed的恢复可靠性。它不是IEEE 802.11数据字段规定的标准LDPC码。
 
+译码器的校验节点现在每轮只求一次最小值和第二小值，避免为每条Tanner图边删除数组；数学结果、归一化系数和停止条件不变。固定LDPC矩阵继续使用只读缓存。优化原理见 [Performance.md](./Performance.md#71-ldpc校验节点的两个最小值)。
+
 ```mermaid
 flowchart LR
     parameters["格式、MCS、空间结构、10 bit seed"] --> payload["ParseWifi：构造55 bit有效载荷"]

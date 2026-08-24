@@ -1413,17 +1413,38 @@ class PowerCalibration:
                     raise ValueError(
                         "unable to identify active signal samples"
                     )
-                for leftIndex, rightIndex in zip(
-                    activeIndices[:-1], activeIndices[1:]
+                firstActive = int(activeIndices[0])
+                lastActive = int(activeIndices[-1])
+                boundedMask = activeMask[
+                    firstActive:lastActive + 1,
+                    chainIndex,
+                ]
+                # Locate complete false runs instead of visiting every pair
+                # of adjacent active samples. Leading and trailing padding are
+                # excluded by the bounded slice, exactly preserving the old
+                # rule that only short internal gaps are filled.
+                transitions = np.diff(boundedMask.astype(np.int8))
+                inactiveStarts = (
+                    np.flatnonzero(transitions == -1)
+                    + firstActive
+                    + 1
+                )
+                inactiveStops = (
+                    np.flatnonzero(transitions == 1)
+                    + firstActive
+                    + 1
+                )
+                shortGapMask = (
+                    inactiveStops - inactiveStarts <= gapTolerance
+                )
+                for gapStart, gapStop in zip(
+                    inactiveStarts[shortGapMask],
+                    inactiveStops[shortGapMask],
                 ):
-                    inactiveLength = int(
-                        rightIndex - leftIndex - 1
-                    )
-                    if 0 < inactiveLength <= gapTolerance:
-                        activeMask[
-                            leftIndex:rightIndex + 1,
-                            chainIndex,
-                        ] = True
+                    activeMask[
+                        int(gapStart):int(gapStop),
+                        chainIndex,
+                    ] = True
         if np.any(np.sum(activeMask, axis=0) == 0):
             raise ValueError(
                 "unable to identify active signal samples"
@@ -2043,6 +2064,109 @@ class SigProc:
         return complexSignal
 
     @staticmethod
+    def CalculateRangeEnergies(
+        powerValues: np.ndarray,
+        rangeStarts: np.ndarray,
+        rangeStops: np.ndarray,
+    ) -> np.ndarray:
+        """Sum nonnegative power over many half-open sample intervals.
+
+        Processing details:
+            Algorithm: Use cumulative differences for well-conditioned
+            ranges, estimate their floating-point cancellation bound, and
+            recompute only suspect ranges through a pairwise binary sum tree.
+            Tree queries add disjoint local nonnegative sums and therefore do
+            not lose a tiny tail-window energy after a much stronger burst.
+
+        Args:
+            powerValues: One-dimensional nonnegative sample powers.
+            rangeStarts: Integer inclusive start index for every interval.
+            rangeStops: Integer exclusive stop index for every interval.
+
+        Returns:
+            result: Stable floating-point energy for every requested range.
+        """
+
+        powerArray = np.asarray(powerValues, dtype=float).reshape(-1)
+        startArray = np.asarray(rangeStarts, dtype=np.int64).reshape(-1)
+        stopArray = np.asarray(rangeStops, dtype=np.int64).reshape(-1)
+        if powerArray.size == 0:
+            raise ValueError("powerValues cannot be empty")
+        if startArray.shape != stopArray.shape:
+            raise ValueError(
+                "rangeStarts and rangeStops must have the same shape"
+            )
+        if (
+            np.any(startArray < 0)
+            or np.any(stopArray <= startArray)
+            or np.any(stopArray > powerArray.size)
+        ):
+            raise ValueError(
+                "energy ranges must be nonempty and inside powerValues"
+            )
+        if np.any(powerArray < 0.0) or np.any(np.isnan(powerArray)):
+            raise ValueError(
+                "powerValues must contain nonnegative non-NaN values"
+            )
+
+        energyPrefix = np.r_[0.0, np.cumsum(powerArray)]
+        rangeEnergies = (
+            energyPrefix[stopArray] - energyPrefix[startArray]
+        )
+        accumulationScale = (
+            np.abs(energyPrefix[stopArray])
+            + np.abs(energyPrefix[startArray])
+        )
+        cancellationBounds = (
+            4.0
+            * np.finfo(float).eps
+            * np.maximum(stopArray, 1)
+            * accumulationScale
+        )
+        suspectMask = (
+            ~np.isfinite(rangeEnergies)
+            | (rangeEnergies <= cancellationBounds)
+        )
+        if not np.any(suspectMask):
+            return np.maximum(rangeEnergies, 0.0)
+
+        treeBase = 1
+        while treeBase < powerArray.size:
+            treeBase <<= 1
+        rangeTree = np.zeros(2 * treeBase, dtype=float)
+        rangeTree[treeBase:treeBase + powerArray.size] = powerArray
+        childStart = treeBase
+        while childStart > 1:
+            parentStart = childStart // 2
+            rangeTree[parentStart:childStart] = np.sum(
+                rangeTree[childStart:2 * childStart].reshape(-1, 2),
+                axis=1,
+            )
+            childStart = parentStart
+
+        leftNodes = startArray[suspectMask] + treeBase
+        rightNodes = stopArray[suspectMask] + treeBase
+        stableEnergies = np.zeros(leftNodes.size, dtype=float)
+        while np.any(leftNodes < rightNodes):
+            activeMask = leftNodes < rightNodes
+            leftNodeMask = activeMask & ((leftNodes & 1) == 1)
+            if np.any(leftNodeMask):
+                stableEnergies[leftNodeMask] += rangeTree[
+                    leftNodes[leftNodeMask]
+                ]
+                leftNodes[leftNodeMask] += 1
+            rightNodeMask = activeMask & ((rightNodes & 1) == 1)
+            if np.any(rightNodeMask):
+                rightNodes[rightNodeMask] -= 1
+                stableEnergies[rightNodeMask] += rangeTree[
+                    rightNodes[rightNodeMask]
+                ]
+            leftNodes //= 2
+            rightNodes //= 2
+        rangeEnergies[suspectMask] = stableEnergies
+        return rangeEnergies
+
+    @staticmethod
     def EstimateSignalOverlap(
         measuredSignal: np.ndarray,
         referenceSignal: np.ndarray,
@@ -2166,71 +2290,152 @@ class SigProc:
             measuredLength - minimumOverlap,
         )
         numericFloor = np.finfo(float).tiny
-        bestScore = float("-inf")
-        bestMeasuredStart = 0
-        bestReferenceStart = activeReferenceStart
-        bestOverlapLength = 0
-        bestTieBreak = (float("-inf"), -1, 0)
-        for candidateLag in range(minimumLag, maximumLag + 1):
-            activeReferenceOffset = max(0, -candidateLag)
-            measuredStart = max(0, candidateLag)
-            overlapLength = min(
-                referenceLength - activeReferenceOffset,
-                measuredLength - measuredStart,
-            )
-            if overlapLength < minimumOverlap:
-                continue
-            probeLength = min(overlapLength, maximumProbeLength)
-            chainPowers = []
-            for chainIndex in range(referenceMatrix.shape[1]):
-                referenceProbe = activeReference[
-                    activeReferenceOffset:
-                    activeReferenceOffset + probeLength,
-                    chainIndex,
-                ]
-                measuredProbe = measuredMatrix[
-                    measuredStart:measuredStart + probeLength,
-                    chainIndex,
-                ]
-                referenceEnergy = float(
-                    np.vdot(referenceProbe, referenceProbe).real
-                )
-                measuredEnergy = float(
-                    np.vdot(measuredProbe, measuredProbe).real
-                )
-                correlationPower = float(
-                    np.abs(
-                        np.vdot(referenceProbe, measuredProbe)
-                    )
-                    ** 2
-                )
-                chainPowers.append(
-                    correlationPower
-                    / max(
-                        referenceEnergy * measuredEnergy,
-                        numericFloor,
-                    )
-                )
-            candidateScore = float(np.mean(chainPowers))
-            candidateTieBreak = (
-                candidateScore,
-                overlapLength,
-                -measuredStart,
-            )
-            if candidateTieBreak > bestTieBreak:
-                bestTieBreak = candidateTieBreak
-                bestScore = candidateScore
-                bestMeasuredStart = measuredStart
-                bestReferenceStart = (
-                    activeReferenceStart + activeReferenceOffset
-                )
-                bestOverlapLength = overlapLength
-
-        if not np.isfinite(bestScore):
+        candidateLags = np.arange(
+            minimumLag, maximumLag + 1, dtype=np.int64
+        )
+        activeReferenceOffsets = np.maximum(0, -candidateLags)
+        measuredStarts = np.maximum(0, candidateLags)
+        overlapLengths = np.minimum(
+            referenceLength - activeReferenceOffsets,
+            measuredLength - measuredStarts,
+        )
+        validMask = overlapLengths >= minimumOverlap
+        candidateLags = candidateLags[validMask]
+        activeReferenceOffsets = activeReferenceOffsets[validMask]
+        measuredStarts = measuredStarts[validMask]
+        overlapLengths = overlapLengths[validMask]
+        if candidateLags.size == 0:
             raise ValueError(
                 "measuredSignal and referenceSignal do not have a "
                 "nonempty searchable overlap"
             )
+        probeLengths = np.minimum(overlapLengths, maximumProbeLength)
+        referenceStops = activeReferenceOffsets + probeLengths
+        measuredStops = measuredStarts + probeLengths
+        chainScoreSums = np.zeros(candidateLags.size, dtype=float)
+        fullCorrelationLength = referenceLength + measuredLength - 1
+        fullFftLength = 1 << int(
+            np.ceil(np.log2(max(fullCorrelationLength, 2)))
+        )
+        usesFixedProbe = probeLengths == maximumProbeLength
+
+        # The former implementation evaluated one vdot per lag and chain.
+        # Linear FFT correlations provide the same causal overlap products in
+        # batches. Edge candidates use the full variable overlap, while the
+        # central region retains the configured fixed-length prefix probe from
+        # the measured or reference side. Pairwise range trees provide stable
+        # normalization energies without slicing every candidate waveform or
+        # subtracting nearly equal global cumulative sums.
+        for chainIndex in range(referenceMatrix.shape[1]):
+            referenceColumn = activeReference[:, chainIndex]
+            measuredColumn = measuredMatrix[:, chainIndex]
+            referenceEnergies = SigProc.CalculateRangeEnergies(
+                np.abs(referenceColumn) ** 2,
+                activeReferenceOffsets,
+                referenceStops,
+            )
+            measuredEnergies = SigProc.CalculateRangeEnergies(
+                np.abs(measuredColumn) ** 2,
+                measuredStarts,
+                measuredStops,
+            )
+            fullCorrelation = np.fft.ifft(
+                np.fft.fft(measuredColumn, fullFftLength)
+                * np.fft.fft(
+                    np.conj(referenceColumn[::-1]),
+                    fullFftLength,
+                )
+            )[:fullCorrelationLength]
+            candidateCorrelations = fullCorrelation[
+                candidateLags + referenceLength - 1
+            ].copy()
+
+            positiveFixedMask = usesFixedProbe & (candidateLags >= 0)
+            if np.any(positiveFixedMask):
+                fixedReference = referenceColumn[:maximumProbeLength]
+                positiveCorrelationLength = (
+                    measuredLength + maximumProbeLength - 1
+                )
+                positiveFftLength = 1 << int(
+                    np.ceil(
+                        np.log2(max(positiveCorrelationLength, 2))
+                    )
+                )
+                positiveCorrelation = np.fft.ifft(
+                    np.fft.fft(measuredColumn, positiveFftLength)
+                    * np.fft.fft(
+                        np.conj(fixedReference[::-1]),
+                        positiveFftLength,
+                    )
+                )[:positiveCorrelationLength]
+                candidateCorrelations[positiveFixedMask] = (
+                    positiveCorrelation[
+                        candidateLags[positiveFixedMask]
+                        + maximumProbeLength
+                        - 1
+                    ]
+                )
+
+            negativeFixedMask = usesFixedProbe & (candidateLags < 0)
+            if np.any(negativeFixedMask):
+                fixedMeasured = measuredColumn[:maximumProbeLength]
+                negativeCorrelationLength = (
+                    referenceLength + maximumProbeLength - 1
+                )
+                negativeFftLength = 1 << int(
+                    np.ceil(
+                        np.log2(max(negativeCorrelationLength, 2))
+                    )
+                )
+                negativeCorrelation = np.fft.ifft(
+                    np.fft.fft(fixedMeasured, negativeFftLength)
+                    * np.fft.fft(
+                        np.conj(referenceColumn[::-1]),
+                        negativeFftLength,
+                    )
+                )[:negativeCorrelationLength]
+                candidateCorrelations[negativeFixedMask] = (
+                    negativeCorrelation[
+                        candidateLags[negativeFixedMask]
+                        + referenceLength
+                        - 1
+                    ]
+                )
+
+            energyProducts = referenceEnergies * measuredEnergies
+            # FFT roundoff can leave a tiny nonzero correlation for two exact
+            # zero windows. Enforce the Cauchy-Schwarz bound before division so
+            # such candidates retain zero confidence instead of being divided
+            # by the subnormal numerical floor.
+            correlationPowers = np.minimum(
+                np.abs(candidateCorrelations) ** 2,
+                energyProducts,
+            )
+            chainScoreSums += (
+                correlationPowers
+                / np.maximum(energyProducts, numericFloor)
+            )
+
+        candidateScores = (
+            chainScoreSums / referenceMatrix.shape[1]
+        )
+        # Match the former tuple comparison: maximize score first, then common
+        # overlap length, then prefer the earliest measured start.
+        candidateOrder = np.lexsort(
+            (-measuredStarts, overlapLengths, candidateScores)
+        )
+        bestIndex = int(candidateOrder[-1])
+        bestScore = float(candidateScores[bestIndex])
+        if not np.isfinite(bestScore):
+            raise ValueError(
+                "measuredSignal and referenceSignal do not have a "
+                "finite searchable overlap"
+            )
+        bestMeasuredStart = int(measuredStarts[bestIndex])
+        bestReferenceStart = int(
+            activeReferenceStart + activeReferenceOffsets[bestIndex]
+        )
+        bestOverlapLength = int(overlapLengths[bestIndex])
         bestConfidence = float(np.sqrt(max(bestScore, 0.0)))
         if bestConfidence < float(minimumConfidence):
             raise ValueError(
@@ -2410,46 +2615,53 @@ class SigProc:
         lags = np.arange(fullLength, dtype=int) - (referenceLength - 1)
         maximumDelay = self.ResolveMaximumIntegerDelay()
         minimumOverlap = max(16, min(referenceLength, measuredLength) // 4)
-        referenceEnergyPrefix = np.r_[
-            0.0, np.cumsum(np.abs(self.referenceSignal) ** 2)
-        ]
-        measuredEnergyPrefix = np.r_[
-            0.0, np.cumsum(np.abs(complexMeasured) ** 2)
-        ]
-        bestScore = -np.inf
-        bestLag = 0
-
-        for correlationIndex, lagValue in enumerate(lags):
-            if abs(int(lagValue)) > maximumDelay:
-                continue
-            referenceStart = max(0, -int(lagValue))
-            referenceStop = min(
-                referenceLength, measuredLength - int(lagValue)
+        # Only lags inside the configured search radius can win. Resolve all
+        # overlap boundaries as NumPy vectors so long reference records do not
+        # execute thousands of scalar Python iterations. ``np.argmax`` keeps
+        # the former first-maximum tie rule because candidate lags remain in
+        # ascending order.
+        candidateMask = np.abs(lags) <= maximumDelay
+        candidateLags = lags[candidateMask]
+        correlationIndices = np.flatnonzero(candidateMask)
+        referenceStarts = np.maximum(0, -candidateLags)
+        referenceStops = np.minimum(
+            referenceLength,
+            measuredLength - candidateLags,
+        )
+        overlapLengths = referenceStops - referenceStarts
+        validMask = overlapLengths >= minimumOverlap
+        if not np.any(validMask):
+            raise RuntimeError("unable to estimate integer delay")
+        candidateLags = candidateLags[validMask]
+        correlationIndices = correlationIndices[validMask]
+        referenceStarts = referenceStarts[validMask]
+        referenceStops = referenceStops[validMask]
+        measuredStarts = referenceStarts + candidateLags
+        measuredStops = measuredStarts + overlapLengths[validMask]
+        referenceEnergies = self.CalculateRangeEnergies(
+            np.abs(self.referenceSignal) ** 2,
+            referenceStarts,
+            referenceStops,
+        )
+        measuredEnergies = self.CalculateRangeEnergies(
+            np.abs(complexMeasured) ** 2,
+            measuredStarts,
+            measuredStops,
+        )
+        normalizations = np.sqrt(
+            np.maximum(
+                referenceEnergies * measuredEnergies,
+                np.finfo(float).tiny,
             )
-            overlapLength = referenceStop - referenceStart
-            if overlapLength < minimumOverlap:
-                continue
-            measuredStart = referenceStart + int(lagValue)
-            measuredStop = measuredStart + overlapLength
-            referenceEnergy = (
-                referenceEnergyPrefix[referenceStop]
-                - referenceEnergyPrefix[referenceStart]
-            )
-            measuredEnergy = (
-                measuredEnergyPrefix[measuredStop]
-                - measuredEnergyPrefix[measuredStart]
-            )
-            normalization = np.sqrt(
-                max(referenceEnergy * measuredEnergy, np.finfo(float).tiny)
-            )
-            candidateScore = abs(correlation[correlationIndex]) / normalization
-            if candidateScore > bestScore:
-                bestScore = float(candidateScore)
-                bestLag = int(lagValue)
-
+        )
+        candidateScores = (
+            np.abs(correlation[correlationIndices]) / normalizations
+        )
+        bestIndex = int(np.argmax(candidateScores))
+        bestScore = float(candidateScores[bestIndex])
         if not np.isfinite(bestScore):
             raise RuntimeError("unable to estimate integer delay")
-        return bestLag
+        return int(candidateLags[bestIndex])
 
     def ExtractIntegerAligned(
         self, measuredSignal: np.ndarray, integerDelaySamples: int
@@ -2614,6 +2826,10 @@ class SigProc:
         complexMeasured = self.ValidateSignal(
             measuredSignal, "measuredSignal"
         )
+        if float(frequencyOffsetHz) == 0.0:
+            # Preserve the historical independent return array without
+            # allocating a phase ramp whose every value is exactly one.
+            return complexMeasured.copy()
         sampleIndices = np.arange(complexMeasured.size, dtype=float)
         correction = np.exp(
             -1j

@@ -259,15 +259,18 @@ def AveragePeriodogram(
         0, complexInput.size - segmentLength + 1, segmentStep
     ):
         signalSegment = complexInput[startIndex : startIndex + segmentLength]
-        signalSpectrum = np.fft.fftshift(
-            np.fft.fft(signalSegment * analysisWindow)
+        signalSpectrum = np.fft.fft(
+            signalSegment * analysisWindow
         )
         accumulatedPsd += np.abs(signalSpectrum) ** 2 / windowPower
         segmentCount += 1
 
     if segmentCount == 0:
         raise RuntimeError("unable to create a PSD segment")
-    averagePsd = accumulatedPsd / segmentCount
+    # Shift the accumulated bins once instead of applying the same permutation
+    # to every segment spectrum. Power accumulation order within each bin is
+    # unchanged, so the result is numerically identical to per-segment shifts.
+    averagePsd = np.fft.fftshift(accumulatedPsd / segmentCount)
     frequencyBins = np.fft.fftshift(
         np.fft.fftfreq(segmentLength, d=1.0 / sampleRateHz)
     )
@@ -1770,78 +1773,27 @@ class Analysis:
         complexMeasured = self.PrepareMeasuredSignal(measuredSignal)
         return self.CalculatePreparedAclr(complexMeasured)
 
-    def CalculatePreparedAclr(
+    def CalculatePreparedAclrDetails(
         self, preparedSignal: np.ndarray
-    ) -> Tuple[float, float, float]:
-        """Calculate ACLR from a synchronized and compensated signal.
+    ) -> Tuple[
+        Tuple[float, float, float],
+        Tuple[Tuple[float, ...], Tuple[float, ...], Tuple[float, ...]],
+    ]:
+        """Calculate aggregate and per-chain ACLR from one set of spectra.
 
         Processing details:
-            Algorithm: Estimate the data-field PSD and integrate equal-width
-            main, lower-adjacent, and upper-adjacent channel regions.
+            Algorithm: Validate the compensated data field once, calculate one
+            overlapping-window periodogram per physical chain, integrate every
+            chain spectrum independently, and sum those same spectra for the
+            aggregate conducted result. Reusing the per-chain FFT products
+            avoids the duplicate spectral pass formerly used by MIMO Analyze.
 
         Args:
             preparedSignal: Signal returned by ``PrepareMeasuredSignal``.
 
         Returns:
-            result: Lower, upper, and worst ACLR values in decibels.
-        """
-
-        self.ValidateParameters()
-        complexMeasured = self.ValidatePreparedSignal(preparedSignal)
-        if self.channelBandwidthHz is None:
-            return float("nan"), float("nan"), float("nan")
-        dataSlice = (
-            slice(0, complexMeasured.shape[0])
-            if self.waveform is None
-            else self.waveform.fieldSlices[self.waveform.dataFieldName]
-        )
-        measuredData = complexMeasured[dataSlice]
-        measuredMatrix = (
-            measuredData.reshape(-1, 1)
-            if measuredData.ndim == 1
-            else measuredData
-        )
-        sampleRateHz = self.sampleRateHz
-        channelBandwidthHz = self.channelBandwidthHz
-        minimumAclrOversampling = float(
-            self.parameters["minimumAclrOversampling"]
-        )
-        if sampleRateHz < minimumAclrOversampling * channelBandwidthHz:
-            raise ValueError(
-                "sampleRateHz must be at least "
-                f"{minimumAclrOversampling:g} times bandwidthHz "
-                "for ACLR analysis"
-            )
-        accumulatedSpectrum = None
-        frequencyBins = None
-        for chainIndex in range(measuredMatrix.shape[1]):
-            chainBins, chainSpectrum = AveragePeriodogram(
-                measuredMatrix[:, chainIndex],
-                sampleRateHz,
-                int(self.parameters["maxSegmentLength"]),
-            )
-            frequencyBins = chainBins
-            accumulatedSpectrum = (
-                chainSpectrum
-                if accumulatedSpectrum is None
-                else accumulatedSpectrum + chainSpectrum
-            )
-        return self.IntegrateAclr(frequencyBins, accumulatedSpectrum)
-
-    def CalculatePreparedAclrPerChain(
-        self, preparedSignal: np.ndarray
-    ) -> Tuple[Tuple[float, ...], Tuple[float, ...], Tuple[float, ...]]:
-        """Calculate conducted ACLR independently for every PA output.
-
-        Processing details:
-            Algorithm: Estimate one data-field periodogram per RF chain and
-            integrate identical wanted and adjacent frequency regions.
-
-        Args:
-            preparedSignal: Synchronized samples shaped samples by chains.
-
-        Returns:
-            result: Lower, upper, and worst ACLR tuples ordered by PA chain.
+            result: Aggregate lower/upper/worst tuple followed by three
+                chain-ordered lower, upper, and worst tuples.
         """
 
         self.ValidateParameters()
@@ -1851,12 +1803,21 @@ class Analysis:
             if complexMeasured.ndim == 1
             else complexMeasured
         )
+        chainCount = measuredMatrix.shape[1]
         if self.channelBandwidthHz is None:
-            missingValues = tuple(
-                float("nan")
-                for _ in range(measuredMatrix.shape[1])
+            aggregateMissing = (
+                float("nan"),
+                float("nan"),
+                float("nan"),
             )
-            return missingValues, missingValues, missingValues
+            perChainMissing = tuple(
+                float("nan") for _ in range(chainCount)
+            )
+            return aggregateMissing, (
+                perChainMissing,
+                perChainMissing,
+                perChainMissing,
+            )
         minimumAclrOversampling = float(
             self.parameters["minimumAclrOversampling"]
         )
@@ -1877,19 +1838,78 @@ class Analysis:
         lowerValues = []
         upperValues = []
         worstValues = []
-        for chainIndex in range(measuredMatrix.shape[1]):
-            frequencyBins, powerSpectrum = AveragePeriodogram(
+        accumulatedSpectrum = None
+        frequencyBins = None
+        for chainIndex in range(chainCount):
+            chainBins, chainSpectrum = AveragePeriodogram(
                 measuredMatrix[dataSlice, chainIndex],
                 self.sampleRateHz,
                 int(self.parameters["maxSegmentLength"]),
             )
+            frequencyBins = chainBins
+            accumulatedSpectrum = (
+                chainSpectrum
+                if accumulatedSpectrum is None
+                else accumulatedSpectrum + chainSpectrum
+            )
             lowerAclrDb, upperAclrDb, worstAclrDb = self.IntegrateAclr(
-                frequencyBins, powerSpectrum
+                chainBins, chainSpectrum
             )
             lowerValues.append(lowerAclrDb)
             upperValues.append(upperAclrDb)
             worstValues.append(worstAclrDb)
-        return tuple(lowerValues), tuple(upperValues), tuple(worstValues)
+        if frequencyBins is None or accumulatedSpectrum is None:
+            raise RuntimeError("unable to calculate an ACLR spectrum")
+        aggregateAclr = self.IntegrateAclr(
+            frequencyBins, accumulatedSpectrum
+        )
+        return aggregateAclr, (
+            tuple(lowerValues),
+            tuple(upperValues),
+            tuple(worstValues),
+        )
+
+    def CalculatePreparedAclr(
+        self, preparedSignal: np.ndarray
+    ) -> Tuple[float, float, float]:
+        """Calculate ACLR from a synchronized and compensated signal.
+
+        Processing details:
+            Algorithm: Estimate the data-field PSD and integrate equal-width
+            main, lower-adjacent, and upper-adjacent channel regions.
+
+        Args:
+            preparedSignal: Signal returned by ``PrepareMeasuredSignal``.
+
+        Returns:
+            result: Lower, upper, and worst ACLR values in decibels.
+        """
+
+        aggregateAclr, _ = self.CalculatePreparedAclrDetails(
+            preparedSignal
+        )
+        return aggregateAclr
+
+    def CalculatePreparedAclrPerChain(
+        self, preparedSignal: np.ndarray
+    ) -> Tuple[Tuple[float, ...], Tuple[float, ...], Tuple[float, ...]]:
+        """Calculate conducted ACLR independently for every PA output.
+
+        Processing details:
+            Algorithm: Estimate one data-field periodogram per RF chain and
+            integrate identical wanted and adjacent frequency regions.
+
+        Args:
+            preparedSignal: Synchronized samples shaped samples by chains.
+
+        Returns:
+            result: Lower, upper, and worst ACLR tuples ordered by PA chain.
+        """
+
+        _, perChainAclr = self.CalculatePreparedAclrDetails(
+            preparedSignal
+        )
+        return perChainAclr
 
     def Analyze(
         self, measuredSignal: Optional[np.ndarray] = None
@@ -1927,31 +1947,111 @@ class Analysis:
             outputPowerDbm,
             outputPowerDbmPerChain,
         ) = self.CalculateOutputPower(complexMeasured)
-        snrDb = self.CalculatePreparedSnr(complexMeasured)
-        evmDb, evmPercent = self.CalculatePreparedEvm(complexMeasured)
-        irrMeasurement = self.MeasurePreparedIrr(complexMeasured)
-        irrDb = irrMeasurement["irrDb"]
-        (
-            aclrLowerDb,
-            aclrUpperDb,
-            aclrWorstDb,
-        ) = self.CalculatePreparedAclr(complexMeasured)
         transmitChainCount = (
             1
             if self.referenceSignal.ndim == 1
             else self.referenceSignal.shape[1]
         )
+        snrDb = self.CalculatePreparedSnr(complexMeasured)
+        if transmitChainCount > 1 and self.frameProcessor is not None:
+            # One OFDM demodulation of each waveform is sufficient for both
+            # aggregate and per-spatial-stream EVM. Rebuild both grids on the
+            # next public call so direct edits to the public reference or its
+            # Wi-Fi metadata cannot leave a stale cross-call cache.
+            measuredSymbols = self.DemodulatePreparedWifiData(
+                complexMeasured
+            )
+            referenceSymbols = self.DemodulatePreparedWifiData(
+                self.referenceSignal
+            )
+            symbolError = measuredSymbols - referenceSymbols
+            evmAlignedMse = float(
+                np.sum(np.abs(symbolError) ** 2)
+                / max(
+                    np.sum(np.abs(referenceSymbols) ** 2),
+                    np.finfo(float).tiny,
+                )
+            )
+            evmRatio = np.sqrt(evmAlignedMse)
+            evmDb = float(
+                10.0
+                * np.log10(
+                    max(evmAlignedMse, np.finfo(float).tiny)
+                )
+            )
+            evmPercent = float(100.0 * evmRatio)
+            spatialReference = (
+                referenceSymbols[:, :, np.newaxis]
+                if referenceSymbols.ndim == 2
+                else referenceSymbols
+            )
+            spatialMeasured = (
+                measuredSymbols[:, :, np.newaxis]
+                if measuredSymbols.ndim == 2
+                else measuredSymbols
+            )
+            streamEvmDbValues = []
+            streamEvmPercentValues = []
+            for streamIndex in range(spatialReference.shape[2]):
+                referenceStream = spatialReference[
+                    :, :, streamIndex
+                ].reshape(-1)
+                streamError = (
+                    spatialMeasured[:, :, streamIndex].reshape(-1)
+                    - referenceStream
+                )
+                streamEvmRatio = np.sqrt(
+                    np.sum(np.abs(streamError) ** 2)
+                    / max(
+                        np.sum(np.abs(referenceStream) ** 2),
+                        np.finfo(float).tiny,
+                    )
+                )
+                streamEvmDbValues.append(
+                    float(
+                        20.0
+                        * np.log10(
+                            max(
+                                streamEvmRatio,
+                                np.finfo(float).tiny,
+                            )
+                        )
+                    )
+                )
+                streamEvmPercentValues.append(
+                    float(100.0 * streamEvmRatio)
+                )
+            perStreamEvmDb = tuple(streamEvmDbValues)
+            perStreamEvmPercent = tuple(streamEvmPercentValues)
+        else:
+            evmDb, evmPercent = self.CalculatePreparedEvm(
+                complexMeasured
+            )
+        irrMeasurement = self.MeasurePreparedIrr(complexMeasured)
+        irrDb = irrMeasurement["irrDb"]
+        (
+            aggregateAclr,
+            perChainAclr,
+        ) = self.CalculatePreparedAclrDetails(complexMeasured)
+        (
+            aclrLowerDb,
+            aclrUpperDb,
+            aclrWorstDb,
+        ) = aggregateAclr
+        (
+            perChainAclrLowerDb,
+            perChainAclrUpperDb,
+            perChainAclrWorstDb,
+        ) = perChainAclr
         if transmitChainCount > 1:
             perChainSnrDb = self.CalculatePreparedSnrPerChain(complexMeasured)
-            (
-                perStreamEvmDb,
-                perStreamEvmPercent,
-            ) = self.CalculatePreparedEvmPerSpatialStream(complexMeasured)
-            (
-                perChainAclrLowerDb,
-                perChainAclrUpperDb,
-                perChainAclrWorstDb,
-            ) = self.CalculatePreparedAclrPerChain(complexMeasured)
+            if self.frameProcessor is None:
+                (
+                    perStreamEvmDb,
+                    perStreamEvmPercent,
+                ) = self.CalculatePreparedEvmPerSpatialStream(
+                    complexMeasured
+                )
             self.lastMimoMetrics = {
                 "snrDbPerChain": perChainSnrDb,
                 "irrDbPerChain": irrMeasurement["irrDbPerChain"],
@@ -2647,9 +2747,15 @@ class Analysis:
                     self.waveform,
                     parameters=pointParameterOverrides,
                 )
-                pointMetrics = pointAnalysis.Analyze(measuredSignal)
-                methodEvmDb.append(pointMetrics["evmDb"])
-                methodEvmPercent.append(pointMetrics["evmPercent"])
+                # A power-EVM sweep consumes only EVM. Avoid calculating
+                # output power, SNR, IRR, and ACLR at every method/power point;
+                # synchronization and the EVM definition remain identical to
+                # the complete Analyze path.
+                pointEvmDb, pointEvmPercent = pointAnalysis.CalculateEvm(
+                    measuredSignal
+                )
+                methodEvmDb.append(pointEvmDb)
+                methodEvmPercent.append(pointEvmPercent)
             evmDbByMethod[methodName] = np.asarray(methodEvmDb, dtype=float)
             evmPercentByMethod[methodName] = np.asarray(
                 methodEvmPercent, dtype=float
@@ -2978,8 +3084,11 @@ class Analysis:
         if not historyRecords:
             raise ValueError("ilcHistory cannot be empty")
         performanceRecords = []
-        inputSignals = []
-        outputSignals = []
+        bestEvmAlignedMse = float("inf")
+        bestIteration = 0
+        bestInputSignal: Optional[np.ndarray] = None
+        bestOutputSignal: Optional[np.ndarray] = None
+        bestMetrics: Optional[SignalMetrics] = None
         previousIteration = 0
         for iterationRecord in historyRecords:
             iteration = int(iterationRecord.iteration)
@@ -3096,21 +3205,28 @@ class Analysis:
                     aclrWorstDb=signalMetrics["aclrWorstDb"],
                 )
             )
-            inputSignals.append(inputSignal.copy())
-            outputSignals.append(outputSignal.copy())
+            # Strict comparison preserves np.argmin's former first-minimum
+            # rule while retaining only the candidate that can be returned.
+            # This avoids copying every full waveform and avoids analyzing the
+            # selected output a second time after the loop.
+            if evmAlignedMse < bestEvmAlignedMse:
+                bestEvmAlignedMse = evmAlignedMse
+                bestIteration = iteration
+                bestInputSignal = inputSignal.copy()
+                bestOutputSignal = outputSignal.copy()
+                bestMetrics = dict(signalMetrics)
 
         performanceTuple = tuple(performanceRecords)
-        bestIndex = int(
-            np.argmin(
-                [record.evmAlignedMse for record in performanceTuple]
-            )
-        )
-        bestOutputSignal = outputSignals[bestIndex].copy()
-        bestMetrics = self.Analyze(bestOutputSignal)
+        if (
+            bestInputSignal is None
+            or bestOutputSignal is None
+            or bestMetrics is None
+        ):
+            raise RuntimeError("unable to select an ILC analysis candidate")
         return ILCAnalysisResult(
             history=performanceTuple,
-            bestIteration=performanceTuple[bestIndex].iteration,
-            bestInputSignal=inputSignals[bestIndex].copy(),
+            bestIteration=bestIteration,
+            bestInputSignal=bestInputSignal,
             bestOutputSignal=bestOutputSignal,
             bestMetrics=bestMetrics,
         )
@@ -3167,8 +3283,11 @@ class Analysis:
             numericFloor,
         )
         performanceRecords = []
-        inputMatrices = []
-        outputMatrices = []
+        bestEvmAlignedMse = float("inf")
+        bestIteration = 0
+        bestInputSignal: Optional[np.ndarray] = None
+        bestOutputSignal: Optional[np.ndarray] = None
+        bestMetrics: Optional[SignalMetrics] = None
         for iterationIndex in range(iterationCount):
             chainRecords = tuple(
                 chainHistory[iterationIndex]
@@ -3379,21 +3498,26 @@ class Analysis:
                     aclrWorstDb=signalMetrics["aclrWorstDb"],
                 )
             )
-            inputMatrices.append(inputMatrix.copy())
-            outputMatrices.append(outputMatrix.copy())
+            if evmAlignedMse < bestEvmAlignedMse:
+                bestEvmAlignedMse = evmAlignedMse
+                bestIteration = iteration
+                bestInputSignal = inputMatrix.copy()
+                bestOutputSignal = outputMatrix.copy()
+                bestMetrics = dict(signalMetrics)
 
         performanceTuple = tuple(performanceRecords)
-        bestIndex = int(
-            np.argmin(
-                [record.evmAlignedMse for record in performanceTuple]
+        if (
+            bestInputSignal is None
+            or bestOutputSignal is None
+            or bestMetrics is None
+        ):
+            raise RuntimeError(
+                "unable to select a MIMO ILC analysis candidate"
             )
-        )
-        bestOutputSignal = outputMatrices[bestIndex].copy()
-        bestMetrics = self.Analyze(bestOutputSignal)
         return ILCAnalysisResult(
             history=performanceTuple,
-            bestIteration=performanceTuple[bestIndex].iteration,
-            bestInputSignal=inputMatrices[bestIndex].copy(),
+            bestIteration=bestIteration,
+            bestInputSignal=bestInputSignal,
             bestOutputSignal=bestOutputSignal,
             bestMetrics=bestMetrics,
         )

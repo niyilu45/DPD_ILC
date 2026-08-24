@@ -924,13 +924,56 @@ class GMPPA:
         complexInput = AsComplexVector(inputSignal)
         outputSignal = np.zeros_like(complexInput)
 
+        # A default GMP expansion references only a handful of unique causal
+        # delays, although the same delayed vector appears in many main,
+        # lagging, and leading terms. Build each delayed waveform and each
+        # delay/order envelope power once per call. The coefficient iteration
+        # order below remains unchanged, so accumulation and causal boundary
+        # behavior match the direct polynomial expansion.
+        requiredDelays = set()
+        requiredEnvelopePowers = set()
+        for nonlinearOrder, memoryIndex in self.mainCoefficients:
+            requiredDelays.add(memoryIndex)
+            requiredEnvelopePowers.add((memoryIndex, nonlinearOrder))
+        for (
+            nonlinearOrder,
+            memoryIndex,
+            crossIndex,
+        ) in self.laggingCoefficients:
+            requiredDelays.add(memoryIndex)
+            requiredDelays.add(memoryIndex + crossIndex)
+            requiredEnvelopePowers.add(
+                (memoryIndex + crossIndex, nonlinearOrder)
+            )
+        for (
+            nonlinearOrder,
+            memoryIndex,
+            crossIndex,
+        ) in self.leadingCoefficients:
+            requiredDelays.add(memoryIndex)
+            requiredDelays.add(memoryIndex + crossIndex)
+            requiredEnvelopePowers.add(
+                (memoryIndex, nonlinearOrder)
+            )
+        delayedSignals = {
+            sampleDelay: DelaySignal(complexInput, sampleDelay)
+            for sampleDelay in requiredDelays
+        }
+        envelopePowers = {
+            (sampleDelay, nonlinearOrder): (
+                np.abs(delayedSignals[sampleDelay])
+                ** (nonlinearOrder - 1)
+            )
+            for sampleDelay, nonlinearOrder in requiredEnvelopePowers
+        }
+
         # Main branch: x[n-m] * |x[n-m]|^(p-1).
         for (nonlinearOrder, memoryIndex), coefficient in self.mainCoefficients.items():
-            delayedSignal = DelaySignal(complexInput, memoryIndex)
+            delayedSignal = delayedSignals[memoryIndex]
             outputSignal += (
                 coefficient
                 * delayedSignal
-                * np.abs(delayedSignal) ** (nonlinearOrder - 1)
+                * envelopePowers[(memoryIndex, nonlinearOrder)]
             )
 
         # Lagging envelope branch:
@@ -940,14 +983,13 @@ class GMPPA:
             memoryIndex,
             crossIndex,
         ), coefficient in self.laggingCoefficients.items():
-            carrierSignal = DelaySignal(complexInput, memoryIndex)
-            envelopeSignal = DelaySignal(
-                complexInput, memoryIndex + crossIndex
-            )
+            carrierSignal = delayedSignals[memoryIndex]
             outputSignal += (
                 coefficient
                 * carrierSignal
-                * np.abs(envelopeSignal) ** (nonlinearOrder - 1)
+                * envelopePowers[
+                    (memoryIndex + crossIndex, nonlinearOrder)
+                ]
             )
 
         # Leading envelope branch:
@@ -957,14 +999,11 @@ class GMPPA:
             memoryIndex,
             crossIndex,
         ), coefficient in self.leadingCoefficients.items():
-            carrierSignal = DelaySignal(
-                complexInput, memoryIndex + crossIndex
-            )
-            envelopeSignal = DelaySignal(complexInput, memoryIndex)
+            carrierSignal = delayedSignals[memoryIndex + crossIndex]
             outputSignal += (
                 coefficient
                 * carrierSignal
-                * np.abs(envelopeSignal) ** (nonlinearOrder - 1)
+                * envelopePowers[(memoryIndex, nonlinearOrder)]
             )
         return outputSignal
 

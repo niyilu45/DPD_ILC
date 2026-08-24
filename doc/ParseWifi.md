@@ -4,6 +4,8 @@
 
 `inc/lib/ParseWifi.py` 用于从接收到的VHT、HE或EHT复基带波形中恢复 `Analysis` 所需的参考信号和帧元数据。
 
+固定的描述字段导频位置、码位位置和跨符号交织顺序现在以不可变字节缓存；每次调用得到新的只读NumPy视图，无法反向污染缓存。接收候选、软bit、seed和解析结果不缓存。发送辅助的重叠搜索也复用 `SigProc`的批量FFT与稳定区间能量实现。详见 [Performance.md](./Performance.md#7-fec与parsewifi)。
+
 工程现在保留三条Analysis入口：
 
 1. 已知参考路径：
@@ -226,6 +228,8 @@ L_{c,v}
 ```
 
 LDPC码字偶数位和奇数位被分散到不同描述符号。这样，某一个OFDM符号受到PA记忆效应、公共相位变化或突发削顶时，不会连续破坏seed或校验字段。
+
+`CachedDescriptorLdpcPhysicalLayout()`只缓存上述固定位置数组的不可变字节。公开的 `DescriptorLdpcPhysicalLayout()`从这些字节创建新的只读视图；底层所有者是 `bytes`，调用方不能通过 `setflags(write=True)`重新打开写权限。因此缓存加速不会把一次外部误修改传播到后续解析。
 
 ### 3.5 旧版CRC描述兼容
 

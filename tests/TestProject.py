@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 import warnings
 
 import numpy as np
@@ -31,7 +32,7 @@ def GetProjectRoot() -> Path:
 if str(GetProjectRoot()) not in sys.path:
     sys.path.insert(0, str(GetProjectRoot()))
 
-from inc.lib.Analysis import Analysis
+from inc.lib.Analysis import Analysis, AveragePeriodogram
 from inc.lib.Channel import Channel
 from inc.lib.ChannelAnalyse import ChannelAnalyse
 from inc.lib.DpdGmp import (
@@ -59,6 +60,7 @@ from inc.lib.PaModel import (
     DefaultGmpCoefficients,
     DohertyConfig,
     DohertyPA,
+    DelaySignal,
     GMPConfig,
     GMPPA,
     IQImbalancePA,
@@ -7995,6 +7997,524 @@ def CheckChannelAnalysisAndCoupledDpd() -> None:
         assert requiredText in channelDocument
 
 
+def BuildNaiveGmpOutput(
+    paModel: GMPPA,
+    inputSignal: np.ndarray,
+) -> np.ndarray:
+    """Evaluate GMP terms without sharing delayed or envelope arrays.
+
+    Processing details:
+        Algorithm: Recreate the original direct implementation by visiting
+        main, lagging, and leading coefficient dictionaries in their stored
+        order and calling ``DelaySignal`` independently for every term. This
+        deliberately slow oracle detects any numerical or causal change in
+        the optimized production implementation without using elapsed time.
+
+    Args:
+        paModel: Configured GMP PA whose coefficient dictionaries are read.
+        inputSignal: Finite one-dimensional complex test waveform.
+
+    Returns:
+        result: Direct per-term GMP output in complex128 precision.
+    """
+
+    complexInput = np.asarray(inputSignal, dtype=np.complex128)
+    outputSignal = np.zeros_like(complexInput)
+    for (
+        nonlinearOrder,
+        memoryIndex,
+    ), coefficient in paModel.mainCoefficients.items():
+        delayedSignal = DelaySignal(complexInput, memoryIndex)
+        outputSignal += (
+            coefficient
+            * delayedSignal
+            * np.abs(delayedSignal) ** (nonlinearOrder - 1)
+        )
+    for (
+        nonlinearOrder,
+        memoryIndex,
+        crossIndex,
+    ), coefficient in paModel.laggingCoefficients.items():
+        carrierSignal = DelaySignal(complexInput, memoryIndex)
+        envelopeSignal = DelaySignal(
+            complexInput,
+            memoryIndex + crossIndex,
+        )
+        outputSignal += (
+            coefficient
+            * carrierSignal
+            * np.abs(envelopeSignal) ** (nonlinearOrder - 1)
+        )
+    for (
+        nonlinearOrder,
+        memoryIndex,
+        crossIndex,
+    ), coefficient in paModel.leadingCoefficients.items():
+        carrierSignal = DelaySignal(
+            complexInput,
+            memoryIndex + crossIndex,
+        )
+        envelopeSignal = DelaySignal(complexInput, memoryIndex)
+        outputSignal += (
+            coefficient
+            * carrierSignal
+            * np.abs(envelopeSignal) ** (nonlinearOrder - 1)
+        )
+    return outputSignal
+
+
+def EstimateLegacyIntegerDelay(
+    signalProcessor: SigProc,
+    measuredSignal: np.ndarray,
+) -> int:
+    """Reproduce the former scalar normalized-correlation lag search.
+
+    Processing details:
+        Algorithm: Calculate the same FFT linear correlation used by
+        ``SigProc``, then visit candidate lags one by one, slice each overlap,
+        calculate its two energies, and preserve the first-maximum tie rule.
+        This scalar oracle verifies the vectorized prefix-sum implementation.
+
+    Args:
+        signalProcessor: Processor containing the reference and search bound.
+        measuredSignal: Padded or cropped finite complex measurement.
+
+    Returns:
+        result: Signed measured-versus-reference integer delay in samples.
+    """
+
+    complexMeasured = signalProcessor.ValidateSignal(
+        measuredSignal,
+        "measuredSignal",
+    )
+    referenceSignal = signalProcessor.referenceSignal
+    referenceLength = referenceSignal.size
+    measuredLength = complexMeasured.size
+    fullLength = referenceLength + measuredLength - 1
+    fftLength = 1 << int(np.ceil(np.log2(max(fullLength, 2))))
+    correlation = np.fft.ifft(
+        np.fft.fft(complexMeasured, fftLength)
+        * np.fft.fft(np.conj(referenceSignal[::-1]), fftLength)
+    )[:fullLength]
+    lags = np.arange(fullLength, dtype=int) - (referenceLength - 1)
+    maximumDelay = signalProcessor.ResolveMaximumIntegerDelay()
+    minimumOverlap = max(
+        16,
+        min(referenceLength, measuredLength) // 4,
+    )
+    bestDelay = 0
+    bestScore = -np.inf
+    for correlationIndex, candidateLag in enumerate(lags):
+        if abs(int(candidateLag)) > maximumDelay:
+            continue
+        referenceStart = max(0, -int(candidateLag))
+        referenceStop = min(
+            referenceLength,
+            measuredLength - int(candidateLag),
+        )
+        if referenceStop - referenceStart < minimumOverlap:
+            continue
+        measuredStart = referenceStart + int(candidateLag)
+        measuredStop = measuredStart + (
+            referenceStop - referenceStart
+        )
+        referenceEnergy = np.sum(
+            np.abs(referenceSignal[referenceStart:referenceStop]) ** 2
+        )
+        measuredEnergy = np.sum(
+            np.abs(complexMeasured[measuredStart:measuredStop]) ** 2
+        )
+        normalization = np.sqrt(
+            max(
+                referenceEnergy * measuredEnergy,
+                np.finfo(float).tiny,
+            )
+        )
+        candidateScore = float(
+            np.abs(correlation[correlationIndex]) / normalization
+        )
+        if candidateScore > bestScore:
+            bestScore = candidateScore
+            bestDelay = int(candidateLag)
+    if not np.isfinite(bestScore):
+        raise RuntimeError("unable to estimate legacy integer delay")
+    return bestDelay
+
+
+def FindLegacyActiveSampleMask(
+    powerCalibration: PowerCalibration,
+    inputSignal: np.ndarray,
+) -> np.ndarray:
+    """Recreate adjacent-active-index gap filling for active detection.
+
+    Processing details:
+        Algorithm: Threshold every chain relative to its peak and revisit
+        each adjacent pair of active indices, filling an internal inactive
+        interval only when its sample count does not exceed the configured
+        tolerance. This is the pre-vectorization behavior used as an oracle.
+
+    Args:
+        powerCalibration: Calibrator providing threshold and gap parameters.
+        inputSignal: Finite complex vector or samples-by-chain matrix.
+
+    Returns:
+        result: Legacy boolean activity mask with input-matching orientation.
+    """
+
+    complexSignal = np.asarray(inputSignal, dtype=np.complex128)
+    inputWasVector = complexSignal.ndim == 1
+    signalMatrix = (
+        complexSignal.reshape(-1, 1)
+        if inputWasVector
+        else complexSignal
+    )
+    instantaneousPower = np.abs(signalMatrix) ** 2
+    peakPowerPerChain = np.max(instantaneousPower, axis=0)
+    relativePowerThreshold = 10.0 ** (
+        float(powerCalibration.parameters["activePowerThresholdDb"])
+        / 10.0
+    )
+    activeMask = (
+        instantaneousPower
+        > peakPowerPerChain.reshape(1, -1)
+        * relativePowerThreshold
+    )
+    gapTolerance = int(
+        powerCalibration.parameters["activeGapToleranceSamples"]
+    )
+    if gapTolerance > 0:
+        for chainIndex in range(signalMatrix.shape[1]):
+            activeIndices = np.flatnonzero(activeMask[:, chainIndex])
+            for activePairIndex in range(activeIndices.size - 1):
+                gapStart = int(activeIndices[activePairIndex]) + 1
+                gapStop = int(activeIndices[activePairIndex + 1])
+                if gapStop - gapStart <= gapTolerance:
+                    activeMask[gapStart:gapStop, chainIndex] = True
+    return activeMask[:, 0] if inputWasVector else activeMask
+
+
+def CheckPerformanceOptimizationEquivalence() -> None:
+    """Verify accelerated hot paths without fragile wall-clock assertions.
+
+    Processing details:
+        Algorithm: Compare cached GMP, vectorized integer-delay, and run-based
+        activity detection against direct legacy oracles; count MIMO Analysis
+        demodulation and periodogram calls; exercise short-probe assisted
+        overlap for positive, negative, and cropped records; and round-trip
+        the descriptor LDPC code through clean and noisy soft observations.
+
+    Returns:
+        result: None. Structural counts and exact numerical assertions expose
+            semantic regressions independently of host or CI execution speed.
+    """
+
+    randomGenerator = np.random.default_rng(20260825)
+
+    # Cached delayed signals and envelope powers must retain bit-for-bit GMP
+    # behavior for built-in coefficients, sparse measured coefficients, and
+    # input records shorter than every configured causal delay.
+    defaultGmp = GMPPA()
+    defaultInput = 0.17 * (
+        randomGenerator.normal(size=257)
+        + 1j * randomGenerator.normal(size=257)
+    )
+    assert np.array_equal(
+        defaultGmp.Process(defaultInput),
+        BuildNaiveGmpOutput(defaultGmp, defaultInput),
+    )
+    customGmp = GMPPA(
+        GMPConfig(
+            nonlinearOrders=(1, 3, 5),
+            memoryDepth=4,
+            crossMemoryDepth=3,
+            mainCoefficients={
+                (1, 0): 1.07 + 0.02j,
+                (3, 2): -0.13 + 0.04j,
+                (5, 3): 0.018 - 0.006j,
+            },
+            laggingCoefficients={
+                (3, 1, 2): 0.031 - 0.009j,
+                (5, 0, 3): -0.004 + 0.002j,
+            },
+            leadingCoefficients={
+                (3, 0, 2): -0.022 + 0.007j,
+                (5, 1, 3): 0.003 - 0.001j,
+            },
+        )
+    )
+    customInput = 0.21 * (
+        randomGenerator.normal(size=113)
+        + 1j * randomGenerator.normal(size=113)
+    )
+    for testedInput in (
+        customInput,
+        customInput[:1],
+        customInput[:2],
+        customInput[:3],
+    ):
+        assert np.array_equal(
+            customGmp.Process(testedInput),
+            BuildNaiveGmpOutput(customGmp, testedInput),
+        )
+
+    # Range-tree energy vectorization must select exactly the lag selected by
+    # the old scalar overlap-energy loop under padding, cropping, and gain.
+    integerReference = (
+        randomGenerator.normal(size=1021)
+        + 1j * randomGenerator.normal(size=1021)
+    )
+    integerProcessor = SigProc(
+        integerReference,
+        40.0e6,
+        parameters={"maxIntegerDelaySamples": 96},
+    )
+    integerGain = 0.64 * np.exp(1j * 0.47)
+    integerCases = (
+        (
+            np.r_[
+                np.zeros(31, dtype=np.complex128),
+                integerGain * integerReference,
+                np.zeros(19, dtype=np.complex128),
+            ],
+            31,
+        ),
+        (integerGain * integerReference[27:], -27),
+        (integerGain * integerReference[:-53], 0),
+    )
+    for measuredSignal, expectedDelay in integerCases:
+        optimizedDelay = integerProcessor.EstimateIntegerDelay(
+            measuredSignal
+        )
+        legacyDelay = EstimateLegacyIntegerDelay(
+            integerProcessor,
+            measuredSignal,
+        )
+        assert optimizedDelay == legacyDelay == expectedDelay
+
+    # Run-boundary gap filling must preserve every boolean decision from the
+    # former adjacent-active-index implementation for vectors and matrices.
+    activitySignal = np.zeros((128, 3), dtype=np.complex128)
+    activitySignal[9:31, 0] = np.exp(
+        1j * np.arange(22, dtype=float) * 0.17
+    )
+    activitySignal[34:61, 0] = 0.8
+    activitySignal[79:111, 0] = 0.6j
+    activitySignal[3:17, 1] = 0.7 - 0.2j
+    activitySignal[18:52, 1] = 0.9 + 0.1j
+    activitySignal[68:125, 1] = 0.5
+    activitySignal[22:49, 2] = 0.6 + 0.4j
+    activitySignal[51:55, 2] = 0.8
+    activitySignal[72:91, 2] = 1.0j
+    for gapTolerance in (0, 1, 2, 4, 16):
+        activeCalibration = PowerCalibration(
+            width=0,
+            parameters={
+                "activePowerThresholdDb": -40.0,
+                "activeGapToleranceSamples": gapTolerance,
+            },
+        )
+        for testedSignal in (
+            activitySignal[:, 0],
+            activitySignal,
+        ):
+            assert np.array_equal(
+                activeCalibration.FindActiveSampleMask(testedSignal),
+                FindLegacyActiveSampleMask(
+                    activeCalibration,
+                    testedSignal,
+                ),
+            )
+
+    # A 2x2 Analysis call needs one measured and one reference demodulation.
+    # Both are rebuilt on reuse so public reference edits cannot leave stale
+    # data, while aggregate and per-stream EVM still share the two local grids.
+    # Its ACLR path performs one periodogram per physical chain and no more.
+    mimoWaveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=3,
+        numDataSymbols=2,
+        sampleRateHz=80.0e6,
+        numTransmitAntennas=2,
+        numSpatialStreams=2,
+        spatialMapping="dft",
+        seed=621,
+        width=0,
+    ).Generate()
+    mimoMeasurement = (
+        0.86 * np.exp(1j * 0.29) * mimoWaveform.samples
+    )
+    mimoAnalysis = Analysis(
+        mimoWaveform.samples,
+        mimoWaveform,
+        parameters={"maxSegmentLength": 2048},
+        width=0,
+    )
+    if mimoAnalysis.frameProcessor is None:
+        raise AssertionError("MIMO Wi-Fi analysis requires FrameProcess")
+    originalDemodulate = (
+        mimoAnalysis.frameProcessor.DemodulatePreparedWifiData
+    )
+    with patch.object(
+        mimoAnalysis.frameProcessor,
+        "DemodulatePreparedWifiData",
+        wraps=originalDemodulate,
+    ) as demodulateMock, patch(
+        "inc.lib.Analysis.AveragePeriodogram",
+        wraps=AveragePeriodogram,
+    ) as periodogramMock:
+        firstMetrics = mimoAnalysis.Analyze(mimoMeasurement)
+        firstDemodulationCount = demodulateMock.call_count
+        firstPeriodogramCount = periodogramMock.call_count
+        assert firstDemodulationCount == 2
+        assert firstPeriodogramCount == 2
+        secondMetrics = mimoAnalysis.Analyze(mimoMeasurement)
+        assert demodulateMock.call_count == firstDemodulationCount + 2
+        assert periodogramMock.call_count == firstPeriodogramCount + 2
+        assert np.allclose(
+            np.asarray(tuple(firstMetrics.values())),
+            np.asarray(tuple(secondMetrics.values())),
+            rtol=0.0,
+            atol=0.0,
+            equal_nan=True,
+        )
+    originalReference = mimoAnalysis.referenceSignal.copy()
+    mimoAnalysis.referenceSignal *= 0.5
+    assert (
+        mimoAnalysis.CalculatePreparedEvmAlignedMse(
+            mimoAnalysis.referenceSignal
+        )
+        < 1.0e-24
+    )
+    mimoAnalysis.referenceSignal = originalReference
+
+    # The assisted correlation probe is intentionally shorter than every
+    # record. Positive lag, negative lag, and tail-cropped capture geometry
+    # must still map exact common sample starts.
+    overlapReference = (
+        randomGenerator.normal(size=513)
+        + 1j * randomGenerator.normal(size=513)
+    )
+    overlapGain = 0.73 * np.exp(1j * 0.42)
+    overlapCases = (
+        (
+            np.r_[
+                np.zeros(29, dtype=np.complex128),
+                overlapGain * overlapReference,
+                np.zeros(17, dtype=np.complex128),
+            ],
+            29,
+            0,
+            513,
+        ),
+        (
+            overlapGain * overlapReference[41:],
+            0,
+            41,
+            472,
+        ),
+        (
+            np.r_[
+                np.zeros(11, dtype=np.complex128),
+                overlapGain * overlapReference[:-31],
+            ],
+            11,
+            0,
+            482,
+        ),
+    )
+    for (
+        measuredSignal,
+        expectedMeasuredStart,
+        expectedReferenceStart,
+        expectedOverlapLength,
+    ) in overlapCases:
+        overlapResult = SigProc.EstimateSignalOverlap(
+            measuredSignal,
+            overlapReference,
+            maximumMeasuredOffsetSamples=80,
+            maximumProbeLength=47,
+            minimumConfidence=0.99,
+        )
+        assert overlapResult.receivedStartSample == expectedMeasuredStart
+        assert overlapResult.referenceStartSample == expectedReferenceStart
+        assert overlapResult.overlapLength == expectedOverlapLength
+        assert overlapResult.confidence > 0.999999
+
+    # Range-tree energies must not select a tiny noise-only tail merely
+    # because subtracting two large cumulative energies loses precision.
+    dynamicGenerator = np.random.default_rng(0)
+    dynamicReference = (
+        dynamicGenerator.normal(size=128)
+        + 1j * dynamicGenerator.normal(size=128)
+    )
+    dynamicActive = (
+        0.8 * dynamicReference
+        + dynamicGenerator.normal(size=128)
+        + 1j * dynamicGenerator.normal(size=128)
+    )
+    dynamicMeasured = np.r_[
+        dynamicActive,
+        1.0e-7
+        * (
+            dynamicGenerator.normal(size=256)
+            + 1j * dynamicGenerator.normal(size=256)
+        ),
+    ]
+    dynamicResult = SigProc.EstimateSignalOverlap(
+        dynamicMeasured,
+        dynamicReference,
+        maximumMeasuredOffsetSamples=200,
+        maximumProbeLength=32,
+        minimumConfidence=0.0,
+    )
+    assert dynamicResult.receivedStartSample == 0
+
+    # Clean and noisy soft observations must both recover the original
+    # systematic LDPC descriptor payload without relying on an optional
+    # version-specific external codec.
+    descriptorMessage = randomGenerator.integers(
+        0,
+        2,
+        size=55,
+        dtype=np.uint8,
+    )
+    descriptorCodeword = EncodeDescriptorLdpc(descriptorMessage)
+    cleanSoftCodeword = (
+        1.0 - 2.0 * descriptorCodeword.astype(float)
+    )
+    assert np.array_equal(
+        DecodeDescriptorLdpc(cleanSoftCodeword),
+        descriptorMessage,
+    )
+    noisySoftCodeword = (
+        3.0 * cleanSoftCodeword
+        + randomGenerator.normal(scale=0.35, size=90)
+    )
+    assert np.array_equal(
+        DecodeDescriptorLdpc(noisySoftCodeword),
+        descriptorMessage,
+    )
+
+    # The protocol-layout cache stores immutable bytes. Public calls return
+    # distinct read-only views whose write flag cannot be re-enabled, so one
+    # caller cannot corrupt a later blind-analysis descriptor search.
+    firstLayout = DescriptorLdpcPhysicalLayout()
+    secondLayout = DescriptorLdpcPhysicalLayout()
+    for firstArray, secondArray in zip(firstLayout, secondLayout):
+        assert firstArray is not secondArray
+        assert not firstArray.flags.writeable
+        assert np.array_equal(firstArray, secondArray)
+        try:
+            firstArray.setflags(write=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "descriptor layout views must remain read-only"
+            )
+
+
 def RunTests() -> None:
     """Run all project checks and report a compact success message.
 
@@ -8008,6 +8528,7 @@ def RunTests() -> None:
     CheckMcsTables()
     CheckFrameFormatAliases()
     CheckFunctionStyle()
+    CheckPerformanceOptimizationEquivalence()
     CheckNoGlobalDataVariables()
     CheckModuleResponsibilityBoundaries()
     CheckBenchmarkSeparation()
