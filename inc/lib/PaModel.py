@@ -835,8 +835,12 @@ class GMPConfig:
 
     Coefficient dictionaries use ``(order, memoryIndex)`` for main terms and
     ``(order, memoryIndex, crossIndex)`` for lagging/leading terms. Missing
-    entries are treated as zero. When no dictionaries are supplied, a stable
-    compressive model with memory is generated automatically.
+    entries are treated as zero. When no dictionaries are supplied, the
+    generator creates a mildly compressive Rapp-like static curve that is
+    monotonic for normalized constant-envelope amplitudes from zero through
+    two, then adds small zero-sum dynamic memory residuals around that curve.
+    Custom dictionaries remain unconstrained behavioral fits and may therefore
+    contain stronger droop, hysteresis, or polynomial foldback.
     """
 
     nonlinearOrders: Tuple[int, ...] = (1, 3, 5, 7)
@@ -4561,10 +4565,15 @@ def DefaultGmpCoefficients(
     Dict[Tuple[int, int, int], complex],
     Dict[Tuple[int, int, int], complex],
 ]:
-    """Create stable default coefficients with compression and memory effects.
+    """Create monotonic static GMP coefficients with mild dynamic memory.
 
     Processing details:
-        Algorithm: Construct the requested model structure in deterministic order so coefficient indices and delayed samples remain reproducible.
+        Algorithm: Select a Rapp-like per-order steady-state target fitted over
+        normalized amplitudes from zero through two, generate small causal main
+        and envelope-cross memory tails, and solve the zero-delay main
+        coefficient so every same-order coefficient still sums to its static
+        target. Memory depth therefore changes transient and frequency behavior
+        without duplicating compression in a constant-envelope plateau.
 
     Args:
         nonlinearOrders: Positive odd polynomial orders included in the model.
@@ -4575,50 +4584,168 @@ def DefaultGmpCoefficients(
         result: Tuple[Dict[Tuple[int, int], complex], Dict[Tuple[int, int, int], complex], Dict[Tuple[int, int, int], complex]]. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
-    # Zero-memory coefficients define the dominant AM-AM/AM-PM behavior.
-    orderCoefficient = {
-        1: 1.0 + 0.0j,
-        3: -0.62 + 0.16j,
-        5: 0.18 - 0.08j,
-        7: -0.024 + 0.014j,
+    # These coefficients were fitted over 0 <= |x| <= 2 to a bounded Rapp-like
+    # AM-AM curve with mild AM-PM conversion.  The resulting constant-envelope
+    # response is monotonic throughout that declared fitting interval.  This
+    # prevents a power-control loop from reaching an ordinary operating point
+    # through a nonphysical polynomial foldback branch.
+    referenceSteadyStateCoefficient = {
+        1: 1.261692 + 0.014052j,
+        3: -0.291144 + 0.054204j,
+        5: 0.031812 - 0.022452j,
+        7: -0.000168 + 0.002784j,
     }
+    selectedOrders = tuple(dict.fromkeys(int(order) for order in nonlinearOrders))
+    steadyStateCoefficients = {
+        nonlinearOrder: referenceSteadyStateCoefficient.get(
+            nonlinearOrder,
+            0.0 + 0.0j,
+        )
+        for nonlinearOrder in selectedOrders
+    }
+
+    if 1 in steadyStateCoefficients:
+        # Removing stabilizing higher orders from a fitted polynomial can make
+        # the remaining subset fold back.  Reduce all nonlinear targets by one
+        # common factor only when the requested default order subset needs it.
+        # The complete (1, 3, 5, 7) default passes unchanged with factor one.
+        validationAmplitude = np.linspace(0.0, 2.0, 4097)
+        fullScaleOutput = sum(
+            coefficient * validationAmplitude**nonlinearOrder
+            for nonlinearOrder, coefficient in (
+                steadyStateCoefficients.items()
+            )
+            if coefficient != 0.0 + 0.0j
+        )
+        fullScaleIsMonotonic = bool(
+            np.all(np.diff(np.abs(fullScaleOutput)) >= -1.0e-12)
+        )
+        nonlinearScale = 1.0
+        if not fullScaleIsMonotonic:
+            lowerScale = 0.0
+            upperScale = 1.0
+            for _ in range(56):
+                candidateScale = 0.5 * (lowerScale + upperScale)
+                candidateOutput = sum(
+                    coefficient
+                    * (
+                        1.0
+                        if nonlinearOrder == 1
+                        else candidateScale
+                    )
+                    * validationAmplitude**nonlinearOrder
+                    for nonlinearOrder, coefficient in (
+                        steadyStateCoefficients.items()
+                    )
+                    if coefficient != 0.0 + 0.0j
+                )
+                isMonotonic = bool(
+                    np.all(
+                        np.diff(np.abs(candidateOutput)) >= -1.0e-12
+                    )
+                )
+                if isMonotonic:
+                    lowerScale = candidateScale
+                else:
+                    upperScale = candidateScale
+            nonlinearScale = 0.98 * lowerScale
+        steadyStateCoefficients = {
+            nonlinearOrder: (
+                coefficient
+                if nonlinearOrder == 1
+                else nonlinearScale * coefficient
+            )
+            for nonlinearOrder, coefficient in (
+                steadyStateCoefficients.items()
+            )
+        }
+    elif len(selectedOrders) > 0:
+        # A default PA without a first-order path has no meaningful small-signal
+        # gain.  Keep its lowest requested basis monotonic and leave all higher
+        # default targets at zero; measured custom dictionaries are unaffected.
+        minimumOrder = min(selectedOrders)
+        steadyStateCoefficients = {
+            nonlinearOrder: (
+                1.0 + 0.0j
+                if nonlinearOrder == minimumOrder
+                else 0.0 + 0.0j
+            )
+            for nonlinearOrder in selectedOrders
+        }
     mainCoefficients: Dict[Tuple[int, int], complex] = {}
     laggingCoefficients: Dict[Tuple[int, int, int], complex] = {}
     leadingCoefficients: Dict[Tuple[int, int, int], complex] = {}
 
-    for nonlinearOrder in nonlinearOrders:
-        baseCoefficient = orderCoefficient.get(
-            nonlinearOrder,
-            (-0.12 + 0.03j) / max(nonlinearOrder - 1, 1),
-        )
-        for memoryIndex in range(memoryDepth):
-            if nonlinearOrder == 1:
-                # The first-order tail creates a mild frequency response.
-                linearTail = (
-                    1.0 + 0.0j
-                    if memoryIndex == 0
-                    else (0.045 - 0.020j) * ((-0.45) ** (memoryIndex - 1))
-                )
-                mainCoefficients[(nonlinearOrder, memoryIndex)] = linearTail
-            else:
-                memoryDecay = (0.34**memoryIndex) * np.exp(
-                    -1j * 0.18 * memoryIndex
-                )
-                mainCoefficients[(nonlinearOrder, memoryIndex)] = (
-                    baseCoefficient * memoryDecay
-                )
-
-        if nonlinearOrder == 1:
+    for nonlinearOrder in selectedOrders:
+        targetCoefficient = steadyStateCoefficients[nonlinearOrder]
+        if targetCoefficient == 0.0 + 0.0j:
             continue
-        for memoryIndex in range(memoryDepth):
-            for crossIndex in range(1, crossMemoryDepth + 1):
-                crossDecay = (0.22**memoryIndex) * (0.42**crossIndex)
-                laggingCoefficients[
-                    (nonlinearOrder, memoryIndex, crossIndex)
-                ] = (0.040 - 0.018j) * crossDecay / (nonlinearOrder - 1)
-                leadingCoefficients[
-                    (nonlinearOrder, memoryIndex, crossIndex)
-                ] = (-0.026 + 0.012j) * crossDecay / (nonlinearOrder - 1)
+
+        # Delayed main-branch coefficients model a small dynamic residual.  A
+        # six-percent first tail is large enough to expose electrical memory in
+        # two-tone and wideband tests, but it avoids the former implementation's
+        # 34-percent repeated compression term that made a constant high-level
+        # run collapse after its first sample.
+        for memoryIndex in range(1, memoryDepth):
+            if nonlinearOrder == 1:
+                delayedCoefficient = (0.045 - 0.020j) * (
+                    (-0.45) ** (memoryIndex - 1)
+                )
+            else:
+                delayedCoefficient = targetCoefficient * (
+                    0.06**memoryIndex
+                ) * np.exp(-1j * 0.18 * memoryIndex)
+            mainCoefficients[(nonlinearOrder, memoryIndex)] = (
+                delayedCoefficient
+            )
+
+        if nonlinearOrder > 1 and targetCoefficient != 0.0 + 0.0j:
+            for memoryIndex in range(memoryDepth):
+                for crossIndex in range(1, crossMemoryDepth + 1):
+                    crossDecay = (0.22**memoryIndex) * (
+                        0.42**crossIndex
+                    )
+                    laggingCoefficients[
+                        (nonlinearOrder, memoryIndex, crossIndex)
+                    ] = (
+                        targetCoefficient
+                        * (-0.060 + 0.025j)
+                        * crossDecay
+                    )
+                    leadingCoefficients[
+                        (nonlinearOrder, memoryIndex, crossIndex)
+                    ] = (
+                        targetCoefficient
+                        * (0.040 - 0.018j)
+                        * crossDecay
+                    )
+
+        # A constant complex envelope makes every basis of the same order
+        # identical.  Set the zero-delay coefficient to the residual required
+        # for their total to equal targetCoefficient.  Consequently changing
+        # memoryDepth or crossMemoryDepth changes dynamics without changing the
+        # settled static gain curve.
+        delayedMainSum = sum(
+            coefficient
+            for (order, memoryIndex), coefficient in mainCoefficients.items()
+            if order == nonlinearOrder and memoryIndex > 0
+        )
+        laggingSum = sum(
+            coefficient
+            for (order, _, _), coefficient in laggingCoefficients.items()
+            if order == nonlinearOrder
+        )
+        leadingSum = sum(
+            coefficient
+            for (order, _, _), coefficient in leadingCoefficients.items()
+            if order == nonlinearOrder
+        )
+        mainCoefficients[(nonlinearOrder, 0)] = (
+            targetCoefficient
+            - delayedMainSum
+            - laggingSum
+            - leadingSum
+        )
 
     return mainCoefficients, laggingCoefficients, leadingCoefficients
 

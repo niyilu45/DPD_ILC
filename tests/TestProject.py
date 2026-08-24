@@ -56,9 +56,11 @@ from inc.lib.Fec import (
 from inc.utils.Draw import Draw
 from inc.utils.FixedPoint import FixedPoint
 from inc.lib.PaModel import (
+    DefaultGmpCoefficients,
     DohertyConfig,
     DohertyPA,
     GMPConfig,
+    GMPPA,
     IQImbalancePA,
     MimoPaModel,
     PaModel,
@@ -2674,6 +2676,183 @@ def CheckRappPaModel() -> None:
                 "invalid Rapp configuration accepted: "
                 f"{invalidOverrides!r}"
             )
+
+
+def CheckGmpPaModel() -> None:
+    """Verify physically consistent default GMP steady and transient behavior.
+
+    Processing details:
+        Algorithm: Sum every same-order default basis to confirm that memory
+        depth cannot move the settled AM-AM curve, excite the default PA with a
+        continuous high-envelope plateau to bound startup droop, and prove that
+        explicitly supplied measured coefficients retain their exact behavior.
+
+    Returns:
+        result: None. Assertions enforce the default GMP coefficient contract.
+    """
+
+    expectedSteadyCoefficients = {
+        1: 1.261692 + 0.014052j,
+        3: -0.291144 + 0.054204j,
+        5: 0.031812 - 0.022452j,
+        7: -0.000168 + 0.002784j,
+    }
+    for memoryDepth in (1, 3, 5):
+        for crossMemoryDepth in (0, 2, 4):
+            (
+                mainCoefficients,
+                laggingCoefficients,
+                leadingCoefficients,
+            ) = DefaultGmpCoefficients(
+                tuple(expectedSteadyCoefficients),
+                memoryDepth,
+                crossMemoryDepth,
+            )
+            for nonlinearOrder, expectedCoefficient in (
+                expectedSteadyCoefficients.items()
+            ):
+                combinedCoefficient = sum(
+                    coefficient
+                    for (order, _), coefficient in mainCoefficients.items()
+                    if order == nonlinearOrder
+                ) + sum(
+                    coefficient
+                    for (order, _, _), coefficient in (
+                        laggingCoefficients.items()
+                    )
+                    if order == nonlinearOrder
+                ) + sum(
+                    coefficient
+                    for (order, _, _), coefficient in (
+                        leadingCoefficients.items()
+                    )
+                    if order == nonlinearOrder
+                )
+                assert np.isclose(
+                    combinedCoefficient,
+                    expectedCoefficient,
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+
+    # The fitted default static curve must remain nondecreasing throughout its
+    # documented normalized input interval instead of folding back and forcing
+    # power calibration onto a remote polynomial expansion branch.
+    amplitudeGrid = np.linspace(0.0, 2.0, 2001)
+    steadyOutputMagnitude = np.abs(
+        sum(
+            coefficient * amplitudeGrid**nonlinearOrder
+            for nonlinearOrder, coefficient in (
+                expectedSteadyCoefficients.items()
+            )
+        )
+    )
+    assert np.all(np.diff(steadyOutputMagnitude) >= -1e-12)
+
+    # The default generator also accepts reduced or extended odd-order sets.
+    # Every automatically generated set must remain monotonic in the same
+    # declared interval; unknown higher orders default to zero rather than
+    # creating an uncontrolled polynomial extrapolation term.
+    for defaultOrderSet in (
+        (1,),
+        (1, 3),
+        (1, 5),
+        (1, 3, 5),
+        (1, 3, 7),
+        (1, 5, 7),
+        (1, 3, 5, 7),
+        (7, 5, 3, 1),
+        (1, 3, 3, 5, 7),
+        (1, 3, 5, 7, 9),
+        (3, 5, 7),
+    ):
+        (
+            orderMainCoefficients,
+            orderLaggingCoefficients,
+            orderLeadingCoefficients,
+        ) = DefaultGmpCoefficients(defaultOrderSet, 3, 2)
+        orderSteadyCoefficients = {
+            nonlinearOrder: sum(
+                coefficient
+                for (order, _), coefficient in (
+                    orderMainCoefficients.items()
+                )
+                if order == nonlinearOrder
+            ) + sum(
+                coefficient
+                for (order, _, _), coefficient in (
+                    orderLaggingCoefficients.items()
+                )
+                if order == nonlinearOrder
+            ) + sum(
+                coefficient
+                for (order, _, _), coefficient in (
+                    orderLeadingCoefficients.items()
+                )
+                if order == nonlinearOrder
+            )
+            for nonlinearOrder in defaultOrderSet
+        }
+        orderOutputMagnitude = np.abs(
+            sum(
+                coefficient * amplitudeGrid**nonlinearOrder
+                for nonlinearOrder, coefficient in (
+                    orderSteadyCoefficients.items()
+                )
+            )
+        )
+        assert np.all(np.diff(orderOutputMagnitude) >= -1e-10)
+        if 9 in defaultOrderSet:
+            assert np.isclose(orderSteadyCoefficients[9], 0.0 + 0.0j)
+
+    # A high-level run preceded by zeros exposes excessive repeated nonlinear
+    # memory coefficients.  All plateau samples should remain at nearly the
+    # same compressed level instead of dropping several decibels after sample
+    # zero as the former 34-percent delayed terms did.
+    plateauPhaseRadians = 0.37
+    plateauLength = 16
+    for plateauAmplitude in (0.25, 0.5, 0.9, 1.2, 1.5, 1.7, 2.0):
+        plateauInput = np.concatenate(
+            (
+                np.zeros(8, dtype=np.complex128),
+                np.full(
+                    plateauLength,
+                    plateauAmplitude * np.exp(1j * plateauPhaseRadians),
+                    dtype=np.complex128,
+                ),
+                np.zeros(8, dtype=np.complex128),
+            )
+        )
+        plateauOutput = GMPPA().Process(plateauInput)
+        plateauMagnitude = np.abs(plateauOutput[8:8 + plateauLength])
+        settledMagnitude = float(np.mean(plateauMagnitude[6:]))
+        onsetToSettledDb = 20.0 * np.log10(
+            plateauMagnitude[0] / settledMagnitude
+        )
+        plateauRippleDb = 20.0 * np.log10(
+            np.max(plateauMagnitude) / np.min(plateauMagnitude)
+        )
+        assert abs(onsetToSettledDb) <= 0.25
+        assert plateauRippleDb <= 0.40
+
+    # Default stabilization must never override coefficients extracted from a
+    # measured PA.  This deliberately strong two-tap model retains its exact
+    # sample-to-sample response because all dictionaries are explicit.
+    measuredGmp = GMPPA(
+        GMPConfig(
+            nonlinearOrders=(1,),
+            memoryDepth=2,
+            crossMemoryDepth=0,
+            mainCoefficients={(1, 0): 1.0 + 0.0j, (1, 1): -0.5 + 0.0j},
+            laggingCoefficients={},
+            leadingCoefficients={},
+        )
+    )
+    measuredInput = np.ones(4, dtype=np.complex128)
+    assert np.allclose(
+        measuredGmp.Process(measuredInput),
+        np.asarray((1.0, 0.5, 0.5, 0.5), dtype=np.complex128),
+    )
 
 
 def CheckIlcFeedbackSynchronization() -> None:
@@ -6276,6 +6455,9 @@ def CheckChannelModel() -> None:
     ) <= 0.25
     assert 1 <= fixedGmpMetrics["iterationCount"] <= 60
     assert fixedGmpMetrics["analogDriveDbPerChain"][0] > 0.0
+    assert fixedGmpMetrics["analogDriveDbPerChain"][0] < 3.0
+    actualFixedGmpInput = fixedGmpChannel.GetLastActualPaInput()
+    assert np.max(np.abs(actualFixedGmpInput)) <= 1.2
     for publicWaveform in (
         fixedGmpChannel.GetLastPaInput(),
         fixedGmpChannel.GetLastPaOutput(),
@@ -7853,6 +8035,7 @@ def RunTests() -> None:
     CheckPowerEvmCurve()
     CheckGuardIntervals()
     CheckRappPaModel()
+    CheckGmpPaModel()
     CheckDohertyPaModel()
     CheckIlcImprovement()
     CheckIlcFeedbackSynchronization()

@@ -192,7 +192,7 @@ flowchart LR
 | `IQImbalancePA.ProcessThermalPeriodFloating`, `IQImbalancePA.SuspendThermalModel`, `IQImbalancePA.RestoreThermalModel`, `IQImbalancePA.GetThermalMetrics`, `IQImbalancePA.CalculateActualDutyCycle`, `IQImbalancePA.ResetThermalState`, `IQImbalancePA.AdvanceIdle` | P/N/E | 在输出端施加广义线性I/Q包装，同时透明代理物理PA的周期热处理、状态事务、诊断、占空比、复位和额外空闲；包装器不建立第二份热状态或修改PA输入活动参考面 | PaModel §7、§13.5–§13.8、Channel §10 |
 | `PaModel.AsComplexVector` | N | 把输入约束为有限一维复包络；不改变样值 | PaModel §2 |
 | `PaModel.DelaySignal` | N | 因果整数延迟并对历史补零 | PaModel §4 |
-| `PaModel.DefaultGmpCoefficients` | E/N | 生成稳定的演示系数，不代表实测器件 | PaModel §11 |
+| `PaModel.DefaultGmpCoefficients` | E/N | 用 $0\leq|x|\leq2$ 内单调的有界Rapp型拟合确定稳态复系数；非线性主记忆和lag/lead交叉项按各阶 $C_p$ 比例衰减，再回调零延迟主项保持每阶总和；含一阶的非默认阶次集合共同缩小非线性项以维持单调，未知高阶为0，无一阶集合只启用最低阶后备项；不代表实测器件 | PaModel §4.9.4、§11 |
 | `PaModel.AddAwgn` | P/N | 按目标复基带 SNR 设置圆对称复高斯噪声方差 | PaModel §8 |
 
 ### 4.1 `Channel.py`：PA到接收端链路
@@ -476,7 +476,7 @@ flowchart LR
 | `BenchMark.GenerateChannelPaInputLabels` | P/E | 对PA后去嵌入目标逐PA运行频域ILC，得到PA输入参考面的监督标签 | ChannelAnalyse §8.3 |
 | `BenchMark.BuildChannelDpdModels` | E | 为各物理PA构造相同结构但独立系数的DpdGmp对象 | ChannelAnalyse §11 |
 | `BenchMark.EvaluateChannelDpdStage` | P/E | 通过同一耦合非线性plant，汇总逐链Wi-Fi EVM/ACLR、公共增益对齐NMSE和残余跨路投影 | ChannelAnalyse §11–§12 |
-| `BenchMark.BuildChannelDpdImprovements` | E | 以Independent为前值、Coupling-aware为后值，统一生成EVM/NMSE/耦合降低及ACLR提高的正向改善和预期状态 | ChannelAnalyse §12 |
+| `BenchMark.BuildChannelDpdImprovements` | E | 以Independent为前值、Coupling-aware为后值，要求EVM/NMSE/残余耦合严格降低，同时保留ACLR有符号变化并执行不超过1.0 dB的退化护栏 | ChannelAnalyse §12 |
 | `BenchMark.SaveChannelAnalysisResults`, `BenchMark.PrintChannelAnalysisResults` | E | 保存或显示既有路径、频响、阶段和改善值，不参与测量或训练 | ChannelAnalyse §13 |
 | `BenchMark.RunChannelAnalysisBenchmark` | E/P | 编排“测Hpre/Hpost→去嵌入训练→PA前预消除→同plant前后比较”的完整闭环 | BenchMark §31、ChannelAnalyse §11–§12 |
 

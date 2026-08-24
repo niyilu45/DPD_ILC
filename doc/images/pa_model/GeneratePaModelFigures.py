@@ -130,38 +130,59 @@ def PlotWienerPanel(axis: plt.Axes, inputAmplitude: np.ndarray) -> None:
 
 
 def PlotGmpPanel(axis: plt.Axes, inputAmplitude: np.ndarray) -> None:
-    """Draw a schematic GMP gain trajectory and identify coefficient roles."""
+    """Draw the actual default GMP steady curve and its mild memory band."""
 
-    nominalGain = np.abs(1.02 - 0.82 * inputAmplitude**2 + 0.24 * inputAmplitude**4)
+    steadyStateCoefficients = {
+        1: 1.261692 + 0.014052j,
+        3: -0.291144 + 0.054204j,
+        5: 0.031812 - 0.022452j,
+        7: -0.000168 + 0.002784j,
+    }
+    steadyOutput = sum(
+        coefficient * inputAmplitude**nonlinearOrder
+        for nonlinearOrder, coefficient in steadyStateCoefficients.items()
+    )
+    nominalGain = np.abs(steadyOutput) / inputAmplitude
+    nominalGainDb = 20.0 * np.log10(np.maximum(nominalGain, 1.0e-6))
+    dynamicHalfWidthDb = 0.15 * np.minimum(inputAmplitude, 1.5)
     axis.plot(
         inputAmplitude,
-        20.0 * np.log10(np.maximum(nominalGain, 1.0e-3)),
+        nominalGainDb,
         linewidth=2.5,
         color="#2563eb",
     )
     axis.fill_between(
         inputAmplitude,
-        20.0 * np.log10(np.maximum(nominalGain, 1.0e-3)) - 0.42 * inputAmplitude,
-        20.0 * np.log10(np.maximum(nominalGain, 1.0e-3)) + 0.42 * inputAmplitude,
+        nominalGainDb - dynamicHalfWidthDb,
+        nominalGainDb + dynamicHalfWidthDb,
         color="#60a5fa",
         alpha=0.22,
-        label="dynamic trajectory width",
+        label="mild default memory trajectory",
+    )
+    annotationAmplitude = 1.05
+    annotationOutput = sum(
+        coefficient * annotationAmplitude**nonlinearOrder
+        for nonlinearOrder, coefficient in steadyStateCoefficients.items()
+    )
+    annotationGainDb = 20.0 * np.log10(
+        abs(annotationOutput) / annotationAmplitude
     )
     axis.annotate(
-        "main coefficients set the center curve",
-        xy=(0.98, 20.0 * np.log10(abs(1.02 - 0.82 * 0.98**2 + 0.24 * 0.98**4))),
-        xytext=(0.12, -10.0),
+        "same-order sums set a monotonic center curve",
+        xy=(annotationAmplitude, annotationGainDb),
+        xytext=(0.12, -3.5),
         arrowprops={"arrowstyle": "->", "color": "#444444"},
     )
     axis.text(
         0.03,
         0.08,
-        "memoryDepth -> main delay span\ncrossMemoryDepth -> envelope-history dependence",
+        "memoryDepth -> zero-sum main residual\n"
+        "crossMemoryDepth -> zero-sum envelope-history residual",
         transform=axis.transAxes,
         color="#174ea6",
         fontweight="bold",
     )
-    axis.set_ylim(-16.0, 1.5)
+    axis.set_ylim(-5.0, 3.0)
     axis.legend(loc="lower left", frameon=False, fontsize=9)
     ConfigureAxes(axis, "C. GMP: polynomial order and delayed-envelope memory")
 

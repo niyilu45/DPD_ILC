@@ -1807,21 +1807,43 @@ result = RunChannelAnalysisBenchmark(
 
 | 阶段 | EVM | 波形 NMSE | 最差 ACLR | 残余耦合 |
 |---|---:|---:|---:|---:|
-| Coupled PA baseline | 7.393 dB | 0.692 dB | 5.732 dB | -12.505 dB |
-| Independent DPD-GMP | 2.711 dB | -3.629 dB | 8.919 dB | -12.199 dB |
-| Post-deembedded DPD-GMP | 2.420 dB | -4.076 dB | 9.301 dB | -14.066 dB |
-| Coupling-aware DPD-GMP | 2.334 dB | -4.487 dB | 9.245 dB | -16.562 dB |
+| Coupled PA baseline | -5.793 dB | -7.863 dB | 19.923 dB | -8.992 dB |
+| Independent DPD-GMP | -5.678 dB | -8.144 dB | 20.707 dB | -8.623 dB |
+| Post-deembedded DPD-GMP | -9.913 dB | -11.051 dB | 19.745 dB | -15.399 dB |
+| Coupling-aware DPD-GMP | -15.939 dB | -14.460 dB | 19.876 dB | -25.102 dB |
 
-相对 Independent DPD-GMP，完整耦合感知方案得到：
+EVM、波形 NMSE 和残余耦合均为越负越好，ACLR 为越大越好。相对 Independent DPD-GMP，完整耦合感知方案得到：
 
-| 目标指标 | 改善量 | 预期 | 结果 |
+| 目标指标 | 有符号变化或改善量 | 预期 | 结果 |
 |---|---:|---|---|
-| EVM | 0.376 dB | 越低越好 | PASS |
-| 波形 NMSE | 0.858 dB | 越低越好 | PASS |
-| 残余耦合 | 4.364 dB | 越低越好 | PASS |
-| 最差 ACLR | 0.325 dB | 越高越好 | PASS |
+| EVM | 改善 10.261 dB | 必须降低 | PASS |
+| 波形 NMSE | 改善 6.316 dB | 必须降低 | PASS |
+| 残余耦合 | 改善 16.479 dB | 必须降低 | PASS |
+| 最差 ACLR | 变化 -0.831 dB | 退化不得超过 1.0 dB | PASS，退化 0.831 dB |
 
-该场景故意同时使用较强双向耦合、不同 PA、频率选择性和高 PAPR Wi-Fi，因此绝对 EVM 是压力测试结果，不能当作 802.11 产品验收门限。此处验证的是同一个物理场景、同一个功率和同一组参考下，测量驱动修改是否按预期改善目标指标。
+该场景故意同时使用较强双向耦合、不同 PA、频率选择性和高 PAPR Wi-Fi，因此绝对 EVM 是压力测试结果，不能当作 802.11 产品验收门限。此处验证的是同一个物理场景、同一个功率和同一组参考下，测量驱动修改是否严格改善 EVM、NMSE 和残余耦合，同时不让 ACLR 出现超过 1.0 dB 的明显退化。
+
+ACLR 的定义是：
+
+```math
+\mathrm{ACLR}
+=
+10\log_{10}\left(\frac{P_{\mathrm{main}}}{P_{\mathrm{adj}}}\right)
+=
+-10\log_{10}\left(\frac{P_{\mathrm{adj}}}{P_{\mathrm{main}}}\right).
+```
+
+Independent 阶段未消除同带通道耦合。对第 $i$ 个接收端口，其主信道功率近似为：
+
+```math
+P_{\mathrm{main,ind},i}
+=
+\mathrm{E}_{B}\left\{
+\left|s_i+c_{ji}s_j\right|^2
+\right\}.
+```
+
+两路独立 seed 使交叉项在足够长的统计窗口内趋近于零，但未消除的 $|c_{ji}s_j|^2$ 仍会抬高主信道参考功率，也就是泄漏比 $P_{\mathrm{adj}}/P_{\mathrm{main}}$ 的分母。Coupling-aware 阶段去掉这部分同带泄漏后，$P_{\mathrm{main}}$ 更接近真正的目标链功率，因此 ACLR 数字可能轻微下降；这不能直接解释为绝对邻道辐射增加。当前结果从 20.707 dB 降至 19.876 dB，变化为 -0.831 dB，所以应如实写成“轻微退化但在 1.0 dB 护栏内通过”，不能称为 ACLR 改善。实际硬件验收还应同时记录邻道绝对功率 dBm 或相对预期目标链功率归一化后的泄漏值。
 
 ![通道测量与耦合感知 DPD-GMP 对比](images/channel_analyse/channel_analysis.png)
 
@@ -1830,7 +1852,7 @@ result = RunChannelAnalysisBenchmark(
 - 左上图显示主路径幅度；本场景主路径为理想直通，所以四条线重合在 0 dB。
 - 右上图显示耦合相对各源主路径的频率响应；曲线斜率和弯曲来自 FIR 与不同分数时延。
 - 左下图显示 PA 前和 PA 后 MIMO 矩阵的带内条件数；均低于 1.5，逆补偿稳定。
-- 右下图比较无 DPD、独立 DPD、仅 PA 后去嵌入和完整耦合感知 DPD；完整方案得到最低 EVM/NMSE，ACLR 相对独立 DPD 也改善。
+- 右下图比较无 DPD、独立 DPD、仅 PA 后去嵌入和完整耦合感知 DPD；完整方案得到最低 EVM/NMSE。黑色 ACLR 曲线从 Independent 的 20.707 dB 降至 Coupling-aware 的 19.876 dB，明确表示 0.831 dB 的轻微退化，而不是改善；该变化仍小于 1.0 dB 验收护栏。
 
 ## 13. 输出文件
 
@@ -1842,7 +1864,7 @@ result = RunChannelAnalysisBenchmark(
 | `channel_path_measurements.csv` | 每条有向路径的增益、相位、平坦度和时延 |
 | `channel_frequency_response.csv` | 每个带内频点的复响应幅相 |
 | `channel_dpd_comparison.csv` | 四个 DPD 阶段的性能 |
-| `channel_dpd_improvements.csv` | Independent 与 Coupling-aware 的改善和 PASS/FAIL |
+| `channel_dpd_improvements.csv` | Independent 与 Coupling-aware 的有符号变化、验收方向和 PASS/FAIL |
 | `channel_analysis.png` | 通道和 DPD 性能四联图 |
 
 仓库参考结果位于 `doc/images/channel_analyse/`。

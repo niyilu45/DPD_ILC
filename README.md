@@ -176,13 +176,13 @@ resultAnalysis = Analysis(
 )
 ```
 
-顶层 [SmallestSISO.py](./SmallestSISO.py) 会用完全相同的 EHT、中等压缩GMP PA、Channel和ILC设置依次运行浮点与16位定点版本。示例把内置GMP的非线性支路系数缩放为25%，保留全部主项、滞后项和超前项，以便在受控的中等压缩区比较不同ILC；定点闭环的功率可达性由解码后的隐藏模拟驱动保证，不再依赖把公开整数码推到满量程：
+顶层 [SmallestSISO.py](./SmallestSISO.py) 会用完全相同的 EHT、默认GMP PA、Channel和ILC设置依次运行浮点与16位定点版本。示例直接使用 `DefaultGmpCoefficients`，不再额外缩放非线性支路。默认稳态系数由 $0\leq|x|\leq2$ 内的有界Rapp型曲线拟合得到，并在该归一化范围内保持AM-AM单调；非线性延迟主项和交叉记忆项都按各阶稳态系数比例生成，零延迟项抵消它们对恒包络稳态的贡献。完整默认模型在0.25至2.0幅度扫描中的最大平台纹波为0.3065 dB。非默认阶次集合若含一阶项，会在必要时共同缩小全部非线性稳态项以保持同一区间单调；未知高阶默认值为0。定点闭环的功率可达性由解码后的隐藏模拟驱动保证，不再依赖把公开整数码推到满量程：
 
 ```powershell
 python SmallestSISO.py
 ```
 
-浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序最后打印两种模式的最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本直接调用 `Channel.Process(waveform.samples, outputPowerDbm=20.0)`；Channel内部按有效Wi-Fi突发区间把PA输出闭环标定到20 dBm，再使用 `sampleMode="forward"`、0度移相和10 mV复包络总RMS白噪声，表示由仪表直接采样主路输出。baseline、每轮ILC反馈和最终接收分析都经过该仪表路径，但接收噪声不进入PA功率校准。前后补零或长占空比静默不进入功率RMS。
+浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序固定运行4轮ILC，使这个确定性最小场景中的两种模式都在局部稳定区同时改善EVM与ACLR，最后打印最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本直接调用 `Channel.Process(waveform.samples, outputPowerDbm=20.0)`；Channel内部按有效Wi-Fi突发区间把PA输出闭环标定到20 dBm，再使用 `sampleMode="forward"`、0度移相和10 mV复包络总RMS白噪声，表示由仪表直接采样主路输出。baseline、每轮ILC反馈和最终接收分析都经过该仪表路径，但接收噪声不进入PA功率校准。前后补零或长占空比静默不进入功率RMS。
 脚本还打印两种波形的峰值以及 `waveformMinimumI/MaximumI/MinimumQ/MaximumQ`。定点版本的 I/Q 字段是公开码值，因此16位分量会位于 `-32768…32767`，并不是小于1的归一化数；复数幅度 `waveformPeakAmplitude` 最多可接近 $\sqrt{2}\,32768$。
 
 ## 工程工作流程图
@@ -605,7 +605,7 @@ flowchart TD
 - `PaModel.Process` 与 `PaModel.SmallSignalGain` 将调用委托给当前实现，因此主程序和 ILC 无须包含模型类型分支。
 - `RappPA.Process` 使用经典SSPA软压缩曲线逐样点映射，保留输入相位，不持有FIR、时延或包络历史，是严格无记忆对照模型。
 - `WienerPA.Process` 依次执行线性记忆滤波、Rapp AM-AM 压缩和 AM-PM 相位旋转。
-- `GMPPA.Process` 使用 `DelaySignal` 构造主项、滞后包络项和超前包络项；未提供系数时由 `DefaultGmpCoefficients` 创建稳定的默认模型。
+- `GMPPA.Process` 使用 `DelaySignal` 构造主项、滞后包络项和超前包络项；未提供系数时，`DefaultGmpCoefficients` 创建在 $0\leq|x|\leq2$ 内单调压缩的默认稳态曲线，再按各阶稳态系数比例生成较小的非线性延迟与交叉项，并从零延迟主项中抵消其总和；一阶线性尾项仍是独立的小信号FIR。非默认阶次组合会自适应保持同一区间单调，未知高阶默认值为0。
 - `DohertyPA.Process` 持续驱动Carrier支路，在包络越过门限时平滑开启Peaking支路，并加入支路时延、复合成和简化负载调制；两条支路可分别选择Wiener或GMP。
 - 可选 `ThermalConfig` 把输出功率和效率映射为耗散功率；数据窗内活动段发热，内部静默段与Channel自动生成的窗外空闲段按 `idleDissipatedPowerW` 冷却。稳态模式把每个RC支路解到周期首尾闭合，瞬态模式从实时状态推进。`enabled=False` 是硬关闭：PA删除活动热网络、清除热metrics和旧互热offset，并旁路温度电参数漂移；底层 `ThermalNetwork` 只允许用启用配置构造。`Channel.Process(rawSignal, outputPowerDbm=...)` 自动完成“保存热状态→参考温度校准→恢复热状态→正式周期发射”。
 - `IQImbalancePA` 在被包装PA的输出上增加共轭镜像，只是用于增广ILC归因测试的参考面无关代数包装器；真实Tx与FB两处I/Q误差应分别使用Channel的 `txIq...` 与 `fbIq...` 参数。它透明代理内部PA的周期热处理、暂停/恢复、metrics、实际占空比、复位和额外空闲接口，因此包装热PA后Channel仍能执行相同热调度与校准事务。`AddAwgn` 模拟反馈接收链噪声。
@@ -1340,12 +1340,12 @@ MIMO独立功率直接调用 `channel.Process(inputWaveform, outputPowerDbm=(22.
 
 | 参数 | 默认值 | 约束或含义 |
 | --- | --- | --- |
-| `nonlinearOrders` | `(1, 3, 5, 7)` | 非空正奇数阶元组。 |
+| `nonlinearOrders` | `(1, 3, 5, 7)` | 非空正奇数阶元组；默认生成器会对含一阶的非默认集合共同缩小非线性稳态项以保持0至2内单调，未知高阶默认值为0；无一阶集合只启用最低阶后备项。 |
 | `memoryDepth` | `3` | 正整数；主分支记忆深度。 |
 | `crossMemoryDepth` | `2` | 非负整数；交叉包络记忆深度。 |
-| `mainCoefficients` | `None` | 主项系数字典，键为 `(order, memoryIndex)`；`None` 使用内置稳定系数。 |
-| `laggingCoefficients` | `None` | 滞后交叉项字典，键为 `(order, memoryIndex, crossIndex)`。 |
-| `leadingCoefficients` | `None` | 超前交叉项字典，键为 `(order, memoryIndex, crossIndex)`。 |
+| `mainCoefficients` | `None` | 主项系数字典，键为 `(order, memoryIndex)`；`None` 使用内置Rapp型拟合系数，并自动抵消默认记忆项对稳态曲线的重复贡献。 |
+| `laggingCoefficients` | `None` | 滞后交叉项字典，键为 `(order, memoryIndex, crossIndex)`；`None` 生成 $C_p(-0.060+j0.025)(0.22)^m(0.42)^l$。 |
+| `leadingCoefficients` | `None` | 超前交叉项字典，键为 `(order, memoryIndex, crossIndex)`；`None` 生成 $C_p(0.040-j0.018)(0.22)^m(0.42)^l$。 |
 
 `DohertyConfig` 支持：
 
@@ -2767,7 +2767,7 @@ print([stage.ToDict() for stage in result.stages])
 print([item.ToDict() for item in result.improvements])
 ```
 
-该场景逐路探测 PA 前和 PA 后网络，输出主路/耦合路径平坦度、中心耦合增益与相位、群时延和 MIMO 条件数；随后比较无 DPD、逐路独立 DPD、仅 PA 后目标去嵌入和完整耦合感知 DPD。默认参考结果中，完整方案相对逐路独立方案改善 EVM 0.376 dB、波形 NMSE 0.858 dB、残余耦合 4.364 dB，并提升最差 ACLR 0.325 dB。
+该场景逐路探测 PA 前和 PA 后网络，输出主路/耦合路径平坦度、中心耦合增益与相位、群时延和 MIMO 条件数；随后比较无 DPD、逐路独立 DPD、仅 PA 后目标去嵌入和完整耦合感知 DPD。默认参考结果中，完整方案相对逐路独立方案改善 EVM 10.261 dB、波形 NMSE 6.316 dB、残余耦合 16.479 dB；最差 ACLR 从 20.707 dB 降至 19.876 dB，轻微退化 0.831 dB，但仍通过“不超过 1.0 dB”的护栏。ACLR 的 PASS 是防止明显退化，不代表 ACLR 得到改善。
 
 输出：
 

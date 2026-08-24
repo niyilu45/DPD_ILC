@@ -8,11 +8,7 @@ import numpy as np
 from inc.lib.Analysis import Analysis
 from inc.lib.Channel import Channel
 from inc.lib.DpdIlc import ILCConfig, RunFrequencyDomainIlc
-from inc.lib.PaModel import (
-    DefaultGmpCoefficients,
-    GMPConfig,
-    PaModel,
-)
+from inc.lib.PaModel import PaModel
 from inc.lib.WaveGenWifi import WaveGenWifi
 from inc.utils.Draw import Draw
 
@@ -66,42 +62,13 @@ def RunSisoMode(
     # WaveGenWifi, PaModel, and Analysis use the same public interface width.
     # Fixed-mode arrays contain integer-valued I/Q codes in a complex128
     # container, while PA and analysis internals use decoded floating values.
-    # The library default GMP is deliberately severe and requires PA input
-    # peaks beyond a signed Q1.(W-1) public converter to reach 20 dBm average
-    # output. This example retains all GMP branches but scales nonlinear
-    # coefficients to 25 percent, so floating and fixed modes represent the
-    # same reachable 20 dBm operating point without concealing saturation.
-    defaultMain, defaultLagging, defaultLeading = (
-        DefaultGmpCoefficients((1, 3, 5, 7), 3, 2)
-    )
-    exampleMain = {
-        coefficientKey: (
-            coefficientValue
-            if coefficientKey[0] == 1
-            else 0.25 * coefficientValue
-        )
-        for coefficientKey, coefficientValue in defaultMain.items()
-    }
-    exampleLagging = {
-        coefficientKey: 0.25 * coefficientValue
-        for coefficientKey, coefficientValue in defaultLagging.items()
-    }
-    exampleLeading = {
-        coefficientKey: 0.25 * coefficientValue
-        for coefficientKey, coefficientValue in defaultLeading.items()
-    }
-    exampleGmpConfig = GMPConfig(
-        nonlinearOrders=(1, 3, 5, 7),
-        memoryDepth=3,
-        crossMemoryDepth=2,
-        mainCoefficients=exampleMain,
-        laggingCoefficients=exampleLagging,
-        leadingCoefficients=exampleLeading,
-    )
+    # Both modes use the same built-in GMP coefficient set.  Any result
+    # difference therefore comes from the public fixed-point boundary,
+    # including code quantization and full-scale clipping when peaks exceed
+    # the signed converter range.
     paModel = PaModel(
         parameters={
             "modelName": "gmp",
-            "gmpConfig": exampleGmpConfig,
             "width": width,
         },
     )
@@ -145,8 +112,12 @@ def RunSisoMode(
     )
     baselineMetrics = resultAnalysis.Analyze(baselineOutput)
 
+    # Four iterations are sufficient for this deterministic minimum example
+    # to improve both EVM and ACLR in floating and fixed modes.  Longer runs
+    # are intentionally left to BenchMark.py, where stopping and metric
+    # tradeoffs can be compared instead of hiding them in a minimal script.
     ilcConfig = ILCConfig(
-        numIterations=8,
+        numIterations=4,
         learningRate=0.15,
         regularization=1.0e-3,
         maxAmplitude=2.0,

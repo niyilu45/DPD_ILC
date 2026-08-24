@@ -136,71 +136,71 @@
     {
       "stageName": "Coupled PA baseline",
       "methodDescription": "No nonlinear or coupling compensation.",
-      "evmDb": 7.392634922275446,
-      "evmPercent": 234.22419020354255,
-      "normalizedMseDb": 0.6917883176694549,
-      "aclrWorstDb": 5.731842252055701,
-      "residualCouplingDb": -12.505341767050638
+      "evmDb": -5.7926004714773836,
+      "evmPercent": 51.32984778887045,
+      "normalizedMseDb": -7.862593130188237,
+      "aclrWorstDb": 19.922643402299926,
+      "residualCouplingDb": -8.991931526209472
     },
     {
       "stageName": "Independent DPD-GMP",
       "methodDescription": "Per-chain PA inverse training without measured pre/post coupling de-embedding.",
-      "evmDb": 2.710678106309505,
-      "evmPercent": 136.62617354084162,
-      "normalizedMseDb": -3.6285446544449713,
-      "aclrWorstDb": 8.91946339593069,
-      "residualCouplingDb": -12.198506617818822
+      "evmDb": -5.678022205903096,
+      "evmPercent": 52.01144141226839,
+      "normalizedMseDb": -8.144289281844538,
+      "aclrWorstDb": 20.706787298020597,
+      "residualCouplingDb": -8.623304796288183
     },
     {
       "stageName": "Post-deembedded DPD-GMP",
       "methodDescription": "Measured post-PA target de-embedding without pre-PA DAC coupling cancellation.",
-      "evmDb": 2.4195297421026782,
-      "evmPercent": 132.12241005944168,
-      "normalizedMseDb": -4.0759018532378795,
-      "aclrWorstDb": 9.300614766095041,
-      "residualCouplingDb": -14.065887974859297
+      "evmDb": -9.913402947637266,
+      "evmPercent": 31.93962792664205,
+      "normalizedMseDb": -11.051021438809343,
+      "aclrWorstDb": 19.74501603943185,
+      "residualCouplingDb": -15.399190532796892
     },
     {
       "stageName": "Coupling-aware DPD-GMP",
       "methodDescription": "Measured post-PA target de-embedding, per-PA GMP fitting, and measured pre-PA DAC coupling cancellation.",
-      "evmDb": 2.334314785231496,
-      "evmPercent": 130.83252985889177,
-      "normalizedMseDb": -4.486644073235669,
-      "aclrWorstDb": 9.244937602113442,
-      "residualCouplingDb": -16.562382691016925
+      "evmDb": -15.938626247880157,
+      "evmPercent": 15.96131569939695,
+      "normalizedMseDb": -14.459904852228142,
+      "aclrWorstDb": 19.87595930881344,
+      "residualCouplingDb": -25.102260252030973
     }
   ],
   "improvements": [
     {
       "metricName": "EVM dB",
-      "beforeValue": 2.710678106309505,
-      "afterValue": 2.334314785231496,
-      "improvementValue": 0.37636332107800907,
+      "beforeValue": -5.678022205903096,
+      "afterValue": -15.938626247880157,
+      "improvementValue": 10.26060404197706,
       "expectedDirection": "lower",
       "expectationMet": true
     },
     {
       "metricName": "Normalized MSE dB",
-      "beforeValue": -3.6285446544449713,
-      "afterValue": -4.486644073235669,
-      "improvementValue": 0.8580994187906978,
+      "beforeValue": -8.144289281844538,
+      "afterValue": -14.459904852228142,
+      "improvementValue": 6.3156155703836045,
       "expectedDirection": "lower",
       "expectationMet": true
     },
     {
       "metricName": "Residual coupling dB",
-      "beforeValue": -12.198506617818822,
-      "afterValue": -16.562382691016925,
-      "improvementValue": 4.363876073198103,
+      "beforeValue": -8.623304796288183,
+      "afterValue": -25.102260252030973,
+      "improvementValue": 16.478955455742792,
       "expectedDirection": "lower",
       "expectationMet": true
     },
     {
       "metricName": "Worst ACLR dB",
-      "beforeValue": 8.91946339593069,
-      "afterValue": 9.244937602113442,
-      "improvementValue": 0.32547420618275247,
-      "expectedDirection": "higher",
+      "beforeValue": 20.706787298020597,
+      "afterValue": 19.87595930881344,
+      "improvementValue": -0.8308279892071582,
+      "expectedDirection": "no more than 1.0 dB lower",
       "expectationMet": true
     }
   ],
@@ -213,10 +213,10 @@
         "sampleCount": 8640,
         "segmentCount": 1,
         "featureCount": 88,
-        "beforeNmseDb": -24.976906006036643,
-        "afterNmseDb": -24.976906006036643,
+        "beforeNmseDb": -15.842610157837766,
+        "afterNmseDb": -18.97597209478306,
         "regularizedConditionNumber": 1585798.6674236967,
-        "normalizedCoefficientUpdateNorm": 1.1333786047205648e-10
+        "normalizedCoefficientUpdateNorm": 1.7737236232829774
       },
       {
         "sampleCount": 8640,

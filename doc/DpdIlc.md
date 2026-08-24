@@ -251,7 +251,7 @@ outputSignal = paModel.Process(inputSignal)
 
 ## 5. 最小可运行SISO示例
 
-工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。示例保留默认GMP的全部主项、滞后项和超前项，但把非线性系数缩放为25%，使20 dBm平均输出在有符号定点转换器范围内可达；这不是放宽功率误差。PA后接入 `sampleMode="forward"`、0度移相和10 mV复包络总RMS白噪声的 `Channel`，表示实验室仪表闭环。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
+工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。示例直接使用默认GMP系数，不再把非线性系数额外缩放为25%。默认各阶系数和形成单调Rapp型稳态曲线，较小的主记忆、滞后和超前动态项按阶零和，因此连续高幅样点不会因重复计入记忆压缩而快速下坠；20 dBm工作点由`Channel.Process(..., outputPowerDbm=20.0)`内部调整PA输入得到。这个最小示例固定运行4轮，使当前确定性场景中的浮点和16位模式都在局部稳定区同时改善EVM与ACLR；更长迭代及停止准则比较留给Benchmark场景。PA后接入 `sampleMode="forward"`、0度移相和10 mV复包络总RMS白噪声的 `Channel`，表示实验室仪表闭环。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
 
 ```python
 from SmallestSISO import RunSisoMode
