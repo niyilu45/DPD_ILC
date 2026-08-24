@@ -1959,7 +1959,7 @@ $\mathbf{H}_{d}$ 是直接通道矩阵，$\mathbf{H}_{i}$ 是镜像通道矩阵�
 3. 在有效数据区联合拟合 $x$ 与 $x^*$，得到直接系数 $\hat a$ 和镜像系数 $\hat b$。
 4. 计算 `Analysis.Analyze()` 返回的 `irrDb`。
 5. 改变输出功率、中心频率和温度重复测量，判断镜像是固定、频率选择性还是功率相关。
-6. 用已知高 IRR 信号直通接收机，单独测量反馈接收机的 IRR 地板。
+6. 用已知 `irrDb` 足够负的信号直通接收机，单独测量反馈接收机的镜像地板。
 
 对单路时域记录，代码对应的回归为
 
@@ -2020,7 +2020,7 @@ b_{\mathrm{fb}}y_{\mathrm{fwd}}^*.
 
 第一步用 $[x,\ x^*]$ 回归得到Tx级联系数；第二步用 $[y_{\mathrm{fwd}},\ y_{\mathrm{fwd}}^*]$ 回归得到FB系数。若只拿fb记录直接对 $x$ 回归，估计值会把Tx与FB两处镜像卷积在一起，无法判断DPD应该补偿哪一部分。
 
-在仿真中可以用 `Channel.GetLastPaInput()`、`GetLastTransmitterOutput()` 与 `GetLastActualPaInput()`分别观察Tx I/Q前、Tx I/Q后和PA耦合后的三个参考面；实际硬件则需要forward仪表或已知IRR更高的独立接收机完成同样的参考面分离。
+在仿真中可以用 `Channel.GetLastPaInput()`、`GetLastTransmitterOutput()` 与 `GetLastActualPaInput()`分别观察Tx I/Q前、Tx I/Q后和PA耦合后的三个参考面；实际硬件则需要forward仪表或已知 `irrDb` 更负的独立接收机完成同样的参考面分离。
 
 ## 16. 检测后的 DPD 推荐与增广 GMP 仿真
 
@@ -2028,7 +2028,7 @@ b_{\mathrm{fb}}y_{\mathrm{fwd}}^*.
 
 | 测量现象 | 推荐 |
 |---|---|
-| IRR 高且 EVM 主要由 PA 压缩决定 | 保留普通 `DpdGmp` |
+| `irrDb` 很负且 EVM 主要由 PA 压缩决定 | 保留普通 `DpdGmp` |
 | 单路自身镜像明显，且镜像在 DPD 可控发射链内 | 使用 `AugmentedDpdGmp` |
 | 镜像随频率变化 | 增加增广 GMP 的 `memoryDepth` 和 `crossMemoryDepth` |
 | 非对角 $\mathbf{H}_{i}$ 明显 | 升级为联合 widely-linear MIMO GMP |
@@ -2047,34 +2047,34 @@ b_{\mathrm{fb}}y_{\mathrm{fwd}}^*.
 - 三个同功率方法：未补偿、普通 GMP、增广 GMP；
 - 普通和增广模型使用相同训练标签、阶数、记忆、岭系数和功率闭环。
 
-理论未补偿 IRR 为
+理论未补偿 `irrDb` 为
 
 ```math
-\mathit{IRR}_{\mathrm{dB}}
+\mathit{irrDb}
 =
 20\log_{10}
-\frac{1}{0.08}
+0.08
 \approx
-21.94\ \mathrm{dB}.
+-21.94\ \mathrm{dBc}.
 ```
 
 ### 16.3 仿真结果
 
-| 方法 | 8 dBm IRR | 22 dBm IRR | 8 dBm EVM | 22 dBm EVM |
+| 方法 | 8 dBm `irrDb` | 22 dBm `irrDb` | 8 dBm EVM | 22 dBm EVM |
 |---|---:|---:|---:|---:|
-| IQ-impaired PA | 21.938 dB | 21.938 dB | -21.944 dB | -21.944 dB |
-| Conventional GMP | 21.938 dB | 21.957 dB | -21.943 dB | -21.957 dB |
-| Augmented GMP | 193.466 dB | 196.802 dB | -186.376 dB | -189.155 dB |
+| IQ-impaired PA | -21.938 dBc | -21.938 dBc | -21.944 dB | -21.944 dB |
+| Conventional GMP | -21.938 dBc | -21.957 dBc | -21.943 dB | -21.957 dB |
+| Augmented GMP | -193.466 dBc | -196.802 dBc | -186.376 dB | -189.155 dB |
 
 ![普通 GMP 与增广 GMP 的功率-EVM/IRR 曲线](./images/channel_analyse/iq_gmp_comparison.png)
 
-**图 4 说明：** 左图越低越好，右图越高越好。普通 GMP 与未补偿曲线几乎重合，说明增加普通非线性阶数不能替代共轭结构；增广 GMP 能表示解析逆中的 $x^*$ 项，因此同时消除镜像和由镜像主导的 EVM。曲线使用无噪声、近线性 PA 和双精度计算，约 190 dB 的结果只表示残差到达数值精度，不代表实际射频硬件性能。真实链路应由接收机 IRR、噪声和量化建立可信测量上限。
+**图 4 说明：** 左图越低越好，右图也越负越好。普通 GMP 与未补偿曲线几乎重合，说明增加普通非线性阶数不能替代共轭结构；增广 GMP 能表示解析逆中的 $x^*$ 项，因此同时消除镜像和由镜像主导的 EVM。曲线使用无噪声、近线性 PA 和双精度计算，约 `-190 dBc` 的结果只表示残差到达数值精度，不代表实际射频硬件性能。真实链路应由接收机镜像地板、噪声和量化建立可信测量下界。
 
 ### 16.4 改进是否符合预期
 
 在所有五个功率点：
 
-- 增广 GMP 相对普通 GMP 的 IRR 提高超过 170 dB；
+- 增广 GMP 相对普通 GMP 的 `irrDb` 降低超过 170 dB，即镜像更负；
 - 增广 GMP 的 EVM 降低超过 160 dB；
 - 普通 GMP 只有不足 0.02 dB 的 IRR 变化，属于有限样本相关和极弱 PA 数值非线性的影响；
 - 未观察到随功率恶化，因为本场景故意把 PA 设置在近线性区。

@@ -23,7 +23,7 @@
 4. Tx I/Q测试使用forward参考面，FB I/Q测试直接从已知PA输出进入 `ProcessPaOutput`。
 5. 温漂测试只需调用 `Channel.Process(rawSignal, outputPowerDbm=...)`；默认 `steady_state` 会在每次调用时执行参考温度功率校准，再按完整周期稳态温度曲线处理。需要观察冷启动历史时显式选择 `transient`。
 6. 参数比较至少包含理想、轻微和压力三档，并给出预期单调趋势。
-7. 理想双精度结果可能显示数百dB IRR或极小EVM，这只代表数值残差，不代表真实仪器动态范围。
+7. 理想双精度结果可能显示低于 `-200 dBc` 的 `irrDb` 或极小EVM，这只代表数值残差，不代表真实仪器动态范围。
 
 最小系统的推荐执行顺序为：
 
@@ -178,7 +178,7 @@ txIqResults = RunTxIqComparison()
 for scenarioName, metrics in txIqResults.items():
     print(
         f"{scenarioName:16s} "
-        f"IRR={metrics['irrDb']:8.2f} dB  "
+        f"IRR={metrics['irrDb']:8.2f} dBc  "
         f"EVM={metrics['evmDb']:8.2f} dB"
     )
 ```
@@ -189,22 +189,22 @@ for scenarioName, metrics in txIqResults.items():
 
 | 场景 | IRR | EVM | 预期判断 |
 |---|---:|---:|---|
-| Disabled gate | 约284 dB | 数值零残差 | 非零增益、相位和DC均被硬开关旁路 |
-| Ideal enabled | 约284 dB | 数值零残差 | 只表示双精度基线 |
-| Gain only | 35.26 dB | -35.26 dB | 与0.3 dB增益误差公式一致 |
-| Phase only | 35.16 dB | -35.16 dB | 与2度正交误差公式一致 |
-| Mild combined | 32.20 dB | -32.20 dB | 两个镜像向量共同作用 |
-| Stress combined | 22.83 dB | -22.83 dB | 镜像明显主导EVM |
+| Disabled gate | 约 -284 dBc | 数值零残差 | 非零增益、相位和DC均被硬开关旁路 |
+| Ideal enabled | 约 -284 dBc | 数值零残差 | 只表示双精度基线 |
+| Gain only | -35.26 dBc | -35.26 dB | 与0.3 dB增益误差公式一致 |
+| Phase only | -35.16 dBc | -35.16 dB | 与2度正交误差公式一致 |
+| Mild combined | -32.20 dBc | -32.20 dB | 两个镜像向量共同作用 |
+| Stress combined | -22.83 dBc | -22.83 dB | 镜像明显主导EVM |
 
-这里EVM约等于IRR的负值，是因为系统中只有一个共轭镜像误差。若加入PA非线性、DC、噪声或削顶，该关系将不再严格成立。
+这里 EVM dB 约等于 `irrDb`，是因为系统中只有一个共轭镜像误差。若加入PA非线性、DC、噪声或削顶，该关系将不再严格成立。
 
 ### 3.5 隔离成功的判据
 
-- 增益误差或相位误差增大时，IRR应降低、EVM应升高。
+- 增益误差或相位误差增大时，`irrDb` 应上升、趋近0，EVM也应升高。
 - Disabled gate应与Ideal enabled逐样点一致，证明False不是仅关闭镜像项，而是同时旁路增益、相位和DC。
 - `sampleMode="forward"` 仍然能看到Tx I/Q误差，因为它位于PA之前。
 - `GetLastTransmitterOutput()` 应与单位PA输出一致。
-- 如果Ideal场景仍只有二三十dB IRR，应先检查输入是否近似proper complex，以及Analysis是否使用了同一参考波形。
+- 如果Ideal场景的 `irrDb` 仍只有 `-20` 至 `-30 dBc`，应先检查输入是否近似proper complex，以及Analysis是否使用了同一参考波形。
 
 ## 4. 最小系统B：单独测试FB I/Q不平衡
 
@@ -279,7 +279,7 @@ fbIqResults = RunFbIqComparison()
 for scenarioName, metrics in fbIqResults.items():
     print(
         f"{scenarioName:16s} "
-        f"IRR={metrics['irrDb']:8.2f} dB  "
+        f"IRR={metrics['irrDb']:8.2f} dBc  "
         f"EVM={metrics['evmDb']:8.2f} dB"
     )
 ```
@@ -330,7 +330,7 @@ def RunFbDcComparison() -> dict:
 | 0.01 | 1% | 约 -40.01 dB |
 | 0.03 | 3% | 约 -30.46 dB |
 
-DC增大时EVM按约20对数规律变差，但IRR仍可能很高，因为DC不是 $x^*$ 镜像。只看IRR会漏掉这一类误差。若把 `fbIqImbalanceEnabled` 改成False，同样的非零 `fbDcOffset` 也会被旁路；Tx端使用 `txIqImbalanceEnabled` 遵循相同规则。
+DC增大时EVM按约20对数规律变差，但 `irrDb` 仍可能很负，因为DC不是 $x^*$ 镜像。只看IRR会漏掉这一类误差。若把 `fbIqImbalanceEnabled` 改成False，同样的非零 `fbDcOffset` 也会被旁路；Tx端使用 `txIqImbalanceEnabled` 遵循相同规则。
 
 ## 5. 最小系统C：单独测试固定温度角
 
@@ -819,7 +819,7 @@ def DrawPeriodicTemperature(channel: Channel) -> None:
 
 至少记录：
 
-- `irrDb`：判断共轭镜像强度；
+- `irrDb`：镜像相对直接分量的 dBc，越负越好；
 - `evmDb` 和 `evmPercent`：判断镜像或DC对调制误差的贡献；
 - Tx测试的 `GetLastTransmitterOutput()`：确认误差位于PA前；
 - forward与fb成对结果：区分真实发射误差和反馈接收机误差。

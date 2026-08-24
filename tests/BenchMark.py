@@ -3832,7 +3832,8 @@ class IqGmpStageResult:
 
         Processing details:
             Algorithm: Copy method identity, requested/measured power, EVM,
-            IRR, and ACLR without changing metric sign conventions.
+            signed image-relative IRR, and ACLR without changing metric sign
+            conventions.
 
         Returns:
             result: CSV/JSON-compatible curve row.
@@ -4737,7 +4738,7 @@ def PrintChannelAnalysisResults(
             f"{stage.methodName:<18} "
             f"Pout={stage.measuredOutputPowerDbm:>6.2f} dBm  "
             f"EVM={stage.evmDb:>8.3f} dB  "
-            f"IRR={stage.irrDb:>8.3f} dB"
+            f"IRR={stage.irrDb:>8.3f} dBc"
         )
 
 

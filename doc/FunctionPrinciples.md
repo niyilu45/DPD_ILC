@@ -522,7 +522,7 @@ flowchart LR
 | `DpdGmp.BuildBasisChunk` | P/N | 按活动 main、lagging 和 leading 规格构造直接 GMP 基矩阵；子类通过覆盖此入口复用同一个归一化岭回归求解器。 | DPD-GMP §16 |
 | `AugmentedDpdGmp.RebuildStructure`, `AugmentedDpdGmp.BuildBasisChunk` | P/N/E | 联合编号直接 GMP 基与其共轭副本；共轭支路保留阶数、信号时延和包络交叉时延，用于表达 IQ 镜像及其非线性记忆。 | DPD-GMP §16 |
 | `AugmentedDpdGmp.GetDirectCoefficients`, `AugmentedDpdGmp.GetImageCoefficients` | E | 分别返回直接支路与镜像支路系数副本，便于诊断而不允许外部静默修改模型。 | DpdGmp §17 |
-| `Analysis.MeasureIrr`, `Analysis.MeasurePreparedIrr`, `Analysis.CalculateIrr`, `Analysis.CalculatePreparedIrr` | P/N | 在统一同步和公共复增益补偿后联合拟合直接项与共轭项，以两项功率之比计算总IRR和逐链IRR；完整测量字典同时给出系数、镜像幅度比、残差与条件数，微小岭项保护数值求解。 | Analysis §15 |
+| `Analysis.MeasureIrr`, `Analysis.MeasurePreparedIrr`, `Analysis.CalculateIrr`, `Analysis.CalculatePreparedIrr` | P/N | 在统一同步和公共复增益补偿后联合拟合直接项与共轭项，以镜像功率/期望功率计算总 `irrDb` 和逐链 `irrDb`；单位为 dBc，越负越好。完整测量字典同时给出系数、镜像幅度比、残差与条件数，微小岭项保护数值求解。 | Analysis §15 |
 | `Draw.CreateIqGmpComparisonFigure`, `Draw.SaveIqGmpComparison` | E | 绘制并保存普通 GMP 与增广 GMP 的同功率 EVM、IRR 双面板曲线，不重新训练模型或计算指标。 | ChannelAnalyse §16 |
 
 ## 17. DPD-LMS逐样点更新函数索引

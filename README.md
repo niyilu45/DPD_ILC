@@ -1005,7 +1005,7 @@ flowchart TD
 - 每次 `Analyze` 只调用一次 `SigProc.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
 - SNR 直接计算校正后数据字段与参考的残差功率；EVM 由 `FrameProcess` 根据 `WifiWaveform` 的数据字段位置去循环前缀、FFT、撤销 CSD 和空间解映射，再与采用相同接收路径得到的参考星座比较。
 - ACLR 通过 `AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
-- `Analyze` 直接返回包含模拟输出功率、SNR、EVM、IRR和ACLR的普通Python字典；调用方用 `metrics["outputPowerDbm"]`、`metrics["evmDb"]` 和 `metrics["irrDb"]` 读取结果。功率在同步后、公共复增益补偿前计算，并按逐链峰值相对门限只统计有效突发样点；帧外补零和长占空比静默不参与RMS，短暂OFDM过零仍被保留。字典也可以直接交给 `Print`，或由 `Save` 写入JSON/CSV。
+- `Analyze` 直接返回包含模拟输出功率、SNR、EVM、IRR和ACLR的普通Python字典；调用方用 `metrics["outputPowerDbm"]`、`metrics["evmDb"]` 和 `metrics["irrDb"]` 读取结果。`irrDb` 保留兼容字段名，但表示镜像相对期望分量的 dBc，负数越负越好。功率在同步后、公共复增益补偿前计算，并按逐链峰值相对门限只统计有效突发样点；帧外补零和长占空比静默不参与RMS，短暂OFDM过零仍被保留。字典也可以直接交给 `Print`，或由 `Save` 写入JSON/CSV。
 - `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
 - `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、模拟输出功率、公共复增益幅相和输入峰值。
 - MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA 输出功率/SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
@@ -1550,7 +1550,7 @@ channel = Channel(
 
 | 模块 | 推荐仿真起点 | 配置值怎样产生影响 |
 | --- | --- | --- |
-| Tx I/Q | `txIqImbalanceEnabled=True`，`0.3 dB`、`2 degree` | 开关为True时，增益和相位误差变成共轭镜像系数并在PA前注入；约对应35 dB量级的单项IRR，forward与fb都会变差。False时增益、相位和DC整级旁路。 |
+| Tx I/Q | `txIqImbalanceEnabled=True`，`0.3 dB`、`2 degree` | 开关为True时，增益和相位误差变成共轭镜像系数并在PA前注入；约对应 `-35 dBc` 量级的单项 `irrDb`，forward与fb都会变差。False时增益、相位和DC整级旁路。 |
 | FB I/Q | `fbIqImbalanceEnabled=True`，`0.3 dB`、`2 degree` | 开关为True时使用相同镜像公式，但只污染fb观测；forward结果不变。False时增益、相位和DC整级旁路。 |
 | 通道耦合 | `-30 dB` | 电压泄漏为 `10^(-30/20)=3.16%`；PA前耦合还会进入非线性。 |
 | FB CFO | `500 Hz`功能验证、`5 kHz`压力测试 | 累计相位为 `2π·CFO·观测时间`；帧越长旋转越明显。 |
@@ -1766,8 +1766,8 @@ assert resultAnalysis.width == 16
 | `CalculateSnr(measuredSignal)` | 待测输出 | 返回数据字段 SNR，单位 dB。 |
 | `CalculateEvmAlignedMse(measuredSignal)` | 待测输出 | 返回与 EVM 接收链完全一致的归一化 MSE；该值等于 RMS EVM 的平方。 |
 | `CalculateEvm(measuredSignal)` | 待测输出 | 返回 `(evmDb, evmPercent)`。 |
-| `MeasureIrr(measuredSignal=None)` | 可选待测输出 | 对同步后的直接/共轭分量做联合最小二乘，返回含总IRR、逐链IRR、镜像幅度比、复系数分量、残差和条件数的普通字典；发送辅助和盲模式可省略输入。 |
-| `CalculateIrr(measuredSignal=None)` | 可选待测输出 | 兼容简洁接口，只返回 `MeasureIrr` 中的总IRR dB。 |
+| `MeasureIrr(measuredSignal=None)` | 可选待测输出 | 对同步后的直接/共轭分量做联合最小二乘，返回含总 `irrDb`、逐链 `irrDb`、镜像幅度比、复系数分量、残差和条件数的普通字典；`irrDb` 为镜像相对期望分量的 dBc，越负越好；发送辅助和盲模式可省略输入。 |
+| `CalculateIrr(measuredSignal=None)` | 可选待测输出 | 兼容简洁接口，只返回 `MeasureIrr` 中的总 `irrDb`，单位 dBc。 |
 | `MeasurePreparedIrr(preparedSignal)` | 已同步输出 | 不重复同步，返回完整IRR测量字典。 |
 | `BuildTwoToneWaveform(measuredSignal, waveform=None, ...)` | `TwoToneWaveform`或原始NumPy/list | 将已有频率元数据保留，或在原始样值模式校验物理频率并构造分析元数据；raw省略位宽时对整数且超出归一化范围的码自动识别为默认16位，否则按浮点处理。 |
 | `AnalyzeTwoTone(measuredSignal, waveform=None, ...)` | PA输出和 `TwoToneWaveform`或NumPy/list | 一次返回双音基波、IM3/IM5/IM7的上下侧dBc、每阶较差侧、综合最差互调和模拟PA输出参考面 `outputPowerDbm` 字典；功率先按接收样值位宽解码并排除长静默，原始样值必须提供 `sampleRateHz` 与 `toneFrequenciesHz`。 |
@@ -1784,7 +1784,7 @@ assert resultAnalysis.width == 16
 | `AnalyzePowerEvmCurve(outputPowerDbmValues, methodEvaluators)` | 递增输出dBm点、`{方法名: 求值器}` 映射 | 按输出回退驱动PA，把每种方法标定到相同输出功率后计算EVM。 |
 | `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取实例解析后的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
 
-`Analyze` 返回字典的固定键包括 `outputPowerDbm`、`snrDb`、`evmDb`、`evmPercent`、`irrDb`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。SISO的 `outputPowerDbm` 是单端口功率；MIMO的该字段是所有独立PA端口在线性功率域求和后的结果，每路功率和IRR分别位于 `GetLastMimoMetrics()["outputPowerDbmPerChain"]` 与 `GetLastMimoMetrics()["irrDbPerChain"]`。需要IRR拟合质量时使用 `MeasureIrr()`，其结果还包含镜像幅度比、拟合残差和回归条件数。`ILCPerformanceIteration` 把RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存同一普通指标字典。`PowerEvmCurve` 保存 `outputPowerDbmValues`、`driveScaleValues`、`targetOutputRmsValues` 以及各方法的EVM数组。
+`Analyze` 返回字典的固定键包括 `outputPowerDbm`、`snrDb`、`evmDb`、`evmPercent`、`irrDb`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。其中 `irrDb=10*log10(Pimage/Pdesired)`，单位 dBc，越负越好；传统正值IRR等于它的相反数。SISO的 `outputPowerDbm` 是单端口功率；MIMO的该字段是所有独立PA端口在线性功率域求和后的结果，每路功率和IRR分别位于 `GetLastMimoMetrics()["outputPowerDbmPerChain"]` 与 `GetLastMimoMetrics()["irrDbPerChain"]`。需要IRR拟合质量时使用 `MeasureIrr()`，其结果还包含镜像幅度比、拟合残差和回归条件数。`ILCPerformanceIteration` 把RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存同一普通指标字典。`PowerEvmCurve` 保存 `outputPowerDbmValues`、`driveScaleValues`、`targetOutputRmsValues` 以及各方法的EVM数组。
 
 ### `Draw` 参数与方法
 

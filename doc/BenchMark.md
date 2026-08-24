@@ -1072,15 +1072,15 @@ y_{\mathrm{IQ}}[n]
 \beta=0.045e^{j0.35}.
 ```
 
-共轭项把正负频率互换，产生普通解析复模型无法完整表示的镜像。按系数幅度估算的镜像抑制度为：
+共轭项把正负频率互换，产生普通解析复模型无法完整表示的镜像。按本工程负 dBc 约定估算的镜像相对电平为：
 
 ```math
-\mathrm{IRR}
+\mathit{irrDb}
 =20\log_{10}
 \left(
-\frac{|\alpha|}{|\beta|}
+\frac{|\beta|}{|\alpha|}
 \right)
-\approx26.94\ \mathrm{dB}.
+\approx-26.94\ \mathrm{dBc}.
 ```
 
 这与参考运行中IQ baseline明显恶化的数量级一致，但EVM还受PA非线性、帧结构和同步处理影响，因此不应要求EVM恰好等于IRR。
@@ -2186,23 +2186,23 @@ flowchart LR
 
 ### 32.4 结果预期
 
-- 未补偿 IRR 应接近 $20\log_{10}(1/0.08)=21.94$ dB；
+- 未补偿 `irrDb` 应接近 $20\log_{10}(0.08)=-21.94$ dBc；
 - 普通 GMP 没有独立共轭支路，IRR 不应有显著改善；
-- 增广 GMP 应明显提高 IRR，并降低由镜像主导的 EVM；
+- 增广 GMP 应使 `irrDb` 明显下降并变得更负，同时降低由镜像主导的 EVM；
 - 五个功率点的趋势应一致；
 - 实际输出功率应接近目标，不能通过后级缩放伪造改善。
 
 ### 32.5 仿真结果
 
-| 方法 | IRR 范围 | EVM 范围 | 结论 |
+| 方法 | `irrDb` 范围 | EVM 范围 | 结论 |
 |---|---:|---:|---|
-| IQ-impaired PA | 21.938 dB | -21.944 dB | 与理论镜像系数一致 |
-| Conventional GMP | 21.938 至 21.957 dB | -21.943 至 -21.957 dB | 基本不能消除镜像 |
-| Augmented GMP | 193.466 至 196.802 dB | -186.376 至 -189.155 dB | 达到无噪声双精度残差底 |
+| IQ-impaired PA | -21.938 dBc | -21.944 dB | 与理论镜像系数一致 |
+| Conventional GMP | -21.938 至 -21.957 dBc | -21.943 至 -21.957 dB | 基本不能消除镜像 |
+| Augmented GMP | -193.466 至 -196.802 dBc | -186.376 至 -189.155 dB | 达到无噪声双精度残差底 |
 
 ![K类增广GMP性能曲线](./images/channel_analyse/iq_gmp_comparison.png)
 
-**图 19 说明：** 右图中普通 GMP 与 baseline 重合，而增广 GMP 显著提高 IRR；左图显示镜像被消除后 EVM 同时下降。极高数值来自理想、无噪声的结构验证，不代表仪器动态范围。
+**图 19 说明：** 右图中普通 GMP 与 baseline 重合，而增广 GMP 使 `irrDb` 显著下降、变得更负；左图显示镜像被消除后 EVM 同时下降。极负数值来自理想、无噪声的结构验证，不代表仪器动态范围。
 
 ### 32.6 输出与验收
 
@@ -2222,8 +2222,8 @@ python tests/BenchMark.py --channel-analyse
 
 - [ ] 三种方法各有五个同功率点；
 - [ ] `Analysis` 结果字典含 `irrDb`；
-- [ ] baseline IRR 与 21.94 dB 理论值一致；
-- [ ] 增广 GMP 的最差 IRR 比普通 GMP 的最好 IRR至少高 40 dB；
+- [ ] baseline `irrDb` 与 -21.94 dBc 理论值一致；
+- [ ] 增广 GMP 最接近0的 `irrDb` 仍比普通 GMP 最负的 `irrDb` 至少低 40 dB；
 - [ ] 曲线、CSV 和 JSON 使用同一批计算结果；
 - [ ] 文档明确区分理想数值残差与真实测量上限。
 

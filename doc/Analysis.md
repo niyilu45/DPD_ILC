@@ -1653,7 +1653,7 @@ Y_{\mathrm{OTA}}(f)=\mathbf h^H(f)\mathbf X(f),
 | 字段 | 索引对象 | 含义 |
 |---|---|---|
 | `snrDbPerChain` | 物理 PA 链 | 每链校正后 SNR |
-| `irrDbPerChain` | 物理 PA 链 | 每链直接分量与共轭镜像分量的功率比 |
+| `irrDbPerChain` | 物理 PA 链 | 每链镜像分量相对直接分量的功率，单位 dBc，越负越好 |
 | `aclrLowerDbPerChain` | 物理 PA 链 | 每链下邻道 ACLR |
 | `aclrUpperDbPerChain` | 物理 PA 链 | 每链上邻道 ACLR |
 | `aclrWorstDbPerChain` | 物理 PA 链 | 每链较差邻道 ACLR |
@@ -1678,7 +1678,7 @@ Analysis只根据输入矩阵的列解释“通道”，不依赖Channel或PA模
 | `snrDb` | 数据字段校正后参考功率/残差功率比 | 越大越好 |
 | `evmDb` | RMS EVM 的 dB 值 | 越负越好 |
 | `evmPercent` | RMS EVM 百分比 | 越小越好 |
-| `irrDb` | 直接分量功率与共轭镜像分量功率之比 | 越大越好 |
+| `irrDb` | 共轭镜像分量相对直接分量的功率 | dBc，越负越好 |
 | `aclrLowerDb` | 主信道/下邻道功率比 | 越大越好 |
 | `aclrUpperDb` | 主信道/上邻道功率比 | 越大越好 |
 | `aclrWorstDb` | 上下邻道较差者 | 越大越好 |
@@ -2538,26 +2538,29 @@ g_Q e^{-j\varphi/2}
 
 $a$ 是期望直接路径，$b$ 是把正频率搬到负频率、把负频率搬到正频率的镜像路径。幅度失配或正交相位误差中的任意一种都能使 $b$ 非零。
 
-### 15.2 IRR 定义
+### 15.2 IRR 定义与本工程的负 dBc 约定
 
-本工程采用直接路径功率与镜像路径功率之比：
-
-```math
-\mathit{IRR}
-=
-\frac{|a|^2}{|b|^2},
-```
+标准教材常把镜像抑制度定义为直接路径功率除以镜像路径功率，因此得到正的 dB 数值。为了让 IRR 与 EVM、IM3/IM5/IM7 一样遵循“失真越负越好”的显示方向，本工程的 `irrDb` 保留兼容字段名，但返回**镜像路径相对直接路径的 dBc**：
 
 ```math
-\mathit{IRR}_{\mathrm{dB}}
+\mathit{irrDb}
 =
-10\log_{10}\mathit{IRR}
+10\log_{10}
+\frac{|b|^2}{|a|^2}
 =
 20\log_{10}
-\frac{|a|}{|b|}.
+\frac{|b|}{|a|}.
 ```
 
-IRR 越大，镜像越小。IRR 与 EVM 不是同一个指标：IRR 只观察能被 $x^*$ 解释的结构性镜像，EVM 还包含 PA 非线性、记忆、噪声、同步残差和量化误差。
+因此 `irrDb=-40 dBc` 表示镜像功率比直接分量低 40 dB，并且优于 `irrDb=-30 dBc`。若需要传统的正值镜像抑制度，只需取相反数：
+
+```math
+\mathit{IRR}_{\mathrm{traditional,dB}}
+=
+-\mathit{irrDb}.
+```
+
+`irrDb` 越负，镜像越小。它与 EVM 不是同一个指标：`irrDb` 只观察能被 $x^*$ 解释的结构性镜像，EVM 还包含 PA 非线性、记忆、噪声、同步残差和量化误差。
 
 若唯一误差是很小的镜像项，且 $|a|$ 约为 1，则有近似关系
 
@@ -2570,7 +2573,7 @@ IRR 越大，镜像越小。IRR 与 EVM 不是同一个指标：IRR 只观察能
 ```math
 \mathit{EVM}_{\mathrm{dB}}
 \approx
--\mathit{IRR}_{\mathrm{dB}}.
+\mathit{irrDb}.
 ```
 
 出现明显偏差并不表示计算错误，而是说明残差中还有非镜像分量。
@@ -2614,13 +2617,13 @@ IRR 越大，镜像越小。IRR 与 EVM 不是同一个指标：IRR 只观察能
 MIMO 输入按物理链分别估计 $\hat a_i$ 和 $\hat b_i$，再累加直接功率与镜像功率：
 
 ```math
-\mathit{IRR}_{\mathrm{MIMO,dB}}
+\mathit{irrDb}_{\mathrm{MIMO}}
 =
 10\log_{10}
 \frac{
-\sum_i|\hat a_i|^2
-}{
 \sum_i|\hat b_i|^2
+}{
+\sum_i|\hat a_i|^2
 }.
 ```
 
@@ -2639,9 +2642,9 @@ y'[n]
 则
 
 ```math
-\frac{|a/g|^2}{|b/g|^2}
+\frac{|b/g|^2}{|a/g|^2}
 =
-\frac{|a|^2}{|b|^2}.
+\frac{|b|^2}{|a|^2}.
 ```
 
 因此公共复增益会改变两个拟合系数的绝对值，却不会改变 IRR。同步仍然必须先做，因为未补偿时延、CFO 或 SFO 会把结构性镜像能量扩散到残差中并降低估计可信度。
@@ -2654,7 +2657,7 @@ y'[n]
 2. 保存实际送入待测链路的复数发送波形 `transmittedSignal`。它可以被裁剪、前后补零，不需要额外提供Wi-Fi配置。
 3. 同时采集接收波形，保留足够的前后保护样点。`Analysis` 使用互相关寻找两路公共区间，不要求两个数组长度相等。
 4. 先补偿整数时延、分数时延、CFO、SFO和公共复增益，再在同一有效区间拟合 $x$ 与 $x^*$ 两列。
-5. 由拟合的直接系数 $hat a$ 和镜像系数 $hat b$ 计算IRR，并检查条件数和拟合残差，避免把不可辨识或模型失配的数据误当成有效IRR。
+5. 由拟合的直接系数 $\hat a$ 和镜像系数 $\hat b$ 计算镜像相对电平 `irrDb`，并检查条件数和拟合残差，避免把不可辨识或模型失配的数据误当成有效IRR。
 
 仪表或芯片导出的两路NumPy波形可以直接测量：
 
@@ -2670,7 +2673,7 @@ irrAnalyzer = Analysis(
 )
 irrMeasurement = irrAnalyzer.MeasureIrr()
 
-print("IRR:", irrMeasurement["irrDb"], "dB")
+print("Image relative level:", irrMeasurement["irrDb"], "dBc")
 print("Image amplitude ratio:", irrMeasurement["imageAmplitudeRatio"])
 print("Fit residual ratio:", irrMeasurement["residualPowerRatio"])
 print(
@@ -2688,7 +2691,7 @@ x[n]=A\exp\left(j2\pi f_0 n/f_s\right),
 
 此时直接项位于 $+f_0$，共轭镜像项位于 $-f_0$。不要使用DC复常数或纯实波形，因为这时 $x=x^*$，两列无法区分；对应的回归条件数会很大。Wi-Fi随机复星座通常天然具有较好的可辨识性。
 
-对真实硬件，建议先把PA置于小信号近线性区测量基础Tx/FB IRR，再逐步扫描频率、输出功率和温度。若IRR只在高功率下降，可能包含PA与I/Q失衡级联形成的共轭非线性；一个常数 $hat b$ 只能给出综合诊断，不能完整替代频率相关或高阶增广模型。
+对真实硬件，建议先把PA置于小信号近线性区测量基础Tx/FB IRR，再逐步扫描频率、输出功率和温度。若 `irrDb` 只在高功率时上升、即变得不够负，可能包含PA与I/Q失衡级联形成的共轭非线性；一个常数 $\hat b$ 只能给出综合诊断，不能完整替代频率相关或高阶增广模型。
 
 ### 15.6 API 与结果字典
 
@@ -2733,8 +2736,8 @@ print(irrMeasurement["residualPowerRatio"])
 
 | `MeasureIrr`字段 | 含义 | 判断方法 |
 |---|---|---|
-| `irrDb` | 全部物理链直接系数功率和与镜像系数功率和之比 | 越大越好 |
-| `irrDbPerChain` | 每条传导链独立IRR | 用于定位某一路I/Q异常 |
+| `irrDb` | 全部物理链镜像系数功率和相对直接系数功率和的 dBc | 越负越好；传统正值IRR等于其相反数 |
+| `irrDbPerChain` | 每条传导链独立的镜像相对电平 | 越接近0的链路镜像越严重 |
 | `desiredCoefficientPower` | $\sum_i\lvert\hat a_i\rvert^2$ | 无量纲拟合量，不是瓦特 |
 | `imageCoefficientPower` | $\sum_i\lvert\hat b_i\rvert^2$ | 无量纲拟合量，不是瓦特 |
 | `imageAmplitudeRatio` | $\sqrt{\sum_i\lvert\hat b_i\rvert^2/\sum_i\lvert\hat a_i\rvert^2}$ | SISO且只有镜像误差时近似等于线性EVM |
@@ -2747,8 +2750,8 @@ print(irrMeasurement["residualPowerRatio"])
 
 ### 15.7 结果判断和限制
 
-- IRR 高而 EVM 差：主要问题可能是 PA 非线性、记忆、噪声或削顶。
-- IRR 低且 EVM 约等于 IRR 的负值：IQ 镜像很可能是 EVM 主导项。
+- `irrDb` 很负而 EVM 仍差：主要问题可能是 PA 非线性、记忆、噪声或削顶。
+- `irrDb` 接近 0，且 EVM dB 约等于 `irrDb`：IQ 镜像很可能是 EVM 主导项。
 - IRR 随频率明显变化：需要带记忆的共轭支路，而不仅是一阶 $x^*$ 系数。
 - IRR 随输出功率变化：可能存在 PA 与 IQ 调制器级联产生的共轭非线性。
 - 使用真实仪器时，应先测量接收机自身 IRR；否则会把反馈接收机镜像错误地当成发射机镜像。

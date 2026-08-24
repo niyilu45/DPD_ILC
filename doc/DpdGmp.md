@@ -751,7 +751,7 @@ print(metrics["aclrWorstDb"])
 
 不要只用训练 `afterNmseDb` 判断增广模型。至少还要检查：
 
-1. 独立帧的 `irrDb` 是否稳定提高；
+1. 独立帧的 `irrDb` 是否稳定下降、变得更负；
 2. `evmDb` 是否同步改善；
 3. `aclrWorstDb` 是否没有因过拟合或峰值增加而下降；
 4. `GetImageCoefficients()` 的范数是否在重复训练间稳定；

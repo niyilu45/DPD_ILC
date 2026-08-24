@@ -2083,9 +2083,9 @@ class Draw:
 
         Processing details:
             Algorithm: Group validated flat rows by method, sort every group
-            by requested PA output power, and draw EVM and IRR on separate
-            shared-power panels so lower EVM and higher IRR remain visually
-            unambiguous.
+            by requested PA output power, and draw EVM and signed IRR on
+            separate shared-power panels so lower EVM and more-negative IRR
+            remain visually unambiguous.
 
         Args:
             stageResults: Flat rows containing method, power, EVM, and IRR.
@@ -2169,8 +2169,8 @@ class Draw:
             )
         axes[0].set_title("Modulation accuracy")
         axes[0].set_ylabel("RMS EVM (dB, lower is better)")
-        axes[1].set_title("Image suppression")
-        axes[1].set_ylabel("IRR (dB, higher is better)")
+        axes[1].set_title("Image relative level")
+        axes[1].set_ylabel("IRR (dBc, more negative is better)")
         for selectedAxes in axes:
             selectedAxes.set_xlabel("PA output power (dBm)")
             selectedAxes.grid(True, linestyle=":", linewidth=0.7)

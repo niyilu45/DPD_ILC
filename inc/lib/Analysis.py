@@ -79,7 +79,9 @@ class IrrMeasurement(TypedDict):
     """Define the ordinary dictionary returned by ``MeasureIrr``.
 
     Coefficient powers are dimensionless fitted-model quantities rather than
-    RF watts. Per-chain tuples preserve the conducted-port reference plane.
+    RF watts. ``irrDb`` uses the signed image-to-desired dBc convention, so
+    a more negative value means better image suppression. Per-chain tuples
+    preserve the conducted-port reference plane.
     """
 
     irrDb: float
@@ -1418,7 +1420,8 @@ class Analysis:
                 blind mode and provide it in explicit-reference mode.
 
         Returns:
-            result: Aggregate direct-to-image power ratio in decibels.
+            result: Aggregate image-to-direct relative power in dBc. A more
+                negative value means better image suppression.
         """
 
         return float(self.MeasureIrr(measuredSignal)["irrDb"])
@@ -1434,7 +1437,8 @@ class Analysis:
             preparedSignal: Signal returned by ``PrepareMeasuredSignal``.
 
         Returns:
-            result: Aggregate image-rejection ratio in dB.
+            result: Aggregate image-to-direct relative power in dBc. A more
+                negative value means better image suppression.
         """
 
         return float(self.MeasurePreparedIrr(preparedSignal)["irrDb"])
@@ -1449,10 +1453,11 @@ class Analysis:
             Algorithm: Fit each measured chain to ``a*x + b*conj(x)`` on the
             useful data field, accumulate ``|a|^2`` as desired-path power and
             ``|b|^2`` as image-path power, calculate aggregate and per-chain
-            ratios, retain complex coefficient components, and quantify the
-            unexplained residual and regression conditioning. A tiny
-            scale-relative ridge protects the solve without materially
-            biasing ordinary circular Wi-Fi or nonzero complex-tone signals.
+            image-to-desired dBc values, retain complex coefficient
+            components, and quantify the unexplained residual and regression
+            conditioning. A tiny scale-relative ridge protects the solve
+            without materially biasing ordinary circular Wi-Fi or nonzero
+            complex-tone signals.
 
         Args:
             preparedSignal: Signal returned by ``PrepareMeasuredSignal``.
@@ -1524,8 +1529,8 @@ class Analysis:
                 float(
                     10.0
                     * np.log10(
-                        max(chainDirectPower, numericFloor)
-                        / max(chainImagePower, numericFloor)
+                        max(chainImagePower, numericFloor)
+                        / max(chainDirectPower, numericFloor)
                     )
                 )
             )
@@ -1537,8 +1542,8 @@ class Analysis:
         aggregateIrrDb = float(
             10.0
             * np.log10(
-                max(directPower, numericFloor)
-                / max(imagePower, numericFloor)
+                max(imagePower, numericFloor)
+                / max(directPower, numericFloor)
             )
         )
         imageAmplitudeRatio = float(
@@ -2767,7 +2772,7 @@ class Analysis:
             raise ValueError("no stage metrics are available to print")
         header = (
             f"{'Stage':<16} {'Pout(dBm)':>10} {'SNR(dB)':>10} "
-            f"{'EVM(dB)':>10} {'IRR(dB)':>10} "
+            f"{'EVM(dB)':>10} {'IRR(dBc)':>10} "
             f"{'EVM(%)':>10} {'ACLR-L':>10} {'ACLR-U':>10} {'ACLR-W':>10}"
         )
         print(header)
@@ -2815,7 +2820,7 @@ class Analysis:
             print(f"\n{stageName} - conducted PA-chain metrics")
             print(
                 f"{'PA':<8} {'Pout(dBm)':>10} {'SNR(dB)':>10} "
-                f"{'IRR(dB)':>10} {'ACLR-L':>10} "
+                f"{'IRR(dBc)':>10} {'ACLR-L':>10} "
                 f"{'ACLR-U':>10} {'ACLR-W':>10}"
             )
             for chainIndex, snrDb in enumerate(

@@ -1371,7 +1371,7 @@ def CheckMimoSpatialStructure() -> None:
             == transmitCount
         )
         assert len(mimoMetrics["irrDbPerChain"]) == transmitCount
-        assert min(mimoMetrics["irrDbPerChain"]) > 200.0
+        assert max(mimoMetrics["irrDbPerChain"]) < -200.0
         aggregatePowerMilliwatt = sum(
             10.0 ** (powerDbm / 10.0)
             for powerDbm in mimoMetrics["outputPowerDbmPerChain"]
@@ -1575,7 +1575,7 @@ def CheckIdealMetrics() -> None:
         assert metrics["snrDb"] > 250.0
         assert metrics["evmDb"] < -250.0
         assert metrics["evmPercent"] < 1e-10
-        assert metrics["irrDb"] > 200.0
+        assert metrics["irrDb"] < -200.0
         normalizedReferenceRms = float(
             np.sqrt(np.mean(np.abs(resultAnalysis.referenceSignal) ** 2))
         )
@@ -1606,7 +1606,7 @@ def CheckIdealMetrics() -> None:
     )
     iqMetrics = iqAnalysis.Analyze()
     irrMeasurement = iqAnalysis.MeasureIrr()
-    expectedIrrDb = 20.0 * np.log10(1.0 / np.abs(imageCoefficient))
+    expectedIrrDb = 20.0 * np.log10(np.abs(imageCoefficient))
     assert abs(iqMetrics["irrDb"] - expectedIrrDb) < 0.1
     assert abs(irrMeasurement["irrDb"] - expectedIrrDb) < 0.1
     assert abs(iqAnalysis.CalculateIrr() - expectedIrrDb) < 0.1
@@ -7938,17 +7938,17 @@ def CheckChannelAnalysisAndCoupledDpd() -> None:
         assert len(result.stages) == 4
         assert len(result.improvements) == 4
         assert len(result.iqImbalanceStages) == 15
-        conventionalIrr = max(
+        conventionalIrr = min(
             stage.irrDb
             for stage in result.iqImbalanceStages
             if stage.methodName == "Conventional GMP"
         )
-        augmentedIrr = min(
+        augmentedIrr = max(
             stage.irrDb
             for stage in result.iqImbalanceStages
             if stage.methodName == "Augmented GMP"
         )
-        assert augmentedIrr > conventionalIrr + 40.0
+        assert augmentedIrr < conventionalIrr - 40.0
         assert all(
             improvement.expectationMet
             for improvement in result.improvements
