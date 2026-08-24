@@ -1944,6 +1944,7 @@ Analysis也可以对任意已知发送NumPy波形计算波形域SNR、EVM、输�
 from inc.lib.Analysis import Analysis
 from inc.lib.PaModel import PaModel
 from inc.lib.WaveGenTwoTone import WaveGenTwoTone
+from inc.utils.SigProc import PowerCalibration
 
 
 twoToneWaveform = WaveGenTwoTone(
@@ -1954,10 +1955,19 @@ twoToneWaveform = WaveGenTwoTone(
         "width": 0,
     }
 ).Generate()
-transmittedSignal = 0.25 * twoToneWaveform.samples
-receivedSignal = PaModel(
+paModel = PaModel(
     parameters={"modelName": "wiener", "width": 0}
-).Process(transmittedSignal)
+)
+powerCalibration = PowerCalibration(
+    paModel=paModel,
+    parameters={
+        "outputPowerDbm": 20.0,
+        "maximumOutputPowerDbm": 25.0,
+        "width": 0,
+    },
+)
+transmittedSignal = powerCalibration.Calibrate(twoToneWaveform.samples)
+receivedSignal = powerCalibration.GetLastPaOutput()
 
 resultAnalysis = Analysis(
     receivedSignal,
@@ -1974,22 +1984,51 @@ print(metrics)
 这时没有 `WifiWaveform`，所以EVM是公共时域样值归一化误差，不是802.11数据子载波EVM。若目标是读取双音IM3、IM5、IM7谱线，可以继续从主 `Analysis` 类调用静态双音接口：
 
 ```python
+twoToneAnalysisParameters = {
+    "maximumOutputPowerDbm": 25.0,
+    "activePowerThresholdDb": -60.0,
+    "activeGapToleranceSamples": 16,
+    "width": 0,
+}
 allImMetrics = Analysis.AnalyzeTwoTone(
     receivedSignal,
     twoToneWaveform,
-    parameters={"maximumOutputPowerDbm": 25.0, "width": 0},
+    parameters=twoToneAnalysisParameters,
 )
-im3Metrics = Analysis.CalculateIm3(receivedSignal, twoToneWaveform)
-im5Metrics = Analysis.CalculateIm5(receivedSignal, twoToneWaveform)
-im7Metrics = Analysis.CalculateIm7(receivedSignal, twoToneWaveform)
+im3Metrics = Analysis.CalculateIm3(
+    receivedSignal,
+    twoToneWaveform,
+    parameters=twoToneAnalysisParameters,
+)
+im5Metrics = Analysis.CalculateIm5(
+    receivedSignal,
+    twoToneWaveform,
+    parameters=twoToneAnalysisParameters,
+)
+im7Metrics = Analysis.CalculateIm7(
+    receivedSignal,
+    twoToneWaveform,
+    parameters=twoToneAnalysisParameters,
+)
 
 print(allImMetrics["worstIntermodulationDbc"])
+print(f"PA output power: {allImMetrics['outputPowerDbm']:.2f} dBm")
 print(im3Metrics["lowerDbc"], im3Metrics["upperDbc"])
+print(f"IM3 measurement power: {im3Metrics['outputPowerDbm']:.2f} dBm")
 print(im5Metrics["lowerProductDbfs"], im5Metrics["upperProductDbfs"])
 print(im7Metrics["worstDbc"])
+
+assert abs(allImMetrics["outputPowerDbm"] - 20.0) <= 0.25
+assert im3Metrics["outputPowerDbm"] == allImMetrics["outputPowerDbm"]
 ```
 
 这里有意保留两类互不混淆的调用：实例 `Analyze()` 计算已知发送波形的时域EVM、SNR、功率和ACLR；静态 `AnalyzeTwoTone()` 及三个单阶方法使用双音精确频率元数据计算互调。静态入口内部委托给 `TwoToneAnalysis`，不解析Wi-Fi描述字段。
+
+`AnalyzeTwoTone`、`CalculateIm3`、`CalculateIm5` 和 `CalculateIm7` 的返回
+字典都包含 `outputPowerDbm`。它表示传入 `measuredSignal` 的模拟PA输出参考面
+功率，而不是发送端输入功率；若调用方在PA之后加入增益或衰减，结果就位于
+该增益或衰减之后的观测面。上例先把PA实际输出闭环到20 dBm，因此完整
+分析和IM3单阶分析应报告相同、且位于校准容限内的约20 dBm结果。
 
 若只有仪表或芯片导出的NumPy数组/Python列表，也可以不构造 `TwoToneWaveform`：
 
@@ -2003,6 +2042,22 @@ rawImMetrics = Analysis.AnalyzeTwoTone(
 ```
 
 在这种原始样值模式中，`sampleRateHz` 和 `toneFrequenciesHz` 必须提供；`width` 为正数时，列表或数组应保存该位宽的整数I/Q码。详细接口边界和完整示例见 [TwoToneAnalysis.md §8.2](./TwoToneAnalysis.md#82-直接使用numpy数组或python列表)。
+
+原始NumPy/list模式省略 `width` 时会自动检查码形态：若I/Q分量均为整数
+且至少一个分量的绝对值大于1，则识别为工程默认16位；其他记录按浮点
+`width=0` 处理。显式配置始终优先，生产测试中的浮点数组仍建议像上例
+一样写明 `width=0`，8、12、24位等非默认格式也必须显式给出。16位码必须先除以
+$2^{15}=32768$ 才是归一化复包络；若把码值直接当作浮点或伏特，功率将
+虚增 $20\log_{10}(32768)\approx90.31$ dB，本来约20 dBm的波形可能显示
+为110 dBm以上。完整推导、有效活动样点门限以及定点调用示例见
+[TwoToneAnalysis.md第5节](./TwoToneAnalysis.md#5-模拟输出功率参考面和定点换算)。
+
+若第二个参数是 `TwoToneWaveform`，显式 `width` 仍只描述
+`measuredSignal` 的接收边界，不要求与发送位宽相等。省略接收位宽时，非零
+发送位宽正常继承；当发送元数据为浮点但测量I/Q呈现典型16位整数码形态时，
+分析器会自动切换到16位接收解码。因此“浮点发送参考 + 16位仪表采集”不再
+静默产生约90.31 dB误差；低幅码或非默认位宽仍应显式配置。频率、采样率和
+样点数继续来自发送元数据，不会因为接收量化格式不同而改变。
 
 ### 11.5 多个测试阶段的横向比较与保存
 

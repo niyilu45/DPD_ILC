@@ -133,6 +133,8 @@ class TwoToneAnalysis:
                 "minimumSpectralPower": 1.0e-30,
                 "maximumOutputPowerDbm": 25.0,
                 "loadResistanceOhm": 50.0,
+                "activePowerThresholdDb": -60.0,
+                "activeGapToleranceSamples": 16,
                 "width": waveform.width,
             }
         )
@@ -228,7 +230,8 @@ class TwoToneAnalysis:
             Algorithm: Restrict the window to supported deterministic choices,
             ensure symmetric edge removal leaves at least 64 samples, require
             positive finite spectral and RF references, and validate the
-            fixed-point format shared with the waveform and PA output.
+            measured-signal fixed-point boundary independently of transmit
+            waveform metadata.
 
         Returns:
             result: None. Invalid settings raise descriptive exceptions.
@@ -272,11 +275,30 @@ class TwoToneAnalysis:
                 raise ValueError(f"{parameterName} must be finite")
         if float(self.parameters["loadResistanceOhm"]) <= 0.0:
             raise ValueError("loadResistanceOhm must be positive")
-        FixedPoint(self.width)
-        if self.width != self.waveform.width:
+        activePowerThresholdDb = self.parameters[
+            "activePowerThresholdDb"
+        ]
+        if (
+            not isinstance(activePowerThresholdDb, (int, float))
+            or isinstance(activePowerThresholdDb, bool)
+            or not np.isfinite(activePowerThresholdDb)
+            or float(activePowerThresholdDb) >= 0.0
+        ):
             raise ValueError(
-                "TwoToneAnalysis and TwoToneWaveform must use the same width"
+                "activePowerThresholdDb must be finite and negative"
             )
+        activeGapToleranceSamples = self.parameters[
+            "activeGapToleranceSamples"
+        ]
+        if (
+            not isinstance(activeGapToleranceSamples, int)
+            or isinstance(activeGapToleranceSamples, bool)
+            or activeGapToleranceSamples < 0
+        ):
+            raise ValueError(
+                "activeGapToleranceSamples must be a nonnegative integer"
+            )
+        FixedPoint(self.width)
 
     def BuildAnalysisWindow(self, sampleCount: int) -> np.ndarray:
         """Construct the configured deterministic spectral analysis window.
@@ -358,9 +380,11 @@ class TwoToneAnalysis:
         """Calculate active continuous-record PA output power in dBm.
 
         Processing details:
-            Algorithm: Decode the public samples, remove the same settling
-            edges used for spectral measurement, calculate complex-envelope
-            RMS, and map normalized RMS one to the configured maximum PA power.
+            Algorithm: Decode the public samples before any arithmetic, remove
+            the same settling edges used for spectral measurement, detect the
+            active two-tone interval while excluding long padding or idle
+            runs, calculate its complex-envelope RMS, and map normalized RMS
+            one to the configured maximum PA power.
 
         Args:
             inputSignal: Floating or integer-code PA output vector.
@@ -369,8 +393,43 @@ class TwoToneAnalysis:
             result: Average steady-state PA output power in dBm.
         """
 
-        decodedSignal = FixedPoint(self.width).DecodeComplex(
-            inputSignal
+        publicSignal = np.asarray(
+            inputSignal, dtype=np.complex128
+        ).reshape(-1)
+        if publicSignal.size == 0 or not np.all(np.isfinite(publicSignal)):
+            raise ValueError(
+                "inputSignal must contain finite nonempty samples"
+            )
+        resolvedWidth = self.width
+        widthWasExplicitlyConfigured = any(
+            "width" in parameterLayer
+            for parameterLayer in self.parameters.maps[:-1]
+        )
+        if not widthWasExplicitlyConfigured and self.waveform.width == 0:
+            componentValues = np.concatenate(
+                (publicSignal.real, publicSignal.imag)
+            )
+            integerCodeShape = bool(
+                np.all(
+                    np.isclose(
+                        componentValues,
+                        np.rint(componentValues),
+                        rtol=0.0,
+                        atol=1.0e-9,
+                    )
+                )
+            )
+            exceedsNormalizedRange = bool(
+                np.max(np.abs(componentValues)) > 1.0 + 1.0e-9
+            )
+            if integerCodeShape and exceedsNormalizedRange:
+                # A floating transmit reference may accompany the project's
+                # default 16-bit receiver capture. Resolve that common case at
+                # the measurement boundary instead of treating DAC codes as
+                # normalized amplitudes and adding about 90.31 dB to power.
+                resolvedWidth = 16
+        decodedSignal = FixedPoint(resolvedWidth).DecodeComplex(
+            publicSignal
         ).reshape(-1)
         settlingSamples = cast(int, self.parameters["settlingSamples"])
         steadySignal = (
@@ -378,16 +437,24 @@ class TwoToneAnalysis:
             if settlingSamples == 0
             else decodedSignal[settlingSamples:-settlingSamples]
         )
-        signalRms = float(np.sqrt(np.mean(np.abs(steadySignal) ** 2)))
         powerCalibration = PowerCalibration(
             parameters={
                 "loadResistanceOhm": self.parameters["loadResistanceOhm"],
                 "maximumOutputPowerDbm": self.parameters[
                     "maximumOutputPowerDbm"
                 ],
+                "activePowerThresholdDb": self.parameters[
+                    "activePowerThresholdDb"
+                ],
+                "activeGapToleranceSamples": self.parameters[
+                    "activeGapToleranceSamples"
+                ],
                 "width": 0,
             }
         )
+        signalRms = powerCalibration.CalculateActiveRmsPerChain(
+            steadySignal
+        )[0]
         return powerCalibration.NormalizedRmsToOutputPowerDbm(signalRms)
 
     def Analyze(self, measuredSignal: np.ndarray) -> TwoToneMetrics:
@@ -408,8 +475,39 @@ class TwoToneAnalysis:
         """
 
         self.ValidateParameters()
-        decodedSignal = FixedPoint(self.width).DecodeComplex(
-            measuredSignal
+        publicSignal = np.asarray(
+            measuredSignal, dtype=np.complex128
+        ).reshape(-1)
+        if publicSignal.size == 0 or not np.all(np.isfinite(publicSignal)):
+            raise ValueError(
+                "measuredSignal must contain finite nonempty samples"
+            )
+        resolvedWidth = self.width
+        widthWasExplicitlyConfigured = any(
+            "width" in parameterLayer
+            for parameterLayer in self.parameters.maps[:-1]
+        )
+        if not widthWasExplicitlyConfigured and self.waveform.width == 0:
+            componentValues = np.concatenate(
+                (publicSignal.real, publicSignal.imag)
+            )
+            integerCodeShape = bool(
+                np.all(
+                    np.isclose(
+                        componentValues,
+                        np.rint(componentValues),
+                        rtol=0.0,
+                        atol=1.0e-9,
+                    )
+                )
+            )
+            exceedsNormalizedRange = bool(
+                np.max(np.abs(componentValues)) > 1.0 + 1.0e-9
+            )
+            if integerCodeShape and exceedsNormalizedRange:
+                resolvedWidth = 16
+        decodedSignal = FixedPoint(resolvedWidth).DecodeComplex(
+            publicSignal
         ).reshape(-1)
         if (
             decodedSignal.size != self.waveform.numSamples

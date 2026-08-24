@@ -5,7 +5,7 @@
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `main.py` 和 `inc/**/*.py` 中 430 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis、DPD-ILC、通道测量和DpdGmp核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC与MIMO ILC统一位于 `DpdIlc.py`，可部署且可增量更新的GMP及耦合感知封装位于`DpdGmp.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
+本次审计共检查 `main.py` 和 `inc/**/*.py` 中 535 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis、DPD-ILC、通道测量和DpdGmp核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC与MIMO ILC统一位于 `DpdIlc.py`，可部署且可增量更新的GMP及耦合感知封装位于`DpdGmp.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
 
 ## 1. 分类规则
 
@@ -34,7 +34,7 @@ flowchart LR
     channelMeasure --> ilc
     sync --> analysis["Analysis.md：MSE/SNR/EVM/ACLR"]
     analysis --> report["打印/保存/绘图"]
-    audit["本文：430 个定义位置逐项索引"] -.-> wave
+    audit["本文：535 个定义位置逐项索引"] -.-> wave
     audit -.-> pa
     audit -.-> ilc
     audit -.-> sync
@@ -142,11 +142,11 @@ flowchart LR
 | `WaveGenTwoTone.ResolveIlcBandwidthHz` | P/E | 优先采用显式带宽，否则按最远IM7绝对频率构造带10%保护的双边ILC更新范围 | WaveGenTwoTone §6 |
 | `WaveGenTwoTone.Generate` | P/N/E | 叠加两个复指数、按有限记录RMS缩放、在公开边界定点编码并返回完整频率元数据 | WaveGenTwoTone §2、§4–§5 |
 | `TwoToneILCIteration.ToDict` | E | 把原生NMSE和独立IM指标合并为CSV/JSON标量记录 | TwoToneAnalysis §9 |
-| `TwoToneAnalysis.__init__`, `TwoToneAnalysis.Width`, `TwoToneAnalysis.GetParameters`, `TwoToneAnalysis.UpdateParameters`, `TwoToneAnalysis.ValidateParameters` | E | 保存双音元数据并以ChainMap管理窗、暂态、功率和位宽配置 | TwoToneAnalysis §3、§7 |
+| `TwoToneAnalysis.__init__`, `TwoToneAnalysis.Width`, `TwoToneAnalysis.GetParameters`, `TwoToneAnalysis.UpdateParameters`, `TwoToneAnalysis.ValidateParameters` | E | 保存双音频率元数据并以ChainMap管理窗、暂态、活动功率检测和被测信号位宽；显式接收位宽可不同于发送元数据位宽 | TwoToneAnalysis §3、§5、§7 |
 | `TwoToneAnalysis.BuildAnalysisWindow` | N | 构造Hann或矩形窗并保证正相干增益 | TwoToneAnalysis §2 |
 | `TwoToneAnalysis.CalculateToneCoefficient` | P/N | 在已知物理频率执行加窗复投影并除以窗相干增益，避免最近FFT格点误差 | TwoToneAnalysis §2 |
-| `TwoToneAnalysis.CalculateOutputPowerDbm` | P/N | 去除PA首尾暂态后计算复包络RMS，并按额定归一化满量程换算输出dBm | TwoToneAnalysis §3、§5 |
-| `TwoToneAnalysis.Analyze` | P/N/E | 计算两个基波及IM3/IM5/IM7上下侧和较差侧dBc，以普通字典返回 | TwoToneAnalysis §1、§4 |
+| `TwoToneAnalysis.CalculateOutputPowerDbm` | P/N | 显式接收位宽优先；省略时可把浮点发送元数据配套的典型16位整数测量码自动识别并解码为归一化复包络，去除PA首尾暂态和长补零/空闲后计算活动RMS，再按额定满量程换算模拟PA输出参考面dBm | TwoToneAnalysis §3、§5 |
+| `TwoToneAnalysis.Analyze` | P/N/E | 使用与功率路径相同的测量位宽解析，计算两个基波及IM3/IM5/IM7上下侧和较差侧dBc，并在同一普通字典中返回模拟输出 `outputPowerDbm` | TwoToneAnalysis §1、§4–§5 |
 | `TwoToneAnalysis.AnalyzeIlcHistory` | P/E | 对每轮原生PA输出独立计算互调，并选择IM3/IM5/IM7最大剩余值最小的实测轮 | TwoToneAnalysis §4、§6 |
 | `TwoToneAnalysis.Print`, `TwoToneAnalysis.SaveIlcHistory` | E | 打印或序列化已经计算的互调结果，不重新运行PA或ILC | TwoToneAnalysis §9–§10 |
 
@@ -169,21 +169,27 @@ flowchart LR
 | `DohertyPA.SmallSignalGain` | P/N | 在零包络极限关闭峰值支路，只返回载波支路与载波合路系数构成的复增益 | PaModel §4.8 |
 | `PaModel.__init__`, `PaModel.ResolveConfiguration`, `PaModel.SynchronizeModel` | E | ChainMap 覆盖解析、未知键警告后忽略，并构造选定Rapp、Wiener、GMP或Doherty内核 | PaModel §12 |
 | `PaModel.ModelName`, `PaModel.Width`, `PaModel.GetParameters`, `PaModel.UpdateParameters` | E | 查询或更新配置；更新后重建模型以保持状态一致 | PaModel §12、FixedPoint §6 |
-| `PaModel.Process`, `PaModel.SmallSignalGain` | E/P | 统一分派到选定物理 PA 的同名计算 | PaModel §9、§12 |
+| `PaModel.Process`, `PaModel.SmallSignalGain` | E/P | 公开Process在定点解码后应用已提交的模拟驱动，再统一分派到选定物理PA；浮点物理内核与小信号PA增益定义保持独立 | PaModel §9、§12 |
+| `PaModel.ResolveCalibrationDriveDb`, `PaModel.SetCalibrationDriveDb`, `PaModel.ProcessCalibrationDrive` | P/N/E | 校验单路PA的解码后模拟驱动；校准试探以显式驱动运行且不改状态，只有闭环收敛后才原子提交供后续公开Process复现 | PaModel §9、SigProc §13.2 |
 | `ThermalConfig.Recommended` | P/E | 为静态、单RC和三支Foster生成完整可运行的25 dBm级仿真起始配置，应用调用方实测覆盖后执行全部字段校验；推荐值不是器件规格 | PaModel §13.7.1–§13.7.6、PaThermalMeasurement §1–§12 |
 | `ThermalConfig.Validate` | P/E | 校验静态、单RC或Foster热网络、耗散功率效率模型、参考功率和温度漂移系数 | PaModel §13 |
-| `ThermalNetwork.__init__`, `ThermalNetwork.ResolveBranches`, `ThermalNetwork.Reset`, `ThermalNetwork.CurrentTemperatureC`, `ThermalNetwork.Advance`, `ThermalNetwork.GetMetrics` | P/N/E | 用RC热阻抗的精确零阶保持离散解积累或释放热量，保存环境温度、各热节点温升和物理时间 | PaModel §13.2–§13.4 |
-| `PaModel.ResolveThermalConfig`, `PaModel.SynchronizeThermalModel`, `PaModel.SuspendThermalModel`, `PaModel.RestoreThermalModel` | E/N | 解析可选热模型并提供无热功率校准所需的暂停/恢复事务；校准试探不推进真实热时间 | PaModel §13.6 |
-| `PaModel.ProcessAtTemperatureFloating`, `PaModel.ApplyTemperatureDrift` | P/N | 在指定结温下调制基础PA输出的复增益、饱和尺度和非线性强度；不推进热状态 | PaModel §13.5 |
-| `PaModel.EstimateDissipatedPowerW`, `PaModel.CalculateActiveDutyCycle` | P/N | 由归一化RF输出、参考dBm、功率相关效率和静态偏置热估计耗散功率；占空比只作为诊断，静默样点仍推进热时间 | PaModel §13.1、§13.3 |
-| `PaModel.ProcessThermalFloating`, `PaModel.ResetThermalState`, `PaModel.AdvanceIdle`, `PaModel.SetExternalTemperatureOffsetC`, `PaModel.GetThermalMetrics` | P/N/E | 分块保持电模型完整记忆，以当前结温输出、耗散功率更新Foster状态，并支持冷启动、帧间冷却、相邻PA热耦合和结构化热诊断 | PaModel §13.4–§13.8 |
+| `ThermalNetwork.__init__`, `ThermalNetwork.ResolveBranches`, `ThermalNetwork.Reset`, `ThermalNetwork.CurrentTemperatureC`, `ThermalNetwork.Advance`, `ThermalNetwork.GetMetrics` | P/N/E | 只接受 `enabled=True` 的热配置，再用RC热阻抗的精确零阶保持离散解积累或释放热量，保存环境温度、各热节点温升和物理时间；禁用必须由PaModel入口旁路 | PaModel §13.2–§13.7 |
+| `ThermalNetwork.CalculateAdvancedState`, `ThermalNetwork.CalculatePeriodicSteadyState` | P/N | 前者在不修改实时热状态的情况下计算一段常功耗的RC精确推进；后者把整周期的分段仿射合成并解出周期首尾一致的支路温升，短周期用 `expm1` 避免相减损失 | PaModel §13.2–§13.4、Channel §10 |
+| `PaModel.ResolveThermalConfig`, `PaModel.SynchronizeThermalModel`, `PaModel.SuspendThermalModel`, `PaModel.RestoreThermalModel` | E/N | 解析可选热模型；`enabled=False` 硬删除热网络、metrics和互热offset；显式挂起保证纯电校准期间同步配置也不能重建热网络；恢复只在当前仍启用同一配置时接受旧快照，实时关闭不能被复活 | PaModel §13.1、§13.6–§13.8 |
+| `PaModel.ProcessAtTemperatureFloating`, `PaModel.ApplyTemperatureDrift` | P/N | 在启用且未挂起时按指定结温调制基础PA输出的复增益、饱和尺度和非线性强度；禁用或校准挂起时直接旁路，不推进热状态 | PaModel §13.5–§13.7 |
+| `PaModel.EstimateDissipatedPowerW`, `PaModel.BuildThermalActiveMask`, `PaModel.BuildThermalIntervals`, `PaModel.CalculateActiveDutyCycle`, `PaModel.CalculateActualDutyCycle` | P/N | 由归一化RF输出、参考dBm、功率相关效率和静态偏置热估计耗散功率；活动掩码在整个数据窗参考峰值下仅计算一次，分段边界同时保留热更新节拍与内部活动/空闲转换；实际周期RF占空比是配置数据窗占空比与窗内活动比的乘积 | PaModel §13.1、§13.3、Channel §10 |
+| `PaModel.SimulateThermalPeriod`, `PaModel.ProcessThermalPeriodFloating` | P/N | 对“数据窗内活/空闲段+自动周期外空闲段”作无副作用温度轨迹仿真；瞬态模式从实时状态推进一周期，稳态模式对温度相关热源迭代解周期固定点，只提交最终周期 | PaModel §13.3–§13.7、Channel §10 |
+| `PaModel.ProcessThermalFloating`, `PaModel.ResetThermalState`, `PaModel.AdvanceIdle`, `PaModel.SetExternalTemperatureOffsetC`, `PaModel.GetThermalMetrics` | P/N/E | 保留直接PA调用的连续瞬态兼容路径，并支持冷启动、额外空闲冷却、相邻PA热耦合和结构化诊断；关闭热模型时外部互热设置不积累隐藏offset，metrics明确返回禁用状态 | PaModel §13.4–§13.8、Channel §10 |
 | `MimoPaModel.__init__`, `MimoPaModel.ResolveNumericSequence`, `MimoPaModel.ResolvePaParametersPerChain`, `MimoPaModel.ValidateParameters`, `MimoPaModel.ResolveThermalCouplingMatrix`, `MimoPaModel.UpdateMutualHeating`, `MimoPaModel.SynchronizeModels` | E | 警告并忽略未知键，把已识别标量/序列配置扩展到每条物理链并构造独立PA；可把逐链耗散功率通过非对角热阻矩阵映射为相邻链温升 | PaModel §10、§13.8 |
 | `MimoPaModel.NumTransmitChains`, `MimoPaModel.Width`, `MimoPaModel.GetParameters`, `MimoPaModel.UpdateParameters` | E | 返回或更新多路配置，不改变功率定义 | PaModel §10、§12、FixedPoint §6 |
 | `MimoPaModel.SetOutputPowerDb`, `MimoPaModel.SetTargetOutputRms`, `MimoPaModel.SetTargetOutputPowerDbm` | P/E | 设置相对幅度比例、旧RMS目标或基于端口阻抗的绝对dBm目标；dB幅度比例为 $10^{P_{dB}/20}$ | PaModel §10 |
-| `MimoPaModel.Process`, `MimoPaModel.ProcessFloating`, `MimoPaModel.ProcessChain` | P/N | 每列通过独立 PA，再执行相对增益或经端口阻抗换算的绝对 dBm 校准；浮点入口避免Channel内部重复公开接口量化 | PaModel §10、§10.2 |
+| `MimoPaModel.Process`, `MimoPaModel.ProcessFloating`, `MimoPaModel.ProcessChain` | P/N | 公开矩阵入口先应用已提交的逐链模拟驱动再通过独立PA；裸浮点入口供Channel避免重复增益和公开接口量化 | PaModel §10、§10.2 |
+| `MimoPaModel.ProcessThermalPeriodFloating`, `MimoPaModel.CalculateActualDutyCycle` | P/N/E | 以公共周期调度处理各物理PA的内部空闲、外部空闲和实际占空比；稳态且存在互热时再用外层固定点使每链自热与互热同时收敛；整个MIMO周期采用全链事务，任一路失败即恢复全部热状态、累计时间和旧metrics；互热矩阵动态改为全零时在下个成功周期清除旧offset | PaModel §13.8、Channel §10 |
+| `MimoPaModel.ResolveCalibrationDriveDbPerChain`, `MimoPaModel.SetCalibrationDriveDb`, `MimoPaModel.ProcessCalibrationDrive` | P/N/E | 校验、试探并在收敛后提交逐PA解码后模拟驱动，使MIMO定点码满量程与PA额定输出功率解耦 | PaModel §10、SigProc §13.2–§13.3 |
 | `MimoPaModel.GetOutputRmsPerChain`, `MimoPaModel.GetOutputPowerDbmPerChain` | E/P | 返回最近一次实际链输出RMS，并可通过端口阻抗换算为dBm | PaModel §10 |
 | `MimoPaModel.SuspendThermalModel`, `MimoPaModel.RestoreThermalModel`, `MimoPaModel.ResetThermalState`, `MimoPaModel.AdvanceIdle`, `MimoPaModel.GetThermalMetrics` | P/E | 按物理PA链保存、恢复、复位和推进独立热状态；为MIMO无热校准和逐链温度诊断提供一致接口 | PaModel §13.8 |
 | `IQImbalancePA.__init__`, `IQImbalancePA.Process`, `IQImbalancePA.SmallSignalGain` | P/N | 广义线性模型 $y=\alpha v+\beta v^*$ 及其直接支路小信号增益 | PaModel §7 |
+| `IQImbalancePA.ProcessThermalPeriodFloating`, `IQImbalancePA.SuspendThermalModel`, `IQImbalancePA.RestoreThermalModel`, `IQImbalancePA.GetThermalMetrics`, `IQImbalancePA.CalculateActualDutyCycle`, `IQImbalancePA.ResetThermalState`, `IQImbalancePA.AdvanceIdle` | P/N/E | 在输出端施加广义线性I/Q包装，同时透明代理物理PA的周期热处理、状态事务、诊断、占空比、复位和额外空闲；包装器不建立第二份热状态或修改PA输入活动参考面 | PaModel §7、§13.5–§13.8、Channel §10 |
 | `PaModel.AsComplexVector` | N | 把输入约束为有限一维复包络；不改变样值 | PaModel §2 |
 | `PaModel.DelaySignal` | N | 因果整数延迟并对历史补零 | PaModel §4 |
 | `PaModel.DefaultGmpCoefficients` | E/N | 生成稳定的演示系数，不代表实测器件 | PaModel §11 |
@@ -195,17 +201,20 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `Channel.__init__`, `Channel.Width`, `Channel.SampleMode`, `Channel.FormatUnknownParameterError`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层；未知名称按字符串相似度对全部合法名称降序提示后报错，非法值显示允许集合、类型或区间；同时校验Tx I/Q、公共相位/噪声、PA前后耦合、反馈链参数、联合功率闭环、随机种子和公开位宽 | Channel §1、§5–§6 |
+| `Channel.__init__`, `Channel.Width`, `Channel.SampleMode`, `Channel.FormatUnknownParameterError`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层；未知名称按字符串相似度对全部合法名称降序提示后报错，非法值显示允许集合、类型或区间；同时校验Tx I/Q、周期热运行模式/占空比/收敛条件、公共相位/噪声、PA前后耦合、反馈链参数、联合功率闭环、随机种子和公开位宽 | Channel §1、§5–§6、§10 |
 | `Channel.SetPaModel` | E | 绑定必须提供公开Process入口的PA对象，并在PA更换时清除私有功率校准状态 | Channel §1、§6 |
 | `Channel.ResolveCouplingPaths`, `Channel.HasPrePaCoupling` | P/E | 把每条源链到目的链的复增益、整数/分数时延和FIR规范为有限参数，并判断PA输入功率是否存在链间耦合依赖 | Channel §1.3、§5 |
 | `Channel.ApplyCouplingPath`, `Channel.ApplyMimoCoupling` | P/N | 对单条串扰路径依次执行FIR、分数时延、整数时延和复系数，再把所有间接路径与隐含单位直通路径线性叠加 | Channel §1.3 |
 | `Channel.ResolveIqImbalanceCoefficients`, `Channel.ApplyIqImbalanceStage` | P/N | 把I/Q增益比和正交相位误差精确换算为直接项与共轭镜像项，再以统一广义线性方程叠加Tx或FB的DC偏置 | Channel §1.2.1、§4.4、§6.2、§6.5 |
-| `Channel.TransmitterIqCoefficients`, `Channel.FeedbackIqCoefficients`, `Channel.ApplyTransmitterIqImbalance` | P/N/E | 分别返回Tx/FB的直接与镜像系数，并在PA前对数字发送波形执行Tx调制器I/Q非理想；Tx误差同时进入forward和fb观测 | Channel §1.2.1、§6.2、§6.5 |
+| `Channel.TransmitterIqCoefficients`, `Channel.FeedbackIqCoefficients`, `Channel.ApplyTransmitterIqImbalance` | P/N/E | 分别返回Tx/FB的直接与镜像系数；各自enabled为False时报告理想系数对。Tx开启时在PA前执行增益/相位/DC非理想并同时进入forward和fb，关闭时返回数值相同的复数副本 | Channel §1.2.1、§4.4、§6.2、§6.5 |
 | `Channel.ApplyPrePaCoupling`, `Channel.ApplyPostPaCoupling` | P/N | 分别在Tx I/Q之后、非线性PA之前和干净PA输出之后应用不同耦合矩阵；前者改变PA实际激励，后者只改变观测到的多路叠加 | Channel §1.3 |
-| `Channel.ProcessBoundPaFloating`, `Channel.ProcessPaBankForCalibration` | P/N/E | 在内部浮点域运行绑定PA；校准回调固定采用“Tx I/Q→PA前耦合→各路PA”，并返回尚未经过PA后耦合和接收噪声的逐PA输出 | Channel §1.3–§1.4、§6 |
+| `Channel.ProcessBoundPaFloating`, `Channel.ProcessPaBankForCalibration` | P/N/E | 在内部浮点域运行绑定PA；兼容校准回调采用“已提交模拟驱动→Tx I/Q→PA前耦合→各路PA”，并返回尚未经过PA后耦合和接收噪声的逐PA输出 | Channel §1.3–§1.4、§6 |
+| `Channel.ResolveCalibrationDriveDbPerChain`, `Channel.ApplyCalibrationDrive`, `Channel.SetCalibrationDriveDb`, `Channel.ProcessCalibrationDrive` | P/N/E | 在公开码解码后、Tx I/Q与PA前耦合之前校验和应用逐链模拟驱动；探测迭代不改状态，收敛时原子提交，校准参考面排除PA后耦合与接收链 | Channel §1.4、§5–§6.3 |
 | `Channel.ResolveCalibrationTargets`, `Channel.ConfigurePowerCalibration` | P/E | 把SISO共同目标或MIMO逐链dBm序列规范化，并配置内部 `PowerCalibration`；存在PA前耦合时默认启用有限差分雅可比联合功率闭环 | Channel §1.4、§5–§6.3 |
-| `Channel.CalibratePaInput`, `Channel.GetLastPaInput`, `Channel.GetLastTransmitterOutput`, `Channel.GetLastActualPaInput`, `Channel.GetLastPaOutput`, `Channel.GetLastCalibrationMetrics` | P/N/E | 对任意初始幅度原始波形自动保存并暂停热状态，执行参考温度隐藏功率闭环后在 `finally` 中原样恢复；分别保留Tx I/Q前后、耦合后PA输入和无热校准输出参考面 | Channel §1、§6.2、§6.3、§6.8、§10 |
-| `Channel.PrepareThermalTest`, `Channel.AdvanceThermalIdle`, `Channel.GetThermalMetrics` | P/N/E | 普通流程由 `Process(rawSignal, outputPowerDbm)` 自动完成无热校准与恢复后真实发射；这些高级接口仅用于显式冻结/复位起始温度、推进空闲热状态和报告自然输出漂移 | Channel §10、PaModel §13.6–§13.7 |
+| `Channel.CalibratePaInput`, `Channel.GetLastPaInput`, `Channel.GetLastTransmitterOutput`, `Channel.GetLastActualPaInput`, `Channel.GetLastPaOutput`, `Channel.GetLastCalibrationMetrics` | P/N/E | 对任意初始幅度原始波形配置目标并调用 `PowerCalibration.Calibrate` 的统一热事务与参考温度功率闭环；分别保留Tx I/Q前后、耦合后PA输入和无热校准输出参考面 | Channel §1、§6.2、§6.3、§6.8、§10 |
+| `Channel.SuspendThermalModel`, `Channel.RestoreThermalModel` | E/N | 把 `PowerCalibration` 的暂停/恢复事务代理到实际绑定PA；要求协议成对出现，无热对象使用 `None` 快照，实时 `enabled=False` 由PA保持为硬关闭 | Channel §6.10、§10、PaModel §13.7 |
+| `Channel.PrepareThermalTest`, `Channel.AdvanceThermalIdle`, `Channel.GetThermalMetrics`, `Channel.IsThermalModelEnabled`, `Channel.GetActualDutyCycle` | P/N/E | 普通流程由 `Process(rawSignal, outputPowerDbm)` 自动完成参考温度校准与周期热发射；高级接口用于冻结/复位起始温度、模拟调度之外的额外空闲、查询热模型启用状态及在PA真实入口参考面计算或读回实际周期RF占空比；热模型关闭时带输入占空比查询仍按Channel活动门限逐链分类 | Channel §10、PaModel §13.6–§13.8 |
+| `Channel.ValidateThermalReferencePlanes` | P/E | 在校准和周期处理前逐条要求Channel `sampleRateHz`、`maximumOutputPowerDbm`、`activePowerThresholdDb` 分别等于启用热PA的 `sampleRateHz`、`referenceOutputPowerDbm`、`activePowerThresholdDb`，避免时间、瓦特和活动区跨模块失配 | Channel §10.2.1、PaModel §13.5.1 |
 | `GenerateThermalFigures.ConfigurePlotStyle`, `GenerateThermalFigures.CalculateStepRise`, `GenerateThermalFigures.CalculateEfficiency`, `GenerateThermalFigures.SimulatePulseTemperature`, `GenerateThermalFigures.SaveThermalNetworkEffects`, `GenerateThermalFigures.SaveHeatSourceEffects`, `GenerateThermalFigures.SaveElectricalDriftEffects`, `GenerateThermalFigures.SaveOperatingScenarioEffects`, `GenerateThermalFigures.SaveBoundaryParameterEffects`, `GenerateThermalFigures.GenerateThermalFigures` | P/N/V | 由RC/Foster解析式、效率方程、脉冲热状态和温度电参数方程可重复生成PaModel §13中的五组参数效果图 | PaModel §13.3–§13.8 |
 | `Channel.SynchronizeRandomGenerator`, `Channel.ResetRandomGenerator` | N/E | 在外部活动参数改变种子时同步随机状态，并支持从固定种子重放同一白噪声序列 | Channel §4–§5 |
 | `Channel.ValidateSignal` | N/E | 保留SISO向量或MIMO矩阵形状，并拒绝空、非有限或不支持维度的波形 | Channel §1、§6 |
@@ -216,14 +225,14 @@ flowchart LR
 | `Channel.ResolveFeedbackFirTaps`, `Channel.ApplyFeedbackLinearResponse` | P/N | 将可选反馈FIR规范为非空有限复抽头，并按每链执行因果卷积、反馈电压增益和附加相位 | Channel §1.2、§4.1 |
 | `Channel.ApplyFeedbackNonlinearity` | P/N | 使用 $v+c_3|v|^2v$ 模拟观察接收机三阶AM-AM/AM-PM，并可执行保持相位的复包络径向限幅 | Channel §4.2 |
 | `Channel.ApplyFeedbackTimingAndFrequency` | P/N | 通过插值模拟分数时延和SFO，补入整数时延，再按真实采样率施加CFO相位斜坡 | Channel §4.3 |
-| `Channel.ApplyFeedbackIqImbalance` | P/N | 在fb观测链使用独立的I/Q直接项、共轭镜像项和复直流偏置；forward模式完全跳过该接收机误差 | Channel §4.4、§6.3 |
+| `Channel.ApplyFeedbackIqImbalance` | P/N/E | 仅在fb模式且 `fbIqImbalanceEnabled=True` 时使用独立的I/Q直接项、共轭镜像项和复直流偏置；False时增益/相位/DC整级旁路，forward模式始终跳过该接收机误差 | Channel §4.4、§6.5 |
 | `Channel.ApplyFeedbackAdc` | P/N | 对反馈接收机内部I/Q分量执行独立满量程限幅、舍入与有限位宽量化，再解码回内部浮点域 | Channel §4.5 |
 | `Channel.ApplyFeedbackAnalogImpairments` | P/E | 依次组合反馈增益/FIR、非线性/限幅、时频偏和I/Q/DC，保证可重复的物理处理顺序 | Channel §1.2、§4 |
 | `Channel.FeedbackDirectSmallSignalGain` | P/N | 返回反馈FIR直流和、反馈增益/相位及I/Q直通分量组成的小信号复增益；不把镜像、DC、噪声和量化当成确定性标量增益 | Channel §4、§4.6 |
 | `Channel.ApplyChannelEffects` | P/E | 先执行公共相位；forward模式跳过全部fb专用参数，fb模式执行完整反馈模拟链；随后加入公共AWGN，最后仅在fb模式执行反馈ADC | Channel §1–§4 |
 | `Channel.ProcessPaOutput` | E/N | 把已有逐PA公开输出解码后先执行PA后耦合，再执行一次forward/fb采样链路并编码；功率闭环因此不包含接收噪声或PA后串扰 | Channel §1、§1.3、§6.2 |
-| `Channel.ProcessFloating`, `Channel.Process` | P/N/E | `Process(inputSignal, outputPowerDbm)` 给定目标时先在暂停热状态下联合或独立闭环调整Tx数字输入，随后恢复结温并按“Tx I/Q→PA前耦合→真实温度逐路PA→PA后耦合→采样链”只正式处理一次；定点公开模式返回整数I/Q码 | Channel §1、§1.3–§1.4、§3.4、§6.2–§6.4、§10 |
-| `Channel.SmallSignalGain` | P/N | forward模式返回Tx I/Q直接系数、PA小信号增益与公共相位之积；fb模式再乘反馈直通小信号系数；DC、镜像、噪声和量化不伪装成标量增益 | Channel §2、§4、§6.2、§6.5 |
+| `Channel.ProcessBoundPaThermalPeriodFloating`, `Channel.ProcessFloating`, `Channel.Process` | P/N/E | 内部周期入口先验证三个跨模块热参考面，再把Channel的稳态/瞬态、数据窗占空比和收敛条件交给绑定PA；默认稳态模式的每次 `Process` 都执行参考温度功率校准，首次必须显式给出目标，后续省略时复用最近成功目标；恢复热状态后只提交一个周期并返回数据窗的浮点或定点公开波形 | Channel §1、§1.3–§1.5、§3.4、§6.1–§6.8、§10 |
+| `Channel.SmallSignalGain` | P/N | forward模式返回已提交SISO模拟drive、Tx I/Q直接系数、PA小信号增益与公共相位之积；fb模式再乘反馈直通小信号系数；DC、镜像、噪声和量化不伪装成标量增益 | Channel §2、§4、§6.2、§6.5 |
 
 ### 4.2 `ChannelAnalyse.py`：MIMO通道测量
 
@@ -340,12 +349,14 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.MaximumOutputPowerDbm`, `PowerCalibration.Width`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate`, `PowerCalibration.SetPaModel` | E | 用ChainMap保存50 Ω端口、默认25 dBm额定输出极限、统一/逐链目标dBm、独立或联合闭环参数、有效区检测阈值和公开I/Q位宽；校验并绑定具有`Process`接口的PA或测量适配器，未知键警告后忽略，已识别值继续严格验证 | SigProc §13 |
+| `PowerCalibration.__init__`, `PowerCalibration.LoadResistanceOhm`, `PowerCalibration.MaximumOutputPowerDbm`, `PowerCalibration.Width`, `PowerCalibration.GetParameters`, `PowerCalibration.UpdateParameters`, `PowerCalibration.Validate`, `PowerCalibration.SetPaModel` | E | 用ChainMap保存50 Ω端口、默认25 dBm额定输出极限、统一/逐链目标dBm、独立或联合闭环参数、有效区检测阈值和公开I/Q位宽；绑定对象或绑定方法并从协议所有者发现位宽、成对drive接口和成对热事务接口，普通lambda不隐式代理闭包热状态，活动校准事务期间拒绝重绑 | SigProc §13 |
 | `PowerCalibration.DbmToRms`, `PowerCalibration.RmsToDbm` | P/N | 按 $P=V_{\mathrm{RMS}}^2/R$ 在绝对 dBm 功率与复包络 RMS 电压之间双向换算 | SigProc §13 |
 | `PowerCalibration.OutputPowerToDriveScale`, `PowerCalibration.NormalizedRmsToOutputPowerDbm` | P | 在目标dBm与相对额定满量程的归一化RMS之间双向换算 | SigProc §13 |
 | `PowerCalibration.FindActiveSampleMask`, `PowerCalibration.CalculateActiveRmsPerChain` | P/N | 以逐链峰值相对门限识别突发有效样点，闭合短过零间隙，但排除前后补零和长占空比静默区，再按有效样点能量计算RMS | SigProc §13.1 |
-| `PowerCalibration.EvaluateDrivePreset` | P/N/E | 按当前dB驱动向量重建公开PA输入、调用一次真实plant并测量每路有效突发输出功率，为独立和联合闭环提供同一观测入口 | SigProc §13.2–§13.3 |
-| `PowerCalibration.Calibrate`, `PowerCalibration.GetLastPaInput`, `PowerCalibration.GetLastPaOutput`, `PowerCalibration.GetLastCalibrationMetrics` | P/N/E | `Calibrate` 反复更新隐藏驱动预设并观测实际PA输出；无耦合时采用有界dB校正/二分，有PA前耦合时由有限差分功率雅可比和正则最小二乘联合更新，直到全部误差进入容限 | SigProc §13.2–§13.3 |
+| `PowerCalibration.PrepareDrivePreset`, `PowerCalibration.EvaluateDrivePreset` | P/N/E | 浮点模式直接缩放波形；支持协议的定点plant固定生成带数字余量的合法公开码，并把剩余逐链增益放到解码后模拟驱动，再运行真实plant和测量有效输出功率 | SigProc §13.2–§13.3 |
+| `PowerCalibration.Calibrate` | P/N/E | 局部捕获原owner的成对热方法，统一执行“热暂停→纯电闭环→`finally` 向同一owner恢复”；拒绝嵌套校准和事务中重绑，直接绑定热PA或Channel都不让trial推进温度，实时禁用配置不能被旧快照复活 | SigProc §13.2–§13.4 |
+| `PowerCalibration.CalibrateElectricalOnly` | P/N/E | 仅供 `Calibrate` 事务内调用的数值内核：无耦合时用有界dB修正/二分，有PA前耦合时用功率Jacobian联合更新，仅在收敛后提交drive；事务外调用硬性抛出 `RuntimeError`，防止绕过热隔离 | SigProc §13.2–§13.3 |
+| `PowerCalibration.GetLastPaInput`, `PowerCalibration.GetLastPaOutput`, `PowerCalibration.GetLastCalibrationMetrics` | E | 返回最近收敛公开输入、参考温度PA输出和成功/失败诊断；温度开关不清除独立保存的已提交drive | SigProc §13.2–§13.4 |
 | `PowerCalibration.CalibrateFixedColumn`, `PowerCalibration.CalibrateWaveformToOutputPower`, `PowerCalibration.CalibrateWaveformToOutputPowers` | P/N/E | 兼容性底层接口：不经过PA闭环，直接消除任意初始RMS归一化并重建目标dBm波形；定点模式通过量化后RMS搜索补偿取整并维持公开整数I/Q码接口，不应用于真实PA工作点设定 | SigProc §13.2–§13.4 |
 | `PowerCalibration.ScaleSignalToOutputPower`, `PowerCalibration.ScaleSignalToOutputPowers` | P/E | 按有效区RMS施加逐链常数增益，把物理电压波形标定到目标dBm且不把补零或长静默计入平均 | SigProc §13.4 |
 | `SignalProcessingResult.ToDict`, `SignalOverlapResult.ToDict` | E | 只序列化估计标量或重叠坐标，不重新计算同步与相关 | SigProc §9 |
@@ -398,8 +409,8 @@ flowchart LR
 | `Analysis.IntegrateAclr` | P/N | 等宽主/邻道 PSD 积分并取较差邻道 | Analysis §6.1、§6.3 |
 | `Analysis.CalculateAclr`, `Analysis.CalculatePreparedAclr`, `Analysis.CalculatePreparedAclrPerChain` | P/N | 数据字段 Welch PSD 的汇总/逐链 ACLR | Analysis §6、§9.3 |
 | `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让输出功率/SNR/EVM/ACLR共用一次同步结果并保存阶段映射 | Analysis §1、§3.1 |
-| `Analysis.BuildTwoToneWaveform`, `Analysis.AnalyzeTwoTone` | P/E | 保留已有双音元数据，或从原始NumPy/list样值、采样率和两个明确频率构造受验证元数据，再委托给 `TwoToneAnalysis`；一次返回基波、IM3/IM5/IM7及输出功率字典，不进入Wi-Fi解析路径 | Analysis §11.4、TwoToneAnalysis §2、§8.1、§8.2 |
-| `Analysis.CalculateIntermodulationOrder`, `Analysis.CalculateIm3`, `Analysis.CalculateIm5`, `Analysis.CalculateIm7` | P/E | 选择3、5或7阶互调，接受元数据或原始NumPy/list输入，返回上下侧物理频率、同侧基波归一化dBc以及绝对互调dBFS；非法阶次或缺失原始样值物理频率直接拒绝 | TwoToneAnalysis §4、§8.1、§8.2 |
+| `Analysis.BuildTwoToneWaveform`, `Analysis.AnalyzeTwoTone` | P/E | 保留已有双音频率元数据，或从原始NumPy/list样值、采样率和两个明确频率构造受验证元数据；省略位宽时把整数且超出归一化范围的记录识别为默认16位，其余raw记录按浮点处理，浮点发送元数据也允许自动识别典型16位接收码，显式接收位宽可不同于发送元数据位宽；随后一次返回基波、IM3/IM5/IM7及模拟输出功率字典，不进入Wi-Fi解析路径 | Analysis §11.4、TwoToneAnalysis §2、§5、§8.1–§8.2 |
+| `Analysis.CalculateIntermodulationOrder`, `Analysis.CalculateIm3`, `Analysis.CalculateIm5`, `Analysis.CalculateIm7` | P/E | 选择3、5或7阶互调，接受元数据或原始NumPy/list输入，返回上下侧物理频率、同侧基波归一化dBc、绝对互调dBFS及同一次分析的 `outputPowerDbm`；非法阶次或缺失原始样值物理频率直接拒绝 | TwoToneAnalysis §4–§5、§8.1–§8.2 |
 | `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO对齐输出，复制反馈同步估计，并在Analysis中按严格EVM选择最佳实测轮 | DpdIlc §7、Analysis §5.10 |
 | `Analysis.AnalyzeMimoIlcHistory` | P/E | 按轮组合各PA链输出，以完整MIMO空间解映射统一计算性能并在Analysis中选择最佳轮 | Analysis §9 |
 | `Analysis.AnalyzePowerEvmCurve` | P/E | 把每个方法求值器视为完整“DPD+PA”被测对象，在共同目标dBm点反复更新输入并重新运行方法，直到PA实测有效突发输出进入容限；不对方法输出做后级缩放，因此EVM对应真实压缩工作点 | Analysis §8 |

@@ -483,7 +483,7 @@ processingResult = resultAnalysis.GetLastSignalProcessingResult()
 
 ## 13. PA输出dBm、输出回退与复包络标定
 
-`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它负责dBm/RMS换算、根据额定输出功率产生第一次输入驱动预设，并闭环调整PA输入；PA非线性仍由绑定的PA模型或仪表实现。它不会在PA输出端乘常数增益来伪造目标功率。普通业务代码不需要主动构造该类；推荐通过 `Channel.Process(rawSignal, outputPowerDbm=...)` 使用，Channel在内部组合本工具。
+`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它负责dBm/RMS换算、根据额定输出功率产生第一次输入驱动预设，并闭环调整PA输入；PA非线性仍由绑定的PA模型或仪表实现。它不会在PA输出端乘常数增益来伪造目标功率。若绑定对象同时提供 `SuspendThermalModel` 与 `RestoreThermalModel`，公开入口 `Calibrate` 还会统一包围一个“暂停热效应—纯电闭环—恢复热状态”的事务。因此通过Channel使用和直接绑定热PA使用都在参考温度电模型上校准。普通业务代码仍推荐调用 `Channel.Process(rawSignal, outputPowerDbm=...)`，由Channel在内部组合本工具。
 
 工程约定复包络 RMS 幅度等于纯电阻端口上的 RF RMS 电压。设端口电阻为 $R$，RMS 电压为 $V_{\mathrm{RMS}}$，则端口平均功率为
 
@@ -521,19 +521,24 @@ P_{\mathrm{dBm}}
 
 ```mermaid
 flowchart LR
-    dbm["绝对功率 dBm"] --> watt["按1 mW参考换算瓦特"]
-    resistance["loadResistanceOhm"] --> rms["计算RMS电压"]
-    watt --> rms
-    rms --> preset["生成第一次输入驱动预设"]
-    preset --> pa["PA模型或仪表"]
-    pa --> measured["测量有效突发RMS电压"]
-    measured --> dbmOutput["换算实测输出功率 dBm"]
-    resistance --> dbmOutput
-    dbmOutput --> error["与目标dBm比较"]
-    error --> preset
+    subgraph physical["物理电压换算接口"]
+        dbm["绝对功率 dBm"] --> watt["按1 mW参考换算瓦特"]
+        resistance["loadResistanceOhm"] --> voltage["物理RMS电压"]
+        watt --> voltage
+        voltage --> physicalDbm["按V²/R反算dBm"]
+        resistance --> physicalDbm
+    end
+    subgraph normalized["归一化PA闭环接口"]
+        preset["总PA输入drive"] --> pa["PA模型或仪表"]
+        pa --> measured["测量归一化有效突发RMS A"]
+        measured --> normalizedDbm["Pmax + 20 log10(A)"]
+        ratedPower["maximumOutputPowerDbm"] --> normalizedDbm
+        normalizedDbm --> error["与目标dBm比较"]
+        error --> preset
+    end
 ```
 
-**图 3 说明：**`PowerCalibration` 为Channel、主程序、`Analysis` 和 Benchmark 提供同一个端口阻抗基准。箭头回路表示每次都重新生成PA输入并重新观测实际PA输出，而不是对已有输出做离线缩放。业务用户只看见Channel的“原始波形+目标dBm”接口；该工具位于 `SigProc.py` 后，`Analysis` 不再需要为了功率换算而导入 `PaModel.py`。其 `ChainMap` 参数同样遵循“未知键警告并忽略、已识别非法值继续报错”的规则。
+**图 3 说明：**左侧是 `DbmToRms`、`RmsToDbm` 等物理电压接口，只有这条路径使用 `loadResistanceOhm`。右侧是 `Calibrate` 实际采用的归一化PA闭环：它把归一化输出RMS $A$ 按 $P_{\max}+20\log_{10}(A)$ 映射为dBm，不使用端口电阻。两者共享dBm单位但参考面不同，不能把归一化样点直接当作伏特。右侧箭头回路表示每次都重新激励PA并观测实际输出，而不是对已有输出做离线缩放。若plant支持热事务，这个闭环整体位于暂停与 `finally` 恢复之间，图中没有把温度画成另一条反馈环。业务用户只看见Channel的“原始波形+目标dBm”接口；该工具位于 `SigProc.py` 后，`Analysis` 不再需要为了功率换算而导入 `PaModel.py`。其 `ChainMap` 参数同样遵循“未知键警告并忽略、已识别非法值继续报错”的规则。
 
 默认每路PA极限输出功率为
 
@@ -541,21 +546,65 @@ flowchart LR
 P_{\max}=25\ \mathrm{dBm}.
 ```
 
-目标输出 $P_{\mathrm{out}}$ 对应的输出回退与归一化驱动为
+这里必须区分三个容易混淆的量：
+
+1. $P_{\max}$ 是归一化PA输出有效区RMS等于1时对应的物理功率，也是API允许请求的额定输出上限；
+2. 目标输出功率决定的是目标PA输出RMS，而不是PA输入必须使用的固定缩放倍数；
+3. 闭环的总输入驱动 $d_m$ 是控制器不断更新的内部状态，它只有第一次试探时才由输出回退给出近似初值。
+
+目标输出 $P_{\mathrm{target}}$ 对应的输出回退为
 
 ```math
-\mathrm{OBO}=P_{\max}-P_{\mathrm{out}},
+\mathrm{OBO}
+=
+P_{\max}-P_{\mathrm{target}}.
 ```
+
+目标归一化输出有效区RMS为
 
 ```math
-a=10^{-\mathrm{OBO}/20}.
+A_{y,\mathrm{target}}
+=
+10^{(P_{\mathrm{target}}-P_{\max})/20}
+=
+10^{-\mathrm{OBO}/20}.
 ```
 
-默认20 dBm工作点对应5 dB名义回退和 $a\approx0.5623$。这个数只作为闭环第一次试探的驱动预设，不能假定经过非线性PA后一定正好得到20 dBm。
+默认20 dBm工作点相对25 dBm额定上限有5 dB输出回退，因此 $A_{y,\mathrm{target}}\approx0.5623$。这个0.5623描述的是目标PA输出RMS。闭环可以把第一次总输入驱动初始化为
 
-`Calibrate(inputSignal)` 是底层校准器的统一入口。Channel内部构造 `PowerCalibration`、绑定具有 `Process(inputSignal)` 接口的PA模型或仪表适配器，并把调用 `Channel.Process` 时给出的目标功率写入该工具。函数内部重复执行“生成PA输入—实际激励PA—测量有效突发功率—更新隐藏预设”，直到每一路误差均不超过 `calibrationToleranceDb`。普通用户只传原始波形与目标dBm，不需要感知该调用或读写每轮驱动预设。
+```math
+d_m^{(0)}
+=
+P_{m,\mathrm{target}}-P_{\max},
+```
 
-闭环返回的是最终PA输入波形；`GetLastPaOutput()` 返回收敛判定所使用的最后一次PA实测输出。代码不会在PA后把输出乘常数来伪造目标dBm，因此AM-AM压缩、AM-PM、EVM和ACLR均对应真实驱动工作点。`outputPowerDbmPerChain` 不为 `None` 时逐列独立闭环，否则所有链使用共同的 `outputPowerDbm`。
+因此本例的初值是 $-5$ dB，但不能把 $10^{d_m^{(0)}/20}$ 当成最终PA输入缩放，更不能假定非线性PA经过该缩放后必然输出20 dBm。AM-AM压缩、记忆效应、Tx I/Q误差、PA前耦合和量化都会改变实际输入输出关系；控制器必须根据每次实测功率继续更新 $d_m$。
+
+`Calibrate(inputSignal)` 是底层校准器的统一公开入口。`SetPaModel` 除了绑定 `Process(inputSignal)`，还会识别可选且必须成对出现的 `SuspendThermalModel` 与 `RestoreThermalModel`。若传入 `paModel.Process` 这类绑定方法，它会从方法的 `__self__` 自动发现位宽、成对drive协议和成对热事务协议；普通lambda没有可追溯的协议所有者，无法自动管理其闭包背后的热状态，因此热PA应优先传对象或绑定方法。`Calibrate` 开始时把当时绑定owner的暂停/恢复方法捕获到本地，取得热快照并暂停温度效应，再调用内部数值内核 `CalibrateElectricalOnly`；事务期间 `SetPaModel` 会拒绝重绑，嵌套 `Calibrate` 也会被拒绝。最后无论收敛、校验失败还是plant抛出异常，都用原owner的本地恢复方法在 `finally` 中归还快照，避免把PA A的快照错误交给PA B。数值内核重复执行“生成PA输入—实际激励PA—测量有效突发功率—更新隐藏预设”，直到每一路误差均不超过 `calibrationToleranceDb`。
+
+`CalibrateElectricalOnly` 只是为了让热事务边界和闭环数值实现分离的内部内核。它不会自行暂停或恢复温度，并且会硬性拒绝事务外直接调用，提示用户改用 `Calibrate`。Channel内部构造 `PowerCalibration`、把自己的热代理接口交给校准器，并将 `Channel.Process` 的目标功率写入该工具；直接使用 `PowerCalibration(paModel=thermalPa)` 也会经过同一个公开热事务。普通用户只传原始波形与目标dBm，不需要感知该内核或读写每轮驱动预设。
+
+浮点模式下，闭环返回最终PA输入波形；定点模式下，闭环返回带数字余量的公开整数码，并由同一个Channel保存与其配对的隐藏模拟增益。`GetLastPaOutput()` 返回收敛判定所使用的最后一次PA实测输出。代码不会在PA后把输出乘常数来伪造目标dBm，因此AM-AM压缩、AM-PM、EVM和ACLR均对应真实驱动工作点。`outputPowerDbmPerChain` 不为 `None` 时逐列独立闭环，否则所有链使用共同的 `outputPowerDbm`。
+
+`PowerCalibration` 的完整配置如下。所有默认值都定义在构造函数内部，并通过 `ChainMap` 允许调用方只覆盖需要修改的项目。直接构造参数和 `UpdateParameters(...)` 位于高优先级覆盖层；它们会覆盖 `parameters` 传入的低层活动映射，而不是与同名键合并。
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `loadResistanceOhm` | `50.0` | 物理电压接口使用的端口阻抗 |
+| `maximumOutputPowerDbm` | `25.0` | 归一化PA输出有效区RMS等于1时对应的额定上限 |
+| `outputPowerDbm` | `20.0` | 未提供逐链目标时使用的共同输出功率 |
+| `outputPowerDbmPerChain` | `None` | 可选逐PA输出功率目标序列 |
+| `calibrationToleranceDb` | `0.25` | 所有链均须满足的绝对功率误差容限 |
+| `maximumCalibrationIterations` | `60` | 单次闭环允许的最大试探轮数 |
+| `calibrationLearningRate` | `0.8` | 未建立上下界时的比例修正系数，以及联合修正的步长系数 |
+| `maximumDriveAdjustmentDb` | `6.0` | 单轮单链允许的最大驱动变化 |
+| `calibrationDigitalHeadroomDb` | `6.0` | 定点公开码相对I/Q满量程保留的峰值余量，总体范围为0至60 dB；低位宽还必须保证峰值至少量化成一个非零码，非法组合会报告该位宽的准确上限 |
+| `enableJointCalibration` | `False` | 是否用有限差分雅可比联合更新多链驱动 |
+| `calibrationProbeStepDb` | `0.05` | 联合模式构造功率雅可比时的单链探测步长 |
+| `calibrationRegularization` | `1e-6` | 联合最小二乘的对角正则系数 |
+| `activePowerThresholdDb` | `-60.0` | 相对峰值的有效突发功率门限 |
+| `activeGapToleranceSamples` | `16` | 仍并入有效突发的最大内部低功率空洞长度 |
+| `width` | `16` | 公开I/Q位宽；0为浮点，闭环定点校准要求至少2 bit |
 
 ### 13.1 有效信号区间与占空比
 
@@ -672,7 +721,15 @@ A_{x,m}
 \frac{x_m[n]}{A_{x,m}}.
 ```
 
-第 $k$ 次试探使用隐藏驱动预设 $d_m^{(k)}$，单位为dB：
+第 $k$ 次试探使用总有效驱动 $d_m^{(k)}$，单位为dB。它定义了进入Tx I/Q模块之前的期望有效区RMS：
+
+```math
+A_{u,m}^{(k)}
+=
+10^{d_m^{(k)}/20}.
+```
+
+在浮点模式下，这个定义直接对应
 
 ```math
 u_m^{(k)}[n]
@@ -680,7 +737,7 @@ u_m^{(k)}[n]
 10^{d_m^{(k)}/20}\bar{x}_m[n].
 ```
 
-把 $u_m^{(k)}[n]$ 真正送入PA或仪表适配器，得到
+在定点模式下，总有效驱动会拆成“安全公开数字码”和“解码后的隐藏模拟增益”，详细推导见13.3节。无论采用哪一种公开接口，真正进入Tx I/Q、PA前耦合和PA的波形仍记为 $u_m^{(k)}[n]$。绑定plant的输出为
 
 ```math
 y_m^{(k)}[n]
@@ -760,7 +817,20 @@ e_m^{(k)}
 \epsilon_P,
 ```
 
-其中默认 $\epsilon_P=0.25$ dB，最多试探60次；用户可按仪表重复性和目标精度收紧容限。收敛后的 $d_m$ 保存在类内部并作为下一次同目标校准的初值，但 `GetLastCalibrationMetrics()` 只返回目标、实测功率、残差和迭代次数，不把隐藏预设暴露给用户。若PA饱和、定点满量程或仪表限幅导致目标不可达，函数在达到迭代上限后明确报错，而不是对PA输出做后级缩放。
+其中默认 $\epsilon_P=0.25$ dB，最多试探60次；用户可按仪表重复性和目标精度收紧容限。收敛后的 $d_m$ 保存在类内部并作为下一次同目标校准的初值。用户无需设置隐藏模拟增益；实现成对trial/commit协议的适配器会在 `GetLastCalibrationMetrics()` 中返回 `analogDriveDbPerChain`。浮点协议路径的该值为0 dB，表示总drive已由公开浮点波形承担；没有该协议的旧式适配器不返回此键。
+
+校准采用trial/commit事务。每一轮 `ProcessCalibrationDrive` 都显式携带本轮候选增益，只产生一次临时PA观测，不修改Channel中已经生效的驱动状态。只有当所有PA链同时满足容限后，`SetCalibrationDriveDb` 才原子提交最终逐链增益，然后缓存被接受的公开输入和PA输出。联合模式为构造雅可比而产生的额外探测也只是trial，不能提前提交。若某次新校准失败，之前已经成功提交的工作点保持不变，因此一次失败的功率请求不会破坏后续不带功率参数的正常传输或ILC测试。
+
+失败并不等价于“目标值大于 `maximumOutputPowerDbm`”。超过额定上限的请求在参数校验阶段直接拒绝；不超过上限的请求仍可能因为真实PA饱和、固定增益仪表适配器、输出采集限幅、极低位宽量化或非单调工作区而不可达。达到迭代上限后函数抛出包含目标功率、最佳实测功率和最佳绝对误差的异常；`GetLastCalibrationMetrics()` 保留本次最佳观测并返回 `converged=False` 与可读的 `failureReason`，成对trial/commit协议存在时还返回最佳 `analogDriveDbPerChain`。成功时 `converged=True`，且不包含失败原因。实现不会通过修改 $P_{\max}$、放大PA输出数组或把失败的最后一次trial误记为新工作点来伪造收敛。
+
+热状态事务与drive提交事务是两条正交状态轴：
+
+1. `Calibrate` 调用 `SuspendThermalModel` 后，热网络、结温、累计热时间、互热offset和热metrics不随trial推进；
+2. `CalibrateElectricalOnly` 只求解电驱动，所有PA链收敛后仍会提交新的公开波形与模拟drive；
+3. `finally` 调用 `RestoreThermalModel`。若校准期间活动配置已经改成 `ThermalConfig(enabled=False)` 或 `None`，这个实时关闭决定优先，旧的启用快照不会被复活；
+4. 若校准失败，热状态同样恢复，而未收敛的候选drive不会提交。
+
+所以“关闭温度”不等于“清零以前成功提交的功率drive”。前者决定是否计算自热、互热和温度漂移，后者决定PA前的工作点。比较温度开关前后电响应时，应让两次测试使用同一个已提交drive，或分别在相同目标功率规则下重新校准；不能把带历史drive的对象与全新0 dB drive对象直接比较后把差异归因于温度。
 
 该闭环假设目标附近的有效突发平均输出功率随输入驱动单调不减，这对正常AM-AM曲线成立。若真实仪表反馈噪声大于功率容限，应先增加仪表平均次数或放宽 `calibrationToleranceDb`；若PA存在热记忆或迟滞，应保证每轮测量使用相同等待时间和采集条件，否则二分上下界可能不再代表同一静态映射。
 
@@ -842,11 +912,174 @@ flowchart LR
 | `calibrationLearningRate` | `0.8` | 联合修正与独立比例修正共用的更新学习率 |
 | `maximumDriveAdjustmentDb` | `6.0` | 每轮每路允许的最大dB修正量 |
 
-`EvaluateDrivePreset(normalizedInput, driveDb, inputWasVector, interfaceFormat)` 是内部统一观测入口。它按给定驱动向量产生公开位宽PA输入，调用一次绑定plant，返回本次PA输入、PA输出和逐路实测dBm。普通用户仍只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`，不需要直接构造雅可比或管理驱动向量。
+`PrepareDrivePreset(normalizedInput, driveDb, interfaceFormat)` 负责构造安全公开波形和逐链解码后模拟增益。`EvaluateDrivePreset(normalizedInput, driveDb, inputWasVector, interfaceFormat)` 是内部统一观测入口：它调用一次绑定plant的trial接口，并返回本次公开PA输入、PA输出、逐路实测dBm和模拟增益向量，但不提交候选增益。普通用户仍只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`，不需要直接构造雅可比、管理驱动向量或调用trial/commit接口。
 
 ### 13.3 定点接口
 
-`width=0` 时输入输出均为浮点复包络。`width>0` 时输入和输出均为公开整数I/Q码，容器类型仍为 `numpy.complex128`。闭环每一轮先把隐藏驱动预设作用于内部浮点波形，再编码为整数码送入PA；PA返回的整数码重新解码后才计算实测功率。因此量化、DAC满量程和削顶都真实进入反馈结果。若定点接口无法达到目标功率，闭环会在迭代上限后报错。
+`width=0` 时输入输出均为浮点复包络。`width>0` 时输入和输出均为公开整数I/Q码，容器类型仍为 `numpy.complex128`。模块内部仍使用浮点运算，但固定字长边界上的数值是诸如8191、-16384一类原始码，而不是小于1的归一化浮点数。
+
+#### 13.3.1 为什么不能在定点编码之前不断放大
+
+若先生成单位有效RMS OFDM波形，再把总驱动直接乘到波形上并编码，公开I/Q接口只允许每个分量落在
+
+```math
+-2^{w-1}
+\leq
+q_I,q_Q
+\leq
+2^{w-1}-1.
+```
+
+解码后的正向满量程为
+
+```math
+r_w
+=
+1-2^{-(w-1)}.
+```
+
+隐藏模拟增益校准要求 $w\geq2$，因为1位带符号接口没有正向非零码，无法构造保留余量的复基带波形。
+
+OFDM具有较高峰均比。即使有效区RMS尚未达到目标，部分I/Q峰值也可能先超过 $r_w$。此后继续增加编码前驱动只会让更多样点饱和为最大码，公开波形不再按预期增大。控制器会观察到一个由数字削顶产生的假功率平台，并可能错误报告“20 dBm不可达”。增加迭代次数只能重复同一批饱和码；增加位宽只改善量化步长，也不会改变归一化范围 $[-1,1)$，因此两者都不能从根本上修复该问题。
+
+正确结构把总有效驱动拆成两部分：
+
+- 一个带峰值余量、始终合法的公开定点数字基波形；
+- 一个在公开码解码之后、Tx I/Q和PA之前施加的隐藏逐链模拟增益。
+
+这等价于真实系统中的“DAC码加后级可调驱动增益”。对外接口仍是相同位宽的整数码，用户只需向 `Channel.Process` 提供原始波形和目标dBm。
+
+#### 13.3.2 安全公开码和6 dB数字余量
+
+对第 $m$ 路单位有效RMS波形 $\bar{x}_m[n]$，先找I/Q分量的最大绝对值：
+
+```math
+C_m
+=
+\max_n
+\left(
+\max
+\left(
+\left|\mathrm{Re}\left(\bar{x}_m[n]\right)\right|,
+\left|\mathrm{Im}\left(\bar{x}_m[n]\right)\right|
+\right)
+\right).
+```
+
+设 `calibrationDigitalHeadroomDb` 为 $H$，安全的解码后分量峰值为
+
+```math
+L_w
+=
+r_w 10^{-H/20}.
+```
+
+数字基波形缩放为
+
+```math
+s_m
+=
+\frac{L_w}{C_m}
+.
+```
+
+这里不再额外限制 $s_m\leq1$。$\bar{x}_m$ 只是单位有效区 RMS 的内部基准，
+不是必须保持原幅度的公开码；当其分量峰值低于安全上限时，校准器可以向上缩放以利用更多量化码。
+无论向上还是向下缩放，公开码的分量峰值都保持在 $L_w$，总有效驱动再由解码后的模拟级补足。
+
+记 $E_w$ 为定点编码器，$D_w$ 为定点解码器，则公开整数码和真正解码回内部的数字波形分别为
+
+```math
+q_m[n]
+=
+E_w\left(s_m\bar{x}_m[n]\right),
+```
+
+```math
+x_{q,m}[n]
+=
+D_w\left(q_m[n]\right).
+```
+
+默认 $H=6$ dB。对16位接口，$r_w\approx0.999969$，所以 $L_w\approx0.50117$，即公开I/Q峰值约占半量程。这为ILC或DPD产生的接近两倍峰值扩展保留空间，同时仍充分利用16位量化精度。需要更大预失真峰值余量时可增大 `calibrationDigitalHeadroomDb`；增大余量会降低数字码幅度和有效量化信噪比，因此不应无条件设得很大。
+
+对 $W$ 位有符号码，正峰值码为 $2^{W-1}-1$。为了让缩放后的最大分量经舍入后至少保留一个非零码，余量还必须满足
+
+```math
+H
+<
+20\log_{10}\left(
+2\left(2^{W-1}-1\right)
+\right).
+```
+
+例如2 bit时必须小于约6.0206 dB，8 bit时必须小于约48.0967 dB；16 bit的该上限高于接口统一设置的60 dB，因此16 bit仍使用0至60 dB总体范围。非法的位宽与余量组合会在PA试探之前直接报出相应允许区间，而不会等到整帧量化为零后再报告“无有效样点”。
+
+取整后不能直接把理论缩放 $s_m$ 当成实际RMS，尤其在低位宽下误差会很明显。实现必须对解码后的整数码重新测量有效区RMS：
+
+```math
+A_{q,m}
+=
+\sqrt{
+\frac{
+\sum_n M_m[n]\left|x_{q,m}[n]\right|^2
+}{
+\sum_n M_m[n]
+}
+}.
+```
+
+第 $k$ 轮总有效驱动仍由 $d_m^{(k)}$ 定义。解码后的隐藏模拟增益为
+
+```math
+G_m^{(k)}
+=
+\frac{
+10^{d_m^{(k)}/20}
+}{
+A_{q,m}
+},
+```
+
+其dB形式为
+
+```math
+g_m^{(k)}
+=
+d_m^{(k)}
+-20\log_{10}\left(A_{q,m}\right).
+```
+
+真正进入Tx I/Q模块的候选波形为
+
+```math
+u_m^{(k)}[n]
+=
+G_m^{(k)}x_{q,m}[n].
+```
+
+因此公开码 $q_m[n]$ 在各轮之间保持安全且不因驱动增加而削顶，而 $u_m^{(k)}[n]$ 的有效区RMS仍严格对应总驱动 $10^{d_m^{(k)}/20}$。量化造成的细微波形误差没有被隐藏：它已经包含在 $x_{q,m}[n]$ 中，并随真实trial一起通过Tx I/Q、PA前耦合和PA。
+
+```mermaid
+flowchart LR
+    raw["任意幅度原始波形"] --> normalize["按有效区归一化为单位RMS"]
+    normalize --> headroom["按 calibrationDigitalHeadroomDb 保留数字峰值余量"]
+    headroom --> encode["编码为公开整数I/Q码 q"]
+    encode --> decode["解码并重新测量量化后RMS"]
+    drive["本轮总有效驱动 d"] --> analog["计算隐藏模拟增益 g"]
+    decode --> analog
+    analog --> tx["Tx I/Q + PA前耦合"]
+    tx --> pa["PA模型或仪表"]
+    pa --> measure["解码PA输出并测量有效突发功率"]
+    measure --> update["更新下一轮总drive"]
+    update --> drive
+```
+
+**图 6 说明：**数字基波形只负责提供合法、带余量的公开码；隐藏模拟增益负责改变真实PA驱动。闭环调节的是两者合成后的总有效drive。PA输出仍跨越公开定点边界，输出量化和输出采集削顶都会进入实测反馈。图中的trial在收敛前不会改变Channel已提交的模拟增益。
+
+收敛后，`GetLastPaInput()` 返回的是公开数字部分 $q_m[n]$。要复现同一功率，必须继续通过完成本次校准的同一个Channel处理，因为该Channel同时保存了已提交的隐藏模拟增益。`GetLastActualPaInput()` 返回经过隐藏增益、Tx I/Q和PA前耦合后的真实PA输入，更适合检查物理工作点。把 `GetLastPaInput()` 单独复制给另一个未校准的裸PA对象，不能保证复现相同输出功率。
+
+采用该结构后，内置默认GMP在 `width=16`、`maximumOutputPowerDbm=25` 时不会再因为数字输入满量程假平台而错误判定20 dBm不可达。真正不可达的外部PA或仪表仍会按13.2节所述返回失败指标并抛出异常；隐藏模拟增益不是PA输出后级缩放，也不会绕过真实PA的非线性。
 
 兼容接口 `CalibrateWaveformToOutputPower` 不经过PA闭环。它的定点取整使“缩放后再量化”的RMS成为分段常数函数，底层 `CalibrateFixedColumn` 因此使用二分搜索寻找量化前比例 $c$：
 
@@ -875,6 +1108,8 @@ Q_w(c\,x[n])
 
 `Calibrate` 是本工程设置PA工作点的闭环接口：它绑定PA，调整PA输入，并用PA实测输出判断收敛。归一化输出有效区RMS等于1对应 `maximumOutputPowerDbm`。
 
+绑定对象若提供成对热事务接口，`Calibrate` 会自动暂停并恢复温度状态；直接调用时也不需要用户手工关闭温度。`CalibrateElectricalOnly` 是该公开入口内部调用的数值内核，不属于用户API，事务外调用会直接抛出 `RuntimeError`。
+
 `CalibrateWaveformToOutputPower` 和 `CalibrateWaveformToOutputPowers` 仅作为兼容性数值接口保留。它们直接把给定数组缩放到目标归一化RMS，不调用PA，也不能用于验证真实AM-AM压缩点。主程序、`SmallestSISO.py`、Benchmark和功率-EVM扫描均不再使用这两个接口。
 
 `ScaleSignalToOutputPower` 和 `ScaleSignalToOutputPowers` 用于已经采用物理伏特单位的复包络：它们按端口阻抗把目标dBm转换为RMS电压。两组接口都使用相同的有效区掩码，但不能混淆数值尺度。
@@ -901,6 +1136,7 @@ powerCalibration = PowerCalibration(
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
         "outputPowerDbm": 20.0,
+        "calibrationDigitalHeadroomDb": 6.0,
         "activePowerThresholdDb": -60.0,
         "activeGapToleranceSamples": 16,
         "width": 16,
@@ -917,6 +1153,8 @@ measuredPowerDbm = (
     powerCalibration.NormalizedRmsToOutputPowerDbm(measuredRms)
 )
 ```
+
+若这里的 `paModel` 启用了 `ThermalConfig`，上述 `Calibrate` 会在参考温度电模型上运行全部trial，并在返回或抛出异常之前恢复原来的结温、累计时间和互热状态。把示例中的调用替换为 `CalibrateElectricalOnly` 会因缺少外层事务而直接得到 `RuntimeError`。
 
 MIMO只需把类内目标改为逐链序列，函数调用不变：
 

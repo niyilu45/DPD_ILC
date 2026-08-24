@@ -11,7 +11,9 @@
 - 三个阶次中最大的剩余互调；
 - PA稳态平均输出功率dBm。
 
-所有结果由 `Analyze(measuredSignal)` 以普通Python字典返回。
+所有结果由 `Analyze(measuredSignal)` 以普通Python字典返回。其中
+`outputPowerDbm` 是送入分析器的模拟PA输出参考面功率；它与IM3、IM5、
+IM7在同一次调用中产生，不需要调用方再写一套RMS功率计算。
 
 主分析类 `Analysis` 还提供 `AnalyzeTwoTone`、`CalculateIm3`、`CalculateIm5` 和 `CalculateIm7` 静态入口。这些入口内部委托给 `TwoToneAnalysis`，不会复制另一套频谱算法，也不会把双音逻辑混入Wi-Fi的实例 `Analyze()` 路径。静态入口既接受原有的 `TwoToneWaveform`，也接受NumPy数组或Python列表；原始样值模式必须同时给出物理 `sampleRateHz` 与两个 `toneFrequenciesHz`，因为仅凭一段复样值无法可靠推断音调的真实频率标尺。
 
@@ -142,26 +144,103 @@ I_{\mathrm{worst}}
 
 `AnalyzeIlcHistory` 在每一轮真实PA输出上独立计算这些值，并选择 $I_{\mathrm{worst}}$ 最小的实测轮。原始 `DpdIlc.py` 仍然只保存波形和MSE，不嵌入任何IM指标。
 
-## 5. 输出功率
+## 5. 模拟输出功率、参考面和定点换算
 
-稳态记录RMS为
+### 5.1 功率测量参考面
+
+`outputPowerDbm` 测量的是 `measuredSignal` 所在参考面的功率。推荐把PA的
+直接输出送入该参数，此时它就是模拟PA输出端口功率；如果调用方先对波形
+加入额外线性增益、PA后耦合或接收链增益，结果自然变成这些模块之后的
+观测参考面功率。分析器不会把PA输入功率当成输出功率，也不会简单复制
+`PowerCalibration` 的目标值。
+
+分析前先去掉首尾各 `settlingSamples` 个暂态样点，再根据
+`activePowerThresholdDb` 找到活动样点，并用
+`activeGapToleranceSamples` 闭合活动区中的短过零间隙。长补零和占空比空闲
+不会拉低活动段功率。令最终活动样点集合为 $\mathcal A$，则归一化复包络
+RMS为
 
 ```math
 y_{\mathrm{rms}}
 =\sqrt{
-\frac{1}{N_{\mathrm{effective}}}
-\sum_n
-\left|y_{\mathrm{steady}}[n]\right|^2
+\frac{1}{|\mathcal A|}
+\sum_{n\in\mathcal A}
+\left|y[n]\right|^2
 }.
 ```
 
-工程约定归一化PA输出RMS为1时对应 `maximumOutputPowerDbm`。因此报告功率为
+工程约定归一化PA输出RMS为1时对应 `maximumOutputPowerDbm`。设端口阻抗
+为 $R$，该满量程功率对应的RMS电压为
+
+```math
+V_{\mathrm{FS}}
+=
+\sqrt{
+R\times 10^{-3}
+\times 10^{P_{\max,\mathrm{dBm}}/10}
+}.
+```
+
+活动信号的模拟RMS电压为 $V_{\mathrm{rms}}=y_{\mathrm{rms}}V_{\mathrm{FS}}$，
+所以报告功率为
 
 ```math
 P_{\mathrm{out,dBm}}
 =P_{\max,\mathrm{dBm}}
 +20\log_{10}\left(y_{\mathrm{rms}}\right).
 ```
+
+这里的 `loadResistanceOhm` 定义模拟端口阻抗，而
+`maximumOutputPowerDbm` 定义归一化满量程的绝对功率。只要所有模块采用
+相同的两个参考值，双音分析、普通Analysis和功率闭环就处于同一模拟功率
+参考面。
+
+### 5.2 定点码为什么不能直接当成浮点或伏特
+
+当 `width=W>0` 时，公开NumPy数组的实部和虚部虽然存储在
+`complex128` 中，但数值是有符号整数码，不是归一化小数，也不是伏特。
+分析器必须先执行
+
+```math
+y[n]
+=
+\frac{c_I[n]+j c_Q[n]}{2^{W-1}},
+```
+
+再计算活动区RMS和dBm。若把码值 $c[n]$ 直接当作浮点复包络，功率会额外
+增加
+
+```math
+\Delta P_{\mathrm{dB}}
+=20\log_{10}\left(2^{W-1}\right)
+=6.0206(W-1)\ \mathrm{dB}.
+```
+
+16位接口的纯缩放误差就是
+$6.0206\times15\approx90.31\ \mathrm{dB}$。因此本应约为20 dBm的波形
+可能被错误报告成约110 dBm；若真实工作点略高、还混入峰值或参考面增益，
+就很容易看到112 dBm附近的异常值。这不是PA产生了如此大的功率，而是把
+整数码误当成模拟幅度造成的单位错误。
+
+原始NumPy/list模式可以对明显超出归一化范围的整数码自动识别工程默认
+16位。这个启发式不用于带 `TwoToneWaveform` 的元数据模式：该模式在省略
+`width` 时继承发送波形位宽。如果发送参考是浮点而接收仪表导出16位码，
+必须显式传入 `width=16`；否则接收码会按发送端的 `width=0` 解释，正好
+产生上述约90.31 dB偏差。
+
+例如 `maximumOutputPowerDbm=25.0`、目标输出为20 dBm时，正确的归一化
+活动区RMS应接近
+
+```math
+y_{\mathrm{rms,target}}
+=10^{(20-25)/20}
+\approx0.5623.
+```
+
+在16位公开接口中，这相当于约
+$0.5623\times32768\approx18427$ 的复包络码RMS。分析器使用 `width=16`
+先除以32768，仍得到约20 dBm；使用 `width=0` 错把18427当作归一化RMS，
+则会多出约90.31 dB。
 
 最终方法对比前，Benchmark会把每种ILC选择出的输入重新交给闭环 `PowerCalibration`。校准器只调整PA输入，直到实际输出功率进入容限，不在PA输出端做常数缩放。因此各方法的IM3、IM5和IM7是在相同真实输出dBm下比较。
 
@@ -192,7 +271,9 @@ TwoToneAnalysis(waveform, parameters=None, width=None, **parameterOverrides)
 | `minimumSpectralPower` | `1e-30` | 对数计算功率下限，避免负无穷 |
 | `maximumOutputPowerDbm` | `25.0` | 归一化输出RMS为1时的PA功率 |
 | `loadResistanceOhm` | `50.0` | 与工程其他功率模块一致的端口阻抗 |
-| `width` | 继承波形 | 0为浮点，大于0为公开整数I/Q码 |
+| `activePowerThresholdDb` | `-60.0` | 相对活动段峰值的功率检测门限，低于门限的长补零或空闲不进入模拟功率RMS |
+| `activeGapToleranceSamples` | `16` | 活动区内允许闭合的短过零间隙样点数 |
+| `width` | 省略时自动识别或继承元数据 | 描述 `measuredSignal` 的边界；典型16位整数码可从浮点发送元数据中自动识别，0为浮点，大于0为公开整数I/Q码 |
 
 ## 8. PA输出分析示例
 
@@ -242,6 +323,8 @@ metrics = toneAnalysis.Analyze(paOutput)
 print(metrics["im3WorstDbc"])
 print(metrics["im5WorstDbc"])
 print(metrics["im7WorstDbc"])
+print(f"PA output power: {metrics['outputPowerDbm']:.2f} dBm")
+assert abs(metrics["outputPowerDbm"] - 20.0) <= 0.25
 ```
 
 ### 8.1 通过主Analysis类分别读取IM3、IM5和IM7
@@ -261,6 +344,7 @@ im5Metrics = Analysis.CalculateIm5(paOutput, toneWaveform)
 im7Metrics = Analysis.CalculateIm7(paOutput, toneWaveform)
 
 print(allMetrics["worstIntermodulationDbc"])
+print(allMetrics["outputPowerDbm"])
 print(allMetrics["im3LowerDbc"], allMetrics["im3UpperDbc"])
 print(allMetrics["im5LowerDbc"], allMetrics["im5UpperDbc"])
 print(allMetrics["im7LowerDbc"], allMetrics["im7UpperDbc"])
@@ -277,6 +361,7 @@ print(im7Metrics["worstDbc"], im7Metrics["lowerProductDbfs"])
 | `lowerFrequencyHz`, `upperFrequencyHz` | 该阶下侧和上侧互调物理频率 |
 | `lowerDbc`, `upperDbc`, `worstDbc` | 同侧基波归一化后的互调指标 |
 | `lowerProductDbfs`, `upperProductDbfs` | 两个互调产物的绝对归一化电平 |
+| `outputPowerDbm` | 与完整分析相同的模拟PA输出参考面功率 |
 
 一次需要全部阶次时优先调用 `AnalyzeTwoTone`，只执行一轮投影。三个专用方法更适合只验收某一阶指标或把单阶结果送入自动测试接口。
 
@@ -317,6 +402,7 @@ im3Metrics = Analysis.CalculateIm3(
 print(rawMetrics["im3LowerDbc"], rawMetrics["im3UpperDbc"])
 print(rawMetrics["im5LowerDbc"], rawMetrics["im5UpperDbc"])
 print(rawMetrics["im7LowerDbc"], rawMetrics["im7UpperDbc"])
+print(rawMetrics["outputPowerDbm"])
 ```
 
 原始样值模式的规则如下：
@@ -325,8 +411,29 @@ print(rawMetrics["im7LowerDbc"], rawMetrics["im7UpperDbc"])
 - `AnalyzeTwoTone` 对IM3、IM5和IM7均同时返回 `LowerDbc` 与 `UpperDbc`；每一阶的 `WorstDbc` 只是两侧中的较差者，不能替代两侧原始结果；
 - 两个基波必须不同，且IM3、IM5和IM7理论位置都必须位于复Nyquist范围内；
 - 原始发送数组和PA输出必须具有相同长度；
-- 浮点样值默认 `width=0`；整数I/Q码必须在 `width` 参数或 `parameters["width"]` 中提供正确位宽；
-- `TwoToneWaveform` 模式仍是最完整的调用方式。若同时提供它和 `sampleRateHz`、`toneFrequenciesHz` 或 `width`，这些值必须一致，避免把一个频率标签应用到另一段波形。
+- 原始NumPy/list模式省略 `width` 时会检查全部I/Q分量：若它们都是整数码形态且至少一个分量的绝对值大于1，则识别为工程默认16位；其他情况按浮点 `width=0` 处理。为了避免幅度很小的整数码、整数值浮点测试信号等歧义，生产测试仍推荐显式配置位宽；8、12、24位等非默认格式必须明确提供；
+- `TwoToneWaveform` 模式仍是最完整的频率元数据调用方式。若同时提供它和 `sampleRateHz` 或 `toneFrequenciesHz`，物理频率参数必须一致；显式 `width` 只描述接收 `measuredSignal`，允许与发送 `TwoToneWaveform.width` 不同。若发送元数据为浮点且接收样值呈现典型16位整数码形态，省略 `width` 时同样自动识别16位；其他非零发送位宽则默认继承。
+
+16位原始码的推荐写法如下。`fixedPaOutput` 必须是模块公开返回的整数码，
+不能预先除以32768后仍声明 `width=16`，也不能保持码值不变却声明
+`width=0`：
+
+```python
+fixedMetrics = Analysis.AnalyzeTwoTone(
+    fixedPaOutput.tolist(),
+    sampleRateHz=100.0e6,
+    toneFrequenciesHz=(-2.0e6, 2.0e6),
+    parameters={
+        "settlingSamples": 256,
+        "maximumOutputPowerDbm": 25.0,
+        "activePowerThresholdDb": -60.0,
+        "activeGapToleranceSamples": 16,
+        "width": 16,
+    },
+)
+
+print(f"PA output power: {fixedMetrics['outputPowerDbm']:.2f} dBm")
+```
 
 ## 9. 单一ILC逐轮分析示例
 

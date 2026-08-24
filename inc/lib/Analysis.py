@@ -106,6 +106,7 @@ class IntermodulationOrderMetrics(TypedDict):
     lowerDbc: float
     upperDbc: float
     worstDbc: float
+    outputPowerDbm: float
 
 
 class MimoSignalMetrics(TypedDict):
@@ -2002,8 +2003,11 @@ class Analysis:
                 frequencies in hertz for raw-record mode.
             ilcBandwidthHz: Optional descriptive ILC bandwidth for raw mode.
                 ``None`` derives a conservative bandwidth from IM7 locations.
-            width: Optional public I/Q width for raw mode. ``None`` selects
-                floating-point samples; metadata-rich mode inherits its width.
+            width: Optional measured-signal I/Q width. In raw mode ``None``
+                recognizes project-style integer codes outside the normalized
+                range as 16-bit samples and otherwise selects floating point.
+                Metadata-rich mode inherits its width only when no measured-
+                signal override is supplied.
 
         Returns:
             result: Existing or newly constructed immutable two-tone metadata.
@@ -2032,10 +2036,12 @@ class Analysis:
                 raise ValueError(
                     "ilcBandwidthHz must match the supplied TwoToneWaveform"
                 )
-            if width is not None and FixedPoint(width).width != waveform.width:
-                raise ValueError(
-                    "width must match the supplied TwoToneWaveform"
-                )
+            # The waveform supplies physical frequencies and record metadata,
+            # while width describes the measured receiver boundary. A
+            # floating transmit reference and fixed-point instrument capture
+            # are therefore a valid and common combination.
+            if width is not None:
+                FixedPoint(width)
             return waveform
 
         rawMetadataSignal = measuredSignal if waveform is None else waveform
@@ -2065,8 +2071,6 @@ class Analysis:
             raise ValueError(
                 "toneFrequenciesHz must contain two distinct finite values"
             )
-        interfaceFormat = FixedPoint(0 if width is None else width)
-        resolvedWidth = interfaceFormat.width
         try:
             rawSamples = np.asarray(
                 rawMetadataSignal,
@@ -2083,6 +2087,51 @@ class Analysis:
             )
         if not np.all(np.isfinite(rawSamples)):
             raise ValueError("raw two-tone waveform must contain finite samples")
+        # Raw floating and fixed public samples intentionally share complex128,
+        # so dtype alone cannot resolve the interface. Project-generated fixed
+        # samples have integer I/Q components and exceed the normalized range;
+        # recognize that common 16-bit representation while retaining backward
+        # compatibility for ordinary normalized floating records. An explicit
+        # width remains authoritative for uncommon widths or ambiguous data.
+        resolvedInputWidth = width
+        if resolvedInputWidth is None:
+            try:
+                measuredWidthProbe = np.asarray(
+                    measuredSignal,
+                    dtype=np.complex128,
+                ).reshape(-1)
+            except (TypeError, ValueError) as error:
+                raise TypeError(
+                    "measuredSignal must be a NumPy array or Python list"
+                ) from error
+            if (
+                measuredWidthProbe.size == 0
+                or not np.all(np.isfinite(measuredWidthProbe))
+            ):
+                raise ValueError(
+                    "measuredSignal must contain finite samples"
+                )
+            componentValues = np.concatenate(
+                (measuredWidthProbe.real, measuredWidthProbe.imag)
+            )
+            integerCodeShape = bool(
+                np.all(
+                    np.isclose(
+                        componentValues,
+                        np.rint(componentValues),
+                        rtol=0.0,
+                        atol=1.0e-9,
+                    )
+                )
+            )
+            exceedsNormalizedRange = bool(
+                np.max(np.abs(componentValues)) > 1.0 + 1.0e-9
+            )
+            resolvedInputWidth = (
+                16 if integerCodeShape and exceedsNormalizedRange else 0
+            )
+        interfaceFormat = FixedPoint(resolvedInputWidth)
+        resolvedWidth = interfaceFormat.width
         decodedSamples = interfaceFormat.DecodeComplex(rawSamples).reshape(-1)
         sortedFrequenciesHz = tuple(
             float(value) for value in sorted(frequencyValues)
@@ -2183,7 +2232,8 @@ class Analysis:
             measuredSignal: Floating or fixed-point PA output NumPy/list data.
             waveform: Optional metadata-rich waveform or raw NumPy/list record.
             parameters: Optional TwoToneAnalysis parameter mapping.
-            width: Optional public I/Q width override for raw records.
+            width: Optional measured-signal I/Q width. It may differ from the
+                supplied transmit waveform metadata.
             sampleRateHz: Required sample rate when ``waveform`` is raw or
                 omitted; it must match metadata-rich input when supplied.
             toneFrequenciesHz: Required two-tone frequencies for raw mode.
@@ -2235,14 +2285,15 @@ class Analysis:
             reuse ``AnalyzeTwoTone`` for one consistent spectral pass, select
             the requested lower, upper, and worse-side dBc fields, recover
             absolute product dBFS by adding each dBc result to its same-side
-            fundamental dBFS, and attach exact product frequencies.
+            fundamental dBFS, and attach exact product frequencies plus the
+            same simulated analog output power as the complete analysis.
 
         Args:
             measuredSignal: Floating or fixed-point PA output NumPy/list data.
             waveform: Optional metadata-rich waveform or raw NumPy/list record.
             nonlinearOrder: Supported odd order 3, 5, or 7.
             parameters: Optional TwoToneAnalysis parameter mapping.
-            width: Optional public I/Q width override.
+            width: Optional measured-signal I/Q width override.
             sampleRateHz: Required sample rate for raw or omitted waveform.
             toneFrequenciesHz: Required fundamental pair for raw mode.
             ilcBandwidthHz: Optional raw-mode descriptive bandwidth.
@@ -2250,7 +2301,8 @@ class Analysis:
 
         Returns:
             result: Ordinary dictionary with order, product frequencies,
-                absolute dBFS levels, same-side dBc values, and worst dBc.
+                absolute dBFS levels, same-side dBc values, worst dBc, and
+                simulated PA output power in dBm.
         """
 
         if (
@@ -2301,6 +2353,7 @@ class Analysis:
             "worstDbc": float(
                 completeMetrics[f"{metricPrefix}WorstDbc"]
             ),
+            "outputPowerDbm": float(completeMetrics["outputPowerDbm"]),
         }
 
     @staticmethod
@@ -2327,14 +2380,15 @@ class Analysis:
             measuredSignal: Floating or fixed-point PA output NumPy/list data.
             waveform: Optional metadata-rich waveform or raw NumPy/list record.
             parameters: Optional TwoToneAnalysis parameter mapping.
-            width: Optional public I/Q width override.
+            width: Optional measured-signal I/Q width override.
             sampleRateHz: Required sample rate for raw or omitted waveform.
             toneFrequenciesHz: Required fundamental pair for raw mode.
             ilcBandwidthHz: Optional raw-mode descriptive bandwidth.
             parameterOverrides: Highest-priority TwoToneAnalysis settings.
 
         Returns:
-            result: Ordinary dictionary containing the paired IM3 result.
+            result: Ordinary dictionary containing paired IM3 metrics and the
+                simulated analog PA output power in dBm.
         """
 
         return Analysis.CalculateIntermodulationOrder(
@@ -2373,14 +2427,15 @@ class Analysis:
             measuredSignal: Floating or fixed-point PA output NumPy/list data.
             waveform: Optional metadata-rich waveform or raw NumPy/list record.
             parameters: Optional TwoToneAnalysis parameter mapping.
-            width: Optional public I/Q width override.
+            width: Optional measured-signal I/Q width override.
             sampleRateHz: Required sample rate for raw or omitted waveform.
             toneFrequenciesHz: Required fundamental pair for raw mode.
             ilcBandwidthHz: Optional raw-mode descriptive bandwidth.
             parameterOverrides: Highest-priority TwoToneAnalysis settings.
 
         Returns:
-            result: Ordinary dictionary containing the paired IM5 result.
+            result: Ordinary dictionary containing paired IM5 metrics and the
+                simulated analog PA output power in dBm.
         """
 
         return Analysis.CalculateIntermodulationOrder(
@@ -2419,14 +2474,15 @@ class Analysis:
             measuredSignal: Floating or fixed-point PA output NumPy/list data.
             waveform: Optional metadata-rich waveform or raw NumPy/list record.
             parameters: Optional TwoToneAnalysis parameter mapping.
-            width: Optional public I/Q width override.
+            width: Optional measured-signal I/Q width override.
             sampleRateHz: Required sample rate for raw or omitted waveform.
             toneFrequenciesHz: Required fundamental pair for raw mode.
             ilcBandwidthHz: Optional raw-mode descriptive bandwidth.
             parameterOverrides: Highest-priority TwoToneAnalysis settings.
 
         Returns:
-            result: Ordinary dictionary containing the paired IM7 result.
+            result: Ordinary dictionary containing paired IM7 metrics and the
+                simulated analog PA output power in dBm.
         """
 
         return Analysis.CalculateIntermodulationOrder(

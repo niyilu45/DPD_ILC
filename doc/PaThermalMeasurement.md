@@ -94,7 +94,10 @@ flowchart LR
 | `supplyVoltageV`、`supplyCurrentA` | V、A | 每路偏置电源同步值 |
 | `ambientTemperatureC` | 摄氏度 | 明确是环境、冷板还是壳体边界 |
 | `junctionTemperatureC` | 摄氏度 | 经校准的结温或沟道温度标签 |
-| `dutyCycle`、`pulsePeriodSec` | 比例、s | 区分相同平均功率下的不同热纹波 |
+| `configuredDutyCycle`、`pulsePeriodSec` | 比例、s | 数据窗口占完整周期的比例，以及完整周期长度 |
+| `waveformActiveDutyCycle` | 比例 | 数据窗口内部实际RF活动样点比例，内部补零也计入窗口总时长 |
+| `actualDutyCycle` | 比例 | 完整周期真实RF活动比例，等于前两种占空比相乘 |
+| `signalDurationSec`、`scheduledIdleDurationSec` | s | 区分完整输入数据窗口与其后的Channel自动调度空闲 |
 | `frameIndex`、`repeatIndex` | 无 | 用于重复性和漂移统计 |
 | `calibrationState` | 无 | 电缆、功率计、TSEP和温度校准版本 |
 
@@ -202,7 +205,88 @@ P_{\mathrm{measured,dBm}}
 
 若只能在RF关闭后用TSEP读取结温，可先测冷却曲线，再根据线性时不变热网络的关系转换为热阻抗曲线。切换延迟以内的数据应剔除或标记为不可观测，不能用插值伪造快速热支路。
 
-测试开始前若PA已经带偏置并达到热平衡，`initialJunctionTemperatureC` 应填写实测初始结温，而不是直接等于边界温度。分段采集之间若存在仪表保存、换帧或触发等待，仿真验证时还应调用 `Channel.AdvanceThermalIdle(actualGapSec)` 推进相同的真实空闲时间；否则仿真会把多段记录错误地首尾无缝连接。
+测试开始前若PA已经带偏置并达到热平衡，`initialJunctionTemperatureC` 应填写实测初始结温，而不是直接等于边界温度。仿真中的 `thermalDutyCycle` 会自动推进每个周期固有的窗口外空闲，不能再用 `Channel.AdvanceThermalIdle` 重复加入这段时间。只有仪表保存、换帧、换频或触发等待等**周期之外**的额外停顿，才调用 `AdvanceThermalIdle(actualGapSec)`。
+
+### 4.5 步骤E：测量周期稳态、内部空闲和真实占空比
+
+周期测试必须先定义三个互不混淆的时间比例。用户配置占空比是整个输入数据窗口与完整周期之比：
+
+```math
+D_{\mathrm{configured}}
+=
+\frac{T_{\mathrm{data}}}{T_{\mathrm{period}}}.
+```
+
+`Tdata` 包含窗口内部的前后补零、包间静默和门控关闭样点。数据窗口内部测得的RF活动比例为：
+
+```math
+D_{\mathrm{waveform}}
+=
+\frac{N_{\mathrm{active}}}{N_{\mathrm{data}}}.
+```
+
+完整周期的真实RF占空比才是：
+
+```math
+D_{\mathrm{actual}}
+=
+D_{\mathrm{configured}}
+D_{\mathrm{waveform}}.
+```
+
+例如仪表每40 ms重复发送一个20 ms数据窗口，窗口内部只有前10 ms有RF，则配置占空比为50%，窗口内部活动比例为50%，真实RF占空比为25%。把25%直接写入 `thermalDutyCycle` 会错误地再追加60 ms窗口外空闲，使周期从40 ms变成80 ms。
+
+推荐的实测步骤为：
+
+1. 保存未裁剪的完整数据窗口，并记录周期触发的相邻时间差。
+2. 在PA输入参考面测量包络，以噪声底以上6至10 dB为活动门限起点，生成内部活动掩码。
+3. 分别记录数据窗口时长、内部活动时长和窗口外空闲时长。
+4. 连续发送同一周期，直到相邻周期相同相位点的温差小于传感器重复性门限。
+5. 同步采集一个完整稳态周期的结温、DC电源、PA输入和PA输出；不能只保存周期平均值。
+6. 再从冷机或已知预热状态采集多个瞬态周期，用于验证模型怎样趋近同一个极限环。
+
+在代码中，默认 `thermalRunMode="steady_state"` 会直接求这个周期极限环；`transient` 会从当前状态逐周期推进。Channel配置与验收骨架为：
+
+```python
+channel = Channel(
+    paModel=fittedPa,
+    parameters={
+        "sampleRateHz": 80.0e6,
+        "maximumOutputPowerDbm": 25.0,
+        "thermalRunMode": "steady_state",
+        "thermalDutyCycle": 0.50,
+        "thermalSteadyStateToleranceC": 1.0e-4,
+        "maximumThermalSteadyStateIterations": 100,
+        "width": 0,
+    },
+)
+predictedOutput = channel.Process(
+    measuredDataWindow,
+    outputPowerDbm=20.0,
+)
+thermalMetrics = channel.GetThermalMetrics()
+measuredActualDuty = channel.GetActualDutyCycle()
+```
+
+第一次稳态调用必须给出 `outputPowerDbm`。Channel每次稳态处理都会先在参考温度电模型上重新校准，再用收敛的周期温度曲线处理；校准试探不推进热时间，也不会把热态输出重新稳定到目标功率。验收时比较 `periodStartingJunctionTemperatureC` 和 `periodEndingJunctionTemperatureC`，而不是数据窗口结束字段 `dataEndingJunctionTemperatureC`。后者在发送结束时本来就可能位于温度峰值。
+
+单RC或每条Foster支路在一个冻结耗散周期内可写为：
+
+```math
+\theta_{i,\mathrm{end}}
+=
+A_i\theta_{i,\mathrm{start}}+B_i.
+```
+
+周期稳态支路状态为：
+
+```math
+\theta_i^{*}
+=
+\frac{B_i}{1-A_i}.
+```
+
+代码还会迭代更新温度相关PA输出、耗散轨迹和MIMO互热，直到支路级 `steadyStateErrorC` 小于 `thermalSteadyStateToleranceC`。因此测量数据也应按周期相位对齐比较完整温度曲线，而不能只用一个平均结温拟合。
 
 ## 5. 静态温度角模型怎样调整
 
@@ -818,7 +902,7 @@ mimoThermalCoupling = (
 )
 ```
 
-当前互热实现是逐帧稳态偏移。如果相邻链温升也表现出明显动态时间常数，只调大互热矩阵不能匹配上升曲线，需要为非对角热路径增加动态Foster状态。
+当前互热矩阵表示完整周期平均耗散产生的稳态偏移。在 `steady_state` 模式下，代码会把每条PA的周期自热和非对角互热放入外层不动点迭代；在 `transient` 模式下，本周期平均耗散因果地更新下一周期使用的互热偏移。如果相邻链温升表现出明显动态时间常数，只调大互热矩阵不能匹配上升曲线，需要为非对角热路径增加动态Foster状态。
 
 ## 11. 按残差现象调整哪一个参数
 
@@ -827,7 +911,9 @@ mimoThermalCoupling = (
 | 所有功率点稳态温升都按相同比例偏小 | 增大热阻总和 | 时间常数、相位系数 |
 | 最终温升正确但模型升温太快 | 增大对应时间常数 | 热阻总和 |
 | 早期温升不足、长期温升正确 | 增大快速支路热阻或减小其时间常数 | 慢支路总热阻 |
-| 低占空比误差大、连续波正确 | 检查空闲耗散、活动门限和快速热支路 | 公共增益系数 |
+| 低占空比误差大、连续波正确 | 分开检查 `thermalDutyCycle`、窗口内部活动比例、空闲耗散、活动门限和快速热支路 | 公共增益系数 |
+| 平均温度正确但周期内峰谷位置错误 | 检查内部空闲位置、周期长度和快速热时间常数 | 只调整热阻总和 |
+| 稳态周期首尾不闭合 | 检查支路级 `steadyStateErrorC`、容差和迭代上限 | 比较数据窗口末端与周期起点 |
 | 温度误差随RF输出功率系统变化 | 重新拟合效率、膝点和功率标尺 | 立即增加Foster支路数 |
 | 结温正确但输出功率温漂错误 | 增益温度系数 | 热阻 |
 | 结温和公共增益正确但EVM/ACLR错误 | 饱和与非线性温度系数 | 环境温度 |
@@ -847,13 +933,16 @@ mimoThermalCoupling = (
 
 ## 12. 独立验收方法
 
-拟合数据和验收数据必须分离。建议把一个功率阶跃、一种占空比和一个温度点完全留作验证。至少比较：
+拟合数据和验收数据必须分离。建议把一个功率阶跃、一组“配置占空比加内部活动比例”、一种周期长度和一个温度点完全留作验证。至少比较：
 
 | 类别 | 指标 | 本工程建议起始门限 |
 |---|---|---:|
 | 温度 | 结温RMSE | 小于传感器不确定度的1至2倍；常见仿真起点为1至3摄氏度 |
 | 温度 | 稳态温升误差 | 小于10% |
 | 动态 | 63.2%上升时间误差 | 小于15% |
+| 周期 | 稳态周期首尾支路闭合 | `steadyStateErrorC` 小于配置容差 |
+| 周期 | 真实RF占空比 | 与触发和PA输入包络测量之差小于测试定义容差 |
+| 周期 | 峰值温度及其周期相位 | 小于传感器不确定度的1至2倍，并且峰值位置一致 |
 | RF绝对量 | 输出功率漂移误差 | 小于0.2至0.5 dB |
 | RF公共相位 | 展开相位漂移误差 | 小于1至2度 |
 | 调制质量 | EVM误差 | 小于1 dB或项目预算 |
@@ -910,6 +999,10 @@ fittedChannel = Channel(
         "maximumOutputPowerDbm": (
             finalThermalConfig.referenceOutputPowerDbm
         ),
+        "thermalRunMode": "steady_state",
+        "thermalDutyCycle": 0.50,
+        "thermalSteadyStateToleranceC": 1.0e-4,
+        "maximumThermalSteadyStateIterations": 100,
         "width": 0,
     },
 )
@@ -920,9 +1013,14 @@ for validationFrame in validationFrames:
         outputPowerDbm=validationFrame["referenceOutputPowerDbm"],
     )
     predictedThermalMetrics = fittedChannel.GetThermalMetrics()
+    predictedActualDuty = fittedChannel.GetActualDutyCycle()
     # Compare predictedOutput and predictedThermalMetrics against a held-out
-    # measured frame. Do not reuse the fitting capture as validation.
+    # measured period. Do not reuse the fitting capture as validation.
+    assert predictedThermalMetrics["steadyStateConverged"]
+    assert predictedThermalMetrics["steadyStateErrorC"] <= 1.0e-4
 ```
+
+把 `thermalDutyCycle=0.50` 替换为每条留出记录的“完整数据窗口时长/完整周期时长”。如果 `validationFrame["inputSignal"]` 内部有空闲，保持这些样点原位；不要裁掉以后再把较小的真实占空比写回 `thermalDutyCycle`。用 `predictedActualDuty` 与PA输入包络实测占空比比较，并用 `temperatureTraceTimeSec` 和 `temperatureTraceC` 对齐整条周期温度曲线。
 
 ## 13. 一手资料与工程边界
 

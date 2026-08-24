@@ -1240,6 +1240,8 @@ flowchart LR
 
 **图 6 说明**：当 $\beta=0$ 时没有镜像；$\lvert\beta\rvert$ 越大，镜像越强。`IQImbalancePA` 把任意基础 PA 的输出包装成这一形式，可测试普通复多项式 DPD 对非解析共轭失真的处理边界；它是归因仿真用的代数包装器，并不声明镜像位于Tx调制器还是FB接收机。需要真实参考面时，应使用Channel的 `txIq...` 参数把误差放在PA前，或使用 `fbIq...` 参数把误差只放在反馈采样支路。
 
+当被包装对象启用电热模型时，`IQImbalancePA` 保持包装器透明：`ProcessThermalPeriodFloating` 先让物理PA按完整周期求温度相关输出，再在输出参考面叠加直接项和共轭项；`SuspendThermalModel`、`RestoreThermalModel`、`GetThermalMetrics`、`CalculateActualDutyCycle`、`ResetThermalState` 和 `AdvanceIdle` 都代理到被包装PA。这样功率校准试探仍能暂停并恢复同一份热状态，Channel也能透过包装器识别热模型、读取metrics和调度占空比。共轭包装器没有独立热容，且输出镜像不会反向改变已经在物理PA输出参考面计算的耗散功率。
+
 ---
 
 ## 8. 反馈 AWGN 模型
@@ -1395,6 +1397,37 @@ U_m^{(i+1)}[k]
 
 因此各PA有独立学习输入、反馈随机种子和收敛历史。`FitMimoGmpPredistorter` 再对每路 $(x_m,u_m^*)$ 标签独立拟合GMP。这只适用于关闭耦合或耦合可以忽略的传导测试；启用Channel的PA前/后耦合后，当前 `RunMimoFrequencyDomainIlc` 不能把联合plant拆成独立SISO，需要后续完整矩阵频响/Jacobian的联合MIMO ILC。
 
+### 10.3 定点码满量程与PA模拟驱动
+
+`maximumOutputPowerDbm=25.0` 表示PA输出参考面的额定上限，不表示16位DAC正码 `32767` 本身就是25 dBm。数字码经过DAC后，工程链路通常还有可调衰减器、VGA或射频驱动级。若闭环只在定点编码前不断放大OFDM波形，高峰均比会先使I/Q码削顶，PA驱动不再随预设增长；这会把本来低于额定上限的20 dBm错误判断为不可达。
+
+本工程因此为 `PaModel` 与 `MimoPaModel` 提供配套的内部校准协议：
+
+- `ProcessCalibrationDrive(inputSignal, driveDbPerChain)` 使用本轮显式模拟驱动进行一次试探，但不修改已提交状态；
+- `SetCalibrationDriveDb(driveDbPerChain)` 只在所有目标均收敛后提交驱动；
+- `ResolveCalibrationDriveDb` 或 `ResolveCalibrationDriveDbPerChain` 严格检查链数和有限值；
+- 普通用户仍只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`，不需要直接调用这些方法。
+
+设第 $m$ 路公开整数码为 $q_m[n]$，用 $D_W$ 表示按位宽进行解码，并定义
+
+```math
+x_{q,m}[n]=D_W\left(q_m[n]\right).
+```
+
+若解码波形 $x_{q,m}$ 的有效RMS为 $r_{q,m}$，闭环当前希望得到的总输入驱动为 $d_m$ dB，则解码后的模拟驱动为
+
+```math
+g_m=d_m-20\log_{10}(r_{q,m}).
+```
+
+实际进入Tx I/Q与PA前耦合网络的信号为
+
+```math
+u_m[n]=10^{g_m/20}x_{q,m}[n].
+```
+
+因此其有效RMS仍为 $10^{d_m/20}$。公开码保持在合法范围并保留默认6 dB数字余量，模拟驱动承担其余幅度；定点量化误差仍在每轮闭环中真实存在。直接用 `PowerCalibration(paModel=paModel, ...)` 时，公开 `Calibrate` 会自动暂停并恢复PA热状态，收敛驱动会提交到该PA对象的公开 `Process` 路径；`ProcessFloating` 仍表示不含这一级隐藏驱动的裸PA内核，避免Channel内部重复乘增益。
+
 ---
 
 ## 11. 默认参数不是器件测量结果
@@ -1430,6 +1463,12 @@ classDiagram
         +modelName
         +width
         +Process(inputSignal)
+        +ProcessThermalPeriodFloating(inputSignal, thermalRunMode, thermalDutyCycle, steadyStateToleranceC, maximumSteadyStateIterations)
+        +CalculateActualDutyCycle(inputSignal, thermalDutyCycle)
+        +SuspendThermalModel()
+        +RestoreThermalModel(snapshot)
+        +ProcessCalibrationDrive(inputSignal, driveDbPerChain)
+        +SetCalibrationDriveDb(driveDbPerChain)
         +SmallSignalGain()
         +ResetThermalState(temperatureC)
         +AdvanceIdle(idleTimeSec)
@@ -1442,10 +1481,15 @@ classDiagram
     class ThermalNetwork {
         +Reset(junctionTemperatureC, ambientTemperatureC)
         +Advance(dissipatedPowerW, durationSec)
+        +CalculateAdvancedState(branchTemperatureRiseC, dissipatedPowerW, durationSec)
+        +CalculatePeriodicSteadyState(intervalPowersW, intervalDurationsSec)
         +CurrentTemperatureC()
         +GetMetrics()
     }
     class PowerCalibration {
+        +SetPaModel(paModel)
+        +Calibrate(inputSignal)
+        -CalibrateElectricalOnly(inputSignal)
         +DbmToRms(powerDbm)
         +RmsToDbm(signalRms)
         +OutputPowerToDriveScale(outputPowerDbm)
@@ -1478,11 +1522,24 @@ classDiagram
     }
     class IQImbalancePA {
         +Process(inputSignal)
+        +ProcessThermalPeriodFloating(inputSignal, thermalRunMode, thermalDutyCycle, steadyStateToleranceC, maximumSteadyStateIterations)
+        +SuspendThermalModel()
+        +RestoreThermalModel(snapshot)
+        +GetThermalMetrics()
+        +CalculateActualDutyCycle(inputSignal, thermalDutyCycle)
+        +ResetThermalState(junctionTemperatureC, ambientTemperatureC)
+        +AdvanceIdle(idleTimeSec)
     }
     class MimoPaModel {
         +width
         +Process(inputMatrix)
         +ProcessFloating(inputMatrix)
+        +ProcessThermalPeriodFloating(inputMatrix, thermalRunMode, thermalDutyCycle, steadyStateToleranceC, maximumSteadyStateIterations)
+        +CalculateActualDutyCycle(inputMatrix, thermalDutyCycle)
+        +SuspendThermalModel()
+        +RestoreThermalModel(snapshot)
+        +ProcessCalibrationDrive(inputMatrix, driveDbPerChain)
+        +SetCalibrationDriveDb(driveDbPerChain)
         +ProcessChain(inputSignal, chainIndex)
         +SetOutputPowerDb(chainIndex, outputPowerDb)
         +SetTargetOutputRms(chainIndex, targetOutputRms)
@@ -1507,7 +1564,7 @@ classDiagram
     IQImbalancePA o-- PaModel : wraps
 ```
 
-**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Rapp、Wiener、GMP或Doherty。Doherty的Carrier和Peaking又各自选择Wiener或GMP。`ThermalConfig.Recommended` 为static、single_rc和foster返回完整可运行的模型专用起点，`Validate` 继续负责物理边界校验。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
+**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Rapp、Wiener、GMP或Doherty。Doherty的Carrier和Peaking又各自选择Wiener或GMP。`ThermalConfig.Recommended` 为static、single_rc和foster返回完整可运行的模型专用起点，`Validate` 继续负责物理边界校验。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口；它把公共周期作为原子热事务，任何一路处理或互热迭代失败都会恢复全部PA的周期前状态和旧metrics。`IQImbalancePA` 不只代理普通 `Process`，还透明代理周期热处理、热状态暂停/恢复、metrics、实际占空比、复位和额外空闲，因此用它包装热PA不会让Channel误判为无热模型。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
 
 如果需要区分实验室前向仪表与板载反馈接收机，应把同一份干净PA输出交给两个独立Channel。`sampleMode="forward"` 跳过反馈专用非理想，用于最终主路EVM/ACLR评价；`sampleMode="fb"` 可增加反馈FIR、时频偏、I/Q/DC、接收机非线性、限幅和ADC量化，用于模拟板载闭环。反馈链参数属于观察接收机，不属于PA模型系数，不能写入Wiener或GMP来混合拟合。
 
@@ -1568,7 +1625,7 @@ dohertyOutput = paModel.Process(inputSignal)
 ```
 
 `PaModel` 的公开构造签名为
-`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收I/Q整数码，解码成归一化浮点后使用Rapp、Wiener、GMP或Doherty模型计算，最后把结果编码回整数码。公开返回容器始终是 `numpy.complex128`：
+`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收I/Q整数码，解码后先应用最近一次成功功率校准提交的模拟驱动，再使用Rapp、Wiener、GMP或Doherty模型计算，最后把结果编码回整数码。未运行功率校准时该驱动为0 dB，所以原有直接调用行为不变。公开返回容器始终是 `numpy.complex128`：
 
 ```python
 from inc.lib.PaModel import PaModel
@@ -1624,7 +1681,7 @@ mimoPaModel.SetTargetOutputPowerDbm(
 )
 ```
 
-`PaModel` 在构造函数内部建立参数层：直接构造参数或 `UpdateParameters(...)` 位于最高优先级，调用方的外部覆盖字典位于中间层，类内不可变默认值是后备层。调用方不需要显式创建 `ChainMap`；`GetParameters()` 返回当前解析结果的字典快照。`PaModel` 与 `MimoPaModel` 都会对未知键发出 `UserWarning`、忽略该键并继续运行；已识别但不合法的模型名、系数对象或功率参数仍会抛出异常。
+`PaModel` 在构造函数内部建立参数层：直接构造参数或 `UpdateParameters(...)` 位于最高优先级，调用方的外部覆盖字典位于中间层，类内不可变默认值是后备层。调用方不需要显式创建 `ChainMap`；`GetParameters()` 返回当前解析结果的字典快照。这个优先级对 `thermalConfig` 同样有效：如果构造时已经写了 `thermalConfig=enabledConfig`，后来只把较低层 `parameters["thermalConfig"]` 改为禁用不会覆盖它；应调用 `UpdateParameters(thermalConfig=disabledConfig)`，或从一开始只在活动映射中维护这个键。`PaModel` 与 `MimoPaModel` 都会对未知键发出 `UserWarning`、忽略该键并继续运行；已识别但不合法的模型名、系数对象或功率参数仍会抛出异常。
 
 ---
 
@@ -1662,10 +1719,10 @@ flowchart LR
 
 图示说明：现有Rapp、Wiener、GMP或Doherty仍先计算基础电响应；归一化输出通过参考dBm和效率模型换成耗散功率，热网络将其积累为结温，结温再调制下一热更新区间的增益、相位、饱和尺度和非线性强度。即使基础Rapp电模型严格无记忆，外接热网络后，结温状态也会让整个电热系统具有慢记忆。
 
-本工程在 `Channel.Process(rawSignal, outputPowerDbm=...)` 内部严格分离两个阶段，调用方只看见一次函数调用：
+本工程在公开功率校准入口中严格分离两个阶段，调用方只看见一次函数调用：
 
-1. **无热参考校准阶段**：Channel保存当前热支路、结温和累计时间，暂停温度影响，并让所有闭环试探只使用参考温度电参数。校准不会增加真实热时间或结温，也不会根据当前热态增益修正驱动。
-2. **正式温度处理阶段**：Channel原样恢复校准前热状态，再用收敛输入真实发射一次。热网络只在这次正式处理期间推进，输出功率可以随温度自然变化。
+1. **无热参考校准阶段**：`PowerCalibration.Calibrate` 通过绑定对象的成对热事务保存当前热支路、结温、累计时间、互热offset和metrics，暂停温度影响，并让内部纯电闭环只使用参考温度电参数。校准不会增加真实热时间或结温，也不会根据当前热态增益修正驱动。Channel提供 `SuspendThermalModel` 与 `RestoreThermalModel` 代理，把事务继续转交给实际绑定PA；直接把 `PaModel` 交给 `PowerCalibration` 也采用同一规则。
+2. **正式温度处理阶段**：Channel在公开 `Calibrate` 返回后，用收敛输入真实发射一次。只要活动配置仍启用温度，热状态已在 `finally` 中原样恢复，热网络只在这次正式处理期间推进，输出功率可以随温度自然变化；若校准过程中已把活动配置改成 `enabled=False`，旧启用快照不会被恢复。
 
 因此普通温度测试可以直接重复调用：
 
@@ -1676,7 +1733,7 @@ receivedSignal = channel.Process(
 )
 ```
 
-这里的22 dBm是参考温度校准目标，不是当前热态输出的闭环设定值。升温后的实际功率应读取 `Channel.GetThermalMetrics()["outputPowerDbm"]`；它允许偏离22 dBm。需要明确冻结并复用数字驱动或复位起始温度时，才使用高级兼容接口 `PrepareThermalTest`。
+这里的22 dBm是参考温度校准目标，不是当前热态输出的闭环设定值。升温后的实际功率应读取 `Channel.GetThermalMetrics()["outputPowerDbm"]`；它允许偏离22 dBm。需要在同一个Channel实例中冻结并复用“公开码+已提交模拟drive”或复位起始温度时，才使用高级兼容接口 `PrepareThermalTest`；其返回数组本身不包含模拟drive状态。
 
 ### 13.2 常见热模型的优缺点比较
 
@@ -2069,26 +2126,99 @@ V_{\mathrm{DD}}(n) I_{\mathrm{DD}}(n),
 
 再拟合效率参数。若没有DC测量，只凭I/Q波形不能唯一确定耗散功率，此时热参数只能作为假设或由温度漂移间接辨识。
 
-### 13.4 占空比为何自然进入温度
+### 13.4 两层占空比、内部空闲和周期边界
 
-长时间平均耗散近似为：
+Channel把调用方传入的完整数组看成一个**数据窗口**。用户配置的 `thermalDutyCycle` 只描述该窗口占完整发送周期的比例：
 
 ```math
-\overline{P}_{\mathrm{diss}}
+D_{\mathrm{configured}}
 =
-D P_{\mathrm{on}}
-+
-(1-D)P_{\mathrm{idle}},
+\frac{T_{\mathrm{data}}}{T_{\mathrm{period}}},
+\qquad
+0<D_{\mathrm{configured}}\leq 1.
 ```
 
-其中 $D$ 是RF有效样点占空比。与RF输出功率校准不同，温度计算不会删除补零和帧间静默：静默样点仍消耗时间，并按 `idleDissipatedPowerW` 加热或冷却。因此相同有效功率下：
+这里的 `Tdata` 包含数组内部的前后补零、包间静默和任何低于活动门限的样点。Channel不会因为这些内部空闲而缩短用户配置的数据窗口。由配置得到的完整周期和窗口外空闲时间分别为：
 
-- 占空比更高，平均耗散通常更高；
-- 突发更长，快速热节点更接近稳态；
-- 空闲更长，结温下降更多；
-- 相同占空比但不同脉冲周期可以具有不同峰值温度和温度纹波。
+```math
+T_{\mathrm{period}}
+=
+\frac{T_{\mathrm{data}}}{D_{\mathrm{configured}}},
+```
 
-`activePowerThresholdDb` 只用于区分RF开启和空闲，以便选择耗散公式并输出 `activeSampleDutyCycle`，不是删除热时间的门限。
+```math
+T_{\mathrm{idle,outer}}
+=
+T_{\mathrm{data}}
+\left(
+\frac{1}{D_{\mathrm{configured}}}-1
+\right).
+```
+
+PA输入功率再通过 `activePowerThresholdDb` 在整个数据窗口上统一分类。活动样点在数据窗口中的比例为：
+
+```math
+D_{\mathrm{waveform}}
+=
+\frac{N_{\mathrm{active}}}{N_{\mathrm{data}}}.
+```
+
+所以完整发送周期内真正有RF活动的占空比是：
+
+```math
+D_{\mathrm{actual}}
+=
+D_{\mathrm{configured}}
+D_{\mathrm{waveform}}.
+```
+
+例如用户配置 `thermalDutyCycle=0.4`，输入数组内部只有一半样点是有效RF，则 `configuredDutyCycle=0.4`、`waveformActiveDutyCycle=0.5`，而 `actualDutyCycle=0.2`。这三个量不能互相替代。
+
+内部空闲和窗口外空闲都完整推进热时间，并使用 `idleDissipatedPowerW`。区别只是内部空闲已经存在于输入数组中，窗口外空闲由Channel根据 `thermalDutyCycle` 自动补入热状态而不向公开输出追加零样点：
+
+```mermaid
+flowchart LR
+    input["输入数据窗口"] --> classify["按全窗口峰值判定活动样点"]
+    classify --> internal["内部活动区升温；内部空闲区冷却"]
+    internal --> outer["自动推进窗口外空闲"]
+    outer --> next["下一个周期起点"]
+```
+
+图示说明：公开输入和输出始终只包含数据窗口；最右侧的窗口外空闲仅存在于热状态时间轴。`thermalUpdateIntervalSamples` 的规则边界和每次活动状态跳变都会切分热区间，因此即使内部空闲短于一个常规热更新块，也会单独按空闲耗散推进。
+
+长时间平均耗散应按完整周期计算：
+
+```math
+\overline{P}_{\mathrm{period}}
+=
+\frac{
+E_{\mathrm{data}}+
+P_{\mathrm{idle}}T_{\mathrm{idle,outer}}
+}{T_{\mathrm{period}}}.
+```
+
+当活动区耗散近似为常数时，才可进一步近似为：
+
+```math
+\overline{P}_{\mathrm{period}}
+\mathrel{\approx}
+D_{\mathrm{actual}}P_{\mathrm{on}}
++
+\left(1-D_{\mathrm{actual}}\right)P_{\mathrm{idle}}.
+```
+
+`activePowerThresholdDb` 只决定某个样点使用活动耗散还是空闲耗散，不会删除任何物理时间。Channel提供两种真实占空比查询方式：
+
+```python
+# Query before processing.  Activity is measured at the actual PA input.
+predictedActualDuty = channel.GetActualDutyCycle(rawSignal)
+
+# Query the accepted result after one complete thermal period.
+receivedSignal = channel.Process(rawSignal, outputPowerDbm=20.0)
+acceptedActualDuty = channel.GetActualDutyCycle()
+```
+
+带输入的查询会经过当前已提交的模拟驱动、Tx I/Q误差和PA前耦合后，在实际PA输入参考面分类；无参数查询读取最近一次已接受周期的 `actualDutyCycle`。第一次调用前尚未完成目标功率校准，因此需要精确复现最终工作点时，应以后者为准。SISO返回浮点数，MIMO返回按物理PA顺序排列的元组。即使未启用热模型，带输入的查询仍然可用：Channel用自己的 `activePowerThresholdDb` 对真实PA入口逐链分类，再乘 `thermalDutyCycle`，不会因为不存在热metrics而错误返回0。无参数查询仍要求已经提交过带周期metrics的热处理。
 
 ### 13.5 单RC与Foster热网络
 
@@ -2134,7 +2264,91 @@ T_{\mathrm{ambient}}
 
 `thermalResistancesCPerW` 决定稳态温升；`thermalTimeConstantsSec` 决定达到稳态的速度。两者必须一一对应。`thermalUpdateIntervalSamples` 只决定每隔多少RF样点更新一次慢热状态：减小它可提高帧内温漂分辨率但增加计算量；它不改变物理时间常数。
 
-#### 13.5.1 热网络参数效果图
+#### 13.5.1 `steady_state`与`transient`运行模式
+
+周期调度属于 `Channel`，不属于 `ThermalConfig`。相关参数如下：
+
+| Channel参数 | 默认值 | 合法范围 | 作用 |
+|---|---:|---|---|
+| `thermalRunMode` | `"steady_state"` | `"steady_state"`或 `"transient"` | 选择周期稳态求解或从当前热状态推进一个周期 |
+| `thermalDutyCycle` | `1.0` | 大于0且小于等于1 | 数据窗口时长除以完整周期时长 |
+| `thermalSteadyStateToleranceC` | `1.0e-4` | 有限正数 | 周期首尾每条RC支路允许的最大闭合误差，单位摄氏度 |
+| `maximumThermalSteadyStateIterations` | `100` | 正整数 | 温度依赖耗散和MIMO互热的最大不动点迭代次数 |
+
+Channel和热PA必须对同一批样点使用同一时间、功率和活动参考面。每次周期处理或功率校准之前，`Channel.ValidateThermalReferencePlanes` 会逐条检查所有已启用热链：
+
+| Channel参数 | 必须等于ThermalConfig参数 | 不一致造成的物理错误 |
+|---|---|---|
+| `sampleRateHz` | `sampleRateHz` | 同一 $N$ 点数据窗会被解释为不同物理时长，热时间常数和外部空闲均失真 |
+| `maximumOutputPowerDbm` | `referenceOutputPowerDbm` | 归一化幅度1会映射到不同RF瓦特数，校准功率和耗散功率不在同一标尺 |
+| `activePowerThresholdDb` | `activePowerThresholdDb` | Channel有效突发功率与热模型RF开关判定会选取不同样点 |
+
+这里是严格相等语义，仅允许数值浮点舍入误差；MIMO要求每一条启用热链都分别满足。校验在闭环校准提交目标或模拟drive之前执行，因此配置错误不会留下部分更新的校准状态。
+
+默认 `steady_state` 表示输入波形会按同一周期无限重复。对于第 `i` 条RC支路和周期内第 `k` 个恒定平均耗散区间：
+
+```math
+\theta_{i,k+1}
+=
+a_{i,k}\theta_{i,k}
++
+R_i\left(1-a_{i,k}\right)P_k,
+```
+
+```math
+a_{i,k}
+=
+\exp\left(-\frac{\Delta t_k}{\tau_i}\right).
+```
+
+把一个完整周期的全部内部活动、内部空闲和窗口外空闲区间依次合成，可以写成：
+
+```math
+\theta_{i,\mathrm{end}}
+=
+A_i\theta_{i,\mathrm{start}}+B_i,
+```
+
+```math
+A_i
+=
+\prod_k a_{i,k}.
+```
+
+周期稳态要求首尾状态相同：
+
+```math
+\theta_{i,\mathrm{start}}^{*}
+=
+\theta_{i,\mathrm{end}}^{*}
+=
+\frac{B_i}{1-A_i}.
+```
+
+如果耗散功率轨迹已经给定，上式就是每条单RC或Foster支路的解析周期解。实际PA输出又依赖温度，所以代码使用外层不动点迭代：先按候选温度生成温度漂移后的输出和耗散轨迹，再用上式更新周期起始状态，直到所有支路首尾闭合：
+
+```math
+e_T
+=
+\max_i
+\left|
+\theta_{i,\mathrm{end}}
+-
+\theta_{i,\mathrm{start}}
+\right|
+\leq
+\varepsilon_T.
+```
+
+这里的容差就是 `thermalSteadyStateToleranceC`。求解试探不会增加实时累计时间；只有最终接受的一个周期会写入热状态并把 `elapsedTimeSec` 增加 `periodDurationSec`。稳态下 `periodStartingJunctionTemperatureC` 与 `periodEndingJunctionTemperatureC` 在容差内相同，但 `dataEndingJunctionTemperatureC` 通常更高，因为随后还要经过自动窗口外空闲才返回周期起点。
+
+`transient` 则从当前实时热状态只推进一个完整周期，不求首尾闭合。冷启动时首尾温度一般不同；连续调用会逐周期趋近极限环。这个模式适合研究开机升温、突发开始、功率阶跃和预热历史。每次调用仍会自动推进由 `thermalDutyCycle` 定义的窗口外空闲，不要再次用 `AdvanceThermalIdle` 重复加入同一段空闲；只有仪表保存、换频或触发等待等**周期之外**的额外停顿才单独调用该函数。
+
+Channel的稳态功率校准规则也与普通直接处理不同：热模型开启且 `thermalRunMode="steady_state"` 时，第一次 `Channel.Process` 必须给出 `outputPowerDbm`。Channel先暂停温度影响，在参考电模型上重新执行闭环功率校准，再恢复热模型并沿周期稳态温度曲线处理一次。后续调用即使省略 `outputPowerDbm`，也会复用最近成功目标并再次校准。校准本身不参与热时间，也不会把热态输出闭环稳定到目标功率，因此热增益和压缩漂移仍能被观察。
+
+直接调用 `PaModel.ProcessThermalFloating` 为兼容原有接口，仍代表 `transient` 且占空比为1的连续数据窗口；需要周期调度时应通过Channel，或显式调用 `ProcessThermalPeriodFloating`。
+
+#### 13.5.2 热网络参数效果图
 
 ![热网络参数效果图](./images/pa_thermal/thermal_network_parameter_effects.png)
 
@@ -2278,7 +2492,7 @@ y(n,T)-g(T)y_0(n).
 
 | 参数 | 默认值 | 单位 | 物理作用 |
 |---|---:|---:|---|
-| `enabled` | `False` | 无 | 总开关；关闭时与原PA行为一致 |
+| `enabled` | `False` | 无 | 硬总开关；关闭时删除活动热网络、清除热metrics和旧互热offset，并旁路全部温度电参数漂移 |
 | `modelName` | `"foster"` | 无 | `static`、`single_rc`或`foster` |
 | `sampleRateHz` | `80e6` | Hz | 把样点数转换为真实发热时间 |
 | `ambientTemperatureC` | `25` | 摄氏度 | 环境或冷板温度 |
@@ -2301,6 +2515,12 @@ y(n,T)-g(T)y_0(n).
 | `maximumJunctionTemperatureC` | `150` | 摄氏度 | 仿真安全上限；超过即停止 |
 
 类字段默认值首先保证 `foster` 配置完整，但 `enabled=False`；它们不是所有模型都能直接复用的推荐。例如只把 `modelName` 改为 `single_rc` 会因为默认存在三组热阻和时间常数而校验失败。普通用户应优先调用 `ThermalConfig.Recommended(modelName, sampleRateHz=...)` 获取一套完整、已校验的模型起始值。
+
+`enabled=False` 是硬关闭，不只是停止RC状态推进。`PaModel.SynchronizeThermalModel` 会移除活动 `ThermalNetwork`，清空上一次热metrics，并把MIMO邻链留下的外部互热温升归零；`SetExternalTemperatureOffsetC` 在关闭状态下也不会积累隐藏offset；`ApplyTemperatureDrift` 再次检查开关并直接返回基础电模型输出。底层 `ThermalNetwork` 只接受 `enabled=True` 的配置，直接用禁用配置构造它会报错；正确关闭方式是把禁用的 `ThermalConfig` 绑定到 `PaModel`，由统一入口旁路所有温度效应。以后重新启用时会按新配置建立新热网络，不会复用关闭前的互热offset。
+
+暂停和关闭也有明确优先级。校准开始时保存的快照只在当前活动配置仍是同一份启用配置时恢复；如果校准期间通过活动映射或 `UpdateParameters` 改成 `enabled=False` 或 `None`，`RestoreThermalModel` 保持关闭并丢弃旧启用快照，不能把温度效应“复活”。
+
+温度开关不会清零以前成功功率校准提交的模拟drive。这是有意的：`enabled` 控制热网络与温度漂移，drive控制PA输入工作点，两者是正交状态。若关闭温度后输出仍不同于一个全新PA对象，应先确认二者的已提交drive是否相同；公平对比应复用同一个drive，或对两边执行相同目标功率校准。
 
 下面所有“推荐值”都是本工程针对约25 dBm归一化行为PA设计的**可运行仿真起点**，不是GaN、LDMOS或GaAs器件规格。封装、PCB、散热器、偏置和环境会共同改变热阻与温度；正式测试必须由热瞬态、DC效率和多温度I/Q数据替换这些起点。Analog Devices的RF热管理说明也强调热流路径必须包含封装、PCB和散热边界，不能只复制一个通用热阻；器件允许结温则必须以具体数据手册为准。
 
@@ -2476,6 +2696,53 @@ MIMO互热参数 `thermalCouplingCPerW` 不属于 `ThermalConfig`，但同样需
 
 推荐值只用于把仿真流程跑通，不能代表具体器件。实际PA应先统一结温、冷板或壳体边界与RF/DC功率参考面，再按“热源效率 → 单RC/Foster热网络 → 四个温度电参数 → MIMO互热”的顺序辨识；不要同时自由调整热阻和增益温度系数去拟合同一条输出功率曲线。测试台连接、TSEP和红外测温边界、耗散功率定义、单RC/Foster非负拟合、效率拟合、三温度点I/Q回归、完整 `ThermalConfig` 回填和独立验证见 [PA温度特性测量、模型辨识与参数回填](./PaThermalMeasurement.md)。
 
+#### 13.7.7 周期热指标怎样读取
+
+`Channel.GetThermalMetrics()` 在SISO下直接返回PA热指标字典；MIMO下的逐链指标位于 `chains` 元组。周期调度新增或重新明确的字段如下：
+
+| 指标 | 含义 |
+|---|---|
+| `thermalRunMode` | 本次接受周期使用的 `steady_state` 或 `transient` 模式 |
+| `configuredDutyCycle` | Channel配置的数据窗口占完整周期比例 |
+| `waveformActiveDutyCycle` | 数据窗口内部按PA输入门限测得的RF活动比例 |
+| `activeSampleDutyCycle` | `waveformActiveDutyCycle` 的兼容字段，数值相同 |
+| `actualDutyCycle` | 完整周期真实RF活动比例，等于前两项乘积 |
+| `signalDurationSec` | 输入数据窗口样点数除以热模型采样率 |
+| `scheduledIdleDurationSec` | Channel自动推进的窗口外空闲时长 |
+| `periodDurationSec` | 数据窗口与自动窗口外空闲的总时长 |
+| `periodStartingJunctionTemperatureC` | 完整周期起点结温 |
+| `dataEndingJunctionTemperatureC` | 输入数据窗口处理完成时的结温 |
+| `periodEndingJunctionTemperatureC` | 自动窗口外空闲结束后的结温 |
+| `startingJunctionTemperatureC` | 周期起点结温的兼容字段 |
+| `endingJunctionTemperatureC` | 数据窗口结束结温的兼容字段，不是完整周期终点 |
+| `periodStartingTemperatureRisePerBranchC` | 周期起点各RC支路相对边界温升 |
+| `dataEndingTemperatureRisePerBranchC` | 数据窗口结束时各支路温升 |
+| `periodEndingTemperatureRisePerBranchC` | 完整周期结束时各支路温升 |
+| `dataWindowAverageDissipatedPowerW` | 只在数据窗口内平均的耗散功率 |
+| `averageDissipatedPowerW` | 包含自动窗口外空闲的完整周期平均耗散功率 |
+| `steadyStateConverged` | 仅在 `steady_state` 模式确实收敛时为 `True`；`transient` 固定为 `False`，表示“未执行稳态求解/不适用”，不是瞬态处理失败 |
+| `steadyStateIterations` | 本次非线性稳态求解迭代次数；静态或无需迭代时可为0 |
+| `steadyStateErrorC` | 最终周期热状态闭合误差 |
+| `temperatureTraceTimeSec` | 从周期起点开始的分段时间坐标 |
+| `temperatureTraceC` | 与时间坐标对应的周期结温曲线 |
+| `temperatureTraceRfActive` | 每个相邻温度点之间的区间是否包含RF活动 |
+
+稳态验收不要比较 `dataEndingJunctionTemperatureC` 和周期起点，因为数据发送结束时本来就可以处于温度峰值。正确检查是：
+
+```python
+thermalMetrics = channel.GetThermalMetrics()
+closureErrorC = abs(
+    thermalMetrics["periodEndingJunctionTemperatureC"]
+    - thermalMetrics["periodStartingJunctionTemperatureC"]
+)
+assert thermalMetrics["steadyStateConverged"]
+assert closureErrorC <= channel.parameters[
+    "thermalSteadyStateToleranceC"
+]
+```
+
+结温标量的首尾差可能因不同Foster支路误差相消而显得很小，因此严格诊断还应查看 `steadyStateErrorC`；它使用支路级闭合误差。
+
 ### 13.8 MIMO热耦合
 
 `MimoPaModel.parameters["thermalCouplingCPerW"]` 可配置链数乘链数的非负矩阵。行表示受热PA，列表示热源PA：
@@ -2487,7 +2754,11 @@ MIMO互热参数 `thermalCouplingCPerW` 不属于 `ThermalConfig`，但同样需
 \mathbf P_{\mathrm{diss}}.
 ```
 
-对角线强制为零，因为每个 `PaModel` 已经通过自己的Foster网络计算自热。当前互热矩阵是逐帧低速稳态近似：本帧测得的逐链平均耗散决定下一帧的相邻温升。若需要互热本身也具有多个时间常数，应把每个非对角路径扩展为独立Foster网络。
+对角线强制为零，因为每个 `PaModel` 已经通过自己的Foster网络计算自热。互热矩阵表示完整周期平均耗散产生的稳态温度偏移，本身没有动态时间常数。在 `steady_state` 模式下，`MimoPaModel` 会把逐链周期平均耗散与互热温升一起放入外层不动点迭代；只有自热周期和互热温升同时收敛后才接受结果。在 `transient` 模式下，互热保持因果的一周期滞后：本周期平均耗散更新下一周期使用的相邻温升。若需要互热本身也具有多个时间常数，应把每个非对角路径扩展为独立Foster网络。
+
+一次MIMO周期是原子热事务：进入逐链处理前保存所有PA热状态、累计时间、最近输出RMS、耗散功率和互热metrics。若后续任一PA因温度上限、模型异常或稳态不收敛而失败，已经处理过的前序PA也全部回滚，旧metrics同时恢复，再向调用方传播原异常。只有所有链和互热固定点都成功时才共同提交一个周期，避免失败调用留下“部分链前进一周期、部分链未前进”的非物理状态。
+
+`thermalCouplingCPerW` 可以在运行中更新。若从非零互热矩阵改为全零矩阵，下一个成功周期会先把每路历史 `mutualHeatingTemperatureRiseC` 清为0，再按无互热条件处理；旧邻链温升不会泄漏到新配置。把某一路 `ThermalConfig.enabled` 改为 `False` 时，该路也会立即清除自身保存的外部互热offset，后续互热更新不会在关闭对象中暗中积累。若矩阵清零周期失败，原子回滚仍恢复调用前的热offset和metrics；直到一次新配置周期完整成功才提交清零结果。
 
 #### 13.8.1 运行条件和互热参数效果图
 
@@ -2496,7 +2767,7 @@ MIMO互热参数 `thermalCouplingCPerW` 不属于 `ThermalConfig`，但同样需
 - **图A**比较相同50%占空比、不同突发周期。平均耗散相同不保证峰值结温和温度纹波相同，因为快速热节点能否在一次开启或关闭期间充分响应取决于脉冲周期。
 - **图B**显示环境温度是结温的外部基线。环境温度变化不会改变热阻和时间常数，但会改变同一耗散下的绝对结温及电参数漂移。
 - **图C**显示初始结温只改变起始状态。当测试持续时间不足时，初始条件会显著影响结果；不能把不同预热状态的数据直接比较。
-- **图D**显示 `thermalCouplingCPerW` 的基本含义：相邻PA耗散功率乘互热阻，就是受热PA的附加温升。当前实现按本帧功率更新下一帧温度偏移，适合慢速板级互热，不用于描述采样级串扰。
+- **图D**显示 `thermalCouplingCPerW` 的基本含义：相邻PA的完整周期平均耗散功率乘互热阻，就是受热PA的附加温升。稳态模式联合求解这个偏移；瞬态模式在下一周期应用它。该参数适合没有独立时间常数的慢速板级互热，不用于描述采样级串扰。
 
 两路PA的例子为：
 
@@ -2546,33 +2817,56 @@ channel = Channel(
     parameters={
         "sampleRateHz": 80.0e6,
         "maximumOutputPowerDbm": 25.0,
+        "thermalRunMode": "steady_state",
+        "thermalDutyCycle": 0.40,
+        "thermalSteadyStateToleranceC": 1.0e-4,
+        "maximumThermalSteadyStateIterations": 100,
         "width": 0,
     },
 )
 
-frameRecords = []
-for frameIndex in range(20):
-    # Channel internally suspends thermal effects for reference calibration,
-    # restores the prior temperature, and then transmits one live frame.
-    receivedSignal = channel.Process(
-        rawSignal,
-        outputPowerDbm=22.0,
-    )
-    frameRecords.append(
-        {
-            "frameIndex": frameIndex,
-            "referenceCalibration": (
-                channel.GetLastCalibrationMetrics()
-            ),
-            **channel.GetThermalMetrics(),
-        }
-    )
-    channel.AdvanceThermalIdle(idleTimeSec=1.0e-3)
+# The data window may contain internal zeros.  They are not removed from the
+# configured 40 percent window, but they do reduce actual RF-active duty.
+rawSignalWithIdle = rawSignal.copy()
+rawSignalWithIdle[rawSignalWithIdle.size // 2 :] = 0.0
+
+# The first steady-state call requires a power target.  Channel calibrates at
+# the reference temperature and then evaluates the accepted waveform on the
+# converged periodic temperature curve.
+receivedSignal = channel.Process(
+    rawSignalWithIdle,
+    outputPowerDbm=22.0,
+)
+thermalMetrics = channel.GetThermalMetrics()
+
+print("configured", thermalMetrics["configuredDutyCycle"])
+print("inside data window", thermalMetrics["waveformActiveDutyCycle"])
+print("actual full period", channel.GetActualDutyCycle())
+print(
+    "period start/data end/period end",
+    thermalMetrics["periodStartingJunctionTemperatureC"],
+    thermalMetrics["dataEndingJunctionTemperatureC"],
+    thermalMetrics["periodEndingJunctionTemperatureC"],
+)
 ```
 
-调用方没有关闭温度模型，也没有显式构造功率校准器。每帧的内部校准使用同一个参考温度目标，不追踪当前热态输出；校准试探不推进热时间，恢复后的真实发射只推进一帧。`GetLastCalibrationMetrics()` 报告参考校准结果，`GetThermalMetrics()` 报告结温、平均耗散、RF占空比、自然漂移后的有效RF区输出功率和累计物理时间。有效区定义与 `activePowerThresholdDb` 一致，因此前后补零不会把输出功率读数拉低。EVM、ACLR仍由独立 `Analysis` 使用每帧输出计算。
+调用方没有关闭温度模型，也没有显式构造功率校准器或外部空闲波形。默认稳态模式下，每次 `Process` 都在参考电模型上重新校准，然后只把最终接受周期计入热时间。`GetLastCalibrationMetrics()` 报告参考校准结果，`GetThermalMetrics()` 报告完整周期平均耗散、三层占空比、首尾温度、温度曲线和自然漂移后的有效RF区输出功率。有效区定义与 `activePowerThresholdDb` 一致，因此前后补零不会把活动区输出功率读数拉低，却会正确降低真实占空比并产生冷却。EVM、ACLR仍由独立 `Analysis` 使用返回的数据窗口计算。
 
-固定温度角、不同单RC热阻和25%/50%/100%占空比的最小隔离系统、可运行代码及实测对比表见 [Example.md](./Example.md)。
+若需要观察从冷机开始的逐周期温升，只需把Channel参数改为：
+
+```python
+transientChannelParameters = {
+    "sampleRateHz": 80.0e6,
+    "maximumOutputPowerDbm": 25.0,
+    "thermalRunMode": "transient",
+    "thermalDutyCycle": 0.40,
+    "width": 0,
+}
+```
+
+此时连续调用的周期首尾温度可以不同；每次调用已经包含60%的自动窗口外空闲。不要再手动加入同一段空闲。
+
+固定温度角、周期稳态与连续瞬态、配置占空比与内部空闲的最小隔离系统、可运行代码和温度曲线绘图见 [Example.md](./Example.md)。
 
 ## 14. 使用边界和常见误解
 

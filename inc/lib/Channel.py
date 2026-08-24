@@ -85,10 +85,15 @@ class Channel:
             {
                 "sampleMode": "forward",
                 "sampleRateHz": 1.0,
+                "thermalRunMode": "steady_state",
+                "thermalDutyCycle": 1.0,
+                "thermalSteadyStateToleranceC": 1.0e-4,
+                "maximumThermalSteadyStateIterations": 100,
                 "phaseDegrees": 0,
                 "noiseAmpMv": None,
                 "noisePwrDbm": None,
                 "noiseSnrDb": None,
+                "txIqImbalanceEnabled": True,
                 "txIqGainImbalanceDb": 0.0,
                 "txIqPhaseImbalanceDegrees": 0.0,
                 "txDcOffset": 0.0 + 0.0j,
@@ -99,6 +104,7 @@ class Channel:
                 "fbFractionalDelaySamples": 0.0,
                 "fbCarrierFrequencyOffsetHz": 0.0,
                 "fbSamplingFrequencyOffsetPpm": 0.0,
+                "fbIqImbalanceEnabled": True,
                 "fbIqGainImbalanceDb": 0.0,
                 "fbIqPhaseImbalanceDegrees": 0.0,
                 "fbDcOffset": 0.0 + 0.0j,
@@ -114,6 +120,7 @@ class Channel:
                 "maximumCalibrationIterations": 60,
                 "calibrationLearningRate": 0.8,
                 "maximumDriveAdjustmentDb": 6.0,
+                "calibrationDigitalHeadroomDb": 6.0,
                 "jointPowerCalibration": None,
                 "calibrationProbeStepDb": 0.05,
                 "calibrationRegularization": 1.0e-6,
@@ -167,8 +174,12 @@ class Channel:
         self.paModel: Optional[Any] = None
         self._paProcessMethod: Optional[Any] = None
         self._powerCalibration: Optional[PowerCalibration] = None
+        self._calibrationDriveDbPerChain: Tuple[float, ...] = tuple()
         self._lastTransmitterOutput: Optional[np.ndarray] = None
         self._lastActualPaInput: Optional[np.ndarray] = None
+        self._lastCalibrationOutputPowerDbm: Optional[
+            Union[float, Tuple[float, ...]]
+        ] = None
         self._activeRandomSeed: Optional[int] = None
         self._randomGenerator = np.random.default_rng()
         self.ValidateParameters()
@@ -375,6 +386,55 @@ class Channel:
                 "finite real number in (0, +inf) Hz."
             )
 
+        thermalRunMode = self.parameters["thermalRunMode"]
+        if (
+            not isinstance(thermalRunMode, str)
+            or thermalRunMode.strip().lower()
+            not in ("steady_state", "transient")
+        ):
+            raise ValueError(
+                "thermalRunMode has an invalid value. Allowed values: "
+                "'steady_state' or 'transient'."
+            )
+        thermalDutyCycle = self.parameters["thermalDutyCycle"]
+        if (
+            not isinstance(thermalDutyCycle, (int, float))
+            or isinstance(thermalDutyCycle, bool)
+            or not np.isfinite(thermalDutyCycle)
+            or not 0.0 < float(thermalDutyCycle) <= 1.0
+        ):
+            raise ValueError(
+                "thermalDutyCycle has an invalid value. Allowed range: "
+                "finite real number in (0, 1]."
+            )
+        thermalSteadyStateToleranceC = self.parameters[
+            "thermalSteadyStateToleranceC"
+        ]
+        if (
+            not isinstance(
+                thermalSteadyStateToleranceC, (int, float)
+            )
+            or isinstance(thermalSteadyStateToleranceC, bool)
+            or not np.isfinite(thermalSteadyStateToleranceC)
+            or float(thermalSteadyStateToleranceC) <= 0.0
+        ):
+            raise ValueError(
+                "thermalSteadyStateToleranceC has an invalid value. "
+                "Allowed range: finite real number in (0, +inf) C."
+            )
+        maximumThermalSteadyStateIterations = self.parameters[
+            "maximumThermalSteadyStateIterations"
+        ]
+        if (
+            not isinstance(maximumThermalSteadyStateIterations, int)
+            or isinstance(maximumThermalSteadyStateIterations, bool)
+            or maximumThermalSteadyStateIterations < 1
+        ):
+            raise ValueError(
+                "maximumThermalSteadyStateIterations has an invalid value. "
+                "Allowed range: integer in [1, +inf)."
+            )
+
         phaseDegrees = self.parameters["phaseDegrees"]
         if (
             not isinstance(phaseDegrees, (int, float))
@@ -432,6 +492,17 @@ class Channel:
                 "noiseSnrDb has an invalid value. Allowed range: None or "
                 "any finite real number in (-inf, +inf) dB."
             )
+
+        for iqEnableParameterName in (
+            "txIqImbalanceEnabled",
+            "fbIqImbalanceEnabled",
+        ):
+            iqStageEnabled = self.parameters[iqEnableParameterName]
+            if not isinstance(iqStageEnabled, bool):
+                raise TypeError(
+                    f"{iqEnableParameterName} has an invalid type. Allowed "
+                    "values: True or False."
+                )
 
         for realImpairmentParameterName in (
             "txIqGainImbalanceDb",
@@ -658,6 +729,19 @@ class Channel:
                 "maximumDriveAdjustmentDb has an invalid value. Allowed "
                 "range: finite real number in (0, +inf) dB."
             )
+        calibrationDigitalHeadroomDb = self.parameters[
+            "calibrationDigitalHeadroomDb"
+        ]
+        if (
+            not isinstance(calibrationDigitalHeadroomDb, (int, float))
+            or isinstance(calibrationDigitalHeadroomDb, bool)
+            or not np.isfinite(calibrationDigitalHeadroomDb)
+            or not 0.0 <= float(calibrationDigitalHeadroomDb) <= 60.0
+        ):
+            raise ValueError(
+                "calibrationDigitalHeadroomDb has an invalid value. Allowed "
+                "range: finite real number in [0, 60] dB."
+            )
         jointPowerCalibration = self.parameters[
             "jointPowerCalibration"
         ]
@@ -765,8 +849,10 @@ class Channel:
         self.paModel = paModel
         self._paProcessMethod = paProcessMethod
         self._powerCalibration = None
+        self._calibrationDriveDbPerChain = tuple()
         self._lastTransmitterOutput = None
         self._lastActualPaInput = None
+        self._lastCalibrationOutputPowerDbm = None
 
     @staticmethod
     def ResolveCalibrationTargets(
@@ -845,10 +931,11 @@ class Channel:
 
         Processing details:
             Algorithm: Resolve scalar or per-chain targets, copy the current
-            Channel power detector and convergence settings into a private
-            ``PowerCalibration`` instance, and reuse that instance so its
-            converged drive preset can accelerate later requests. Rebuild the
-            helper only after a PA replacement or public-width change.
+            Channel power detector, digital-headroom and convergence settings
+            into a private ``PowerCalibration`` instance, bind the Channel's
+            clean calibration-drive protocol, and reuse the helper so its
+            converged total drive can accelerate later requests. Rebuild it
+            only after a PA replacement or public-width change.
 
         Args:
             outputPowerDbm: Shared target dBm or one target for every PA chain.
@@ -863,6 +950,7 @@ class Channel:
                 "or SetPaModel"
             )
         self.ValidateParameters()
+        self.ValidateThermalReferencePlanes()
         scalarTarget, perChainTargets = self.ResolveCalibrationTargets(
             outputPowerDbm
         )
@@ -884,6 +972,9 @@ class Channel:
             ],
             "maximumDriveAdjustmentDb": self.parameters[
                 "maximumDriveAdjustmentDb"
+            ],
+            "calibrationDigitalHeadroomDb": self.parameters[
+                "calibrationDigitalHeadroomDb"
             ],
             "enableJointCalibration": (
                 self.HasPrePaCoupling()
@@ -911,7 +1002,7 @@ class Channel:
             or self._powerCalibration.width != self.width
         ):
             self._powerCalibration = PowerCalibration(
-                paModel=self.ProcessPaBankForCalibration,
+                paModel=self,
                 parameters=calibrationParameters,
             )
         else:
@@ -925,55 +1016,42 @@ class Channel:
         inputSignal: np.ndarray,
         outputPowerDbm: Union[float, Sequence[float], np.ndarray],
     ) -> np.ndarray:
-        """Generate a hidden digital Tx input that meets requested output dBm.
+        """Generate a public Tx waveform and hidden drive for requested dBm.
 
         Processing details:
-            Algorithm: Configure the private closed loop, normalize only the
-            active part of the caller's arbitrary waveform, repeatedly send a
-            newly scaled digital input through Tx I/Q impairment, pre-PA
-            coupling, and the bound PA, measure actual active PA output power,
-            and update the preset until every chain falls inside the configured
-            tolerance. Before those trials, suspend and snapshot any active PA
-            thermal network; restore the exact temperature and elapsed-time
-            state in a finally block after calibration. Padding and long idle
-            intervals are excluded by the active-region detector.
+            Algorithm: Configure the private closed loop and normalize only the
+            active part of the caller's arbitrary waveform. In fixed mode,
+            retain legal public DAC codes with digital headroom and repeatedly
+            vary a post-decode analog drive before Tx I/Q impairment, pre-PA
+            coupling, and the bound PA. Measure actual active PA output power
+            until every chain enters tolerance, committing the hidden analog
+            drive only on success. Suspend and snapshot any active PA thermal
+            network before the trials and restore exact temperature and elapsed
+            time in a finally block. Padding and long idle intervals remain
+            outside the active-region detector.
 
         Args:
             inputSignal: Arbitrarily scaled public SISO or MIMO waveform.
             outputPowerDbm: Shared target dBm or one target per PA chain.
 
         Returns:
-            result: Public digital waveform accepted before Tx I/Q impairment.
+            result: Public waveform before the committed analog drive stage.
         """
 
+        self.ValidateParameters()
+        # Direct CalibratePaInput and PrepareThermalTest callers must receive
+        # the same pre-transaction reference-plane checks as Process callers.
+        self.ValidateThermalReferencePlanes()
         powerCalibration = self.ConfigurePowerCalibration(outputPowerDbm)
-        # Calibration must identify the reference-temperature electrical
-        # operating point. Preserve the complete live thermal state so the
-        # repeated trial waveforms neither heat the PA nor compensate its
-        # current temperature-dependent gain drift.
-        suspendMethod = (
-            None
-            if self.paModel is None
-            else getattr(self.paModel, "SuspendThermalModel", None)
+        # PowerCalibration owns the common thermal transaction so the same
+        # reference-temperature behavior also applies to direct calibrator use.
+        calibratedInput = powerCalibration.Calibrate(inputSignal)
+        scalarTarget, perChainTargets = self.ResolveCalibrationTargets(
+            outputPowerDbm
         )
-        restoreMethod = (
-            None
-            if self.paModel is None
-            else getattr(self.paModel, "RestoreThermalModel", None)
+        self._lastCalibrationOutputPowerDbm = (
+            scalarTarget if perChainTargets is None else perChainTargets
         )
-        if callable(suspendMethod) != callable(restoreMethod):
-            raise TypeError(
-                "a bound PA thermal transaction must expose both "
-                "SuspendThermalModel and RestoreThermalModel, or neither"
-            )
-        thermalSnapshot = (
-            suspendMethod() if callable(suspendMethod) else None
-        )
-        try:
-            calibratedInput = powerCalibration.Calibrate(inputSignal)
-        finally:
-            if callable(restoreMethod):
-                restoreMethod(thermalSnapshot)
         return calibratedInput
 
     def PrepareThermalTest(
@@ -987,15 +1065,17 @@ class Channel:
         ] = None,
         ambientTemperatureC: Optional[float] = None,
     ) -> np.ndarray:
-        """Calibrate once without heating and freeze the digital Tx drive.
+        """Calibrate once without heating and freeze one Channel drive state.
 
         Processing details:
             Algorithm: Suspend the bound SISO or MIMO PA thermal network,
-            execute the existing dBm closed loop using only reference electrical
-            parameters, copy the converged public digital input before Tx I/Q,
-            restore thermal modeling without accepting any calibration heat,
+            execute the existing dBm closed loop using only reference
+            electrical parameters, retain the converged analog drive inside
+            this Channel and copy its paired public codes before Tx I/Q,
+            restore thermal modeling without accepting calibration heat,
             optionally reset the requested starting temperatures, and return
-            the frozen drive. A later Process call reapplies the Tx I/Q stage.
+            the codes. A later Process call on this instance reapplies both the
+            committed analog drive and Tx I/Q stage.
 
         Args:
             inputSignal: Arbitrarily scaled public SISO or MIMO waveform.
@@ -1004,7 +1084,7 @@ class Channel:
             ambientTemperatureC: Optional shared ambient test temperature.
 
         Returns:
-            result: Frozen public digital Tx input for open-loop thermal tests.
+            result: Frozen public codes for this Channel's open-loop tests.
         """
 
         if self.paModel is None:
@@ -1055,6 +1135,64 @@ class Channel:
             raise RuntimeError("bound PA does not support thermal idle advance")
         return advanceMethod(idleTimeSec)
 
+    def SuspendThermalModel(self) -> object:
+        """Suspend the bound PA thermal state during power calibration.
+
+        Processing details:
+            Algorithm: Validate the wrapped PA's paired transaction protocol
+            before changing state, then delegate snapshot creation. A PA with
+            no thermal protocol returns None and remains electrically usable.
+
+        Returns:
+            result: Opaque bound-PA thermal snapshot or None.
+        """
+
+        if self.paModel is None:
+            return None
+        suspendMethod = getattr(
+            self.paModel, "SuspendThermalModel", None
+        )
+        restoreMethod = getattr(
+            self.paModel, "RestoreThermalModel", None
+        )
+        if callable(suspendMethod) != callable(restoreMethod):
+            raise TypeError(
+                "a bound PA thermal transaction must expose both "
+                "SuspendThermalModel and RestoreThermalModel, or neither"
+            )
+        return suspendMethod() if callable(suspendMethod) else None
+
+    def RestoreThermalModel(self, thermalSnapshot: object) -> None:
+        """Restore the bound PA state after electrical power calibration.
+
+        Processing details:
+            Algorithm: Treat a None snapshot as a no-op and otherwise forward
+            the opaque snapshot to the paired bound-PA restore method. The PA
+            remains responsible for honoring a live ``enabled=False`` setting
+            instead of reviving an obsolete enabled snapshot.
+
+        Args:
+            thermalSnapshot: Value returned by ``SuspendThermalModel``.
+
+        Returns:
+            result: None. Bound thermal state is restored when still enabled.
+        """
+
+        if thermalSnapshot is None:
+            return
+        if self.paModel is None:
+            raise RuntimeError(
+                "cannot restore thermal state without a bound PA model"
+            )
+        restoreMethod = getattr(
+            self.paModel, "RestoreThermalModel", None
+        )
+        if not callable(restoreMethod):
+            raise TypeError(
+                "bound PA does not expose RestoreThermalModel"
+            )
+        restoreMethod(thermalSnapshot)
+
     def GetThermalMetrics(self) -> Dict[str, object]:
         """Return thermal diagnostics from the bound PA without reprocessing.
 
@@ -1072,6 +1210,217 @@ class Channel:
         if not callable(metricsMethod):
             return {"enabled": False}
         return dict(metricsMethod())
+
+    def IsThermalModelEnabled(self) -> bool:
+        """Report whether at least one bound PA has active thermal state.
+
+        Processing details:
+            Algorithm: Inspect the bound PA's read-only thermal metrics. A
+            SISO dictionary uses its top-level ``enabled`` flag, while a MIMO
+            dictionary is active when any chain reports enabled operation.
+
+        Returns:
+            result: True when periodic thermal scheduling is required.
+        """
+
+        if self.paModel is None:
+            return False
+        metricsMethod = getattr(self.paModel, "GetThermalMetrics", None)
+        if not callable(metricsMethod):
+            return False
+        thermalMetrics = metricsMethod()
+        if not isinstance(thermalMetrics, Mapping):
+            raise TypeError(
+                "bound PA GetThermalMetrics must return a mapping"
+            )
+        if "enabled" in thermalMetrics:
+            return bool(thermalMetrics["enabled"])
+        chainMetrics = thermalMetrics.get("chains", tuple())
+        if isinstance(chainMetrics, Sequence) and not isinstance(
+            chainMetrics, (str, bytes)
+        ):
+            return any(
+                isinstance(chainMetric, Mapping)
+                and bool(chainMetric.get("enabled", False))
+                for chainMetric in chainMetrics
+            )
+        return False
+
+    def ValidateThermalReferencePlanes(
+        self,
+    ) -> Tuple[Mapping[str, object], ...]:
+        """Validate shared thermal time, power, and activity reference planes.
+
+        Processing details:
+            Algorithm: Collect every enabled SISO or MIMO PA thermal metrics
+            mapping and require its sample rate, normalized-output dBm scale,
+            and RF-active threshold to equal the corresponding Channel value.
+            One data window cannot represent different physical durations or
+            different normalized-power meanings across connected modules.
+
+        Returns:
+            result: Immutable tuple of enabled per-chain thermal mappings.
+        """
+
+        if self.paModel is None:
+            return tuple()
+        thermalMetrics = self.GetThermalMetrics()
+        if "enabled" in thermalMetrics:
+            enabledChainMetrics = (
+                (thermalMetrics,) if thermalMetrics["enabled"] else tuple()
+            )
+        else:
+            rawChainMetrics = thermalMetrics.get("chains", tuple())
+            if not isinstance(rawChainMetrics, Sequence) or isinstance(
+                rawChainMetrics, (str, bytes)
+            ):
+                raise TypeError(
+                    "MIMO thermal metrics must expose a chain sequence"
+                )
+            enabledChainMetrics = tuple(
+                chainMetric
+                for chainMetric in rawChainMetrics
+                if isinstance(chainMetric, Mapping)
+                and bool(chainMetric.get("enabled", False))
+            )
+        expectedValues = (
+            (
+                "sampleRateHz",
+                float(self.parameters["sampleRateHz"]),
+                "Hz",
+            ),
+            (
+                "referenceOutputPowerDbm",
+                float(self.parameters["maximumOutputPowerDbm"]),
+                "dBm",
+            ),
+            (
+                "activePowerThresholdDb",
+                float(self.parameters["activePowerThresholdDb"]),
+                "dB",
+            ),
+        )
+        for chainIndex, chainMetric in enumerate(enabledChainMetrics):
+            for metricName, channelValue, unitName in expectedValues:
+                if metricName not in chainMetric:
+                    raise TypeError(
+                        "enabled thermal PA metrics must expose "
+                        f"{metricName}"
+                    )
+                paValue = float(chainMetric[metricName])
+                if not np.isclose(
+                    paValue,
+                    channelValue,
+                    rtol=1.0e-12,
+                    atol=1.0e-12,
+                ):
+                    raise ValueError(
+                        f"Channel {metricName} must equal enabled PA chain "
+                        f"{chainIndex} ThermalConfig.{metricName}; received "
+                        f"{channelValue:.12g} {unitName} and "
+                        f"{paValue:.12g} {unitName}"
+                    )
+        return tuple(enabledChainMetrics)
+
+    def GetActualDutyCycle(
+        self,
+        inputSignal: Optional[np.ndarray] = None,
+    ) -> Union[float, Tuple[float, ...]]:
+        """Return measured RF-active duty for a full scheduled period.
+
+        Processing details:
+            Algorithm: Without an input, read the accepted value from the most
+            recent thermal period. With an input, cross the public fixed-point
+            boundary, apply committed analog drive, Tx I/Q impairment, and
+            pre-PA coupling, then ask the built-in PA bank to classify activity
+            at the actual PA-input reference plane. SISO returns a scalar and
+            MIMO returns one value per column.
+
+        Args:
+            inputSignal: Optional raw public data-window vector or matrix.
+
+        Returns:
+            result: Actual RF-active fraction of the complete period.
+        """
+
+        if self.paModel is None:
+            raise RuntimeError("GetActualDutyCycle requires a bound PA model")
+        self.ValidateParameters()
+        self.ValidateThermalReferencePlanes()
+        if inputSignal is None:
+            thermalMetrics = self.GetThermalMetrics()
+            if "actualDutyCycle" in thermalMetrics:
+                return float(thermalMetrics["actualDutyCycle"])
+            chainMetrics = thermalMetrics.get("chains", tuple())
+            if isinstance(chainMetrics, Sequence) and not isinstance(
+                chainMetrics, (str, bytes)
+            ):
+                dutyValues = tuple(
+                    float(chainMetric.get("actualDutyCycle", 0.0))
+                    for chainMetric in chainMetrics
+                    if isinstance(chainMetric, Mapping)
+                )
+                if dutyValues:
+                    return dutyValues
+            raise RuntimeError(
+                "Process must complete one thermal period before the "
+                "no-argument duty-cycle query"
+            )
+        interfaceFormat = FixedPoint(self.width)
+        normalizedInput = interfaceFormat.DecodeComplex(
+            self.ValidateSignal(inputSignal, "inputSignal")
+        )
+        drivenInput = self.ApplyCalibrationDrive(normalizedInput)
+        transmitterOutput = self.ApplyTransmitterIqImbalance(drivenInput)
+        actualPaInput = self.ApplyPrePaCoupling(transmitterOutput)
+        if not self.IsThermalModelEnabled():
+            # Duty-cycle observation is useful before thermal modeling is
+            # enabled. Classify the actual PA-input columns with the Channel's
+            # global activity threshold instead of reporting a false zero.
+            inputMatrix = (
+                actualPaInput.reshape(-1, 1)
+                if actualPaInput.ndim == 1
+                else actualPaInput
+            )
+            thresholdScale = 10.0 ** (
+                float(self.parameters["activePowerThresholdDb"]) / 10.0
+            )
+            dutyValues = []
+            for chainIndex in range(inputMatrix.shape[1]):
+                chainPower = np.abs(inputMatrix[:, chainIndex]) ** 2
+                peakPower = float(np.max(chainPower))
+                waveformDutyCycle = (
+                    0.0
+                    if peakPower <= np.finfo(float).tiny
+                    else float(
+                        np.mean(chainPower >= peakPower * thresholdScale)
+                    )
+                )
+                dutyValues.append(
+                    float(self.parameters["thermalDutyCycle"])
+                    * waveformDutyCycle
+                )
+            if actualPaInput.ndim == 1:
+                return dutyValues[0]
+            return tuple(dutyValues)
+        dutyMethod = getattr(
+            self.paModel, "CalculateActualDutyCycle", None
+        )
+        if not callable(dutyMethod):
+            raise TypeError(
+                "bound PA must expose CalculateActualDutyCycle for a "
+                "pre-processing duty query"
+            )
+        dutyResult = dutyMethod(
+            actualPaInput,
+            float(self.parameters["thermalDutyCycle"]),
+        )
+        if isinstance(dutyResult, (int, float, np.integer, np.floating)):
+            return float(dutyResult)
+        dutyValues = tuple(float(value) for value in dutyResult)
+        if actualPaInput.ndim == 1 and len(dutyValues) == 1:
+            return dutyValues[0]
+        return dutyValues
 
     def GetLastPaInput(self) -> np.ndarray:
         """Return the latest calibrated digital input before Tx I/Q error.
@@ -1661,8 +2010,9 @@ class Channel:
         """Return configured Tx direct and conjugate-image coefficients.
 
         Processing details:
-            Algorithm: Validate the live Channel configuration and convert the
-            transmitter gain and phase mismatch parameters to the exact
+            Algorithm: Validate the live Channel configuration. Return the
+            ideal direct/image pair when the Tx stage is disabled; otherwise
+            convert transmitter gain and phase mismatch parameters to the exact
             widely-linear coefficient pair used before PA-input coupling.
 
         Returns:
@@ -1670,6 +2020,8 @@ class Channel:
         """
 
         self.ValidateParameters()
+        if not bool(self.parameters["txIqImbalanceEnabled"]):
+            return 1.0 + 0.0j, 0.0 + 0.0j
         return self.ResolveIqImbalanceCoefficients(
             float(self.parameters["txIqGainImbalanceDb"]),
             float(self.parameters["txIqPhaseImbalanceDegrees"]),
@@ -1679,15 +2031,18 @@ class Channel:
         """Return configured feedback direct and image coefficients.
 
         Processing details:
-            Algorithm: Validate the live Channel configuration and convert the
-            feedback receiver gain and phase mismatch parameters to the exact
-            widely-linear coefficient pair used before feedback DC addition.
+            Algorithm: Validate the live Channel configuration. Return the
+            ideal direct/image pair when the feedback stage is disabled;
+            otherwise convert receiver gain and phase mismatch parameters to
+            the exact pair used before feedback DC addition.
 
         Returns:
             result: Feedback direct coefficient followed by image coefficient.
         """
 
         self.ValidateParameters()
+        if not bool(self.parameters["fbIqImbalanceEnabled"]):
+            return 1.0 + 0.0j, 0.0 + 0.0j
         return self.ResolveIqImbalanceCoefficients(
             float(self.parameters["fbIqGainImbalanceDb"]),
             float(self.parameters["fbIqPhaseImbalanceDegrees"]),
@@ -1699,10 +2054,12 @@ class Channel:
         """Apply Tx modulator I/Q mismatch and DC offset before every PA.
 
         Processing details:
-            Algorithm: Use the common widely-linear I/Q stage with the ``tx``
-            parameters before PA-input coupling. This impairment therefore
-            changes the physical PA drive, PA nonlinear products, clean
-            forward observation, feedback observation, and power calibration.
+            Algorithm: Validate and return an unchanged complex copy when
+            ``txIqImbalanceEnabled`` is False, bypassing Tx gain mismatch,
+            phase mismatch, and DC leakage together. When enabled, use the
+            common widely-linear I/Q stage with the ``tx`` parameters before
+            PA-input coupling. This impairment changes physical PA drive, PA
+            nonlinear products, both observations, and power calibration.
 
         Args:
             inputSignal: Digital transmitter waveform before RF modulation.
@@ -1712,6 +2069,11 @@ class Channel:
         """
 
         self.ValidateParameters()
+        if not bool(self.parameters["txIqImbalanceEnabled"]):
+            return np.asarray(
+                self.ValidateSignal(inputSignal, "inputSignal"),
+                dtype=np.complex128,
+            ).copy()
         return self.ApplyIqImbalanceStage(
             inputSignal,
             float(self.parameters["txIqGainImbalanceDb"]),
@@ -2180,9 +2542,11 @@ class Channel:
         """Apply I/Q gain/phase mismatch and complex receiver DC offset.
 
         Processing details:
-            Algorithm: Use the shared widely-linear I/Q stage with the
-            feedback receiver gain mismatch, quadrature phase error, and DC
-            offset. This stage is called only by ``sampleMode="fb"``.
+            Algorithm: Validate and return an unchanged complex copy when
+            ``fbIqImbalanceEnabled`` is False, bypassing feedback gain
+            mismatch, quadrature phase error, and DC offset together. When
+            enabled, use the shared widely-linear stage. This function appears
+            in the processing chain only for ``sampleMode="fb"``.
 
         Args:
             inputSignal: Feedback waveform after timing and frequency errors.
@@ -2192,6 +2556,11 @@ class Channel:
         """
 
         self.ValidateParameters()
+        if not bool(self.parameters["fbIqImbalanceEnabled"]):
+            return np.asarray(
+                self.ValidateSignal(inputSignal, "inputSignal"),
+                dtype=np.complex128,
+            ).copy()
         return self.ApplyIqImbalanceStage(
             inputSignal,
             float(self.parameters["fbIqGainImbalanceDb"]),
@@ -2410,18 +2779,257 @@ class Channel:
             )
         return normalizedOutput
 
+    def ProcessBoundPaThermalPeriodFloating(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Evaluate the bound PA over one Channel-configured thermal period.
+
+        Processing details:
+            Algorithm: Prefer the built-in periodic thermal protocol and pass
+            the Channel run mode, scheduling duty, closure tolerance, and
+            iteration limit. A nonthermal third-party PA retains the ordinary
+            floating path. A third-party PA that advertises enabled thermal
+            state but lacks the protocol is rejected instead of silently
+            ignoring steady-state or scheduled-idle semantics.
+
+        Args:
+            inputSignal: Actual normalized PA-input vector or matrix.
+
+        Returns:
+            result: PA output data window with matching shape.
+        """
+
+        if self.paModel is None:
+            raise RuntimeError(
+                "Process requires a PA bound through paModel or SetPaModel"
+            )
+        self.ValidateParameters()
+        normalizedInput = self.ValidateSignal(inputSignal, "inputSignal")
+        periodicProcessor = getattr(
+            self.paModel, "ProcessThermalPeriodFloating", None
+        )
+        if callable(periodicProcessor):
+            self.ValidateThermalReferencePlanes()
+            normalizedPaOutput = periodicProcessor(
+                normalizedInput,
+                thermalRunMode=str(
+                    self.parameters["thermalRunMode"]
+                ).strip().lower(),
+                thermalDutyCycle=float(
+                    self.parameters["thermalDutyCycle"]
+                ),
+                steadyStateToleranceC=float(
+                    self.parameters["thermalSteadyStateToleranceC"]
+                ),
+                maximumSteadyStateIterations=int(
+                    self.parameters[
+                        "maximumThermalSteadyStateIterations"
+                    ]
+                ),
+            )
+        else:
+            if self.IsThermalModelEnabled():
+                raise TypeError(
+                    "an enabled thermal PA must expose "
+                    "ProcessThermalPeriodFloating for Channel scheduling"
+                )
+            return self.ProcessBoundPaFloating(normalizedInput)
+        normalizedOutput = self.ValidateSignal(
+            normalizedPaOutput, "paOutputSignal"
+        )
+        if normalizedOutput.shape != normalizedInput.shape:
+            raise ValueError(
+                "bound PA must preserve the input vector or matrix shape"
+            )
+        return normalizedOutput
+
+    def ResolveCalibrationDriveDbPerChain(
+        self,
+        driveDbPerChain: Sequence[float],
+        chainCount: int,
+    ) -> Tuple[float, ...]:
+        """Validate one post-DAC calibration drive per waveform chain.
+
+        Processing details:
+            Algorithm: Require a nonempty one-dimensional sequence whose length
+            matches the current waveform, reject boolean and nonfinite values,
+            and return immutable plain floats before exponential conversion.
+
+        Args:
+            driveDbPerChain: Chain-ordered analog drive values in decibels.
+            chainCount: Number of SISO or MIMO columns being processed.
+
+        Returns:
+            result: Validated drive tuple in physical transmit-chain order.
+        """
+
+        if (
+            not isinstance(chainCount, int)
+            or isinstance(chainCount, bool)
+            or chainCount < 1
+        ):
+            raise ValueError("chainCount must be a positive integer")
+        if isinstance(driveDbPerChain, (str, bytes)):
+            raise TypeError("driveDbPerChain must be a numeric sequence")
+        driveArray = np.asarray(driveDbPerChain, dtype=object)
+        if driveArray.ndim != 1 or driveArray.size != chainCount:
+            raise ValueError(
+                "driveDbPerChain must contain one value per waveform chain"
+            )
+        resolvedValues = []
+        for driveValue in driveArray:
+            if (
+                not isinstance(
+                    driveValue,
+                    (int, float, np.integer, np.floating),
+                )
+                or isinstance(driveValue, (bool, np.bool_))
+                or not np.isfinite(driveValue)
+            ):
+                raise ValueError(
+                    "every driveDbPerChain entry must be a finite real dB "
+                    "value"
+                )
+            resolvedValues.append(float(driveValue))
+        return tuple(resolvedValues)
+
+    def ApplyCalibrationDrive(
+        self,
+        inputSignal: np.ndarray,
+        driveDbPerChain: Optional[Sequence[float]] = None,
+    ) -> np.ndarray:
+        """Apply committed or explicit analog drive after public decoding.
+
+        Processing details:
+            Algorithm: Preserve vector or matrix orientation, resolve one dB
+            gain per column, multiply in floating point, and reject numerical
+            overflow. An empty committed tuple means unity drive before the
+            first successful closed-loop calibration.
+
+        Args:
+            inputSignal: Decoded normalized SISO or MIMO transmit waveform.
+            driveDbPerChain: Optional explicit trial drives. None selects the
+                most recently committed calibration values.
+
+        Returns:
+            result: Floating waveform at the output of the simulated analog
+                drive stage and before transmitter I/Q impairment.
+        """
+
+        normalizedInput = self.ValidateSignal(inputSignal, "inputSignal")
+        inputWasVector = normalizedInput.ndim == 1
+        inputMatrix = (
+            normalizedInput.reshape(-1, 1)
+            if inputWasVector
+            else normalizedInput
+        )
+        chainCount = inputMatrix.shape[1]
+        selectedDriveValues: Sequence[float]
+        if driveDbPerChain is not None:
+            selectedDriveValues = driveDbPerChain
+        elif self._calibrationDriveDbPerChain:
+            selectedDriveValues = self._calibrationDriveDbPerChain
+        else:
+            selectedDriveValues = tuple(0.0 for _ in range(chainCount))
+        resolvedDriveDb = self.ResolveCalibrationDriveDbPerChain(
+            selectedDriveValues,
+            chainCount,
+        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            driveScale = np.power(
+                10.0, np.asarray(resolvedDriveDb, dtype=float) / 20.0
+            )
+            drivenMatrix = inputMatrix * driveScale.reshape(1, -1)
+        if not np.all(np.isfinite(drivenMatrix)):
+            raise ValueError(
+                "driveDbPerChain is outside the numeric amplitude range"
+            )
+        if inputWasVector:
+            return np.asarray(drivenMatrix[:, 0], dtype=np.complex128)
+        return np.asarray(drivenMatrix, dtype=np.complex128)
+
+    def SetCalibrationDriveDb(
+        self, driveDbPerChain: Sequence[float]
+    ) -> None:
+        """Commit hidden post-DAC drives after closed-loop convergence.
+
+        Processing details:
+            Algorithm: Validate the complete candidate tuple before replacing
+            private state. The operation is atomic and is never called by
+            ``PowerCalibration`` for an unsuccessful or probe iteration.
+
+        Args:
+            driveDbPerChain: One converged analog drive in dB per chain.
+
+        Returns:
+            result: None. Later normal processing reuses the accepted drives.
+        """
+
+        if isinstance(driveDbPerChain, (str, bytes)):
+            raise TypeError("driveDbPerChain must be a numeric sequence")
+        driveArray = np.asarray(driveDbPerChain, dtype=object)
+        if driveArray.ndim != 1 or driveArray.size == 0:
+            raise ValueError(
+                "driveDbPerChain must be a nonempty one-dimensional sequence"
+            )
+        self._calibrationDriveDbPerChain = (
+            self.ResolveCalibrationDriveDbPerChain(
+                driveDbPerChain,
+                int(driveArray.size),
+            )
+        )
+
+    def ProcessCalibrationDrive(
+        self,
+        inputSignal: np.ndarray,
+        driveDbPerChain: Sequence[float],
+    ) -> np.ndarray:
+        """Measure a clean PA trial at explicit post-decode analog drives.
+
+        Processing details:
+            Algorithm: Decode the legal public waveform once, apply the trial
+            drive without changing committed state, then execute Tx I/Q
+            impairment, pre-PA coupling, and the nonlinear PA bank. Encode the
+            clean per-PA outputs while excluding post-coupling and receiver
+            impairments from the power-control reference plane.
+
+        Args:
+            inputSignal: Public floating waveform or fixed-point I/Q codes.
+            driveDbPerChain: Trial analog drive in dB for every waveform chain.
+
+        Returns:
+            result: Public clean PA output before post-PA coupling and sampling.
+        """
+
+        interfaceFormat = FixedPoint(self.width)
+        normalizedInput = interfaceFormat.DecodeComplex(
+            self.ValidateSignal(inputSignal, "inputSignal")
+        )
+        drivenInput = self.ApplyCalibrationDrive(
+            normalizedInput, driveDbPerChain
+        )
+        transmitterOutput = self.ApplyTransmitterIqImbalance(drivenInput)
+        actualPaInput = self.ApplyPrePaCoupling(transmitterOutput)
+        self._lastTransmitterOutput = np.array(
+            transmitterOutput, dtype=np.complex128, copy=True
+        )
+        self._lastActualPaInput = np.array(
+            actualPaInput, dtype=np.complex128, copy=True
+        )
+        normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
+        return interfaceFormat.EncodeComplex(normalizedPaOutput)
+
     def ProcessPaBankForCalibration(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
         """Evaluate Tx I/Q, pre-PA coupling, and PA at the public boundary.
 
         Processing details:
-            Algorithm: Decode the trial waveform once, apply transmitter I/Q
-            mismatch and PA-input cross-coupling, evaluate every nonlinear PA,
-            and encode the clean per-PA outputs. Post-PA coupling and receiver
-            effects are excluded so ``outputPowerDbm`` continues to mean each
-            physical PA's own output power. Calibration therefore includes Tx
-            modulator loss and image drive but excludes feedback receiver error.
+            Algorithm: Decode the trial waveform once, apply the committed
+            post-DAC drive, transmitter I/Q mismatch and PA-input cross-coupling,
+            evaluate every nonlinear PA, and encode the clean per-PA outputs.
+            Post-PA coupling and receiver effects are excluded so
+            ``outputPowerDbm`` continues to mean each physical PA's own output.
 
         Args:
             inputSignal: Public SISO or samples-by-chains calibration trial.
@@ -2434,8 +3042,9 @@ class Channel:
         normalizedInput = interfaceFormat.DecodeComplex(
             self.ValidateSignal(inputSignal, "inputSignal")
         )
+        drivenInput = self.ApplyCalibrationDrive(normalizedInput)
         transmitterOutput = self.ApplyTransmitterIqImbalance(
-            normalizedInput
+            drivenInput
         )
         actualPaInput = self.ApplyPrePaCoupling(transmitterOutput)
         self._lastTransmitterOutput = np.array(
@@ -2453,9 +3062,10 @@ class Channel:
         """Evaluate Tx I/Q, coupled PA paths, and the selected sampler.
 
         Processing details:
-            Algorithm: Apply Tx I/Q mismatch, additive complex FIR coupling
-            before the PA bank, all nonlinear branches, output coupling, and
-            finally the forward-instrument or embedded-feedback receive path.
+            Algorithm: Apply the committed post-DAC calibration drive, Tx I/Q
+            mismatch, additive complex FIR coupling before the PA bank, all
+            nonlinear branches, output coupling, and finally the forward-
+            instrument or embedded-feedback receive path.
 
         Args:
             inputSignal: Normalized digital Tx input vector or matrix.
@@ -2467,8 +3077,9 @@ class Channel:
         normalizedInput = self.ValidateSignal(
             inputSignal, "inputSignal"
         )
+        drivenInput = self.ApplyCalibrationDrive(normalizedInput)
         transmitterOutput = self.ApplyTransmitterIqImbalance(
-            normalizedInput
+            drivenInput
         )
         actualPaInput = self.ApplyPrePaCoupling(transmitterOutput)
         self._lastTransmitterOutput = np.array(
@@ -2477,7 +3088,9 @@ class Channel:
         self._lastActualPaInput = np.array(
             actualPaInput, dtype=np.complex128, copy=True
         )
-        normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
+        normalizedPaOutput = self.ProcessBoundPaThermalPeriodFloating(
+            actualPaInput
+        )
         coupledPaOutput = self.ApplyPostPaCoupling(
             normalizedPaOutput
         )
@@ -2494,14 +3107,19 @@ class Channel:
 
         Processing details:
             Algorithm: When ``outputPowerDbm`` is provided, first run the
-            private closed loop that repeatedly adjusts the digital Tx input
-            before I/Q impairment and observes clean PA output until its
-            reference-temperature active-region power converges while the PA
-            thermal state is suspended. Restore that state, then pass the
-            converged input through the complete live PA and sampling path
-            exactly once so temperature drift remains visible in the returned
-            waveform. When the target is None, preserve the direct one-pass
-            PA-to-sampler behavior required by iterative algorithms.
+            private closed loop that selects a legal public waveform and a
+            post-decode analog drive before I/Q impairment while observing clean
+            PA output at the reference temperature. Restore the suspended
+            thermal state, commit only the converged drive, then pass the public
+            waveform through the complete live PA and sampling path exactly once
+            so temperature drift remains visible. When the target is None,
+            preserve the direct one-pass behavior with the most recently
+            committed drive, as required by iterative algorithms. When an
+            enabled PA uses the default steady-state thermal mode, a missing
+            target reuses the most recent successful target and repeats the
+            reference-temperature calibration; the first such call therefore
+            requires an explicit target. The accepted waveform is then
+            evaluated on the periodic steady-state temperature curve.
 
         Args:
             inputSignal: Public digital Tx vector or samples-by-chains matrix.
@@ -2511,11 +3129,29 @@ class Channel:
             result: Public receiver waveform with matching shape and type.
         """
 
+        self.ValidateParameters()
+        # Reject cross-module reference-plane mismatches before a closed-loop
+        # calibration can commit a new target or analog drive.
+        self.ValidateThermalReferencePlanes()
         processingInput = inputSignal
-        if outputPowerDbm is not None:
+        resolvedOutputPowerDbm = outputPowerDbm
+        usesSteadyStateThermalMode = (
+            self.IsThermalModelEnabled()
+            and str(self.parameters["thermalRunMode"]).strip().lower()
+            == "steady_state"
+        )
+        if resolvedOutputPowerDbm is None and usesSteadyStateThermalMode:
+            if self._lastCalibrationOutputPowerDbm is None:
+                raise ValueError(
+                    "the first steady-state thermal Channel.Process call "
+                    "requires outputPowerDbm so every steady-state period "
+                    "can repeat reference-temperature power calibration"
+                )
+            resolvedOutputPowerDbm = self._lastCalibrationOutputPowerDbm
+        if resolvedOutputPowerDbm is not None:
             processingInput = self.CalibratePaInput(
                 inputSignal,
-                outputPowerDbm,
+                resolvedOutputPowerDbm,
             )
             # CalibratePaInput has already restored the PA's original thermal
             # state. Re-evaluate the accepted drive once so this public call
@@ -2532,10 +3168,11 @@ class Channel:
         """Return the deterministic direct small-signal sampling-path gain.
 
         Processing details:
-            Algorithm: Multiply the Tx I/Q direct coefficient, bound PA's
-            small-signal gain, and common phase. In feedback mode also multiply
-            by the feedback I/Q and linear-path direct coefficient. Image and
-            DC terms are intentionally excluded from this one-scalar result.
+            Algorithm: Multiply the committed SISO analog drive, Tx I/Q direct
+            coefficient, bound PA small-signal gain, and common phase. In
+            feedback mode also multiply by the feedback I/Q and linear-path
+            direct coefficient. Image and DC terms are excluded from this
+            one-scalar result.
 
         Returns:
             result: Complex direct small-signal gain for the selected mode.
@@ -2559,8 +3196,22 @@ class Channel:
         transmitterDirectCoefficient, _ = (
             self.TransmitterIqCoefficients()
         )
+        if len(self._calibrationDriveDbPerChain) > 1:
+            raise ValueError(
+                "SmallSignalGain is scalar and cannot represent multiple "
+                "calibrated channel drives"
+            )
+        calibrationDriveDb = (
+            0.0
+            if not self._calibrationDriveDbPerChain
+            else self._calibrationDriveDbPerChain[0]
+        )
+        calibrationDriveScale = np.power(
+            10.0, calibrationDriveDb / 20.0
+        )
         selectedPathGain = complex(
-            transmitterDirectCoefficient
+            calibrationDriveScale
+            * transmitterDirectCoefficient
             * smallSignalGainMethod()
             * np.exp(1j * phaseRadians)
         )

@@ -59,6 +59,7 @@ from inc.lib.PaModel import (
     DohertyConfig,
     DohertyPA,
     GMPConfig,
+    IQImbalancePA,
     MimoPaModel,
     PaModel,
     RappConfig,
@@ -2048,6 +2049,273 @@ def CheckPowerEvmCurve() -> None:
         },
     ).Analyze()
     assert abs(fixedBurstMetrics["outputPowerDbm"] - 22.0) < 0.01
+    fixedReplayedBurst = fixedPaModel.Process(fixedCalibratedInput)
+    assert np.array_equal(fixedReplayedBurst, fixedCalibratedBurst)
+
+    fixedMimoPaModel = MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "paParametersPerChain": (
+                {"modelName": "wiener"},
+                {"modelName": "gmp"},
+            ),
+            "width": 16,
+        }
+    )
+    fixedMimoCalibration = PowerCalibration(
+        paModel=fixedMimoPaModel,
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "outputPowerDbmPerChain": (18.0, 20.0),
+            "calibrationToleranceDb": 0.25,
+            "maximumCalibrationIterations": 60,
+            "width": 16,
+        },
+    )
+    fixedMimoInput = np.column_stack(
+        (fixedInputBurst, fixedInputBurst)
+    )
+    fixedMimoCalibratedInput = fixedMimoCalibration.Calibrate(
+        fixedMimoInput
+    )
+    fixedMimoAcceptedOutput = fixedMimoCalibration.GetLastPaOutput()
+    fixedMimoReplayedOutput = fixedMimoPaModel.Process(
+        fixedMimoCalibratedInput
+    )
+    assert np.array_equal(
+        fixedMimoReplayedOutput, fixedMimoAcceptedOutput
+    )
+    fixedMimoMetrics = fixedMimoCalibration.GetLastCalibrationMetrics()
+    assert np.all(
+        np.abs(
+            np.asarray(
+                fixedMimoMetrics["measuredOutputPowerDbmPerChain"]
+            )
+            - np.asarray((18.0, 20.0))
+        )
+        <= 0.25
+    )
+
+    # A fixed-only third-party plant without a post-decode drive interface can
+    # still have a genuinely unreachable target. The failure must preserve a
+    # useful best measurement instead of merely reporting an iteration limit.
+    class UnreachableFixedPa:
+        """Return a deterministic 10 dBm active waveform for every trial."""
+
+        def __init__(self) -> None:
+            """Initialize the synthetic PA at the shared 16-bit boundary.
+
+            Processing details:
+                Algorithm: Store the external word width used by
+                ``PowerCalibration.SetPaModel`` compatibility validation.
+
+            Returns:
+                result: None. The constant-output plant is ready.
+            """
+
+            self.width = 16
+
+        def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+            """Return a phase-preserving active burst at exactly 10 dBm.
+
+            Processing details:
+                Algorithm: Decode the public trial, retain its active support
+                and sample phase, replace every active magnitude by the
+                normalized RMS for 10 dBm under a 25 dBm full-scale mapping,
+                and encode the result once.
+
+            Args:
+                inputSignal: Public 16-bit trial waveform.
+
+            Returns:
+                result: Public fixed-point waveform whose active RMS is 10 dBm.
+            """
+
+            fixedFormat = FixedPoint(self.width)
+            floatingInput = fixedFormat.DecodeComplex(inputSignal)
+            activeSamples = np.abs(floatingInput) > np.finfo(float).tiny
+            floatingOutput = np.zeros_like(
+                floatingInput, dtype=np.complex128
+            )
+            outputRms = np.power(10.0, (10.0 - 25.0) / 20.0)
+            floatingOutput[activeSamples] = outputRms * np.exp(
+                1j * np.angle(floatingInput[activeSamples])
+            )
+            return fixedFormat.EncodeComplex(floatingOutput)
+
+    unreachableCalibration = PowerCalibration(
+        paModel=UnreachableFixedPa(),
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "outputPowerDbm": 20.0,
+            "calibrationToleranceDb": 0.1,
+            "maximumCalibrationIterations": 6,
+            "width": 16,
+        },
+    )
+    try:
+        unreachableCalibration.Calibrate(fixedInputBurst)
+    except RuntimeError as error:
+        failureMessage = str(error)
+        assert "did not converge" in failureMessage
+        assert "target" in failureMessage
+        assert "best measured" in failureMessage
+    else:
+        raise AssertionError("an unreachable fixed-point target converged")
+    failureMetrics = unreachableCalibration.GetLastCalibrationMetrics()
+    assert failureMetrics["converged"] is False
+    assert failureMetrics["targetOutputPowerDbmPerChain"] == (20.0,)
+    assert np.isclose(
+        failureMetrics["measuredOutputPowerDbmPerChain"][0],
+        10.0,
+        atol=0.15,
+    )
+    assert np.isclose(
+        failureMetrics["errorDbPerChain"][0], 10.0, atol=0.15
+    )
+    assert 1 <= failureMetrics["iterationCount"] <= 6
+    assert "analogDriveDbPerChain" not in failureMetrics
+
+    # Repeated legacy codes can reflect an ordinary quantization step rather
+    # than digital full scale. A deliberately tiny learning rate must exhaust
+    # its configured trial budget without reporting a false clipping plateau.
+    class LegacyFixedLinearPa:
+        """Apply a fixed linear gain without a post-decode drive protocol."""
+
+        def __init__(self, gain: float = 0.8) -> None:
+            """Initialize the legacy adapter at an 8-bit public boundary.
+
+            Processing details:
+                Algorithm: Store the public width used by compatibility
+                validation and a mutable scalar plant gain while intentionally
+                omitting the paired calibration drive methods.
+
+            Args:
+                gain: Finite linear complex-envelope amplitude gain.
+
+            Returns:
+                result: None. The linear legacy plant is ready.
+            """
+
+            self.width = 8
+            self.gain = float(gain)
+
+        def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+            """Apply a finite linear gain across the fixed-point boundary.
+
+            Processing details:
+                Algorithm: Decode signed 8-bit I/Q codes, multiply every
+                complex sample by 0.8, and encode the output once.
+
+            Args:
+                inputSignal: Public 8-bit complex I/Q codes.
+
+            Returns:
+                result: Public fixed-point output from the reachable plant.
+            """
+
+            fixedFormat = FixedPoint(self.width)
+            floatingInput = fixedFormat.DecodeComplex(inputSignal)
+            return fixedFormat.EncodeComplex(self.gain * floatingInput)
+
+    legacyCalibration = PowerCalibration(
+        paModel=LegacyFixedLinearPa(),
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "outputPowerDbm": 20.0,
+            "calibrationToleranceDb": 0.01,
+            "maximumCalibrationIterations": 6,
+            "calibrationLearningRate": 1.0e-4,
+            "width": 8,
+        },
+    )
+    legacyInputBurst = FixedPoint(8).EncodeComplex(paddedBurst / 3.0)
+    try:
+        legacyCalibration.Calibrate(legacyInputBurst)
+    except RuntimeError:
+        legacyMetrics = legacyCalibration.GetLastCalibrationMetrics()
+        assert legacyMetrics["iterationCount"] == 6
+        assert "every nonzero" not in legacyMetrics["failureReason"]
+        assert "analogDriveDbPerChain" not in legacyMetrics
+    else:
+        raise AssertionError("the tiny-step legacy test unexpectedly converged")
+
+    asymmetricLegacyCalibration = PowerCalibration(
+        paModel=LegacyFixedLinearPa(),
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "outputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.01,
+            "maximumCalibrationIterations": 6,
+            "calibrationLearningRate": 1.0e-4,
+            "width": 8,
+        },
+    )
+    asymmetricLegacyInput = FixedPoint(8).EncodeComplex(
+        np.full(128, 0.5 + 0.05j, dtype=np.complex128)
+    )
+    try:
+        asymmetricLegacyCalibration.Calibrate(asymmetricLegacyInput)
+    except RuntimeError:
+        asymmetricLegacyMetrics = (
+            asymmetricLegacyCalibration.GetLastCalibrationMetrics()
+        )
+        assert asymmetricLegacyMetrics["iterationCount"] == 6
+        assert "every nonzero" not in (
+            asymmetricLegacyMetrics["failureReason"]
+        )
+    else:
+        raise AssertionError(
+            "the asymmetric tiny-step legacy test unexpectedly converged"
+        )
+
+    # A terminal codeword is only a blocker when output power is too low.
+    # If a changed plant makes the same codeword too powerful, calibration must
+    # reduce drive, leave the rail, and find the lower reachable operating point.
+    mutableLegacyPa = LegacyFixedLinearPa(gain=0.7)
+    railEscapeCalibration = PowerCalibration(
+        paModel=mutableLegacyPa,
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "outputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.25,
+            "maximumCalibrationIterations": 60,
+            "calibrationLearningRate": 0.8,
+            "width": 8,
+        },
+    )
+    terminalInput = FixedPoint(8).EncodeComplex(
+        np.full(128, 0.5 + 0.5j, dtype=np.complex128)
+    )
+    railEscapeCalibration.Calibrate(terminalInput)
+    mutableLegacyPa.gain = 0.9
+    railEscapeCalibration.UpdateParameters(
+        calibrationToleranceDb=0.05,
+        maximumCalibrationIterations=500,
+        calibrationLearningRate=0.01,
+    )
+    escapedRailInput = railEscapeCalibration.Calibrate(terminalInput)
+    escapedRailMetrics = railEscapeCalibration.GetLastCalibrationMetrics()
+    assert escapedRailMetrics["converged"] is True
+    assert abs(
+        escapedRailMetrics["measuredOutputPowerDbmPerChain"][0] - 25.0
+    ) <= 0.05
+    assert np.max(np.abs(escapedRailInput.real)) < 127.0
+    assert np.max(np.abs(escapedRailInput.imag)) < 127.0
+
+    for invalidPowerParameters in (
+        {"width": 1},
+        {"width": 2, "calibrationDigitalHeadroomDb": 60.0},
+        {"width": 8, "calibrationDigitalHeadroomDb": 49.0},
+    ):
+        try:
+            PowerCalibration(parameters=invalidPowerParameters)
+        except ValueError as error:
+            assert "Allowed" in str(error) or "at least 2" in str(error)
+        else:
+            raise AssertionError(
+                "an unusable fixed-point calibration format was accepted"
+            )
 
     voltageCalibratedBurst = (
         floatingCalibration.ScaleSignalToOutputPower(
@@ -3600,9 +3868,9 @@ def CheckPaThermalModel() -> None:
     Processing details:
         Algorithm: Compare static and Foster state behavior, confirm higher
         duty cycle produces more heat, prove reference-temperature calibration
-        does not advance thermal time, and verify the public Channel.Process
-        entry automatically performs cold calibration before one live thermal
-        transmission while output power remains free to drift between frames.
+        does not advance thermal time, and explicitly select transient Channel
+        scheduling before verifying that cold calibration precedes each live
+        thermal transmission while output power remains free to drift.
 
     Returns:
         result: None. Assertions identify thermal state or workflow failures.
@@ -3752,6 +4020,8 @@ def CheckPaThermalModel() -> None:
         paModel=thermalPa,
         parameters={
             "sampleRateHz": thermalConfig.sampleRateHz,
+            "thermalRunMode": "transient",
+            "thermalDutyCycle": 1.0,
             "maximumOutputPowerDbm": 25.0,
             "calibrationToleranceDb": 0.05,
             "width": 0,
@@ -3834,6 +4104,1412 @@ def CheckPaThermalModel() -> None:
         "averageDissipatedPowerW"
     ]
     assert mimoThermalPa.paModels[1]._externalTemperatureOffsetC > 0.0
+
+
+def CheckThermalDisableAndCalibrationBypass() -> None:
+    """Verify authoritative thermal disable and cold calibration transactions.
+
+    Processing details:
+        Algorithm: Compare disabled and absent thermal models at floating and
+        fixed public boundaries, reject direct construction of a disabled
+        ThermalNetwork, clear a retained MIMO heating offset on a live disable,
+        exercise explicit suspension and live disable before restoration, and
+        prove successful and failed direct calibrations preserve exact thermal
+        state while observing the reference-temperature electrical PA. Repeat
+        the transaction through a bound Process method, an IQ wrapper, and a
+        small MIMO bank, then verify a thermally disabled steady-mode Channel
+        never requires an output-power target.
+
+    Returns:
+        result: None. Assertions identify thermal-disable or calibration-state
+        regressions at every supported public PA boundary.
+    """
+
+    disabledThermalConfig = ThermalConfig(
+        enabled=False,
+        modelName="single_rc",
+        sampleRateHz=100.0e3,
+        ambientTemperatureC=25.0,
+        initialJunctionTemperatureC=125.0,
+        referenceTemperatureC=25.0,
+        thermalResistancesCPerW=(40.0,),
+        thermalTimeConstantsSec=(0.01,),
+        thermalUpdateIntervalSamples=16,
+        idleDissipatedPowerW=0.0,
+        referenceOutputPowerDbm=25.0,
+        gainTemperatureCoefficientDbPerC=-0.10,
+        phaseTemperatureCoefficientDegreesPerC=0.25,
+        saturationTemperatureCoefficientPerC=-0.003,
+        nonlinearityTemperatureCoefficientPerC=0.01,
+        maximumJunctionTemperatureC=150.0,
+    )
+    enabledThermalConfig = replace(
+        disabledThermalConfig,
+        enabled=True,
+        initialJunctionTemperatureC=70.0,
+    )
+    floatingInput = 0.23 * np.exp(
+        1j * np.linspace(0.0, 3.0 * np.pi, 192, endpoint=False)
+    )
+
+    # A disabled ThermalConfig is a PaModel switch, not a request to build a
+    # lower-level network that could accidentally ignore the switch.
+    try:
+        ThermalNetwork(disabledThermalConfig)
+    except ValueError as error:
+        assert "enabled=True" in str(error)
+    else:
+        raise AssertionError(
+            "ThermalNetwork accepted ThermalConfig(enabled=False)"
+        )
+
+    # Disabled thermal parameters, even deliberately extreme ones, must be
+    # numerically indistinguishable from omitting thermalConfig altogether.
+    for interfaceWidth in (0, 16):
+        noThermalPa = PaModel(
+            parameters={"modelName": "rapp", "width": interfaceWidth}
+        )
+        disabledThermalPa = PaModel(
+            parameters={
+                "modelName": "rapp",
+                "thermalConfig": disabledThermalConfig,
+                "width": interfaceWidth,
+            }
+        )
+        publicInput = (
+            floatingInput
+            if interfaceWidth == 0
+            else FixedPoint(interfaceWidth).EncodeComplex(floatingInput)
+        )
+        referenceOutput = noThermalPa.Process(publicInput)
+        disabledOutput = disabledThermalPa.Process(publicInput)
+        assert np.array_equal(disabledOutput, referenceOutput)
+        assert disabledThermalPa.GetThermalMetrics() == {"enabled": False}
+        assert disabledThermalPa.thermalNetwork is None
+        assert np.isclose(
+            disabledThermalPa._externalTemperatureOffsetC, 0.0
+        )
+
+    # A live True-to-False update must erase neighbor-induced temperature
+    # state immediately and must not retain a hidden offset for re-enablement.
+    liveDisablePa = PaModel(
+        parameters={
+            "modelName": "rapp",
+            "thermalConfig": enabledThermalConfig,
+            "width": 0,
+        }
+    )
+    liveDisablePa.SetExternalTemperatureOffsetC(9.0)
+    assert np.isclose(liveDisablePa._externalTemperatureOffsetC, 9.0)
+    liveDisablePa.UpdateParameters(
+        thermalConfig=disabledThermalConfig
+    )
+    assert liveDisablePa.GetThermalMetrics() == {"enabled": False}
+    assert liveDisablePa.thermalNetwork is None
+    assert np.isclose(liveDisablePa._externalTemperatureOffsetC, 0.0)
+    assert np.array_equal(
+        liveDisablePa.Process(floatingInput),
+        PaModel(modelName="rapp", width=0).Process(floatingInput),
+    )
+    liveDisablePa.SetExternalTemperatureOffsetC(12.0)
+    assert np.isclose(liveDisablePa._externalTemperatureOffsetC, 0.0)
+
+    # Suspension must bypass every temperature-application entry, not only
+    # the usual Process path. Nested transactions are rejected because one
+    # snapshot cannot safely represent two independently owned restores.
+    transactionPa = PaModel(
+        parameters={
+            "modelName": "rapp",
+            "thermalConfig": enabledThermalConfig,
+            "width": 0,
+        }
+    )
+    coldElectricalOutput = PaModel(
+        modelName="rapp", width=0
+    ).ProcessFloating(floatingInput)
+    hotElectricalOutput = transactionPa.ProcessAtTemperatureFloating(
+        floatingInput, 125.0
+    )
+    assert not np.allclose(hotElectricalOutput, coldElectricalOutput)
+    transactionPa.SetExternalTemperatureOffsetC(6.0)
+    thermalSnapshot = transactionPa.SuspendThermalModel()
+    assert thermalSnapshot is not None
+    assert np.array_equal(
+        transactionPa.ApplyTemperatureDrift(
+            coldElectricalOutput, 125.0
+        ),
+        coldElectricalOutput,
+    )
+    assert np.array_equal(
+        transactionPa.ProcessAtTemperatureFloating(
+            floatingInput, 125.0
+        ),
+        coldElectricalOutput,
+    )
+    try:
+        transactionPa.SuspendThermalModel()
+    except RuntimeError as error:
+        assert "already suspended" in str(error)
+    else:
+        raise AssertionError("nested thermal suspension was accepted")
+
+    # A live disable issued during the suspended interval is authoritative;
+    # restoring the older snapshot must not revive heat or mutual coupling.
+    transactionPa.UpdateParameters(
+        thermalConfig=disabledThermalConfig
+    )
+    transactionPa.RestoreThermalModel(thermalSnapshot)
+    assert transactionPa.GetThermalMetrics() == {"enabled": False}
+    assert transactionPa.thermalNetwork is None
+    assert np.isclose(transactionPa._externalTemperatureOffsetC, 0.0)
+    assert np.array_equal(
+        transactionPa.Process(floatingInput), coldElectricalOutput
+    )
+
+    # Warm the PA and add a mutual-heating contribution before calibration so
+    # exact restoration covers branch temperatures, elapsed time, diagnostics,
+    # and external temperature rise rather than only a pristine network.
+    hotCalibrationPa = PaModel(
+        parameters={
+            "modelName": "rapp",
+            "thermalConfig": enabledThermalConfig,
+            "width": 0,
+        }
+    )
+    warmupSignal = np.full(
+        160, 0.42 + 0.03j, dtype=np.complex128
+    )
+    hotCalibrationPa.Process(warmupSignal)
+    hotCalibrationPa.SetExternalTemperatureOffsetC(4.0)
+    thermalMetricsBeforeSuccess = hotCalibrationPa.GetThermalMetrics()
+    assert thermalMetricsBeforeSuccess["elapsedTimeSec"] > 0.0
+    assert np.isclose(
+        thermalMetricsBeforeSuccess["mutualHeatingTemperatureRiseC"],
+        4.0,
+    )
+    calibrationInput = np.concatenate(
+        (
+            np.zeros(16, dtype=np.complex128),
+            floatingInput,
+            np.zeros(16, dtype=np.complex128),
+        )
+    )
+    commonCalibrationParameters = {
+        "outputPowerDbm": 18.0,
+        "maximumOutputPowerDbm": 25.0,
+        "calibrationToleranceDb": 0.02,
+        "maximumCalibrationIterations": 30,
+        "width": 0,
+    }
+    hotCalibration = PowerCalibration(
+        paModel=hotCalibrationPa,
+        parameters=commonCalibrationParameters,
+    )
+    # The electrical loop is deliberately exposed only as a guarded kernel.
+    # Bypassing Calibrate must fail before either PA or thermal state changes.
+    thermalMetricsBeforeRejectedKernel = (
+        hotCalibrationPa.GetThermalMetrics()
+    )
+    try:
+        hotCalibration.CalibrateElectricalOnly(calibrationInput)
+    except RuntimeError as error:
+        assert "internal numerical kernel" in str(error)
+        assert "call Calibrate" in str(error)
+    else:
+        raise AssertionError(
+            "CalibrateElectricalOnly ran outside its thermal transaction"
+        )
+    assert (
+        hotCalibrationPa.GetThermalMetrics()
+        == thermalMetricsBeforeRejectedKernel
+    )
+    coldCalibrationPa = PaModel(modelName="rapp", width=0)
+    coldCalibration = PowerCalibration(
+        paModel=coldCalibrationPa,
+        parameters=commonCalibrationParameters,
+    )
+    hotCalibratedInput = hotCalibration.Calibrate(calibrationInput)
+    coldCalibratedInput = coldCalibration.Calibrate(calibrationInput)
+    assert np.array_equal(hotCalibratedInput, coldCalibratedInput)
+    assert np.array_equal(
+        hotCalibration.GetLastPaOutput(),
+        coldCalibration.GetLastPaOutput(),
+    )
+    assert (
+        hotCalibration.GetLastCalibrationMetrics()
+        == coldCalibration.GetLastCalibrationMetrics()
+    )
+    assert (
+        hotCalibrationPa.GetThermalMetrics()
+        == thermalMetricsBeforeSuccess
+    )
+    assert np.isclose(
+        hotCalibrationPa._externalTemperatureOffsetC, 4.0
+    )
+
+    # Passing PaModel.Process directly must discover the owning PA's width,
+    # drive protocol, and thermal transaction through the bound method.
+    thermalMetricsBeforeBoundMethod = (
+        hotCalibrationPa.GetThermalMetrics()
+    )
+    boundMethodCalibration = PowerCalibration(
+        paModel=hotCalibrationPa.Process,
+        parameters=commonCalibrationParameters,
+    )
+    boundMethodInput = boundMethodCalibration.Calibrate(calibrationInput)
+    assert np.array_equal(boundMethodInput, coldCalibratedInput)
+    assert np.array_equal(
+        boundMethodCalibration.GetLastPaOutput(),
+        coldCalibration.GetLastPaOutput(),
+    )
+    assert (
+        hotCalibrationPa.GetThermalMetrics()
+        == thermalMetricsBeforeBoundMethod
+    )
+
+    # Even an exception from a deliberately under-budgeted calibration must
+    # execute the finally restore and leave the exact hot snapshot untouched.
+    failureParameters = {
+        "outputPowerDbm": 24.37,
+        "calibrationToleranceDb": 1.0e-12,
+        "maximumCalibrationIterations": 1,
+    }
+    hotCalibration.UpdateParameters(**failureParameters)
+    coldCalibration.UpdateParameters(**failureParameters)
+    thermalMetricsBeforeFailure = hotCalibrationPa.GetThermalMetrics()
+    try:
+        hotCalibration.Calibrate(calibrationInput)
+    except RuntimeError as error:
+        assert "did not converge" in str(error)
+    else:
+        raise AssertionError(
+            "one-iteration hot calibration unexpectedly converged"
+        )
+    try:
+        coldCalibration.Calibrate(calibrationInput)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(
+            "one-iteration cold calibration unexpectedly converged"
+        )
+    assert (
+        hotCalibrationPa.GetThermalMetrics()
+        == thermalMetricsBeforeFailure
+    )
+    hotFailureMetrics = hotCalibration.GetLastCalibrationMetrics()
+    coldFailureMetrics = coldCalibration.GetLastCalibrationMetrics()
+    assert hotFailureMetrics["converged"] is False
+    assert coldFailureMetrics["converged"] is False
+    assert np.allclose(
+        hotFailureMetrics["measuredOutputPowerDbmPerChain"],
+        coldFailureMetrics["measuredOutputPowerDbmPerChain"],
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+
+    # A hostile measurement callback must not replace the PA after its old
+    # thermal snapshot has been captured. Otherwise the finalizer could restore
+    # that snapshot into the wrong physical device and strand the old PA in its
+    # suspended state.
+    class RebindingThermalPlant:
+        """Attempt to replace the bound PA from inside a calibration trial."""
+
+        def __init__(
+            self,
+            wrappedPa: PaModel,
+            replacementPa: PaModel,
+        ) -> None:
+            """Retain two thermal PAs and an initially unbound calibrator.
+
+            Processing details:
+                Algorithm: Expose the wrapped PA's public width and paired
+                thermal protocol while retaining a distinct replacement PA
+                that the malicious Process callback will try to install.
+
+            Args:
+                wrappedPa: Original PA whose thermal state will be suspended.
+                replacementPa: Different PA proposed during the active trial.
+
+            Returns:
+                result: None. The adversarial callback is ready for binding.
+            """
+
+            self.wrappedPa = wrappedPa
+            self.replacementPa = replacementPa
+            self.calibrator = None
+            self.width = wrappedPa.width
+
+        def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+            """Try to rebind the calibrator before evaluating the old PA.
+
+            Processing details:
+                Algorithm: Require the test to install its PowerCalibration,
+                request an illegal active-transaction PA replacement, and
+                delegate only if that safety guard unexpectedly permits it.
+
+            Args:
+                inputSignal: Floating calibration trial waveform.
+
+            Returns:
+                result: Wrapped-PA output only if the forbidden rebind succeeds.
+            """
+
+            if not isinstance(self.calibrator, PowerCalibration):
+                raise RuntimeError("test calibrator was not attached")
+            self.calibrator.SetPaModel(self.replacementPa)
+            return self.wrappedPa.Process(inputSignal)
+
+        def SuspendThermalModel(self) -> object:
+            """Snapshot and suspend the original wrapped thermal PA.
+
+            Processing details:
+                Algorithm: Delegate snapshot ownership to the original PA so
+                the test can verify that calibration restores the same owner.
+
+            Returns:
+                result: Opaque snapshot created by the original wrapped PA.
+            """
+
+            return self.wrappedPa.SuspendThermalModel()
+
+        def RestoreThermalModel(self, thermalSnapshot: object) -> None:
+            """Restore a captured snapshot only to the original wrapped PA.
+
+            Processing details:
+                Algorithm: Delegate the final transaction step to the PA that
+                created the snapshot, never to the proposed replacement PA.
+
+            Args:
+                thermalSnapshot: Opaque original-PA thermal snapshot.
+
+            Returns:
+                result: None. The original PA resumes its prior hot state.
+            """
+
+            self.wrappedPa.RestoreThermalModel(thermalSnapshot)
+
+    replacementPa = PaModel(
+        parameters={
+            "modelName": "rapp",
+            "thermalConfig": enabledThermalConfig,
+            "width": 0,
+        }
+    )
+    replacementPa.Process(0.5 * warmupSignal)
+    replacementPa.SetExternalTemperatureOffsetC(2.0)
+    originalMetricsBeforeRebind = hotCalibrationPa.GetThermalMetrics()
+    replacementMetricsBeforeRebind = replacementPa.GetThermalMetrics()
+    rebindingPlant = RebindingThermalPlant(
+        hotCalibrationPa, replacementPa
+    )
+    rebindingCalibration = PowerCalibration(
+        paModel=rebindingPlant,
+        parameters=commonCalibrationParameters,
+    )
+    rebindingPlant.calibrator = rebindingCalibration
+    try:
+        rebindingCalibration.Calibrate(calibrationInput[:128])
+    except RuntimeError as error:
+        assert "cannot rebind" in str(error)
+        assert "active calibration transaction" in str(error)
+    else:
+        raise AssertionError(
+            "calibration callback replaced its PA during a transaction"
+        )
+    assert (
+        hotCalibrationPa.GetThermalMetrics()
+        == originalMetricsBeforeRebind
+    )
+    assert (
+        replacementPa.GetThermalMetrics()
+        == replacementMetricsBeforeRebind
+    )
+    assert hotCalibrationPa._thermalEffectsSuspended is False
+    assert replacementPa._thermalEffectsSuspended is False
+
+    # IQ and MIMO facades must forward the same transaction protocol. Small
+    # waveforms and relaxed tolerances keep this architectural check quick.
+    iqThermalPa = PaModel(
+        parameters={
+            "modelName": "rapp",
+            "thermalConfig": enabledThermalConfig,
+            "width": 0,
+        }
+    )
+    iqThermalPa.Process(warmupSignal)
+    iqWrappedPa = IQImbalancePA(
+        iqThermalPa,
+        directCoefficient=0.99 + 0.01j,
+        imageCoefficient=0.02 - 0.005j,
+    )
+    iqMetricsBeforeCalibration = iqWrappedPa.GetThermalMetrics()
+    iqCalibration = PowerCalibration(
+        paModel=iqWrappedPa,
+        parameters={
+            "outputPowerDbm": 16.0,
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "maximumCalibrationIterations": 24,
+            "width": 0,
+        },
+    )
+    iqCalibration.Calibrate(calibrationInput[:128])
+    assert iqWrappedPa.GetThermalMetrics() == iqMetricsBeforeCalibration
+
+    mimoCalibrationPa = MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "paParametersPerChain": (
+                {
+                    "modelName": "rapp",
+                    "thermalConfig": enabledThermalConfig,
+                },
+                {
+                    "modelName": "rapp",
+                    "thermalConfig": enabledThermalConfig,
+                },
+            ),
+            "thermalCouplingCPerW": (
+                (0.0, 1.0),
+                (1.5, 0.0),
+            ),
+            "width": 0,
+        }
+    )
+    mimoInput = np.column_stack(
+        (calibrationInput[:128], 0.7j * calibrationInput[:128])
+    )
+    mimoCalibrationPa.Process(mimoInput)
+    mimoMetricsBeforeCalibration = (
+        mimoCalibrationPa.GetThermalMetrics()
+    )
+    mimoCalibration = PowerCalibration(
+        paModel=mimoCalibrationPa,
+        parameters={
+            "outputPowerDbmPerChain": (16.0, 17.0),
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "maximumCalibrationIterations": 24,
+            "width": 0,
+        },
+    )
+    mimoCalibration.Calibrate(mimoInput)
+    assert (
+        mimoCalibrationPa.GetThermalMetrics()
+        == mimoMetricsBeforeCalibration
+    )
+
+    # Default steady-state scheduling is irrelevant when the PA reports that
+    # thermal effects are disabled, so a first target-free call remains valid.
+    disabledChannel = Channel(
+        paModel=PaModel(
+            parameters={
+                "modelName": "rapp",
+                "thermalConfig": disabledThermalConfig,
+                "width": 0,
+            }
+        ),
+        parameters={"width": 0},
+    )
+    targetFreeOutput = disabledChannel.Process(floatingInput)
+    assert targetFreeOutput.shape == floatingInput.shape
+    assert np.all(np.isfinite(targetFreeOutput))
+    assert disabledChannel.GetThermalMetrics() == {"enabled": False}
+
+
+def CheckChannelPeriodicThermalModes() -> None:
+    """Verify Channel periodic steady-state and transient thermal scheduling.
+
+    Processing details:
+        Algorithm: Validate every scheduling control, use a waveform containing
+        an internal idle region to distinguish configured and actual duty,
+        require a closed steady-state temperature cycle, prove every steady
+        call repeats reference-temperature power calibration, compare causal
+        transient periods, and exercise per-chain MIMO duty reporting.
+
+    Returns:
+        result: None. Assertions identify periodic thermal regressions.
+    """
+
+    defaultParameters = Channel(parameters={"width": 0}).GetParameters()
+    assert defaultParameters["thermalRunMode"] == "steady_state"
+    assert np.isclose(defaultParameters["thermalDutyCycle"], 1.0)
+    assert defaultParameters["thermalSteadyStateToleranceC"] > 0.0
+    assert defaultParameters["maximumThermalSteadyStateIterations"] >= 1
+
+    invalidThermalParameters = (
+        ({"thermalRunMode": "periodic"}, "thermalRunMode", "Allowed values"),
+        ({"thermalRunMode": 1}, "thermalRunMode", "Allowed values"),
+        ({"thermalDutyCycle": 0.0}, "thermalDutyCycle", "Allowed range"),
+        ({"thermalDutyCycle": 1.01}, "thermalDutyCycle", "Allowed range"),
+        ({"thermalDutyCycle": True}, "thermalDutyCycle", "Allowed range"),
+        (
+            {"thermalSteadyStateToleranceC": 0.0},
+            "thermalSteadyStateToleranceC",
+            "Allowed range",
+        ),
+        (
+            {"thermalSteadyStateToleranceC": float("nan")},
+            "thermalSteadyStateToleranceC",
+            "Allowed range",
+        ),
+        (
+            {"maximumThermalSteadyStateIterations": 0},
+            "maximumThermalSteadyStateIterations",
+            "Allowed range",
+        ),
+        (
+            {"maximumThermalSteadyStateIterations": 1.5},
+            "maximumThermalSteadyStateIterations",
+            "Allowed range",
+        ),
+    )
+    for invalidParameters, parameterName, expectedPhrase in (
+        invalidThermalParameters
+    ):
+        try:
+            Channel(parameters={"width": 0, **invalidParameters})
+        except ValueError as error:
+            errorMessage = str(error)
+            assert parameterName in errorMessage
+            assert expectedPhrase in errorMessage
+        else:
+            raise AssertionError(
+                f"invalid periodic thermal setting accepted: {parameterName}"
+            )
+
+    thermalConfig = ThermalConfig(
+        enabled=True,
+        modelName="single_rc",
+        sampleRateHz=100.0e3,
+        thermalResistancesCPerW=(20.0,),
+        thermalTimeConstantsSec=(5.0e-3,),
+        thermalUpdateIntervalSamples=50,
+        idleDissipatedPowerW=0.0,
+        referenceOutputPowerDbm=25.0,
+        gainTemperatureCoefficientDbPerC=-0.03,
+        maximumJunctionTemperatureC=200.0,
+    )
+    activeSamples = np.full(500, 0.25 + 0.05j, dtype=np.complex128)
+    idleSamples = np.zeros(500, dtype=np.complex128)
+    periodicInput = np.concatenate((activeSamples, idleSamples))
+    steadyPa = PaModel(
+        parameters={
+            "modelName": "wiener",
+            "thermalConfig": thermalConfig,
+            "width": 0,
+        }
+    )
+    steadyChannel = Channel(
+        paModel=steadyPa,
+        parameters={
+            "sampleRateHz": thermalConfig.sampleRateHz,
+            "thermalRunMode": "steady_state",
+            "thermalDutyCycle": 0.4,
+            "thermalSteadyStateToleranceC": 1.0e-6,
+            "maximumThermalSteadyStateIterations": 100,
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "width": 0,
+        },
+    )
+
+    # The configured duty counts the complete data window. Half of this test
+    # window is internally idle, so its true RF-active duty is 0.4 * 0.5.
+    assert np.isclose(steadyChannel.GetActualDutyCycle(periodicInput), 0.2)
+    try:
+        steadyChannel.Process(periodicInput)
+    except ValueError as error:
+        assert "requires outputPowerDbm" in str(error)
+    else:
+        raise AssertionError(
+            "the first steady-state period ran without a power target"
+        )
+
+    firstSteadyOutput = steadyChannel.Process(
+        periodicInput,
+        outputPowerDbm=18.0,
+    )
+    firstSteadyMetrics = steadyChannel.GetThermalMetrics()
+    firstCalibrationMetrics = steadyChannel.GetLastCalibrationMetrics()
+    assert firstCalibrationMetrics["converged"]
+    assert firstCalibrationMetrics["targetOutputPowerDbmPerChain"] == (18.0,)
+    assert abs(
+        firstCalibrationMetrics["measuredOutputPowerDbmPerChain"][0] - 18.0
+    ) <= 0.05
+    assert firstSteadyMetrics["thermalRunMode"] == "steady_state"
+    assert firstSteadyMetrics["steadyStateConverged"]
+    assert firstSteadyMetrics["steadyStateIterations"] >= 1
+    assert firstSteadyMetrics["steadyStateErrorC"] <= 1.0e-6
+    assert np.isclose(firstSteadyMetrics["configuredDutyCycle"], 0.4)
+    assert np.isclose(firstSteadyMetrics["waveformActiveDutyCycle"], 0.5)
+    assert np.isclose(firstSteadyMetrics["activeSampleDutyCycle"], 0.5)
+    assert np.isclose(firstSteadyMetrics["actualDutyCycle"], 0.2)
+    assert np.isclose(steadyChannel.GetActualDutyCycle(), 0.2)
+    assert np.isclose(firstSteadyMetrics["signalDurationSec"], 0.01)
+    assert np.isclose(firstSteadyMetrics["periodDurationSec"], 0.025)
+    assert np.isclose(
+        firstSteadyMetrics["scheduledIdleDurationSec"], 0.015
+    )
+    assert np.isclose(firstSteadyMetrics["elapsedTimeSec"], 0.025)
+    assert abs(
+        firstSteadyMetrics["periodEndingJunctionTemperatureC"]
+        - firstSteadyMetrics["periodStartingJunctionTemperatureC"]
+    ) <= 1.0e-6
+    assert (
+        firstSteadyMetrics["dataEndingJunctionTemperatureC"]
+        > firstSteadyMetrics["periodStartingJunctionTemperatureC"]
+    )
+    temperatureTrace = np.asarray(
+        firstSteadyMetrics["temperatureTraceC"], dtype=float
+    )
+    activityTrace = tuple(
+        firstSteadyMetrics["temperatureTraceRfActive"]
+    )
+    assert any(activityTrace)
+    assert not all(activityTrace)
+    assert np.max(temperatureTrace) > temperatureTrace[-2]
+    assert temperatureTrace[-1] < temperatureTrace[-2]
+
+    # Omitting the target after the first accepted request must reuse 18 dBm
+    # and recalibrate. Scaling the raw active samples by five therefore leaves
+    # the accepted steady-state output unchanged rather than reducing it by 5x.
+    secondSteadyOutput = steadyChannel.Process(0.2 * periodicInput)
+    secondSteadyMetrics = steadyChannel.GetThermalMetrics()
+    secondCalibrationMetrics = steadyChannel.GetLastCalibrationMetrics()
+    assert secondCalibrationMetrics["converged"]
+    assert secondCalibrationMetrics["targetOutputPowerDbmPerChain"] == (18.0,)
+    assert abs(
+        secondCalibrationMetrics["measuredOutputPowerDbmPerChain"][0] - 18.0
+    ) <= 0.05
+    assert np.allclose(
+        secondSteadyOutput,
+        firstSteadyOutput,
+        rtol=1.0e-9,
+        atol=1.0e-12,
+    )
+    assert np.isclose(secondSteadyMetrics["elapsedTimeSec"], 0.05)
+    assert abs(
+        secondSteadyMetrics["periodEndingJunctionTemperatureC"]
+        - secondSteadyMetrics["periodStartingJunctionTemperatureC"]
+    ) <= 1.0e-6
+
+    transientPa = PaModel(
+        parameters={
+            "modelName": "wiener",
+            "thermalConfig": thermalConfig,
+            "width": 0,
+        }
+    )
+    transientChannel = Channel(
+        paModel=transientPa,
+        parameters={
+            "sampleRateHz": thermalConfig.sampleRateHz,
+            "thermalRunMode": "transient",
+            "thermalDutyCycle": 0.4,
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "width": 0,
+        },
+    )
+    transientChannel.Process(periodicInput, outputPowerDbm=18.0)
+    firstTransientMetrics = transientChannel.GetThermalMetrics()
+    transientChannel.Process(periodicInput, outputPowerDbm=18.0)
+    secondTransientMetrics = transientChannel.GetThermalMetrics()
+    assert firstTransientMetrics["thermalRunMode"] == "transient"
+    assert (
+        firstTransientMetrics["periodEndingJunctionTemperatureC"]
+        > firstTransientMetrics["periodStartingJunctionTemperatureC"]
+    )
+    assert np.isclose(
+        secondTransientMetrics["periodStartingJunctionTemperatureC"],
+        firstTransientMetrics["periodEndingJunctionTemperatureC"],
+    )
+    assert (
+        secondTransientMetrics["periodEndingJunctionTemperatureC"]
+        > firstTransientMetrics["periodEndingJunctionTemperatureC"]
+    )
+    assert np.isclose(secondTransientMetrics["elapsedTimeSec"], 0.05)
+
+    mimoThermalPa = MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "paParametersPerChain": (
+                {"modelName": "wiener", "thermalConfig": thermalConfig},
+                {"modelName": "wiener", "thermalConfig": thermalConfig},
+            ),
+            "thermalCouplingCPerW": (
+                (0.0, 1.0),
+                (2.0, 0.0),
+            ),
+            "width": 0,
+        }
+    )
+    mimoChannel = Channel(
+        paModel=mimoThermalPa,
+        parameters={
+            "sampleRateHz": thermalConfig.sampleRateHz,
+            "thermalRunMode": "steady_state",
+            "thermalDutyCycle": 0.4,
+            "thermalSteadyStateToleranceC": 1.0e-5,
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "width": 0,
+        },
+    )
+    secondChain = np.concatenate(
+        (
+            np.full(250, 0.25 + 0.05j, dtype=np.complex128),
+            np.zeros(750, dtype=np.complex128),
+        )
+    )
+    mimoInput = np.column_stack((periodicInput, secondChain))
+    assert np.allclose(mimoChannel.GetActualDutyCycle(mimoInput), (0.2, 0.1))
+    mimoOutput = mimoChannel.Process(
+        mimoInput,
+        outputPowerDbm=(16.0, 16.0),
+    )
+    assert mimoOutput.shape == mimoInput.shape
+    assert np.allclose(mimoChannel.GetActualDutyCycle(), (0.2, 0.1))
+    completeMimoMetrics = mimoChannel.GetThermalMetrics()
+    mimoMetrics = completeMimoMetrics["chains"]
+    assert len(mimoMetrics) == 2
+    assert completeMimoMetrics["mutualHeating"]["steadyStateConverged"]
+    assert (
+        completeMimoMetrics["mutualHeating"]["steadyStateErrorC"]
+        <= 1.0e-5
+    )
+    assert all(
+        chainMetrics["steadyStateConverged"] for chainMetrics in mimoMetrics
+    )
+    assert all(
+        abs(
+            chainMetrics["periodEndingJunctionTemperatureC"]
+            - chainMetrics["periodStartingJunctionTemperatureC"]
+        )
+        <= 1.0e-5
+        for chainMetrics in mimoMetrics
+    )
+
+
+def CheckPeriodicThermalEdgeCases() -> None:
+    """Verify periodic-thermal reference planes and atomic transactions.
+
+    Processing details:
+        Algorithm: Measure actual RF duty without a ThermalConfig, reject each
+        Channel/PA time-power-activity reference-plane mismatch before power
+        calibration can commit state, force the second chain of an uncoupled
+        MIMO PA to fail after the first chain advances and require a complete
+        rollback, then prove an IQ-imbalance wrapper preserves steady-state
+        scheduling, outer idle time, and per-call power recalibration.
+
+    Returns:
+        result: None. Assertions identify periodic thermal edge regressions.
+    """
+
+    activeSamples = np.full(
+        500, 0.25 + 0.05j, dtype=np.complex128
+    )
+    idleSamples = np.zeros(500, dtype=np.complex128)
+    periodicInput = np.concatenate((activeSamples, idleSamples))
+
+    # Actual-duty observation remains useful before self-heating is enabled.
+    # Channel classifies activity at its PA-input reference plane, so a 50%
+    # active data window scheduled for 40% of the period has 20% RF duty.
+    nonthermalChannel = Channel(
+        paModel=PaModel(
+            parameters={"modelName": "wiener", "width": 0}
+        ),
+        parameters={
+            "thermalDutyCycle": 0.4,
+            "activePowerThresholdDb": -60.0,
+            "width": 0,
+        },
+    )
+    assert np.isclose(
+        nonthermalChannel.GetActualDutyCycle(periodicInput), 0.2
+    )
+
+    referenceThermalConfig = ThermalConfig(
+        enabled=True,
+        modelName="single_rc",
+        sampleRateHz=100.0e3,
+        thermalResistancesCPerW=(20.0,),
+        thermalTimeConstantsSec=(5.0e-3,),
+        thermalUpdateIntervalSamples=50,
+        idleDissipatedPowerW=0.0,
+        referenceOutputPowerDbm=25.0,
+        activePowerThresholdDb=-60.0,
+        gainTemperatureCoefficientDbPerC=-0.03,
+        maximumJunctionTemperatureC=200.0,
+    )
+    mismatchCases = (
+        ("sampleRateHz", 101.0e3, 100.0e3),
+        ("maximumOutputPowerDbm", 24.0, 25.0),
+        ("activePowerThresholdDb", -50.0, -60.0),
+    )
+    expectedMetricNames = {
+        "sampleRateHz": "sampleRateHz",
+        "maximumOutputPowerDbm": "referenceOutputPowerDbm",
+        "activePowerThresholdDb": "activePowerThresholdDb",
+    }
+    for channelParameterName, mismatchedValue, repairedValue in mismatchCases:
+        mismatchPa = PaModel(
+            parameters={
+                "modelName": "wiener",
+                "thermalConfig": referenceThermalConfig,
+                "width": 0,
+            }
+        )
+        mismatchChannel = Channel(
+            paModel=mismatchPa,
+            parameters={
+                "sampleRateHz": 100.0e3,
+                "maximumOutputPowerDbm": 25.0,
+                "activePowerThresholdDb": -60.0,
+                "thermalRunMode": "steady_state",
+                "thermalDutyCycle": 0.4,
+                "width": 0,
+                channelParameterName: mismatchedValue,
+            },
+        )
+        if channelParameterName == "sampleRateHz":
+            try:
+                mismatchChannel.CalibratePaInput(
+                    periodicInput, outputPowerDbm=18.0
+                )
+            except ValueError as error:
+                assert "sampleRateHz" in str(error)
+            else:
+                raise AssertionError(
+                    "direct calibration accepted a thermal sample-rate "
+                    "reference-plane mismatch"
+                )
+            try:
+                mismatchChannel.GetLastCalibrationMetrics()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(
+                    "failed direct calibration committed diagnostics"
+                )
+        try:
+            mismatchChannel.Process(periodicInput, outputPowerDbm=18.0)
+        except ValueError as error:
+            assert expectedMetricNames[channelParameterName] in str(error)
+        else:
+            raise AssertionError(
+                "thermal reference-plane mismatch reached calibration: "
+                f"{channelParameterName}"
+            )
+        try:
+            mismatchChannel.GetLastCalibrationMetrics()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(
+                "reference-plane mismatch committed calibration diagnostics"
+            )
+        mismatchChannel.UpdateParameters(
+            **{channelParameterName: repairedValue}
+        )
+        try:
+            mismatchChannel.Process(periodicInput)
+        except ValueError as error:
+            assert "requires outputPowerDbm" in str(error)
+        else:
+            raise AssertionError(
+                "failed reference-plane validation cached a power target"
+            )
+
+    # The second chain deliberately crosses its safety temperature after the
+    # first chain has completed. With a zero mutual-heating matrix, the whole
+    # MIMO period must still behave as one atomic thermal transaction.
+    safeThermalConfig = replace(
+        referenceThermalConfig,
+        maximumJunctionTemperatureC=200.0,
+    )
+    failingThermalConfig = replace(
+        referenceThermalConfig,
+        maximumJunctionTemperatureC=25.000001,
+    )
+    failingMimoPa = MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "paParametersPerChain": (
+                {
+                    "modelName": "wiener",
+                    "thermalConfig": safeThermalConfig,
+                },
+                {
+                    "modelName": "wiener",
+                    "thermalConfig": failingThermalConfig,
+                },
+            ),
+            "thermalCouplingCPerW": (
+                (0.0, 0.0),
+                (0.0, 0.0),
+            ),
+            "width": 0,
+        }
+    )
+    failureInput = np.column_stack(
+        (
+            np.full(1000, 0.4 + 0.0j, dtype=np.complex128),
+            np.full(1000, 0.4 + 0.0j, dtype=np.complex128),
+        )
+    )
+    metricsBeforeFailure = failingMimoPa.GetThermalMetrics()
+    rmsBeforeFailure = failingMimoPa.GetOutputRmsPerChain()
+    powerBeforeFailure = failingMimoPa.GetOutputPowerDbmPerChain()
+    try:
+        failingMimoPa.ProcessThermalPeriodFloating(
+            failureInput,
+            thermalRunMode="transient",
+            thermalDutyCycle=0.5,
+        )
+    except RuntimeError as error:
+        assert "maximumJunctionTemperatureC" in str(error)
+    else:
+        raise AssertionError(
+            "the deliberately unsafe second thermal chain did not fail"
+        )
+    metricsAfterFailure = failingMimoPa.GetThermalMetrics()
+    assert metricsAfterFailure == metricsBeforeFailure
+    assert all(
+        np.isclose(chainMetrics["elapsedTimeSec"], 0.0)
+        for chainMetrics in metricsAfterFailure["chains"]
+    )
+    assert failingMimoPa.GetOutputRmsPerChain() == rmsBeforeFailure
+    assert failingMimoPa.GetOutputPowerDbmPerChain() == powerBeforeFailure
+
+    # Removing a live coupling matrix must also remove its retained external
+    # temperature offsets. Otherwise a later nominally uncoupled period would
+    # silently continue using stale heat from the preceding coupled solution.
+    couplingResetMimoPa = MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "paParametersPerChain": (
+                {
+                    "modelName": "wiener",
+                    "thermalConfig": referenceThermalConfig,
+                },
+                {
+                    "modelName": "wiener",
+                    "thermalConfig": referenceThermalConfig,
+                },
+            ),
+            "thermalCouplingCPerW": (
+                (0.0, 1.0),
+                (2.0, 0.0),
+            ),
+            "width": 0,
+        }
+    )
+    couplingResetInput = np.column_stack(
+        (periodicInput, 0.5 * periodicInput)
+    )
+    couplingResetMimoPa.ProcessThermalPeriodFloating(
+        couplingResetInput,
+        thermalRunMode="steady_state",
+        thermalDutyCycle=0.4,
+        steadyStateToleranceC=1.0e-5,
+        maximumSteadyStateIterations=100,
+    )
+    coupledMetrics = couplingResetMimoPa.GetThermalMetrics()
+    assert coupledMetrics["mutualHeating"]["steadyStateConverged"]
+    assert all(
+        chainMetrics["mutualHeatingTemperatureRiseC"] > 0.0
+        for chainMetrics in coupledMetrics["chains"]
+    )
+    couplingResetMimoPa.UpdateParameters(
+        thermalCouplingCPerW=(
+            (0.0, 0.0),
+            (0.0, 0.0),
+        )
+    )
+    couplingResetMimoPa.ProcessThermalPeriodFloating(
+        couplingResetInput,
+        thermalRunMode="steady_state",
+        thermalDutyCycle=0.4,
+        steadyStateToleranceC=1.0e-5,
+        maximumSteadyStateIterations=100,
+    )
+    uncoupledMetrics = couplingResetMimoPa.GetThermalMetrics()
+    assert all(
+        np.isclose(
+            chainMetrics["mutualHeatingTemperatureRiseC"], 0.0
+        )
+        for chainMetrics in uncoupledMetrics["chains"]
+    )
+    assert uncoupledMetrics["mutualHeating"] == {
+        "steadyStateConverged": True,
+        "steadyStateIterations": 0,
+        "steadyStateErrorC": 0.0,
+    }
+    assert all(
+        chainMetrics["steadyStateConverged"]
+        and chainMetrics["steadyStateErrorC"] <= 1.0e-5
+        for chainMetrics in uncoupledMetrics["chains"]
+    )
+
+    # A transparent IQ wrapper must not hide the thermal protocol. The second
+    # call omits its target and scales the raw input by five; equal outputs
+    # therefore demonstrate that the cached target triggered fresh calibration
+    # before a second live steady-state period was evaluated.
+    iqWrappedPa = IQImbalancePA(
+        PaModel(
+            parameters={
+                "modelName": "wiener",
+                "thermalConfig": referenceThermalConfig,
+                "width": 0,
+            }
+        ),
+        directCoefficient=0.99 + 0.01j,
+        imageCoefficient=0.025 - 0.01j,
+    )
+    iqChannel = Channel(
+        paModel=iqWrappedPa,
+        parameters={
+            "sampleRateHz": 100.0e3,
+            "maximumOutputPowerDbm": 25.0,
+            "activePowerThresholdDb": -60.0,
+            "thermalRunMode": "steady_state",
+            "thermalDutyCycle": 0.4,
+            "thermalSteadyStateToleranceC": 1.0e-6,
+            "maximumThermalSteadyStateIterations": 100,
+            "calibrationToleranceDb": 0.05,
+            "width": 0,
+        },
+    )
+    firstIqOutput = iqChannel.Process(
+        periodicInput, outputPowerDbm=18.0
+    )
+    firstIqMetrics = iqChannel.GetThermalMetrics()
+    firstIqCalibration = iqChannel.GetLastCalibrationMetrics()
+    secondIqOutput = iqChannel.Process(0.2 * periodicInput)
+    secondIqMetrics = iqChannel.GetThermalMetrics()
+    secondIqCalibration = iqChannel.GetLastCalibrationMetrics()
+    assert firstIqMetrics["thermalRunMode"] == "steady_state"
+    assert secondIqMetrics["thermalRunMode"] == "steady_state"
+    assert firstIqMetrics["scheduledIdleDurationSec"] > 0.0
+    assert np.isclose(
+        secondIqMetrics["elapsedTimeSec"],
+        2.0 * firstIqMetrics["periodDurationSec"],
+    )
+    assert firstIqCalibration["targetOutputPowerDbmPerChain"] == (18.0,)
+    assert secondIqCalibration["targetOutputPowerDbmPerChain"] == (18.0,)
+    assert firstIqCalibration["converged"]
+    assert secondIqCalibration["converged"]
+    assert np.allclose(
+        secondIqOutput,
+        firstIqOutput,
+        rtol=1.0e-9,
+        atol=1.0e-12,
+    )
+
+
+def CheckChannelIqEnableControls() -> None:
+    """Verify independent Tx and feedback I/Q-stage enable controls.
+
+    Processing details:
+        Algorithm: Preserve the historical enabled-by-default behavior, prove
+        that each False switch bypasses its gain mismatch, phase error, and DC
+        offset as one atomic stage, exercise independent Tx-only and
+        feedback-only paths in both sample modes, repeat the bypass through a
+        fixed-point two-chain PA, and reject every non-boolean switch value
+        with a diagnostic that states the allowed values.
+
+    Returns:
+        result: None. Assertions enforce I/Q-stage gating at every interface.
+    """
+
+    testSignal = np.asarray(
+        (0.21 + 0.13j, -0.37 + 0.08j, 0.04 - 0.29j, -0.11 - 0.18j),
+        dtype=np.complex128,
+    )
+    configuredIqParameters = {
+        "txIqGainImbalanceDb": 1.75,
+        "txIqPhaseImbalanceDegrees": 8.0,
+        "txDcOffset": 0.025 - 0.017j,
+        "fbIqGainImbalanceDb": -1.25,
+        "fbIqPhaseImbalanceDegrees": -6.0,
+        "fbDcOffset": -0.019 + 0.011j,
+        "width": 0,
+    }
+
+    # True defaults preserve the pre-switch API: omitting either enable name
+    # must produce exactly the same coefficients and samples as explicit True.
+    implicitEnabledChannel = Channel(parameters=configuredIqParameters)
+    explicitEnabledChannel = Channel(
+        parameters={
+            **configuredIqParameters,
+            "txIqImbalanceEnabled": True,
+            "fbIqImbalanceEnabled": True,
+        }
+    )
+    implicitParameters = implicitEnabledChannel.GetParameters()
+    assert implicitParameters["txIqImbalanceEnabled"] is True
+    assert implicitParameters["fbIqImbalanceEnabled"] is True
+    assert (
+        implicitEnabledChannel.TransmitterIqCoefficients()
+        == explicitEnabledChannel.TransmitterIqCoefficients()
+    )
+    assert (
+        implicitEnabledChannel.FeedbackIqCoefficients()
+        == explicitEnabledChannel.FeedbackIqCoefficients()
+    )
+    assert np.array_equal(
+        implicitEnabledChannel.ApplyTransmitterIqImbalance(testSignal),
+        explicitEnabledChannel.ApplyTransmitterIqImbalance(testSignal),
+    )
+    assert np.array_equal(
+        implicitEnabledChannel.ApplyFeedbackIqImbalance(testSignal),
+        explicitEnabledChannel.ApplyFeedbackIqImbalance(testSignal),
+    )
+
+    # False atomically bypasses all three terms. Deliberately large finite
+    # values ensure a partial bypass could not accidentally pass this check.
+    disabledIqChannel = Channel(
+        parameters={
+            **configuredIqParameters,
+            "txIqImbalanceEnabled": False,
+            "fbIqImbalanceEnabled": False,
+        }
+    )
+    assert disabledIqChannel.TransmitterIqCoefficients() == (
+        1.0 + 0.0j,
+        0.0 + 0.0j,
+    )
+    assert disabledIqChannel.FeedbackIqCoefficients() == (
+        1.0 + 0.0j,
+        0.0 + 0.0j,
+    )
+    assert np.array_equal(
+        disabledIqChannel.ApplyTransmitterIqImbalance(testSignal),
+        testSignal,
+    )
+    assert np.array_equal(
+        disabledIqChannel.ApplyFeedbackIqImbalance(testSignal),
+        testSignal,
+    )
+    assert not np.array_equal(
+        explicitEnabledChannel.ApplyTransmitterIqImbalance(testSignal),
+        testSignal,
+    )
+    assert not np.array_equal(
+        explicitEnabledChannel.ApplyFeedbackIqImbalance(testSignal),
+        testSignal,
+    )
+
+    # A feedback-only defect is invisible to forward instrument sampling but
+    # visible to embedded feedback sampling. Disabling Tx must not disable FB.
+    feedbackOnlyForwardChannel = Channel(
+        parameters={
+            **configuredIqParameters,
+            "sampleMode": "forward",
+            "txIqImbalanceEnabled": False,
+            "fbIqImbalanceEnabled": True,
+        }
+    )
+    feedbackOnlyEmbeddedChannel = Channel(
+        parameters={
+            **configuredIqParameters,
+            "sampleMode": "fb",
+            "txIqImbalanceEnabled": False,
+            "fbIqImbalanceEnabled": True,
+        }
+    )
+    assert np.array_equal(
+        feedbackOnlyForwardChannel.ProcessPaOutput(testSignal),
+        testSignal,
+    )
+    expectedFeedbackOutput = (
+        feedbackOnlyEmbeddedChannel.ApplyFeedbackIqImbalance(testSignal)
+    )
+    assert np.allclose(
+        feedbackOnlyEmbeddedChannel.ProcessPaOutput(testSignal),
+        expectedFeedbackOutput,
+    )
+    assert not np.allclose(expectedFeedbackOutput, testSignal)
+
+    # Conversely, a Tx-only defect drives the PA in both sample modes. An
+    # independently disabled FB stage makes the two observations identical.
+    txOnlyForwardChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            **configuredIqParameters,
+            "sampleMode": "forward",
+            "txIqImbalanceEnabled": True,
+            "fbIqImbalanceEnabled": False,
+        },
+    )
+    txOnlyEmbeddedChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            **configuredIqParameters,
+            "sampleMode": "fb",
+            "txIqImbalanceEnabled": True,
+            "fbIqImbalanceEnabled": False,
+        },
+    )
+    txOnlyForwardOutput = txOnlyForwardChannel.Process(testSignal)
+    txOnlyEmbeddedOutput = txOnlyEmbeddedChannel.Process(testSignal)
+    assert np.allclose(txOnlyEmbeddedOutput, txOnlyForwardOutput)
+    assert np.allclose(
+        txOnlyForwardChannel.GetLastTransmitterOutput(),
+        txOnlyForwardChannel.ApplyTransmitterIqImbalance(testSignal),
+    )
+    assert not np.allclose(
+        txOnlyForwardChannel.GetLastTransmitterOutput(), testSignal
+    )
+
+    # High-priority UpdateParameters overrides must gate the live ChainMap
+    # immediately without mutating the caller-owned lower-priority mapping.
+    # Exercise all three useful states through the same Channel and PA objects
+    # so stale coefficients or cached processing decisions cannot pass.
+    liveIqParameters = {
+        **configuredIqParameters,
+        "sampleMode": "fb",
+        "txIqImbalanceEnabled": False,
+        "fbIqImbalanceEnabled": False,
+    }
+    liveIqChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters=liveIqParameters,
+    )
+    allDisabledOutput = liveIqChannel.Process(testSignal)
+    assert liveIqChannel.TransmitterIqCoefficients() == (
+        1.0 + 0.0j,
+        0.0 + 0.0j,
+    )
+    assert liveIqChannel.FeedbackIqCoefficients() == (
+        1.0 + 0.0j,
+        0.0 + 0.0j,
+    )
+    assert np.array_equal(
+        liveIqChannel.GetLastTransmitterOutput(), testSignal
+    )
+
+    liveIqChannel.UpdateParameters(txIqImbalanceEnabled=True)
+    assert liveIqParameters["txIqImbalanceEnabled"] is False
+    assert liveIqChannel.GetParameters()["txIqImbalanceEnabled"] is True
+    assert liveIqChannel.TransmitterIqCoefficients() != (
+        1.0 + 0.0j,
+        0.0 + 0.0j,
+    )
+    assert liveIqChannel.FeedbackIqCoefficients() == (
+        1.0 + 0.0j,
+        0.0 + 0.0j,
+    )
+    txOnlyLiveOutput = liveIqChannel.Process(testSignal)
+    txOnlyLiveDrive = liveIqChannel.ApplyTransmitterIqImbalance(testSignal)
+    expectedTxOnlyLiveOutput = liveIqChannel.paModel.Process(
+        txOnlyLiveDrive
+    )
+    assert np.allclose(txOnlyLiveOutput, expectedTxOnlyLiveOutput)
+    assert np.allclose(
+        liveIqChannel.GetLastTransmitterOutput(), txOnlyLiveDrive
+    )
+    assert not np.allclose(txOnlyLiveOutput, allDisabledOutput)
+
+    liveIqChannel.UpdateParameters(
+        txIqImbalanceEnabled=False,
+        fbIqImbalanceEnabled=True,
+    )
+    liveResolvedParameters = liveIqChannel.GetParameters()
+    assert liveResolvedParameters["txIqImbalanceEnabled"] is False
+    assert liveResolvedParameters["fbIqImbalanceEnabled"] is True
+    assert liveIqParameters["fbIqImbalanceEnabled"] is False
+    assert liveIqChannel.TransmitterIqCoefficients() == (
+        1.0 + 0.0j,
+        0.0 + 0.0j,
+    )
+    assert liveIqChannel.FeedbackIqCoefficients() != (
+        1.0 + 0.0j,
+        0.0 + 0.0j,
+    )
+    feedbackOnlyLiveOutput = liveIqChannel.Process(testSignal)
+    expectedFeedbackOnlyLiveOutput = (
+        liveIqChannel.ApplyFeedbackIqImbalance(allDisabledOutput)
+    )
+    assert np.allclose(
+        feedbackOnlyLiveOutput, expectedFeedbackOnlyLiveOutput
+    )
+    assert np.array_equal(
+        liveIqChannel.GetLastTransmitterOutput(), testSignal
+    )
+    assert not np.allclose(feedbackOnlyLiveOutput, allDisabledOutput)
+
+    # The disabled stages must remain transparent for samples-by-chains data
+    # after public 16-bit decoding and re-encoding around a MIMO PA bank.
+    mimoFloatingInput = np.column_stack(
+        (testSignal, 0.63 * testSignal[::-1] * np.exp(0.37j))
+    )
+    fixedFormat = FixedPoint(16)
+    mimoFixedInput = fixedFormat.EncodeComplex(mimoFloatingInput)
+    idealFixedChannel = Channel(
+        paModel=MimoPaModel(
+            parameters={"numTransmitChains": 2, "width": 0}
+        ),
+        parameters={"sampleMode": "fb", "width": 16},
+    )
+    disabledFixedChannel = Channel(
+        paModel=MimoPaModel(
+            parameters={"numTransmitChains": 2, "width": 0}
+        ),
+        parameters={
+            **configuredIqParameters,
+            "sampleMode": "fb",
+            "txIqImbalanceEnabled": False,
+            "fbIqImbalanceEnabled": False,
+            "width": 16,
+        },
+    )
+    enabledFixedChannel = Channel(
+        paModel=MimoPaModel(
+            parameters={"numTransmitChains": 2, "width": 0}
+        ),
+        parameters={
+            **configuredIqParameters,
+            "sampleMode": "fb",
+            "txIqImbalanceEnabled": True,
+            "fbIqImbalanceEnabled": True,
+            "width": 16,
+        },
+    )
+    idealFixedOutput = idealFixedChannel.Process(mimoFixedInput)
+    disabledFixedOutput = disabledFixedChannel.Process(mimoFixedInput)
+    enabledFixedOutput = enabledFixedChannel.Process(mimoFixedInput)
+    assert disabledFixedOutput.shape == mimoFixedInput.shape
+    assert disabledFixedOutput.dtype == np.complex128
+    assert np.array_equal(disabledFixedOutput, idealFixedOutput)
+    assert not np.array_equal(enabledFixedOutput, idealFixedOutput)
+    assert np.array_equal(
+        disabledFixedChannel.GetLastTransmitterOutput(),
+        fixedFormat.DecodeComplex(mimoFixedInput),
+    )
+
+    # Boolean switches intentionally reject integer, string, None, and NumPy
+    # scalar lookalikes so configuration mistakes cannot silently enable IQ.
+    for parameterName in (
+        "txIqImbalanceEnabled",
+        "fbIqImbalanceEnabled",
+    ):
+        for invalidValue in (0, 1, "False", None, np.bool_(False)):
+            try:
+                Channel(parameters={parameterName: invalidValue})
+            except TypeError as error:
+                errorText = str(error)
+                assert parameterName in errorText
+                assert "invalid type" in errorText
+                assert "Allowed values: True or False" in errorText
+            else:
+                raise AssertionError(
+                    f"{parameterName} accepted non-boolean "
+                    f"{invalidValue!r}"
+                )
 
 
 def CheckChannelModel() -> None:
@@ -4567,6 +6243,139 @@ def CheckChannelModel() -> None:
         <= 0.15
     )
 
+    # The rated 25 dBm PA range must include a 20 dBm operating point even
+    # when an EHT waveform and the default GMP are exposed through a 16-bit
+    # interface. The hidden drive belongs after DAC decoding, while all public
+    # arrays must remain integer-valued I/Q codes.
+    fixedWifiWaveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=7,
+        numDataSymbols=10,
+        seed=101,
+        width=16,
+    ).Generate()
+    fixedGmpChannel = Channel(
+        paModel=PaModel(modelName="gmp", width=16),
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.25,
+            "maximumCalibrationIterations": 60,
+            "width": 16,
+        },
+    )
+    fixedGmpOutput = fixedGmpChannel.Process(
+        fixedWifiWaveform.samples,
+        outputPowerDbm=20.0,
+    )
+    fixedGmpMetrics = fixedGmpChannel.GetLastCalibrationMetrics()
+    assert fixedGmpMetrics["converged"] is True
+    assert fixedGmpMetrics["targetOutputPowerDbmPerChain"] == (20.0,)
+    assert abs(
+        fixedGmpMetrics["measuredOutputPowerDbmPerChain"][0] - 20.0
+    ) <= 0.25
+    assert 1 <= fixedGmpMetrics["iterationCount"] <= 60
+    assert fixedGmpMetrics["analogDriveDbPerChain"][0] > 0.0
+    for publicWaveform in (
+        fixedGmpChannel.GetLastPaInput(),
+        fixedGmpChannel.GetLastPaOutput(),
+        fixedGmpOutput,
+    ):
+        assert publicWaveform.dtype == np.complex128
+        assert np.array_equal(
+            publicWaveform.real, np.rint(publicWaveform.real)
+        )
+        assert np.array_equal(
+            publicWaveform.imag, np.rint(publicWaveform.imag)
+        )
+    fixedGmpOutputMetrics = Analysis(
+        fixedGmpOutput,
+        transmittedSignal=fixedGmpOutput,
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "activePowerThresholdDb": -60.0,
+            "activeGapToleranceSamples": 16,
+            "width": 16,
+        },
+    ).Analyze()
+    assert abs(fixedGmpOutputMetrics["outputPowerDbm"] - 20.0) <= 0.25
+    decodedFixedGmpInput = FixedPoint(16).DecodeComplex(
+        fixedGmpChannel.GetLastPaInput()
+    )
+    assert np.max(np.abs(decodedFixedGmpInput.real)) < 0.51
+    assert np.max(np.abs(decodedFixedGmpInput.imag)) < 0.51
+
+    defaultHeadroomPeak = float(
+        np.max(
+            np.maximum(
+                np.abs(decodedFixedGmpInput.real),
+                np.abs(decodedFixedGmpInput.imag),
+            )
+        )
+    )
+    fixedGmpChannel.UpdateParameters(
+        calibrationDigitalHeadroomDb=9.0
+    )
+    largerHeadroomOutput = fixedGmpChannel.Process(
+        fixedWifiWaveform.samples,
+        outputPowerDbm=20.0,
+    )
+    largerHeadroomMetrics = fixedGmpChannel.GetLastCalibrationMetrics()
+    largerHeadroomInput = fixedGmpChannel.GetLastPaInput()
+    decodedLargerHeadroomInput = FixedPoint(16).DecodeComplex(
+        largerHeadroomInput
+    )
+    largerHeadroomPeak = float(
+        np.max(
+            np.maximum(
+                np.abs(decodedLargerHeadroomInput.real),
+                np.abs(decodedLargerHeadroomInput.imag),
+            )
+        )
+    )
+    assert largerHeadroomPeak < 0.75 * defaultHeadroomPeak
+    assert abs(
+        largerHeadroomMetrics["measuredOutputPowerDbmPerChain"][0]
+        - 20.0
+    ) <= 0.25
+    largerHeadroomOutputMetrics = Analysis(
+        largerHeadroomOutput,
+        transmittedSignal=largerHeadroomOutput,
+        parameters={"maximumOutputPowerDbm": 25.0, "width": 16},
+    ).Analyze()
+    assert abs(
+        largerHeadroomOutputMetrics["outputPowerDbm"] - 20.0
+    ) <= 0.25
+
+    # A failed replacement request must not commit its trial analog drive.
+    # Reusing the previously accepted public codes must therefore reproduce
+    # the same deterministic channel output after the failure.
+    stableOutputBeforeFailure = fixedGmpChannel.Process(
+        largerHeadroomInput
+    )
+    fixedGmpChannel.UpdateParameters(
+        calibrationToleranceDb=1.0e-6,
+        maximumCalibrationIterations=1,
+    )
+    try:
+        fixedGmpChannel.Process(
+            fixedWifiWaveform.samples,
+            outputPowerDbm=24.0,
+        )
+    except RuntimeError:
+        failedReplacementMetrics = (
+            fixedGmpChannel.GetLastCalibrationMetrics()
+        )
+        assert failedReplacementMetrics["converged"] is False
+    else:
+        raise AssertionError("a one-trial replacement unexpectedly converged")
+    stableOutputAfterFailure = fixedGmpChannel.Process(
+        largerHeadroomInput
+    )
+    assert np.array_equal(
+        stableOutputAfterFailure, stableOutputBeforeFailure
+    )
+
     fixedPa = PaModel(parameters={"modelName": "gmp", "width": 16})
     fixedChannel = Channel(
         paModel=fixedPa,
@@ -4627,6 +6436,7 @@ def CheckChannelModel() -> None:
             )
         },
         {"jointPowerCalibration": "auto"},
+        {"calibrationDigitalHeadroomDb": -0.1},
         {"calibrationProbeStepDb": 0.0},
         {"calibrationRegularization": 0.0},
     )
@@ -4642,6 +6452,271 @@ def CheckChannelModel() -> None:
                 f"invalid channel configuration accepted: "
                 f"{invalidParameters!r}"
             )
+
+
+def CheckTwoToneAnalogPowerReporting() -> None:
+    """Verify calibrated two-tone power for every public input representation.
+
+    Processing details:
+        Algorithm: Generate an unequal-amplitude two-tone record whose active
+        RMS maps to 20 dBm under the project's 25 dBm normalized full-scale
+        convention. Compare direct and facade dictionary results for floating
+        NumPy/list inputs, repeat with 16-bit public I/Q codes while omitting
+        width to exercise the raw-record default, and add long leading,
+        trailing, and internal idle intervals to prove inactive samples do not
+        dilute the reported active PA output power. Finally verify that every
+        order-specific IM3/IM5/IM7 result carries the same analog-power metric.
+
+    Returns:
+        result: None. Assertion failures identify fixed-point decoding, active
+            power, result-shape, or per-order facade regressions.
+    """
+
+    sampleRateHz = 100.0e6
+    toneFrequenciesHz = (-2.0e6, 2.0e6)
+    maximumOutputPowerDbm = 25.0
+    expectedOutputPowerDbm = 20.0
+    expectedNormalizedRms = float(
+        np.power(
+            10.0,
+            (expectedOutputPowerDbm - maximumOutputPowerDbm) / 20.0,
+        )
+    )
+    commonGeneratorParameters = {
+        "sampleRateHz": sampleRateHz,
+        "toneFrequenciesHz": toneFrequenciesHz,
+        "toneAmplitudes": (1.0, 0.6),
+        "tonePhasesDegrees": (17.0, -31.0),
+        "numSamples": 4096,
+        "rmsLevel": expectedNormalizedRms,
+    }
+    expectedMetricNames = {
+        "fundamentalLowerDbfs",
+        "fundamentalUpperDbfs",
+        "fundamentalAverageDbfs",
+        "im3LowerDbc",
+        "im3UpperDbc",
+        "im3WorstDbc",
+        "im5LowerDbc",
+        "im5UpperDbc",
+        "im5WorstDbc",
+        "im7LowerDbc",
+        "im7UpperDbc",
+        "im7WorstDbc",
+        "worstIntermodulationDbc",
+        "outputPowerDbm",
+    }
+    analysisParameters = {
+        "settlingSamples": 0,
+        "maximumOutputPowerDbm": maximumOutputPowerDbm,
+        "activePowerThresholdDb": -60.0,
+        "activeGapToleranceSamples": 16,
+    }
+
+    floatingWaveform = WaveGenTwoTone(
+        parameters={**commonGeneratorParameters, "width": 0}
+    ).Generate()
+    directFloatingMetrics = TwoToneAnalysis(
+        floatingWaveform,
+        parameters={**analysisParameters, "width": 0},
+    ).Analyze(floatingWaveform.samples)
+    assert isinstance(directFloatingMetrics, dict)
+    assert set(directFloatingMetrics) == expectedMetricNames
+    assert np.isclose(
+        directFloatingMetrics["outputPowerDbm"],
+        expectedOutputPowerDbm,
+        atol=0.01,
+    )
+
+    # Raw normalized floating records remain backward compatible when width is
+    # omitted, while an explicit zero remains the authoritative declaration.
+    inferredFloatingMetrics = Analysis.AnalyzeTwoTone(
+        floatingWaveform.samples,
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=toneFrequenciesHz,
+        parameters=analysisParameters,
+    )
+    floatingNumpyMetrics = Analysis.AnalyzeTwoTone(
+        floatingWaveform.samples,
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=toneFrequenciesHz,
+        parameters=analysisParameters,
+        width=0,
+    )
+    floatingListMetrics = Analysis.AnalyzeTwoTone(
+        floatingWaveform.samples.tolist(),
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=list(toneFrequenciesHz),
+        parameters=analysisParameters,
+        width=0,
+    )
+    for floatingMetrics in (
+        inferredFloatingMetrics,
+        floatingNumpyMetrics,
+        floatingListMetrics,
+    ):
+        assert isinstance(floatingMetrics, dict)
+        assert set(floatingMetrics) == expectedMetricNames
+        assert np.isclose(
+            floatingMetrics["outputPowerDbm"],
+            expectedOutputPowerDbm,
+            atol=0.01,
+        )
+
+    fixedWaveform = WaveGenTwoTone(
+        parameters={**commonGeneratorParameters, "width": 16}
+    ).Generate()
+    directFixedMetrics = TwoToneAnalysis(
+        fixedWaveform,
+        parameters={**analysisParameters, "width": 16},
+    ).Analyze(fixedWaveform.samples)
+    assert isinstance(directFixedMetrics, dict)
+    assert set(directFixedMetrics) == expectedMetricNames
+    assert np.isclose(
+        directFixedMetrics["outputPowerDbm"],
+        expectedOutputPowerDbm,
+        atol=0.02,
+    )
+
+    # Transmit metadata and receiver sample width describe different physical
+    # boundaries. A floating reference may therefore accompany a 16-bit VSA
+    # capture without changing its frequency metadata or power calibration.
+    mixedBoundaryMetrics = Analysis.AnalyzeTwoTone(
+        fixedWaveform.samples,
+        floatingWaveform,
+        parameters=analysisParameters,
+        width=16,
+    )
+    assert np.isclose(
+        mixedBoundaryMetrics["outputPowerDbm"],
+        expectedOutputPowerDbm,
+        atol=0.02,
+    )
+    inferredMixedBoundaryMetrics = Analysis.AnalyzeTwoTone(
+        fixedWaveform.samples,
+        floatingWaveform,
+        parameters=analysisParameters,
+    )
+    directInferredMixedBoundaryMetrics = TwoToneAnalysis(
+        floatingWaveform,
+        parameters=analysisParameters,
+    ).Analyze(fixedWaveform.samples)
+    for inferredMixedMetrics in (
+        inferredMixedBoundaryMetrics,
+        directInferredMixedBoundaryMetrics,
+    ):
+        assert np.isclose(
+            inferredMixedMetrics["outputPowerDbm"],
+            expectedOutputPowerDbm,
+            atol=0.02,
+        )
+    mixedRawBoundaryMetrics = Analysis.AnalyzeTwoTone(
+        fixedWaveform.samples,
+        floatingWaveform.samples,
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=toneFrequenciesHz,
+        parameters=analysisParameters,
+    )
+    assert np.isclose(
+        mixedRawBoundaryMetrics["outputPowerDbm"],
+        expectedOutputPowerDbm,
+        atol=0.02,
+    )
+
+    # Integer-code-shaped raw NumPy/list records outside normalized range are
+    # recognized as signed 16-bit I/Q when width is omitted. Treating these
+    # codes as floating amplitudes produced the former 112 dBm failure, so the
+    # near-20 dBm comparison is also a direct scale regression.
+    fixedNumpyMetrics = Analysis.AnalyzeTwoTone(
+        fixedWaveform.samples,
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=toneFrequenciesHz,
+        parameters=analysisParameters,
+    )
+    fixedListMetrics = Analysis.AnalyzeTwoTone(
+        fixedWaveform.samples.tolist(),
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=list(toneFrequenciesHz),
+        parameters=analysisParameters,
+    )
+    for fixedMetrics in (
+        fixedNumpyMetrics,
+        fixedListMetrics,
+    ):
+        assert isinstance(fixedMetrics, dict)
+        assert set(fixedMetrics) == expectedMetricNames
+        assert np.isclose(
+            fixedMetrics["outputPowerDbm"],
+            expectedOutputPowerDbm,
+            atol=0.02,
+        )
+        assert fixedMetrics["outputPowerDbm"] <= maximumOutputPowerDbm
+        for absoluteMetricName in (
+            "fundamentalLowerDbfs",
+            "fundamentalUpperDbfs",
+            "fundamentalAverageDbfs",
+        ):
+            assert np.isclose(
+                fixedMetrics[absoluteMetricName],
+                directFixedMetrics[absoluteMetricName],
+                atol=1.0e-12,
+            )
+
+    idleSampleCount = 768
+    paddedFloatingSignal = np.concatenate(
+        (
+            np.zeros(384, dtype=np.complex128),
+            floatingWaveform.samples,
+            np.zeros(idleSampleCount, dtype=np.complex128),
+            floatingWaveform.samples,
+            np.zeros(512, dtype=np.complex128),
+        )
+    )
+    paddedFloatingMetrics = Analysis.AnalyzeTwoTone(
+        paddedFloatingSignal,
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=toneFrequenciesHz,
+        parameters=analysisParameters,
+        width=0,
+    )
+    paddedFixedSignal = FixedPoint(16).EncodeComplex(
+        paddedFloatingSignal
+    )
+    paddedFixedMetrics = Analysis.AnalyzeTwoTone(
+        paddedFixedSignal.tolist(),
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=list(toneFrequenciesHz),
+        parameters=analysisParameters,
+    )
+    for paddedMetrics, toleranceDb in (
+        (paddedFloatingMetrics, 0.01),
+        (paddedFixedMetrics, 0.02),
+    ):
+        assert isinstance(paddedMetrics, dict)
+        assert np.isclose(
+            paddedMetrics["outputPowerDbm"],
+            expectedOutputPowerDbm,
+            atol=toleranceDb,
+        )
+
+    for orderMethod in (
+        Analysis.CalculateIm3,
+        Analysis.CalculateIm5,
+        Analysis.CalculateIm7,
+    ):
+        orderMetrics = orderMethod(
+            fixedWaveform.samples.tolist(),
+            sampleRateHz=sampleRateHz,
+            toneFrequenciesHz=list(toneFrequenciesHz),
+            parameters=analysisParameters,
+        )
+        assert isinstance(orderMetrics, dict)
+        assert "outputPowerDbm" in orderMetrics
+        assert np.isclose(
+            orderMetrics["outputPowerDbm"],
+            expectedOutputPowerDbm,
+            atol=0.02,
+        )
 
 
 def CheckTwoToneIlcAnalysis() -> None:
@@ -4851,6 +6926,7 @@ def CheckTwoToneIlcAnalysis() -> None:
             "lowerDbc",
             "upperDbc",
             "worstDbc",
+            "outputPowerDbm",
         }
         assert orderMetrics["nonlinearOrder"] == nonlinearOrder
         assert np.isclose(
@@ -4882,6 +6958,10 @@ def CheckTwoToneIlcAnalysis() -> None:
             orderMetrics["upperProductDbfs"],
             baselineMetrics["fundamentalUpperDbfs"]
             + baselineMetrics[f"{expectedPrefix}UpperDbc"],
+        )
+        assert np.isclose(
+            orderMetrics["outputPowerDbm"],
+            baselineMetrics["outputPowerDbm"],
         )
 
     try:
@@ -5757,6 +7837,10 @@ def RunTests() -> None:
     CheckUnknownConfigurationWarnings()
     CheckFixedPointInterfaces()
     CheckPaThermalModel()
+    CheckThermalDisableAndCalibrationBypass()
+    CheckChannelPeriodicThermalModes()
+    CheckPeriodicThermalEdgeCases()
+    CheckChannelIqEnableControls()
     CheckChannelModel()
     CheckWifiFormats()
     CheckWifiBandwidths()
@@ -5774,6 +7858,7 @@ def RunTests() -> None:
     CheckIlcFeedbackSynchronization()
     CheckReceiveOnlyWifiAnalysis()
     CheckMseEvmConvergence()
+    CheckTwoToneAnalogPowerReporting()
     CheckTwoToneIlcAnalysis()
     CheckPaCharacterizationBenchmark()
     CheckDpdLmsModelAndBenchmark()

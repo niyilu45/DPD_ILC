@@ -315,6 +315,8 @@ class ThermalNetwork:
             Algorithm: Validate the immutable configuration, select all Foster
             branches or the one requested RC branch, and distribute the initial
             junction-to-ambient temperature rise in proportion to resistance.
+            Reject disabled configurations because PaModel represents disabled
+            operation by omitting the ThermalNetwork entirely.
 
         Args:
             config: Validated thermal-network and temperature-drift settings.
@@ -324,6 +326,12 @@ class ThermalNetwork:
         """
 
         config.Validate()
+        if not config.enabled:
+            raise ValueError(
+                "ThermalNetwork requires ThermalConfig.enabled=True; "
+                "bind a disabled ThermalConfig to PaModel to bypass all "
+                "temperature effects"
+            )
         self.config = config
         self.ambientTemperatureC = float(config.ambientTemperatureC)
         self.elapsedTimeSec = 0.0
@@ -444,17 +452,137 @@ class ThermalNetwork:
             or resolvedDuration < 0.0
         ):
             raise ValueError("thermal power and duration must be finite and nonnegative")
-        if self.config.modelName.strip().lower() != "static":
-            resistanceValues, timeConstantValues = self.ResolveBranches()
-            decayValues = np.exp(-resolvedDuration / timeConstantValues)
-            self.temperatureRisePerBranchC = (
-                decayValues * self.temperatureRisePerBranchC
-                + resistanceValues
-                * resolvedPower
-                * (1.0 - decayValues)
-            )
+        self.temperatureRisePerBranchC = self.CalculateAdvancedState(
+            self.temperatureRisePerBranchC,
+            resolvedPower,
+            resolvedDuration,
+        )
         self.elapsedTimeSec += resolvedDuration
         return self.CurrentTemperatureC()
+
+    def CalculateAdvancedState(
+        self,
+        startingTemperatureRisePerBranchC: np.ndarray,
+        dissipatedPowerW: float,
+        durationSec: float,
+    ) -> np.ndarray:
+        """Calculate one exact thermal step without changing live state.
+
+        Processing details:
+            Algorithm: Validate a complete branch-state vector and apply the
+            zero-order-hold RC solution independently to every Foster branch.
+            Static mode returns an unchanged copy because its junction
+            temperature is selected explicitly rather than integrated.
+
+        Args:
+            startingTemperatureRisePerBranchC: Branch rises at interval start.
+            dissipatedPowerW: Nonnegative mean heat input during the interval.
+            durationSec: Nonnegative interval duration in seconds.
+
+        Returns:
+            result: New branch-temperature-rise vector without side effects.
+        """
+
+        startingState = np.asarray(
+            startingTemperatureRisePerBranchC, dtype=float
+        )
+        if startingState.shape != self.temperatureRisePerBranchC.shape:
+            raise ValueError(
+                "startingTemperatureRisePerBranchC has an incompatible shape"
+            )
+        if not np.all(np.isfinite(startingState)):
+            raise ValueError(
+                "startingTemperatureRisePerBranchC must contain finite values"
+            )
+        resolvedPower = float(dissipatedPowerW)
+        resolvedDuration = float(durationSec)
+        if (
+            not np.isfinite(resolvedPower)
+            or resolvedPower < 0.0
+            or not np.isfinite(resolvedDuration)
+            or resolvedDuration < 0.0
+        ):
+            raise ValueError(
+                "thermal power and duration must be finite and nonnegative"
+            )
+        if self.config.modelName.strip().lower() == "static":
+            return startingState.copy()
+        resistanceValues, timeConstantValues = self.ResolveBranches()
+        decayValues = np.exp(-resolvedDuration / timeConstantValues)
+        return np.asarray(
+            decayValues * startingState
+            + resistanceValues
+            * resolvedPower
+            * (1.0 - decayValues),
+            dtype=float,
+        )
+
+    def CalculatePeriodicSteadyState(
+        self,
+        dissipatedPowersW: Sequence[float],
+        durationsSec: Sequence[float],
+    ) -> np.ndarray:
+        """Solve the branch state that repeats after one power schedule.
+
+        Processing details:
+            Algorithm: Starting from zero branch rise, compose every exact
+            constant-power interval to obtain the additive term of the full
+            cycle. Divide it by one minus the full-cycle decay on each branch,
+            using ``expm1`` for short-period numerical accuracy. This is an
+            analytic periodic solution for a frozen dissipated-power trace.
+
+        Args:
+            dissipatedPowersW: Mean heat power for each consecutive interval.
+            durationsSec: Physical duration paired with every power value.
+
+        Returns:
+            result: Branch rises at both the beginning and end of the cycle.
+        """
+
+        powerValues = np.asarray(dissipatedPowersW, dtype=float)
+        durationValues = np.asarray(durationsSec, dtype=float)
+        if (
+            powerValues.ndim != 1
+            or durationValues.ndim != 1
+            or powerValues.size == 0
+            or powerValues.size != durationValues.size
+        ):
+            raise ValueError(
+                "dissipatedPowersW and durationsSec must be matching "
+                "nonempty one-dimensional sequences"
+            )
+        if (
+            not np.all(np.isfinite(powerValues))
+            or np.any(powerValues < 0.0)
+            or not np.all(np.isfinite(durationValues))
+            or np.any(durationValues < 0.0)
+            or float(np.sum(durationValues)) <= 0.0
+        ):
+            raise ValueError(
+                "periodic powers must be nonnegative and durations must "
+                "define one positive finite period"
+            )
+        if self.config.modelName.strip().lower() == "static":
+            return self.temperatureRisePerBranchC.copy()
+        additiveState = np.zeros_like(
+            self.temperatureRisePerBranchC, dtype=float
+        )
+        for dissipatedPowerW, durationSec in zip(
+            powerValues, durationValues
+        ):
+            additiveState = self.CalculateAdvancedState(
+                additiveState,
+                float(dissipatedPowerW),
+                float(durationSec),
+            )
+        _, timeConstantValues = self.ResolveBranches()
+        totalDurationSec = float(np.sum(durationValues))
+        oneMinusCycleDecay = -np.expm1(
+            -totalDurationSec / timeConstantValues
+        )
+        return np.asarray(
+            additiveState / oneMinusCycleDecay, dtype=float
+        )
 
     def GetMetrics(self) -> Dict[str, object]:
         """Return a defensive dictionary describing the current thermal state.
@@ -1248,8 +1376,10 @@ class PaModel:
         self.model = None
         self.thermalNetwork: Optional[ThermalNetwork] = None
         self._activeThermalConfig: Optional[ThermalConfig] = None
+        self._thermalEffectsSuspended = False
         self._externalTemperatureOffsetC = 0.0
         self._lastThermalMetrics: Dict[str, object] = {}
+        self._calibrationDriveDb = 0.0
         self._activeConfiguration: Optional[
             Tuple[
                 str,
@@ -1360,8 +1490,10 @@ class PaModel:
 
         Processing details:
             Algorithm: Disable the network for None or disabled configuration,
-            preserve state while the immutable configuration is unchanged, and
-            initialize a new network only when the caller changes its settings.
+            preserve the explicit electrical-only suspension state during a
+            calibration transaction, retain state while an enabled immutable
+            configuration is unchanged, and initialize a new network only when
+            the caller changes enabled settings outside that transaction.
 
         Returns:
             result: None. Thermal state matches the active parameter mapping.
@@ -1371,9 +1503,22 @@ class PaModel:
         if thermalConfig is None or not thermalConfig.enabled:
             self.thermalNetwork = None
             self._activeThermalConfig = thermalConfig
+            # Disabled means no self-heating and no retained neighbor-induced
+            # temperature shift. Clearing both prevents a previous MIMO run
+            # from resurfacing stale thermal drift after later re-enablement.
+            self._externalTemperatureOffsetC = 0.0
             self._lastThermalMetrics = {}
             return
-        if thermalConfig == self._activeThermalConfig:
+        if self._thermalEffectsSuspended:
+            # Suspension is an explicit transaction state. Do not recreate a
+            # thermal network merely because processing synchronizes live
+            # parameters while electrical-only calibration is in progress.
+            self.thermalNetwork = None
+            return
+        if (
+            thermalConfig == self._activeThermalConfig
+            and self.thermalNetwork is not None
+        ):
             return
         self.thermalNetwork = ThermalNetwork(thermalConfig)
         self._activeThermalConfig = thermalConfig
@@ -1385,14 +1530,18 @@ class PaModel:
         Processing details:
             Algorithm: Copy the active configuration, branch temperatures,
             ambient value, elapsed time, and latest diagnostics, then disable
-            only the network reference so calibration evaluates the electrical
-            model at its fixed reference temperature without producing heat.
+            the network reference and set an explicit suspension flag so every
+            temperature application path evaluates the electrical model at its
+            fixed reference temperature without producing heat. Reject nested
+            suspension because one snapshot must have one matching restore.
 
         Returns:
             result: Snapshot dictionary, or None when thermal modeling is off.
         """
 
         self.SynchronizeThermalModel()
+        if self._thermalEffectsSuspended:
+            raise RuntimeError("thermal model is already suspended")
         if self.thermalNetwork is None:
             return None
         snapshot = {
@@ -1411,6 +1560,7 @@ class PaModel:
                 self._externalTemperatureOffsetC
             ),
         }
+        self._thermalEffectsSuspended = True
         self.thermalNetwork = None
         return snapshot
 
@@ -1421,9 +1571,12 @@ class PaModel:
         """Restore thermal state saved before temperature-independent work.
 
         Processing details:
-            Algorithm: Treat None as a no-op, reconstruct the validated active
-            network, restore branch temperatures, ambient and elapsed time,
-            and recover the latest public diagnostics without advancing heat.
+            Algorithm: Treat None as a no-op. If live configuration was disabled
+            during the transaction, clear suspension without reviving the old
+            snapshot. Otherwise reconstruct the matching validated network,
+            restore branch temperatures, ambient, elapsed time, mutual offset,
+            and latest diagnostics without advancing heat. A different enabled
+            configuration starts a fresh, topology-compatible network.
 
         Args:
             thermalSnapshot: Snapshot returned by ``SuspendThermalModel``.
@@ -1437,6 +1590,26 @@ class PaModel:
         thermalConfig = thermalSnapshot.get("thermalConfig")
         if not isinstance(thermalConfig, ThermalConfig):
             raise TypeError("thermal snapshot contains an invalid configuration")
+        currentThermalConfig = self.ResolveThermalConfig()
+        if (
+            currentThermalConfig is None
+            or not currentThermalConfig.enabled
+        ):
+            # A live disable performed while calibration was running is
+            # authoritative. Never revive the older enabled snapshot.
+            self.thermalNetwork = None
+            self._activeThermalConfig = currentThermalConfig
+            self._externalTemperatureOffsetC = 0.0
+            self._lastThermalMetrics = {}
+            self._thermalEffectsSuspended = False
+            return
+        if currentThermalConfig != thermalConfig:
+            # A different enabled configuration must start its own network;
+            # branch states from another topology or parameter set are invalid.
+            self._thermalEffectsSuspended = False
+            self._activeThermalConfig = None
+            self.SynchronizeThermalModel()
+            return
         restoredNetwork = ThermalNetwork(thermalConfig)
         restoredRises = np.asarray(
             thermalSnapshot["temperatureRisePerBranchC"], dtype=float
@@ -1458,6 +1631,7 @@ class PaModel:
         self._externalTemperatureOffsetC = float(
             thermalSnapshot.get("externalTemperatureOffsetC", 0.0)
         )
+        self._thermalEffectsSuspended = False
 
     def ResolveConfiguration(
         self,
@@ -1565,7 +1739,8 @@ class PaModel:
 
         Processing details:
             Algorithm: Round and saturate the public fixed-point I/Q codes,
-            decode them to a normalized floating envelope, evaluate the PA,
+            decode them to a normalized floating envelope, apply the most
+            recently committed post-DAC calibration drive, evaluate the PA,
             and encode the floating result back to integer-valued public codes.
 
         Args:
@@ -1580,7 +1755,96 @@ class PaModel:
         self.SynchronizeThermalModel()
         interfaceFormat = FixedPoint(self.width)
         floatingInput = interfaceFormat.DecodeComplex(inputSignal)
-        floatingOutput = self.ProcessFloating(floatingInput)
+        driveScale = np.power(10.0, self._calibrationDriveDb / 20.0)
+        floatingOutput = self.ProcessFloating(driveScale * floatingInput)
+        return interfaceFormat.EncodeComplex(floatingOutput)
+
+    def ResolveCalibrationDriveDb(
+        self, driveDbPerChain: Sequence[float]
+    ) -> float:
+        """Validate and return the single-chain analog calibration drive.
+
+        Processing details:
+            Algorithm: Require exactly one finite real dB value because this
+            facade owns one physical PA. Reject booleans and nested values so
+            a calibration adapter cannot silently address the wrong chain.
+
+        Args:
+            driveDbPerChain: One-element sequence containing analog drive dB.
+
+        Returns:
+            result: Validated scalar analog drive in decibels.
+        """
+
+        if isinstance(driveDbPerChain, (str, bytes)):
+            raise TypeError("driveDbPerChain must be a one-element sequence")
+        driveArray = np.asarray(driveDbPerChain, dtype=object)
+        if driveArray.ndim != 1 or driveArray.size != 1:
+            raise ValueError(
+                "driveDbPerChain must contain exactly one PA drive value"
+            )
+        driveValue = driveArray[0]
+        if (
+            not isinstance(
+                driveValue,
+                (int, float, np.integer, np.floating),
+            )
+            or isinstance(driveValue, (bool, np.bool_))
+            or not np.isfinite(driveValue)
+        ):
+            raise ValueError(
+                "driveDbPerChain must contain one finite real dB value"
+            )
+        return float(driveValue)
+
+    def SetCalibrationDriveDb(
+        self, driveDbPerChain: Sequence[float]
+    ) -> None:
+        """Commit the hidden post-DAC drive selected by power calibration.
+
+        Processing details:
+            Algorithm: Validate the one-chain drive and store it independently
+            from the caller's PA coefficient mapping. Later public ``Process``
+            calls reproduce the accepted operating point without asking the
+            caller to scale fixed-point codes beyond their legal range.
+
+        Args:
+            driveDbPerChain: One-element sequence containing analog drive dB.
+
+        Returns:
+            result: None. The accepted drive applies to later public calls.
+        """
+
+        self._calibrationDriveDb = self.ResolveCalibrationDriveDb(
+            driveDbPerChain
+        )
+
+    def ProcessCalibrationDrive(
+        self,
+        inputSignal: np.ndarray,
+        driveDbPerChain: Sequence[float],
+    ) -> np.ndarray:
+        """Evaluate one trial with an explicit post-decode analog drive.
+
+        Processing details:
+            Algorithm: Decode the legal public waveform, multiply it by the
+            supplied analog drive without changing the committed state, run
+            the floating electrical and thermal PA path, and encode the clean
+            output once for measurement by ``PowerCalibration``.
+
+        Args:
+            inputSignal: Public floating samples or signed fixed-point I/Q codes.
+            driveDbPerChain: One-element trial analog-drive sequence in dB.
+
+        Returns:
+            result: Public PA output produced by this calibration trial.
+        """
+
+        trialDriveDb = self.ResolveCalibrationDriveDb(driveDbPerChain)
+        interfaceFormat = FixedPoint(self.width)
+        floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+        driveScale = np.power(10.0, trialDriveDb / 20.0)
+        floatingOutput = self.ProcessFloating(driveScale * floatingInput)
         return interfaceFormat.EncodeComplex(floatingOutput)
 
     def ProcessFloating(self, inputSignal: np.ndarray) -> np.ndarray:
@@ -1649,7 +1913,9 @@ class PaModel:
         Processing details:
             Algorithm: Preserve full-frame electrical memory by accepting the
             previously evaluated base output, then apply configured complex
-            gain and compression drift for one thermal update interval.
+            gain and compression drift for one thermal update interval. Return
+            the electrical output unchanged when configuration is disabled or
+            a power-calibration suspension transaction is active.
 
         Args:
             baseOutput: Electrical-model samples before temperature drift.
@@ -1661,7 +1927,11 @@ class PaModel:
 
         thermalConfig = self.ResolveThermalConfig()
         complexOutput = np.asarray(baseOutput, dtype=np.complex128)
-        if thermalConfig is None or not thermalConfig.enabled:
+        if (
+            self._thermalEffectsSuspended
+            or thermalConfig is None
+            or not thermalConfig.enabled
+        ):
             return complexOutput
         temperatureDeltaC = (
             float(junctionTemperatureC)
@@ -1704,17 +1974,21 @@ class PaModel:
     def EstimateDissipatedPowerW(
         self,
         outputSignal: np.ndarray,
+        activeMask: Optional[np.ndarray] = None,
     ) -> float:
         """Estimate mean heat power from normalized RF output and efficiency.
 
         Processing details:
             Algorithm: Map normalized instantaneous envelope power to watts,
-            classify samples below the relative active threshold as idle,
-            calculate constant or smooth output-power-dependent efficiency for
-            active samples, and average RF loss plus idle bias dissipation.
+            use a caller-supplied full-frame activity mask when available or
+            derive a local peak-relative mask for compatibility, calculate
+            output-power-dependent efficiency on active samples, and average
+            RF loss plus idle bias dissipation over the complete interval.
 
         Args:
             outputSignal: Temperature-modified normalized PA output segment.
+            activeMask: Optional boolean activity classification generated
+                once from the complete PA-input waveform.
 
         Returns:
             result: Mean dissipated heat power in watts for the segment.
@@ -1723,18 +1997,34 @@ class PaModel:
         thermalConfig = self.ResolveThermalConfig()
         if thermalConfig is None:
             return 0.0
-        outputPowerNormalized = np.abs(outputSignal) ** 2
+        complexOutput = np.asarray(outputSignal, dtype=np.complex128)
+        if complexOutput.ndim != 1 or complexOutput.size == 0:
+            raise ValueError("outputSignal must be a nonempty complex vector")
+        outputPowerNormalized = np.abs(complexOutput) ** 2
         referencePowerW = 10.0 ** (
             (float(thermalConfig.referenceOutputPowerDbm) - 30.0) / 10.0
         )
         outputPowerW = referencePowerW * outputPowerNormalized
-        peakPower = float(np.max(outputPowerNormalized))
-        if peakPower <= np.finfo(float).tiny:
-            return float(thermalConfig.idleDissipatedPowerW)
-        activeThresholdLinear = 10.0 ** (
-            float(thermalConfig.activePowerThresholdDb) / 10.0
-        )
-        activeMask = outputPowerNormalized >= activeThresholdLinear * peakPower
+        if activeMask is None:
+            peakPower = float(np.max(outputPowerNormalized))
+            if peakPower <= np.finfo(float).tiny:
+                resolvedActiveMask = np.zeros(
+                    complexOutput.size, dtype=bool
+                )
+            else:
+                activeThresholdLinear = 10.0 ** (
+                    float(thermalConfig.activePowerThresholdDb) / 10.0
+                )
+                resolvedActiveMask = (
+                    outputPowerNormalized
+                    >= activeThresholdLinear * peakPower
+                )
+        else:
+            resolvedActiveMask = np.asarray(activeMask, dtype=bool)
+            if resolvedActiveMask.shape != complexOutput.shape:
+                raise ValueError(
+                    "activeMask must match the outputSignal vector shape"
+                )
         efficiencyValues = np.full(
             outputPowerW.shape,
             float(thermalConfig.minimumDrainEfficiency),
@@ -1768,20 +2058,20 @@ class PaModel:
             * (1.0 / efficiencyValues - 1.0)
         )
         dissipatedPowerPerSample = np.where(
-            activeMask,
+            resolvedActiveMask,
             activeDissipation,
             float(thermalConfig.idleDissipatedPowerW),
         )
         return float(np.mean(dissipatedPowerPerSample))
 
     def ProcessThermalFloating(self, inputSignal: np.ndarray) -> np.ndarray:
-        """Process a waveform causally while RF power advances thermal state.
+        """Process one continuous transient data window without an outer gap.
 
         Processing details:
-            Algorithm: Split the waveform into configured thermal update
-            intervals, evaluate each segment at its starting junction
-            temperature, estimate mean heat from all active and idle samples,
-            and advance the Foster state for the exact segment duration.
+            Algorithm: Delegate to the general period processor in transient
+            mode with a configured duty cycle of one. Direct PaModel users
+            retain the historical continuous-waveform behavior, while Channel
+            supplies explicit steady-state and scheduled-idle settings.
 
         Args:
             inputSignal: Normalized finite complex waveform to transmit.
@@ -1790,94 +2080,533 @@ class PaModel:
             result: Same-length complex waveform including thermal drift.
         """
 
+        return self.ProcessThermalPeriodFloating(
+            inputSignal,
+            thermalRunMode="transient",
+            thermalDutyCycle=1.0,
+            steadyStateToleranceC=1.0e-4,
+            maximumSteadyStateIterations=100,
+        )
+
+    def BuildThermalActiveMask(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Classify RF-active samples once for an entire data window.
+
+        Processing details:
+            Algorithm: Compare instantaneous PA-input power with one threshold
+            derived from the full-window peak. A completely silent waveform
+            produces an all-false mask. Reusing this mask for every thermal
+            segment prevents a low-level idle segment from becoming active
+            merely because it has its own smaller local peak.
+
+        Args:
+            inputSignal: Normalized finite PA-input waveform.
+
+        Returns:
+            result: Boolean vector marking true RF-active samples.
+        """
+
+        thermalConfig = self.ResolveThermalConfig()
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        if (
+            complexInput.ndim != 1
+            or complexInput.size == 0
+            or not np.all(np.isfinite(complexInput))
+        ):
+            raise ValueError("inputSignal must be a nonempty finite vector")
+        if thermalConfig is None:
+            return np.zeros(complexInput.size, dtype=bool)
+        inputPower = np.abs(complexInput) ** 2
+        peakPower = float(np.max(inputPower))
+        if peakPower <= np.finfo(float).tiny:
+            return np.zeros(complexInput.size, dtype=bool)
+        threshold = peakPower * 10.0 ** (
+            float(thermalConfig.activePowerThresholdDb) / 10.0
+        )
+        return np.asarray(inputPower >= threshold, dtype=bool)
+
+    def BuildThermalIntervals(
+        self, activeMask: np.ndarray
+    ) -> Tuple[Tuple[int, int], ...]:
+        """Split a data window at thermal limits and activity transitions.
+
+        Processing details:
+            Algorithm: Combine regular thermal-update boundaries with every
+            true-to-false or false-to-true activity transition. Consequently
+            even an idle run shorter than ``thermalUpdateIntervalSamples``
+            receives its own idle-power interval and can cool toward the idle
+            thermal equilibrium rather than being averaged into RF activity.
+
+        Args:
+            activeMask: Full-window boolean RF-activity vector.
+
+        Returns:
+            result: Ordered half-open sample-index intervals.
+        """
+
+        thermalConfig = self.ResolveThermalConfig()
+        if thermalConfig is None:
+            raise RuntimeError("thermal model is not configured")
+        resolvedMask = np.asarray(activeMask, dtype=bool)
+        if resolvedMask.ndim != 1 or resolvedMask.size == 0:
+            raise ValueError("activeMask must be a nonempty vector")
+        intervalLength = int(thermalConfig.thermalUpdateIntervalSamples)
+        regularBoundaries = range(
+            intervalLength, resolvedMask.size, intervalLength
+        )
+        transitionBoundaries = (
+            np.flatnonzero(resolvedMask[1:] != resolvedMask[:-1]) + 1
+        )
+        boundaryValues = sorted(
+            {
+                0,
+                resolvedMask.size,
+                *regularBoundaries,
+                *(int(value) for value in transitionBoundaries),
+            }
+        )
+        return tuple(
+            (startIndex, stopIndex)
+            for startIndex, stopIndex in zip(
+                boundaryValues[:-1], boundaryValues[1:]
+            )
+        )
+
+    def SimulateThermalPeriod(
+        self,
+        baseOutput: np.ndarray,
+        activeMask: np.ndarray,
+        startingTemperatureRisePerBranchC: np.ndarray,
+        externalIdleDurationSec: float,
+    ) -> Dict[str, object]:
+        """Simulate one complete period without mutating the thermal network.
+
+        Processing details:
+            Algorithm: Apply temperature drift at the beginning of each data
+            interval, estimate heat with the full-window activity mask, advance
+            a local copy of every RC state exactly, and finally append the
+            scheduled outer idle interval. The returned waveform contains only
+            the caller's data window; idle time changes thermal state but does
+            not append samples to the public signal.
+
+        Args:
+            baseOutput: Full electrical-model output before thermal drift.
+            activeMask: Full-window RF-activity classification.
+            startingTemperatureRisePerBranchC: Period-start branch state.
+            externalIdleDurationSec: Scheduled idle time after the data window.
+
+        Returns:
+            result: Dictionary containing output, heat schedule, branch states,
+                energy, and a compact period temperature trace.
+        """
+
         thermalConfig = self.ResolveThermalConfig()
         if thermalConfig is None or self.thermalNetwork is None:
-            return np.asarray(
-                self.model.Process(inputSignal), dtype=np.complex128
+            raise RuntimeError("thermal model is not enabled")
+        complexBaseOutput = np.asarray(baseOutput, dtype=np.complex128)
+        resolvedActiveMask = np.asarray(activeMask, dtype=bool)
+        if (
+            complexBaseOutput.ndim != 1
+            or complexBaseOutput.size == 0
+            or resolvedActiveMask.shape != complexBaseOutput.shape
+        ):
+            raise ValueError(
+                "baseOutput and activeMask must be matching nonempty vectors"
             )
-        baseOutput = np.asarray(
-            self.model.Process(inputSignal), dtype=np.complex128
+        resolvedIdleDurationSec = float(externalIdleDurationSec)
+        if (
+            not np.isfinite(resolvedIdleDurationSec)
+            or resolvedIdleDurationSec < 0.0
+        ):
+            raise ValueError(
+                "externalIdleDurationSec must be finite and nonnegative"
+            )
+        branchState = np.asarray(
+            startingTemperatureRisePerBranchC, dtype=float
+        ).copy()
+        if branchState.shape != self.thermalNetwork.temperatureRisePerBranchC.shape:
+            raise ValueError(
+                "startingTemperatureRisePerBranchC has an incompatible shape"
+            )
+        outputSignal = np.empty_like(
+            complexBaseOutput, dtype=np.complex128
         )
-        outputSignal = np.empty_like(inputSignal, dtype=np.complex128)
-        intervalLength = int(thermalConfig.thermalUpdateIntervalSamples)
-        dissipatedEnergyJ = 0.0
-        startingTemperatureC = (
-            self.thermalNetwork.CurrentTemperatureC()
-            + self._externalTemperatureOffsetC
-        )
-        for startIndex in range(0, inputSignal.size, intervalLength):
-            stopIndex = min(startIndex + intervalLength, inputSignal.size)
-            inputSegment = inputSignal[startIndex:stopIndex]
-            baseOutputSegment = baseOutput[startIndex:stopIndex]
-            junctionTemperatureC = (
-                self.thermalNetwork.CurrentTemperatureC()
+        dissipatedPowersW = []
+        durationsSec = []
+        dataDissipatedEnergyJ = 0.0
+        elapsedDataTimeSec = 0.0
+        temperatureTraceTimeSec = [0.0]
+        temperatureTraceC = [
+            float(
+                self.thermalNetwork.ambientTemperatureC
+                + np.sum(branchState)
                 + self._externalTemperatureOffsetC
             )
+        ]
+        temperatureTraceRfActive = []
+        maximumTemperatureC = float(
+            thermalConfig.maximumJunctionTemperatureC
+        )
+        for startIndex, stopIndex in self.BuildThermalIntervals(
+            resolvedActiveMask
+        ):
+            junctionTemperatureC = float(
+                self.thermalNetwork.ambientTemperatureC
+                + np.sum(branchState)
+                + self._externalTemperatureOffsetC
+            )
+            if junctionTemperatureC > maximumTemperatureC:
+                raise RuntimeError(
+                    "PA junction temperature exceeded "
+                    "maximumJunctionTemperatureC"
+                )
             outputSegment = self.ApplyTemperatureDrift(
-                baseOutputSegment,
+                complexBaseOutput[startIndex:stopIndex],
                 junctionTemperatureC,
             )
             outputSignal[startIndex:stopIndex] = outputSegment
-            dissipatedPowerW = self.EstimateDissipatedPowerW(outputSegment)
-            durationSec = inputSegment.size / float(thermalConfig.sampleRateHz)
-            dissipatedEnergyJ += dissipatedPowerW * durationSec
-            selfHeatingTemperatureC = self.thermalNetwork.Advance(
+            segmentMask = resolvedActiveMask[startIndex:stopIndex]
+            dissipatedPowerW = self.EstimateDissipatedPowerW(
+                outputSegment, segmentMask
+            )
+            durationSec = (
+                (stopIndex - startIndex)
+                / float(thermalConfig.sampleRateHz)
+            )
+            branchState = self.thermalNetwork.CalculateAdvancedState(
+                branchState,
                 dissipatedPowerW,
                 durationSec,
             )
-            junctionTemperatureC = (
-                selfHeatingTemperatureC
-                + self._externalTemperatureOffsetC
-            )
-            if junctionTemperatureC > float(
-                thermalConfig.maximumJunctionTemperatureC
-            ):
-                raise RuntimeError(
-                    "PA junction temperature exceeded maximumJunctionTemperatureC"
+            elapsedDataTimeSec += durationSec
+            dataDissipatedEnergyJ += dissipatedPowerW * durationSec
+            dissipatedPowersW.append(dissipatedPowerW)
+            durationsSec.append(durationSec)
+            temperatureTraceTimeSec.append(elapsedDataTimeSec)
+            temperatureTraceC.append(
+                float(
+                    self.thermalNetwork.ambientTemperatureC
+                    + np.sum(branchState)
+                    + self._externalTemperatureOffsetC
                 )
-        totalDurationSec = inputSignal.size / float(thermalConfig.sampleRateHz)
-        inputPower = np.abs(inputSignal) ** 2
-        inputPeakPower = float(np.max(inputPower))
-        activeThreshold = inputPeakPower * 10.0 ** (
-            float(thermalConfig.activePowerThresholdDb) / 10.0
+            )
+            temperatureTraceRfActive.append(bool(np.any(segmentMask)))
+        dataEndingState = branchState.copy()
+        if resolvedIdleDurationSec > 0.0:
+            idlePowerW = float(thermalConfig.idleDissipatedPowerW)
+            branchState = self.thermalNetwork.CalculateAdvancedState(
+                branchState,
+                idlePowerW,
+                resolvedIdleDurationSec,
+            )
+            dissipatedPowersW.append(idlePowerW)
+            durationsSec.append(resolvedIdleDurationSec)
+            temperatureTraceTimeSec.append(
+                elapsedDataTimeSec + resolvedIdleDurationSec
+            )
+            temperatureTraceC.append(
+                float(
+                    self.thermalNetwork.ambientTemperatureC
+                    + np.sum(branchState)
+                    + self._externalTemperatureOffsetC
+                )
+            )
+            temperatureTraceRfActive.append(False)
+        if max(temperatureTraceC) > maximumTemperatureC:
+            raise RuntimeError(
+                "PA junction temperature exceeded maximumJunctionTemperatureC"
+            )
+        return {
+            "outputSignal": outputSignal,
+            "dataEndingTemperatureRisePerBranchC": dataEndingState,
+            "periodEndingTemperatureRisePerBranchC": branchState,
+            "dissipatedPowersW": tuple(dissipatedPowersW),
+            "durationsSec": tuple(durationsSec),
+            "dataDissipatedEnergyJ": dataDissipatedEnergyJ,
+            "periodDissipatedEnergyJ": (
+                dataDissipatedEnergyJ
+                + float(thermalConfig.idleDissipatedPowerW)
+                * resolvedIdleDurationSec
+            ),
+            "temperatureTraceTimeSec": tuple(temperatureTraceTimeSec),
+            "temperatureTraceC": tuple(temperatureTraceC),
+            "temperatureTraceRfActive": tuple(temperatureTraceRfActive),
+        }
+
+    def ProcessThermalPeriodFloating(
+        self,
+        inputSignal: np.ndarray,
+        thermalRunMode: str = "steady_state",
+        thermalDutyCycle: float = 1.0,
+        steadyStateToleranceC: float = 1.0e-4,
+        maximumSteadyStateIterations: int = 100,
+    ) -> np.ndarray:
+        """Process one scheduled thermal period in steady or transient mode.
+
+        Processing details:
+            Algorithm: Treat the complete input array as the configured data
+            window, derive its outer idle duration from ``thermalDutyCycle``,
+            and split its internal active and idle samples. Transient mode
+            advances exactly one cycle from live state. Steady-state mode
+            repeatedly freezes the temperature-dependent heat trace, solves
+            each RC branch's analytic periodic starting state, and verifies
+            that every branch returns to that state within tolerance. Solver
+            trials never change live elapsed time; only the accepted period is
+            committed.
+
+        Args:
+            inputSignal: Normalized finite PA-input data-window waveform.
+            thermalRunMode: ``"steady_state"`` or ``"transient"``.
+            thermalDutyCycle: Data-window duration divided by period duration.
+            steadyStateToleranceC: Maximum allowed per-branch closure error.
+            maximumSteadyStateIterations: Maximum nonlinear fixed-point steps.
+
+        Returns:
+            result: Temperature-modified output for the data window only.
+        """
+
+        self.SynchronizeModel()
+        self.SynchronizeThermalModel()
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        if (
+            complexInput.ndim != 1
+            or complexInput.size == 0
+            or not np.all(np.isfinite(complexInput))
+        ):
+            raise ValueError("inputSignal must be a nonempty finite vector")
+        if not isinstance(thermalRunMode, str):
+            raise TypeError("thermalRunMode must be a string")
+        resolvedRunMode = thermalRunMode.strip().lower()
+        if resolvedRunMode not in ("steady_state", "transient"):
+            raise ValueError(
+                "thermalRunMode must be 'steady_state' or 'transient'"
+            )
+        if (
+            not isinstance(thermalDutyCycle, (int, float))
+            or isinstance(thermalDutyCycle, bool)
+            or not np.isfinite(thermalDutyCycle)
+            or not 0.0 < float(thermalDutyCycle) <= 1.0
+        ):
+            raise ValueError(
+                "thermalDutyCycle must be a finite real number in (0, 1]"
+            )
+        if (
+            not isinstance(steadyStateToleranceC, (int, float))
+            or isinstance(steadyStateToleranceC, bool)
+            or not np.isfinite(steadyStateToleranceC)
+            or float(steadyStateToleranceC) <= 0.0
+        ):
+            raise ValueError(
+                "steadyStateToleranceC must be a finite positive value"
+            )
+        if (
+            not isinstance(maximumSteadyStateIterations, int)
+            or isinstance(maximumSteadyStateIterations, bool)
+            or maximumSteadyStateIterations < 1
+        ):
+            raise ValueError(
+                "maximumSteadyStateIterations must be a positive integer"
+            )
+        thermalConfig = self.ResolveThermalConfig()
+        if thermalConfig is None or self.thermalNetwork is None:
+            return np.asarray(
+                self.model.Process(complexInput), dtype=np.complex128
+            )
+        baseOutput = np.asarray(
+            self.model.Process(complexInput), dtype=np.complex128
         )
-        activeMask = inputPower >= activeThreshold
-        if inputPeakPower <= np.finfo(float).tiny:
-            activeMask = np.zeros(inputSignal.size, dtype=bool)
+        activeMask = self.BuildThermalActiveMask(complexInput)
+        signalDurationSec = (
+            complexInput.size / float(thermalConfig.sampleRateHz)
+        )
+        periodDurationSec = signalDurationSec / float(thermalDutyCycle)
+        externalIdleDurationSec = periodDurationSec - signalDurationSec
+        periodStartingState = np.asarray(
+            self.thermalNetwork.temperatureRisePerBranchC, dtype=float
+        ).copy()
+        steadyStateConverged = False
+        steadyStateIterations = 0
+        steadyStateErrorC = 0.0
+        simulationResult: Dict[str, object]
+        if (
+            resolvedRunMode == "steady_state"
+            and thermalConfig.modelName.strip().lower() != "static"
+        ):
+            candidateState = periodStartingState.copy()
+            bestErrorC = float("inf")
+            for iterationIndex in range(
+                1, maximumSteadyStateIterations + 1
+            ):
+                trialResult = self.SimulateThermalPeriod(
+                    baseOutput,
+                    activeMask,
+                    candidateState,
+                    externalIdleDurationSec,
+                )
+                solvedState = self.thermalNetwork.CalculatePeriodicSteadyState(
+                    cast(
+                        Sequence[float],
+                        trialResult["dissipatedPowersW"],
+                    ),
+                    cast(Sequence[float], trialResult["durationsSec"]),
+                )
+                candidateState = solvedState
+                verificationResult = self.SimulateThermalPeriod(
+                    baseOutput,
+                    activeMask,
+                    candidateState,
+                    externalIdleDurationSec,
+                )
+                endingState = np.asarray(
+                    verificationResult[
+                        "periodEndingTemperatureRisePerBranchC"
+                    ],
+                    dtype=float,
+                )
+                closureErrorC = float(
+                    np.max(np.abs(endingState - candidateState))
+                )
+                bestErrorC = min(bestErrorC, closureErrorC)
+                if closureErrorC <= float(steadyStateToleranceC):
+                    periodStartingState = candidateState.copy()
+                    simulationResult = verificationResult
+                    steadyStateConverged = True
+                    steadyStateIterations = iterationIndex
+                    steadyStateErrorC = closureErrorC
+                    break
+                candidateState = 0.5 * (
+                    candidateState
+                    + np.asarray(
+                        verificationResult[
+                            "periodEndingTemperatureRisePerBranchC"
+                        ],
+                        dtype=float,
+                    )
+                )
+            else:
+                raise RuntimeError(
+                    "periodic thermal steady-state solver did not converge "
+                    f"within {maximumSteadyStateIterations} iterations; "
+                    f"best branch error was {bestErrorC:.6g} C and the "
+                    f"allowed tolerance is {float(steadyStateToleranceC):.6g} C"
+                )
+        else:
+            simulationResult = self.SimulateThermalPeriod(
+                baseOutput,
+                activeMask,
+                periodStartingState,
+                externalIdleDurationSec,
+            )
+            if resolvedRunMode == "steady_state":
+                steadyStateConverged = True
+                steadyStateIterations = 0
+                steadyStateErrorC = 0.0
+        outputSignal = np.asarray(
+            simulationResult["outputSignal"], dtype=np.complex128
+        )
+        dataEndingState = np.asarray(
+            simulationResult["dataEndingTemperatureRisePerBranchC"],
+            dtype=float,
+        )
+        periodEndingState = np.asarray(
+            simulationResult["periodEndingTemperatureRisePerBranchC"],
+            dtype=float,
+        )
+        self.thermalNetwork.temperatureRisePerBranchC = (
+            periodEndingState.copy()
+        )
+        self.thermalNetwork.elapsedTimeSec += periodDurationSec
+        periodStartingJunctionTemperatureC = float(
+            self.thermalNetwork.ambientTemperatureC
+            + np.sum(periodStartingState)
+            + self._externalTemperatureOffsetC
+        )
+        dataEndingJunctionTemperatureC = float(
+            self.thermalNetwork.ambientTemperatureC
+            + np.sum(dataEndingState)
+            + self._externalTemperatureOffsetC
+        )
+        periodEndingJunctionTemperatureC = float(
+            self.thermalNetwork.ambientTemperatureC
+            + np.sum(periodEndingState)
+            + self._externalTemperatureOffsetC
+        )
+        waveformActiveDutyCycle = float(np.mean(activeMask))
+        actualDutyCycle = (
+            float(thermalDutyCycle) * waveformActiveDutyCycle
+        )
         activeOutputPower = (
             float(np.mean(np.abs(outputSignal[activeMask]) ** 2))
             if np.any(activeMask)
             else np.finfo(float).tiny
         )
+        dataDissipatedEnergyJ = float(
+            simulationResult["dataDissipatedEnergyJ"]
+        )
+        periodDissipatedEnergyJ = float(
+            simulationResult["periodDissipatedEnergyJ"]
+        )
         self._lastThermalMetrics = {
             **self.thermalNetwork.GetMetrics(),
-            "junctionTemperatureC": (
-                self.thermalNetwork.CurrentTemperatureC()
-                + self._externalTemperatureOffsetC
-            ),
+            "junctionTemperatureC": periodEndingJunctionTemperatureC,
             "selfHeatingJunctionTemperatureC": (
                 self.thermalNetwork.CurrentTemperatureC()
             ),
             "mutualHeatingTemperatureRiseC": (
                 self._externalTemperatureOffsetC
             ),
-            "startingJunctionTemperatureC": startingTemperatureC,
-            "endingJunctionTemperatureC": (
-                self.thermalNetwork.CurrentTemperatureC()
-                + self._externalTemperatureOffsetC
+            "startingJunctionTemperatureC": (
+                periodStartingJunctionTemperatureC
+            ),
+            "endingJunctionTemperatureC": dataEndingJunctionTemperatureC,
+            "periodStartingJunctionTemperatureC": (
+                periodStartingJunctionTemperatureC
+            ),
+            "dataEndingJunctionTemperatureC": (
+                dataEndingJunctionTemperatureC
+            ),
+            "periodEndingJunctionTemperatureC": (
+                periodEndingJunctionTemperatureC
+            ),
+            "periodStartingTemperatureRisePerBranchC": tuple(
+                float(value) for value in periodStartingState
+            ),
+            "dataEndingTemperatureRisePerBranchC": tuple(
+                float(value) for value in dataEndingState
+            ),
+            "periodEndingTemperatureRisePerBranchC": tuple(
+                float(value) for value in periodEndingState
             ),
             "averageDissipatedPowerW": (
-                dissipatedEnergyJ / totalDurationSec
+                periodDissipatedEnergyJ / periodDurationSec
             ),
-            "activeSampleDutyCycle": self.CalculateActiveDutyCycle(inputSignal),
+            "dataWindowAverageDissipatedPowerW": (
+                dataDissipatedEnergyJ / signalDurationSec
+            ),
+            "activeSampleDutyCycle": waveformActiveDutyCycle,
+            "waveformActiveDutyCycle": waveformActiveDutyCycle,
+            "configuredDutyCycle": float(thermalDutyCycle),
+            "actualDutyCycle": actualDutyCycle,
+            "signalDurationSec": signalDurationSec,
+            "scheduledIdleDurationSec": externalIdleDurationSec,
+            "periodDurationSec": periodDurationSec,
+            "thermalRunMode": resolvedRunMode,
+            "steadyStateConverged": steadyStateConverged,
+            "steadyStateIterations": steadyStateIterations,
+            "steadyStateErrorC": steadyStateErrorC,
+            "temperatureTraceTimeSec": simulationResult[
+                "temperatureTraceTimeSec"
+            ],
+            "temperatureTraceC": simulationResult["temperatureTraceC"],
+            "temperatureTraceRfActive": simulationResult[
+                "temperatureTraceRfActive"
+            ],
             "outputPowerDbm": (
                 float(thermalConfig.referenceOutputPowerDbm)
                 + 10.0
                 * np.log10(
-                    max(
-                        activeOutputPower,
-                        np.finfo(float).tiny,
-                    )
+                    max(activeOutputPower, np.finfo(float).tiny)
                 )
             ),
         }
@@ -1901,14 +2630,42 @@ class PaModel:
         thermalConfig = self.ResolveThermalConfig()
         if thermalConfig is None:
             return 0.0
-        inputPower = np.abs(inputSignal) ** 2
-        peakPower = float(np.max(inputPower))
-        if peakPower <= np.finfo(float).tiny:
-            return 0.0
-        threshold = peakPower * 10.0 ** (
-            float(thermalConfig.activePowerThresholdDb) / 10.0
+        return float(np.mean(self.BuildThermalActiveMask(inputSignal)))
+
+    def CalculateActualDutyCycle(
+        self,
+        inputSignal: np.ndarray,
+        thermalDutyCycle: float = 1.0,
+    ) -> float:
+        """Combine the scheduled data-window duty with measured RF activity.
+
+        Processing details:
+            Algorithm: Validate the configured ratio of data-window duration
+            to period duration, measure the fraction of active samples inside
+            that complete window, and multiply the two independent fractions.
+            Internal zero samples therefore reduce actual RF duty without
+            changing the caller's configured scheduling duty.
+
+        Args:
+            inputSignal: Normalized finite PA-input data-window waveform.
+            thermalDutyCycle: Configured data-window fraction of one period.
+
+        Returns:
+            result: Actual RF-active fraction of the complete period.
+        """
+
+        if (
+            not isinstance(thermalDutyCycle, (int, float))
+            or isinstance(thermalDutyCycle, bool)
+            or not np.isfinite(thermalDutyCycle)
+            or not 0.0 < float(thermalDutyCycle) <= 1.0
+        ):
+            raise ValueError(
+                "thermalDutyCycle must be a finite real number in (0, 1]"
+            )
+        return float(thermalDutyCycle) * self.CalculateActiveDutyCycle(
+            inputSignal
         )
-        return float(np.mean(inputPower >= threshold))
 
     def ResetThermalState(
         self,
@@ -1965,6 +2722,7 @@ class PaModel:
             selfHeatingTemperatureC + self._externalTemperatureOffsetC
         )
         self._lastThermalMetrics = {
+            **self._lastThermalMetrics,
             **self.thermalNetwork.GetMetrics(),
             "junctionTemperatureC": junctionTemperatureC,
             "selfHeatingJunctionTemperatureC": selfHeatingTemperatureC,
@@ -1974,7 +2732,7 @@ class PaModel:
             "averageDissipatedPowerW": float(
                 thermalConfig.idleDissipatedPowerW
             ),
-            "activeSampleDutyCycle": 0.0,
+            "latestExplicitIdleDurationSec": float(idleTimeSec),
         }
         return junctionTemperatureC
 
@@ -2001,19 +2759,24 @@ class PaModel:
             raise ValueError(
                 "externalTemperatureOffsetC must be finite and nonnegative"
             )
+        self.SynchronizeThermalModel()
+        if self.thermalNetwork is None:
+            # A disabled thermal model must not accumulate a hidden mutual-
+            # heating offset that could alter output after later re-enablement.
+            self._externalTemperatureOffsetC = 0.0
+            return
         self._externalTemperatureOffsetC = resolvedOffset
-        if self.thermalNetwork is not None:
-            self._lastThermalMetrics = {
-                **self._lastThermalMetrics,
-                "junctionTemperatureC": (
-                    self.thermalNetwork.CurrentTemperatureC()
-                    + resolvedOffset
-                ),
-                "selfHeatingJunctionTemperatureC": (
-                    self.thermalNetwork.CurrentTemperatureC()
-                ),
-                "mutualHeatingTemperatureRiseC": resolvedOffset,
-            }
+        self._lastThermalMetrics = {
+            **self._lastThermalMetrics,
+            "junctionTemperatureC": (
+                self.thermalNetwork.CurrentTemperatureC()
+                + resolvedOffset
+            ),
+            "selfHeatingJunctionTemperatureC": (
+                self.thermalNetwork.CurrentTemperatureC()
+            ),
+            "mutualHeatingTemperatureRiseC": resolvedOffset,
+        }
 
     def GetThermalMetrics(self) -> Dict[str, object]:
         """Return the latest temperature, heat, duty-cycle, and timing values.
@@ -2029,7 +2792,22 @@ class PaModel:
         self.SynchronizeThermalModel()
         if self.thermalNetwork is None:
             return {"enabled": False}
-        return {"enabled": True, **dict(self._lastThermalMetrics)}
+        thermalConfig = self.ResolveThermalConfig()
+        if thermalConfig is None:
+            raise RuntimeError(
+                "enabled thermal state requires an active ThermalConfig"
+            )
+        return {
+            "enabled": True,
+            "sampleRateHz": float(thermalConfig.sampleRateHz),
+            "referenceOutputPowerDbm": float(
+                thermalConfig.referenceOutputPowerDbm
+            ),
+            "activePowerThresholdDb": float(
+                thermalConfig.activePowerThresholdDb
+            ),
+            **dict(self._lastThermalMetrics),
+        }
 
     def SmallSignalGain(self) -> complex:
         """Return the configured model's DC small-signal complex gain.
@@ -2142,8 +2920,10 @@ class MimoPaModel:
         )
         self.paModels = []
         self._activePaParameterSnapshot = None
+        self._calibrationDriveDbPerChain: Tuple[float, ...] = tuple()
         self.lastOutputRmsPerChain: Tuple[float, ...] = tuple()
         self.lastDissipatedPowerWPerChain: Tuple[float, ...] = tuple()
+        self._lastMutualHeatingMetrics: Dict[str, object] = {}
         self.SynchronizeModels()
 
     @property
@@ -2459,6 +3239,10 @@ class MimoPaModel:
             for chainParameters in paParameterSnapshot
         ]
         self._activePaParameterSnapshot = paParameterSnapshot
+        self._calibrationDriveDbPerChain = tuple(
+            0.0 for _ in range(self.numTransmitChains)
+        )
+        self._lastMutualHeatingMetrics = {}
 
     def SetOutputPowerDb(self, chainIndex: int, outputPowerDb: float) -> None:
         """Set one chain's relative output-power calibration in decibels.
@@ -2572,10 +3356,11 @@ class MimoPaModel:
         """Process every transmit column through its independent PA chain.
 
         Processing details:
-            Algorithm: Decode the public matrix of fixed I/Q codes once,
-            process every normalized floating column through its PA and power
-            controls, encode every result column back to public integer codes,
-            and preserve the original vector or matrix orientation.
+            Algorithm: Decode the public matrix of fixed I/Q codes once, apply
+            each committed post-DAC calibration drive, process every normalized
+            floating column through its PA and power controls, encode every
+            result column back to public integer codes, and preserve the
+            original vector or matrix orientation.
 
         Args:
             inputSignal: Complex vector for one chain or matrix shaped samples
@@ -2601,11 +3386,18 @@ class MimoPaModel:
             )
         if complexInput.shape[0] == 0 or not np.all(np.isfinite(complexInput)):
             raise ValueError("inputSignal must contain finite samples")
+        driveDbPerChain = self.ResolveCalibrationDriveDbPerChain(
+            self._calibrationDriveDbPerChain
+        )
+        driveScalePerChain = np.power(
+            10.0, np.asarray(driveDbPerChain, dtype=float) / 20.0
+        )
+        drivenInput = complexInput * driveScalePerChain.reshape(1, -1)
         outputColumns = []
         outputRmsValues = []
         for chainIndex in range(self.numTransmitChains):
             floatingChainOutput = self.ProcessChainFloating(
-                complexInput[:, chainIndex], chainIndex
+                drivenInput[:, chainIndex], chainIndex
             )
             outputColumns.append(
                 interfaceFormat.EncodeComplex(floatingChainOutput)
@@ -2631,6 +3423,125 @@ class MimoPaModel:
         if inputWasVector and self.numTransmitChains == 1:
             return outputMatrix[:, 0]
         return outputMatrix
+
+    def ResolveCalibrationDriveDbPerChain(
+        self, driveDbPerChain: Sequence[float]
+    ) -> Tuple[float, ...]:
+        """Validate one hidden analog-drive value per physical PA chain.
+
+        Processing details:
+            Algorithm: Flatten a one-dimensional sequence, require its length
+            to equal ``numTransmitChains``, and reject boolean or nonfinite
+            entries before any exponential amplitude conversion.
+
+        Args:
+            driveDbPerChain: Chain-ordered post-DAC drive values in decibels.
+
+        Returns:
+            result: Immutable validated drive tuple in physical chain order.
+        """
+
+        if isinstance(driveDbPerChain, (str, bytes)):
+            raise TypeError("driveDbPerChain must be a numeric sequence")
+        driveArray = np.asarray(driveDbPerChain, dtype=object)
+        if (
+            driveArray.ndim != 1
+            or driveArray.size != self.numTransmitChains
+        ):
+            raise ValueError(
+                "driveDbPerChain must contain one value per transmit chain"
+            )
+        resolvedValues = []
+        for driveValue in driveArray:
+            if (
+                not isinstance(
+                    driveValue,
+                    (int, float, np.integer, np.floating),
+                )
+                or isinstance(driveValue, (bool, np.bool_))
+                or not np.isfinite(driveValue)
+            ):
+                raise ValueError(
+                    "every driveDbPerChain entry must be a finite real dB "
+                    "value"
+                )
+            resolvedValues.append(float(driveValue))
+        return tuple(resolvedValues)
+
+    def SetCalibrationDriveDb(
+        self, driveDbPerChain: Sequence[float]
+    ) -> None:
+        """Commit post-DAC analog drives selected by power calibration.
+
+        Processing details:
+            Algorithm: Validate one value per PA and replace the private drive
+            tuple atomically. Public fixed-point waveforms remain legal DAC
+            codes while subsequent ``Process`` calls reproduce the calibrated
+            operating point on every chain.
+
+        Args:
+            driveDbPerChain: Chain-ordered analog drive values in decibels.
+
+        Returns:
+            result: None. Accepted drives apply to later public processing.
+        """
+
+        self._calibrationDriveDbPerChain = (
+            self.ResolveCalibrationDriveDbPerChain(driveDbPerChain)
+        )
+
+    def ProcessCalibrationDrive(
+        self,
+        inputSignal: np.ndarray,
+        driveDbPerChain: Sequence[float],
+    ) -> np.ndarray:
+        """Evaluate a MIMO trial at explicit post-decode analog drives.
+
+        Processing details:
+            Algorithm: Decode the public waveform matrix once, apply one trial
+            analog gain to every transmit column without changing committed
+            state, execute the raw floating PA bank, and encode the clean
+            per-chain outputs once for closed-loop power measurement.
+
+        Args:
+            inputSignal: Public SISO vector or samples-by-chains matrix.
+            driveDbPerChain: One trial analog-drive value per physical PA.
+
+        Returns:
+            result: Public clean PA output with the original orientation.
+        """
+
+        self.SynchronizeModels()
+        interfaceFormat = FixedPoint(self.width)
+        floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+        inputWasVector = floatingInput.ndim == 1
+        inputMatrix = (
+            floatingInput.reshape(-1, 1)
+            if inputWasVector
+            else floatingInput
+        )
+        if (
+            inputMatrix.ndim != 2
+            or inputMatrix.shape[0] == 0
+            or inputMatrix.shape[1] != self.numTransmitChains
+            or not np.all(np.isfinite(inputMatrix))
+        ):
+            raise ValueError(
+                "inputSignal must have one finite column per transmit chain"
+            )
+        resolvedDriveDb = self.ResolveCalibrationDriveDbPerChain(
+            driveDbPerChain
+        )
+        driveScalePerChain = np.power(
+            10.0, np.asarray(resolvedDriveDb, dtype=float) / 20.0
+        )
+        floatingOutput = self.ProcessFloating(
+            inputMatrix * driveScalePerChain.reshape(1, -1)
+        )
+        publicOutput = interfaceFormat.EncodeComplex(floatingOutput)
+        if inputWasVector and self.numTransmitChains == 1:
+            return np.asarray(publicOutput)[:, 0]
+        return np.asarray(publicOutput, dtype=np.complex128)
 
     def ProcessFloating(
         self, inputSignal: np.ndarray
@@ -2693,6 +3604,335 @@ class MimoPaModel:
             return outputMatrix[:, 0]
         return outputMatrix
 
+    def ProcessThermalPeriodFloating(
+        self,
+        inputSignal: np.ndarray,
+        thermalRunMode: str = "steady_state",
+        thermalDutyCycle: float = 1.0,
+        steadyStateToleranceC: float = 1.0e-4,
+        maximumSteadyStateIterations: int = 100,
+    ) -> np.ndarray:
+        """Process all PA chains over one common scheduled thermal period.
+
+        Processing details:
+            Algorithm: Apply each chain's legacy input scaling, delegate the
+            self-heating period to its PaModel, then apply legacy output
+            scaling. In steady-state mode an enabled mutual C/W matrix is
+            included in an outer fixed-point loop. Every outer probe restores
+            the original thermal snapshots, so only the accepted common
+            period advances elapsed time. Transient mode preserves the causal
+            one-period-late mutual-heating update.
+
+        Args:
+            inputSignal: Normalized vector or samples-by-chains PA input.
+            thermalRunMode: ``"steady_state"`` or ``"transient"``.
+            thermalDutyCycle: Common data-window fraction of one period.
+            steadyStateToleranceC: Maximum thermal fixed-point error in C.
+            maximumSteadyStateIterations: Maximum self and mutual iterations.
+
+        Returns:
+            result: Same-orientation floating PA-bank output data window.
+        """
+
+        self.SynchronizeModels()
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        inputWasVector = complexInput.ndim == 1
+        inputMatrix = (
+            complexInput.reshape(-1, 1)
+            if inputWasVector
+            else complexInput
+        )
+        if (
+            inputMatrix.ndim != 2
+            or inputMatrix.shape[1] != self.numTransmitChains
+            or inputMatrix.shape[0] == 0
+            or not np.all(np.isfinite(inputMatrix))
+        ):
+            raise ValueError(
+                "inputSignal must have one finite column per transmit chain"
+            )
+        if not isinstance(thermalRunMode, str):
+            raise TypeError("thermalRunMode must be a string")
+        resolvedRunMode = thermalRunMode.strip().lower()
+        if resolvedRunMode not in ("steady_state", "transient"):
+            raise ValueError(
+                "thermalRunMode must be 'steady_state' or 'transient'"
+            )
+        if (
+            not isinstance(thermalDutyCycle, (int, float))
+            or isinstance(thermalDutyCycle, bool)
+            or not np.isfinite(thermalDutyCycle)
+            or not 0.0 < float(thermalDutyCycle) <= 1.0
+        ):
+            raise ValueError(
+                "thermalDutyCycle must be a finite real number in (0, 1]"
+            )
+        if (
+            not isinstance(steadyStateToleranceC, (int, float))
+            or isinstance(steadyStateToleranceC, bool)
+            or not np.isfinite(steadyStateToleranceC)
+            or float(steadyStateToleranceC) <= 0.0
+        ):
+            raise ValueError(
+                "steadyStateToleranceC must be a finite positive value"
+            )
+        if (
+            not isinstance(maximumSteadyStateIterations, int)
+            or isinstance(maximumSteadyStateIterations, bool)
+            or maximumSteadyStateIterations < 1
+        ):
+            raise ValueError(
+                "maximumSteadyStateIterations must be a positive integer"
+            )
+        enabledThermalSampleRatesHz = tuple(
+            float(thermalConfig.sampleRateHz)
+            for paModel in self.paModels
+            for thermalConfig in (paModel.ResolveThermalConfig(),)
+            if thermalConfig is not None and thermalConfig.enabled
+        )
+        if enabledThermalSampleRatesHz and not all(
+            np.isclose(
+                sampleRateHz,
+                enabledThermalSampleRatesHz[0],
+                rtol=1.0e-12,
+                atol=0.0,
+            )
+            for sampleRateHz in enabledThermalSampleRatesHz[1:]
+        ):
+            raise ValueError(
+                "all enabled MIMO ThermalConfig.sampleRateHz values must "
+                "match so every chain advances one common physical period"
+            )
+        inputPowerDbValues = self.ResolveNumericSequence(
+            "inputPowerDbPerChain", 0.0
+        )
+        outputPowerDbValues = self.ResolveNumericSequence(
+            "outputPowerDbPerChain", 0.0
+        )
+        targetOutputRmsValues = self.ResolveNumericSequence(
+            "targetOutputRmsPerChain", 0.0, allowNoneEntries=True
+        )
+        targetOutputPowerDbmValues = self.ResolveNumericSequence(
+            "targetOutputPowerDbmPerChain",
+            0.0,
+            allowNoneEntries=True,
+        )
+        couplingMatrix = self.ResolveThermalCouplingMatrix()
+        hasMutualHeating = bool(np.any(couplingMatrix > 0.0))
+        # One MIMO period is an atomic thermal transaction. A later chain can
+        # fail after an earlier chain has already advanced, so retain every
+        # chain state even when the mutual-heating matrix is disabled.
+        thermalSnapshots: Tuple[
+            Optional[Dict[str, object]], ...
+        ] = self.SuspendThermalModel()
+        self.RestoreThermalModel(thermalSnapshots)
+        previousOutputRmsPerChain = tuple(self.lastOutputRmsPerChain)
+        previousDissipatedPowerWPerChain = tuple(
+            self.lastDissipatedPowerWPerChain
+        )
+        previousMutualHeatingMetrics = dict(
+            self._lastMutualHeatingMetrics
+        )
+        candidateOffsetsC = np.asarray(
+            [
+                float(
+                    paModel.GetThermalMetrics().get(
+                        "mutualHeatingTemperatureRiseC", 0.0
+                    )
+                )
+                for paModel in self.paModels
+            ],
+            dtype=float,
+        )
+        if not hasMutualHeating:
+            # A live configuration update can remove a previously active
+            # coupling matrix. Clear the stale neighbor-temperature offsets
+            # before this period so disabled mutual heating has no memory.
+            candidateOffsetsC = np.zeros(
+                self.numTransmitChains, dtype=float
+            )
+        outputColumns = []
+        outputRmsValues = []
+        mutualHeatingIterations = 0
+        mutualHeatingErrorC = 0.0
+        iterationLimit = (
+            maximumSteadyStateIterations
+            if resolvedRunMode == "steady_state" and hasMutualHeating
+            else 1
+        )
+        try:
+            for mutualIterationIndex in range(1, iterationLimit + 1):
+                if thermalSnapshots is not None:
+                    self.RestoreThermalModel(thermalSnapshots)
+                    for paModel, temperatureOffsetC in zip(
+                        self.paModels, candidateOffsetsC
+                    ):
+                        paModel.SetExternalTemperatureOffsetC(
+                            float(temperatureOffsetC)
+                        )
+                outputColumns = []
+                outputRmsValues = []
+                for chainIndex, paModel in enumerate(self.paModels):
+                    inputScale = 10.0 ** (
+                        float(inputPowerDbValues[chainIndex]) / 20.0
+                    )
+                    chainOutput = paModel.ProcessThermalPeriodFloating(
+                        inputScale * inputMatrix[:, chainIndex],
+                        thermalRunMode=resolvedRunMode,
+                        thermalDutyCycle=thermalDutyCycle,
+                        steadyStateToleranceC=steadyStateToleranceC,
+                        maximumSteadyStateIterations=(
+                            maximumSteadyStateIterations
+                        ),
+                    )
+                    outputScale = 10.0 ** (
+                        float(outputPowerDbValues[chainIndex]) / 20.0
+                    )
+                    chainOutput = outputScale * chainOutput
+                    targetOutputRms = targetOutputRmsValues[chainIndex]
+                    targetOutputPowerDbm = targetOutputPowerDbmValues[
+                        chainIndex
+                    ]
+                    if targetOutputPowerDbm is not None:
+                        targetOutputRms = PowerCalibration(
+                            loadResistanceOhm=self.parameters[
+                                "loadResistanceOhm"
+                            ],
+                            maximumOutputPowerDbm=self.parameters[
+                                "maximumOutputPowerDbm"
+                            ],
+                        ).DbmToRms(targetOutputPowerDbm)
+                    if targetOutputRms is not None:
+                        currentRms = float(
+                            np.sqrt(np.mean(np.abs(chainOutput) ** 2))
+                        )
+                        if currentRms <= np.finfo(float).tiny:
+                            raise ValueError(
+                                "cannot set target RMS on a zero-power PA output"
+                            )
+                        chainOutput = (
+                            float(targetOutputRms)
+                            * chainOutput
+                            / currentRms
+                        )
+                    outputColumns.append(
+                        np.asarray(chainOutput, dtype=np.complex128)
+                    )
+                    outputRmsValues.append(
+                        float(
+                            np.sqrt(np.mean(np.abs(chainOutput) ** 2))
+                        )
+                    )
+                self.lastDissipatedPowerWPerChain = tuple(
+                    float(
+                        paModel.GetThermalMetrics().get(
+                            "averageDissipatedPowerW", 0.0
+                        )
+                    )
+                    for paModel in self.paModels
+                )
+                if not (
+                    resolvedRunMode == "steady_state"
+                    and hasMutualHeating
+                ):
+                    break
+                solvedOffsetsC = couplingMatrix @ np.asarray(
+                    self.lastDissipatedPowerWPerChain, dtype=float
+                )
+                mutualHeatingErrorC = float(
+                    np.max(np.abs(solvedOffsetsC - candidateOffsetsC))
+                )
+                mutualHeatingIterations = mutualIterationIndex
+                if mutualHeatingErrorC <= float(steadyStateToleranceC):
+                    # The output, traces, and period-ending metrics were all
+                    # evaluated with candidateOffsetsC. Keep that accepted
+                    # state intact; solvedOffsetsC is only the fixed-point
+                    # residual check and may differ by as much as tolerance.
+                    break
+                candidateOffsetsC = 0.5 * (
+                    candidateOffsetsC + solvedOffsetsC
+                )
+            else:
+                raise RuntimeError(
+                    "MIMO mutual-heating steady-state solver did not "
+                    f"converge within {maximumSteadyStateIterations} "
+                    f"iterations; final error was "
+                    f"{mutualHeatingErrorC:.6g} C and the allowed tolerance "
+                    f"is {float(steadyStateToleranceC):.6g} C"
+                )
+        except Exception:
+            self.RestoreThermalModel(thermalSnapshots)
+            self.lastOutputRmsPerChain = previousOutputRmsPerChain
+            self.lastDissipatedPowerWPerChain = (
+                previousDissipatedPowerWPerChain
+            )
+            self._lastMutualHeatingMetrics = (
+                previousMutualHeatingMetrics
+            )
+            raise
+        outputMatrix = np.column_stack(outputColumns)
+        self.lastOutputRmsPerChain = tuple(outputRmsValues)
+        if resolvedRunMode == "transient":
+            self.UpdateMutualHeating()
+        self._lastMutualHeatingMetrics = {
+            "steadyStateConverged": (
+                resolvedRunMode == "steady_state"
+                and (
+                    not hasMutualHeating
+                    or mutualHeatingErrorC
+                    <= float(steadyStateToleranceC)
+                )
+            ),
+            "steadyStateIterations": mutualHeatingIterations,
+            "steadyStateErrorC": mutualHeatingErrorC,
+        }
+        if inputWasVector and self.numTransmitChains == 1:
+            return outputMatrix[:, 0]
+        return outputMatrix
+
+    def CalculateActualDutyCycle(
+        self,
+        inputSignal: np.ndarray,
+        thermalDutyCycle: float = 1.0,
+    ) -> Tuple[float, ...]:
+        """Return one complete-period RF duty fraction per PA chain.
+
+        Processing details:
+            Algorithm: Validate the normalized samples-by-chains matrix and
+            delegate full-window activity detection to each physical PaModel,
+            multiplying every result by the common scheduling duty cycle.
+
+        Args:
+            inputSignal: Normalized PA-input vector or matrix.
+            thermalDutyCycle: Configured data-window fraction of one period.
+
+        Returns:
+            result: Chain-ordered actual RF duty-cycle tuple.
+        """
+
+        self.SynchronizeModels()
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        inputMatrix = (
+            complexInput.reshape(-1, 1)
+            if complexInput.ndim == 1
+            else complexInput
+        )
+        if (
+            inputMatrix.ndim != 2
+            or inputMatrix.shape[0] == 0
+            or inputMatrix.shape[1] != self.numTransmitChains
+            or not np.all(np.isfinite(inputMatrix))
+        ):
+            raise ValueError(
+                "inputSignal must have one finite column per transmit chain"
+            )
+        return tuple(
+            paModel.CalculateActualDutyCycle(
+                inputMatrix[:, chainIndex], thermalDutyCycle
+            )
+            for chainIndex, paModel in enumerate(self.paModels)
+        )
+
     def ProcessChain(
         self, inputSignal: np.ndarray, chainIndex: int
     ) -> np.ndarray:
@@ -2700,7 +3940,8 @@ class MimoPaModel:
 
         Processing details:
             Algorithm: Decode raw external codes, apply the selected chain's
-            floating PA and power controls, then encode raw external codes.
+            committed post-DAC calibration drive, floating PA and power
+            controls, then encode raw external codes.
 
         Args:
             inputSignal: One-dimensional complex samples for one RF chain.
@@ -2722,7 +3963,15 @@ class MimoPaModel:
             raise ValueError("inputSignal must be a nonempty vector")
         if not np.all(np.isfinite(complexInput)):
             raise ValueError("inputSignal must contain finite samples")
-        chainOutput = self.ProcessChainFloating(complexInput, chainIndex)
+        driveDbPerChain = self.ResolveCalibrationDriveDbPerChain(
+            self._calibrationDriveDbPerChain
+        )
+        driveScale = np.power(
+            10.0, driveDbPerChain[chainIndex] / 20.0
+        )
+        chainOutput = self.ProcessChainFloating(
+            driveScale * complexInput, chainIndex
+        )
         return interfaceFormat.EncodeComplex(chainOutput)
 
     def ProcessChainFloating(
@@ -2843,9 +4092,20 @@ class MimoPaModel:
         """
 
         self.SynchronizeModels()
-        return tuple(
-            paModel.SuspendThermalModel() for paModel in self.paModels
-        )
+        thermalSnapshots = []
+        try:
+            for paModel in self.paModels:
+                thermalSnapshots.append(paModel.SuspendThermalModel())
+        except Exception:
+            # A later chain can reject snapshot creation. Restore every chain
+            # already suspended so the transaction never leaves a partial
+            # MIMO bank in temperature-independent mode.
+            for restoredPaModel, thermalSnapshot in zip(
+                self.paModels, thermalSnapshots
+            ):
+                restoredPaModel.RestoreThermalModel(thermalSnapshot)
+            raise
+        return tuple(thermalSnapshots)
 
     def RestoreThermalModel(
         self,
@@ -2959,7 +4219,8 @@ class MimoPaModel:
         return {
             "chains": tuple(
                 paModel.GetThermalMetrics() for paModel in self.paModels
-            )
+            ),
+            "mutualHeating": dict(self._lastMutualHeatingMetrics),
         }
 
 
@@ -3049,6 +4310,189 @@ class IQImbalancePA:
             + self.imageCoefficient * np.conj(paOutput),
             dtype=np.complex128,
         )
+
+    def ProcessThermalPeriodFloating(
+        self,
+        inputSignal: np.ndarray,
+        thermalRunMode: str = "steady_state",
+        thermalDutyCycle: float = 1.0,
+        steadyStateToleranceC: float = 1.0e-4,
+        maximumSteadyStateIterations: int = 100,
+    ) -> np.ndarray:
+        """Preserve periodic thermal scheduling through the IQ wrapper.
+
+        Processing details:
+            Algorithm: Delegate the complete self-heating period to the
+            wrapped PA and apply the widely-linear output transformation only
+            after the physical PA has generated its temperature-dependent
+            waveform. This keeps heat generation at the PA-output reference
+            plane while retaining the wrapper's observable IQ imbalance.
+
+        Args:
+            inputSignal: Normalized floating PA-input data window.
+            thermalRunMode: ``"steady_state"`` or ``"transient"``.
+            thermalDutyCycle: Data-window fraction of the complete period.
+            steadyStateToleranceC: Allowed periodic closure error in C.
+            maximumSteadyStateIterations: Maximum thermal solver iterations.
+
+        Returns:
+            result: Temperature-aware, IQ-imbalanced floating waveform.
+        """
+
+        thermalProcessor = getattr(
+            self.paModel, "ProcessThermalPeriodFloating", None
+        )
+        if not callable(thermalProcessor):
+            return self.ProcessFloating(inputSignal)
+        paOutput = thermalProcessor(
+            inputSignal,
+            thermalRunMode=thermalRunMode,
+            thermalDutyCycle=thermalDutyCycle,
+            steadyStateToleranceC=steadyStateToleranceC,
+            maximumSteadyStateIterations=maximumSteadyStateIterations,
+        )
+        return np.asarray(
+            self.directCoefficient * paOutput
+            + self.imageCoefficient * np.conj(paOutput),
+            dtype=np.complex128,
+        )
+
+    def SuspendThermalModel(self) -> object:
+        """Suspend a wrapped thermal PA for cold power-calibration trials.
+
+        Processing details:
+            Algorithm: Forward the transactional snapshot request when the
+            wrapped PA supports thermal state; otherwise return None so the
+            paired restore operation remains a harmless no-op.
+
+        Returns:
+            result: Opaque wrapped-PA thermal snapshot or None.
+        """
+
+        suspendMethod = getattr(self.paModel, "SuspendThermalModel", None)
+        restoreMethod = getattr(self.paModel, "RestoreThermalModel", None)
+        if callable(suspendMethod) != callable(restoreMethod):
+            raise TypeError(
+                "wrapped PA thermal transaction must expose both "
+                "SuspendThermalModel and RestoreThermalModel, or neither"
+            )
+        return suspendMethod() if callable(suspendMethod) else None
+
+    def RestoreThermalModel(self, thermalSnapshot: object) -> None:
+        """Restore a wrapped PA thermal snapshot without advancing time.
+
+        Processing details:
+            Algorithm: Forward a non-None opaque snapshot to the wrapped PA.
+            A None snapshot represents a wrapped PA without thermal support.
+
+        Args:
+            thermalSnapshot: Value returned by ``SuspendThermalModel``.
+
+        Returns:
+            result: None. The prior wrapped thermal state is restored.
+        """
+
+        if thermalSnapshot is None:
+            return
+        restoreMethod = getattr(self.paModel, "RestoreThermalModel", None)
+        if not callable(restoreMethod):
+            raise TypeError(
+                "wrapped thermal PA must expose RestoreThermalModel"
+            )
+        restoreMethod(thermalSnapshot)
+
+    def GetThermalMetrics(self) -> Dict[str, object]:
+        """Return the wrapped PA's latest thermal diagnostics.
+
+        Processing details:
+            Algorithm: Forward the read-only metrics protocol and copy its
+            mapping so the IQ wrapper cannot hide enabled periodic scheduling.
+
+        Returns:
+            result: Thermal metrics dictionary or an explicit disabled flag.
+        """
+
+        metricsMethod = getattr(self.paModel, "GetThermalMetrics", None)
+        if not callable(metricsMethod):
+            return {"enabled": False}
+        thermalMetrics = metricsMethod()
+        if not isinstance(thermalMetrics, Mapping):
+            raise TypeError(
+                "wrapped PA GetThermalMetrics must return a mapping"
+            )
+        return dict(thermalMetrics)
+
+    def CalculateActualDutyCycle(
+        self,
+        inputSignal: np.ndarray,
+        thermalDutyCycle: float = 1.0,
+    ) -> object:
+        """Forward actual RF-duty observation to the wrapped physical PA.
+
+        Processing details:
+            Algorithm: Reuse the wrapped PA's own activity threshold and
+            reference plane because output IQ imbalance does not alter the
+            PA-input activity schedule or its heat-generation duty cycle.
+
+        Args:
+            inputSignal: Normalized floating PA-input data window.
+            thermalDutyCycle: Data-window fraction of the complete period.
+
+        Returns:
+            result: Scalar or per-chain complete-period RF duty fraction.
+        """
+
+        dutyMethod = getattr(
+            self.paModel, "CalculateActualDutyCycle", None
+        )
+        if not callable(dutyMethod):
+            raise TypeError(
+                "wrapped thermal PA must expose CalculateActualDutyCycle"
+            )
+        return dutyMethod(inputSignal, thermalDutyCycle)
+
+    def ResetThermalState(
+        self,
+        junctionTemperatureC: Optional[object] = None,
+        ambientTemperatureC: Optional[float] = None,
+    ) -> None:
+        """Reset the wrapped PA's optional thermal state.
+
+        Processing details:
+            Algorithm: Forward the explicit reset request without changing IQ
+            coefficients, and reject wrappers around PAs lacking that protocol.
+
+        Args:
+            junctionTemperatureC: Optional scalar or per-chain start value.
+            ambientTemperatureC: Optional thermal-boundary temperature in C.
+
+        Returns:
+            result: None. Wrapped thermal state is reset.
+        """
+
+        resetMethod = getattr(self.paModel, "ResetThermalState", None)
+        if not callable(resetMethod):
+            raise TypeError("wrapped PA does not support ResetThermalState")
+        resetMethod(junctionTemperatureC, ambientTemperatureC)
+
+    def AdvanceIdle(self, idleTimeSec: float) -> object:
+        """Advance wrapped thermal state through an additional idle gap.
+
+        Processing details:
+            Algorithm: Forward the physical duration to the wrapped PA; the IQ
+            output transformation has no independent heat state to advance.
+
+        Args:
+            idleTimeSec: Nonnegative additional idle duration in seconds.
+
+        Returns:
+            result: Wrapped PA junction temperature result.
+        """
+
+        advanceMethod = getattr(self.paModel, "AdvanceIdle", None)
+        if not callable(advanceMethod):
+            raise TypeError("wrapped PA does not support AdvanceIdle")
+        return advanceMethod(idleTimeSec)
 
     def SmallSignalGain(self) -> complex:
         """Return the direct-path small-signal gain of the wrapped PA.

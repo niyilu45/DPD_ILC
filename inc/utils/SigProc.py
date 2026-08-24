@@ -70,6 +70,7 @@ class PowerCalibration:
                 "maximumCalibrationIterations": 60,
                 "calibrationLearningRate": 0.8,
                 "maximumDriveAdjustmentDb": 6.0,
+                "calibrationDigitalHeadroomDb": 6.0,
                 "enableJointCalibration": False,
                 "calibrationProbeStepDb": 0.05,
                 "calibrationRegularization": 1.0e-6,
@@ -110,16 +111,27 @@ class PowerCalibration:
         )
         self.paModel: Optional[Any] = None
         self._paProcessMethod: Optional[Any] = None
+        self._paCalibrationProcessMethod: Optional[Any] = None
+        self._paCalibrationCommitMethod: Optional[Any] = None
+        self._paThermalSuspendMethod: Optional[Any] = None
+        self._paThermalRestoreMethod: Optional[Any] = None
+        self._electricalCalibrationTransactionActive = False
         self._calibrationDriveDbPerChain: Tuple[float, ...] = tuple()
         self._calibrationTargetPowerDbmPerChain: Tuple[
             float, ...
         ] = tuple()
+        self._lastCalibrationTargetPowerDbmPerChain: Tuple[
+            float, ...
+        ] = tuple()
+        self._lastAnalogDriveDbPerChain: Tuple[float, ...] = tuple()
         self._lastCalibratedPaInput: Optional[np.ndarray] = None
         self._lastCalibratedPaOutput: Optional[np.ndarray] = None
         self._lastMeasuredOutputPowerDbmPerChain: Tuple[
             float, ...
         ] = tuple()
         self._lastCalibrationIterationCount = 0
+        self._lastCalibrationConverged: Optional[bool] = None
+        self._lastCalibrationFailureReason: Optional[str] = None
         self.Validate()
         if paModel is not None:
             self.SetPaModel(paModel)
@@ -364,6 +376,19 @@ class PowerCalibration:
             raise ValueError(
                 "maximumDriveAdjustmentDb must be finite and positive"
             )
+        calibrationDigitalHeadroomDb = self.parameters[
+            "calibrationDigitalHeadroomDb"
+        ]
+        if (
+            not isinstance(calibrationDigitalHeadroomDb, (int, float))
+            or isinstance(calibrationDigitalHeadroomDb, bool)
+            or not np.isfinite(calibrationDigitalHeadroomDb)
+            or not 0.0 <= float(calibrationDigitalHeadroomDb) <= 60.0
+        ):
+            raise ValueError(
+                "calibrationDigitalHeadroomDb must be finite and in the "
+                "interval [0, 60] dB"
+            )
         enableJointCalibration = self.parameters[
             "enableJointCalibration"
         ]
@@ -393,7 +418,30 @@ class PowerCalibration:
             raise ValueError(
                 "calibrationRegularization must be finite and positive"
             )
-        FixedPoint(self.width)
+        interfaceFormat = FixedPoint(self.width)
+        if self.width == 1:
+            raise ValueError(
+                "PowerCalibration width must be 0 for floating point or at "
+                "least 2 bits for fixed-point power calibration"
+            )
+        if self.width > 1:
+            formatInfo = interfaceFormat.GetFormatInfo()
+            maximumCode = float(cast(float, formatInfo["maximumCode"]))
+            maximumNonzeroHeadroomDb = 20.0 * np.log10(
+                2.0 * maximumCode
+            )
+            configuredHeadroomDb = float(calibrationDigitalHeadroomDb)
+            if (
+                maximumNonzeroHeadroomDb < 60.0
+                and configuredHeadroomDb >= maximumNonzeroHeadroomDb
+            ):
+                raise ValueError(
+                    "calibrationDigitalHeadroomDb has an invalid value for "
+                    f"width={self.width}. Allowed range: finite real number "
+                    f"in [0, {maximumNonzeroHeadroomDb:.6f}) dB so the "
+                    "largest waveform component retains at least one "
+                    "nonzero code."
+                )
 
     def SetPaModel(self, paModel: Any) -> None:
         """Bind the PA or measurement adapter used by closed-loop calibration.
@@ -401,17 +449,32 @@ class PowerCalibration:
         Processing details:
             Algorithm: Require a callable object or a callable ``Process``
             method and the same public fixed-point width as this calibrator.
-            Reset the hidden drive preset because a different PA has a
-            different AM-AM curve.
+            For a bound-method callback, discover width, calibration-drive,
+            and thermal-transaction protocols on its owning object.
+            Detect the optional paired ``ProcessCalibrationDrive`` and
+            ``SetCalibrationDriveDb`` interface used to place a hidden analog
+            drive after fixed-point decoding. Also detect the paired thermal
+            suspend/restore transaction so every calibration entry operates
+            on the reference-temperature electrical model. Reset all cached
+            convergence state because a different PA has a different AM-AM
+            curve. Reject rebinding while a transaction is active so its
+            captured thermal snapshot always returns to the same PA owner.
 
         Args:
             paModel: PA model, instrument adapter, or callback facade exposing
                 ``Process(inputSignal)`` and an optional ``width`` property.
+                Fixed-point plants may additionally expose the paired
+                calibration-drive methods described above.
 
         Returns:
             result: None. Subsequent ``Calibrate`` calls use this PA.
         """
 
+        if self._electricalCalibrationTransactionActive:
+            raise RuntimeError(
+                "SetPaModel cannot rebind a PA during an active calibration "
+                "transaction"
+            )
         processMethod = getattr(paModel, "Process", None)
         if processMethod is None and callable(paModel):
             processMethod = paModel
@@ -419,30 +482,88 @@ class PowerCalibration:
             raise TypeError(
                 "paModel must expose Process(inputSignal) or be callable"
             )
-        paWidth = getattr(paModel, "width", self.width)
+        protocolOwner = getattr(paModel, "__self__", None)
+        if protocolOwner is None:
+            protocolOwner = paModel
+        paWidth = getattr(protocolOwner, "width", self.width)
         FixedPoint(paWidth)
         if int(paWidth) != self.width:
             raise ValueError(
                 "PowerCalibration and paModel must use the same width"
             )
+        calibrationProcessMethod = getattr(
+            protocolOwner, "ProcessCalibrationDrive", None
+        )
+        calibrationCommitMethod = getattr(
+            protocolOwner, "SetCalibrationDriveDb", None
+        )
+        if callable(calibrationProcessMethod) != callable(
+            calibrationCommitMethod
+        ):
+            raise TypeError(
+                "a calibration-drive adapter must expose both "
+                "ProcessCalibrationDrive and SetCalibrationDriveDb, or "
+                "neither"
+            )
+        thermalSuspendMethod = getattr(
+            protocolOwner, "SuspendThermalModel", None
+        )
+        thermalRestoreMethod = getattr(
+            protocolOwner, "RestoreThermalModel", None
+        )
+        if callable(thermalSuspendMethod) != callable(
+            thermalRestoreMethod
+        ):
+            raise TypeError(
+                "a thermal calibration transaction must expose both "
+                "SuspendThermalModel and RestoreThermalModel, or neither"
+            )
         self.paModel = paModel
         self._paProcessMethod = processMethod
+        self._paCalibrationProcessMethod = (
+            calibrationProcessMethod
+            if callable(calibrationProcessMethod)
+            else None
+        )
+        self._paCalibrationCommitMethod = (
+            calibrationCommitMethod
+            if callable(calibrationCommitMethod)
+            else None
+        )
+        self._paThermalSuspendMethod = (
+            thermalSuspendMethod
+            if callable(thermalSuspendMethod)
+            else None
+        )
+        self._paThermalRestoreMethod = (
+            thermalRestoreMethod
+            if callable(thermalRestoreMethod)
+            else None
+        )
         self._calibrationDriveDbPerChain = tuple()
         self._calibrationTargetPowerDbmPerChain = tuple()
+        self._lastCalibrationTargetPowerDbmPerChain = tuple()
+        self._lastAnalogDriveDbPerChain = tuple()
         self._lastCalibratedPaInput = None
         self._lastCalibratedPaOutput = None
         self._lastMeasuredOutputPowerDbmPerChain = tuple()
         self._lastCalibrationIterationCount = 0
+        self._lastCalibrationConverged = None
+        self._lastCalibrationFailureReason = None
 
     def GetLastPaInput(self) -> np.ndarray:
-        """Return the last converged waveform sent to the PA.
+        """Return the last converged public waveform before analog drive.
 
         Processing details:
-            Algorithm: Copy the cached public floating or fixed-point input so
-            callers cannot mutate the hidden calibration state.
+            Algorithm: Copy the cached public floating waveform or fixed-point
+            DAC codes so callers cannot mutate calibration state. For a
+            drive-aware fixed plant, the returned codes must be paired with the
+            committed ``analogDriveDbPerChain`` to reproduce the physical PA
+            input; Channel exposes that latter plane through
+            ``GetLastActualPaInput``.
 
         Returns:
-            result: Last converged PA input waveform.
+            result: Last converged public waveform before analog drive.
         """
 
         if self._lastCalibratedPaInput is None:
@@ -465,24 +586,25 @@ class PowerCalibration:
         return self._lastCalibratedPaOutput.copy()
 
     def GetLastCalibrationMetrics(self) -> Dict[str, object]:
-        """Return convergence results without exposing the hidden preset.
+        """Return the latest successful or failed convergence result.
 
         Processing details:
-            Algorithm: Report target powers, measured powers, residual errors,
-            and iteration count while intentionally keeping the internally
-            updated PA drive preset private.
+            Algorithm: Report target powers, best or accepted measurements,
+            residual errors, iteration count, convergence status, and the
+            committed or best trial analog drive. Include a failure reason when
+            the loop cannot reach its target.
 
         Returns:
-            result: Ordinary dictionary describing the accepted calibration.
+            result: Ordinary dictionary describing the latest calibration.
         """
 
         if not self._lastMeasuredOutputPowerDbmPerChain:
             raise RuntimeError(
                 "Calibrate must run before GetLastCalibrationMetrics"
             )
-        targetPowers = self._calibrationTargetPowerDbmPerChain
+        targetPowers = self._lastCalibrationTargetPowerDbmPerChain
         measuredPowers = self._lastMeasuredOutputPowerDbmPerChain
-        return {
+        result: Dict[str, object] = {
             "targetOutputPowerDbmPerChain": targetPowers,
             "measuredOutputPowerDbmPerChain": measuredPowers,
             "errorDbPerChain": tuple(
@@ -492,40 +614,108 @@ class PowerCalibration:
                 )
             ),
             "iterationCount": self._lastCalibrationIterationCount,
-            "converged": True,
+            "converged": bool(self._lastCalibrationConverged),
         }
+        if self._lastAnalogDriveDbPerChain:
+            result["analogDriveDbPerChain"] = (
+                self._lastAnalogDriveDbPerChain
+            )
+        if self._lastCalibrationFailureReason is not None:
+            result["failureReason"] = self._lastCalibrationFailureReason
+        return result
 
     def Calibrate(self, inputSignal: np.ndarray) -> np.ndarray:
-        """Find the PA input waveform that meets configured output power.
+        """Calibrate against the reference-temperature electrical PA model.
 
         Processing details:
-            Algorithm: Normalize only the original waveform's active-region
-            RMS, apply a hidden per-chain drive preset, send the regenerated
-            waveform through the bound PA, and measure the actual active PA
-            output power. Update the preset in the logarithmic amplitude
-            domain. Once measurements bracket a target, use bisection;
-            otherwise use a bounded proportional correction. Repeat until
-            every chain is within ``calibrationToleranceDb``.
+            Algorithm: Snapshot and suspend any paired PA thermal state, run
+            the complete closed-loop electrical calibration, and restore the
+            exact junction temperatures, elapsed time, mutual-heating offsets,
+            and diagnostics in a finally block. A disabled thermal model
+            returns no snapshot and remains disabled. This wrapper protects
+            direct PowerCalibration use as well as Channel-mediated use.
 
         Args:
             inputSignal: Arbitrarily scaled public waveform vector or
                 samples-by-chain matrix.
 
         Returns:
-            result: Converged PA input waveform with the same shape and public
-                floating/fixed interface convention as the original input.
+            result: Converged public waveform from the thermal-free loop.
         """
 
         if self._paProcessMethod is None:
             raise RuntimeError(
                 "PowerCalibration.Calibrate requires a bound paModel"
             )
+        if self._electricalCalibrationTransactionActive:
+            raise RuntimeError("nested power calibration is not supported")
+        thermalSuspendMethod = self._paThermalSuspendMethod
+        thermalRestoreMethod = self._paThermalRestoreMethod
+        thermalSnapshot = None
+        suspensionCompleted = False
+        self._electricalCalibrationTransactionActive = True
+        try:
+            thermalSnapshot = (
+                thermalSuspendMethod()
+                if thermalSuspendMethod is not None
+                else None
+            )
+            suspensionCompleted = True
+            return self.CalibrateElectricalOnly(inputSignal)
+        finally:
+            try:
+                if thermalRestoreMethod is not None and suspensionCompleted:
+                    thermalRestoreMethod(thermalSnapshot)
+            finally:
+                self._electricalCalibrationTransactionActive = False
+
+    def CalibrateElectricalOnly(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Find the PA input waveform that meets configured output power.
+
+        Processing details:
+            Algorithm: Normalize only the original waveform's active-region
+            RMS and update total per-chain drive in the logarithmic amplitude
+            domain. Floating plants carry that drive in the waveform. A
+            drive-aware fixed plant keeps legal public DAC codes with configured
+            headroom and applies the remainder after decoding. Measure actual
+            active PA output power, use bisection after bracketing and bounded
+            proportional correction otherwise, then commit analog drive only
+            when every chain is within ``calibrationToleranceDb``. Callers use
+            ``Calibrate`` so the surrounding thermal transaction is applied;
+            this method contains only the reusable numerical loop and rejects
+            invocation outside that transaction.
+
+        Args:
+            inputSignal: Arbitrarily scaled public waveform vector or
+                samples-by-chain matrix.
+
+        Returns:
+            result: Converged public waveform with the same shape and external
+                floating/fixed convention as the input. A fixed drive-aware
+                plant retains the matching analog drive internally.
+        """
+
+        if not self._electricalCalibrationTransactionActive:
+            raise RuntimeError(
+                "CalibrateElectricalOnly is an internal numerical kernel; "
+                "call Calibrate so thermal state is isolated transactionally"
+            )
+        if self._paProcessMethod is None:
+            raise RuntimeError(
+                "PowerCalibration.Calibrate requires a bound paModel"
+            )
         # A failed new calibration must never leave an older converged capture
         # visible through the public getters.
+        self._lastCalibrationTargetPowerDbmPerChain = tuple()
+        self._lastAnalogDriveDbPerChain = tuple()
         self._lastCalibratedPaInput = None
         self._lastCalibratedPaOutput = None
         self._lastMeasuredOutputPowerDbmPerChain = tuple()
         self._lastCalibrationIterationCount = 0
+        self._lastCalibrationConverged = None
+        self._lastCalibrationFailureReason = None
         interfaceFormat = FixedPoint(self.width)
         floatingInput = interfaceFormat.DecodeComplex(inputSignal)
         if (
@@ -571,6 +761,7 @@ class PowerCalibration:
             inputMatrix / inputRmsPerChain.reshape(1, -1)
         )
         targetPowerArray = np.asarray(targetPowers, dtype=float)
+        self._lastCalibrationTargetPowerDbmPerChain = targetPowers
         if (
             self._calibrationTargetPowerDbmPerChain == targetPowers
             and len(self._calibrationDriveDbPerChain) == chainCount
@@ -598,12 +789,21 @@ class PowerCalibration:
             int, self.parameters["maximumCalibrationIterations"]
         )
         bestMaximumErrorDb = np.inf
+        bestMeasuredPowerArray: Optional[np.ndarray] = None
+        bestAnalogDriveDb: Optional[np.ndarray] = None
+        previousPublicTrialInput: Optional[np.ndarray] = None
+        repeatedFixedInputCount = 0
+        failureReason = (
+            "the bound plant did not cover the requested output power or "
+            "its response was non-monotonic"
+        )
 
         for iterationIndex in range(maximumIterations):
             (
                 publicTrialInput,
                 publicPaOutput,
                 measuredPowerArray,
+                analogDriveDb,
             ) = self.EvaluateDrivePreset(
                 normalizedInput,
                 driveDb,
@@ -614,7 +814,13 @@ class PowerCalibration:
             maximumErrorDb = float(np.max(np.abs(errorDb)))
             if maximumErrorDb < bestMaximumErrorDb:
                 bestMaximumErrorDb = maximumErrorDb
+                bestMeasuredPowerArray = measuredPowerArray.copy()
+                bestAnalogDriveDb = analogDriveDb.copy()
             if maximumErrorDb <= toleranceDb:
+                if self._paCalibrationCommitMethod is not None:
+                    self._paCalibrationCommitMethod(
+                        tuple(float(value) for value in analogDriveDb)
+                    )
                 self._calibrationDriveDbPerChain = tuple(
                     float(value) for value in driveDb
                 )
@@ -626,10 +832,81 @@ class PowerCalibration:
                 self._lastMeasuredOutputPowerDbmPerChain = tuple(
                     float(value) for value in measuredPowerArray
                 )
+                self._lastAnalogDriveDbPerChain = (
+                    tuple()
+                    if self._paCalibrationProcessMethod is None
+                    else tuple(float(value) for value in analogDriveDb)
+                )
                 self._lastCalibrationIterationCount = (
                     iterationIndex + 1
                 )
+                self._lastCalibrationConverged = True
                 return publicTrialInput
+
+            if (
+                self.width > 0
+                and self._paCalibrationProcessMethod is None
+                and previousPublicTrialInput is not None
+                and np.array_equal(
+                    publicTrialInput, previousPublicTrialInput
+                )
+            ):
+                repeatedFixedInputCount += 1
+            else:
+                repeatedFixedInputCount = 0
+            previousPublicTrialInput = publicTrialInput.copy()
+            fixedInputAtFullScale = False
+            if self.width > 0:
+                formatInfo = interfaceFormat.GetFormatInfo()
+                minimumCode = float(cast(float, formatInfo["minimumCode"]))
+                maximumCode = float(cast(float, formatInfo["maximumCode"]))
+                publicTrialMatrix = (
+                    publicTrialInput.reshape(-1, 1)
+                    if publicTrialInput.ndim == 1
+                    else publicTrialInput
+                )
+                realPositive = normalizedInput.real > 0.0
+                realNegative = normalizedInput.real < 0.0
+                imagPositive = normalizedInput.imag > 0.0
+                imagNegative = normalizedInput.imag < 0.0
+                realAtTerminalCode = (
+                    (~realPositive & ~realNegative)
+                    | (realPositive & (publicTrialMatrix.real >= maximumCode))
+                    | (realNegative & (publicTrialMatrix.real <= minimumCode))
+                )
+                imagAtTerminalCode = (
+                    (~imagPositive & ~imagNegative)
+                    | (imagPositive & (publicTrialMatrix.imag >= maximumCode))
+                    | (imagNegative & (publicTrialMatrix.imag <= minimumCode))
+                )
+                # A repeated quantized waveform is not necessarily saturated:
+                # a small dB update may simply stay inside one code bin. The
+                # only rigorous finite-code terminal state is the codeword
+                # reached by infinite positive gain, where every original
+                # nonzero I or Q component is pinned to its signed rail.
+                terminalCodePerChain = np.all(
+                    realAtTerminalCode & imagAtTerminalCode,
+                    axis=0,
+                )
+                # Keep early termination conservative. In SISO, a positive
+                # power error requires more input drive and cannot escape the
+                # terminal codeword. A negative error must continue because
+                # reducing drive can leave the rail. Coupled MIMO plants are
+                # allowed to use their full iteration budget because another
+                # chain can still affect the blocked output.
+                fixedInputAtFullScale = bool(
+                    chainCount == 1
+                    and terminalCodePerChain[0]
+                    and errorDb[0] > toleranceDb
+                )
+            if repeatedFixedInputCount >= 3 and fixedInputAtFullScale:
+                failureReason = (
+                    "every nonzero fixed-point I/Q component reached its "
+                    "signed terminal code and the bound plant does not expose "
+                    "a post-decode analog-drive calibration interface"
+                )
+                self._lastCalibrationIterationCount = iterationIndex + 1
+                break
 
             if (
                 bool(self.parameters["enableJointCalibration"])
@@ -644,7 +921,7 @@ class PowerCalibration:
                 for driveIndex in range(chainCount):
                     probeDriveDb = driveDb.copy()
                     probeDriveDb[driveIndex] += probeStepDb
-                    _, _, probePowerArray = self.EvaluateDrivePreset(
+                    _, _, probePowerArray, _ = self.EvaluateDrivePreset(
                         normalizedInput,
                         probeDriveDb,
                         inputWasVector,
@@ -704,10 +981,142 @@ class PowerCalibration:
                 driveDb + proportionalAdjustmentDb,
             )
 
+        if bestMeasuredPowerArray is None:
+            raise RuntimeError(
+                "closed-loop PA power calibration produced no valid "
+                "measurement"
+            )
+        self._lastMeasuredOutputPowerDbmPerChain = tuple(
+            float(value) for value in bestMeasuredPowerArray
+        )
+        self._lastAnalogDriveDbPerChain = (
+            tuple()
+            if (
+                bestAnalogDriveDb is None
+                or self._paCalibrationProcessMethod is None
+            )
+            else tuple(float(value) for value in bestAnalogDriveDb)
+        )
+        if self._lastCalibrationIterationCount == 0:
+            self._lastCalibrationIterationCount = maximumIterations
+        self._lastCalibrationConverged = False
+        self._lastCalibrationFailureReason = failureReason
+        targetDescription = ", ".join(
+            f"{value:.3f}" for value in targetPowerArray
+        )
+        measuredDescription = ", ".join(
+            f"{value:.3f}" for value in bestMeasuredPowerArray
+        )
         raise RuntimeError(
-            "closed-loop PA power calibration did not converge within "
-            f"{maximumIterations} iterations; best error was "
-            f"{bestMaximumErrorDb:.3f} dB"
+            "closed-loop PA power calibration did not converge; target "
+            f"was ({targetDescription}) dBm, best measured output was "
+            f"({measuredDescription}) dBm, best error was "
+            f"{bestMaximumErrorDb:.3f} dB after "
+            f"{self._lastCalibrationIterationCount} iterations; "
+            f"{failureReason}"
+        )
+
+    def PrepareDrivePreset(
+        self,
+        normalizedInput: np.ndarray,
+        driveDb: np.ndarray,
+        interfaceFormat: FixedPoint,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build one legal public waveform and its post-decode analog drive.
+
+        Processing details:
+            Algorithm: In floating mode, apply the complete candidate drive to
+            the waveform. In fixed mode with a calibration-drive-aware plant,
+            create one drive-independent public waveform below the signed I/Q
+            limit by ``calibrationDigitalHeadroomDb``. Measure its quantized
+            active RMS and place the complete remaining gain after decoding.
+            A legacy plant without that paired interface retains the historical
+            all-digital behavior so third-party callbacks remain compatible.
+
+        Args:
+            normalizedInput: Unit-active-RMS samples-by-chain matrix.
+            driveDb: Total candidate drive in dB for every chain.
+            interfaceFormat: Public floating or signed-code converter.
+
+        Returns:
+            result: Public trial matrix followed by post-decode analog-drive dB
+                values in physical chain order.
+        """
+
+        inputMatrix = np.asarray(normalizedInput, dtype=np.complex128)
+        driveVector = np.asarray(driveDb, dtype=float).reshape(-1)
+        if (
+            inputMatrix.ndim != 2
+            or inputMatrix.shape[1] != driveVector.size
+            or inputMatrix.shape[0] == 0
+            or not np.all(np.isfinite(inputMatrix))
+            or not np.all(np.isfinite(driveVector))
+        ):
+            raise ValueError(
+                "normalizedInput and driveDb must contain matching finite "
+                "chains"
+            )
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            requestedDriveScale = np.power(10.0, driveVector / 20.0)
+        if np.any(~np.isfinite(requestedDriveScale)) or np.any(
+            requestedDriveScale <= 0.0
+        ):
+            raise ValueError("driveDb is outside the numeric amplitude range")
+
+        digitalDriveScale = requestedDriveScale.copy()
+        analogDriveDb = np.zeros(driveVector.size, dtype=float)
+        if (
+            not interfaceFormat.IsFloatingPoint()
+            and self._paCalibrationProcessMethod is not None
+        ):
+            formatInfo = interfaceFormat.GetFormatInfo()
+            maximumNormalizedComponent = float(
+                cast(float, formatInfo["physicalMaximumValue"])
+            )
+            if maximumNormalizedComponent <= 0.0:
+                raise ValueError(
+                    "fixed-point PA power calibration requires width >= 2"
+                )
+            componentPeakPerChain = np.maximum(
+                np.max(np.abs(inputMatrix.real), axis=0),
+                np.max(np.abs(inputMatrix.imag), axis=0),
+            )
+            if np.any(componentPeakPerChain <= np.finfo(float).tiny):
+                raise ValueError(
+                    "every calibration chain must contain nonzero samples"
+                )
+            headroomScale = np.power(
+                10.0,
+                -float(
+                    self.parameters["calibrationDigitalHeadroomDb"]
+                )
+                / 20.0,
+            )
+            digitalDriveScale = (
+                maximumNormalizedComponent
+                * headroomScale
+                / componentPeakPerChain
+            )
+
+        floatingTrialInput = inputMatrix * digitalDriveScale.reshape(1, -1)
+        publicTrialInput = interfaceFormat.EncodeComplex(floatingTrialInput)
+        if (
+            not interfaceFormat.IsFloatingPoint()
+            and self._paCalibrationProcessMethod is not None
+        ):
+            quantizedTrialInput = interfaceFormat.DecodeComplex(
+                publicTrialInput
+            )
+            quantizedRmsPerChain = np.asarray(
+                self.CalculateActiveRmsPerChain(quantizedTrialInput),
+                dtype=float,
+            )
+            analogDriveDb = driveVector - 20.0 * np.log10(
+                quantizedRmsPerChain
+            )
+        return (
+            np.asarray(publicTrialInput, dtype=np.complex128),
+            np.asarray(analogDriveDb, dtype=float),
         )
 
     def EvaluateDrivePreset(
@@ -716,15 +1125,15 @@ class PowerCalibration:
         driveDb: np.ndarray,
         inputWasVector: bool,
         interfaceFormat: FixedPoint,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Run one candidate drive vector and measure every output power.
 
         Processing details:
-            Algorithm: Apply the candidate dB drive independently to each
-            normalized input column, cross the configured public fixed-point
-            boundary once, execute the bound PA or coupled-plant callback,
-            validate its chain dimensions, and convert active-region output
-            RMS values into the configured absolute dBm reference.
+            Algorithm: Split each candidate between a legal public digital
+            waveform and an optional post-decode analog drive, execute the
+            bound PA or coupled-plant callback, validate its chain dimensions,
+            and convert active-region output RMS values into the configured
+            absolute dBm reference.
 
         Args:
             normalizedInput: Unit-active-RMS samples-by-chain matrix.
@@ -733,8 +1142,8 @@ class PowerCalibration:
             interfaceFormat: Validated public fixed-point boundary converter.
 
         Returns:
-            result: Public trial input, public plant output, and measured dBm
-                vector in physical chain order.
+            result: Public trial input, public plant output, measured dBm, and
+                post-decode analog-drive vectors in physical chain order.
         """
 
         if self._paProcessMethod is None:
@@ -753,22 +1162,27 @@ class PowerCalibration:
             raise ValueError(
                 "normalizedInput and driveDb must contain matching chains"
             )
-        driveScale = np.power(10.0, driveVector / 20.0)
-        trialInputMatrix = (
-            inputMatrix * driveScale.reshape(1, -1)
-        )
-        publicTrialInputMatrix = interfaceFormat.EncodeComplex(
-            trialInputMatrix
+        (
+            publicTrialInputMatrix,
+            analogDriveDb,
+        ) = self.PrepareDrivePreset(
+            inputMatrix,
+            driveVector,
+            interfaceFormat,
         )
         publicTrialInput = (
             publicTrialInputMatrix[:, 0]
             if inputWasVector
             else publicTrialInputMatrix
         )
-        publicPaOutput = np.asarray(
-            self._paProcessMethod(publicTrialInput),
-            dtype=np.complex128,
-        )
+        if self._paCalibrationProcessMethod is None:
+            rawPaOutput = self._paProcessMethod(publicTrialInput)
+        else:
+            rawPaOutput = self._paCalibrationProcessMethod(
+                publicTrialInput,
+                tuple(float(value) for value in analogDriveDb),
+            )
+        publicPaOutput = np.asarray(rawPaOutput, dtype=np.complex128)
         floatingPaOutput = interfaceFormat.DecodeComplex(
             publicPaOutput
         )
@@ -803,6 +1217,7 @@ class PowerCalibration:
             np.asarray(publicTrialInput, dtype=np.complex128),
             np.asarray(publicPaOutput, dtype=np.complex128),
             measuredPowerArray,
+            analogDriveDb,
         )
 
     def DbmToRms(self, powerDbm: float) -> float:

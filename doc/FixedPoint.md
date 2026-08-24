@@ -127,6 +127,8 @@ driveCodes = 0.5 * waveform.samples
 
 数组暂时可能出现半整数码。进入 `PaModel.Process` 或 `Analysis` 时，边界会先用 `QuantizeCodes` 的规则将其舍入成有效码，再解码到内部浮点域。
 
+这种写法只适合调用方主动做数字回退。比例大于1时仍受有符号I/Q码满量程限制，不能用来模拟DAC之后的可变增益放大器。`PowerCalibration` 的内置定点路径不会靠不断放大公开整数码寻找PA功率；它先产生具有数字余量的合法码，再在解码后的浮点域调整隐藏模拟驱动。
+
 ## 6. 可运行的 14 位示例
 
 ```python
@@ -191,21 +193,26 @@ assert waveform.samples.real.min() >= -8192
 ```mermaid
 flowchart LR
     inputCodes["输入整数码"] --> decode["解码为归一化浮点"]
-    decode --> pa["Wiener或GMP浮点PA"]
+    decode --> analogDrive["已提交的隐藏模拟驱动<br/>首次校准前为0 dB"]
+    analogDrive --> pa["Rapp/Wiener/GMP/Doherty浮点PA"]
     pa --> encode["编码、舍入、饱和"]
     encode --> outputCodes["输出整数码"]
 ```
 
-**图 2 说明**：PA 内部幂次、记忆抽头和包络交叉项不直接对 `8191` 做运算，而是对解码后的约 `0.9999` 做运算；否则高阶项会产生完全错误的数量级。
+**图 2 说明**：PA 内部幂次、记忆抽头和包络交叉项不直接对 `8191` 做运算，而是对解码后的约 `0.9999` 做运算；否则高阶项会产生完全错误的数量级。直接使用 `PaModel` 做过一次成功的闭环校准后，`SetCalibrationDriveDb` 会提交模拟驱动，后续公开 `Process` 自动复用该驱动；底层 `ProcessFloating` 仍以调用者提供的实际浮点PA输入为准，不重复施加驱动。
 
 ### 7.3 Channel
 
-`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码。提供目标功率时，Channel先保存并暂停PA热状态，内部 `PowerCalibration` 每轮以同一公开位宽产生PA输入码，随后在浮点域执行PA前耦合和参考温度各路PA，并测量解码后的有效突发功率；收敛后恢复原热状态，把收敛输入码重新解码并通过真实温度PA、PA后耦合与 `sampleMode` 采样路径一次，再编码返回。这样校准量化误差被正确计入，校准试探不发热，正式返回波形仍包含温漂。目标为 `None` 时，`Channel.Process` 只解码一次并执行单次耦合PA与采样链路。`Channel.ProcessPaOutput` 用于已有逐PA输出，同样只解码和编码一次，并从PA后耦合开始处理。
+`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码。提供目标功率时，Channel先保存并暂停PA热状态。内部 `PowerCalibration` 把原始有效区归一化波形缩放成合法公开码，并用 `calibrationDigitalHeadroomDb=6.0` 默认保留6 dB每分量峰值余量；码值解码以后，闭环才调整隐藏的逐链模拟驱动，然后执行Tx I/Q、PA前耦合和参考温度各路PA。PA输出经过公开边界量化再解码，功率检测器只统计有效突发，因此输入和输出量化误差都进入闭环，但驱动增加不再要求生成越界整数码。
+
+成功后，Channel提交模拟驱动，恢复原热状态，并用同一公开码和已提交驱动通过真实温度PA、PA后耦合与 `sampleMode` 采样路径一次，再编码返回。校准试探不发热，正式返回波形仍包含温漂。目标为 `None` 时，`Channel.Process` 解码公开输入，应用最近一次已经提交的模拟驱动，再执行单次耦合PA与采样链路；从未校准时该驱动为0 dB。`Channel.ProcessPaOutput` 用于已有逐PA输出，从PA后耦合开始处理，不重复施加PA前驱动。
 
 ```mermaid
 flowchart LR
-    publicInput["公开整数码"] --> decode["FixedPoint.DecodeComplex"]
-    decode --> pre["浮点PA前耦合<br/>复系数/FIR/时延"]
+    publicInput["公开整数码<br/>校准时默认保留6 dB余量"] --> decode["FixedPoint.DecodeComplex"]
+    decode --> analogDrive["隐藏逐链模拟驱动"]
+    analogDrive --> txIq["Tx I/Q非理想"]
+    txIq --> pre["浮点PA前耦合<br/>复系数/FIR/时延"]
     pre --> pa["各路浮点PA<br/>Rapp/Wiener/GMP/Doherty"]
     pa --> post["浮点PA后耦合<br/>复系数/FIR/时延"]
     post --> phase["浮点相位旋转"]
@@ -218,7 +225,15 @@ flowchart LR
     encode --> publicOutput["公开整数码"]
 ```
 
-**图 3 说明**：耦合复增益、FIR和分数时延滤波都在解码后的内部浮点域计算，最后只在公开出口量化一次，因此启用耦合不会改变调用方看到的数据类型。例如16位接口中的10 mV噪声不是码值10。模块先用 `maximumOutputPowerDbm` 和 `loadResistanceOhm` 求出归一化RMS，再乘以32768并舍入成最终公开噪声码。浮点和定点模式因此代表相同物理耦合与噪声。
+**图 3 说明**：6 dB数字余量属于公开码的构造条件，不是PA输出回退，也不是额外衰减PA输出。公开码解码后，隐藏模拟驱动位于Tx I/Q和PA之前；耦合复增益、FIR和分数时延滤波也都在内部浮点域计算，最后只在公开出口量化一次。因此启用校准或耦合不会改变调用方看到的数据类型。例如16位接口中的10 mV噪声不是码值10。模块先用 `maximumOutputPowerDbm` 和 `loadResistanceOhm` 求出归一化RMS，再乘以32768并舍入成最终公开噪声码。浮点和定点模式因此代表相同物理耦合与噪声。
+
+完成校准后，三个发送参考面有明确区别：
+
+- `GetLastPaInput()` 返回隐藏模拟驱动之前的公开数字波形；定点模式下I/Q仍是合法整数码。
+- `GetLastTransmitterOutput()` 返回经过隐藏模拟驱动和Tx I/Q之后、PA前耦合之前的内部浮点波形。
+- `GetLastActualPaInput()` 返回进一步经过PA前耦合后真正进入各路PA的内部浮点波形。
+
+即使 `GetLastPaInput()` 的定点码在多次闭环试探中保持不变，后两个参考面仍可随 `analogDriveDbPerChain` 改变。三者不能作为同一个DPD训练标签互换。
 
 `width` 与 `fbAdcWidth` 是两个不同边界：
 
@@ -287,7 +302,27 @@ OFDM 具有较高 PAPR，即使整包 RMS 已归一化，瞬时 I 或 Q 仍可�
 
 ## 10. dBm 与整数码的关系
 
-定点码不是伏特，也不是 dBm。目标输出功率只决定 PA 的归一化驱动工作点和最终报告标定。
+定点码不是伏特，也不是dBm。`maximumOutputPowerDbm` 定义每路PA输出参考面的额定功率上限，同时规定归一化输出有效区RMS等于1时的dBm映射。它不表示16位码 `32767` 本身等于25 dBm，也不表示校准器会在PA输出端追加增益。
+
+设额定上限为 $P_{\max}$，目标输出功率为 $P_{\mathrm{target}}$，则功率检测器期望的归一化**输出**RMS为：
+
+```math
+A_{\mathrm{target}}
+=
+10^{(P_{\mathrm{target}}-P_{\max})/20}.
+```
+
+当 $P_{\max}=25\ \mathrm{dBm}$、$P_{\mathrm{target}}=20\ \mathrm{dBm}$ 时：
+
+```math
+A_{\mathrm{target}}
+=
+10^{-5/20}
+\approx
+0.5623.
+```
+
+这个0.5623是目标PA输出RMS，不是应直接乘到PA输入的驱动比例。PA的线性增益、AM-AM压缩、AM-PM和记忆项都会改变输入输出映射；闭环必须实际运行PA，再根据测得输出反求驱动。
 
 50 Ω 端口的复包络 RMS 电压与 dBm 的关系为：
 
@@ -299,15 +334,93 @@ P_{\mathrm{W}}=10^{(P_{\mathrm{dBm}}-30)/10}
 V_{\mathrm{RMS}}=\sqrt{P_{\mathrm{W}}R}
 ```
 
+### 10.1 定点数字余量和隐藏模拟驱动
+
+设单位有效区RMS波形为 $\bar{x}_m[n]$，位宽为 $W$，正最大归一化分量为：
+
+```math
+C_{\max}
+=
+1-2^{1-W}.
+```
+
+`calibrationDigitalHeadroomDb` 记为 $H_{\mathrm{dig}}$，其幅度比例为：
+
+```math
+h
+=
+10^{-H_{\mathrm{dig}}/20}.
+```
+
+默认 $H_{\mathrm{dig}}=6\ \mathrm{dB}$，所以 $h\approx0.5012$。代码先求每路I/Q分量峰值：
+
+```math
+C_m
+=
+\max_n
+\left(
+\max
+\left(
+\left|\mathrm{Re}\left(\bar{x}_m[n]\right)\right|,
+\left|\mathrm{Im}\left(\bar{x}_m[n]\right)\right|
+\right)
+\right).
+```
+
+数字缩放和公开码为：
+
+```math
+s_m
+=
+\frac{C_{\max}h}{C_m},
+\qquad
+q_m[n]
+=
+Q_W\left(s_m\bar{x}_m[n]\right).
+```
+
+$Q_W$ 表示编码、舍入和饱和。随后公开码只解码一次：
+
+```math
+z_m[n]
+=
+D_W\left(q_m[n]\right),
+```
+
+其中 $D_W$ 表示 `DecodeComplex`。校准器根据量化后的有效区RMS $A_{z,m}$，把第 $k$ 次总候选驱动 $d_m^{(k)}$ 分配为解码后的模拟驱动：
+
+```math
+g_m^{(k)}
+=
+d_m^{(k)}
+-20\log_{10}\left(A_{z,m}\right),
+```
+
+```math
+u_m^{(k)}[n]
+=
+10^{g_m^{(k)}/20}z_m[n].
+```
+
+$u_m^{(k)}[n]$ 才是隐藏模拟驱动之后、Tx I/Q之前的信号。它随后进入Tx I/Q、PA前耦合和PA。公开码 $q_m[n]$ 始终合法，而闭环仍能提高实际PA激励。因此，增加 `width` 只会改善量化分辨率，不会扩展归一化码范围；设置25 dBm额定上限时，20 dBm不应再仅因为固定点码已经达到满量程而不可达。
+
+数字余量是峰值余量，不是输出功率回退。余量过小会让高PAPR的OFDM峰值接近削顶；余量过大会减少有效码利用率、提高量化噪声。默认6 dB是两者之间的通用起点。低位宽还必须保证缩放后的峰值至少能量化成一个非零码；闭环校验会根据位宽报告允许的准确上限。浮点模式没有整数码边界，因而忽略 `calibrationDigitalHeadroomDb`。
+
+### 10.2 推荐校准顺序
+
 推荐顺序为：
 
-1. 用输出回退量计算归一化驱动比例；
-2. 对公开整数码乘该比例；
-3. 在模块边界舍入码值并解码；
-4. 在归一化浮点域完成 PA、ILC 和 Analysis；
-5. 仅在功率报告阶段把 PA 输出按 RMS 标定为目标 dBm。
+1. 根据 $P_{\max}$ 和 $P_{\mathrm{target}}$ 计算目标PA输出RMS，而不是假定PA输入驱动。
+2. 根据有效突发和 `calibrationDigitalHeadroomDb` 生成合法公开整数码。
+3. 解码公开码，并在解码后施加隐藏的逐链模拟驱动。
+4. 依次运行Tx I/Q、PA前耦合和真实非线性PA，测量PA自身的有效突发输出功率。
+5. 根据功率误差更新模拟驱动；MIMO PA前耦合场景使用Jacobian联合更新。
+6. 收敛后提交模拟驱动，后续正常 `Process` 自动复用；PA输出不做后级常数缩放。
+7. Analysis直接分析实际返回波形，并使用相同的 $P_{\max}$ 映射报告dBm。
 
-物理电压标定后的数组不再是定点 I/Q 码，不能重新送入配置了正 `width` 的 `Analysis`。EVM 和 ACLR 对公共常数增益不敏感，因此性能分析使用未做物理电压标定的 PA 码值；功率报告单独使用标定副本。
+闭环异常会报告目标功率、最佳实测输出、最佳误差、迭代次数和失败原因。只要至少有一次有效测量，`GetLastCalibrationMetrics()` 还会返回 `converged=False`、`failureReason`，以及可用时的 `analogDriveDbPerChain`。内置 `PaModel`、`MimoPaModel` 和 `Channel` 提供解码后模拟驱动接口；只实现传统 `Process` 的第三方定点plant仍走兼容的全数字路径，如果公开码连续停在同一个满量程值，错误信息会明确指出缺少模拟驱动接口。
+
+物理电压标定后的数组不再是定点I/Q码，不能重新送入配置了正 `width` 的 `Analysis`。EVM和ACLR使用真实PA公开输出码；功率报告把同一波形解码后的有效区RMS映射为dBm，不生成一个经过PA后缩放的替代波形。
 
 ## 11. 浮点与定点最小 SISO 示例
 
@@ -338,3 +451,6 @@ python SmallestSISO.py
 5. 14 位最大正码是 `8191`，16 位最大正码是 `32767`。
 6. 只有内部算法或显式调用 `DecodeComplex` 后，样值才恢复到单位幅度附近。
 7. 物理电压标定数据不能伪装成定点码重新送入定点接口。
+8. `maximumOutputPowerDbm` 是PA输出参考面的额定上限，不是公开整数码的功率标签。
+9. 定点闭环默认保留6 dB数字峰值余量，并在解码后调整隐藏模拟驱动；不要通过制造越界码代替该驱动级。
+10. `GetLastPaInput()` 是模拟驱动前的公开数字参考，真正的PA激励应查看 `GetLastActualPaInput()`。

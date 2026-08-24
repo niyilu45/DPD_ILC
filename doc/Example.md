@@ -8,6 +8,8 @@
 - FB I/Q不平衡是否只污染反馈观测，而不会改变forward结果？
 - 固定结温从25摄氏度升到85摄氏度时，PA输出怎样变化？
 - 相同PA输出功率下，热阻或占空比改变以后，温升和输出漂移怎样变化？
+- 用户配置的周期占空比、波形内部空闲比例和真实RF占空比怎样区分？
+- 周期稳态和从冷机开始的连续瞬态应怎样分别验证？
 
 最小系统不是完整整机仿真。它的目的，是让输出变化可以归因到一个参数模块。确认单模块行为以后，才能把多个非理想逐个加入完整DPD系统。
 
@@ -19,7 +21,7 @@
 2. 所有对比使用同一个随机种子、同一段输入波形和同一参考面。
 3. I/Q测试使用单位PA，排除PA压缩、记忆和温度影响。
 4. Tx I/Q测试使用forward参考面，FB I/Q测试直接从已知PA输出进入 `ProcessPaOutput`。
-5. 温漂测试只需重复调用 `Channel.Process(rawSignal, outputPowerDbm=...)`；函数内部暂停温度影响做参考校准，恢复原热状态后真实发射一次，不会闭环稳定当前热态输出。
+5. 温漂测试只需调用 `Channel.Process(rawSignal, outputPowerDbm=...)`；默认 `steady_state` 会在每次调用时执行参考温度功率校准，再按完整周期稳态温度曲线处理。需要观察冷启动历史时显式选择 `transient`。
 6. 参数比较至少包含理想、轻微和压力三档，并给出预期单调趋势。
 7. 理想双精度结果可能显示数百dB IRR或极小EVM，这只代表数值残差，不代表真实仪器动态范围。
 
@@ -56,13 +58,14 @@ y(n).
 
 ### 3.2 参数对比
 
-| 场景 | `txIqGainImbalanceDb` | `txIqPhaseImbalanceDegrees` | 目的 |
-|---|---:|---:|---|
-| Ideal | 0.0 | 0.0 | 数值基线 |
-| Gain only | 0.3 | 0.0 | 单独观察增益误差 |
-| Phase only | 0.0 | 2.0 | 单独观察正交误差 |
-| Mild combined | 0.3 | 2.0 | 常用功能验证起点 |
-| Stress combined | 1.0 | 5.0 | 明显镜像压力测试 |
+| 场景 | `txIqImbalanceEnabled` | `txIqGainImbalanceDb` | `txIqPhaseImbalanceDegrees` | `txDcOffset` | 目的 |
+|---|---:|---:|---:|---:|---|
+| Disabled gate | False | 1.0 | 5.0 | `0.03+0.01j` | 用非零存量参数验证整级硬旁路 |
+| Ideal enabled | True | 0.0 | 0.0 | `0+0j` | 启用模块后的数值理想基线 |
+| Gain only | True | 0.3 | 0.0 | `0+0j` | 单独观察增益误差 |
+| Phase only | True | 0.0 | 2.0 | `0+0j` | 单独观察正交误差 |
+| Mild combined | True | 0.3 | 2.0 | `0+0j` | 常用功能验证起点 |
+| Stress combined | True | 1.0 | 5.0 | `0+0j` | 明显镜像压力测试 |
 
 ### 3.3 最小可运行代码
 
@@ -133,26 +136,30 @@ def RunTxIqComparison() -> dict:
     sampleRateHz = 80.0e6
     referenceSignal = GenerateProperComplexProbe(4096, 1001)
     scenarioDefinitions = {
-        "Ideal": (0.0, 0.0),
-        "Gain only": (0.3, 0.0),
-        "Phase only": (0.0, 2.0),
-        "Mild combined": (0.3, 2.0),
-        "Stress combined": (1.0, 5.0),
+        "Disabled gate": (False, 1.0, 5.0, 0.03 + 0.01j),
+        "Ideal enabled": (True, 0.0, 0.0, 0.0 + 0.0j),
+        "Gain only": (True, 0.3, 0.0, 0.0 + 0.0j),
+        "Phase only": (True, 0.0, 2.0, 0.0 + 0.0j),
+        "Mild combined": (True, 0.3, 2.0, 0.0 + 0.0j),
+        "Stress combined": (True, 1.0, 5.0, 0.0 + 0.0j),
     }
     comparisonResults = {}
 
     for scenarioName, (
+        iqImbalanceEnabled,
         gainImbalanceDb,
         phaseImbalanceDegrees,
+        dcOffset,
     ) in scenarioDefinitions.items():
         channel = Channel(
             paModel=IdentityPa(),
             parameters={
                 "sampleMode": "forward",
                 "sampleRateHz": sampleRateHz,
+                "txIqImbalanceEnabled": iqImbalanceEnabled,
                 "txIqGainImbalanceDb": gainImbalanceDb,
                 "txIqPhaseImbalanceDegrees": phaseImbalanceDegrees,
-                "txDcOffset": 0.0 + 0.0j,
+                "txDcOffset": dcOffset,
                 "noiseSnrDb": None,
                 "width": 0,
             },
@@ -182,7 +189,8 @@ for scenarioName, metrics in txIqResults.items():
 
 | 场景 | IRR | EVM | 预期判断 |
 |---|---:|---:|---|
-| Ideal | 约284 dB | 数值零残差 | 只表示双精度基线 |
+| Disabled gate | 约284 dB | 数值零残差 | 非零增益、相位和DC均被硬开关旁路 |
+| Ideal enabled | 约284 dB | 数值零残差 | 只表示双精度基线 |
 | Gain only | 35.26 dB | -35.26 dB | 与0.3 dB增益误差公式一致 |
 | Phase only | 35.16 dB | -35.16 dB | 与2度正交误差公式一致 |
 | Mild combined | 32.20 dB | -32.20 dB | 两个镜像向量共同作用 |
@@ -193,6 +201,7 @@ for scenarioName, metrics in txIqResults.items():
 ### 3.5 隔离成功的判据
 
 - 增益误差或相位误差增大时，IRR应降低、EVM应升高。
+- Disabled gate应与Ideal enabled逐样点一致，证明False不是仅关闭镜像项，而是同时旁路增益、相位和DC。
 - `sampleMode="forward"` 仍然能看到Tx I/Q误差，因为它位于PA之前。
 - `GetLastTransmitterOutput()` 应与单位PA输出一致。
 - 如果Ideal场景仍只有二三十dB IRR，应先检查输入是否近似proper complex，以及Analysis是否使用了同一参考波形。
@@ -213,11 +222,11 @@ y_{\mathrm{PA}}(n)
 z_{\mathrm{fb}}(n).
 ```
 
-这样不会再次运行PA，也不会应用Tx I/Q。所有FB增益、FIR、时频偏、非线性、ADC和噪声都保持理想，只改变三个FB I/Q参数。
+这样不会再次运行PA，也不会应用Tx I/Q。所有FB增益、FIR、时频偏、非线性、ADC和噪声都保持理想，只改变FB I/Q开关及其三个误差参数。
 
 ### 4.2 参数对比与代码
 
-FB的增益和相位配置使用与Tx场景相同的五档值。把下面代码接在第3.3节公共函数之后即可运行：
+FB的增益和相位配置使用与Tx场景相同的五档值，并额外保留一组非零增益、相位和DC但关闭FB硬开关。把下面代码接在第3.3节公共函数之后即可运行：
 
 ```python
 def RunFbIqComparison() -> dict:
@@ -226,25 +235,29 @@ def RunFbIqComparison() -> dict:
     sampleRateHz = 80.0e6
     cleanPaOutput = GenerateProperComplexProbe(4096, 1001)
     scenarioDefinitions = {
-        "Ideal": (0.0, 0.0),
-        "Gain only": (0.3, 0.0),
-        "Phase only": (0.0, 2.0),
-        "Mild combined": (0.3, 2.0),
-        "Stress combined": (1.0, 5.0),
+        "Disabled gate": (False, 1.0, 5.0, 0.03 + 0.01j),
+        "Ideal enabled": (True, 0.0, 0.0, 0.0 + 0.0j),
+        "Gain only": (True, 0.3, 0.0, 0.0 + 0.0j),
+        "Phase only": (True, 0.0, 2.0, 0.0 + 0.0j),
+        "Mild combined": (True, 0.3, 2.0, 0.0 + 0.0j),
+        "Stress combined": (True, 1.0, 5.0, 0.0 + 0.0j),
     }
     comparisonResults = {}
 
     for scenarioName, (
+        iqImbalanceEnabled,
         gainImbalanceDb,
         phaseImbalanceDegrees,
+        dcOffset,
     ) in scenarioDefinitions.items():
         channel = Channel(
             parameters={
                 "sampleMode": "fb",
                 "sampleRateHz": sampleRateHz,
+                "fbIqImbalanceEnabled": iqImbalanceEnabled,
                 "fbIqGainImbalanceDb": gainImbalanceDb,
                 "fbIqPhaseImbalanceDegrees": phaseImbalanceDegrees,
-                "fbDcOffset": 0.0 + 0.0j,
+                "fbDcOffset": dcOffset,
                 "fbThirdOrderCoefficient": 0.0 + 0.0j,
                 "fbClipAmplitude": None,
                 "fbAdcWidth": None,
@@ -271,11 +284,12 @@ for scenarioName, metrics in fbIqResults.items():
     )
 ```
 
-因为Tx与FB模块复用相同的I/Q系数换算，五档结果应与第3.4节基本一致。但是物理含义不同：
+因为Tx与FB模块复用相同的I/Q系数换算，这六档结果应与第3.4节基本一致：Disabled gate与Ideal enabled都应回到逐样点一致的理想输出，其余误差档位遵循相同IRR趋势。但是物理含义不同：
 
 - Tx结果代表真实发射镜像，可以由增广DPD补偿。
 - FB结果只是测量镜像，不应直接由发射DPD补偿。
 - 把同一组非零 `fbIq...` 参数放入 `sampleMode="forward"` 后，输出应回到Ideal基线。这是区分Tx和FB参考面的关键对照。
+- 在 `sampleMode="fb"` 中设置 `fbIqImbalanceEnabled=False` 也应回到Ideal基线，但它只旁路FB增益、相位和DC，不关闭Tx I/Q或其他FB模块。
 
 ### 4.3 单独测试DC偏置
 
@@ -294,6 +308,7 @@ def RunFbDcComparison() -> dict:
         channel = Channel(
             parameters={
                 "sampleMode": "fb",
+                "fbIqImbalanceEnabled": True,
                 "fbDcOffset": dcMagnitude + 0.0j,
                 "width": 0,
             }
@@ -315,7 +330,7 @@ def RunFbDcComparison() -> dict:
 | 0.01 | 1% | 约 -40.01 dB |
 | 0.03 | 3% | 约 -30.46 dB |
 
-DC增大时EVM按约20对数规律变差，但IRR仍可能很高，因为DC不是 $x^*$ 镜像。只看IRR会漏掉这一类误差。
+DC增大时EVM按约20对数规律变差，但IRR仍可能很高，因为DC不是 $x^*$ 镜像。只看IRR会漏掉这一类误差。若把 `fbIqImbalanceEnabled` 改成False，同样的非零 `fbDcOffset` 也会被旁路；Tx端使用 `txIqImbalanceEnabled` 遵循相同规则。
 
 ## 5. 最小系统C：单独测试固定温度角
 
@@ -390,18 +405,20 @@ fosterChannel = Channel(
     parameters={
         "sampleRateHz": 80.0e6,
         "maximumOutputPowerDbm": 25.0,
+        "thermalRunMode": "steady_state",
+        "thermalDutyCycle": 0.50,
         "width": 0,
     },
 )
 
-for frameIndex in range(20):
-    receivedSignal = fosterChannel.Process(
-        rawSignal,
-        outputPowerDbm=20.0,
-    )
-    print(frameIndex, fosterChannel.GetThermalMetrics())
-    fosterChannel.AdvanceThermalIdle(1.0e-3)
+receivedSignal = fosterChannel.Process(
+    rawSignal,
+    outputPowerDbm=20.0,
+)
+print(fosterChannel.GetThermalMetrics())
 ```
+
+`thermalDutyCycle=0.50` 表示整个 `rawSignal` 数据窗口占一个周期的50%；其余50%的窗口外空闲由Channel自动推进，不需要再调用 `AdvanceThermalIdle`。若 `rawSignal` 内部还有补零，它们仍属于用户配置的数据窗口，但会被自动识别为空闲并降低 `actualDutyCycle`。
 
 全部公共参数、四个温度电系数、敏感性范围和实测替换规则见 [PaModel.md的完整推荐表](./PaModel.md#1371-三种已实现模型的完整推荐值)。
 
@@ -437,6 +454,8 @@ def CreateThermalChannel(
     initialTemperatureC: float,
     thermalResistanceCPerW: float,
     thermalTimeConstantSec: float,
+    thermalRunMode: str = "steady_state",
+    thermalDutyCycle: float = 1.0,
 ) -> Channel:
     """Create one isolated SISO thermal PA and its forward channel."""
 
@@ -471,6 +490,8 @@ def CreateThermalChannel(
             "sampleRateHz": sampleRateHz,
             "maximumOutputPowerDbm": 25.0,
             "calibrationToleranceDb": 0.05,
+            "thermalRunMode": thermalRunMode,
+            "thermalDutyCycle": thermalDutyCycle,
             "width": 0,
         },
     )
@@ -537,23 +558,42 @@ for temperatureC, metrics in staticTemperatureResults.items():
 
 这个结果由示例中较强的负增益温度系数、负饱和温度系数和正附加非线性系数共同产生。若只打开 `gainTemperatureCoefficientDbPerC`，公共复增益对齐会消除大部分EVM变化，但绝对输出功率仍会漂移；因此温漂测试必须同时观察输出功率和对齐后EVM。
 
-## 6. 最小系统D：单独测试动态自热
+## 6. 最小系统D：单独测试周期动态自热
 
-### 6.1 测试边界
+### 6.1 测试边界和两种运行模式
 
-动态自热测试仍包含“无热参考校准”和“真实温度发射”两个物理阶段，但它们已经封装在一次 `Channel.Process(rawSignal, outputPowerDbm=...)` 调用内部。用户不用关闭温度模型、调用校准器或管理 `frozenInput`。
+动态自热测试仍包含“参考温度功率校准”和“真实温度发射”两个物理阶段，但它们已经封装在 `Channel.Process(rawSignal, outputPowerDbm=...)` 内部。用户不用关闭温度模型、调用校准器或构造空闲波形。
 
-每帧传入的 `outputPowerDbm` 只约束暂停温度影响后的参考电模型。Channel随后恢复本帧开始前的结温和累计时间，并用收敛输入真实发射一次；它不会围绕当前热态输出重新稳定功率。因此连续调用仍会得到自然温升和输出漂移。
+Channel把每次输入看成一个数据窗口，再根据 `thermalDutyCycle` 自动补足窗口外空闲。两种模式的区别如下：
 
-### 6.2 比较不同热阻
+| 模式 | 周期起点 | 一次 `Process` 的含义 | 首尾温度 | 适用场景 |
+|---|---|---|---|---|
+| `steady_state`，默认 | 自动求周期不动点 | 在收敛的周期温度曲线上处理一个数据窗口 | 周期首尾在容差内相同；数据窗口末端可以更热 | 连续循环工作点、不同功率或占空比的公平对比 |
+| `transient` | 当前保存的实时热状态 | 从当前状态推进数据窗口和自动外部空闲各一次 | 未稳定时通常不同 | 冷启动、预热、功率阶跃和突发建立过程 |
 
-保持时间常数20 ms、输入波形、目标功率和温度系数不变，只改变单RC热阻：5、20和40摄氏度每瓦。热阻越大，相同耗散功率形成的稳态温升越高。
+```mermaid
+flowchart TD
+    call["Channel.Process"] --> calibrate["参考温度功率校准"]
+    calibrate --> mode{"thermalRunMode"}
+    mode -->|steady_state| solve["求周期首尾相同的热状态"]
+    mode -->|transient| live["读取当前实时热状态"]
+    solve --> data["处理数据窗口；内部空闲也冷却"]
+    live --> data
+    data --> idle["自动推进窗口外空闲"]
+    idle --> metrics["保存占空比、温度曲线和周期指标"]
+```
+
+图示说明：功率校准试探不推进热时间，也不围绕热态输出追踪目标。真实处理才产生温度相关增益、相位、饱和和非线性漂移。默认稳态模式第一次调用必须提供 `outputPowerDbm`；后续省略时会复用最近成功目标并再次做参考校准。
+
+### 6.2 周期稳态下比较不同热阻
+
+保持时间常数20 ms、配置占空比50%、输入波形、目标功率和温度系数不变，只改变单RC热阻：5、20和40摄氏度/W。默认稳态模式不需要先循环很多帧；一次调用就求出无限周期发送时的极限温度曲线。
 
 ```python
-def RunThermalResistanceScenario(
+def RunSteadyResistanceScenario(
     thermalResistanceCPerW: float,
 ) -> dict:
-    """Measure eight internally calibrated thermal frames."""
+    """Measure one converged periodic single-RC operating point."""
 
     sampleRateHz = 100.0e3
     rawSignal = GenerateThermalProbe(2000, 2027)
@@ -563,69 +603,57 @@ def RunThermalResistanceScenario(
         initialTemperatureC=25.0,
         thermalResistanceCPerW=thermalResistanceCPerW,
         thermalTimeConstantSec=0.02,
+        thermalRunMode="steady_state",
+        thermalDutyCycle=0.50,
     )
-    firstOutput = channel.Process(
-        rawSignal,
-        outputPowerDbm=20.0,
-    )
-    firstMetrics = channel.GetThermalMetrics()
-    lastOutput = firstOutput
-    lastMetrics = firstMetrics
-    for _ in range(7):
-        lastOutput = channel.Process(
-            rawSignal,
-            outputPowerDbm=20.0,
-        )
-        lastMetrics = channel.GetThermalMetrics()
-
-    driftMetrics = Analysis(
-        lastOutput,
-        transmittedSignal=firstOutput,
-        sampleRateHz=sampleRateHz,
-        width=0,
-    ).Analyze()
+    channel.Process(rawSignal, outputPowerDbm=20.0)
+    thermalMetrics = channel.GetThermalMetrics()
     return {
-        "firstTemperatureC": firstMetrics[
-            "endingJunctionTemperatureC"
+        "periodStartC": thermalMetrics[
+            "periodStartingJunctionTemperatureC"
         ],
-        "lastTemperatureC": lastMetrics[
-            "endingJunctionTemperatureC"
+        "dataEndC": thermalMetrics["dataEndingJunctionTemperatureC"],
+        "periodEndC": thermalMetrics[
+            "periodEndingJunctionTemperatureC"
         ],
-        "firstOutputPowerDbm": firstMetrics["outputPowerDbm"],
-        "lastOutputPowerDbm": lastMetrics["outputPowerDbm"],
-        "evmDbVersusFirstFrame": driftMetrics["evmDb"],
-        "evmPercentVersusFirstFrame": driftMetrics["evmPercent"],
+        "periodAveragePowerW": thermalMetrics[
+            "averageDissipatedPowerW"
+        ],
+        "closureErrorC": thermalMetrics["steadyStateErrorC"],
     }
 
 
 for thermalResistanceCPerW in (5.0, 20.0, 40.0):
     print(
         thermalResistanceCPerW,
-        RunThermalResistanceScenario(thermalResistanceCPerW),
+        RunSteadyResistanceScenario(thermalResistanceCPerW),
     )
 ```
 
-典型结果为：
+预期对比如下：
 
-| 热阻 | 第1帧结温 | 第8帧结温 | 第1帧功率 | 第8帧功率 | 第8帧相对第1帧EVM |
-|---:|---:|---:|---:|---:|---:|
-| 5摄氏度每瓦 | 25.52摄氏度 | 25.82摄氏度 | 19.94 dBm | 19.87 dBm | -51.14 dB |
-| 20摄氏度每瓦 | 27.05摄氏度 | 28.13摄氏度 | 19.83 dBm | 19.58 dBm | -39.61 dB |
-| 40摄氏度每瓦 | 29.00摄氏度 | 30.89摄氏度 | 19.69 dBm | 19.23 dBm | -33.89 dB |
+| 热阻增大 | 周期起点温度 | 数据窗口末端温度 | 周期平均耗散 | 周期闭合误差 |
+|---|---|---|---|---|
+| 5 → 20 → 40摄氏度/W | 单调升高 | 单调升高 | 会随温度电漂移略变，不能假定严格不变 | 每组都应小于配置容差 |
 
-热阻增大后，温升、功率下降和波形形状漂移都增大，符合单RC模型预期。若结温升高但输出功率和EVM完全不变，应检查所有温度电参数是否仍为0。
+热阻越大，相同耗散形成的温升越高；由于本示例同时启用了温度相关电参数，输出和耗散会反过来轻微改变，所以不能用一个固定耗散乘热阻替代完整不动点求解。若结温变化而输出功率和EVM完全不变，应检查四个温度电参数是否全为0。
 
-### 6.3 比较不同占空比
+### 6.3 配置占空比、内部空闲和真实占空比
 
-占空比测试保持活动区目标输出功率相同，只改变每帧中有效RF样点的比例。补零样点不进入活动区输出功率统计，但仍推进热时间并按 `idleDissipatedPowerW` 处理。
+用户配置的是“数据窗口/完整周期”，不是数组中非零样点的比例。下面的函数把数据窗口后半段改为0，并同时记录三种占空比：
 
 ```python
-def RunDutyCycleScenario(activeDutyCycle: float) -> dict:
-    """Measure eight equal-duration frames at one RF duty cycle."""
+def RunDutyCycleScenario(
+    thermalDutyCycle: float,
+    waveformActiveDutyCycle: float,
+) -> dict:
+    """Compare scheduled duty with activity measured inside the waveform."""
 
     sampleRateHz = 100.0e3
     fullProbe = GenerateThermalProbe(2000, 2027)
-    activeSampleCount = int(fullProbe.size * activeDutyCycle)
+    activeSampleCount = int(
+        fullProbe.size * waveformActiveDutyCycle
+    )
     rawSignal = np.zeros(fullProbe.size, dtype=np.complex128)
     rawSignal[:activeSampleCount] = fullProbe[:activeSampleCount]
     channel = CreateThermalChannel(
@@ -634,43 +662,156 @@ def RunDutyCycleScenario(activeDutyCycle: float) -> dict:
         initialTemperatureC=25.0,
         thermalResistanceCPerW=20.0,
         thermalTimeConstantSec=0.02,
+        thermalRunMode="steady_state",
+        thermalDutyCycle=thermalDutyCycle,
     )
-    for _ in range(8):
-        channel.Process(
-            rawSignal,
-            outputPowerDbm=20.0,
-        )
 
+    # This pre-processing query predicts activity at the current PA input.
+    predictedActualDuty = channel.GetActualDutyCycle(rawSignal)
+    channel.Process(rawSignal, outputPowerDbm=20.0)
     thermalMetrics = channel.GetThermalMetrics()
     return {
-        "measuredDutyCycle": thermalMetrics["activeSampleDutyCycle"],
-        "endingTemperatureC": thermalMetrics[
-            "endingJunctionTemperatureC"
+        "configuredDutyCycle": thermalMetrics["configuredDutyCycle"],
+        "waveformActiveDutyCycle": thermalMetrics[
+            "waveformActiveDutyCycle"
         ],
-        "outputPowerDbm": thermalMetrics["outputPowerDbm"],
-        "averageDissipatedPowerW": thermalMetrics[
-            "averageDissipatedPowerW"
+        "actualDutyCycle": channel.GetActualDutyCycle(),
+        "predictedActualDutyCycle": predictedActualDuty,
+        "scheduledIdleDurationSec": thermalMetrics[
+            "scheduledIdleDurationSec"
+        ],
+        "periodDurationSec": thermalMetrics["periodDurationSec"],
+        "periodStartC": thermalMetrics[
+            "periodStartingJunctionTemperatureC"
+        ],
+        "dataEndC": thermalMetrics["dataEndingJunctionTemperatureC"],
+        "periodEndC": thermalMetrics[
+            "periodEndingJunctionTemperatureC"
         ],
     }
 
 
-for activeDutyCycle in (0.25, 0.50, 1.00):
-    print(activeDutyCycle, RunDutyCycleScenario(activeDutyCycle))
+dutyCases = (
+    (0.50, 1.00),
+    (1.00, 0.50),
+    (0.50, 0.50),
+    (0.25, 1.00),
+)
+for thermalDutyCycle, waveformActiveDutyCycle in dutyCases:
+    print(
+        thermalDutyCycle,
+        waveformActiveDutyCycle,
+        RunDutyCycleScenario(
+            thermalDutyCycle,
+            waveformActiveDutyCycle,
+        ),
+    )
 ```
 
-典型结果为：
+理想门限下预期关系为：
 
-| 配置占空比 | 测得占空比 | 第8帧结温 | 活动区输出功率 | 平均耗散功率 |
-|---:|---:|---:|---:|---:|
-| 25% | 25.00% | 25.55摄氏度 | 19.89 dBm | 0.041 W |
-| 50% | 49.95% | 26.22摄氏度 | 19.78 dBm | 0.081 W |
-| 100% | 99.95% | 28.13摄氏度 | 19.58 dBm | 0.157 W |
+| `thermalDutyCycle` | 窗口内部活动比例 | `actualDutyCycle` | 物理解释 |
+|---:|---:|---:|---|
+| 50% | 100% | 50% | 整个数据窗口发射，随后自动外部空闲 |
+| 100% | 50% | 50% | 周期没有外部空闲，但数据窗口后半段自身为空闲 |
+| 50% | 50% | 25% | 数据窗口内部和窗口外部都存在空闲 |
+| 25% | 100% | 25% | 较短的全活动窗口，随后较长外部空闲 |
 
-占空比越高，平均耗散越大、结温越高，同一参考温度目标下的真实输出功率下降越明显。示例每帧都传入20 dBm，但Channel只在暂停温度影响的参考电模型上校准，不会闭环追踪当前热态输出，因此不会隐藏自然温漂。只有另行构造一个根据热态实测功率持续修正驱动的外部控制环，才会把这种功率差异抵消。
+第一组与第二组、第三组与第四组的真实RF占空比分别相同，但周期长度和热量在周期中的位置不同，所以快速RC支路的峰值温度和温度纹波可以不同。只比较平均占空比无法验证热记忆。
 
-### 6.4 从实际PA测量得到上述参数
+### 6.4 瞬态模式怎样逐周期趋近稳态
 
-本章示例用于隔离参数影响，不应从仿真曲线反向猜测真实器件参数。实际工程应同步测量结温、DC电压电流、输入/输出RF功率和I/Q，先拟合热源效率，再拟合单RC或Foster，最后在已知结温下拟合增益、相位、饱和尺度和附加非线性温度系数。完整仪表连接、测试时序、NumPy拟合函数、static/单RC/Foster回填例和留出数据验收方法见 [PA温度特性测量、模型辨识与参数回填](./PaThermalMeasurement.md)。
+下面显式选择 `transient`，每次调用从上次周期终点继续。由于 `thermalDutyCycle=0.40`，每个20 ms数据窗口后都自动推进30 ms窗口外空闲：
+
+```python
+def RunTransientWarmup() -> list:
+    """Record the causal temperature state over repeated periods."""
+
+    sampleRateHz = 100.0e3
+    rawSignal = GenerateThermalProbe(2000, 2027)
+    channel = CreateThermalChannel(
+        sampleRateHz=sampleRateHz,
+        modelName="single_rc",
+        initialTemperatureC=25.0,
+        thermalResistanceCPerW=20.0,
+        thermalTimeConstantSec=0.02,
+        thermalRunMode="transient",
+        thermalDutyCycle=0.40,
+    )
+    periodRecords = []
+    for periodIndex in range(12):
+        channel.Process(rawSignal, outputPowerDbm=20.0)
+        thermalMetrics = channel.GetThermalMetrics()
+        periodRecords.append(
+            {
+                "periodIndex": periodIndex,
+                "periodStartC": thermalMetrics[
+                    "periodStartingJunctionTemperatureC"
+                ],
+                "dataEndC": thermalMetrics[
+                    "dataEndingJunctionTemperatureC"
+                ],
+                "periodEndC": thermalMetrics[
+                    "periodEndingJunctionTemperatureC"
+                ],
+            }
+        )
+    return periodRecords
+
+
+print(RunTransientWarmup())
+```
+
+未达到稳态时，本周期 `periodEndC` 会成为下一周期 `periodStartC`，首尾差逐渐减小。最终它应趋近使用相同波形和参数直接运行 `steady_state` 得到的周期极限环。这里不要再调用 `AdvanceThermalIdle(30e-3)`，否则同一外部空闲会计算两次。
+
+### 6.5 绘制一个周期的温度曲线
+
+温度曲线已经保存在指标字典中，不需要重新仿真。每个 `temperatureTraceRfActive[k]` 描述第 `k` 个时间点到第 `k+1` 个时间点之间是否存在RF活动：
+
+```python
+import matplotlib.pyplot as plt
+
+
+def DrawPeriodicTemperature(channel: Channel) -> None:
+    """Plot one accepted period and shade RF-active thermal intervals."""
+
+    thermalMetrics = channel.GetThermalMetrics()
+    timeMs = 1.0e3 * np.asarray(
+        thermalMetrics["temperatureTraceTimeSec"],
+        dtype=float,
+    )
+    temperatureC = np.asarray(
+        thermalMetrics["temperatureTraceC"],
+        dtype=float,
+    )
+    intervalActivity = np.asarray(
+        thermalMetrics["temperatureTraceRfActive"],
+        dtype=bool,
+    )
+
+    figure, axis = plt.subplots(figsize=(8.0, 4.0))
+    axis.plot(timeMs, temperatureC, marker="o", label="junction")
+    for intervalIndex, isActive in enumerate(intervalActivity):
+        if isActive:
+            axis.axvspan(
+                timeMs[intervalIndex],
+                timeMs[intervalIndex + 1],
+                color="tab:red",
+                alpha=0.15,
+            )
+    axis.set_xlabel("Time within period (ms)")
+    axis.set_ylabel("Junction temperature (C)")
+    axis.grid(True, alpha=0.3)
+    axis.legend()
+    figure.tight_layout()
+    plt.show()
+```
+
+稳态曲线的第一个和最后一个温度点应重合；中间曲线可以先升后降，也可以因内部空闲形成多个局部峰谷。红色背景表示活动热区间，未着色区域可能是输入数组内部空闲，也可能是Channel自动加入的窗口外空闲。
+
+### 6.6 从实际PA测量得到上述参数
+
+本章示例用于隔离参数影响，不应从仿真曲线反向猜测真实器件参数。实际工程应同步测量结温、DC电压电流、输入/输出RF功率和I/Q，先拟合热源效率，再拟合单RC或Foster，最后在已知结温下拟合增益、相位、饱和尺度和附加非线性温度系数。周期测试还必须同时记录用户数据窗口、窗口内部RF活动掩码、完整周期和额外仪表间隔。完整仪表连接、测试时序、NumPy拟合函数、周期稳态验收、static/单RC/Foster回填例和留出数据验收方法见 [PA温度特性测量、模型辨识与参数回填](./PaThermalMeasurement.md)。
 
 ## 7. 参数对比时应该记录哪些结果
 
@@ -687,8 +828,11 @@ for activeDutyCycle in (0.25, 0.50, 1.00):
 
 至少记录：
 
-- `startingJunctionTemperatureC` 和 `endingJunctionTemperatureC`；
-- `averageDissipatedPowerW` 和 `activeSampleDutyCycle`；
+- `periodStartingJunctionTemperatureC`、`dataEndingJunctionTemperatureC` 和 `periodEndingJunctionTemperatureC`；
+- `configuredDutyCycle`、`waveformActiveDutyCycle` 和 `actualDutyCycle`；
+- `dataWindowAverageDissipatedPowerW` 和完整周期的 `averageDissipatedPowerW`；
+- `steadyStateConverged`、`steadyStateIterations` 和 `steadyStateErrorC`；
+- `temperatureTraceTimeSec`、`temperatureTraceC` 和 `temperatureTraceRfActive`；
 - `outputPowerDbm`：观察绝对增益和压缩漂移；
 - 相对冷机或第1帧的EVM：观察公共复增益对齐后剩余的非线性形状变化；
 - ACLR或双音IM3：需要判断温度相关带外再生时再加入，不能只看功率。
@@ -714,9 +858,12 @@ for activeDutyCycle in (0.25, 0.50, 1.00):
 2. 确认 `width=0`，先排除公开定点量化；验证通过后再单独加入定点系统。
 3. 确认Analysis使用 `transmittedSignal=referenceSignal`，没有进入盲Descriptor解析。
 4. Tx I/Q必须通过 `Process`，FB I/Q必须通过fb模式或 `ProcessPaOutput`；不要混淆参考面。
-5. 温漂阶段可以继续传入 `outputPowerDbm`；当前Channel只在暂停温度影响的参考面校准，恢复原热状态后真实处理一次，不会闭环稳定当前热态输出。
-6. 检查温度系数是否非零；只有热网络升温而电参数不随温度变化时，波形可能几乎不变。
-7. 一次只恢复一个被关闭的模块，直到找到趋势改变的来源。
+5. 默认稳态模式第一次调用必须传 `outputPowerDbm`；后续即使省略也会复用最近目标并重新执行参考温度校准。该校准不会闭环稳定热态输出。
+6. 检查 `thermalDutyCycle` 表示数据窗口占完整周期，而不是数组非零比例；用 `GetActualDutyCycle()` 核对真实RF占空比。
+7. 检查是否把自动窗口外空闲又传给 `AdvanceThermalIdle`，从而重复计算冷却时间。
+8. 稳态闭合应比较周期起点和周期终点，不要误用数据窗口末端的兼容字段 `endingJunctionTemperatureC`。
+9. 检查温度系数是否非零；只有热网络升温而电参数不随温度变化时，波形可能几乎不变。
+10. 一次只恢复一个被关闭的模块，直到找到趋势改变的来源。
 
 ## 10. 最小系统E：单独验证Rapp无记忆PA
 

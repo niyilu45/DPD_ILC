@@ -6,21 +6,36 @@
 
 ```mermaid
 flowchart LR
-    raw["用户原始波形"] --> calibration["Channel内部功率闭环<br/>调整PA输入缩放"]
-    target["用户目标输出功率 dBm"] --> calibration
-    calibration --> txIq["Tx I/Q调制器<br/>增益/相位不平衡与DC"]
+    raw["用户原始波形"] --> active["有效突发检测<br/>逐链单位RMS归一化"]
+    active --> publicWave["公开数字波形<br/>浮点幅值或定点整数码"]
+    publicWave --> decode["公开边界解码<br/>定点码转内部浮点"]
+    decode --> analogDrive["隐藏逐链模拟drive<br/>定点默认保留6 dB数字余量"]
+    target["用户目标输出功率 dBm"] --> controller["dB域功率闭环控制器"]
+    controller -. "浮点：调整公开波形幅值" .-> publicWave
+    controller -. "定点：调整模拟drive" .-> analogDrive
+    analogDrive --> txIqEnable{"txIqImbalanceEnabled"}
+    txIqEnable -->|True| txIq["Tx I/Q调制器<br/>增益/相位不平衡与DC"]
+    txIqEnable -->|False| txIqBypass["Tx I/Q整级旁路"]
     txIq --> preCoupling["PA前耦合 Hpre(z)"]
-    preCoupling --> pa["每路独立PA<br/>Rapp/Wiener/GMP/Doherty"]
-    pa --> paOutput["各PA自身输出 yPA(n)"]
+    txIqBypass --> preCoupling
+    preCoupling --> pa["每路独立PA电模型<br/>Rapp/Wiener/GMP/Doherty"]
+    pa --> paOutput["参考温度PA输出"]
     paOutput --> detector["有效突发功率检测"]
-    detector -. "误差超出容差时反馈" .-> calibration
-    paOutput --> postCoupling["PA后耦合 Hpost(z)"]
+    detector -. "误差超出容差时反馈" .-> controller
+    detector --> restoreThermal["收敛后恢复热状态"]
+    restoreThermal --> thermalPeriod["正式热周期<br/>稳态固定点或瞬态推进"]
+    thermalPeriod --> livePaOutput["数据窗PA输出<br/>窗后自动空闲只更新温度"]
+    livePaOutput --> postCoupling["PA后耦合 Hpost(z)"]
     postCoupling --> phase["公共固定相位旋转"]
     phase --> mode{"sampleMode"}
     mode -->|forward| instrument["前向仪表采样<br/>跳过fb专用非理想"]
-    mode -->|fb| fbAnalog["板载反馈模拟链<br/>频响/增益/非线性/时频偏/IQ/DC"]
+    mode -->|fb| fbAnalog["板载反馈模拟链<br/>频响/增益/非线性/时频偏"]
+    fbAnalog --> fbIqEnable{"fbIqImbalanceEnabled"}
+    fbIqEnable -->|True| fbIq["FB I/Q增益/相位/DC"]
+    fbIqEnable -->|False| fbIqBypass["FB I/Q整级旁路"]
     instrument --> noise["AddNoise"]
-    fbAnalog --> noise
+    fbIq --> noise
+    fbIqBypass --> noise
     noise --> fbAdc{"fb模式？"}
     fbAdc -->|forward| receiver["仪表采样波形"]
     fbAdc -->|fb| adc["反馈ADC限幅与量化"]
@@ -29,15 +44,16 @@ flowchart LR
 
 图示说明：
 
-- `txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees` 和 `txDcOffset` 位于PA之前，属于真实发射链路；无论选择forward还是fb，它们都会改变PA激励和空口输出。
+- `txIqImbalanceEnabled=True` 时，`txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees` 和 `txDcOffset` 位于PA之前，属于真实发射链路；无论选择forward还是fb，它们都会改变PA激励和空口输出。设为 `False` 时，这三个数值即使非零也被整级旁路。
 - `sampleMode="forward"` 是默认值，表示用校准仪表直接观测PA主路输出。所有 `fb...` 参数都被保留但不生效，因此不会把板载反馈接收机失真混入PA/DPD评价，但Tx I/Q不平衡仍然存在。
-- `sampleMode="fb"` 表示通过板载反馈接收链采样；只有此模式会执行 `fbGainDb`、`fbFirTaps`、时延、CFO/SFO、I/Q不平衡、反馈非线性、限幅、DC和ADC量化。
+- `sampleMode="fb"` 表示通过板载反馈接收链采样；只有此模式会执行 `fbGainDb`、`fbFirTaps`、时延、CFO/SFO、反馈非线性、限幅和ADC量化。FB I/Q增益、相位与DC还要求独立开关 `fbIqImbalanceEnabled=True`。
 - `prePaCouplingPaths` 在Tx I/Q调制器之后、PA非线性之前，把其他通道的延迟复泄漏叠加到每个PA输入；`postPaCouplingPaths` 在非线性之后混合各PA输出。两者都与forward/fb选择无关。
-- `Channel.Process(rawSignal, outputPowerDbm=...)` 是推荐入口。用户只提供任意初始幅度的原始波形和参考温度目标PA输出功率；Channel内部保存并暂停热状态，调整PA输入并反复观测参考温度输出。收敛后恢复原热状态，再用收敛输入执行一次真实PA发射和所选采样路径，因此校准试探不发热，而返回波形仍包含温漂。
-- `Channel.Process(rawSignal)` 保留无功率校准的单次PA→采样路径，主要供ILC每轮plant调用。
+- `Channel.Process(rawSignal, outputPowerDbm=...)` 是推荐入口。用户只提供任意初始幅度的原始波形和参考温度目标PA输出功率；Channel内部的 `PowerCalibration.Calibrate` 通过Channel热事务代理保存并暂停实际PA热状态，调整逐链总drive并反复观测参考温度输出。正位宽模式不会用超量程数字码模拟更大驱动，而是在合法公开码解码后施加隐藏模拟drive。收敛后在 `finally` 中恢复原热状态，再用同一公开波形和已提交drive执行一次真实PA发射和所选采样路径，因此校准试探不发热，而返回波形仍包含温漂。
+- 启用热模型且使用默认 `thermalRunMode="steady_state"` 时，每次 `Channel.Process` 都重做参考温度功率校准。首次必须显式给出 `outputPowerDbm`；成功后的后续调用可省略，Channel会复用最近成功目标并仍执行校准。未启用热模型或显式选择 `"transient"` 时，`Channel.Process(rawSignal)` 才是无功率校准的单周期PA→采样路径。
 - `Channel.ProcessPaOutput` 接收各PA已经产生但尚未经过输出耦合的矩阵，不再次运行PA，依次执行PA后耦合和所选采样路径。
-- 功率闭环由Channel私有持有的 `PowerCalibration` 完成。普通用户不需要构造、配置或调用校准器。
+- 功率闭环由Channel私有持有的 `PowerCalibration` 完成。Channel的 `SuspendThermalModel` 与 `RestoreThermalModel` 只把统一事务代理到实际绑定PA；普通用户不需要构造、配置或调用校准器，也不需要手工开关温度。
 - PA输出功率闭环只观察所有采样路径非理想之前的干净PA输出，因此不会把仪表或板载反馈接收机的失真误认为PA发射功率。
+- `maximumOutputPowerDbm` 是内置PA的额定输出上限和归一化功率参考，不是任意可移动的显示标尺。内置plant应覆盖不超过该上限的目标；默认 `25 dBm` 上限下，`20 dBm` 必须是可达工作点。
 - 实验室“仪表闭环ILC”把forward模式的Channel作为plant；验证板载反馈算法时把fb模式的Channel作为plant，但最终EVM/ACLR仍应由独立forward模式采样评价。
 
 ### 1.1 前向仪表采样
@@ -399,11 +415,11 @@ jG_Q\sin\phi
 \right).
 ```
 
-`Process(inputSignal)` 会执行Tx I/Q；`ProcessPaOutput(paOutputSignal)` 接收的是已经产生的PA输出，因此不会再次执行Tx I/Q，只会执行PA后耦合和所选forward/fb采样链。`GetLastPaInput()`为兼容旧接口保留名称，现在明确返回Tx I/Q之前的数字波形；`GetLastTransmitterOutput()`返回Tx I/Q之后、PA前耦合之前的波形；`GetLastActualPaInput()`返回耦合后真正进入PA的波形。
+`Process(inputSignal)` 会先解码公开边界、复用已提交的逐链模拟drive，再执行Tx I/Q；`ProcessPaOutput(paOutputSignal)` 接收的是已经产生的PA输出，因此不会再次执行drive或Tx I/Q，只会执行PA后耦合和所选forward/fb采样链。`GetLastPaInput()`为兼容旧接口保留名称，现在明确返回定点解码与模拟drive之前的公开数字波形；`GetLastTransmitterOutput()`返回模拟drive和Tx I/Q之后、PA前耦合之前的波形；`GetLastActualPaInput()`返回PA前耦合后真正进入PA的波形。
 
 ### 1.3 PA前与PA后多通道耦合
 
-输入和输出矩阵都使用“样点数 × 物理通道数”。设第 $i$ 路原始输入为 $x_i(n)$，PA前耦合后第 $j$ 路实际激励为：
+输入和输出矩阵都使用“样点数 × 物理通道数”。这里令 $x_i(n)$ 表示第 $i$ 路已经过公开边界解码、隐藏模拟drive和Tx I/Q的调制器输出，而不是用户传入的原始整数码。PA前耦合后第 $j$ 路实际激励为：
 
 ```math
 u_j(n)
@@ -496,6 +512,123 @@ p_m(\mathbf d+\Delta d\mathbf e_n)-p_m(\mathbf d)
 ```
 
 `jointPowerCalibration=None` 表示自动模式：存在PA前耦合时启用Jacobian联合更新，否则沿用较快的逐链闭环。用户也可以显式设为 `True` 或 `False`。PA后耦合不进入功率检测，因此不会改变“每个PA自身输出dBm”的含义。
+
+### 1.5 定点功率校准的数字与模拟参考面
+
+浮点模式没有有限数字满量程，闭环可以把完整的候选drive直接乘到公开浮点波形。定点模式不同：公开接口中的复数容器仍为 `numpy.complex128`，但I和Q必须是位宽允许范围内的整数码。若闭环继续放大这些码，数字输入会先饱和成相同的码序列；再增加迭代次数也不会改变实际PA激励。
+
+Channel因此把正位宽校准分成两个物理阶段：
+
+```mermaid
+flowchart LR
+    raw["任意幅度原始波形"] --> normalize["有效区逐链归一化"]
+    normalize --> headroom["按calibrationDigitalHeadroomDb<br/>配置分量峰值余量"]
+    headroom --> encode["公开定点编码 QW"]
+    encode --> publicPlane["GetLastPaInput<br/>公开整数码参考面"]
+    publicPlane --> decode["定点解码 DW"]
+    decode --> drive["隐藏逐链模拟drive"]
+    drive --> txIq["Tx I/Q"]
+    txIq --> pre["PA前耦合"]
+    pre --> physicalPlane["GetLastActualPaInput<br/>物理PA输入参考面"]
+    physicalPlane --> pa["逐路PA"]
+    pa --> detector["干净PA输出功率检测"]
+    detector -. "更新总drive" .-> drive
+```
+
+图中 `GetLastPaInput()` 与 `GetLastActualPaInput()` 不表示同一个量：
+
+- `GetLastPaInput()` 返回公开数字边界上的收敛波形。正位宽模式下，它是合法的整数I/Q码，位于定点解码和隐藏模拟drive之前。
+- `GetLastTransmitterOutput()` 返回隐藏模拟drive和Tx I/Q模块之后、PA前耦合之前的内部浮点波形。
+- `GetLastActualPaInput()` 返回模拟drive、Tx I/Q和PA前耦合都已施加后的内部浮点波形，是真正进入各物理PA的激励。它不受公开定点码范围的限制。
+
+设第 $m$ 路原始有效区RMS为 $r_{x,m}$，归一化波形为：
+
+```math
+\widetilde{x}_m(n)=\frac{x_m(n)}{r_{x,m}}.
+```
+
+设正位宽为 $W$，公开定点接口允许的最大正归一化分量为 $A_{\mathrm{FS}}$，数字余量为 $H_{\mathrm{d}}$ dB。归一化波形的I/Q分量峰值为：
+
+```math
+c_m
+=
+\max_n
+\left(
+|\Re\{\widetilde{x}_m(n)\}|,
+|\Im\{\widetilde{x}_m(n)\}|
+\right).
+```
+
+公开数字缩放与整数码为：
+
+```math
+a_{\mathrm{d},m}
+=
+\frac{A_{\mathrm{FS}}10^{-H_{\mathrm{d}}/20}}{c_m},
+\qquad
+q_m(n)=Q_W\{a_{\mathrm{d},m}\widetilde{x}_m(n)\}.
+```
+
+默认 `calibrationDigitalHeadroomDb=6.0`，因此公开波形的最大I或Q分量约为满量程的：
+
+```math
+10^{-6/20}\approx 0.5012.
+```
+
+量化后重新测量解码波形 $D_W\{q_m\}$ 的有效区RMS，记为 $r_{q,m}$。若闭环当前需要的总drive为 $d_{\mathrm{total},m}$ dB，则隐藏模拟drive为：
+
+```math
+d_{\mathrm{analog},m}
+=
+d_{\mathrm{total},m}
+-20\log_{10}(r_{q,m}).
+```
+
+进入Tx I/Q模块之前的内部波形为：
+
+```math
+x_{\mathrm{drive},m}(n)
+=
+10^{d_{\mathrm{analog},m}/20}
+D_W\{q_m(n)\}.
+```
+
+这种分配把量化后的真实RMS也计入模拟drive，避免因为取整产生系统性功率偏差。数字余量仅决定公开码离满量程有多远；它不是PA输出回退，也不会降低用户请求的目标输出功率。余量增大可降低后续数字削顶风险，但会减少有效码字并提高量化噪声；默认6 dB是在峰值余量和定点精度之间的通用起点。
+
+归一化PA输出有效区RMS为 $r_y$ 时，功率定义为：
+
+```math
+P_{\mathrm{out,dBm}}
+=
+P_{\mathrm{max,dBm}}
++20\log_{10}(r_y).
+```
+
+这里的 $P_{\mathrm{max,dBm}}$ 就是 `maximumOutputPowerDbm`。默认值 `25.0` 表示内置PA在额定归一化输出RMS等于1时为25 dBm，而20 dBm对应：
+
+```math
+r_y
+=
+10^{(20-25)/20}
+\approx
+0.5623.
+```
+
+所以 `20 dBm <= 25 dBm` 对默认GMP等内置drive-aware plant必须可达，不能因为公开定点码已经饱和而误报不可达。真正的不可达情况包括目标高于额定上限、第三方plant没有模拟drive接口且数字码已到满量程，以及用户自定义PA参数使响应不覆盖目标或出现无法求解的非单调区。
+
+一次 `Channel.Process(rawSignal, outputPowerDbm=target)` 的完整顺序为：
+
+1. 校验目标、位宽、数字余量、迭代参数和逐链维度；任何目标都不得高于 `maximumOutputPowerDbm`。
+2. `PowerCalibration.Calibrate` 调用Channel的热事务代理，保存PA温度、热时间、互热offset和热metrics，并在全部校准试探期间暂停温度演化与温度电参数漂移。
+3. 只用原始输入的有效突发样点计算逐链RMS，排除前后补零和超过容差的长静默区。
+4. 把每路原始波形归一化到有效区单位RMS，并用目标相对额定上限的功率回退作为总drive初值。
+5. 浮点模式直接把总drive乘入公开波形；定点模式生成带数字余量的合法整数码，并按量化后的真实RMS计算隐藏模拟drive。
+6. 公开波形进入Channel后先解码，再经过逐链模拟drive、Tx I/Q不平衡和DC、PA前耦合，最后进入各路非线性PA。
+7. 仅在每个PA自身输出、PA后耦合之前测量有效区功率；公共移相、forward/fb接收链和白噪声都不进入校准误差。
+8. 未包围目标时使用有界dB比例更新，形成上下界后使用二分；存在PA前耦合且启用联合校准时使用有限差分Jacobian更新所有链。
+9. 全部链进入 `calibrationToleranceDb` 后才原子提交逐链模拟drive，并缓存公开输入、干净PA输出和成功metrics。
+10. `finally` 恢复校准前的完整热状态，再用已接受的公开输入与drive正式处理一次；这一次会推进温度，并继续经过PA后耦合、公共相位、所选采样支路和噪声。若校准期间活动配置已经关闭温度，恢复不会复活旧启用快照。
+11. 若闭环失败，不提交候选drive；异常与失败metrics保留目标、历史最佳测量、误差、轮数和原因，供用户定位真实不可达或第三方接口限制。
 
 ## 2. 固定相位旋转
 
@@ -693,7 +826,7 @@ SISO只有一个噪声RMS；MIMO对每一列独立计算 $x_{\mathrm{rms},m}$，
 
 ### 3.5 物理电压到归一化波形
 
-工程规定PA归一化输出RMS等于1时，对应 `maximumOutputPowerDbm`。满量程物理RMS电压为：
+工程把PA归一化输出RMS等于1定义为额定输出上限 `maximumOutputPowerDbm`。对应的额定物理RMS电压为：
 
 ```math
 V_{\mathrm{FS,rms}}
@@ -824,11 +957,29 @@ v_{\mathrm{iq}}(n)
 \alpha v(n)+\beta v^*(n)+d.
 ```
 
-其中 $\alpha$ 是直接分量系数，$\beta$ 是镜像分量系数。最后一项 $d$ 是该模块自身的复直流偏置。代码中的 `ResolveIqImbalanceCoefficients` 负责把增益误差与正交误差换算成 $\alpha$ 和 $\beta$，Tx与FB模块复用这套数学关系，但不共用参数值或参考面。
+其中 $\alpha$ 是直接分量系数，$\beta$ 是镜像分量系数。最后一项 $d$ 是该模块自身的复直流偏置。代码中的 `ResolveIqImbalanceCoefficients` 负责把增益误差与正交误差换算成 $\alpha$ 和 $\beta$，Tx与FB模块复用这套数学关系，但不共用参数值、开关或参考面。
+
+为表示硬开关，令 $s_{\mathrm{tx}}$ 与 $s_{\mathrm{fb}}$ 在启用时等于1、关闭时等于0。任意一处I/Q模块都可以统一写为：
+
+```math
+v_{\mathrm{out}}(n)
+=
+(1-s)v_{\mathrm{in}}(n)
++
+s\left[
+\alpha v_{\mathrm{in}}(n)
++
+\beta v_{\mathrm{in}}^*(n)
++
+d
+\right].
+```
+
+因此 $s=0$ 时严格得到 $v_{\mathrm{out}}(n)=v_{\mathrm{in}}(n)$。它不是只把 $\beta$ 清零：直接系数偏差和DC项也一起消失。这使用户可以保留一套实测的增益、相位和DC参数，仅用布尔开关做理想/非理想对照。
 
 #### 4.4.2 Tx I/Q调制器
 
-Tx参数为 `txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees` 和 `txDcOffset`。它们位于PA之前：
+Tx参数为 `txIqImbalanceEnabled`、`txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees` 和 `txDcOffset`。开关为True时，后三项位于PA之前：
 
 ```math
 x_{\mathrm{tx}}(n)
@@ -840,11 +991,11 @@ x_{\mathrm{tx}}(n)
 d_{\mathrm{tx}}.
 ```
 
-因此Tx镜像不只是观测误差，还会进入PA非线性。即使PA模型本身只含直接基函数，级联后也可能出现与 $x^*$、$x|x|^2$ 和 $x^*|x|^2$ 有关的混合失真。forward与fb两种采样都会看到这个物理影响。
+因此Tx镜像不只是观测误差，还会进入PA非线性。即使PA模型本身只含直接基函数，级联后也可能出现与 $x^*$、$x|x|^2$ 和 $x^*|x|^2$ 有关的混合失真。forward与fb两种采样都会看到这个物理影响。`txIqImbalanceEnabled=False` 时则令 $s_{\mathrm{tx}}=0$，PA直接接收该模块入口波形，Tx增益、相位和DC全部不添加。
 
 #### 4.4.3 FB I/Q解调器
 
-FB参数为 `fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees` 和 `fbDcOffset`。它们只在 `sampleMode="fb"` 时应用：
+FB参数为 `fbIqImbalanceEnabled`、`fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees` 和 `fbDcOffset`。它们只在 `sampleMode="fb"` 且开关为True时应用：
 
 ```math
 v_{\mathrm{fb,iq}}(n)
@@ -856,7 +1007,7 @@ v_{\mathrm{fb,iq}}(n)
 d_{\mathrm{fb}}.
 ```
 
-FB镜像不会改变PA或forward参考面的真实输出。训练前应校准或去嵌入它，不能让DPD把FB接收机误差写进发射波形。两处非零I/Q误差都会形成共轭镜像，不能只靠公共复增益完全去除。
+FB镜像不会改变PA或forward参考面的真实输出。训练前应校准或去嵌入它，不能让DPD把FB接收机误差写进发射波形。两处非零I/Q误差都会形成共轭镜像，不能只靠公共复增益完全去除。`fbIqImbalanceEnabled=False` 时令 $s_{\mathrm{fb}}=0$，FB增益、相位和DC全部不添加，但同一fb支路中的FIR、时频偏、非线性、噪声和ADC配置仍照常处理。
 
 ### 4.5 反馈ADC
 
@@ -920,19 +1071,29 @@ A_{\mathrm{FS}}\frac{q}{2^{W-1}}.
 
 ```mermaid
 flowchart LR
-    input["公开数字Tx输入"] --> calibration["输出功率闭环"]
-    calibration --> txIq["Tx I/Q调制器<br/>txIq... / txDcOffset"]
+    input["公开数字Tx输入"] --> decode["公开边界解码"]
+    target["outputPowerDbm"] --> calibration["输出功率闭环"]
+    calibration --> analogDrive["隐藏逐链模拟drive<br/>calibrationDigitalHeadroomDb"]
+    decode --> analogDrive
+    analogDrive --> txIqEnable{"txIqImbalanceEnabled"}
+    txIqEnable -->|True| txIq["Tx I/Q调制器<br/>txIq... / txDcOffset"]
+    txIqEnable -->|False| txIqBypass["Tx I/Q整级旁路"]
     txIq --> pre["PA前耦合<br/>prePaCouplingPaths"]
-    pre --> pa["逐路PA"]
-    pa --> post["PA后耦合<br/>postPaCouplingPaths"]
+    txIqBypass --> pre
+    pre --> pa["逐路PA电模型"]
+    pa --> thermal["周期热调度<br/>thermalRunMode / thermalDutyCycle"]
+    thermal --> post["PA后耦合<br/>postPaCouplingPaths"]
     post --> phase["公共移相<br/>phaseDegrees"]
     phase --> mode{"sampleMode"}
     mode -->|forward| forwardNoise["前向仪表与互斥噪声配置"]
     mode -->|fb| fbLinear["FB增益/相位/FIR"]
     fbLinear --> fbNonlinear["FB三阶非线性与限幅"]
     fbNonlinear --> fbSync["FB Delay/CFO/SFO"]
-    fbSync --> fbIq["FB I/Q解调器<br/>fbIq... / fbDcOffset"]
+    fbSync --> fbIqEnable{"fbIqImbalanceEnabled"}
+    fbIqEnable -->|True| fbIq["FB I/Q解调器<br/>fbIq... / fbDcOffset"]
+    fbIqEnable -->|False| fbIqBypass["FB I/Q整级旁路"]
     fbIq --> fbNoise["互斥噪声配置"]
+    fbIqBypass --> fbNoise
     fbNoise --> fbAdc["FB ADC"]
     forwardNoise --> output["公开接收波形"]
     fbAdc --> output
@@ -940,25 +1101,27 @@ flowchart LR
 
 图示说明：
 
-- 主信号从左向右依次经过功率校准、Tx I/Q调制器、PA前耦合、逐路PA、PA后耦合和公共固定移相。
-- Tx I/Q位于PA之前，因此forward与fb都包含它；FB I/Q位于采样分支内部，只改变fb观测。
+- 主信号从左向右依次经过公开边界解码、已提交的逐链模拟drive、Tx I/Q调制器、PA前耦合、逐路PA、PA后耦合和公共固定移相。功率闭环负责寻找并提交drive，不是一个PA输出后的缩放模块。
+- Tx I/Q位于PA之前，因此启用时forward与fb都包含它；FB I/Q位于采样分支内部，启用时只改变fb观测。两个enabled开关分别旁路自己的完整增益/相位/DC模块，互不联动。
 - `sampleMode="forward"` 在公共移相后进入仪表前向采样支路，不经过任何 `fb...` 参数。
 - `sampleMode="fb"` 才会继续经过反馈增益/FIR、非线性/限幅、时延/CFO/SFO、I/Q 不平衡/DC 和反馈 ADC。
 - 三种白噪声配置位于所选采样支路的末端，因此它们描述接收或采样噪声，而不是 PA 本身的非线性。
-- `width` 只定义公开输入输出的整数码位宽；图中所有物理模块仍在内部浮点域计算。
+- `width` 只定义公开输入输出的整数码位宽；图中模拟drive及所有物理模块仍在内部浮点域计算。
+- `calibrationDigitalHeadroomDb` 只配置定点公开码的分量峰值余量；闭环自动把剩余总drive放在解码后的逐链模拟增益中。
 - 功率校准参数控制“如何寻找 PA 输入预设值”，不会改变 PA、耦合网络或反馈接收机的物理模型。
+- 周期热调度在PA电模型和PA后耦合之间计算温度依赖的幅度、相位、饱和与非线性漂移。数据窗内静默样点和自动外部空闲都更新热状态，但外部空闲不改变公开输出长度。
 
 ### 5.2 参数与可观测现象的对应关系
 
 ```mermaid
 flowchart TB
     subgraph transmitter["发射与PA模块"]
-        txIq["Tx I/Q参数"] --> txObs["forward与fb共同镜像<br/>PA激励和级联非线性改变"]
+        txIq["Tx I/Q enabled与误差参数"] --> txObs["True：forward与fb共同镜像<br/>False：增益/相位/DC均不添加"]
         coupling["PA前后耦合参数"] --> couplingObs["非对角频响<br/>幅相纹波与群时延"]
     end
     subgraph feedback["FB接收模块"]
         fbSync["FB线性与同步参数"] --> syncObs["fb幅相、时延、CFO、SFO"]
-        fbIq["FB I/Q参数"] --> fbIqObs["仅fb镜像与星座中心偏移"]
+        fbIq["FB I/Q enabled与误差参数"] --> fbIqObs["True：仅fb镜像与中心偏移<br/>False：整级旁路"]
         fbNonlinear["FB非线性与ADC参数"] --> fbNonlinearObs["fb压缩、削顶与量化台阶"]
     end
     subgraph measurement["测量与求解模块"]
@@ -974,12 +1137,13 @@ flowchart TB
 |---|---|---|
 | A | `sourceChain`、`destinationChain`、`gainDb`、`firTaps` | 耦合方向、耦合幅度、带内纹波和陷波 |
 | B | 耦合路径 `phaseDegrees`、`integerDelaySamples`、`fractionalDelaySamples` | 中心相位和随频率变化的相位斜率 |
-| C-Tx | `txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees`、`txDcOffset` | PA前星座椭圆化与镜像；同时影响forward、fb和PA非线性 |
-| C-FB | `fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees`、`fbDcOffset` | 仅fb观测端的星座椭圆化、共轭镜像和中心偏移 |
+| C-Tx | `txIqImbalanceEnabled`、`txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees`、`txDcOffset` | True时产生PA前星座椭圆化、镜像与DC并同时影响forward、fb和PA非线性；False时整级旁路 |
+| C-FB | `fbIqImbalanceEnabled`、`fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees`、`fbDcOffset` | True时只在fb观测端产生星座椭圆化、共轭镜像和中心偏移；False时整级旁路 |
 | D | `fbThirdOrderCoefficient`、`fbClipAmplitude`、`fbAdcWidth`、`fbAdcFullScale` | AM/AM 弯曲、硬限幅和量化台阶 |
 | E | 反馈时延、CFO、SFO 和 `sampleRateHz` | 波形横向平移、逐样点相位旋转和时间轴伸缩 |
 | F | 有效突发检测与三种噪声配置 | 功率统计窗口、噪声底、SNR 和 EVM |
 | G | 目标功率与校准求解参数 | 输出功率收敛速度、稳态误差和 MIMO 联合收敛性 |
+| H | `thermalRunMode`、`thermalDutyCycle`、稳态容差与迭代上限 | 周期首/数据尾/周期尾温度、自动空闲冷却和收敛诊断 |
 
 ### 5.3 调参方向与物理含义
 
@@ -994,7 +1158,8 @@ flowchart TB
 | `firTaps` | 决定频率选择性、记忆长度、纹波和可能的陷波 | 不能只用一个中心增益概括 |
 | `sourceChain` / `destinationChain` | 改变泄漏的方向和 MIMO 拓扑 | 它们不表示耦合强度 |
 | 公共 `phaseDegrees` | 所选观测信号整体旋转 `-90`、`0` 或 `90` 度 | 不改变功率、噪声或非线性 |
-| `txIqGainImbalanceDb` | PA前I/Q两轴尺度差增大，Tx镜像和PA级联互调增强 | 不是反馈接收机误差 |
+| `txIqImbalanceEnabled` | True执行Tx增益/相位/DC，False让输入原样进入PA前耦合 | 不会关闭FB I/Q、耦合或PA |
+| `txIqGainImbalanceDb` | PA前I/Q两轴尺度差增大，Tx镜像和PA级联互调增强 | 开关为False时该值被保留但不生效 |
 | `txIqPhaseImbalanceDegrees` | PA前正交误差增大，Tx镜像增强 | 不是公共相位旋转 |
 | `txDcOffset` | PA输入出现复直流偏置并可能改变PA工作点 | 不会被forward模式跳过 |
 | `fbGainDb` | 反馈链路整体幅度变化 | 不等于 PA 增益变化 |
@@ -1004,7 +1169,8 @@ flowchart TB
 | `fbFractionalDelaySamples` | 增加分数样点时延 | 不等于 SFO |
 | `fbCarrierFrequencyOffsetHz` | 每个样点累积相位，星座随时间旋转 | 不只是一个固定相位 |
 | `fbSamplingFrequencyOffsetPpm` | 反馈时间轴逐渐伸缩，帧越长累计偏差越大 | 不只是一个固定延迟 |
-| `fbIqGainImbalanceDb` | I/Q 两轴尺度不一致，镜像泄漏增强 | 不是公共复增益 |
+| `fbIqImbalanceEnabled` | True执行FB增益/相位/DC，False让时频偏后的波形原样进入后续噪声/ADC | 不会关闭Tx I/Q或其他FB非理想 |
+| `fbIqGainImbalanceDb` | I/Q 两轴尺度不一致，镜像泄漏增强 | 开关为False时该值被保留但不生效 |
 | `fbIqPhaseImbalanceDegrees` | I/Q 正交性变差，星座倾斜并产生镜像 | 不是公共相位旋转 |
 | `fbDcOffset` | 星座中心平移并在零频出现直流分量 | 不会随信号幅度同比缩放 |
 | `fbThirdOrderCoefficient` | 反馈接收机三阶弯曲和互调增强 | 不应被训练器误认为 PA 三阶项 |
@@ -1016,14 +1182,18 @@ flowchart TB
 | `noiseSnrDb` | 数值增大时添加的噪声减小，EVM 通常改善 | 它不是噪声功率本身 |
 | `randomSeed` | 只改变或复现噪声样本实现 | 不改变理论噪声方差 |
 | `sampleRateHz` | 改变 Hz、ppm、秒与样点之间的换算 | 不会自动改变 PA 或耦合增益 |
+| `thermalDutyCycle` | 数值减小时数据窗后自动空闲变长，周期平均耗散和稳态温度通常下降 | 不会删除数据窗内部静默，也不会给返回数组追加零 |
+| `thermalSteadyStateToleranceC` | 数值增大时更易提前停止，但允许更大周期支路温度闭合误差 | 不是测温仪精度 |
+| `maximumThermalSteadyStateIterations` | 增大时允许温度依赖热源和MIMO互热进行更多固定点迭代 | 不保证非物理参数一定收敛 |
 | `activePowerThresholdDb` | 阈值升高时有效功率统计更集中在突发高幅区 | 不是接收机检测灵敏度模型 |
 | `activeGapToleranceSamples` | 数值增大时会闭合更长的突发内部低幅间隙 | 不会补回真实缺失样点 |
 | `loadResistanceOhm` | 改变电压、瓦特和 dBm 的换算关系 | 不改变归一化样本本身 |
-| `maximumOutputPowerDbm` | 改变归一化 PA 输出 RMS 等于 1 时代表的物理功率 | 不是每次调用的目标功率 |
+| `maximumOutputPowerDbm` | 定义归一化PA输出RMS等于1时的额定输出上限；内置plant据此覆盖不高于上限的目标 | 不是可随意抬高以掩盖不可达问题的显示标尺 |
 | `calibrationToleranceDb` | 数值增大时更容易提前停止，但允许更大功率误差 | 不改变目标值 |
 | `maximumCalibrationIterations` | 数值增大时允许更多闭环尝试 | 不保证病态耦合下一定收敛 |
 | `calibrationLearningRate` | 数值增大时单轮校正更激进 | 过大可能来回振荡 |
-| `maximumDriveAdjustmentDb` | 数值增大时单轮允许更大的驱动修正 | 不会提高 PA 的物理饱和功率 |
+| `maximumDriveAdjustmentDb` | 数值增大时单轮允许更大的总drive修正 | 不会提高 PA 的物理饱和功率 |
+| `calibrationDigitalHeadroomDb` | 数值增大时公开定点码峰值降低、隐藏模拟drive相应增大 | 不是PA输出回退，也不会改变目标dBm |
 | `jointPowerCalibration` | 在 MIMO 耦合下选择联合或逐链求解策略 | 它不是耦合开关 |
 | `calibrationProbeStepDb` | 增大时 Jacobian 探测更明显，但局部线性近似变粗 | 不是实际输出功率步进 |
 | `calibrationRegularization` | 增大时联合求解更稳定、更新更保守 | 过大可能留下功率偏差 |
@@ -1055,22 +1225,37 @@ Channel(
 | `phaseDegrees` | `0` | degree | PA输出后的公共移相，仅允许 `-90`、`0`、`90` |
 | `width` | `16` | bit/I或Q | `0`为浮点；正整数为公开边界有符号I/Q码位宽 |
 
+#### 6.1.1 周期热运行参数
+
+以下参数属于Channel调度器，只在绑定PA启用热模型时改变结果。它们不放入 `ThermalConfig`，因为“同一PA如何按周期发射”是系统场景，不是器件本身的热参数。
+
+| 参数 | 默认值 | 允许值 | 物理含义 |
+|---|---:|---|---|
+| `thermalRunMode` | `"steady_state"` | `"steady_state"` 或 `"transient"` | 直接解周期稳态，或从当前实时热状态推进一周期 |
+| `thermalDutyCycle` | `1.0` | 有限实数 `(0, 1]` | 整个输入数据窗时长占完整周期时长的比例；不扣除窗内静默 |
+| `thermalSteadyStateToleranceC` | `1e-4` | 有限正实数 | 各RC支路周期末与周期初温升的允许闭合误差，单位摄氏度 |
+| `maximumThermalSteadyStateIterations` | `100` | 正整数 | 温度相关耗散功率及MIMO互热外层固定点的最大求解次数 |
+
+这四个参数的时域定义、稳态方程、查询方法和metrics表见第10节。
+
 ### 6.2 Tx I/Q调制器模块
 
-这三个参数位于PA之前，对forward和fb两种采样模式都生效，并纳入功率校准的真实plant。
+这四个参数定义PA之前的Tx I/Q模块。默认开关为True以保持历史行为；开启时后三项对forward和fb两种采样模式都生效，并纳入功率校准的真实plant。
 
 | 参数 | 默认值 | 单位 | 说明 |
 |---|---:|---|---|
+| `txIqImbalanceEnabled` | `True` | boolean | Tx I/Q硬开关；False时增益误差、相位误差和DC整级旁路 |
 | `txIqGainImbalanceDb` | `0.0` | dB | Tx调制器I/Q增益比误差；0为理想 |
 | `txIqPhaseImbalanceDegrees` | `0.0` | degree | Tx调制器相对理想90度正交的相位误差 |
 | `txDcOffset` | `0+0j` | normalized | Tx复直流或LO泄漏项；在PA前加入 |
 
 #### 6.2.1 Tx I/Q参数的生效条件
 
-- `Process(...)` 和内部功率校准都会应用Tx I/Q模块。
-- `sampleMode="forward"` 与 `sampleMode="fb"` 都不会跳过Tx I/Q。
+- `txIqImbalanceEnabled=True` 时，`Process(...)` 和内部功率校准都会应用Tx I/Q模块。
+- `txIqImbalanceEnabled=False` 时，`ApplyTransmitterIqImbalance` 返回数值相同的复数副本；非零增益、相位和DC配置均不添加，功率校准也看到旁路后的plant。
+- 开关为True时，`sampleMode="forward"` 与 `sampleMode="fb"` 都不会跳过Tx I/Q。
 - `ProcessPaOutput(...)` 的输入已被定义为PA输出，因此不会再次应用Tx I/Q。
-- 当前三个Tx I/Q参数是所有链共用的标量；多链独立Tx误差需要分别构造Channel，或后续扩展为逐链参数序列。
+- 当前开关和三个Tx I/Q误差参数是所有链共用的标量；多链独立Tx误差需要分别构造Channel，或后续扩展为逐链参数序列。
 
 ### 6.3 PA前后耦合模块
 
@@ -1111,19 +1296,22 @@ Channel(
 
 ### 6.5 FB I/Q解调器模块
 
-这三个参数只污染板载反馈观测，不改变forward仪表看到的真实PA输出。
+这四个参数定义板载反馈I/Q模块，不改变forward仪表看到的真实PA输出。默认开关为True以保持历史行为。
 
 | 参数 | 默认值 | 单位 | 说明 |
 |---|---:|---|---|
+| `fbIqImbalanceEnabled` | `True` | boolean | FB I/Q硬开关；False时增益误差、相位误差和DC整级旁路 |
 | `fbIqGainImbalanceDb` | `0.0` | dB | FB接收机I/Q增益比误差 |
 | `fbIqPhaseImbalanceDegrees` | `0.0` | degree | FB接收机相对理想90度正交的相位误差 |
 | `fbDcOffset` | `0+0j` | normalized | FB接收机复直流偏置 |
 
 #### 6.5.1 FB I/Q参数的生效条件
 
-- 只有 `sampleMode="fb"` 才应用FB I/Q模块。
-- `sampleMode="forward"` 会完整忽略三个FB I/Q参数，即使它们被设置为非零。
-- 当前三个FB I/Q参数是所有反馈链共用的标量；它们不参与PA输出功率校准。
+- 只有 `sampleMode="fb"` 且 `fbIqImbalanceEnabled=True` 才应用FB I/Q模块。
+- `fbIqImbalanceEnabled=False` 时，`ApplyFeedbackIqImbalance` 返回数值相同的复数副本；非零增益、相位和DC配置均不添加，其他FB模块不受影响。
+- `sampleMode="forward"` 会完整忽略四个FB I/Q参数，即使开关为True且误差值非零。
+- 当前开关和三个FB I/Q误差参数是所有反馈链共用的标量；它们不参与PA输出功率校准。
+- `txIqImbalanceEnabled` 与 `fbIqImbalanceEnabled` 相互独立；关闭一个不会改变另一个的行为。
 - DPD若使用fb采样训练，应先去嵌入FB镜像；最终EVM与IRR应在forward参考面复测。
 
 ### 6.6 FB非线性与ADC模块
@@ -1151,11 +1339,12 @@ Channel(
 | 参数 | 默认值 | 单位 | 说明 |
 |---|---:|---|---|
 | `loadResistanceOhm` | `50.0` | Ω | dBm与RMS电压换算阻抗 |
-| `maximumOutputPowerDbm` | `25.0` | dBm | 归一化PA输出RMS等于1所代表的功率 |
+| `maximumOutputPowerDbm` | `25.0` | dBm | 内置PA的额定输出上限；归一化PA输出有效区RMS等于1时对应此功率 |
 | `calibrationToleranceDb` | `0.25` | dB | 内部闭环允许的最大PA输出功率误差 |
 | `maximumCalibrationIterations` | `60` | 次 | 内部闭环最多运行PA的次数 |
 | `calibrationLearningRate` | `0.8` | 无 | 未括住目标时的dB域修正比例 |
-| `maximumDriveAdjustmentDb` | `6.0` | dB/次 | 单轮Tx数字输入预设最大调整量 |
+| `maximumDriveAdjustmentDb` | `6.0` | dB/次 | 单轮总drive预设最大调整量 |
+| `calibrationDigitalHeadroomDb` | `6.0` | dB | 定点校准公开I/Q分量峰值相对数字满量程的余量；总体范围 `[0, 60]`，低位宽还须满足至少保留一个非零峰值码，校准入口会报告准确上限 |
 | `jointPowerCalibration` | `None` | 无 | `None`按PA前耦合自动选择；布尔值强制联合或逐链校准 |
 | `calibrationProbeStepDb` | `0.05` | dB | 联合校准估计功率Jacobian的逐路扰动 |
 | `calibrationRegularization` | `1e-6` | 无 | 联合校准正规方程的正则化系数 |
@@ -1222,6 +1411,8 @@ channel = Channel(
 
 #### 6.9.1 Tx与FB I/Q参数如何影响IRR
 
+先判断各自硬开关，再解释误差数值。`txIqImbalanceEnabled=False` 或 `fbIqImbalanceEnabled=False` 时，对应模块严格采用单位映射；该模块的增益、相位和DC数值不会进入波形，因此也不应根据下表预测IRR。两个开关默认均为True，且彼此独立。开关为True时才使用下面的系数关系。
+
 增益误差 $g$ 和正交误差 $\phi$ 先变成直接系数 $\alpha$ 与镜像系数 $\beta$。当误差较小时：
 
 ```math
@@ -1262,6 +1453,7 @@ j\frac{\phi}{2},
 
 - `txIq...` 在PA之前，镜像继续进入PA并产生共轭非线性级联；数值增大时，forward和fb的IRR、EVM都可能变差。
 - `fbIq...` 在PA之后，只污染fb观测；数值增大时，forward不变而fb的IRR、EVM变差。
+- disabled开关并不清除已保存的非零数值，只在处理与系数查询时使该级采用 $\alpha=1$、$\beta=0$ 且 $d=0$。重新置True会恢复这些参数的物理作用。
 
 直流参数的影响由它相对有效信号RMS的比例决定：
 
@@ -1450,7 +1642,7 @@ R
 }.
 ```
 
-`noiseAmpMv=10` 直接表示复噪声总RMS为10 mV；I与Q各自的RMS为 $10/\sqrt{2}$ mV。相同的毫伏数在不同 `maximumOutputPowerDbm` 标尺下对应不同归一化噪声幅度，所以只有在端口阻抗和满量程功率都匹配时才能跨工程复用。
+`noiseAmpMv=10` 直接表示复噪声总RMS为10 mV；I与Q各自的RMS为 $10/\sqrt{2}$ mV。相同的毫伏数在不同 `maximumOutputPowerDbm` 额定功率参考下对应不同归一化噪声幅度，所以只有在端口阻抗和额定功率都匹配时才能跨工程复用。
 
 当EVM主要受白噪声限制时：
 
@@ -1472,7 +1664,7 @@ R
 
 #### 6.9.6 功率校准参数如何改变收敛
 
-未形成上下界时，单路驱动更新近似为：
+闭环首先形成逐链总drive $d_k$。浮点模式把总drive放入公开波形；定点且plant支持模拟drive接口时，公开整数码保持 `calibrationDigitalHeadroomDb` 指定的数字余量，总drive的剩余部分在解码后施加。未形成上下界时，单路总drive更新近似为：
 
 ```math
 \Delta d_k
@@ -1506,12 +1698,13 @@ P_{\mathrm{target}}-P_k
 | 参数 | 推荐起点 | 数值增大后的影响 |
 |---|---:|---|
 | `loadResistanceOhm` | 使用端口实值，射频系统通常50 Ω | 同样电压被换算为更小功率；不是调优旋钮 |
-| `maximumOutputPowerDbm` | 使用PA模型满量程对应功率，当前默认25 dBm | 同样归一化RMS代表更高物理功率 |
+| `maximumOutputPowerDbm` | 使用PA的额定输出上限，内置模型默认25 dBm | 同样归一化输出RMS代表更高物理功率；不能通过虚增该值解决校准失败 |
 | `outputPowerDbm`调用参数 | 通常比极限低3至8 dB；0至3 dB回退用于压缩压力测试 | 越接近极限，压缩、EVM和校准难度通常越大 |
 | `calibrationToleranceDb` | `0.1...0.25 dB` | 更容易提前停止，但稳态功率误差允许更大 |
 | `maximumCalibrationIterations` | `40...80`，默认60 | 只增加最大尝试次数，不保证病态场景收敛 |
 | `calibrationLearningRate` | `0.5...0.8`；强耦合可降到 `0.3...0.5` | 更新更快，但过大可能振荡或跨过局部单调区 |
 | `maximumDriveAdjustmentDb` | `3...6 dB`；近饱和可收紧到 `1...3 dB` | 单步更激进，过大可能跳入深压缩区 |
+| `calibrationDigitalHeadroomDb` | 默认 `6 dB`；通常从 `3...9 dB` 调整 | 公开码离削顶更远、所需模拟drive更高，但低位宽下可用码减少、量化误差增大 |
 | `jointPowerCalibration` | `None` | 自动在存在PA前耦合时启用联合求解 |
 | `calibrationProbeStepDb` | `0.03...0.1 dB`，默认0.05 dB | 探测信号更明显，但局部线性近似变粗 |
 | `calibrationRegularization` | 良态时 `1e-6`；病态时尝试 `1e-4...1e-2` | 联合解更稳定、更保守，但过大会留下功率误差 |
@@ -1529,6 +1722,44 @@ P_{\mathrm{peak}}
 
 因此 `activePowerThresholdDb=-60` 表示保留功率高于峰值百万分之一的样点，而不是接收机灵敏度为 -60 dBm。
 
+##### 收敛失败怎样诊断
+
+校准失败不再只报告“60轮未收敛”。异常信息会同时给出目标功率、历史最佳实测功率、最佳绝对误差、实际迭代次数和失败原因。失败后仍可调用 `GetLastCalibrationMetrics()` 读取最佳试探结果：
+
+| 字典键 | 成功时 | 失败时 |
+|---|---|---|
+| `targetOutputPowerDbmPerChain` | 已接受的逐链目标 | 本次失败请求的逐链目标 |
+| `measuredOutputPowerDbmPerChain` | 收敛试探的逐链功率 | 历史最佳试探的逐链功率 |
+| `errorDbPerChain` | 目标减去收敛实测值 | 目标减去历史最佳实测值 |
+| `iterationCount` | 收敛所用轮数 | 失败前实际完成的轮数 |
+| `converged` | `True` | `False` |
+| `analogDriveDbPerChain` | 成对trial/commit协议的已提交逐链模拟drive；浮点路径为0 dB；旧式适配器无此键 | 成对协议的历史最佳试探模拟drive；浮点路径为0 dB；旧式适配器无此键 |
+| `failureReason` | 不存在 | 可达范围、非单调响应或定点接口限制的说明 |
+
+```python
+try:
+    receivedSignal = channel.Process(
+        rawSignal,
+        outputPowerDbm=20.0,
+    )
+except RuntimeError as error:
+    # The exception contains target, best measurement, error, and reason.
+    print(error)
+    failureMetrics = channel.GetLastCalibrationMetrics()
+    assert failureMetrics["converged"] is False
+    print(failureMetrics["measuredOutputPowerDbmPerChain"])
+    print(failureMetrics["failureReason"])
+```
+
+典型判断顺序如下：
+
+1. 先确认 `outputPowerDbm <= maximumOutputPowerDbm`。超过额定上限属于配置错误，不应开始闭环。
+2. 若使用内置Rapp、Wiener、GMP、Doherty或内置MIMO plant，正位宽路径会自动使用解码后的模拟drive。默认上限25 dBm时，20 dBm属于必须覆盖的正常目标；出现不可达提示应视为实现或自定义参数问题，而不是通过增大 `maximumOutputPowerDbm` 绕过。
+3. 第三方PA通过Channel使用时，应提供 `ProcessFloating(inputSignal)`，让Channel在公开码解码并施加模拟drive后直接送入物理PA模型；若只有定点 `Process`，中间再次编码可能重新削顶。第三方对象若直接绑定 `PowerCalibration`，则应提供配对的 `ProcessCalibrationDrive(inputSignal, driveDbPerChain)` 与 `SetCalibrationDriveDb(driveDbPerChain)`。缺少drive-aware接口时只能沿用全数字调节；连续多轮产生相同满量程公开码后会报告数字饱和或在迭代上限给出最佳实测值。
+4. 若数字码仍在变化但最佳功率不再接近目标，检查自定义PA的AM/AM曲线、目标附近是否单调、PA前耦合Jacobian是否病态，以及每路目标是否都落在真实覆盖范围内。单纯增加 `maximumCalibrationIterations` 通常不能修复这些物理或接口问题。
+
+失败metrics用于诊断，不代表接受了该试探工作点。`GetLastPaInput()` 与 `GetLastPaOutput()`仍只返回成功收敛的公开输入和干净PA输出；一次新的失败校准不会把历史成功波形伪装成本次结果。
+
 #### 6.9.7 三套可直接使用的仿真起点
 
 下面三套配置用于算法归因，不代表硬件统一规格。`sampleRateHz`、ADC满量程和功率相关值仍应按实际波形修改。
@@ -1537,6 +1768,7 @@ P_{\mathrm{peak}}
 idealChannelParameters = {
     "sampleMode": "forward",
     "sampleRateHz": 80.0e6,
+    "txIqImbalanceEnabled": True,
     "txIqGainImbalanceDb": 0.0,
     "txIqPhaseImbalanceDegrees": 0.0,
     "txDcOffset": 0.0 + 0.0j,
@@ -1547,6 +1779,7 @@ idealChannelParameters = {
 typicalFeedbackParameters = {
     "sampleMode": "fb",
     "sampleRateHz": 80.0e6,
+    "txIqImbalanceEnabled": True,
     "txIqGainImbalanceDb": 0.3,
     "txIqPhaseImbalanceDegrees": 2.0,
     "txDcOffset": 0.001 + 0.001j,
@@ -1554,6 +1787,7 @@ typicalFeedbackParameters = {
     "fbFractionalDelaySamples": 0.2,
     "fbCarrierFrequencyOffsetHz": 500.0,
     "fbSamplingFrequencyOffsetPpm": 5.0,
+    "fbIqImbalanceEnabled": True,
     "fbIqGainImbalanceDb": 0.3,
     "fbIqPhaseImbalanceDegrees": 2.0,
     "fbDcOffset": 0.002 - 0.001j,
@@ -1567,6 +1801,7 @@ typicalFeedbackParameters = {
 stressFeedbackParameters = {
     "sampleMode": "fb",
     "sampleRateHz": 80.0e6,
+    "txIqImbalanceEnabled": True,
     "txIqGainImbalanceDb": 1.0,
     "txIqPhaseImbalanceDegrees": 5.0,
     "txDcOffset": 0.01 + 0.005j,
@@ -1574,6 +1809,7 @@ stressFeedbackParameters = {
     "fbFractionalDelaySamples": 0.3,
     "fbCarrierFrequencyOffsetHz": 5000.0,
     "fbSamplingFrequencyOffsetPpm": 50.0,
+    "fbIqImbalanceEnabled": True,
     "fbIqGainImbalanceDb": 1.0,
     "fbIqPhaseImbalanceDegrees": 5.0,
     "fbDcOffset": 0.01 - 0.005j,
@@ -1596,31 +1832,43 @@ stressFeedbackParameters = {
 
 | 方法 | 参数 | 返回值或作用 |
 |---|---|---|
-| `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 有目标时自动保存热状态、无热校准、恢复热状态并真实处理一次；`None`时直接执行一次PA与采样 |
-| `CalibratePaInput(inputSignal, outputPowerDbm)` | 原始波形、目标功率 | 高级诊断入口；自动暂停并恢复热状态，闭环调整Tx I/Q之前的数字输入并返回参考温度收敛值，但不执行正式热态发射 |
-| `GetLastPaInput()` | 无 | 兼容名称；返回最近一次收敛的Tx I/Q之前数字波形 |
-| `GetLastTransmitterOutput()` | 无 | 返回Tx I/Q之后、PA前耦合之前的波形 |
-| `GetLastActualPaInput()` | 无 | 返回Tx I/Q和PA前耦合之后真正进入PA的波形 |
+| `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 默认稳态热模式每次都校准后提交一个稳态周期；首次必须给目标，后续 `None` 复用最近成功目标。非热或瞬态模式的 `None` 才是不校准的单周期处理 |
+| `CalibratePaInput(inputSignal, outputPowerDbm)` | 原始波形、目标功率 | 高级诊断入口；调用内部 `PowerCalibration.Calibrate` 的统一热事务与闭环，返回定点解码与模拟drive之前的公开收敛波形，但不执行正式热态发射 |
+| `GetLastPaInput()` | 无 | 兼容名称；返回最近一次收敛的公开数字波形，位于定点解码、模拟drive和Tx I/Q之前 |
+| `GetLastTransmitterOutput()` | 无 | 返回模拟drive与Tx I/Q之后、PA前耦合之前的内部浮点波形 |
+| `GetLastActualPaInput()` | 无 | 返回模拟drive、Tx I/Q和PA前耦合之后真正进入PA的内部浮点波形 |
 | `GetLastPaOutput()` | 无 | 返回最近一次无热参考闭环接受的干净PA输出；启用温度模型后不等于正式热态返回波形 |
-| `GetLastCalibrationMetrics()` | 无 | 返回无热参考校准的目标、实测dBm、误差和迭代次数字典；真实热态功率读取 `GetThermalMetrics()` |
-| `PrepareThermalTest(...)` | 原始波形、参考目标及可选起始温度 | 高级兼容入口；显式生成冻结输入并可复位结温，普通调用不需要使用 |
+| `GetLastCalibrationMetrics()` | 无 | 成功或失败后返回目标、最佳实测dBm、误差、迭代次数、状态和适用的模拟drive；真实热态功率读取 `GetThermalMetrics()` |
+| `PrepareThermalTest(...)` | 原始波形、参考目标及可选起始温度 | 高级兼容入口；冻结公开码和当前Channel内已提交的模拟drive，并可复位结温；若要后续无校准重放，需使用瞬态模式 |
+| `ProcessBoundPaThermalPeriodFloating(inputSignal)` | 实际PA入口浮点波形 | 向内置SISO/MIMO PA传入Channel热运行模式、占空比、收敛容差和迭代上限；第三方热PA需支持同名协议 |
+| `IsThermalModelEnabled()` | 无 | 检查SISO顶层 `enabled` 或MIMO任一链的 `enabled`，不推进状态 |
+| `ValidateThermalReferencePlanes()` | 无 | 对每条启用热链严格核对采样率、归一化输出dBm标尺和活动门限；校准或周期处理前不一致即报错，返回启用链metrics元组 |
+| `GetActualDutyCycle(inputSignal=None)` | 可选公开数据窗 | 有入参时在真实PA入口参考面预计整周期RF占空比；无入参时读回最近已提交周期；SISO返回浮点，MIMO返回逐链元组 |
+| `AdvanceThermalIdle(idleTimeSec)` | 非负秒数 | 只推进周期调度之外的额外空闲；`thermalDutyCycle` 已经自动生成的窗外空闲不应再手动重复 |
+| `GetThermalMetrics()` | 无 | 返回占空比、周期时间、首/数据尾/周期尾温度、轨迹、耗散功率、稳态收敛和输出功率诊断 |
+| `SuspendThermalModel()` | 无 | 校准器使用的内部代理；要求绑定PA的暂停/恢复接口成对出现，返回PA热快照或在PA无热协议时返回 `None` |
+| `RestoreThermalModel(thermalSnapshot)` | 由暂停代理返回的不透明快照 | 校准器在 `finally` 中使用的内部代理；活动配置已关闭温度时保持关闭，不恢复旧启用状态 |
 | `ProcessPaOutput(paOutputSignal)` | 已有各PA自身输出 | 不运行PA或功率闭环，执行PA后耦合及所选采样路径 |
 | `FormatUnknownParameterError(ownerName, unknownNames, supportedNames)` | 配置上下文、错误名称、全部合法名称 | 对每个错误名称按相关度降序列出全部合法名称并生成严格模式异常文本 |
 | `ResolveCouplingPaths(parameterName, chainCount=None)` | 路径参数名、可选链数 | 拒绝未知子键并规范、校验耦合路径 |
 | `ApplyCouplingPath(sourceSignal, couplingPath)` | 单路源信号、规范路径 | 应用FIR、整数/分数时延、增益与相位 |
 | `ApplyMimoCoupling(inputSignal, parameterName)` | 多路矩阵、路径参数名 | 保留直通并累加所有非对角耦合 |
 | `ResolveIqImbalanceCoefficients(gainImbalanceDb, phaseImbalanceDegrees)` | I/Q增益与正交误差 | 返回广义线性直接系数和共轭镜像系数 |
-| `ApplyTransmitterIqImbalance(inputSignal)` | Tx数字波形 | 在PA前应用Tx I/Q增益、相位误差和DC |
-| `TransmitterIqCoefficients()` / `FeedbackIqCoefficients()` | 无 | 分别返回Tx和FB当前直接/镜像系数 |
+| `ApplyTransmitterIqImbalance(inputSignal)` | Tx数字波形 | Tx开关为True时在PA前应用增益、相位误差和DC；False时返回数值相同的复数副本 |
+| `TransmitterIqCoefficients()` / `FeedbackIqCoefficients()` | 无 | 分别返回Tx和FB当前直接/镜像系数；对应开关为False时返回理想对 `(1+0j, 0+0j)` |
 | `ApplyPrePaCoupling(inputSignal)` | PA前矩阵 | 生成每个PA真正看到的耦合激励 |
 | `ApplyPostPaCoupling(paOutputSignal)` | 各PA自身输出矩阵 | 在采样前混合PA非线性输出 |
 | `HasPrePaCoupling()` | 无 | 判断自动联合功率校准是否需要启用 |
 | `ProcessBoundPaFloating(inputSignal)` | 实际PA激励 | 只运行绑定PA，不加耦合或采样影响 |
-| `ProcessPaBankForCalibration(inputSignal)` | 公开试探波形 | 执行Tx I/Q、PA前耦合和PA，用于功率闭环 |
+| `ResolveCalibrationDriveDbPerChain(driveDbPerChain, chainCount)` | 逐链drive与链数 | 校验并返回与物理链顺序一致的有限dB元组 |
+| `ApplyCalibrationDrive(inputSignal, driveDbPerChain=None)` | 已解码波形；可选逐链试探drive | 在内部浮点域施加显式试探drive或最近一次已提交drive |
+| `SetCalibrationDriveDb(driveDbPerChain)` | 收敛的逐链模拟drive | 仅在成功校准后原子提交，供后续正常 `Process` 复用 |
+| `ProcessCalibrationDrive(inputSignal, driveDbPerChain)` | 公开试探波形与逐链模拟drive | 解码后依次执行模拟drive、Tx I/Q、PA前耦合和PA，并返回干净PA输出 |
+| `ProcessPaBankForCalibration(inputSignal)` | 公开试探波形 | 使用已提交drive执行Tx I/Q、PA前耦合和PA；保留兼容入口 |
 | `ApplyFeedbackLinearResponse(inputSignal)` | fb模拟输入 | 应用反馈增益、相位和FIR |
 | `ApplyFeedbackNonlinearity(inputSignal)` | fb线性输出 | 应用反馈三阶非线性和包络限幅 |
 | `ApplyFeedbackTimingAndFrequency(inputSignal)` | fb模拟波形 | 应用分数/整数时延、CFO和SFO |
-| `ApplyFeedbackIqImbalance(inputSignal)` | fb时频偏输出 | 应用I/Q增益/相位误差和DC |
+| `ApplyFeedbackIqImbalance(inputSignal)` | fb时频偏输出 | FB开关为True时应用I/Q增益、相位误差和DC；False时返回数值相同的复数副本 |
 | `ApplyFeedbackAdc(inputSignal)` | fb含噪波形 | 应用反馈ADC分量限幅与量化 |
 | `ApplyFeedbackAnalogImpairments(inputSignal)` | 公共移相后的PA输出 | 按固定顺序组合全部fb模拟非理想 |
 | `FeedbackDirectSmallSignalGain()` | 无 | 返回fb线性直通分量的复小信号系数 |
@@ -1761,6 +2009,7 @@ feedbackChannel = Channel(
         "fbFractionalDelaySamples": 0.18,
         "fbCarrierFrequencyOffsetHz": 2500.0,
         "fbSamplingFrequencyOffsetPpm": 8.0,
+        "fbIqImbalanceEnabled": True,
         "fbIqGainImbalanceDb": 0.35,
         "fbIqPhaseImbalanceDegrees": 1.5,
         "fbDcOffset": 0.002 - 0.001j,
@@ -1824,6 +2073,7 @@ channel = Channel(
         "noisePwrDbm": None,
         "noiseSnrDb": None,
         "maximumOutputPowerDbm": 25.0,
+        "calibrationDigitalHeadroomDb": 6.0,
         "loadResistanceOhm": 50.0,
         "randomSeed": 1019,
         "width": 0,
@@ -1841,6 +2091,7 @@ actualPaInput = channel.GetLastActualPaInput()
 referenceCalibrationPaOutput = channel.GetLastPaOutput()
 calibrationMetrics = channel.GetLastCalibrationMetrics()
 print(calibrationMetrics)
+print(calibrationMetrics.get("analogDriveDbPerChain"))
 ```
 
 对应流程为：
@@ -1849,22 +2100,29 @@ print(calibrationMetrics)
 flowchart TD
     original["用户原始波形<br/>无需预归一化"] --> process["Channel.Process"]
     target["用户目标 20 dBm"] --> process
-    process --> suspend["保存并暂停热状态"]
-    suspend --> calibration["内部PowerCalibration<br/>隐藏输入缩放预设"]
-    calibration --> txIq["Tx I/Q调制器"]
+    process --> calibrate["PowerCalibration.Calibrate"]
+    calibrate --> suspend["Channel代理保存并暂停PA热状态"]
+    suspend --> normalize["内部纯电闭环<br/>有效突发逐链归一化"]
+    normalize --> publicWave["公开波形<br/>浮点候选或带余量定点整数码"]
+    publicWave --> decode["公开定点边界解码"]
+    decode --> analogDrive["隐藏逐链模拟drive"]
+    analogDrive --> txIq["Tx I/Q调制器"]
     txIq --> preCoupling["PA前耦合"]
     preCoupling --> pa["参考温度PA"]
     pa --> detector["有效突发功率检测"]
     detector --> decision{"误差在容差内？"}
-    decision -->|否| calibration
-    decision -->|是| restore["恢复原结温与热时间"]
-    restore --> livePa["收敛输入通过真实温度PA一次"]
+    decision -->|否| update["更新逐链总drive"]
+    update -->|width等于0：调整波形幅值| publicWave
+    update -->|width大于0：调整模拟部分| analogDrive
+    decision -->|是| commit["提交模拟drive"]
+    commit --> restore["恢复原结温与热时间"]
+    restore --> livePa["同一公开波形和drive<br/>通过真实温度PA一次"]
     livePa --> phase["PA后耦合与固定移相"]
     phase --> noise["AddNoise"]
     noise --> receiver["返回接收波形"]
 ```
 
-图示说明：闭环每次都重新缩放原始波形并在暂停热网络后运行参考温度PA，不是在PA输出后乘常数伪造功率。有效区检测会排除前后补零和长静默。功率误差只由无热参考PA输出决定；进入容差后先恢复校准前的结温和累计时间，再用收敛输入执行一次真实温度PA、PA后耦合、相位和接收噪声。`GetLastPaOutput()` 与 `GetLastCalibrationMetrics()`保留的是无热参考闭环观测；本次真实输出功率由 `GetThermalMetrics()` 报告。
+图示说明：闭环在暂停热网络后运行参考温度PA，不是在PA输出后乘常数伪造功率。热事务由 `PowerCalibration.Calibrate` 统一管理，Channel只代理到实际PA；直接使用同一个校准器入口也具有相同保护。浮点模式在公开波形中承载总drive；定点模式先生成具有 `calibrationDigitalHeadroomDb` 余量的合法整数码，再在解码后调整隐藏模拟drive。有效区检测会排除前后补零和长静默。功率误差只由PA后耦合之前的无热参考PA输出决定；进入容差后提交drive、恢复校准前的结温和累计时间，再用相同公开输入和drive执行一次真实温度PA、PA后耦合、相位和接收噪声。`GetLastPaInput()`保存公开参考面，`GetLastActualPaInput()`保存模拟drive、Tx I/Q和PA前耦合之后的物理参考面。`GetLastPaOutput()` 与 `GetLastCalibrationMetrics()`保留无热参考闭环观测；本次真实输出功率由 `GetThermalMetrics()` 报告。
 
 ### 7.5 毫伏、dBm和SNR三种噪声配置
 
@@ -1992,11 +2250,15 @@ channel = Channel(
         "phaseDegrees": -90,
         "noiseAmpMv": 10.0,
         "maximumOutputPowerDbm": 25.0,
+        "calibrationDigitalHeadroomDb": 6.0,
         "randomSeed": 91,
         "width": 16,
     },
 )
-fixedOutput = channel.Process(fixedInput)
+fixedOutput = channel.Process(fixedInput, outputPowerDbm=20.0)
+calibratedPublicInput = channel.GetLastPaInput()
+actualPaInput = channel.GetLastActualPaInput()
+calibrationMetrics = channel.GetLastCalibrationMetrics()
 
 assert fixedOutput.dtype == np.complex128
 assert np.array_equal(
@@ -2005,9 +2267,22 @@ assert np.array_equal(
 assert np.array_equal(
     fixedOutput.imag, np.rint(fixedOutput.imag)
 )
+assert np.array_equal(
+    calibratedPublicInput.real,
+    np.rint(calibratedPublicInput.real),
+)
+assert np.array_equal(
+    calibratedPublicInput.imag,
+    np.rint(calibratedPublicInput.imag),
+)
+assert calibrationMetrics["converged"] is True
+assert abs(
+    calibrationMetrics["measuredOutputPowerDbmPerChain"][0]
+    - 20.0
+) <= 0.25
 ```
 
-10 mV不会被直接当成整数码10。Channel先把物理电压转换为内部归一化RMS，生成浮点噪声，最后统一编码为16位整数码。
+10 mV不会被直接当成整数码10。Channel先把物理电压转换为内部归一化RMS，生成浮点噪声，最后统一编码为16位整数码。`calibratedPublicInput`也是整数码，并默认保留6 dB分量峰值余量；`actualPaInput`是公开码解码后再经过隐藏模拟drive、Tx I/Q和PA前耦合的浮点物理参考面，因此不应对它做整数码断言。默认25 dBm额定上限下，20 dBm由内置Wiener、GMP等drive-aware plant正常覆盖。
 
 ### 7.8 运行时更新参数和复现噪声
 
@@ -2163,6 +2438,7 @@ forwardChannel = Channel(
     paModel=paModel,
     parameters={
         "sampleMode": "forward",
+        "txIqImbalanceEnabled": True,
         "txIqGainImbalanceDb": 0.6,
         "txIqPhaseImbalanceDegrees": 2.0,
         "txDcOffset": 0.005 + 0.0j,
@@ -2175,9 +2451,11 @@ feedbackChannel = Channel(
     paModel=paModel,
     parameters={
         "sampleMode": "fb",
+        "txIqImbalanceEnabled": True,
         "txIqGainImbalanceDb": 0.6,
         "txIqPhaseImbalanceDegrees": 2.0,
         "txDcOffset": 0.005 + 0.0j,
+        "fbIqImbalanceEnabled": True,
         "fbIqGainImbalanceDb": -0.4,
         "fbIqPhaseImbalanceDegrees": -1.5,
         "fbDcOffset": -0.003 + 0.002j,
@@ -2190,9 +2468,25 @@ txDirect, txImage = feedbackChannel.TransmitterIqCoefficients()
 fbDirect, fbImage = feedbackChannel.FeedbackIqCoefficients()
 print("Tx image ratio:", abs(txImage / txDirect))
 print("FB image ratio:", abs(fbImage / fbDirect))
+
+# Keep all measured impairment values but bypass only the Tx stage.
+feedbackChannel.UpdateParameters(
+    txIqImbalanceEnabled=False,
+    fbIqImbalanceEnabled=True,
+)
+print("Tx disabled coefficients:", feedbackChannel.TransmitterIqCoefficients())
+print("FB still enabled coefficients:", feedbackChannel.FeedbackIqCoefficients())
+
+# Reverse the two independent switches without rewriting gain, phase, or DC.
+feedbackChannel.UpdateParameters(
+    txIqImbalanceEnabled=True,
+    fbIqImbalanceEnabled=False,
+)
+print("Tx restored coefficients:", feedbackChannel.TransmitterIqCoefficients())
+print("FB disabled coefficients:", feedbackChannel.FeedbackIqCoefficients())
 ```
 
-`airReference`包含Tx I/Q、PA和forward公共效应，但不包含任何FB I/Q；`feedbackCapture`同时包含Tx与FB两处镜像。实际DPD训练若使用 `feedbackCapture`，应先用独立接收机校准结果去嵌入FB镜像，再把剩余Tx镜像交给增广GMP。最终EVM和IRR必须在forward参考面评价。
+前两次处理时两个开关都为True，因此 `airReference` 包含Tx I/Q、PA和forward公共效应，但不包含任何FB I/Q；`feedbackCapture` 同时包含Tx与FB两处镜像。后续两组 `UpdateParameters` 展示硬开关的独立性：关闭的一侧系数查询固定返回 `(1+0j, 0+0j)`，另一侧仍根据原有非零参数计算。实际DPD训练若使用 `feedbackCapture`，应先用独立接收机校准结果去嵌入FB镜像，再把剩余Tx镜像交给增广GMP。最终EVM和IRR必须在forward参考面评价。
 
 完成一次功率校准后，可以分别检查三个发送参考面：
 
@@ -2205,7 +2499,7 @@ txModulatorOutput = feedbackChannel.GetLastTransmitterOutput()
 actualPaInput = feedbackChannel.GetLastActualPaInput()
 ```
 
-`calibratedDigitalInput`在Tx I/Q之前，`txModulatorOutput`在Tx I/Q之后，`actualPaInput`还包含PA前耦合。三者不能混作同一个DPD训练标签。
+`calibratedDigitalInput`在定点解码、隐藏模拟drive和Tx I/Q之前；`txModulatorOutput`已经包含模拟drive及Tx I/Q；`actualPaInput`还包含PA前耦合。正位宽时第一项是公开整数码，后两项是内部浮点物理波形，三者不能混作同一个DPD训练标签。
 
 ## 8. `SmallestSISO.py`中的设置
 
@@ -2222,6 +2516,7 @@ channel = Channel(
         "noisePwrDbm": None,
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
+        "calibrationDigitalHeadroomDb": 6.0,
         "randomSeed": 1019,
         "width": width,
     },
@@ -2231,8 +2526,8 @@ channel = Channel(
 其执行边界为：
 
 1. 示例直接调用 `channel.Process(waveform.samples, outputPowerDbm=20.0)`；调用方不创建功率校准器。
-2. `Channel` 内部反复调整PA输入，直到干净PA输出达到目标，再执行0度移相和10 mV接收噪声。
-3. `channel.GetLastPaInput()` 返回Tx I/Q之前的收敛数字输入，可作为控制算法的目标参考；`GetLastTransmitterOutput()`返回Tx I/Q之后的调制器输出，`GetLastActualPaInput()`返回耦合后真正进入PA的波形。
+2. `Channel` 内部反复调整总drive，直到干净PA输出达到目标。定点模式公开码默认保留6 dB数字余量，剩余drive位于解码后的隐藏模拟级；随后再执行0度移相和10 mV接收噪声。
+3. `channel.GetLastPaInput()` 返回定点解码和模拟drive之前的收敛公开数字输入，可作为控制算法的数字参考；`GetLastTransmitterOutput()`返回模拟drive及Tx I/Q之后的调制器输出，`GetLastActualPaInput()`返回PA前耦合后真正进入PA的浮点波形。
 4. `RunFrequencyDomainIlc` 把 `Channel` 当作完整反馈链路。
 5. 最佳ILC输入再次通过同一个 `Channel.Process(..., outputPowerDbm=20.0)` 复测目标工作点。
 6. 输出字典同时保留Channel参数与内部PA功率闭环结果，避免把接收噪声功率误解为PA发射功率。
@@ -2278,54 +2573,177 @@ postMeasurement = channelAnalyzer.Measure(
 
 ## 10. Channel内置无热校准与温度测试
 
-普通用户不需要调用 `SuspendThermalModel`、`RestoreThermalModel`、`CalibratePaInput` 或 `PrepareThermalTest`。只要把原始波形和参考温度目标功率传给 `Channel.Process`，函数内部就完成一个不可见的热状态事务：
+本节的“稳态”指周期稳态：同一数据窗周期性发送，周期内温度可以先升后降，但周期末回到周期初。这不等于把整帧固定在一个温度上。
+
+`ThermalConfig.enabled=False` 是PA层的硬关闭。Channel会把该链视为无热链，不要求它参与热参考面校验或稳态求解；PA会移除热网络、清除旧热metrics和外部互热offset，并旁路温度造成的增益、相位、饱和与非线性漂移。关闭温度不会清零以前成功校准后提交的模拟drive，因为drive描述输入工作点而 `enabled` 描述热物理，两者彼此独立。若要比较开关温度的波形，必须保持drive一致，或按同一目标功率规则分别校准。
+
+如果在一次校准的暂停区间内把活动配置改成 `enabled=False`，`PowerCalibration` 的 `finally` 仍会调用恢复代理，但PA会以实时关闭配置为准，不会用旧快照重新启用热网络。反过来，构造 `PaModel` 时显式传入的 `thermalConfig=` 位于ChainMap高优先级层；只修改低优先级 `parameters["thermalConfig"]` 不能覆盖它，应使用 `PaModel.UpdateParameters(thermalConfig=...)` 或只保留一个配置来源。
+
+### 10.1 三种占空比不能混用
+
+设输入数组包含 $N$ 个样点，采样率为 $f_s$，整个数据窗时长为：
+
+```math
+T_{\mathrm{data}}
+=
+\frac{N}{f_s}.
+```
+
+`thermalDutyCycle` 是用户配置的数据窗占空比 $D_{\mathrm{cfg}}$，它把整个输入数组当作“数据部分”，不扣除其中的零或长静默段。Channel由此自动生成完整周期和数据窗之后的外部空闲：
+
+```math
+T_{\mathrm{period}}
+=
+\frac{T_{\mathrm{data}}}{D_{\mathrm{cfg}}},
+\qquad
+T_{\mathrm{idle,outer}}
+=
+T_{\mathrm{data}}
+\left(
+\frac{1}{D_{\mathrm{cfg}}}-1
+\right).
+```
+
+PA在整个数据窗的峰值参考下用 `ThermalConfig.activePowerThresholdDb` 分类活动样点。设窗内活动样点比例为 $D_{\mathrm{wave}}$，则真正有RF激励的整周期占空比为：
+
+```math
+D_{\mathrm{actual}}
+=
+D_{\mathrm{cfg}}D_{\mathrm{wave}}.
+```
+
+例如用户配置 `thermalDutyCycle=0.4`，而数据窗内只有50%样点为RF活动，则 `configuredDutyCycle=0.4`、`waveformActiveDutyCycle=0.5`，而 `actualDutyCycle=0.2`。窗内静默和窗外空闲都使用 `idleDissipatedPowerW` 更新热网络，因此都可以冷却；外部空闲不向返回波形追加样点。
+
+### 10.2 稳态与瞬态运行模式
+
+`thermalRunMode="transient"` 从当前实时RC状态推进“数据窗+自动外部空闲”一个周期。未稳定时，周期初和周期末温度不同；连续调用会自然趋向周期稳态。
+
+默认 `thermalRunMode="steady_state"` 直接解周期固定点。对第 $i$ 个Foster支路和第 $k$ 个常耗散区间，精确零阶保持推进为：
+
+```math
+\theta_{i,k+1}
+=
+a_{i,k}\theta_{i,k}
++
+R_iP_k(1-a_{i,k}),
+\qquad
+a_{i,k}
+=
+\exp
+\left(
+-\frac{\Delta t_k}{\tau_i}
+\right).
+```
+
+合成一整周期后可写为：
+
+```math
+\theta_{i,\mathrm{end}}
+=
+A_i\theta_{i,\mathrm{start}}+B_i.
+```
+
+周期稳态条件与冻结热源下的解为：
+
+```math
+\theta_{i,\mathrm{end}}
+=
+\theta_{i,\mathrm{start}},
+\qquad
+\theta_{i,\mathrm{start}}
+=
+\frac{B_i}{1-A_i}.
+```
+
+实际耗散功率会因温度改变PA输出而反过来变化，因此 `ProcessThermalPeriodFloating` 会重复“冻结本轮耗散轨迹→解析求周期起点→重放验证首尾”，直到每个支路误差不超过 `thermalSteadyStateToleranceC`。默认容差为 `1e-4` 摄氏度，最多 `100` 轮。试算不改变实时状态或累计时间，只提交收敛的一个周期。MIMO存在互热矩阵时，`MimoPaModel.ProcessThermalPeriodFloating` 再用一层固定点使自热和互热同时收敛。
+
+#### 10.2.1 校准前统一三个参考平面
+
+Channel的功率闭环、周期时长和活动样点统计必须与热PA解释为同一物理量。`ValidateThermalReferencePlanes()` 在功率校准和正式周期处理之前遍历所有启用热链，并执行以下严格校验：
+
+| Channel参数 | 必须等于每路ThermalConfig参数 | 物理含义 |
+|---|---|---|
+| `sampleRateHz` | `sampleRateHz` | $N/f_s$ 的数据窗时长和全部热时间常数使用同一秒标尺 |
+| `maximumOutputPowerDbm` | `referenceOutputPowerDbm` | 归一化输出幅度1对应同一个实际RF功率 |
+| `activePowerThresholdDb` | `activePowerThresholdDb` | 有效突发功率测量与热活动/空闲判定使用同一组样点 |
+
+数值只允许浮点舍入级误差。SISO检查一份热配置，MIMO逐链检查；任意一路不一致都会在校准目标或模拟drive提交之前抛出含链号和两个数值的异常。这样不会出现“Channel按80 MHz校准，PA按160 MHz发热”或“功率统计排除的静默样点仍被热模型当成发射”等隐藏参考面错误。
+
+### 10.3 稳态 `Process` 为什么每次都校准
+
+稳态调用的原始波形可能在两次之间改变幅度、峰均比、窗内静默位置或MIMO耦合激励。因此默认稳态模式的每次 `Channel.Process` 都先调用 `ValidateThermalReferencePlanes()`，通过后再暂停热网络并重做参考温度功率校准，最后用当次收敛的公开码和模拟drive求热稳态：
 
 ```mermaid
 flowchart LR
-    raw["任意原始波形与目标dBm"] --> snapshot["保存当前结温、热支路与累计时间"]
-    snapshot --> suspend["暂停温度影响"]
-    suspend --> calibrate["参考温度功率闭环"]
-    calibrate --> restore["原样恢复热状态"]
-    restore --> frame["收敛输入真实发射一帧"]
-    frame --> drift["结温推进，输出功率自然漂移"]
-    drift --> idle["可选AdvanceThermalIdle"]
-    idle --> snapshot
+    raw["当次原始数据窗"] --> target{"是否给出目标dBm？"}
+    target -->|"是"| snapshot["保存热状态"]
+    target -->|"否，但有成功缓存"| cached["复用最近成功目标"]
+    target -->|"首次也没有"| error["ValueError"]
+    cached --> snapshot
+    snapshot --> calibrate["暂停热影响<br/>参考温度功率闭环"]
+    calibrate --> restore["恢复校准前热状态"]
+    restore --> solve["稳态温度固定点"]
+    solve --> data["返回数据窗输出"]
+    solve --> idle["自动外部空闲<br/>只更新热状态"]
 ```
 
+首次稳态热 `Process` 必须显式给出 `outputPowerDbm`。只有一次校准成功后，后续 `Process(rawSignal)` 才可以省略目标；此时不是跳过校准，而是复用最近成功的共同或逐链目标重做校准。未启用热模型或选择瞬态模式时，省略目标才会直接复用已提交drive做一次开环处理。
+
+`CalibratePaInput` 的多轮试探不推进热时间；`GetLastPaOutput()` 和 `GetLastCalibrationMetrics()` 属于参考温度校准面。公开返回的波形和 `GetThermalMetrics()` 属于周期热态正式发射面，因而热态 `outputPowerDbm` 可以低于校准目标，这是温漂而不是校准失败。
+
+### 10.4 查询实际占空比
+
 ```python
-for frameIndex in range(100):
-    receivedSignal = channel.Process(
-        rawSignal,
-        outputPowerDbm=22.0,
-    )
-    thermalMetrics = channel.GetThermalMetrics()
-    calibrationMetrics = channel.GetLastCalibrationMetrics()
-    print(
-        frameIndex,
-        calibrationMetrics["measuredOutputPowerDbmPerChain"][0],
-        thermalMetrics["outputPowerDbm"],
-        thermalMetrics["junctionTemperatureC"],
-    )
-    channel.AdvanceThermalIdle(1.0e-3)
+channel.UpdateParameters(
+    thermalRunMode="steady_state",
+    thermalDutyCycle=0.4,
+)
+
+# This query includes decoding, committed analog drive, Tx I/Q, and pre-PA
+# coupling before classifying activity at the physical PA-input plane.
+predictedDutyCycle = channel.GetActualDutyCycle(rawSignal)
+
+# The first steady-state call must provide a target.
+receivedSignal = channel.Process(rawSignal, outputPowerDbm=22.0)
+
+# A later call may omit the target; the cached 22 dBm target is recalibrated.
+nextReceivedSignal = channel.Process(nextRawSignal)
+acceptedDutyCycle = channel.GetActualDutyCycle()
+thermalMetrics = channel.GetThermalMetrics()
 ```
 
-上例虽然每帧都给出 `outputPowerDbm=22.0`，但该值只约束暂停温度影响后的参考电模型，不会围绕当前热态输出闭环。若PA升温后增益下降，`GetLastCalibrationMetrics()`仍会显示参考校准接近22 dBm，而 `GetThermalMetrics()["outputPowerDbm"]` 会自然低于22 dBm。每次校准的多轮试探不推进热时间；只有恢复状态后的正式一帧和显式空闲间隔推进热网络。
+SISO查询返回一个浮点值；MIMO返回按物理PA链排列的元组。带入参的 `GetActualDutyCycle(rawSignal)` 先跨过公开定点边界，再应用已提交模拟drive、Tx I/Q和PA前耦合，所以它衡量的是真正PA入口参考面。即使绑定PA没有启用热模型，这个带入参查询仍会按Channel的 `activePowerThresholdDb` 逐链分类，并返回 `thermalDutyCycle` 与窗内活动比例的乘积；它不会因为热metrics关闭而返回伪0。无参形查询不重新处理波形，仅读回最近已提交热周期；在还没有成功处理热周期时会报错。
 
-主要热接口的边界为：
+### 10.5 热metrics字典
 
-| 接口 | 是否执行参考校准 | 是否推进热状态 | 普通用户是否需要调用 |
-|---|---|---|---|
-| `Process(rawSignal, outputPowerDbm=...)` | 是，内部自动暂停温度影响 | 是，仅正式发射一次 | 是，推荐的唯一主入口 |
-| `Process(calibratedInput)` | 否 | 是 | 只在调用方已经拥有精确驱动时使用 |
-| `PrepareThermalTest(...)` | 是，内部自动暂停温度影响 | 否 | 否；仅用于显式冻结输入或复位起始温度的高级实验 |
-| `AdvanceThermalIdle(idleTimeSec)` | 否 | 是 | 需要模拟帧间空闲时调用 |
-| `GetThermalMetrics()` | 否 | 否 | 可选诊断 |
+SISO `GetThermalMetrics()` 中与周期调度相关的键如下。MIMO在 `chains` 元组中为每个PA保存同样的字典，并在 `mutualHeating` 中额外给出互热稳态收敛信息。
 
-`CalibratePaInput` 使用 `try/finally` 保存并恢复热状态；绑定的第三方PA如果实现热事务，必须同时提供 `SuspendThermalModel` 和 `RestoreThermalModel`，只提供其中一个会在改变状态前报错。`GetLastPaOutput()` 和 `GetLastCalibrationMetrics()`属于无热参考校准面；公开返回的 `receivedSignal` 与 `GetThermalMetrics()`属于恢复温度后的正式发射面，两组功率不同是预期行为。
+| 键 | 含义 |
+|---|---|
+| `configuredDutyCycle` | 用户配置的数据窗/周期比例 |
+| `waveformActiveDutyCycle` / `activeSampleDutyCycle` | 数据窗内部RF活动样点比例；后者为兼容键 |
+| `actualDutyCycle` | `configuredDutyCycle * waveformActiveDutyCycle` |
+| `signalDurationSec` / `scheduledIdleDurationSec` / `periodDurationSec` | 数据窗、自动外部空闲和完整周期时长 |
+| `periodStartingJunctionTemperatureC` | 周期起点结温 |
+| `dataEndingJunctionTemperatureC` | 输入数据窗处理完后、外部空闲之前的结温 |
+| `periodEndingJunctionTemperatureC` | 外部空闲结束后的结温；稳态下应与周期起点一致 |
+| `temperatureTraceTimeSec` / `temperatureTraceC` / `temperatureTraceRfActive` | 周期分段时刻、结温和区间RF活动标记 |
+| `averageDissipatedPowerW` | 包含内外空闲的完整周期平均耗散功率 |
+| `dataWindowAverageDissipatedPowerW` | 只在数据窗内平均的耗散功率 |
+| `thermalRunMode` | 当次已提交的 `steady_state` 或 `transient` |
+| `steadyStateConverged` / `steadyStateIterations` / `steadyStateErrorC` | 仅 `steady_state` 实际收敛时首项为 `True`，并给出迭代次数和最大支路闭合误差；`transient` 的首项固定为 `False`，表示未执行稳态求解而不是处理失败 |
+| `outputPowerDbm` | 当次热态数据窗内RF活动样点的PA输出功率 |
 
-需要严格复用同一冻结数字输入、同时显式复位起始结温时，仍可使用兼容接口：
+`startingJunctionTemperatureC` 和 `endingJunctionTemperatureC` 是兼容键，分别等于周期起点和数据窗结束温度。不要把 `endingJunctionTemperatureC` 误认为包含外部空闲的周期末温度。
+
+### 10.6 额外空闲和高级冻结路径
+
+`thermalDutyCycle` 已经自动完成每个周期的窗外空闲，因此不应再用 `AdvanceThermalIdle` 重复同一段间隔。`AdvanceThermalIdle(idleTimeSec)` 只用于不属于周期调度的额外停顿，例如连续发送100周期后的1 ms停顿。
+
+`PrepareThermalTest` 仍可用于冻结“公开码+当前Channel内已提交模拟drive”并复位起始温度。由于默认稳态 `Process` 会再次校准，真正的无校准冻结重放要显式选择瞬态模式：
 
 ```python
+channel.UpdateParameters(thermalRunMode="transient")
 frozenInput = channel.PrepareThermalTest(
     rawSignal,
     calibrationOutputPowerDbm=22.0,
@@ -2336,6 +2754,12 @@ for frameIndex in range(100):
     receivedSignal = channel.Process(frozenInput)
 ```
 
-这条高级路径与主入口采用同一个无热校准事务，不要求调用方手工关闭或恢复温度影响。
+`PowerCalibration.Calibrate` 使用 `try/finally` 保存并恢复热状态，`CalibratePaInput` 只配置目标并调用这个统一入口。Channel新增的 `SuspendThermalModel` 和 `RestoreThermalModel` 是校准器与实际PA之间的代理。绑定的第三方PA如果实现热事务，必须同时提供这两个方法；第三方PA若报告热模型已启用，还必须实现 `ProcessThermalPeriodFloating`，否则Channel会报错，避免静默忽略稳态或占空比语义。
+
+`IQImbalancePA` 包装热PA时会透明代理 `ProcessThermalPeriodFloating`、`SuspendThermalModel`、`RestoreThermalModel`、`GetThermalMetrics`、`CalculateActualDutyCycle`、`ResetThermalState` 和 `AdvanceIdle`。因此Channel仍能识别其内部热状态，校准期间能暂停/恢复它，并从物理PA输入参考面取得占空比；I/Q共轭输出包装本身不建立第二套热状态。
+
+MIMO正式周期使用全链原子事务。`MimoPaModel.ProcessThermalPeriodFloating` 在第一路推进前保存每一路热网络、累计时间、旧输出/耗散和互热metrics；如果后续任意一路越温、异常或固定点不收敛，所有已经推进的链和这些诊断量都会恢复到调用前状态。只有全部链成功后才共同提交，调用方可以安全重试而不会累积半个MIMO周期。
+
+运行中把 `thermalCouplingCPerW` 从非零矩阵更新为全零矩阵时，下一个成功周期会清除所有历史互热offset，再按无互热条件计算；不会把上一配置的邻链温升继续带入输出。清零也服从同一原子事务：该周期若失败，调用前的热offset和metrics会恢复。
 
 热源、Foster方程、不同热模型优缺点、全部 `ThermalConfig` 参数和MIMO互热矩阵见 [PaModel.md第13节](./PaModel.md#13-pa电热模型功率占空比与输出漂移)。
