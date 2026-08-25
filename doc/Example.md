@@ -20,7 +20,7 @@
 1. 每次只改变一个模块的参数组，其他非理想使用0或 `None`。
 2. 所有对比使用同一个随机种子、同一段输入波形和同一参考面。
 3. I/Q测试使用单位PA，排除PA压缩、记忆和温度影响。
-4. `Channel.Process` 总是从同一次PA/热周期返回 `(chOut, fbOut)`；Tx I/Q隔离测试使用 `chOut`，DPD/ILC训练使用 `fbOut`。FB I/Q最小测试仍可从已知PA输出进入按 `sampleMode` 选路的兼容 `ProcessPaOutput`。
+4. `Channel.Process` 总是从同一次PA/热周期返回 `(chOut, fbOut)`；Tx I/Q隔离测试使用 `chOut`。默认 `sampleMode="forward"` 时第二项是第一项的数值相同副本；需要板载反馈DPD/ILC训练或FB I/Q隔离时显式选择 `sampleMode="fb"`。FB I/Q最小测试仍可从已知PA输出进入按该参数选路的兼容 `ProcessPaOutput`。
 5. 温漂测试只需调用 `Channel.Process(rawSignal, outputPowerDbm=...)`；默认 `steady_state` 会在每次调用时执行参考温度功率校准，再按完整周期稳态温度曲线处理。需要观察冷启动历史时显式选择 `transient`。
 6. 参数比较至少包含理想、轻微和压力三档，并给出预期单调趋势。
 7. 理想双精度结果可能显示低于 `-200 dBc` 的 `irrDb` 或极小EVM，这只代表数值残差，不代表真实仪器动态范围。
@@ -563,7 +563,7 @@ for temperatureC, metrics in staticTemperatureResults.items():
 
 ### 6.1 测试边界和两种运行模式
 
-动态自热测试仍包含“参考温度功率设定闭环”和“真实温度发射”两个物理阶段，但它们已经封装在 `Channel.Process(rawSignal, outputPowerDbm=...)` 内部。这里的目标始终是干净物理PA输出功率，不是raw `fbOut` 表观功率。用户不用关闭温度模型、调用校准器或构造空闲波形；正式发射只执行一个热周期并同时返回 `chOut` 与 `fbOut`。
+动态自热测试仍包含“参考温度功率设定闭环”和“真实温度发射”两个物理阶段，但它们已经封装在 `Channel.Process(rawSignal, outputPowerDbm=...)` 内部。这里的目标始终是干净物理PA输出功率，不是raw `fbOut` 表观功率。用户不用关闭温度模型、调用校准器或构造空闲波形；正式发射只执行一个热周期并返回两项。forward模式复制前向结果，fb模式才额外执行反馈链，但两者都不改变功率校准的干净PA参考面。
 
 Channel把每次输入看成一个数据窗口，再根据 `thermalDutyCycle` 自动补足窗口外空闲。两种模式的区别如下：
 
@@ -580,9 +580,13 @@ flowchart TD
     mode -->|transient| live["读取当前实时热状态"]
     solve --> data["处理数据窗口；内部空闲也冷却"]
     live --> data
-    data --> branch{"同一PA/热周期后分叉"}
-    branch --> channelOutput["chOut：最终RF分析"]
-    branch --> feedbackOutput["fbOut：DPD/ILC训练"]
+    data --> channelOutput["chOut：最终RF分析"]
+    data --> sampleMode{"sampleMode：选择fbOut来源"}
+    channelOutput -. "forward副本来源" .-> forwardCopy["数值相同副本"]
+    sampleMode -->|forward| forwardCopy
+    sampleMode -->|fb| feedbackChain["完整反馈链"]
+    forwardCopy --> feedbackOutput["fbOut：DPD/ILC训练"]
+    feedbackChain --> feedbackOutput
     data --> idle["自动推进窗口外空闲"]
     idle --> metrics["保存占空比、温度曲线和周期指标"]
 ```
@@ -863,7 +867,7 @@ def DrawPeriodicTemperature(channel: Channel) -> None:
 1. 确认比较使用同一输入数组，而不是相同配置重新生成的另一段随机波形。
 2. 确认 `width=0`，先排除公开定点量化；验证通过后再单独加入定点系统。
 3. 确认Analysis使用 `transmittedSignal=referenceSignal`，没有进入盲Descriptor解析。
-4. Tx I/Q必须通过 `Process` 并在 `chOut` 观察；DPD训练取同次 `fbOut`。只有兼容最小测试才用fb模式的 `ProcessPaOutput`；不要混淆参考面。
+4. Tx I/Q必须通过 `Process` 并在 `chOut` 观察；DPD训练取同次 `fbOut`。需要板载反馈观测时必须显式设置 `sampleMode="fb"`；forward模式下第二项只是主路副本。只有兼容最小测试才用fb模式的 `ProcessPaOutput`；不要混淆参考面。
 5. 默认稳态模式第一次调用必须传 `outputPowerDbm`；后续即使省略也会复用最近目标并重新执行参考温度校准。该校准不会闭环稳定热态输出。
 6. 检查 `thermalDutyCycle` 表示数据窗口占完整周期，而不是数组非零比例；用 `GetActualDutyCycle()` 核对真实RF占空比。
 7. 检查是否把自动窗口外空闲又传给 `AdvanceThermalIdle`，从而重复计算冷却时间。

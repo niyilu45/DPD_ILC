@@ -1173,14 +1173,18 @@ P_{\mathrm{NL},k}
 =20\log_{10}(\mathrm{EVM}_{\mathrm{rms}}).
 ```
 
-代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子。`DpdIlc` 在迭代期间完全不调用该方法，而是把每次Channel求值得到的第二个输出 `fbOut` 交给独立 `SigProc`，同步并除去公共复增益后计算原生MSE和ILC更新。`ILCIteration.feedbackOutputSignal` 保存raw `fbOut`，同步估计和原生MSE也都描述反馈域；同一次PA/热周期分出的第一个输出 `chOut` 则原样保存在 `ILCIteration.outputSignal`。若外部仪表给两路添加不同数量的补零或裁剪，学习器只同步 `fbOut`，`AnalyzeIlcHistory` 会再次独立同步原始 `chOut`，不会用反馈波形替换主路波形。ILC结束后，`Analysis.AnalyzeIlcHistory` 只对后者调用普通 `Analyze`，把主路SNR、EVM、ACLR与反馈域原生MSE合并为 `ILCPerformanceIteration`，并在分析层按严格主路EVM在线维护最佳轮。MIMO对应使用 `AnalyzeMimoIlcHistory`，它先按轮组合全部PA链，再执行完整空间解映射。
+代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子。`DpdIlc` 在迭代期间完全不调用该方法，而是把每次Channel求值得到的第二个输出 `fbOut` 交给独立 `SigProc`，同步并除去公共复增益后计算原生MSE和ILC更新。Channel的 `sampleMode="forward"` 会让这第二项成为 `chOut` 的数值相同副本；需要分析板载反馈训练时必须显式选择 `sampleMode="fb"`，此时第二项才包含完整FB接收非理想。`ILCIteration.feedbackOutputSignal` 保存raw `fbOut`，同步估计和原生MSE也都描述所选训练观测；同一次PA/热周期的第一个输出 `chOut` 则原样保存在 `ILCIteration.outputSignal`。若外部仪表给两路添加不同数量的补零或裁剪，学习器只同步 `fbOut`，`AnalyzeIlcHistory` 会再次独立同步原始 `chOut`，不会用反馈波形替换主路波形。ILC结束后，`Analysis.AnalyzeIlcHistory` 只对后者调用普通 `Analyze`，把主路SNR、EVM、ACLR与训练观测域原生MSE合并为 `ILCPerformanceIteration`，并在分析层按严格主路EVM在线维护最佳轮。MIMO对应使用 `AnalyzeMimoIlcHistory`，它先按轮组合全部PA链，再执行完整空间解映射。
 
 ```mermaid
 flowchart LR
-    plant["第 k 轮一次PA/热周期"] --> branch{"同一状态分叉"}
-    branch --> channelOutput["chOut：主路"]
-    branch --> capture["fbOut：原始反馈"]
-    capture --> ilcSync["DpdIlc内部SigProc<br/>时延 / CFO / SFO / 复增益"]
+    plant["第 k 轮一次PA/热周期"] --> channelOutput["chOut：主路"]
+    plant --> sampleMode{"sampleMode：选择训练观测"}
+    channelOutput -. "forward副本来源" .-> forwardCopy["数值相同副本"]
+    sampleMode -->|forward| forwardCopy
+    sampleMode -->|fb| capture["完整板载反馈"]
+    forwardCopy --> feedbackOutput["fbOut"]
+    capture --> feedbackOutput
+    feedbackOutput --> ilcSync["DpdIlc内部SigProc<br/>时延 / CFO / SFO / 复增益"]
     ilcSync --> ilc["DpdIlc：参考域误差与全部迭代"]
     ilc --> history["ILCIteration：输入、chOut、fbOut<br/>反馈MSE与同步估计"]
     channelOutput --> history
@@ -1202,7 +1206,7 @@ flowchart LR
     evmMse --> best["Analysis层选择EVM最佳轮"]
 ```
 
-**图 5-2 说明**：算法层先在 `fbOut` 上完成同步、复增益对齐和学习，同时保存同轮 `chOut`；分析层随后只在 `chOut` 上计算RF指标。Raw MSE和LC-MSE回答“反馈观测是否跟踪目标”，EVM-MSE回答“前向主路调制质量是否改善”。因此反馈链存在频响、镜像、非线性、限幅或量化时，两类曲线不必同趋势，这不是Analysis计算错误。`feedbackComplexGain` 保留反馈物理幅相，`ILCResult.outputSignal` 返回最佳输入对应的 `chOut`，`ILCResult.feedbackOutputSignal` 返回同次求值得到的raw `fbOut`。
+**图 5-2 说明**：算法层先在二元组第二项 `fbOut` 上完成同步、复增益对齐和学习，同时保存同轮 `chOut`；分析层随后只在 `chOut` 上计算RF指标。forward模式下两项相同，Raw/LC-MSE与主路评价只剩处理口径差异；fb模式下反馈链存在频响、镜像、非线性、限幅或量化时，两类曲线不必同趋势，这不是Analysis计算错误。`feedbackComplexGain` 保留所选训练观测的物理幅相，`ILCResult.outputSignal` 返回最佳输入对应的 `chOut`，`ILCResult.feedbackOutputSignal` 返回同次求值得到的raw `fbOut`。
 
 ### 5.9 三种 MSE 应当怎样联合阅读
 
@@ -1894,6 +1898,7 @@ paModel = PaModel(
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "fb",
         "sampleRateHz": wifiWaveform.sampleRateHz,
         "phaseDegrees": 90,
         "noiseAmpMv": 10.0,
@@ -1928,7 +1933,7 @@ print(metrics)
 
 90度固定相位会由公共复增益补偿，不应单独恶化EVM；PA非线性和10 mV随机噪声仍保留在误差中。`metrics["outputPowerDbm"]` 表示 `chOut` 所在前向主路参考面的分析结果，而 `channel.GetLastCalibrationMetrics()` 保留不含接收噪声的PA功率闭环实测值。`PowerCalibration.outputPowerDbm` 始终定义在干净PA物理输出面，不是含反馈增益、FIR、非线性、噪声和ADC的raw `fbOut` 表观功率。
 
-DPD或ILC使用 `fbOut` 板载反馈波形进行更新时，不应把同一份反馈波形作为最终黄金结果。反馈接收机的FIR、CFO/SFO、I/Q镜像和ADC量化有一部分可以由同步或公共复增益补偿减弱，但反馈非线性、限幅、镜像与量化噪声不能被一个标量增益完全消除。推荐从同一次Channel求值得到两路：
+DPD或ILC使用 `fbOut` 板载反馈波形进行更新时，应先显式配置 `sampleMode="fb"`，并且不应把同一份反馈波形作为最终黄金结果。反馈接收机的FIR、CFO/SFO、I/Q镜像和ADC量化有一部分可以由同步或公共复增益补偿减弱，但反馈非线性、限幅、镜像与量化噪声不能被一个标量增益完全消除。推荐从同一次Channel求值得到两路：
 
 ```python
 chOut, fbOut = channel.Process(

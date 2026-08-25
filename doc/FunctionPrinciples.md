@@ -201,7 +201,7 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `Channel.__init__`, `Channel.Width`, `Channel.SampleMode`, `Channel.FormatUnknownParameterError`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层；未知名称按字符串相似度对全部合法名称降序提示后报错，非法值显示允许集合、类型或区间；同时校验Tx I/Q、周期热运行模式/占空比/收敛条件、公共相位/噪声、PA前后耦合、反馈链参数、联合功率闭环、随机种子和公开位宽 | Channel §1、§5–§6、§10 |
+| `Channel.__init__`, `Channel.Width`, `Channel.SampleMode`, `Channel.FormatUnknownParameterError`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层；未知名称按字符串相似度对全部合法名称降序提示后报错，非法值显示允许集合、类型或区间；同时校验Tx I/Q、周期热运行模式/占空比/收敛条件、公共相位/噪声、PA前后耦合、反馈链参数、联合功率闭环、随机种子和公开位宽。SampleMode还决定公开Process第二项是chOut副本还是完整FB观测 | Channel §1、§5–§6、§10 |
 | `Channel.SetPaModel` | E | 绑定必须提供公开Process入口的PA对象，并在PA更换时清除私有功率校准状态 | Channel §1、§6 |
 | `Channel.ResolveCouplingPaths`, `Channel.HasPrePaCoupling` | P/E | 把每条源链到目的链的复增益、整数/分数时延和FIR规范为有限参数，并判断PA输入功率是否存在链间耦合依赖 | Channel §1.3、§5 |
 | `Channel.ApplyCouplingPath`, `Channel.ApplyMimoCoupling` | P/N | 对单条串扰路径依次执行FIR、分数时延、整数时延和复系数，再把所有间接路径与隐含单位直通路径线性叠加 | Channel §1.3 |
@@ -229,9 +229,9 @@ flowchart LR
 | `Channel.ApplyFeedbackAdc` | P/N | 对反馈接收机内部I/Q分量执行独立满量程限幅、舍入与有限位宽量化，再解码回内部浮点域 | Channel §4.5 |
 | `Channel.ApplyFeedbackAnalogImpairments` | P/E | 依次组合反馈增益/FIR、非线性/限幅、时频偏和I/Q/DC，保证可重复的物理处理顺序 | Channel §1.2、§4 |
 | `Channel.FeedbackDirectSmallSignalGain` | P/N | 返回反馈FIR直流和、反馈增益/相位及I/Q直通分量组成的小信号复增益；不把镜像、DC、噪声和量化当成确定性标量增益 | Channel §4、§4.6 |
-| `Channel.ApplyForwardChannelEffects`, `Channel.ApplyFeedbackChannelEffects`, `Channel.ApplyChannelEffects` | P/E | 主路执行公共相位与测量噪声，反馈路执行公共相位、完整FB模拟链、独立噪声与ADC；兼容入口仍按sampleMode选一路，公开Process则同时返回两路 | Channel §1–§4 |
+| `Channel.ApplyForwardChannelEffects`, `Channel.ApplyFeedbackChannelEffects`, `Channel.ApplyChannelEffects` | P/E | 主路从公共PA后节点执行公共相位与测量噪声；反馈路独立从同一无前向噪声节点执行公共相位、完整FB模拟链、独立噪声与ADC。兼容入口按sampleMode选一路；公开Process在forward时复制主路，在fb时执行反馈路 | Channel §1–§4 |
 | `Channel.ProcessPaOutput` | E/N | 把已有逐PA公开输出解码后先执行PA后耦合，再执行一次forward/fb采样链路并编码；功率闭环因此不包含接收噪声或PA后串扰 | Channel §1、§1.3、§6.2 |
-| `Channel.ProcessBoundPaThermalPeriodFloating`, `Channel.ProcessCoupledPaFloating`, `Channel.ProcessFloating`, `Channel.ProcessOutputPathsFloating`, `Channel.Process` | P/N/E | 内部周期入口先验证三个跨模块热参考面；公共核心只提交一次PA热周期和PA后耦合，再从同一状态分叉出chOut与fbOut。兼容浮点入口仍按sampleMode选一路；公开Process始终分别编码并返回两路 | Channel §1、§1.3–§1.5、§3.4、§6.1–§6.8、§10 |
+| `Channel.ProcessBoundPaThermalPeriodFloating`, `Channel.ProcessCoupledPaFloating`, `Channel.ProcessFloating`, `Channel.ProcessOutputPathsFloating`, `Channel.Process` | P/N/E | 内部周期入口先验证三个跨模块热参考面；公共核心只提交一次PA热周期和PA后耦合，并始终生成chOut。forward模式复制chOut为第二项，fb模式才从公共无前向噪声节点生成完整反馈观测；兼容浮点入口按sampleMode选一路，公开Process分别编码并返回二元组 | Channel §1、§1.3–§1.5、§3.4、§6.1–§6.8、§10 |
 | `Channel.SmallSignalGain` | P/N | forward模式返回已提交SISO模拟drive、Tx I/Q直接系数、PA小信号增益与公共相位之积；fb模式再乘反馈直通小信号系数；DC、镜像、噪声和量化不伪装成标量增益 | Channel §2、§4、§6.2、§6.5 |
 
 ### 4.2 `ChannelAnalyse.py`：MIMO通道测量

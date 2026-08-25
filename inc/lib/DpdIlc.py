@@ -332,9 +332,10 @@ def CalculateIterationMetrics(
         channelOutputSignal: Optional raw forward output from the same PA
             evaluation. When omitted, the measured signal is used for legacy
             single-output PA compatibility.
-        feedbackOutputSignal: Optional raw embedded-feedback output retained
-            for feedback-link diagnostics. When omitted, ``measuredOutput`` is
-            retained.
+        feedbackOutputSignal: Optional raw selected feedback observation. A
+            forward-mode Channel supplies a chOut copy, while feedback mode
+            supplies the embedded receiver output. When omitted,
+            ``measuredOutput`` is retained.
 
     Returns:
         result: Complete immutable diagnostics for one ILC iteration.

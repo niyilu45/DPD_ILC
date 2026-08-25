@@ -2,8 +2,9 @@
 
 The channel can apply transmitter I/Q imbalance, causal complex coupling paths
 before a multi-chain PA bank, and coupling after its nonlinear outputs. One PA
-evaluation then branches into a forward channel observation and a nonideal
-embedded-feedback observation. Public fixed-point boundaries use raw integer
+evaluation always produces a forward channel observation. Forward sampling
+copies it into the feedback return, while feedback sampling additionally
+evaluates the embedded receiver. Public fixed-point boundaries use raw integer
 I/Q codes while every physical operation remains floating point.
 """
 
@@ -205,14 +206,15 @@ class Channel:
 
     @property
     def SampleMode(self) -> str:
-        """Return the legacy single-output compatibility sample mode.
+        """Return the normalized feedback-observation sampling mode.
 
         Processing details:
             Algorithm: Strip surrounding whitespace, convert the configured
             name to lowercase, and return the validated canonical value so
-            live caller-owned mapping changes affect ``ProcessFloating``,
-            ``ProcessPaOutput``, and ``SmallSignalGain``. Public ``Process``
-            always returns both paths and does not discard either one.
+            live caller-owned mapping changes affect the next call. Forward
+            mode makes public ``fbOut`` an exact copy of ``chOut``; feedback
+            mode evaluates the embedded receiver for ``fbOut``. Compatibility
+            methods still return only the selected observation.
 
         Returns:
             result: ``"forward"`` for instrument sampling or ``"fb"`` for
@@ -2708,8 +2710,8 @@ class Channel:
         Processing details:
             Algorithm: Delegate to the explicit forward or feedback helper
             selected by ``sampleMode``. This compatibility entry remains
-            single-output; the public ``Process`` method now returns both
-            receiver paths independently of ``sampleMode``.
+            single-output. Public ``Process`` always returns two arrays, but
+            forward mode makes its feedback array equal to its channel array.
 
         Args:
             paOutputSignal: Normalized floating PA output samples.
@@ -3196,22 +3198,25 @@ class Channel:
 
         Processing details:
             Algorithm: Run the transmitter, coupled PA bank, and thermal
-            period exactly once. Split the common post-PA waveform into the
-            forward measurement path and the full embedded-feedback path.
-            Independent noise realizations are generated for the two receiver
-            branches, while their PA memory and temperature state are shared.
+            period exactly once, then evaluate the forward measurement path.
+            In forward mode return an independent copy of that same waveform
+            as ``fbOut``. In feedback mode additionally evaluate the complete
+            embedded receiver, with an independent noise realization, while
+            retaining the common PA memory and temperature state.
 
         Args:
             inputSignal: Normalized digital Tx input vector or matrix.
 
         Returns:
-            result: ``(chOut, fbOut)`` in normalized floating units. ``chOut``
-                is the forward measurement waveform and ``fbOut`` is the DPD
-                feedback waveform.
+            result: ``(chOut, fbOut)`` in normalized floating units. ``fbOut``
+                equals ``chOut`` in forward mode and contains the embedded-
+                feedback observation in feedback mode.
         """
 
         coupledPaOutput = self.ProcessCoupledPaFloating(inputSignal)
         channelOutput = self.ApplyForwardChannelEffects(coupledPaOutput)
+        if self.sampleMode == "forward":
+            return channelOutput, channelOutput.copy()
         feedbackOutput = self.ApplyFeedbackChannelEffects(coupledPaOutput)
         return channelOutput, feedbackOutput
 
@@ -3239,8 +3244,9 @@ class Channel:
             reference-temperature calibration; the first such call therefore
             requires an explicit target. The accepted waveform is then
             evaluated on the periodic steady-state temperature curve exactly
-            once and split into both receiver branches. DPD/ILC uses
-            ``fbOut``; final RF metrics use ``chOut``.
+            once. Forward mode copies ``chOut`` into ``fbOut``; feedback mode
+            evaluates the embedded receiver for ``fbOut``. DPD/ILC uses the
+            selected ``fbOut`` observation and final RF metrics use ``chOut``.
 
         Args:
             inputSignal: Public digital Tx vector or samples-by-chains matrix.

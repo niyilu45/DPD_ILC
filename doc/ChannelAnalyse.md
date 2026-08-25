@@ -1777,7 +1777,7 @@ result = RunChannelAnalysisBenchmark(
 
 关闭噪声和反馈非理想是为了控制变量，使修改前后的差异只来自通道测量和耦合感知补偿。
 
-实际启用反馈非理想时，耦合感知DPD的训练矩阵和MSE必须来自每次双输出plant调用的 `fbOut`，而不是用 `chOut` 绕过板载反馈链；最终EVM、SNR、ACLR、IRR、功率和残余耦合验收则使用同次 `chOut`。两路在PA后耦合之后才分叉，因此共享相同的跨通道耦合、PA记忆和热状态。这里的 `outputPowerDbm` 仍是PA后耦合前的逐PA干净物理输出目标，不是含FB耦合器增益和接收机失真的raw `fbOut` 表观功率。
+实际启用反馈非理想时，Channel必须显式设置 `sampleMode="fb"`，耦合感知DPD的训练矩阵和MSE再取每次双输出plant调用的 `fbOut`，而不是使用默认forward副本绕过板载反馈链；最终EVM、SNR、ACLR、IRR、功率和残余耦合验收则使用同次 `chOut`。两项共享相同的跨通道耦合、PA记忆和热状态，fb模式的第二项从无前向噪声的公共PA后节点进入反馈接收机。这里的 `outputPowerDbm` 仍是PA后耦合前的逐PA干净物理输出目标，不是含FB耦合器增益和接收机失真的raw `fbOut` 表观功率。
 
 ### 11.2 测试阶段
 
@@ -1993,15 +1993,15 @@ $\mathbf{H}_{d}$ 是直接通道矩阵，$\mathbf{H}_{i}$ 是镜像通道矩阵�
 
 ### 15.3 如何区分发射端 IQ 不平衡与反馈接收机 IQ 不平衡
 
-工程中应固定两个独立参考面：公开 `Channel.Process` 或内部 `ProcessOutputPathsFloating` 从同一次PA/热状态同时返回 `chOut` 与 `fbOut`。前者测量真实发射主路，后者还包含板载反馈接收机；对应Channel参数不能混用：
+工程中应固定两个独立参考面：公开 `Channel.Process` 或内部 `ProcessOutputPathsFloating` 从同一次PA/热状态同时返回 `chOut` 与 `fbOut`。前者测量真实发射主路；只有显式 `sampleMode="fb"` 时，后者才包含板载反馈接收机，默认forward模式下两项完全相同。对应Channel参数不能混用：
 
 | 物理模块 | Channel参数 | forward可见 | fb可见 | 是否允许DPD补偿 |
 |---|---|---:|---:|---|
 | Tx I/Q调制器 | `txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees`、`txDcOffset` | 是 | 是 | 可以，但需要增广模型 |
 | FB I/Q解调器 | `fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees`、`fbDcOffset` | 否 | 是 | 不应直接补偿，应先校准或去嵌入 |
 
-- 同次 `chOut` 和 `fbOut` 都看到相同镜像：优先怀疑Tx发射链。
-- 只有 `fbOut` 看到镜像：优先校准FB链，不能让DPD预补偿该测量误差。
+- 在fb模式下，同次 `chOut` 和 `fbOut` 都看到相同镜像：优先怀疑Tx发射链。
+- 在fb模式下，只有 `fbOut` 看到镜像：优先校准FB链，不能让DPD预补偿该测量误差。
 - IRR 随 PA 输出功率变化：可能是 PA 非线性与 IQ 支路的级联效应。
 - IRR 与输出功率无关但随频率变化：更像调制器、滤波器或接收机的频率选择性 IQ 失衡。
 - 更换独立接收机后镜像系数相位翻转或大幅变化：说明参考面尚未固定。

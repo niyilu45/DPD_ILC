@@ -2,11 +2,12 @@
 
 ## 1. 模块边界
 
-`inc/lib/Channel.py` 描述PA前多通道耦合、独立非线性PA、PA后耦合、外部仪表采样和板载反馈接收机。公开入口 `Channel.Process(...)` 固定返回二元组 `chOut, fbOut`：`chOut` 是前向主路测量，`fbOut` 是经过完整反馈接收链的DPD/ILC训练观测。两路由同一次PA计算、同一段记忆状态和同一个热周期分叉，不能通过分别调用PA来伪造。
+`inc/lib/Channel.py` 描述PA前多通道耦合、独立非线性PA、PA后耦合、外部仪表采样和板载反馈接收机。公开入口 `Channel.Process(...)` 固定返回二元组 `chOut, fbOut`：`chOut` 始终是前向主路测量；`sampleMode="forward"` 时 `fbOut` 是 `chOut` 的数值相同副本，`sampleMode="fb"` 时 `fbOut` 才是经过完整反馈接收链的DPD/ILC训练观测。两种模式都只运行一次PA、使用同一段记忆状态和同一个热周期，不能通过分别调用PA来伪造。
 
-`sampleMode` 不再决定公开 `Process` 返回哪一路；它只供 `ProcessFloating`、`ApplyChannelEffects`、`ProcessPaOutput`、`SmallSignalGain` 等兼容单输出接口选择旧行为。新代码应显式解包两路：
+`sampleMode` 不改变公开 `Process` 的二元组顺序，但会决定第二项怎样产生：默认 `"forward"` 复制第一项并完全绕过FB专用链；`"fb"` 才执行完整反馈接收机。`ProcessFloating`、`ApplyChannelEffects`、`ProcessPaOutput`、`SmallSignalGain` 等兼容单输出接口仍按它选择旧行为。需要反馈链训练的新代码应显式选择fb模式并解包两路：
 
 ```python
+channel.UpdateParameters(sampleMode="fb")
 chOut, fbOut = channel.Process(rawSignal, outputPowerDbm=20.0)
 trainingSignal = fbOut
 finalMetrics = resultAnalysis.Analyze(chOut)
@@ -36,19 +37,22 @@ flowchart LR
     restoreThermal --> thermalPeriod["正式热周期<br/>稳态固定点或瞬态推进"]
     thermalPeriod --> livePaOutput["数据窗PA输出<br/>窗后自动空闲只更新温度"]
     livePaOutput --> postCoupling["PA后耦合 Hpost(z)"]
-    postCoupling --> branch{"同一次PA/热周期后分叉"}
-    branch --> forwardPhase["主路公共固定相位"]
-    branch --> feedbackPhase["反馈路公共固定相位"]
+    postCoupling --> forwardPhase["主路公共固定相位"]
     forwardPhase --> instrument["前向仪表采样<br/>跳过fb专用非理想"]
+    instrument --> forwardNoise["AddNoise"]
+    forwardNoise --> receiver["chOut：最终RF指标"]
+    postCoupling --> sampleMode{"sampleMode：选择fbOut来源"}
+    sampleMode -->|forward| forwardCopy["数值相同副本<br/>完全绕过FB专用链"]
+    sampleMode -->|fb| feedbackPhase["反馈路公共固定相位"]
     feedbackPhase --> fbAnalog["板载反馈模拟链<br/>频响/增益/非线性/时频偏"]
+    receiver -. "forward副本来源" .-> forwardCopy
     fbAnalog --> fbIqEnable{"fbIqImbalanceEnabled"}
     fbIqEnable -->|True| fbIq["FB I/Q增益/相位/DC"]
     fbIqEnable -->|False| fbIqBypass["FB I/Q整级旁路"]
-    instrument --> forwardNoise["独立AddNoise"]
     fbIq --> feedbackNoise["独立AddNoise"]
     fbIqBypass --> feedbackNoise
     feedbackNoise --> adc["反馈ADC限幅与量化"]
-    forwardNoise --> receiver["chOut：最终RF指标"]
+    forwardCopy --> receiverFb
     adc --> receiverFb["fbOut：DPD/ILC同步与更新"]
 ```
 
@@ -56,15 +60,15 @@ flowchart LR
 
 - `txIqImbalanceEnabled=True` 时，`txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees` 和 `txDcOffset` 位于PA之前，属于真实发射链路；无论选择forward还是fb，它们都会改变PA激励和空口输出。设为 `False` 时，这三个数值即使非零也被整级旁路。
 - `chOut` 用校准仪表直接观测PA主路输出。所有 `fb...` 参数都不会进入该分支，因此不会把板载反馈接收机失真混入最终EVM、SNR、ACLR、IRR和功率，但Tx I/Q不平衡仍然存在。
-- `fbOut` 通过板载反馈接收链采样；该分支执行 `fbGainDb`、`fbFirTaps`、时延、CFO/SFO、反馈非线性、限幅和ADC量化。FB I/Q增益、相位与DC还要求独立开关 `fbIqImbalanceEnabled=True`。
+- `sampleMode="forward"` 时，`fbOut` 是已经加入前向噪声后的 `chOut` 数值副本；它不会重新产生噪声，也不会执行任何 `fb...` 模块。`sampleMode="fb"` 时，第二项才通过板载反馈接收链，执行 `fbGainDb`、`fbFirTaps`、时延、CFO/SFO、反馈非线性、限幅和ADC量化；FB I/Q增益、相位与DC还要求独立开关 `fbIqImbalanceEnabled=True`。
 - `prePaCouplingPaths` 在Tx I/Q调制器之后、PA非线性之前，把其他通道的延迟复泄漏叠加到每个PA输入；`postPaCouplingPaths` 在非线性之后混合各PA输出。两者都与forward/fb选择无关。
-- `Channel.Process(rawSignal, outputPowerDbm=...)` 是推荐入口。用户只提供任意初始幅度的原始波形和参考温度目标PA输出功率；Channel内部的 `PowerCalibration.Calibrate` 通过Channel热事务代理保存并暂停实际PA热状态，调整逐链总drive并反复观测参考温度的干净PA输出。正位宽模式不会用超量程数字码模拟更大驱动，而是在合法公开码解码后施加隐藏模拟drive。收敛后在 `finally` 中恢复原热状态，再用同一公开波形和已提交drive执行一次真实PA/热周期，然后从同一个PA后波形分出 `chOut` 与 `fbOut`，因此校准试探不发热，而两路返回波形都包含相同的温漂历史。
+- `Channel.Process(rawSignal, outputPowerDbm=...)` 是推荐入口。用户只提供任意初始幅度的原始波形和参考温度目标PA输出功率；Channel内部的 `PowerCalibration.Calibrate` 通过Channel热事务代理保存并暂停实际PA热状态，调整逐链总drive并反复观测参考温度的干净PA输出。正位宽模式不会用超量程数字码模拟更大驱动，而是在合法公开码解码后施加隐藏模拟drive。收敛后在 `finally` 中恢复原热状态，再用同一公开波形和已提交drive执行一次真实PA/热周期。随后始终生成 `chOut`，并按 `sampleMode` 复制它或产生完整 `fbOut`；因此校准试探不发热，而两项返回波形都对应同一次温漂历史。
 - 启用热模型且使用默认 `thermalRunMode="steady_state"` 时，每次 `Channel.Process` 都重做参考温度功率校准。首次必须显式给出 `outputPowerDbm`；成功后的后续调用可省略，Channel会复用最近成功目标并仍执行校准。未启用热模型或显式选择 `"transient"` 时，`Channel.Process(rawSignal)` 才是无功率校准的单周期PA→采样路径。
 - `Channel.ProcessPaOutput` 接收各PA已经产生但尚未经过输出耦合的矩阵，不再次运行PA，依次执行PA后耦合和 `sampleMode` 所选的兼容单输出采样路径。
 - 功率闭环由Channel私有持有的 `PowerCalibration` 完成。Channel的 `SuspendThermalModel` 与 `RestoreThermalModel` 只把统一事务代理到实际绑定PA；普通用户不需要构造、配置或调用校准器，也不需要手工开关温度。
 - 必须区分两种“校准”：PA功率设定闭环 `PowerCalibration` 仍观察PA后耦合前、所有接收非理想之前的干净物理PA输出，`outputPowerDbm` 绝不是原始 `fbOut` 的表观功率；DPD/ILC校准或训练则使用 `fbOut` 做同步、MSE和系数更新。最终RF验收只把同一轮的 `chOut` 交给 `Analysis`。
 - `maximumOutputPowerDbm` 是内置PA的额定输出上限和归一化功率参考，不是任意可移动的显示标尺。内置plant应覆盖不超过该上限的目标；默认 `25 dBm` 上限下，`20 dBm` 必须是可达工作点。
-- DPD/ILC把整个Channel作为plant时，内部适配器固定选择 `fbOut` 训练，并保留同一轮的 `chOut` 用于最终评价。`sampleMode` 只服务旧单输出调用，不应再用它切换新训练流程。
+- DPD/ILC把整个Channel作为plant时，内部适配器固定选择二元组第二项 `fbOut` 训练，并保留同一轮的 `chOut` 用于最终评价。需要板载反馈链时必须显式设置 `sampleMode="fb"`；`forward` 模式则明确表示用前向主路的相同副本训练。
 
 ### 1.1 `chOut`前向仪表采样
 
@@ -78,9 +82,17 @@ y_{\mathrm{PA}}(n)\exp(j\phi_c)+w(n).
 
 `fb...` 配置不会进入该公式。即使兼容参数 `sampleMode="fb"`，公开 `Process` 返回的第一个数组仍遵循这个主路方程。
 
-### 1.2 `fbOut`板载反馈采样
+### 1.2 `fbOut`训练观测
 
-反馈模式的内部顺序为：
+`sampleMode="forward"` 定义为：
+
+```math
+fbOut(n)=chOut(n).
+```
+
+这里是数值副本而不是再次计算前向链，因此两项逐样点完全一致，且所有FB增益、FIR、同步误差、I/Q、非线性、限幅和ADC参数均被绕过。
+
+`sampleMode="fb"` 时，反馈模式的内部顺序为：
 
 ```text
 PA output
@@ -115,7 +127,7 @@ H_{\mathrm{fb}}[y_{\mathrm{PA}}]
 \right\}.
 ```
 
-这条路径故意包含板载观察接收机的非理想。若直接用未经校准的 `fbOut` 更新ILC，算法可能学习PA与反馈链路的组合逆响应；因此同一次 `Process` 返回的 `chOut` 必须作为独立评价路径。
+这条路径故意包含板载观察接收机的非理想。若在 `sampleMode="fb"` 下直接用未经校准的 `fbOut` 更新ILC，算法可能学习PA与反馈链路的组合逆响应；因此同一次 `Process` 返回的 `chOut` 必须作为独立评价路径。若只想验证理想前向闭环，则保留默认 `forward`，此时训练观测就是 `chOut` 的相同副本。
 
 设同步和公共复增益补偿算子为 $S(\cdot)$，则第 $k$ 轮DPD/ILC训练误差使用：
 
@@ -655,7 +667,7 @@ r_y
 7. 仅在每个PA自身输出、PA后耦合之前测量有效区功率；公共移相、forward/fb接收链和白噪声都不进入校准误差。
 8. 未包围目标时使用有界dB比例更新，形成上下界后使用二分；存在PA前耦合且启用联合校准时使用有限差分Jacobian更新所有链。
 9. 全部链进入 `calibrationToleranceDb` 后才原子提交逐链模拟drive，并缓存公开输入、干净PA输出和成功metrics。
-10. `finally` 恢复校准前的完整热状态，再用已接受的公开输入与drive正式处理一次；这一次会推进温度，并在PA后耦合后同时产生带独立噪声的 `chOut` 与 `fbOut`。若校准期间活动配置已经关闭温度，恢复不会复活旧启用快照。
+10. `finally` 恢复校准前的完整热状态，再用已接受的公开输入与drive正式处理一次；这一次会推进温度并生成 `chOut`。`sampleMode="forward"` 直接复制该结果为 `fbOut`，`"fb"` 才从同一PA后节点执行带独立噪声的完整反馈链。若校准期间活动配置已经关闭温度，恢复不会复活旧启用快照。
 11. 若闭环失败，不提交候选drive；异常与失败metrics保留目标、历史最佳测量、误差、轮数和原因，供用户定位真实不可达或第三方接口限制。
 
 ## 2. 固定相位旋转
@@ -1023,7 +1035,7 @@ d_{\mathrm{tx}}.
 
 #### 4.4.3 FB I/Q解调器
 
-FB参数为 `fbIqImbalanceEnabled`、`fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees` 和 `fbDcOffset`。公开 `Process` 的 `fbOut` 在开关为True时应用它们；兼容单输出接口还要求 `sampleMode="fb"` 才能观察该分支：
+FB参数为 `fbIqImbalanceEnabled`、`fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees` 和 `fbDcOffset`。公开 `Process` 只有在 `sampleMode="fb"` 且开关为True时才对 `fbOut` 应用它们；兼容单输出接口同样要求 `sampleMode="fb"` 才能观察该分支：
 
 ```math
 v_{\mathrm{fb,iq}}(n)
@@ -1111,11 +1123,14 @@ flowchart LR
     pre --> pa["逐路PA电模型"]
     pa --> thermal["周期热调度<br/>thermalRunMode / thermalDutyCycle"]
     thermal --> post["PA后耦合<br/>postPaCouplingPaths"]
-    post --> branch{"同一PA/热状态分叉"}
-    branch --> forwardPhase["主路公共移相<br/>phaseDegrees"]
-    branch --> feedbackPhase["反馈路公共移相<br/>phaseDegrees"]
+    post --> forwardPhase["主路公共移相<br/>phaseDegrees"]
     forwardPhase --> forwardNoise["前向仪表与互斥噪声配置"]
+    forwardNoise --> channelOutput["chOut<br/>最终RF指标"]
+    post --> sampleMode{"sampleMode：选择fbOut来源"}
+    sampleMode -->|forward| forwardCopy["数值相同副本<br/>跳过全部FB模块"]
+    sampleMode -->|fb| feedbackPhase["反馈路公共移相<br/>phaseDegrees"]
     feedbackPhase --> fbLinear["FB增益/相位/FIR"]
+    channelOutput -. "forward副本来源" .-> forwardCopy
     fbLinear --> fbNonlinear["FB三阶非线性与限幅"]
     fbNonlinear --> fbSync["FB Delay/CFO/SFO"]
     fbSync --> fbIqEnable{"fbIqImbalanceEnabled"}
@@ -1124,7 +1139,7 @@ flowchart LR
     fbIq --> fbNoise["互斥噪声配置"]
     fbIqBypass --> fbNoise
     fbNoise --> fbAdc["FB ADC"]
-    forwardNoise --> channelOutput["chOut<br/>最终RF指标"]
+    forwardCopy --> feedbackOutput
     fbAdc --> feedbackOutput["fbOut<br/>DPD/ILC训练"]
 ```
 
@@ -1132,9 +1147,9 @@ flowchart LR
 
 - 主信号从左向右依次经过公开边界解码、已提交的逐链模拟drive、Tx I/Q调制器、PA前耦合、逐路PA、PA后耦合和公共固定移相。功率闭环负责寻找并提交drive，不是一个PA输出后的缩放模块。
 - Tx I/Q位于PA之前，因此启用时forward与fb都包含它；FB I/Q位于采样分支内部，启用时只改变fb观测。两个enabled开关分别旁路自己的完整增益/相位/DC模块，互不联动。
-- 公开 `Process` 总是同时构造两路：`chOut` 在公共移相后进入仪表前向支路，不经过任何 `fb...` 参数；`fbOut` 继续经过反馈增益/FIR、非线性/限幅、时延/CFO/SFO、I/Q不平衡/DC和反馈ADC。
-- `sampleMode` 只决定兼容单输出接口选取哪条支路，不影响 `Process` 二元组的顺序或含义。
-- 三种白噪声配置位于两个采样支路的末端，两路各生成自己的噪声实现，因此它们描述接收或采样噪声，而不是PA本身的非线性。
+- 公开 `Process` 总是先构造 `chOut`，它在公共移相后进入仪表前向支路，不经过任何 `fb...` 参数。`sampleMode="forward"` 把这个结果直接复制为 `fbOut`；`sampleMode="fb"` 才让第二项经过反馈增益/FIR、非线性/限幅、时延/CFO/SFO、I/Q不平衡/DC和反馈ADC。
+- `sampleMode` 不改变 `Process` 的二元组顺序，但决定第二项是前向副本还是板载反馈观测；兼容单输出接口仍返回对应选路。
+- 三种白噪声配置描述接收或采样噪声，而不是PA本身的非线性。`forward` 模式只生成一次前向噪声并复制结果；`fb` 模式在前向和反馈路径分别生成独立噪声实现。
 - `width` 只定义公开输入输出的整数码位宽；图中模拟drive及所有物理模块仍在内部浮点域计算。
 - `calibrationDigitalHeadroomDb` 只配置定点公开码的分量峰值余量；闭环自动把剩余总drive放在解码后的逐链模拟增益中。
 - 功率校准参数控制“如何寻找 PA 输入预设值”，不会改变 PA、耦合网络或反馈接收机的物理模型。
@@ -1249,7 +1264,7 @@ Channel(
 
 | 参数 | 默认值 | 单位 | 说明 |
 |---|---:|---|---|
-| `sampleMode` | `"forward"` | 无 | 仅供兼容单输出接口选择主路或反馈路；公开 `Process` 总是返回 `(chOut, fbOut)` |
+| `sampleMode` | `"forward"` | 无 | 公开 `Process` 始终返回 `(chOut, fbOut)`；`forward` 令第二项成为第一项的数值相同副本并绕过FB链，`fb` 令第二项经过完整反馈链。兼容单输出接口仍按该值选路 |
 | `sampleRateHz` | `1.0` | sample/s | CFO、SFO、分数时延和热时间换算使用的真实采样率 |
 | `phaseDegrees` | `0` | degree | PA输出后的公共移相，仅允许 `-90`、`0`、`90` |
 | `width` | `16` | bit/I或Q | `0`为浮点；正整数为公开边界有符号I/Q码位宽 |
@@ -1311,7 +1326,7 @@ Channel(
 
 ### 6.4 FB线性、同步与振荡器模块
 
-以下参数只作用于 `fbOut`。对于兼容单输出接口，只有 `sampleMode="fb"` 时才能在返回值中观察它们。
+以下参数只在 `sampleMode="fb"` 时作用于公开 `Process` 的 `fbOut`；`forward` 模式完全绕过它们。对于兼容单输出接口，同样只有 `sampleMode="fb"` 时才能在返回值中观察它们。
 
 | 参数 | 默认值 | 单位 | 说明 |
 |---|---:|---|---|
@@ -1336,7 +1351,7 @@ Channel(
 
 #### 6.5.1 FB I/Q参数的生效条件
 
-- 公开 `Process` 的 `fbOut` 在 `fbIqImbalanceEnabled=True` 时应用FB I/Q模块；兼容单输出入口还需要 `sampleMode="fb"` 才返回这一分支。
+- 公开 `Process` 仅在 `sampleMode="fb"` 且 `fbIqImbalanceEnabled=True` 时对 `fbOut` 应用FB I/Q模块；兼容单输出入口同样需要 `sampleMode="fb"` 才返回这一分支。
 - `fbIqImbalanceEnabled=False` 时，`ApplyFeedbackIqImbalance` 返回数值相同的复数副本；非零增益、相位和DC配置均不添加，其他FB模块不受影响。
 - `chOut` 会完整忽略四个FB I/Q参数，即使开关为True且误差值非零。
 - 当前开关和三个FB I/Q误差参数是所有反馈链共用的标量；它们不参与PA输出功率校准。
@@ -1354,7 +1369,7 @@ Channel(
 
 ### 6.7 接收噪声模块
 
-三种噪声强度参数互斥。公开 `Process` 在 `chOut` 与 `fbOut` 两个观测支路末端分别生成独立噪声；兼容单输出入口只返回 `sampleMode` 所选支路。
+三种噪声强度参数互斥。`sampleMode="forward"` 时公开 `Process` 只生成一次前向噪声，随后复制结果，因而 `chOut` 与 `fbOut` 逐样点相同；`sampleMode="fb"` 时前向与反馈观测支路末端分别生成独立噪声。兼容单输出入口只返回 `sampleMode` 所选支路。
 
 | 参数 | 默认值 | 单位 | 说明 |
 |---|---:|---|---|
@@ -1433,7 +1448,7 @@ channel = Channel(
 
 公共参数先决定整条链路的解释方式：
 
-- `sampleMode="forward"` 或 `"fb"` 只选择兼容单输出接口的返回参考面；它不是失真强度数值，也不改变公开 `Process` 同时执行并返回两条支路。
+- `sampleMode="forward"` 或 `"fb"` 不是失真强度数值。它既选择兼容单输出接口的返回参考面，也决定公开 `Process` 的第二项：前者复制 `chOut` 并跳过FB专用链，后者执行完整反馈链。
 - `sampleRateHz` 必须等于波形真实采样率。错误配置为真实值的两倍时，同一个 `fbCarrierFrequencyOffsetHz` 产生的逐样点相位会少一半，所有以样点表示的时延也会被错误解释成一半的物理时间。
 - 公共 `phaseDegrees` 使输出乘以 $\exp(j\theta)$；`90 degree` 对应乘以 $j$，`-90 degree` 对应乘以 $-j$，功率不变。默认 `0 degree` 最适合不需要外部移相器的场景。
 - 公开接口 `width=0` 适合算法浮点归因；`width=12...16` 适合验证定点边界，其中默认16 bit通常作为高精度定点起点。正位宽的归一化LSB为 $2^{-(W-1)}$，位宽每减少1 bit，量化步长翻倍。
@@ -1861,8 +1876,8 @@ stressFeedbackParameters = {
 
 | 方法 | 参数 | 返回值或作用 |
 |---|---|---|
-| `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 返回 `(chOut, fbOut)`；默认稳态热模式每次都校准后只提交一个稳态周期，再从同一PA后节点分叉。首次必须给目标，后续 `None` 复用最近成功目标 |
-| `ProcessOutputPathsFloating(inputSignal)` | 内部归一化浮点波形 | 从一次PA/热周期返回浮点 `(chOut, fbOut)`；供ILC适配器使用 |
+| `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 返回 `(chOut, fbOut)`；默认稳态热模式每次都校准后只提交一个稳态周期。`forward` 复制第一项，`fb` 执行完整反馈链；首次必须给目标，后续 `None` 复用最近成功目标 |
+| `ProcessOutputPathsFloating(inputSignal)` | 内部归一化浮点波形 | 从一次PA/热周期返回浮点 `(chOut, fbOut)`；`sampleMode` 决定第二项是前向副本还是反馈观测，供ILC适配器使用 |
 | `ProcessFloating(inputSignal)` | 内部归一化浮点波形 | 兼容单输出入口，按 `sampleMode` 返回一路；新代码不应用它代替双输出接口 |
 | `CalibratePaInput(inputSignal, outputPowerDbm)` | 原始波形、目标功率 | 高级诊断入口；调用内部 `PowerCalibration.Calibrate` 的统一热事务与闭环，返回定点解码与模拟drive之前的公开收敛波形，但不执行正式热态发射 |
 | `GetLastPaInput()` | 无 | 兼容名称；返回最近一次收敛的公开数字波形，位于定点解码、模拟drive和Tx I/Q之前 |
@@ -1914,9 +1929,10 @@ stressFeedbackParameters = {
 |---|---|---|
 | 同时取得主路和反馈观测 | `chOut, fbOut = Channel.Process(...)` | 内部无热功率闭环多次，恢复热状态后真实PA/热周期一次 |
 | 最终EVM/SNR/ACLR/IRR/功率 | 对 `chOut` 调用 `Analysis` | 与 `fb...` 非理想隔离 |
-| DPD/ILC同步、MSE和系数更新 | 使用 `fbOut` | 包含板载反馈链非理想 |
-| 兼容代码只取前向一路 | `sampleMode="forward"`配合单输出兼容接口 | 取决于具体兼容入口 |
-| 兼容代码只取反馈一路 | `sampleMode="fb"`配合单输出兼容接口 | 取决于具体兼容入口 |
+| 理想前向观测训练 | `sampleMode="forward"` 后使用 `fbOut` | `fbOut` 与 `chOut` 数值完全一致 |
+| 板载反馈DPD/ILC同步、MSE和系数更新 | 显式 `sampleMode="fb"` 后使用 `fbOut` | 包含板载反馈链非理想 |
+| 兼容代码只取前向一路 | `sampleMode="forward"` 配合单输出兼容接口 | 取决于具体兼容入口 |
+| 兼容代码只取反馈一路 | `sampleMode="fb"` 配合单输出兼容接口 | 取决于具体兼容入口 |
 | 原始波形和目标PA输出功率 | `Channel.Process(rawSignal, outputPowerDbm=20.0)` | `outputPowerDbm`按干净PA物理输出定义，不是raw FB表观功率 |
 | MIMO原始矩阵和逐链目标 | `Channel.Process(rawMatrix, outputPowerDbm=(22.0, 21.0))` | 有PA前耦合时无热联合闭环，随后各PA真实处理一次 |
 | 已有精确PA输入，不需要设定功率 | `Channel.Process(paInputSignal)` | 一次 |
@@ -2001,19 +2017,22 @@ chOut, fbOut = channel.Process(paInputSignal)
 flowchart LR
     publicInput["公开PA输入"] --> decode["解码到内部浮点"]
     decode --> pa["PA.ProcessFloating"]
-    pa --> branch{"同一PA输出分叉"}
-    branch --> forward["前向仪表采样<br/>跳过全部fb参数"]
-    branch --> feedback["完整FB链<br/>含FB ADC"]
+    pa --> forward["前向仪表采样<br/>跳过全部fb参数"]
     forward --> noise["AddNoise"]
     noise --> encodeCh["编码chOut"]
-    feedback --> encodeFb["编码fbOut"]
+    pa --> sampleMode{"sampleMode：选择fbOut来源"}
+    sampleMode -->|forward| copy["数值相同副本"]
+    sampleMode -->|fb| feedback["完整FB链 + 独立噪声<br/>含FB ADC"]
+    noise -. "forward副本来源" .-> copy
+    copy --> encodeFb["编码fbOut"]
+    feedback --> encodeFb
 ```
 
-图示说明：`width=0` 时解码和编码是等值复制；`width>0` 时两路公开I/Q都是整数码，但PA、移相和噪声仍在内部归一化浮点域计算。最终Analysis使用 `chOut`，而DPD/ILC使用 `fbOut`。
+图示说明：`width=0` 时解码和编码是等值复制；`width>0` 时两路公开I/Q都是整数码，但PA、移相和噪声仍在内部归一化浮点域计算。默认 `sampleMode="forward"` 时只生成一次前向波形并让两项逐样点相同；选择 `"fb"` 才构造第二条反馈链。最终Analysis使用 `chOut`，而DPD/ILC使用 `fbOut`。
 
 ### 7.3 前向仪表与板载反馈同时输出
 
-推荐用一个Channel的一次 `Process` 同时取得两路：`fbOut` 作为ILC训练观测，`chOut` 作为独立黄金参考和最终评价。这样两路严格共享同一PA记忆状态和热周期：
+推荐用一个Channel的一次 `Process` 同时取得两路，并显式设置 `sampleMode="fb"`：`fbOut` 作为板载反馈ILC训练观测，`chOut` 作为独立黄金参考和最终评价。这样两路严格共享同一PA记忆状态和热周期：
 
 ```python
 from inc.lib.Channel import Channel
@@ -2022,6 +2041,7 @@ from inc.lib.Channel import Channel
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "fb",
         "sampleRateHz": 160.0e6,
         "fbGainDb": -6.0,
         "fbPhaseDegrees": 18.0,
@@ -2051,18 +2071,18 @@ chOut, fbOut = channel.Process(paInputSignal)
 # Use fbOut for DPD training and chOut for final Analysis.
 ```
 
-`chOut` 用于最终EVM、SNR、ACLR、IRR和功率判断；`fbOut` 用于训练或验证反馈校准。不能只用未经校准的 `fbOut` 同时训练和评价DPD，否则容易得到“板载反馈EVM很好但主路仪表EVM变差”的虚假结论。
+`chOut` 用于最终EVM、SNR、ACLR、IRR和功率判断；显式 `sampleMode="fb"` 后得到的 `fbOut` 用于训练或验证反馈校准。不能只用未经校准的 `fbOut` 同时训练和评价DPD，否则容易得到“板载反馈EVM很好但主路仪表EVM变差”的虚假结论。
 
-只有兼容单输出调用才需要用 `sampleMode` 保留一套参数并切换：
+公开双输出调用也读取 `sampleMode`。若切回forward模式，第二项会同步变为第一项的数值副本；兼容单输出调用则继续只返回所选一路：
 
 ```python
-feedbackChannel.UpdateParameters(sampleMode="forward")
-forwardCaptureFromSameObject = feedbackChannel.ProcessPaOutput(
+channel.UpdateParameters(sampleMode="forward")
+forwardCaptureFromSameObject = channel.ProcessPaOutput(
     cleanPaOutput
 )
 ```
 
-forward模式会完整跳过所有 `fb...` 非理想，但公共 `phaseDegrees` 和三种互斥噪声控制仍然生效。
+forward模式会完整跳过所有 `fb...` 非理想，但公共 `phaseDegrees` 和三种互斥噪声控制仍然生效。对公开 `Process` 而言，这些公共效果只计算一次，随后复制，所以 `np.array_equal(chOut, fbOut)` 为True。
 
 ### 7.4 用户只提供原始波形与目标输出功率
 
@@ -2140,14 +2160,17 @@ flowchart TD
     decision -->|是| commit["提交模拟drive"]
     commit --> restore["恢复原结温与热时间"]
     restore --> livePa["同一公开波形和drive<br/>通过真实温度PA一次"]
-    livePa --> branch{"PA后耦合后分叉"}
-    branch --> forward["前向主路 + 独立噪声"]
-    branch --> feedback["完整FB链 + 独立噪声 + ADC"]
+    livePa --> forward["前向主路 + 接收噪声"]
     forward --> channelOutput["chOut：最终RF指标"]
-    feedback --> feedbackOutput["fbOut：DPD/ILC训练"]
+    livePa --> sampleMode{"sampleMode：选择fbOut来源"}
+    sampleMode -->|forward| copy["数值相同副本<br/>绕过FB链"]
+    sampleMode -->|fb| feedback["完整FB链 + 独立噪声 + ADC"]
+    channelOutput -. "forward副本来源" .-> copy
+    copy --> feedbackOutput["fbOut：DPD/ILC训练"]
+    feedback --> feedbackOutput
 ```
 
-图示说明：PA功率闭环在暂停热网络后运行参考温度PA，不是在PA输出后乘常数伪造功率。热事务由 `PowerCalibration.Calibrate` 统一管理，Channel只代理到实际PA；直接使用同一个校准器入口也具有相同保护。浮点模式在公开波形中承载总drive；定点模式先生成具有 `calibrationDigitalHeadroomDb` 余量的合法整数码，再在解码后调整隐藏模拟drive。有效区检测会排除前后补零和长静默。功率误差只由PA后耦合之前的无热参考PA输出决定；`outputPowerDbm=20.0` 表示这个干净物理PA参考面达到20 dBm，而不是要求含 `fbGainDb`、FB FIR、FB非线性、噪声和ADC的raw `fbOut` 显示20 dBm。进入容差后提交drive、恢复校准前的结温和累计时间，再用相同公开输入和drive执行一次真实温度PA/热周期并分出两路。`GetLastPaInput()`保存公开参考面，`GetLastActualPaInput()`保存模拟drive、Tx I/Q和PA前耦合之后的物理参考面。`GetLastPaOutput()` 与 `GetLastCalibrationMetrics()`保留无热参考闭环观测；本次真实热态功率由 `GetThermalMetrics()` 报告。DPD/ILC“校准”是另一件事：它只用 `fbOut` 做同步、MSE和更新。
+图示说明：PA功率闭环在暂停热网络后运行参考温度PA，不是在PA输出后乘常数伪造功率。热事务由 `PowerCalibration.Calibrate` 统一管理，Channel只代理到实际PA；直接使用同一个校准器入口也具有相同保护。浮点模式在公开波形中承载总drive；定点模式先生成具有 `calibrationDigitalHeadroomDb` 余量的合法整数码，再在解码后调整隐藏模拟drive。有效区检测会排除前后补零和长静默。功率误差只由PA后耦合之前的无热参考PA输出决定；`outputPowerDbm=20.0` 表示这个干净物理PA参考面达到20 dBm，而不是要求raw `fbOut` 显示20 dBm。进入容差后提交drive、恢复校准前的结温和累计时间，再用相同公开输入和drive执行一次真实温度PA/热周期：默认forward模式复制前向结果，fb模式才执行含 `fbGainDb`、FB FIR、FB非线性、噪声和ADC的接收链。`GetLastPaInput()`保存公开参考面，`GetLastActualPaInput()`保存模拟drive、Tx I/Q和PA前耦合之后的物理参考面。`GetLastPaOutput()` 与 `GetLastCalibrationMetrics()`保留无热参考闭环观测；本次真实热态功率由 `GetThermalMetrics()` 报告。DPD/ILC“校准”是另一件事：它只用二元组第二项做同步、MSE和更新，需要板载反馈时必须配置 `sampleMode="fb"`。
 
 ### 7.5 毫伏、dBm和SNR三种噪声配置
 
@@ -2464,6 +2487,7 @@ paModel = PaModel(modelName="gmp", width=0)
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "fb",
         "txIqImbalanceEnabled": True,
         "txIqGainImbalanceDb": 0.6,
         "txIqPhaseImbalanceDegrees": 2.0,
@@ -2522,6 +2546,7 @@ actualPaInput = channel.GetLastActualPaInput()
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "forward",
         "sampleRateHz": waveform.sampleRateHz,
         "phaseDegrees": 0,
         "noiseAmpMv": 10.0,
@@ -2540,7 +2565,7 @@ channel = Channel(
 1. 示例直接调用 `channel.Process(waveform.samples, outputPowerDbm=20.0)`；调用方不创建功率校准器。
 2. `Channel` 内部反复调整总drive，直到干净PA输出达到目标。定点模式公开码默认保留6 dB数字余量，剩余drive位于解码后的隐藏模拟级；随后再执行0度移相和10 mV接收噪声。
 3. `channel.GetLastPaInput()` 返回定点解码和模拟drive之前的收敛公开数字输入，可作为控制算法的数字参考；`GetLastTransmitterOutput()`返回模拟drive及Tx I/Q之后的调制器输出，`GetLastActualPaInput()`返回PA前耦合后真正进入PA的浮点波形。
-4. `RunFrequencyDomainIlc` 把 `Channel` 当作完整反馈链路。
+4. `RunFrequencyDomainIlc` 把 `Channel` 当作双输出plant，但该最小示例显式使用 `sampleMode="forward"`，所以训练用的 `fbOut` 与 `chOut` 完全一致；若要测试板载反馈非理想，应把该参数改为 `"fb"`。
 5. 最佳ILC输入再次通过同一个 `Channel.Process(..., outputPowerDbm=20.0)` 复测目标工作点。
 6. 输出字典同时保留Channel参数与内部PA功率闭环结果，避免把接收噪声功率误解为PA发射功率。
 
@@ -2695,15 +2720,19 @@ flowchart LR
     snapshot --> calibrate["暂停热影响<br/>参考温度功率闭环"]
     calibrate --> restore["恢复校准前热状态"]
     restore --> solve["稳态温度固定点"]
-    solve --> branch{"同一数据窗分叉"}
-    branch --> channelOutput["chOut：最终RF指标"]
-    branch --> feedbackOutput["fbOut：DPD/ILC训练"]
+    solve --> channelOutput["chOut：最终RF指标"]
+    solve --> sampleMode{"sampleMode：选择fbOut来源"}
+    sampleMode -->|forward| forwardCopy["数值相同副本"]
+    sampleMode -->|fb| feedbackChain["完整反馈链"]
+    channelOutput -. "forward副本来源" .-> forwardCopy
+    forwardCopy --> feedbackOutput["fbOut：DPD/ILC训练"]
+    feedbackChain --> feedbackOutput
     solve --> idle["自动外部空闲<br/>只更新热状态"]
 ```
 
 首次稳态热 `Process` 必须显式给出 `outputPowerDbm`。只有一次校准成功后，后续 `Process(rawSignal)` 才可以省略目标；此时不是跳过校准，而是复用最近成功的共同或逐链目标重做校准。未启用热模型或选择瞬态模式时，省略目标才会直接复用已提交drive做一次开环处理。
 
-`CalibratePaInput` 的多轮试探不推进热时间；`GetLastPaOutput()` 和 `GetLastCalibrationMetrics()` 属于参考温度校准面。公开返回的 `chOut`、`fbOut` 和 `GetThermalMetrics()` 属于同一个周期热态正式发射面，因而热态物理PA输出功率可以低于参考温度校准目标，这是温漂而不是校准失败。`fbOut` 的raw表观功率还会额外受FB增益、频响、非线性和量化影响，不能与 `outputPowerDbm` 直接比较。
+`CalibratePaInput` 的多轮试探不推进热时间；`GetLastPaOutput()` 和 `GetLastCalibrationMetrics()` 属于参考温度校准面。公开返回的 `chOut`、`fbOut` 和 `GetThermalMetrics()` 属于同一个周期热态正式发射面，因而热态物理PA输出功率可以低于参考温度校准目标，这是温漂而不是校准失败。只有 `sampleMode="fb"` 时，raw `fbOut` 表观功率才会额外受FB增益、频响、非线性和量化影响；无论哪种采样模式，功率设定闭环都不拿接收端输出与 `outputPowerDbm` 比较。
 
 ### 10.4 查询实际占空比
 

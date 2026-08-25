@@ -1707,7 +1707,7 @@ classDiagram
 
 **图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Rapp、Wiener、GMP或Doherty。Doherty的Carrier和Peaking又各自选择Wiener或GMP。`ThermalConfig.Recommended` 为static、single_rc和foster返回完整可运行的模型专用起点，`Validate` 继续负责物理边界校验。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口；它把公共周期作为原子热事务，任何一路处理或互热迭代失败都会恢复全部PA的周期前状态和旧metrics。`IQImbalancePA` 不只代理普通 `Process`，还透明代理周期热处理、热状态暂停/恢复、metrics、实际占空比、复位和额外空闲，因此用它包装热PA不会让Channel误判为无热模型。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
 
-需要区分实验室前向仪表与板载反馈接收机时，完整Channel会在同一次PA计算和同一个热周期后分叉，公开返回 `(chOut, fbOut)`。前者跳过反馈专用非理想，用于最终EVM、SNR、ACLR、IRR和功率评价；后者增加反馈FIR、时频偏、I/Q/DC、接收机非线性、限幅和ADC量化，用于DPD/ILC同步、MSE和更新。`sampleMode` 只供兼容单输出入口选路。反馈链参数属于观察接收机，不属于PA模型系数，不能写入Wiener或GMP来混合拟合。
+需要区分实验室前向仪表与板载反馈接收机时，完整Channel会在同一次PA计算和同一个热周期上公开返回 `(chOut, fbOut)`。前者始终跳过反馈专用非理想，用于最终EVM、SNR、ACLR、IRR和功率评价；默认 `sampleMode="forward"` 时后者只是前者的数值相同副本。显式设置 `sampleMode="fb"` 后，第二项才从公共PA后节点增加反馈FIR、时频偏、I/Q/DC、接收机非线性、限幅、独立噪声和ADC量化，用于板载反馈DPD/ILC同步、MSE和更新。兼容单输出入口仍按该参数选路。反馈链参数属于观察接收机，不属于PA模型系数，不能写入Wiener或GMP来混合拟合。
 
 ```python
 from inc.lib.PaModel import (

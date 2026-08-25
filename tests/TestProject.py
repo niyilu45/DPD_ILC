@@ -5517,6 +5517,7 @@ def CheckChannelIqEnableControls() -> None:
     # A feedback-only defect is invisible to forward instrument sampling but
     # visible to embedded feedback sampling. Disabling Tx must not disable FB.
     feedbackOnlyForwardChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
         parameters={
             **configuredIqParameters,
             "sampleMode": "forward",
@@ -5544,6 +5545,14 @@ def CheckChannelIqEnableControls() -> None:
         expectedFeedbackOutput,
     )
     assert not np.allclose(expectedFeedbackOutput, testSignal)
+    (
+        feedbackOnlyForwardOutput,
+        feedbackOnlyForwardReturnedFeedback,
+    ) = feedbackOnlyForwardChannel.Process(testSignal)
+    assert np.array_equal(
+        feedbackOnlyForwardReturnedFeedback,
+        feedbackOnlyForwardOutput,
+    )
 
     # Conversely, a Tx-only defect drives the PA in both sample modes. An
     # independently disabled FB stage makes the two observations identical.
@@ -5785,6 +5794,7 @@ def CheckChannelDualOutputContract() -> None:
         np.zeros(64, dtype=np.complex128),
     ]
     commonChannelParameters = {
+        "sampleMode": "fb",
         "maximumOutputPowerDbm": 25.0,
         "calibrationToleranceDb": 0.05,
         "width": 0,
@@ -5821,6 +5831,12 @@ def CheckChannelDualOutputContract() -> None:
     assert np.allclose(idealOutput, idealFeedbackOutput)
     assert np.allclose(impairedOutput, idealOutput)
     assert not np.allclose(impairedFeedbackOutput, impairedOutput)
+    assert np.allclose(
+        impairedFeedbackOutput,
+        impairedFeedbackChannel.ApplyFeedbackChannelEffects(
+            impairedFeedbackChannel.GetLastPaOutput()
+        ),
+    )
     assert abs(
         idealCalibrationMetrics["measuredOutputPowerDbmPerChain"][0]
         - 17.0
@@ -5835,6 +5851,40 @@ def CheckChannelDualOutputContract() -> None:
         impairedCalibrationMetrics["analogDriveDbPerChain"],
         idealCalibrationMetrics["analogDriveDbPerChain"],
     )
+
+    # Forward sampling intentionally does not expose the embedded receiver.
+    # Even with every feedback-only impairment enabled and a nonzero noise
+    # request, fbOut must be an exact sample-for-sample copy of chOut. Using
+    # array_equal also catches accidental independent noise generation.
+    forwardModeChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            "sampleMode": "forward",
+            "sampleRateHz": 20.0e6,
+            "maximumOutputPowerDbm": 25.0,
+            "fbGainDb": 7.0,
+            "fbPhaseDegrees": -43.0,
+            "fbFirTaps": (1.0 + 0.0j, -0.21 + 0.13j),
+            "fbIntegerDelaySamples": 3,
+            "fbFractionalDelaySamples": 0.2,
+            "fbCarrierFrequencyOffsetHz": 2500.0,
+            "fbSamplingFrequencyOffsetPpm": -35.0,
+            "fbIqGainImbalanceDb": 2.5,
+            "fbIqPhaseImbalanceDegrees": 9.0,
+            "fbDcOffset": 0.04 - 0.03j,
+            "fbThirdOrderCoefficient": -0.12 + 0.03j,
+            "fbClipAmplitude": 0.45,
+            "fbAdcWidth": 8,
+            "fbAdcFullScale": 0.55,
+            "noiseSnrDb": 34.0,
+            "randomSeed": 817,
+            "width": 0,
+        },
+    )
+    forwardModeOutput, forwardModeFeedbackOutput = (
+        forwardModeChannel.Process(calibrationSignal)
+    )
+    assert np.array_equal(forwardModeFeedbackOutput, forwardModeOutput)
 
     # Splitting the common post-PA waveform must not evaluate or heat the PA
     # twice. The elapsed time therefore advances by exactly N / Fs seconds.
@@ -5854,6 +5904,7 @@ def CheckChannelDualOutputContract() -> None:
     thermalChannel = Channel(
         paModel=thermalPa,
         parameters={
+            "sampleMode": "fb",
             "sampleRateHz": thermalSampleRateHz,
             "thermalRunMode": "transient",
             "fbGainDb": -3.0,
@@ -5871,6 +5922,7 @@ def CheckChannelDualOutputContract() -> None:
     )
     assert thermalOutput.shape == thermalInput.shape
     assert thermalFeedbackOutput.shape == thermalInput.shape
+    assert not np.allclose(thermalFeedbackOutput, thermalOutput)
     assert np.isclose(
         elapsedTimeAfterSec - elapsedTimeBeforeSec,
         thermalInput.size / thermalSampleRateHz,
@@ -5888,6 +5940,7 @@ def CheckChannelDualOutputContract() -> None:
     fixedChannel = Channel(
         paModel=PaModel(modelName="wiener", width=16),
         parameters={
+            "sampleMode": "fb",
             "fbGainDb": -2.0,
             "fbPhaseDegrees": -17.0,
             "width": 16,
@@ -5900,6 +5953,55 @@ def CheckChannelDualOutputContract() -> None:
         assert np.array_equal(publicOutput.real, np.rint(publicOutput.real))
         assert np.array_equal(publicOutput.imag, np.rint(publicOutput.imag))
     assert not np.array_equal(fixedFeedbackOutput, fixedOutput)
+
+    # Repeat the forward-copy contract at the public fixed-point MIMO
+    # boundary. The severe feedback settings and receiver noise are ignored in
+    # this mode, while both returned matrices retain integer-valued I/Q codes.
+    fixedMimoInput = np.column_stack(
+        (
+            fixedInput,
+            fixedFormat.EncodeComplex(
+                np.asarray(
+                    (-0.14 + 0.23j, 0.09 - 0.27j, 0.31 + 0.02j),
+                    dtype=np.complex128,
+                )
+            ),
+        )
+    )
+    fixedMimoForwardChannel = Channel(
+        paModel=MimoPaModel(
+            parameters={"numTransmitChains": 2, "width": 0}
+        ),
+        parameters={
+            "sampleMode": "forward",
+            "sampleRateHz": 20.0e6,
+            "maximumOutputPowerDbm": 25.0,
+            "fbGainDb": -9.0,
+            "fbPhaseDegrees": 71.0,
+            "fbFirTaps": (1.0 + 0.0j, 0.18j),
+            "fbIntegerDelaySamples": 1,
+            "fbIqGainImbalanceDb": -3.0,
+            "fbIqPhaseImbalanceDegrees": 12.0,
+            "fbThirdOrderCoefficient": 0.15 - 0.04j,
+            "fbAdcWidth": 7,
+            "fbAdcFullScale": 0.7,
+            "noiseAmpMv": 10.0,
+            "randomSeed": 823,
+            "width": 16,
+        },
+    )
+    fixedMimoOutput, fixedMimoFeedbackOutput = (
+        fixedMimoForwardChannel.Process(fixedMimoInput)
+    )
+    assert fixedMimoOutput.shape == fixedMimoInput.shape
+    assert fixedMimoOutput.dtype == np.complex128
+    assert np.array_equal(fixedMimoFeedbackOutput, fixedMimoOutput)
+    assert np.array_equal(
+        fixedMimoOutput.real, np.rint(fixedMimoOutput.real)
+    )
+    assert np.array_equal(
+        fixedMimoOutput.imag, np.rint(fixedMimoOutput.imag)
+    )
 
     class SyntheticDualOutputPlant:
         """Expose a perfect forward observation and nonlinear feedback."""
@@ -5921,6 +6023,7 @@ def CheckChannelDualOutputContract() -> None:
             self.channelReference = np.asarray(
                 channelReference, dtype=np.complex128
             ).copy()
+            self.sampleMode = "fb"
             self.width = 0
 
         def ProcessOutputPathsFloating(
@@ -6198,7 +6301,7 @@ def CheckChannelModel() -> None:
         txChannelOutput,
         expectedForwardOutput,
     )
-    assert not np.allclose(txFeedbackOutput, txChannelOutput)
+    assert np.array_equal(txFeedbackOutput, txChannelOutput)
     assert np.allclose(
         txIqChannel.GetLastTransmitterOutput(), expectedTxOutput
     )

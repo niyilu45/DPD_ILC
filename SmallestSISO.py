@@ -92,11 +92,14 @@ def RunSisoMode(
     # The caller supplies only the arbitrary raw waveform and requested PA
     # output power. Channel owns the complete hidden closed loop: it changes
     # PA input drive, measures clean PA output, converges to the target, and
-    # applies receiver phase/noise once after calibration has completed.
+    # applies the forward receiver phase/noise once after calibration. Because
+    # sampleMode is forward, fbOut is an exact copy of chOut in this example.
     baselineOutput, baselineFeedbackOutput = channel.Process(
         waveform.samples,
         outputPowerDbm=paOutputPowerDbm,
     )
+    if not np.array_equal(baselineOutput, baselineFeedbackOutput):
+        raise RuntimeError("forward sample mode must return identical outputs")
     referenceSignal = channel.GetLastPaInput()
     baselineCalibrationMetrics = (
         channel.GetLastCalibrationMetrics()
@@ -123,10 +126,10 @@ def RunSisoMode(
         maxAmplitude=2.0,
         randomSeed=1019,
     )
-    # Channel exposes both receiver branches to ILC. The learning residual and
-    # coefficient update use fbOut after the embedded feedback impairments,
-    # while each stored iteration keeps the parallel chOut for independent
-    # EVM and ACLR evaluation.
+    # Channel exposes both receiver outputs to ILC. The learning residual and
+    # coefficient update always use fbOut; in this forward-mode example it is
+    # the exact chOut copy. Selecting sampleMode="fb" would instead route the
+    # embedded feedback impairments into the learning observation.
     ilcResult = RunFrequencyDomainIlc(
         referenceSignal,
         channel,
@@ -144,6 +147,8 @@ def RunSisoMode(
         ilcAnalysisResult.bestInputSignal,
         outputPowerDbm=paOutputPowerDbm,
     )
+    if not np.array_equal(selectedIlcOutput, selectedFeedbackOutput):
+        raise RuntimeError("forward sample mode must return identical outputs")
     selectedCalibrationMetrics = (
         channel.GetLastCalibrationMetrics()
     )
@@ -152,8 +157,6 @@ def RunSisoMode(
         {
             "PA + channel baseline": baselineOutput,
             "Frequency-domain ILC + channel": selectedIlcOutput,
-            "PA + feedback baseline": baselineFeedbackOutput,
-            "Frequency-domain ILC feedback": selectedFeedbackOutput,
         }
     )
     resultAnalysis.PrintConvergence(

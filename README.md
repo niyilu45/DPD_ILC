@@ -156,6 +156,7 @@ paModel = PaModel(
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "fb",
         "sampleRateHz": 80.0e6,
         "noiseAmpMv": 10.0,
         "width": 16,
@@ -183,7 +184,7 @@ resultAnalysis = Analysis(
 python SmallestSISO.py
 ```
 
-浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序固定运行4轮ILC，使这个确定性最小场景中的两种模式都在局部稳定区同时改善EVM与ACLR，最后打印最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本直接调用 `chOut, fbOut = Channel.Process(waveform.samples, outputPowerDbm=20.0)`；Channel内部按有效Wi-Fi突发区间把干净PA物理输出闭环标定到20 dBm，再从同一次PA/热周期分出带0度公共移相和10 mV复包络总RMS白噪声的前向主路 `chOut` 与完整反馈链 `fbOut`。ILC同步、MSE和更新使用 `fbOut`，最终EVM/SNR/ACLR/IRR/功率使用 `chOut`；接收噪声不进入PA功率设定闭环。前后补零或长占空比静默不进入功率RMS。
+浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序固定运行4轮ILC，使这个确定性最小场景中的两种模式都在局部稳定区同时改善EVM与ACLR，最后打印最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本直接调用 `chOut, fbOut = Channel.Process(waveform.samples, outputPowerDbm=20.0)`；Channel内部按有效Wi-Fi突发区间把干净PA物理输出闭环标定到20 dBm，再执行一次带0度公共移相和10 mV复包络总RMS白噪声的前向主路。这个最小示例显式选择 `sampleMode="forward"`，所以 `fbOut` 是 `chOut` 的数值相同副本，完全绕过FB专用链；ILC同步、MSE和更新使用这个副本，最终EVM/SNR/ACLR/IRR/功率使用 `chOut`。需要研究板载反馈非理想时应改为 `sampleMode="fb"`，此时第二项才经过完整反馈链。接收噪声不进入PA功率设定闭环，前后补零或长占空比静默不进入功率RMS。
 脚本还打印两种波形的峰值以及 `waveformMinimumI/MaximumI/MinimumQ/MaximumQ`。定点版本的 I/Q 字段是公开码值，因此16位分量会位于 `-32768…32767`，并不是小于1的归一化数；复数幅度 `waveformPeakAmplitude` 最多可接近 $\sqrt{2}\,32768$。
 
 ## 工程工作流程图
@@ -217,17 +218,20 @@ flowchart TD
     restoreThermal --> thermalPeriod["正式周期热调度<br/>默认解周期稳态"]
     thermalPeriod --> livePaOutput["数据窗内部空闲可冷却<br/>窗后自动追加外部空闲"]
     livePaOutput --> postCoupling["PA后 Hpost(z)：混合非线性输出"]
-    postCoupling --> branch{"同一次PA/热周期后分叉"}
-    branch --> forwardCapture["chOut：前向仪表采样<br/>跳过fb专用非理想"]
-    branch --> feedbackCapture["fbOut：板载反馈模拟链<br/>频响/非线性/时频偏"]
+    postCoupling --> forwardCapture["前向仪表采样<br/>跳过fb专用非理想"]
+    forwardCapture --> forwardNoise["前向物理白噪声"]
+    forwardNoise --> channelOutput["chOut：最终RF指标"]
+    postCoupling --> sampleMode{"sampleMode：选择fbOut来源"}
+    sampleMode -->|forward| forwardCopy["数值相同副本<br/>完全绕过FB专用链"]
+    sampleMode -->|fb| feedbackCapture["板载反馈模拟链<br/>频响/非线性/时频偏"]
+    channelOutput -. "forward副本来源" .-> forwardCopy
     feedbackCapture --> fbIqEnable{"fbIqImbalanceEnabled"}
     fbIqEnable -->|True| fbIqStage["FB I/Q增益/相位/DC"]
     fbIqEnable -->|False| fbIqBypass["原样旁路FB增益/相位/DC"]
-    forwardCapture --> forwardNoise["前向物理白噪声"]
     fbIqStage --> feedbackNoise["反馈物理白噪声"]
     fbIqBypass --> feedbackNoise
     feedbackNoise --> feedbackAdc["FB ADC"]
-    forwardNoise --> channelOutput["chOut：最终RF指标"]
+    forwardCopy --> feedbackOutput
     feedbackAdc --> feedbackOutput["fbOut：DPD/ILC训练"]
 
     start --> frequencyIlc["SISO 或逐 PA RunMimoFrequencyDomainIlc"]
@@ -292,10 +296,10 @@ flowchart TD
 1. `main.py` 首先读取帧格式、带宽、MCS、PA 类型、驱动电平和 ILC 参数，只把调用方明确指定的覆盖值传给 `WaveGenWifi`、`PaModel`、`Analysis` 和 `Draw`；需要接收链路影响时再构造 `Channel`。每个类在自己的构造函数内部定义不可变默认参数，并建立 `ChainMap`，因此调用处不需要导入、复制或显式拼接默认参数。
 2. 调用 `WaveGenWifi.Generate()` 后，每条空间流拥有独立随机 QAM 与导频；空间映射矩阵 `Q` 把空间流映射到物理发射链，并叠加每链循环移位分集（CSD）。SISO 返回向量，MIMO 返回形状为 `samples × numTransmitAntennas` 的矩阵。
 3. 普通用户只调用 `Channel.Process(rawSignal, outputPowerDbm=...)`。Channel先用 `ValidateThermalReferencePlanes` 保证自身 `sampleRateHz`、`maximumOutputPowerDbm`、`activePowerThresholdDb` 分别等于每路启用热PA的 `sampleRateHz`、`referenceOutputPowerDbm`、`activePowerThresholdDb`；随后 `PowerCalibration.Calibrate` 通过Channel的热事务代理保存并暂停PA热状态，在 `finally` 中恢复。定点模式把保留数字余量的公开码解码后，通过隐藏逐链模拟驱动、Tx I/Q调制器和PA前耦合送入不同PA，并对各PA自身输出计算参考温度有效突发功率。没有PA前耦合时使用逐链闭环；存在耦合时自动用有限差分功率Jacobian联合更新全部模拟驱动。收敛后Channel再按 `thermalRunMode` 执行一个正式周期：默认 `"steady_state"` 先解出周期首尾温度一致的轨迹，`"transient"` 则从当前温度因果推进一周期。数据窗内静默样点与由 `thermalDutyCycle` 自动生成的窗外空闲都以空闲耗散功率冷却，不向返回数组追加零。校准试探不发热，只提交的正式周期推进物理时间。`ThermalConfig.enabled=False` 是硬关闭，会清除热网络、旧热metrics和互热offset，并旁路温度电参数漂移。MIMO正式周期是原子事务，任一路失败会回滚全部PA热状态和旧metrics。`GetActualDutyCycle` 和 `GetThermalMetrics` 分别查询实际RF占空比和完整温度轨迹。
-4. `Channel.Process` 固定返回 `(chOut, fbOut)`。两路共享一次PA记忆和热周期：`chOut` 是跳过全部 `fb...` 参数的VSA前向主路；`fbOut` 包含反馈增益/FIR、时延、CFO/SFO、I/Q不平衡、DC、三阶失真、限幅和ADC。`sampleMode` 只为兼容单输出接口保留。
-5. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR；它用 `fbOut` 做同步、MSE和更新，同时把同轮 `chOut` 保存到历史，供 `Analysis.AnalyzeIlcHistory` 计算最终参考面的RF指标。现有 `RunMimoFrequencyDomainIlc` 是逐PA独立算法，只适用于关闭或忽略跨通道耦合；启用PA前/后耦合后的联合补偿需要完整矩阵频响或Jacobian的MIMO ILC，文档不会把逐链结果误写成联合补偿结果。
-5. `Analysis` 使用三条互相独立的路径。显式参考模式直接保存 `referenceSignal` 与 `WifiWaveform`；发送波形辅助模式对NumPy数组或 `WifiWaveform.samples` 做互相关，直接截取公共区间，绝不解析Descriptor、恢复seed或重新生成参考；只有盲分析模式才调用 `ParseWifi` 恢复包起点、格式、MCS、FFT/GI、空间结构和参考样值。三条路径之后共用 `SigProc`；具备Wi-Fi元数据时再用 `FrameProcess` 计算严格子载波EVM。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
-6. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
+4. `Channel.Process` 固定返回 `(chOut, fbOut)`。`chOut` 始终是跳过全部 `fb...` 参数的VSA前向主路；默认 `sampleMode="forward"` 时，`fbOut` 是 `chOut` 的数值相同副本且完全不执行FB专用链。显式选择 `sampleMode="fb"` 时，两路共享一次PA记忆和热周期，第二项再经过反馈增益/FIR、时延、CFO/SFO、I/Q不平衡、DC、三阶失真、限幅和ADC。
+5. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR；它固定用二元组第二项 `fbOut` 做同步、MSE和更新，同时把同轮 `chOut` 保存到历史，供 `Analysis.AnalyzeIlcHistory` 计算最终参考面的RF指标。因此需要板载反馈链训练的Channel必须显式配置 `sampleMode="fb"`；`forward` 模式表示用前向主路的相同副本训练。现有 `RunMimoFrequencyDomainIlc` 是逐PA独立算法，只适用于关闭或忽略跨通道耦合；启用PA前/后耦合后的联合补偿需要完整矩阵频响或Jacobian的MIMO ILC，文档不会把逐链结果误写成联合补偿结果。
+6. `Analysis` 使用三条互相独立的路径。显式参考模式直接保存 `referenceSignal` 与 `WifiWaveform`；发送波形辅助模式对NumPy数组或 `WifiWaveform.samples` 做互相关，直接截取公共区间，绝不解析Descriptor、恢复seed或重新生成参考；只有盲分析模式才调用 `ParseWifi` 恢复包起点、格式、MCS、FFT/GI、空间结构和参考样值。三条路径之后共用 `SigProc`；具备Wi-Fi元数据时再用 `FrameProcess` 计算严格子载波EVM。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
+7. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
 
 图中从“生成独立验证 VHT/HE/EHT 帧”开始的支路专门验证部署模型的泛化能力；它使用相同格式配置和不同随机种子的载荷，不与 ILC 训练帧重复。
 
@@ -640,9 +644,11 @@ flowchart TD
     liveTx --> livePa["ProcessBoundPaThermalPeriodFloating<br/>稳态或瞬态正式周期"]
     livePa --> duty["窗内静默冷却 + 自动窗外空闲<br/>GetActualDutyCycle"]
     duty --> post["PA后耦合 Hpost(z)"]
-    post --> branch{"同一次PA/热周期后分叉"}
-    branch --> forwardNoise["chOut：前向仪表 + AddNoise<br/>忽略fb专用参数"]
-    branch --> fbLinear["fbOut：FB增益/相位/FIR"]
+    post --> forwardNoise["前向仪表 + AddNoise<br/>忽略fb专用参数"]
+    post --> sampleMode{"sampleMode：选择fbOut来源"}
+    sampleMode -->|forward| forwardCopy["复制前向结果<br/>完全绕过FB专用链"]
+    sampleMode -->|fb| fbLinear["FB增益/相位/FIR"]
+    forwardNoise -. "forward副本来源" .-> forwardCopy
     fbLinear --> fbNonlinear["FB三阶非线性/限幅"]
     fbNonlinear --> fbSync["FB时延/CFO/SFO"]
     fbSync --> fbIqEnable{"fbIqImbalanceEnabled"}
@@ -652,6 +658,7 @@ flowchart TD
     fbIqBypass --> fbNoise
     fbNoise --> fbAdc["FB ADC"]
     forwardNoise --> encodeCh["FixedPoint公开边界编码"]
+    forwardCopy --> encodeFb
     fbAdc --> encodeFb["FixedPoint公开边界编码"]
     encodeCh --> channelOutput["chOut：最终RF指标"]
     encodeFb --> feedbackOutput["fbOut：DPD/ILC训练"]
@@ -661,9 +668,9 @@ flowchart TD
 
 **图示说明：**
 
-- 推荐调用 `chOut, fbOut = Process(rawSignal, outputPowerDbm=20.0)`。用户只给原始波形和参考温度目标输出功率；`PowerCalibration.Calibrate` 通过Channel代理暂停热状态并完成干净PA物理输出功率闭环，异常路径也在 `finally` 中恢复。定点模式先产生保留 `calibrationDigitalHeadroomDb` 数字余量的合法公开码，解码后再调节隐藏的逐链模拟驱动，随后依次经过Tx I/Q、PA前耦合和PA。存在PA前串扰时，功率Jacobian联合调整各路模拟驱动。恢复热状态后，Channel只提交一个完整物理周期，再从同一个PA后节点分叉；两路数据形状不变，而调度空闲仅更新热状态。
+- 推荐调用 `chOut, fbOut = Process(rawSignal, outputPowerDbm=20.0)`。用户只给原始波形和参考温度目标输出功率；`PowerCalibration.Calibrate` 通过Channel代理暂停热状态并完成干净PA物理输出功率闭环，异常路径也在 `finally` 中恢复。定点模式先产生保留 `calibrationDigitalHeadroomDb` 数字余量的合法公开码，解码后再调节隐藏的逐链模拟驱动，随后依次经过Tx I/Q、PA前耦合和PA。存在PA前串扰时，功率Jacobian联合调整各路模拟驱动。恢复热状态后，Channel只提交一个完整物理周期并生成前向主路；`sampleMode` 决定第二项复制主路还是从同一个无前向噪声的PA后节点进入FB链。两项数据形状不变，而调度空闲仅更新热状态。
 - 启用热模型且使用默认 `thermalRunMode="steady_state"` 时，每次 `Process` 都重做参考温度功率校准：首次必须显式给出 `outputPowerDbm`，后续省略时复用最近一次成功目标。只有未启用热模型或显式选择 `thermalRunMode="transient"` 时，`Process(rawSignal)` 才保留不校准功率的单周期链路。`ProcessPaOutput` 用于已有PA输出，不会再次运行PA。
-- `chOut` 模拟前向VSA/仪表采样并忽略全部 `fb...` 配置；`fbOut` 模拟板载反馈接收机并依次加入反馈频响、时频偏、I/Q与DC误差、接收机非线性、限幅和ADC量化。`sampleMode` 只供兼容单输出接口选路。
+- `chOut` 始终模拟前向VSA/仪表采样并忽略全部 `fb...` 配置。`sampleMode="forward"` 时 `fbOut` 是 `chOut` 的数值相同副本，复用同一噪声实现并完全绕过FB专用链；`sampleMode="fb"` 时 `fbOut` 才依次加入反馈频响、时频偏、I/Q与DC误差、接收机非线性、限幅、独立接收噪声和ADC量化。兼容单输出接口仍按 `sampleMode` 选择一路。
 - `prePaCouplingPaths` 和 `postPaCouplingPaths` 使用逐方向路径配置，每条路径具有独立增益、相位、复FIR、整数和分数时延；0到1与1到0无需对称。
 - `noiseAmpMv` 定义复包络总RMS毫伏数；`noisePwrDbm` 定义端口噪声功率；`noiseSnrDb` 定义每路有效突发信号功率与复噪声功率之比。三者默认都是 `None`，只能选择一个非 `None` 控制量。
 - 相位只允许 `-90`、`0`、`90` 度，默认0度不旋转。圆对称复噪声的I/Q分量各承担总方差的一半。
@@ -1298,7 +1305,7 @@ calibrationMetrics = channel.GetLastCalibrationMetrics()
 
 三个输入参考面不能混用：`digitalTxInputWaveform` 是隐藏模拟驱动之前的公开数字波形；`txModulatorOutput` 已经过隐藏模拟驱动和Tx I/Q，但尚未经过PA前耦合；`actualPaInputWaveform` 还包含PA前耦合，是实际进入各路PA模型的浮点复包络。定点模式下即使前者的公开码保持不变，后两者也会随闭环提交的 `analogDriveDbPerChain` 改变。
 
-MIMO独立功率直接调用 `chOut, fbOut = channel.Process(inputWaveform, outputPowerDbm=(22.0, 21.0, 20.0, 19.0))`。只有开发新的PA测量适配器或单独调试功率检测器时，才需要直接使用底层的 `PowerCalibration.Calibrate(inputSignal)`；这个直接入口同样自动保护热状态。启用温度模型时，`referenceCalibrationPaOutput` 和 `calibrationMetrics` 属于暂停温度影响后的参考校准面；函数返回的两路才经过恢复温度后的同一次真实PA/热周期，实际热态输出功率从 `channel.GetThermalMetrics()` 读取。最终Analysis用 `chOut`，DPD/ILC训练用 `fbOut`。温度开关不会清零已提交的模拟drive；比较启用与关闭温度时应保持drive相同，或按同一目标功率规则重新校准。
+MIMO独立功率直接调用 `chOut, fbOut = channel.Process(inputWaveform, outputPowerDbm=(22.0, 21.0, 20.0, 19.0))`。只有开发新的PA测量适配器或单独调试功率检测器时，才需要直接使用底层的 `PowerCalibration.Calibrate(inputSignal)`；这个直接入口同样自动保护热状态。启用温度模型时，`referenceCalibrationPaOutput` 和 `calibrationMetrics` 属于暂停温度影响后的参考校准面；函数返回的两项才经过恢复温度后的同一次真实PA/热周期，实际热态输出功率从 `channel.GetThermalMetrics()` 读取。最终Analysis用 `chOut`，DPD/ILC训练用 `fbOut`；需要板载反馈训练时先显式设置 `sampleMode="fb"`，否则第二项是前向副本。温度开关不会清零已提交的模拟drive；比较启用与关闭温度时应保持drive相同，或按同一目标功率规则重新校准。
 
 例如在 50 Ω 端口上，`0 dBm = 1 mW` 对应约 `0.223607 V RMS`。对于带占空比的记录，本工程报告Wi-Fi突发开启期间的平均功率：若有效突发占整段采集的50%，整段平均会额外低3.01 dB，但该关断时间不会进入校准或Analysis的RMS分母。完整门限、短空洞闭合和定点搜索公式见 [SigProc.md](doc/SigProc.md#131-有效信号区间与占空比)。
 
@@ -1424,7 +1431,7 @@ Channel参数按物理模块分类如下，避免把真实Tx失真和FB观测误
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `sampleMode` | `"forward"` | 仅供兼容单输出接口选择一路；公开 `Process` 总是返回 `(chOut, fbOut)`。 |
+| `sampleMode` | `"forward"` | 公开 `Process` 始终返回 `(chOut, fbOut)`；`forward` 令第二项成为第一项的数值相同副本并绕过FB链，`fb` 令第二项经过完整反馈链。兼容单输出接口仍按该值选路。 |
 | `sampleRateHz` | `1.0` | CFO、SFO、时延和物理时间换算所用采样率。 |
 | `phaseDegrees` | `0` | PA后的公共固定移相，仅允许 `-90`、`0`、`90` 度。 |
 | `width` | `16` | 公开I/Q位宽；`0`为浮点，正值为整数码。 |
@@ -1500,13 +1507,14 @@ D_{\mathrm{cfg}}D_{\mathrm{wave}}.
 | `fbIqPhaseImbalanceDegrees` | `0.0` | 只污染fb观测的正交相位误差。 |
 | `fbDcOffset` | `0+0j` | fb接收机复直流偏置。 |
 
-两个开关互相独立，默认均为 `True` 以保持原有配置行为。下面的配置保留非零误差参数但只关闭Tx I/Q；因此PA激励不再含Tx镜像或Tx DC，而fb采样仍会加入FB镜像与FB DC。关闭开关不需要把各误差参数逐项清零，稍后重新置 `True` 时原配置仍可复用。
+两个开关互相独立，默认均为 `True` 以保持原有配置行为。下面的配置保留非零误差参数但只关闭Tx I/Q；因此PA激励不再含Tx镜像或Tx DC，而在显式 `sampleMode="fb"` 时，fb采样仍会加入FB镜像与FB DC。关闭开关不需要把各误差参数逐项清零，稍后重新置 `True` 时原配置仍可复用。
 
 ```python
 from inc.lib.Channel import Channel
 
 channel = Channel(
     parameters={
+        "sampleMode": "fb",
         "txIqImbalanceEnabled": False,
         "txIqGainImbalanceDb": 0.5,
         "txIqPhaseImbalanceDegrees": 3.0,
@@ -1563,7 +1571,7 @@ channel = Channel(
 
 完整的推导、分级数值表、DC泄漏、耦合比例、CFO/SFO累计误差、ADC步长和三套可直接使用的配置见 [Channel配置值选择说明](doc/Channel.md#69-配置值如何进入模型以及怎样选择)。
 
-`Process(inputSignal, outputPowerDbm=None)` 执行“Tx I/Q→PA前耦合→不同PA→PA后耦合→同时分出主路与反馈路”的完整链路，并返回 `(chOut, fbOut)`。默认稳态热模式的首次调用不能省略 `outputPowerDbm`；成功后可省略，但Channel会复用缓存目标并仍在每次调用重做PA功率设定。Tx I/Q参数同时影响两路，除非 `txIqImbalanceEnabled=False` 将Tx增益、相位和DC一起旁路；FB I/Q参数只在 `fbOut` 且 `fbIqImbalanceEnabled=True` 时生效。`outputPowerDbm` 始终指干净PA物理输出，不是raw `fbOut` 表观功率。`ProcessPaOutput(paOutputSignal)` 从已有PA输出开始，是由 `sampleMode` 选路的兼容单输出入口。详细参考面、系数公式、分类参数表和Tx/FB对比示例见 [Channel.md](doc/Channel.md)。
+`Process(inputSignal, outputPowerDbm=None)` 执行“Tx I/Q→PA前耦合→不同PA→PA后耦合→前向主路”的完整链路，并返回 `(chOut, fbOut)`。默认稳态热模式的首次调用不能省略 `outputPowerDbm`；成功后可省略，但Channel会复用缓存目标并仍在每次调用重做PA功率设定。`sampleMode="forward"` 时第二项直接复制第一项，因而所有FB参数都被绕过；`sampleMode="fb"` 时第二项才从同一次PA/热周期进入完整反馈链。Tx I/Q参数位于PA之前并影响两种模式；FB I/Q参数仅在 `sampleMode="fb"`、`fbIqImbalanceEnabled=True` 时影响 `fbOut`。`outputPowerDbm` 始终指干净PA物理输出，不是raw `fbOut` 表观功率。`ProcessPaOutput(paOutputSignal)` 从已有PA输出开始，是由 `sampleMode` 选路的兼容单输出入口。详细参考面、系数公式、分类参数表和Tx/FB对比示例见 [Channel.md](doc/Channel.md)。
 
 诊断接口的参考面也彼此独立：`GetLastPaInput()`为兼容旧名称而保留，返回定点解码和隐藏模拟驱动之前的公开数字输入；`GetLastTransmitterOutput()`返回经过模拟驱动与Tx I/Q之后、PA前耦合之前的波形；`GetLastActualPaInput()`返回耦合后真正进入PA的波形。不要把三者混作同一个DPD训练标签。
 
@@ -1872,7 +1880,7 @@ assert resultAnalysis.width == 16
 | `randomSeed` | `19` | 反馈噪声及算法随机过程种子。 |
 | `feedbackSynchronizationParameters` | `None` | 可选映射；覆盖ILC内部 `SigProc` 的最大时延、最大CFO、最大SFO、时间窗和补偿开关。 |
 
-`ILCConfig` 只包含学习算法、约束和反馈测量参数，不包含EVM、SNR或ACLR计算器。所有SISO和MIMO ILC入口都完全独立于 `Analysis`。双输出plant每轮返回 `(chOut, fbOut)`：同步、公共复增益对齐、MSE和系数更新固定使用 `fbOut`，`ILCIteration.outputSignal` 保存同轮 `chOut`，`feedbackOutputSignal` 保存raw `fbOut`。调用方随后使用 `resultAnalysis.AnalyzeIlcHistory(...)` 或 `AnalyzeMimoIlcHistory(...)` 在 `chOut` 参考面计算每轮RF性能并选择严格EVM最佳轮；最终 `ILCResult.outputSignal` 也是最佳输入对应的 `chOut`。
+`ILCConfig` 只包含学习算法、约束和反馈测量参数，不包含EVM、SNR或ACLR计算器。所有SISO和MIMO ILC入口都完全独立于 `Analysis`。双输出plant每轮返回 `(chOut, fbOut)`：同步、公共复增益对齐、MSE和系数更新固定使用 `fbOut`，`ILCIteration.outputSignal` 保存同轮 `chOut`，`feedbackOutputSignal` 保存raw `fbOut`。Channel若要模拟板载反馈训练，必须显式设置 `sampleMode="fb"`；默认 `forward` 会让 `fbOut` 成为 `chOut` 的相同副本。调用方随后使用 `resultAnalysis.AnalyzeIlcHistory(...)` 或 `AnalyzeMimoIlcHistory(...)` 在 `chOut` 参考面计算每轮RF性能并选择严格EVM最佳轮；最终 `ILCResult.outputSignal` 也是最佳输入对应的 `chOut`。
 
 ILC内部对同步后的反馈 $\bar y_k$ 估计公共复增益 $\hat g_k$，再在与参考相同的幅度域构造误差：
 

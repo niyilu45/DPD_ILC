@@ -29,9 +29,13 @@ flowchart LR
     wave["WaveGenWifi.Generate<br/>生成SISO或MIMO Wi-Fi原始信号"] --> channelCalibration
     pa["PaModel或MimoPaModel"] --> channelCalibration
     channelCalibration --> reference["Channel.GetLastPaInput<br/>期望PA输出及ILC初始输入"]
-    channelCalibration --> branch{"同一次PA/热周期分叉"}
-    branch --> baseline["chOut：前向仪表观测"]
-    branch --> feedback["fbOut：板载反馈接收机观测"]
+    channelCalibration --> baseline["chOut：前向仪表观测"]
+    channelCalibration --> sampleMode{"sampleMode：选择fbOut来源"}
+    baseline -. "forward副本来源" .-> forwardCopy["数值相同副本"]
+    sampleMode -->|forward| forwardCopy
+    sampleMode -->|fb| boardFeedback["板载反馈接收机观测"]
+    forwardCopy --> feedback["fbOut：ILC训练观测"]
+    boardFeedback --> feedback
     reference --> ilc["DpdIlc中的Run...Ilc"]
     pa --> ilc
     feedback --> ilc
@@ -60,7 +64,7 @@ flowchart LR
 - `ILCConfig` 不保存任何EVM、SNR或ACLR计算器；它只控制学习更新、幅度约束和反馈采集。
 - `DpdIlc.py` 不接收任何EVM、SNR或ACLR回调；每轮只用 `fbOut` 完成同步、公共复增益对齐、MSE和系数更新，同时保存同次plant求值得到的 `chOut`。
 - ILC返回后，`Analysis.AnalyzeIlcHistory` 对每轮 `ILCIteration.outputSignal` 中的 `chOut` 计算模拟输出功率、SNR、EVM和ACLR；它不会把反馈接收机非理想计入最终PA指标。
-- Channel作为plant时不再依赖 `sampleMode` 选择训练路径：`NormalizedPaAdapter` 固定用第二个输出 `fbOut` 训练，并保留第一个输出 `chOut` 评价。兼容单输出PA会被映射为两路相同，保持原有行为；若调用方传入的已经是 `NormalizedPaAdapter`，内部不会再把它当成普通单输出PA而折叠双分支，嵌套适配仍完整透传 `(chOut, fbOut)`。
+- Channel作为plant时，`NormalizedPaAdapter` 固定用第二个输出 `fbOut` 训练，并保留第一个输出 `chOut` 评价；但第二项的来源由Channel的 `sampleMode` 决定。`"forward"` 返回前向主路的数值相同副本，`"fb"` 才返回完整板载反馈观测，因此需要反馈链训练时必须显式选fb模式。兼容单输出PA会被映射为两路相同，保持原有行为；若调用方传入的已经是 `NormalizedPaAdapter`，内部不会再把它当成普通单输出PA而折叠双分支，嵌套适配仍完整透传 `(chOut, fbOut)`。
 - `ILCAnalysisResult.bestInputSignal` 只对当前重复波形直接有效；拟合部署模型后，才能处理独立的新Wi-Fi帧。
 
 ---
@@ -155,6 +159,7 @@ paOutputPowerDbm = 20.0
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "fb",
         "sampleRateHz": waveform.sampleRateHz,
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
@@ -202,6 +207,7 @@ y_{\mathrm{PA}}[n]
 channel = Channel(
     paModel=paModel,
     parameters={
+        "sampleMode": "fb",
         "sampleRateHz": waveform.sampleRateHz,
         "fbGainDb": -6.0,
         "fbFirTaps": (1.0 + 0.0j, 0.08 - 0.03j),
@@ -220,11 +226,11 @@ chOut, fbOut = channel.Process(
 )
 ```
 
-- DPD/ILC训练：把 `channel` 作为plant；内部适配器固定使用 `fbOut`，因此必须校准或补偿反馈接收机非理想。
+- DPD/ILC训练：把显式配置 `sampleMode="fb"` 的 `channel` 作为plant；内部适配器固定使用 `fbOut`，因此必须校准或补偿反馈接收机非理想。
 - 最终验收：把同一次plant求值得到的 `chOut` 交给Analysis计算EVM、SNR、ACLR、IRR和功率。
 - 若使用外部仪表闭环，应让自定义plant也遵守 `(chOut, fbOut)` 契约，把实际训练观测放在第二项。
 
-`phaseDegrees` 和三种噪声控制是两条路径的公共配置；两路各生成独立噪声样值。所有以 `fb` 开头的参数只作用于 `fbOut`。完整处理次序和参数定义见 [Channel.md](./Channel.md)。
+`phaseDegrees` 和三种噪声控制是两条路径的公共配置。fb模式下两路各生成独立噪声样值；forward模式只生成一次前向噪声并复制结果。所有以 `fb` 开头的参数只在fb模式下作用于 `fbOut`。完整处理次序和参数定义见 [Channel.md](./Channel.md)。
 
 ### 4.4 PA对象接口要求
 
@@ -254,7 +260,7 @@ chOut, fbOut = plant.Process(inputSignal)
 
 ## 5. 最小可运行SISO示例
 
-工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。示例直接使用默认GMP系数，不再把非线性系数额外缩放为25%。默认各阶系数和形成单调Rapp型稳态曲线，较小的主记忆、滞后和超前动态项按阶零和，因此连续高幅样点不会因重复计入记忆压缩而快速下坠；20 dBm工作点由`Channel.Process(..., outputPowerDbm=20.0)`内部调整PA输入得到。这个最小示例固定运行4轮，使当前确定性场景中的浮点和16位模式都在局部稳定区同时改善EVM与ACLR；更长迭代及停止准则比较留给Benchmark场景。Channel在同一次PA求值后返回带0度公共移相和10 mV复包络总RMS白噪声的 `chOut` 与完整反馈链 `fbOut`；ILC用后者训练，Analysis用前者验收。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
+工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。示例直接使用默认GMP系数，不再把非线性系数额外缩放为25%。默认各阶系数和形成单调Rapp型稳态曲线，较小的主记忆、滞后和超前动态项按阶零和，因此连续高幅样点不会因重复计入记忆压缩而快速下坠；20 dBm工作点由`Channel.Process(..., outputPowerDbm=20.0)`内部调整PA输入得到。这个最小示例固定运行4轮，使当前确定性场景中的浮点和16位模式都在局部稳定区同时改善EVM与ACLR；更长迭代及停止准则比较留给Benchmark场景。示例显式设置 `sampleMode="forward"`：Channel在同一次PA求值后生成带0度公共移相和10 mV复包络总RMS白噪声的 `chOut`，再把其数值相同副本作为 `fbOut`；ILC用后者训练，Analysis用前者验收。要研究板载反馈接收机时应把该参数改为 `"fb"`。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
 
 ```python
 from SmallestSISO import RunSisoMode
@@ -731,7 +737,7 @@ noiseAwareAnalysis = resultAnalysis.AnalyzeIlcHistory(
 
 理想独立噪声下，平均后的噪声方差为单次测量的 `1/R`。
 
-如果plant已经是配置了 `noiseAmpMv`、`noisePwrDbm` 或 `noiseSnrDb` 的Channel，应把 `ILCConfig.feedbackSnrDb` 保持为 `None`，否则会在 `fbOut` 上同时叠加Channel接收噪声和ILC内部抽象反馈噪声。Channel的 `fb...` 参数会直接加入 `fbOut` 的确定性非理想；这些非理想不会被 `feedbackAverages` 消除。`chOut` 的独立噪声用于最终Analysis，不参与DPD系数更新。
+如果plant已经是配置了 `noiseAmpMv`、`noisePwrDbm` 或 `noiseSnrDb` 的Channel，应把 `ILCConfig.feedbackSnrDb` 保持为 `None`，否则会在Channel返回之后继续只对训练用 `fbOut` 叠加ILC内部抽象反馈噪声。`sampleMode="fb"` 时，Channel的 `fb...` 参数会直接加入 `fbOut` 的确定性非理想，且两条接收路径各自产生噪声；这些确定性非理想不会被 `feedbackAverages` 消除。`sampleMode="forward"` 时，Channel原始返回的 `chOut` 与 `fbOut` 使用同一个噪声实现并逐样点相同；若此时仍配置 `ILCConfig.feedbackSnrDb`，适配器会在返回后二次只污染训练副本，所以history中的两项可以不同，这不违反 `Channel.Process` 的相同副本契约。
 
 ### 10.2 结果解释
 

@@ -1250,7 +1250,7 @@ theoreticalIrrDb = 10.0 * np.log10(
 | Tx I/Q | `txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees`、`txDcOffset` | 是 | 可用模拟校准或增广GMP联合补偿 |
 | FB I/Q | `fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees`、`fbDcOffset` | 否，只污染fb观测 | 先做接收机校准或去嵌入，不应由发射DPD直接补偿 |
 
-在本工程中，Tx I/Q位于PA和输出分叉之前，因此公开 `Channel.Process` 返回的 `chOut` 与 `fbOut` 都包含它；FB I/Q只进入 `fbOut`。`sampleMode` 仅供兼容单输出接口选路。若板载 `fbOut` 的EVM/IRR改善但 `chOut` 变差，通常意味着训练器正在补偿FB接收机自身误差。
+在本工程中，Tx I/Q位于PA和观测选择之前，因此公开 `Channel.Process` 返回的 `chOut` 与 `fbOut` 都包含它。FB I/Q只有在 `sampleMode="fb"` 时才进入 `fbOut`；默认 `"forward"` 会让第二项成为第一项的数值相同副本，并完全绕过FB I/Q及其他反馈模块。兼容单输出接口也按该参数选路。若fb模式下板载 `fbOut` 的EVM/IRR改善但 `chOut` 变差，通常意味着训练器正在补偿FB接收机自身误差。
 
 若链路可近似为
 
@@ -2487,13 +2487,13 @@ welchFrequencyHz, welchPeriodogram = AveragePeriodogram(
 chOut, fbOut = channel.Process(inputSignal, outputPowerDbm=20.0)
 ```
 
-两路来自同一次PA计算、同一段PA记忆状态和同一个热周期，然后才分叉。这样比较主路与反馈路时，不会把第二次调用造成的噪声、温度或记忆状态差异误认为反馈链误差。
+两项来自同一次PA计算、同一段PA记忆状态和同一个热周期。`sampleMode="forward"` 时第二项是已完成 `chOut` 的数值相同副本；`sampleMode="fb"` 时第二项才从公共PA后节点进入完整反馈接收机。这样比较主路与反馈路时，不会把第二次调用造成的温度或记忆状态差异误认为反馈链误差。
 
 用途必须分开：
 
-- `fbOut` 进入DPD/ILC同步、公共复增益估计、MSE和系数更新；
+- `fbOut` 进入DPD/ILC同步、公共复增益估计、MSE和系数更新；需要真实板载反馈条件时显式配置 `sampleMode="fb"`；
 - `chOut` 进入最终EVM、SNR、ACLR、IRR、功率和双音互调分析；
-- `sampleMode` 只保留给旧的单输出接口，不改变上述二元组顺序。
+- `sampleMode` 不改变二元组顺序，但决定第二项是前向副本还是完整反馈观测；兼容单输出接口仍按它选路。
 
 设第 $k$ 轮输入为 $u_k$，公共PA/热状态算子为 $P_k$，前向和反馈接收算子分别为 $H_{\mathrm{ch}}$ 与 $H_{\mathrm{fb}}$，则：
 
@@ -2503,8 +2503,18 @@ v_k=P_k(u_k),
 
 ```math
 chOut_k=H_{\mathrm{ch}}(v_k),
+```
+
+```math
+fbOut_k=chOut_k,
 \qquad
-fbOut_k=H_{\mathrm{fb}}(v_k).
+sampleMode=\mathrm{forward}.
+```
+
+```math
+fbOut_k=H_{\mathrm{fb}}(v_k),
+\qquad
+sampleMode=\mathrm{fb}.
 ```
 
 训练误差由 `fbOut` 构造：
@@ -2521,6 +2531,6 @@ x-S(fbOut_k),
 \mathrm{Metrics}_k=A(chOut_k,x).
 ```
 
-这里还必须区分另一种容易混淆的“校准”。`PowerCalibration.outputPowerDbm` 是PA功率设定闭环的目标，它仍定义在PA后耦合前、接收非理想之前的干净物理PA输出面；它不是raw `fbOut` 的表观功率。比如 `fbGainDb=-6 dB` 时，20 dBm物理PA输出的反馈样值功率可以显得约低6 dB，但功率控制器不能因此把PA错误推到26 dBm。DPD/ILC所谓“校准或训练”才使用 `fbOut`。
+这里还必须区分另一种容易混淆的“校准”。`PowerCalibration.outputPowerDbm` 是PA功率设定闭环的目标，它仍定义在PA后耦合前、接收非理想之前的干净物理PA输出面；它不是raw `fbOut` 的表观功率。比如在 `sampleMode="fb"` 下配置 `fbGainDb=-6 dB` 时，20 dBm物理PA输出的反馈样值功率可以显得约低6 dB，但功率控制器不能因此把PA错误推到26 dBm。DPD/ILC所谓“校准或训练”才使用二元组第二项。
 
-如果只用 `fbOut` 同时训练和验收，反馈接收机自己的FIR、I/Q镜像、非线性、限幅和ADC误差可能被误判为PA失真；如果只用 `chOut` 训练，则又绕过了真实板载反馈链。双输出接口正是为了让“实际训练条件”和“真实最终性能”同时可见而不混淆。
+如果在fb模式下只用 `fbOut` 同时训练和验收，反馈接收机自己的FIR、I/Q镜像、非线性、限幅和ADC误差可能被误判为PA失真；如果使用forward副本训练，则明确绕过了真实板载反馈链。双输出接口与 `sampleMode` 的组合正是为了在“理想前向训练”和“实际反馈训练”之间显式选择，同时始终保留 `chOut` 作为最终性能参考。

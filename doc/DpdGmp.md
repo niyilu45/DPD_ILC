@@ -373,9 +373,9 @@ trainingResult = dpd.FitIndirect(
 
 `FitIndirect` 要求 PA 输入和输出数组长度相同。它调用 `SigProc` 对输出执行整数/分数时延、载波频偏、采样频偏和公共复增益补偿，然后拟合“校正后 PA 输出到真实 PA 输入”的后置逆。
 
-真实仪表中应先确认反馈链本身不会产生明显非线性；否则间接学习会把反馈链失真一起写入DPD系数。把Channel作为plant时，每次 `Process` 返回 `(chOut, fbOut)`：GMP标签、同步、训练NMSE和系数更新使用 `fbOut`，最终EVM、SNR、ACLR、IRR和功率使用同次 `chOut`。两路来自同一次PA记忆/热状态，不能用两次PA调用替代。
+真实仪表中应先确认反馈链本身不会产生明显非线性；否则间接学习会把反馈链失真一起写入DPD系数。把Channel作为plant时，每次 `Process` 返回 `(chOut, fbOut)`：GMP标签、同步、训练NMSE和系数更新使用第二项，最终EVM、SNR、ACLR、IRR和功率使用同次第一项。需要板载反馈链训练时必须显式设置 `sampleMode="fb"`；默认forward模式让第二项成为第一项的数值相同副本。两项来自同一次PA记忆/热状态，不能用两次PA调用替代。
 
-`PowerCalibration.outputPowerDbm` 与上述DPD训练反馈不是同一个“校准”概念。它仍闭环到PA后耦合前、接收非理想之前的干净物理PA输出；raw `fbOut` 的反馈增益、频响、非线性、噪声和ADC量化不会改变目标功率定义。
+`PowerCalibration.outputPowerDbm` 与上述DPD训练反馈不是同一个“校准”概念。它仍闭环到PA后耦合前、接收非理想之前的干净物理PA输出；fb模式raw `fbOut` 的反馈增益、频响、非线性、噪声和ADC量化不会改变目标功率定义，forward模式的副本也不会进入该闭环。
 
 ---
 
