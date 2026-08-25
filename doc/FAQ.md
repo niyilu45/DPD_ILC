@@ -1292,6 +1292,679 @@ u[n]
 
 本工程的隔离仿真使用 8% 共轭泄漏，即 $|b|=0.08$。未补偿和普通 GMP 的 `irrDb` 都约为 `-21.94 dBc`；增广 GMP 在无噪声、近线性 PA 的归因场景中达到约 `-193.5` 至 `-196.8 dBc`。后一个量级是双精度数值残差，不代表真实仪器能达到该动态范围。真实下界通常由接收机自身 IQ 不平衡、噪声、量化、时变漂移和模型失配决定。
 
+### 为什么DPD迭代过程中fbIrr在改善，txIrr却没有改善
+
+#### 先明确两个名称对应的参考面
+
+当前工程统一返回的指标键是 `irrDb`，并没有固定命名为 `fbIrr` 或 `txIrr` 的内建字段。这两个名称通常是调用方分别对不同波形调用 `Analysis.MeasureIrr()` 后保存的外部变量：
+
+| 外部名称 | 推荐测量波形 | 参考信号 | 物理含义 |
+|---|---|---|---|
+| `fbIrr` | `ILCIteration.feedbackOutputSignal` 或 `fbOut` | 原始理想目标 $x$ | DPD、Tx、PA与FB接收机的级联镜像 |
+| `txIrr` | `ILCIteration.outputSignal` 或 `chOut` | 同一个原始理想目标 $x$ | 真正需要验收的主路镜像 |
+| Tx本征IRR | `TransmitterIqCoefficients()` 的直接与镜像系数 | 不使用迭代波形 | Tx调制器硬件或Channel配置本身的失配 |
+| DPD输入IRR | 当前预失真输入 $u$ | 原始理想目标 $x$ | DPD为了补偿下游误差而主动注入的共轭分量 |
+
+Tx本征IRR只由 `txIqGainImbalanceDb` 和 `txIqPhaseImbalanceDegrees` 决定。DPD不会修改这些硬件参数，因此用 `TransmitterIqCoefficients()` 计算的本征IRR本来就不会随迭代变化。DPD输入IRR也不要求改善；增广DPD必须在Tx之前主动生成反向镜像，所以该参考面的IRR可能变得不够负。真正的发射验收量应当是以原始目标 $x$ 为参考，对最终 `chOut` 计算的IRR。
+
+#### 反馈闭环优化的是级联参考面
+
+设增广DPD输出为
+
+```math
+u=p x+q x^*.
+```
+
+把Tx、PA和前向主路在当前工作点附近写成widely-linear形式：
+
+```math
+y=A u+B u^*.
+```
+
+代入DPD输出后，主路相对于原始目标 $x$ 的直接系数和镜像系数分别为
+
+```math
+F=A p+B q^*,
+```
+
+```math
+I=A q+B p^*.
+```
+
+因此主路的镜像相对电平为
+
+```math
+\mathit{txIrrDb}
+=
+20\log_{10}
+\left|
+\frac{I}{F}
+\right|.
+```
+
+再设反馈接收机为
+
+```math
+z=C y+D y^*,
+```
+
+其中 $D$ 表示FB解调器自身产生的共轭镜像。反馈端相对于 $x$ 的直接系数与镜像系数分别为
+
+```math
+F_{\mathrm{fb}}=C F+D I^*,
+```
+
+```math
+I_{\mathrm{fb}}=C I+D F^*.
+```
+
+所以反馈端指标为
+
+```math
+\mathit{fbIrrDb}
+=
+20\log_{10}
+\left|
+\frac{C I+D F^*}
+     {C F+D I^*}
+\right|.
+```
+
+当前ILC用 `fbOut` 构造同步结果、误差和系数更新，因此它会努力满足
+
+```math
+C I+D F^*\approx0.
+```
+
+这给出的主路镜像近似为
+
+```math
+I
+\approx
+-\frac{D}{C}F^*.
+```
+
+只要FB镜像系数 $D$ 不为零，这个条件就不等于 $I\approx0$。DPD可能故意在真实主路中保留或注入一个镜像，用它抵消FB接收机随后产生的镜像。结果是 `fbIrr` 持续下降并变得更负，而真正的 `txIrr` 不改善，甚至可能变差。
+
+```mermaid
+flowchart LR
+    target["原始目标 x"] --> dpd["增广DPD<br/>u = p x + q x*"]
+    dpd --> txPa["Tx I/Q + PA"]
+    txPa --> channelOutput["chOut：真实主路"]
+    channelOutput --> txMetric["txIrr：最终验收"]
+    channelOutput --> fbIq["FB接收机<br/>C y + D y*"]
+    fbIq --> feedbackOutput["fbOut"]
+    feedbackOutput --> fbMetric["fbIrr"]
+    feedbackOutput --> update["同步 / MSE / ILC更新"]
+    update --> dpd
+    txMetric -. "当前不参与更新方向" .-> update
+```
+
+**图说明：** 当前更新环路只从 `fbOut` 回到DPD。若FB接收机存在镜像，DPD会调整 $q$ 使两项镜像在FB ADC处相消；图中的 `chOut` 仍可能携带这项人为注入的镜像。`chOut` 虽然被保存用于最终Analysis，但它不是当前ILC更新方向的来源。
+
+#### 一个可以手算的例子
+
+假设Tx和PA完全理想，只有FB接收机具有镜像系数 $\beta$：
+
+```math
+y=u,
+```
+
+```math
+z=y+\beta y^*.
+```
+
+若DPD发送未补偿目标 $u=x$，则主路没有镜像，而反馈端为
+
+```math
+z=x+\beta x^*.
+```
+
+取 $|\beta|=0.08$ 时，反馈端初始指标为
+
+```math
+20\log_{10}(0.08)
+\approx
+-21.94\ \mathrm{dBc}.
+```
+
+为了让反馈端严格恢复为 $x$，增广逆可以发送
+
+```math
+u
+=
+\frac{x-\beta x^*}
+     {1-|\beta|^2}.
+```
+
+代回反馈链后得到 $z=x$，所以理想数学模型中的 `fbIrr` 趋于负无穷；但是主路 $y=u$ 已经包含幅度比约为 $|\beta|$ 的人为镜像，因此 `txIrr` 反而约为 `-21.94 dBc`。这不是迭代没有收敛，而是它精确收敛到了错误的观测参考面。
+
+#### 当前代码为什么会出现这种趋势
+
+1. `DpdIlc.MeasurePaOutputs()` 从同一次plant调用取得 `(chOut, fbOut)`，但所有ILC学习函数都把第二项作为反馈测量。
+2. `RunWaveformUpdate()`只对 `fbOut` 做 `SigProc` 同步，并用 `targetSignal - alignedFbOut` 形成误差。
+3. ILC内部保存的最佳输入按反馈域 `linearCompensatedNmseDb` 选择，不按主路IRR选择。
+4. `RunAugmentedIqIlc()`的低功率直接项和共轭项也由反馈波形估计，因此求到的是“Tx + PA + FB”的级联增广逆。
+5. `ILCIteration.outputSignal` 保存同次 `chOut` 供事后评价，但不会反向改变已经执行的更新。
+
+还有一个容易制造“txIrr完全不变”假象的代码用法：`Channel.GetLastTransmitterOutput()`只缓存最近一次Channel调用。若ILC结束后遍历历史，却在每一轮都读取这个getter，所有轮次实际读取的是同一段最后波形。要得到逐轮主路IRR，应直接使用每条 `ILCIteration.outputSignal`；若确实要观察逐轮PA前的Tx输出，则必须在每轮plant求值时单独保存该参考面，不能事后重复读取last-value getter。
+
+#### forward模式下的强制一致性检查
+
+当同时满足以下条件时：
+
+```python
+channel.UpdateParameters(sampleMode="forward")
+ilcConfig = ILCConfig(feedbackSnrDb=None)
+```
+
+`Channel`会令 `fbOut` 成为 `chOut` 的逐样点副本。若两路使用同一个原始目标、同一个活动区间和同一套Analysis同步参数，则每轮IRR必须相同。可以先检查：
+
+```python
+for iterationRecord in ilcResult.history:
+    assert np.array_equal(
+        iterationRecord.outputSignal,
+        iterationRecord.feedbackOutputSignal,
+    )
+```
+
+如果数组相同但IRR不同，问题位于调用方的参考波形、位宽、裁剪区间或Analysis配置。若数组不同，还要检查 `ILCConfig.feedbackSnrDb`；该参数在Channel返回后只向反馈分支增加噪声，即使Channel本身工作在forward模式，也会使ILC历史中的两路不再严格相同。
+
+#### 四组隔离实验
+
+| Tx I/Q | FB I/Q | 预期现象 | 结论 |
+|---|---|---|---|
+| 关闭 | 关闭 | `txIrr` 与 `fbIrr` 趋势一致 | 检查基础DPD与分析链 |
+| 开启 | 关闭 | 增广DPD应同时改善主路和反馈IRR | 验证Tx镜像可补偿性 |
+| 关闭 | 开启 | FB改善而主路不改善或变差 | 直接证明DPD正在误补偿FB |
+| 开启 | 开启 | 只能观察到级联镜像 | 必须先独立标定FB才能分离来源 |
+
+仿真中可以暂时设置 `fbIqImbalanceEnabled=False`，并关闭FB FIR、非线性、限幅、时频偏和ADC，验证主路与反馈趋势是否恢复一致。实际硬件应使用已知IRR足够负的干净信号直接注入FB接收机，绕过Tx和PA，独立估计FB的直接系数 $C$ 与镜像系数 $D$。
+
+#### 正确的FB去嵌方法
+
+已知FB模型
+
+```math
+z=C y+D y^*
+```
+
+时，只要
+
+```math
+|C|^2-|D|^2>0,
+```
+
+就可以在DPD更新前恢复主路估计：
+
+```math
+\widehat y
+=
+\frac{C^*z-Dz^*}
+     {|C|^2-|D|^2}.
+```
+
+DPD应使用 $\widehat y$ 做同步、MSE和系数更新，而不是直接使用raw `fbOut`。如果FB I/Q失衡随频率变化，应使用widely-linear FIR，或者在每个频点对直接路径和镜像路径组成的 $2\times2$ 矩阵分别求逆，不能只使用一个平坦复系数。
+
+最终工程流程建议为：
+
+1. 用独立干净源标定FB接收机的直接与镜像响应。
+2. 对每次 `fbOut` 先做widely-linear去嵌，再送入DPD同步和更新。
+3. Tx线性I/Q失衡优先先做独立I/Q校准；需要联合补偿时使用 `RunAugmentedIqIlc` 或 `AugmentedDpdGmp`。
+4. 每轮以同一个原始目标分别计算 `chOut` 与去嵌前后 `fbOut` 的IRR。
+5. 同时检查 `MeasureIrr()` 返回的 `residualPowerRatio` 和条件数。残差大说明 $a x+b x^*$ 不足以描述PA非线性镜像；条件数大说明当前参考信号无法可靠区分 $x$ 与 $x^*$。
+6. 最终部署与回退判断必须使用 `chOut` 的EVM、IRR、ACLR、输出功率和峰值，而不能只看反馈域MSE或 `fbIrr`。
+
+一句话总结：`fbIrr`改善只证明“DPD到反馈ADC”的级联镜像减小；只有FB链已经校准或去嵌，或者DPD直接使用forward参考面训练时，它才可以解释为真实Tx主路IRR改善。
+
+### 只有FB链时，怎样用0度和90度相位采集分离FB自身的I/Q镜像
+
+#### 这种方法解决了什么不可辨识问题
+
+只有一条反馈记录时，平坦FB接收机可以写成：
+
+```math
+z[n]=C y[n]+D y^*[n]+c+v[n].
+```
+
+这里：
+
+- $y[n]$ 是真正的PA输出，已经包含Tx I/Q误差、PA非线性、记忆效应和真实发射镜像；
+- $C$ 是FB直接支路；
+- $D$ 是FB解调器产生的共轭镜像支路；
+- $c$ 是FB直流偏置；
+- $v[n]$ 是噪声和量化误差。
+
+只观察 $z[n]$ 时，$y[n]$ 与 $D y^*[n]$ 混在一起，无法判断镜像来自真实Tx/PA还是FB接收机。先把PA输出的低功率耦合观测经过FB增益、滤波、可能的前级非线性和时频响应，记I/Q变频器输入为：
+
+```math
+u[n]=F_{\mathrm{pre}}\{y[n]\}.
+```
+
+若在这个低功率观测支路中、紧邻FB I/Q变频器之前加入已知相移 $p_\theta=\exp(j\theta)$，则：
+
+```math
+z_\theta[n]
+=
+\alpha p_\theta u[n]
++
+\beta p_\theta^* u^*[n]
++c+v_\theta[n].
+```
+
+直接分量随相位正向旋转，共轭镜像分量随相位反向旋转。这个相反的旋转方向提供了第二条独立方程。
+
+令A状态为0度、B状态为90度，并先去除DC：
+
+```math
+z_A[n]=d[n]+i[n],
+```
+
+```math
+z_B[n]=j d[n]-j i[n],
+```
+
+其中：
+
+```math
+d[n]=\alpha u[n],
+```
+
+```math
+i[n]=\beta u^*[n].
+```
+
+于是：
+
+```math
+\widehat d[n]
+=
+\frac{z_A[n]-jz_B[n]}{2},
+```
+
+```math
+\widehat i[n]
+=
+\frac{z_A[n]+jz_B[n]}{2}.
+```
+
+$\widehat d$ 只去除了FB接收机自己产生的共轭项，但仍完整保留 $y$ 中真实存在的Tx镜像和PA失真。因此DPD使用 $\widehat d$ 训练时，仍然能够补偿真实发射链，而不会被FB镜像诱导到错误方向。
+
+相移必须位于PA之后的低功率耦合观察支路，并且位于FB I/Q解调器之前。工程上推荐把它放在I/Q变频器输入附近：这样两个状态共用完全相同的FB前级工作点，并且不等幅的移相响应不会改变前级非线性或限幅状态。在ADC之后把数字样值乘以 $j$ 没有作用，因为此时直接项和镜像项已经混合并会一起同向旋转。在PA之前移相也不等价：PA非线性、记忆和Tx共轭响应会随输入相位状态重新求值，以上两方程不再共享同一个 $y[n]$。
+
+```mermaid
+flowchart LR
+    paOutput["PA输出 y"] --> coupler["低功率耦合支路"]
+    coupler --> fbFrontEnd["共用FB前级<br/>增益/滤波/非线性/时频响应"]
+    fbFrontEnd --> phaseSwitch["0度 / 90度移相状态"]
+    phaseSwitch --> fbReceiver["同一FB I/Q混频器和ADC"]
+    fbReceiver --> phaseCaptures["z0 / z90"]
+    phaseCaptures --> align["去DC、时延/CFO/SFO配准"]
+    align --> separation["2乘2相位矩阵分离"]
+    separation --> directPart["直接分量：送入DPD训练"]
+    separation --> imagePart["FB镜像：用于诊断"]
+```
+
+**图说明：** 两个状态必须共用PA输出参考面、耦合支路和同一套FB接收机。移相状态改变直接项和共轭项的旋转方向，2乘2求逆才能把两者拆开；若在数字域对已混合的单路FB数据再旋转，不会增加新的独立方程。
+
+#### 实际移相器不理想时怎样求解
+
+实际两个状态的复传输通常不是严格的 $1$ 和 $j$。设经过幅相标定后得到 $p_A$、$p_B$，去DC后的观测满足：
+
+```math
+\begin{bmatrix}
+z_A[n] \\
+z_B[n]
+\end{bmatrix}
+=
+\begin{bmatrix}
+p_A & p_A^* \\
+p_B & p_B^*
+\end{bmatrix}
+\begin{bmatrix}
+d[n] \\
+i[n]
+\end{bmatrix}.
+```
+
+定义：
+
+```math
+\Delta=p_Ap_B^*-p_A^*p_B.
+```
+
+则：
+
+```math
+\widehat d[n]
+=
+\frac{p_B^*z_A[n]-p_A^*z_B[n]}{\Delta},
+```
+
+```math
+\widehat i[n]
+=
+\frac{-p_Bz_A[n]+p_Az_B[n]}{\Delta}.
+```
+
+矩阵可辨识能力为：
+
+```math
+|\Delta|
+=
+2|p_A||p_B|
+|\sin(\theta_A-\theta_B)|.
+```
+
+因此0度和90度是两个状态中条件最好的选择；相差0度或180度时矩阵不可逆。工程中必须测量移相器在整个工作带宽内的幅度、相位、群时延和温度漂移，不能把标称90度当成精确值。
+
+宽带时应对每一对共轭频点构造对应的2乘2矩阵，并用带正则项的求逆获得直接与镜像频谱。若移相器状态具有频率相关幅相误差，只使用一个平坦标量会在带边留下镜像残差。
+
+#### 为什么普通AB采集会把温漂误认为镜像
+
+普通顺序为：
+
+```text
+A：0 degree  ->  B：90 degree
+```
+
+两次观测不是同时发生。令直接和镜像分量在中心时刻附近缓慢变化：
+
+```math
+d(t)=d_0+\dot d(t-t_0),
+```
+
+```math
+i(t)=i_0+\dot i(t-t_0).
+```
+
+即使真实FB镜像为零，若A、B两次的直接复增益分别为 $d_A$、$d_B$，理想公式仍会得到伪镜像：
+
+```math
+\widehat i_{\mathrm{false}}
+=
+\frac{d_A-d_B}{2}.
+```
+
+若A、B之间存在1%的复幅度差，伪镜像幅度比约为0.005，因此本工程的镜像相对电平约为：
+
+```math
+20\log_{10}(0.005)
+\approx
+-46.0\ \mathrm{dBc}.
+```
+
+若两次采集之间有1度公共相位变化，小误差下的伪镜像幅度比约为 $0.5\pi/180$，对应：
+
+```math
+irrDb\approx-41.2\ \mathrm{dBc}.
+```
+
+因此，当目标是把FB残余镜像压到低于 `-40 dBc` 时，单个AB采集对很容易被PA温漂、FB增益漂移或LO相位漂移限制。
+
+#### ABBA为什么能够抵消一阶温漂
+
+推荐的四次采集顺序为：
+
+```text
+A1          B1          B2          A2
+0 degree    90 degree   90 degree   0 degree
+t1          t2          t3          t4
+```
+
+当四次记录的中心时刻等间隔时，可写成：
+
+```math
+t_1=t_0-\frac{3T}{2},
+```
+
+```math
+t_2=t_0-\frac{T}{2},
+```
+
+```math
+t_3=t_0+\frac{T}{2},
+```
+
+```math
+t_4=t_0+\frac{3T}{2}.
+```
+
+先对相同状态逐样点求平均：
+
+```math
+\overline z_A[n]
+=
+\frac{z_{A1}[n]+z_{A2}[n]}{2},
+```
+
+```math
+\overline z_B[n]
+=
+\frac{z_{B1}[n]+z_{B2}[n]}{2}.
+```
+
+A状态的平均时刻与B状态的平均时刻都等于 $t_0$：
+
+```math
+\frac{t_1+t_4}{2}
+=
+\frac{t_2+t_3}{2}
+=t_0.
+```
+
+所以线性变化项在两个状态内分别相消：
+
+```math
+\frac{d(t_1)+d(t_4)}{2}=d_0,
+```
+
+```math
+\frac{d(t_2)+d(t_3)}{2}=d_0.
+```
+
+镜像分量同理。再用 $\overline z_A$、$\overline z_B$ 做2乘2分离，就得到同一个中心时刻的直接与镜像估计。ABBA把普通AB中与采集间隔成正比的一阶漂移误差，降低为与采集间隔平方相关的曲率误差。
+
+| 顺序 | A状态平均时刻 | B状态平均时刻 | 一阶漂移 |
+|---|---:|---:|---|
+| `AB` | A采集时刻 | B采集时刻 | 不抵消 |
+| `AABB` | 偏早 | 偏晚 | 不抵消 |
+| `ABAB` | 偏早半个间隔 | 偏晚半个间隔 | 不完全抵消 |
+| `ABBA` | 公共中心时刻 | 公共中心时刻 | 抵消 |
+
+温度变化通常是指数过程，而不是严格直线。把复响应继续展开：
+
+```math
+d(t)
+=
+d_0
++\dot d(t-t_0)
++\frac{1}{2}\ddot d(t-t_0)^2
++\cdots.
+```
+
+ABBA消除 $\dot d$，但仍保留量级为 $O(\ddot dT^2)$ 的二阶残差。降低这项残差的方法是缩短切换间隔、先把PA运行到周期热稳态，以及交替使用：
+
+```text
+ABBA | BAAB | ABBA | BAAB
+```
+
+ABBA中A位于时间窗口端点、B位于中间；BAAB交换这两个位置。联合两类块可以平衡二阶曲率、状态次序和开关建立时间造成的偏差。
+
+#### 采集时间不等间隔时不能直接平均
+
+如果真实时间戳不对称，应把同一状态线性插值到公共时刻 $t_0$。例如A状态：
+
+```math
+\overline z_A(t_0)
+=
+\frac{t_{A2}-t_0}{t_{A2}-t_{A1}}z_{A1}
++
+\frac{t_0-t_{A1}}{t_{A2}-t_{A1}}z_{A2}.
+```
+
+B状态使用同样方法。多组数据可以联合拟合 $d_0$、$i_0$ 以及它们的复斜率，而不是先平均。这里的复斜率同时描述幅度与相位的局部变化。
+
+#### 怎样由相位对生成单路FB补偿滤波器
+
+每次DPD更新都采集两种相位可以直接使用 $\widehat d$，但采集时间会增加。更常用的流程是周期性执行相位对，然后拟合一个冻结的widely-linear FIR：
+
+```math
+\widehat d[n]
+=
+\sum_{k=0}^{L-1}g_d[k]z[n-k]
++
+\sum_{k=0}^{L-1}g_i[k]z^*[n-k].
+```
+
+令 $\mathbf X$ 的前 $L$ 列为raw 0度反馈的因果延迟，后 $L$ 列为其共轭延迟，$\mathbf d$ 为相位对分离出的直接目标。使用岭回归：
+
+```math
+\widehat{\mathbf g}
+=
+\left(
+\mathbf X^H\mathbf X+\lambda\mathbf I
+\right)^{-1}
+\mathbf X^H\mathbf d.
+```
+
+滤波器标定完成后，普通DPD每轮只采集一路raw FB，通过固定的双支路FIR得到训练反馈。温度、频段、FB增益、采样率或模拟滤波配置变化后，必须重新标定。
+
+当前 `Calibrate(zeroCapture, ninetyCapture)` 直接接收一组两状态记录并缓存FIR；`SeparateAbbaPhasePair(...)` 只返回经ABBA抑制漂移后的直接项与镜像项，不会隐式改写滤波器。若要让ABBA结果参与单状态FIR拟合，应先把四条已经解码、配准的记录按外侧A和内侧B分别对称平均，再把两条平均记录交给 `Calibrate`；定点记录应先按其真实 `width` 解码，平均与拟合均在归一化浮点域完成，不能直接把半整数码冒充新的定点采样。
+
+#### 推荐的实际工程时序
+
+1. 固定DPD系数、DAC码、RF增益、AGC和ALC；每次发送完全相同的波形与seed。
+2. 让PA先达到目标周期热状态；每次采集使用相同的数据周期和外部空闲时间。
+3. 使用同一个FB mixer与ADC快速执行ABBA；不要把两个未经联合标定的不同接收机当作两个相位状态。
+4. 每次切换后保留相同的稳定保护时间，并丢弃开关瞬态样点。
+5. 用静默区估计DC；若没有可靠静默区，改用0、90、180、270度四相位方案同时分离直接、镜像和公共DC。
+6. 对四次记录执行整数时延、分数时延、CFO和SFO校正，但不能独立消除每次捕获的任意复增益，否则会破坏已知相移关系。
+7. 根据真实时间戳平均或插值到公共中心时刻，再使用实测相移矩阵分离。
+8. 用未参与拟合的相位对验证直接分量NMSE、残余 `irrDb` 和矩阵条件数。
+9. 冻结补偿FIR后再启动DPD；raw FB只用于诊断，校正FB才进入同步、MSE和系数更新。
+10. 当残余镜像、滤波残差、FB温度或增益变化超过门限时停止更新并重新标定。
+
+#### 直接调用相位对分离和滤波器标定
+
+`FeedbackIqCalibration` 可以独立处理从仪表或板载ADC导出的NumPy波形。下例使用实测的两个移相状态复传输，而不是假设它们精确等于 $1$ 和 $j$：
+
+```python
+import numpy as np
+
+from inc.utils.SigProc import FeedbackIqCalibration
+
+phaseZeroResponse = 0.998 * np.exp(1j * np.deg2rad(0.3))
+phaseNinetyResponse = 0.970 * np.exp(1j * np.deg2rad(89.1))
+
+feedbackCalibration = FeedbackIqCalibration(
+    parameters={
+        "phaseResponses": (
+            phaseZeroResponse,
+            phaseNinetyResponse,
+        ),
+        "commonDcOffset": measuredFeedbackDc,
+        "filterLength": 7,
+        "regularization": 1.0e-5,
+        "width": 0,
+    }
+)
+
+directFeedback, imageFeedback = (
+    feedbackCalibration.SeparatePhasePair(
+        phaseZeroCapture,
+        phaseNinetyCapture,
+    )
+)
+
+calibrationMetrics = feedbackCalibration.Calibrate(
+    phaseZeroCapture,
+    phaseNinetyCapture,
+)
+correctedFeedback = feedbackCalibration.Apply(
+    laterPhaseZeroCapture
+)
+
+print(calibrationMetrics["imageToDirectDb"])
+print(calibrationMetrics["fitNmseDb"])
+print(calibrationMetrics["phaseMatrixConditionNumber"])
+```
+
+`directFeedback` 是供DPD学习的观测，`imageFeedback` 用于监控FB自身镜像。`Calibrate()` 以raw 0度采集为输入、以相位对分离出的直接分量为目标，拟合后续单路采集可使用的widely-linear FIR。参数变更后，旧tap会被判定为过期，必须重新标定，不会静默复用错误的逆滤波器。
+
+ABBA采集只需换用四输入接口：
+
+```python
+directFeedback, imageFeedback = (
+    feedbackCalibration.SeparateAbbaPhasePair(
+        phaseZeroFirstCapture,
+        phaseNinetyFirstCapture,
+        phaseNinetySecondCapture,
+        phaseZeroSecondCapture,
+    )
+)
+```
+
+这个函数按 `0 degree -> 90 degree -> 90 degree -> 0 degree` 对应的顺序解码，先对两个外侧0度记录和两个内侧90度记录分别平均，再做2乘2分离。它假定四次记录已按同一参考波形完成时延、CFO和SFO配准，且中心时刻对称；时间戳不等间时应先用前文的加权插值。
+
+#### 在Channel中自动标定并供ILC使用
+
+仿真中的 `phase_pair` 模式只计算一次PA和一个热周期，然后从同一个PA输出分出0度与90度两个FB观测。它把分离后的直接分量作为 `fbOut`，因此现有ILC不需要修改入口：
+
+```python
+from inc.lib.Channel import Channel
+from inc.lib.PaModel import PaModel
+
+paModel = PaModel(modelName="gmp", width=0)
+
+channel = Channel(
+    paModel=paModel,
+    width=0,
+    parameters={
+        "sampleMode": "fb",
+        "sampleRateHz": 80.0e6,
+        "fbIqImbalanceEnabled": True,
+        "fbIqGainImbalanceDb": 0.6,
+        "fbIqPhaseImbalanceDegrees": 2.5,
+        "fbIqCompensationMode": "phase_pair",
+        "fbPhasePairResponses": (
+            phaseZeroResponse,
+            phaseNinetyResponse,
+        ),
+        "fbIqCompensationFilterLength": 7,
+        "fbIqCompensationRegularization": 1.0e-5,
+    },
+)
+
+chOut, correctedFbOut = channel.Process(
+    txSignal,
+    outputPowerDbm=20.0,
+)
+rawFbZero, rawFbNinety = channel.GetLastFeedbackPhasePair()
+phasePairMetrics = channel.GetFeedbackIqCalibrationMetrics()
+
+# Reuse the frozen widely-linear filter with one FB capture per DPD update.
+channel.UpdateParameters(fbIqCompensationMode="filter")
+nextChOut, nextCorrectedFbOut = channel.Process(nextTxSignal)
+```
+
+`chOut` 仍然是最终主路性能观测，`correctedFbOut` 是去除FB自身I/Q镜像后的DPD训练观测。`phase_pair` 适合首次标定或慢速重标定；`filter` 适合常规高速DPD迭代。若未先成功运行 `phase_pair`，或PA对象被替换、采样率、FB增益/滤波/时延/IQ/ADC、移相响应、FIR长度、正则化强度或公开位宽改变，`filter` 模式会拒绝运行并要求重新标定。
+
+这里的 `outputPowerDbm` 仍然是干净PA输出参考面的功率目标。功率闭环不会把带FB增益、IQ误差或ADC限幅的raw反馈幅度误当成PA输出功率。
+
+四次独立等方差噪声经过ABBA平均后，直接或镜像估计的噪声方差相对单个AB采集对降低一半，即约3 dB；这是用两倍采集时间换来的，并不是无代价增益。
+
+#### 这种方法不能解决什么
+
+- 它能分离FB共轭镜像，但不能仅凭FB数据把直接FB频响 $C$ 与真实PA输出 $y$ 单独拆开。平坦 $C$ 可以由公共复增益补偿；频率选择性 $C$ 仍需要低功率环回或工厂标定。
+- 当前 `phaseResponses` 是全带宽和所有MIMO链共用的两个复标量。若实测移相器的幅相或群时延在带内明显变化，应先做状态频响均衡、分频段标定，或将实现扩展为逐频点2乘2求逆；不能把一对标量响应当成宽带真值。
+- FB三阶非线性、限幅、ADC削顶和混叠不是可逆的线性I/Q误差。出现这些现象时应先降低FB增益或提高ADC余量。
+- 两次或四次发送的PA输出必须具有足够重复性。若DPD输入、PA记忆初态、温度或电源状态随机变化，差异项仍会泄漏到镜像估计。
+- 相移器必须位于高隔离耦合支路，不能明显改变PA看到的负载；否则相位状态本身会改变PA输出。
+- ABBA只抑制缓慢的一阶漂移，不能消除随机跳变、快速相位噪声或明显的二阶热曲率。
+
+相关的90度切换与相移环回思路可参考：[IEEE双相位I/Q校准方法](https://doi.org/10.1109/TCSII.2013.2268412) 和 [phase-shifted local loopback研究](https://opus.lib.uts.edu.au/handle/10453/66712)。
+
 ## Q4：增广 GMP 会不会反而使 DPD 性能变差？
 
 会。增广 GMP 不是“始终更好”的开关，它用更多自由度换取对共轭失真的可表示性。

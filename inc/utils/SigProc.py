@@ -1883,6 +1883,791 @@ class PowerCalibration:
         return scaledMatrix
 
 
+class FeedbackIqCalibration:
+    """Separate and compensate feedback-receiver I/Q image leakage.
+
+    A phase switch placed before the imperfect feedback I/Q receiver produces
+    two observations of the same PA output.  For measured complex switch
+    responses ``r0`` and ``r1`` the observations, after removing their common
+    receiver DC offset, are
+
+    ``z0 = r0 * direct + conj(r0) * image`` and
+    ``z1 = r1 * direct + conj(r1) * image``.
+
+    Inverting this two-by-two system separates the physical direct observation
+    from the image created inside the feedback receiver without assuming that
+    the PA output is circular or free of transmitter I/Q imbalance.  A
+    regularized widely-linear FIR can subsequently reproduce the separated
+    direct observation from an ordinary single-state feedback capture.
+    """
+
+    def __init__(
+        self,
+        parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
+        **parameterOverrides: object,
+    ) -> None:
+        """Initialize phase-pair separation and FIR-calibration state.
+
+        Processing details:
+            Algorithm: Define all defaults inside the constructor, preserve a
+            live recognized view of the caller mapping, layer local overrides
+            with ``ChainMap`` precedence, validate the measured phase-switch
+            responses and numeric controls, and start without valid filter
+            coefficients.  Width zero selects normalized floating samples;
+            positive widths expose signed integer I/Q codes while all matrix
+            calculations remain floating point internally.
+
+        Args:
+            parameters: Optional live mapping of supported configuration keys.
+            width: Optional external I/Q component width. ``None`` retains the
+                internal 16-bit default, zero selects floating-point samples,
+                and a positive value selects fixed-point integer codes.
+            parameterOverrides: Highest-priority recognized configuration
+                values. Unknown values are warned about and ignored.
+
+        Returns:
+            result: None. The object is ready to separate a phase pair or fit a
+                widely-linear compensation filter.
+        """
+
+        self.defaultParameters: Mapping[str, object] = MappingProxyType(
+            {
+                "phaseResponses": (1.0 + 0.0j, 0.0 + 1.0j),
+                "commonDcOffset": 0.0 + 0.0j,
+                "filterLength": 1,
+                "regularization": 1.0e-6,
+                "width": 16,
+            }
+        )
+        directOverrides = dict(parameterOverrides)
+        if width is not None:
+            directOverrides["width"] = width
+        if parameters is not None and not isinstance(parameters, Mapping):
+            raise TypeError("parameters must be a mapping or None")
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "FeedbackIqCalibration",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
+            directOverrides,
+            self.defaultParameters,
+            "FeedbackIqCalibration",
+        )
+        self.parameters: ChainMap[str, object] = ChainMap(
+            recognizedOverrides,
+            externalParameters,
+            self.defaultParameters,
+        )
+        self.directFilterTaps: Optional[np.ndarray] = None
+        self.conjugateFilterTaps: Optional[np.ndarray] = None
+        self.calibrationMetrics: Optional[Dict[str, object]] = None
+        self.calibrationSignature: Optional[Tuple[object, ...]] = None
+        self.ValidateParameters()
+
+    @property
+    def Width(self) -> int:
+        """Return the configured public I/Q component width.
+
+        Processing details:
+            Algorithm: Read the highest-priority validated ChainMap value
+            without changing the caller-owned mapping.
+
+        Returns:
+            result: Zero for floating mode or a positive fixed-point width.
+        """
+
+        return cast(int, self.parameters["width"])
+
+    width = Width
+
+    def GetParameters(self) -> Dict[str, object]:
+        """Return a flattened snapshot of the effective configuration.
+
+        Processing details:
+            Algorithm: Validate live parameter layers and copy every resolved
+            ChainMap value into an ordinary dictionary.
+
+        Returns:
+            result: Independent dictionary containing every supported setting.
+        """
+
+        self.ValidateParameters()
+        return dict(self.parameters)
+
+    def UpdateParameters(self, **parameterOverrides: object) -> None:
+        """Update calibration parameters transactionally.
+
+        Processing details:
+            Algorithm: Filter unsupported names, apply recognized local values,
+            validate the complete resolved state, restore the prior local layer
+            on failure, and invalidate fitted taps after any successful change
+            that can alter signal scaling or the inverse-filter solution.
+
+        Args:
+            parameterOverrides: Supported highest-priority values to update.
+
+        Returns:
+            result: None. Successful changes affect subsequent operations.
+        """
+
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "FeedbackIqCalibration.UpdateParameters",
+        )
+        previousOverrides = dict(self.parameters.maps[0])
+        self.parameters.maps[0].update(recognizedOverrides)
+        try:
+            self.ValidateParameters()
+        except (TypeError, ValueError):
+            self.parameters.maps[0].clear()
+            self.parameters.maps[0].update(previousOverrides)
+            raise
+        if recognizedOverrides:
+            self.Invalidate()
+
+    def ValidateParameters(self) -> None:
+        """Validate phase responses, DC, FIR length, ridge, and width.
+
+        Processing details:
+            Algorithm: Require two finite nonzero measured complex switch
+            responses whose direct/conjugate mixing matrix is nonsingular,
+            require a finite complex common DC offset, a positive integer FIR
+            length, positive finite ridge strength, and a FixedPoint-supported
+            public width.
+
+        Returns:
+            result: None. Invalid recognized values raise explicit exceptions.
+        """
+
+        phaseResponses = self.parameters["phaseResponses"]
+        if isinstance(phaseResponses, (str, bytes)) or not (
+            isinstance(phaseResponses, Sequence)
+            or isinstance(phaseResponses, np.ndarray)
+        ):
+            raise TypeError(
+                "phaseResponses must be a sequence containing exactly two "
+                "finite complex responses"
+            )
+        if len(phaseResponses) != 2:
+            raise ValueError(
+                "phaseResponses must contain exactly two finite complex "
+                "responses for the nominal zero- and ninety-degree states"
+            )
+        responseArray = np.asarray(phaseResponses, dtype=np.complex128)
+        if not np.all(np.isfinite(responseArray)):
+            raise ValueError("phaseResponses must contain only finite values")
+        if np.any(np.abs(responseArray) <= np.finfo(float).tiny):
+            raise ValueError("phaseResponses cannot contain a zero response")
+        separationMatrix = np.asarray(
+            (
+                (responseArray[0], np.conj(responseArray[0])),
+                (responseArray[1], np.conj(responseArray[1])),
+            ),
+            dtype=np.complex128,
+        )
+        determinantMagnitude = float(abs(np.linalg.det(separationMatrix)))
+        responseScale = float(np.max(np.abs(responseArray)))
+        if determinantMagnitude <= np.finfo(float).eps * responseScale**2:
+            raise ValueError(
+                "phaseResponses produce a singular direct/image separation "
+                "matrix; their relative phase cannot be 0 or 180 degrees"
+            )
+
+        try:
+            commonDcOffset = complex(self.parameters["commonDcOffset"])
+        except (TypeError, ValueError, OverflowError) as error:
+            raise TypeError(
+                "commonDcOffset must be one finite complex scalar"
+            ) from error
+        if not np.isfinite(commonDcOffset):
+            raise ValueError("commonDcOffset must be finite")
+
+        filterLength = self.parameters["filterLength"]
+        if (
+            not isinstance(filterLength, int)
+            or isinstance(filterLength, bool)
+            or filterLength < 1
+        ):
+            raise ValueError(
+                "filterLength must be an integer in [1, +inf) taps"
+            )
+        regularization = self.parameters["regularization"]
+        if (
+            not isinstance(regularization, (int, float))
+            or isinstance(regularization, bool)
+            or not np.isfinite(regularization)
+            or float(regularization) <= 0.0
+        ):
+            raise ValueError(
+                "regularization must be a finite real number in (0, +inf)"
+            )
+        width = self.parameters["width"]
+        if not isinstance(width, int) or isinstance(width, bool):
+            raise TypeError("width must be an integer in [0, 53] bits")
+        FixedPoint(width)
+
+    def Invalidate(self) -> None:
+        """Discard fitted compensation taps and calibration diagnostics.
+
+        Processing details:
+            Algorithm: Clear every coefficient and metric reference together so
+            ``Apply`` can never mix an old direct tap vector with a new
+            conjugate tap vector or changed configuration.
+
+        Returns:
+            result: None. A later ``Calibrate`` call is required before Apply.
+        """
+
+        self.directFilterTaps = None
+        self.conjugateFilterTaps = None
+        self.calibrationMetrics = None
+        self.calibrationSignature = None
+
+    def CalibrationSignature(self) -> Tuple[object, ...]:
+        """Return an immutable identity for the active inverse definition.
+
+        Processing details:
+            Algorithm: Normalize measured phase responses, common DC, FIR
+            length, ridge strength, and external width into scalar tuple values
+            so live caller-owned parameter mutations can be detected after a
+            fit rather than silently reusing stale taps.
+
+        Returns:
+            result: Immutable tuple covering every calibration-sensitive value.
+        """
+
+        self.ValidateParameters()
+        phaseResponses = cast(
+            Sequence[complex], self.parameters["phaseResponses"]
+        )
+        return (
+            tuple(complex(responseValue) for responseValue in phaseResponses),
+            complex(self.parameters["commonDcOffset"]),
+            int(self.parameters["filterLength"]),
+            float(self.parameters["regularization"]),
+            int(self.parameters["width"]),
+        )
+
+    def RequireCurrentCalibration(self) -> None:
+        """Reject missing or stale FIR state before exposing or applying it.
+
+        Processing details:
+            Algorithm: Require taps, metrics, and the saved configuration
+            signature atomically, compare that signature with all current live
+            ChainMap values, and clear the complete fit before raising when any
+            caller-owned parameter changed after calibration.
+
+        Returns:
+            result: None. Successful return guarantees current complete taps.
+        """
+
+        if (
+            self.directFilterTaps is None
+            or self.conjugateFilterTaps is None
+            or self.calibrationMetrics is None
+            or self.calibrationSignature is None
+        ):
+            raise RuntimeError(
+                "Calibrate must complete before using the feedback I/Q filter"
+            )
+        if self.calibrationSignature != self.CalibrationSignature():
+            self.Invalidate()
+            raise RuntimeError(
+                "the feedback I/Q filter is stale because phaseResponses, "
+                "commonDcOffset, filterLength, regularization, or width "
+                "changed; run Calibrate again"
+            )
+
+    @staticmethod
+    def ValidateSignal(inputSignal: np.ndarray, signalName: str) -> np.ndarray:
+        """Validate one finite vector or samples-by-chains matrix.
+
+        Processing details:
+            Algorithm: Convert array-like input to complex128, preserve a
+            one-dimensional SISO vector or two-dimensional MIMO matrix, and
+            reject empty, scalar, higher-dimensional, or nonfinite data.
+
+        Args:
+            inputSignal: Public or internal complex signal to validate.
+            signalName: Name included in an actionable validation message.
+
+        Returns:
+            result: Finite complex128 array with its vector or matrix shape.
+        """
+
+        complexSignal = np.asarray(inputSignal, dtype=np.complex128)
+        if complexSignal.ndim not in (1, 2):
+            raise ValueError(
+                f"{signalName} must be a one-dimensional vector or a "
+                "two-dimensional samples-by-chains matrix"
+            )
+        if complexSignal.size == 0 or complexSignal.shape[0] == 0:
+            raise ValueError(f"{signalName} cannot be empty")
+        if not np.all(np.isfinite(complexSignal)):
+            raise ValueError(f"{signalName} contains NaN or infinite values")
+        return complexSignal
+
+    def DecodeSignal(
+        self, inputSignal: np.ndarray, signalName: str
+    ) -> np.ndarray:
+        """Decode one public signal into normalized floating samples.
+
+        Processing details:
+            Algorithm: Validate shape and finiteness, then use the configured
+            FixedPoint boundary to decode integer codes or copy floating data.
+
+        Args:
+            inputSignal: Public complex samples or fixed integer I/Q codes.
+            signalName: Name included in validation errors.
+
+        Returns:
+            result: Normalized complex128 signal with unchanged shape.
+        """
+
+        self.ValidateParameters()
+        validatedSignal = self.ValidateSignal(inputSignal, signalName)
+        return FixedPoint(self.width).DecodeComplex(validatedSignal)
+
+    def EncodeSignal(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Encode normalized floating samples at the public boundary.
+
+        Processing details:
+            Algorithm: Use the configured FixedPoint converter to preserve
+            floating values in width-zero mode or emit saturated signed I/Q
+            integer codes in positive-width mode.
+
+        Args:
+            inputSignal: Finite normalized complex vector or matrix.
+
+        Returns:
+            result: Public complex128 array following the configured convention.
+        """
+
+        return FixedPoint(self.width).EncodeComplex(inputSignal)
+
+    def ResolvePhaseResponses(self) -> Tuple[complex, complex]:
+        """Return measured zero- and ninety-state complex responses.
+
+        Processing details:
+            Algorithm: Validate the live parameter mapping and copy both values
+            into immutable Python complex scalars.
+
+        Returns:
+            result: Complex response of the first state followed by the second.
+        """
+
+        self.ValidateParameters()
+        phaseResponses = cast(
+            Sequence[complex], self.parameters["phaseResponses"]
+        )
+        return complex(phaseResponses[0]), complex(phaseResponses[1])
+
+    def SeparateFloatingPhasePair(
+        self,
+        phaseZeroSignal: np.ndarray,
+        phaseNinetySignal: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Separate normalized direct and image arrays without re-encoding.
+
+        Processing details:
+            Algorithm: Subtract the configured common receiver DC from both
+            captures, form the measured two-state response matrix, and solve
+            its exact two-by-two complex system simultaneously for every sample
+            and every MIMO chain.
+
+        Args:
+            phaseZeroSignal: Normalized first-state feedback capture.
+            phaseNinetySignal: Normalized second-state feedback capture.
+
+        Returns:
+            result: Normalized ``(directSignal, imageSignal)`` arrays.
+        """
+
+        zeroSignal = self.ValidateSignal(
+            phaseZeroSignal, "phaseZeroSignal"
+        )
+        ninetySignal = self.ValidateSignal(
+            phaseNinetySignal, "phaseNinetySignal"
+        )
+        if zeroSignal.shape != ninetySignal.shape:
+            raise ValueError(
+                "phaseZeroSignal and phaseNinetySignal must have identical "
+                "shapes"
+            )
+        zeroResponse, ninetyResponse = self.ResolvePhaseResponses()
+        separationMatrix = np.asarray(
+            (
+                (zeroResponse, np.conj(zeroResponse)),
+                (ninetyResponse, np.conj(ninetyResponse)),
+            ),
+            dtype=np.complex128,
+        )
+        commonDcOffset = complex(self.parameters["commonDcOffset"])
+        stackedCaptures = np.stack(
+            (
+                zeroSignal - commonDcOffset,
+                ninetySignal - commonDcOffset,
+            ),
+            axis=0,
+        )
+        flattenedCaptures = stackedCaptures.reshape(2, -1)
+        separatedComponents = np.linalg.solve(
+            separationMatrix, flattenedCaptures
+        ).reshape(stackedCaptures.shape)
+        return (
+            np.asarray(separatedComponents[0], dtype=np.complex128),
+            np.asarray(separatedComponents[1], dtype=np.complex128),
+        )
+
+    def SeparatePhasePair(
+        self,
+        phaseZeroSignal: np.ndarray,
+        phaseNinetySignal: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Separate direct and image components from two public captures.
+
+        Processing details:
+            Algorithm: Decode both public arrays exactly once, solve the
+            measured complex phase-response system after common-DC removal,
+            then independently encode the separated direct and image arrays.
+
+        Args:
+            phaseZeroSignal: Feedback capture in the nominal zero-degree state.
+            phaseNinetySignal: Feedback capture in the nominal ninety-degree
+                state, acquired from the same PA output waveform.
+
+        Returns:
+            result: Public ``(directSignal, imageSignal)`` arrays whose shape and
+                fixed/floating representation match the inputs' module mode.
+        """
+
+        decodedZeroSignal = self.DecodeSignal(
+            phaseZeroSignal, "phaseZeroSignal"
+        )
+        decodedNinetySignal = self.DecodeSignal(
+            phaseNinetySignal, "phaseNinetySignal"
+        )
+        directSignal, imageSignal = self.SeparateFloatingPhasePair(
+            decodedZeroSignal, decodedNinetySignal
+        )
+        return self.EncodeSignal(directSignal), self.EncodeSignal(imageSignal)
+
+    def SeparateAbbaPhasePair(
+        self,
+        phaseZeroFirstSignal: np.ndarray,
+        phaseNinetyFirstSignal: np.ndarray,
+        phaseNinetySecondSignal: np.ndarray,
+        phaseZeroSecondSignal: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Separate an ABBA capture sequence while suppressing linear drift.
+
+        Processing details:
+            Algorithm: Decode the zero/ninety/ninety/zero sequence, require all
+            shapes to match, average the two outer zero-state captures and the
+            two inner ninety-state captures, solve the phase-pair system, and
+            encode both components. Symmetric averaging cancels first-order
+            gain and phase drift about the sequence midpoint.
+
+        Args:
+            phaseZeroFirstSignal: First nominal zero-degree capture.
+            phaseNinetyFirstSignal: First nominal ninety-degree capture.
+            phaseNinetySecondSignal: Second nominal ninety-degree capture.
+            phaseZeroSecondSignal: Final nominal zero-degree capture.
+
+        Returns:
+            result: Public drift-reduced ``(directSignal, imageSignal)`` arrays.
+        """
+
+        decodedSignals = (
+            self.DecodeSignal(
+                phaseZeroFirstSignal, "phaseZeroFirstSignal"
+            ),
+            self.DecodeSignal(
+                phaseNinetyFirstSignal, "phaseNinetyFirstSignal"
+            ),
+            self.DecodeSignal(
+                phaseNinetySecondSignal, "phaseNinetySecondSignal"
+            ),
+            self.DecodeSignal(
+                phaseZeroSecondSignal, "phaseZeroSecondSignal"
+            ),
+        )
+        expectedShape = decodedSignals[0].shape
+        if any(
+            decodedSignal.shape != expectedShape
+            for decodedSignal in decodedSignals[1:]
+        ):
+            raise ValueError(
+                "all four ABBA feedback captures must have identical shapes"
+            )
+        averagedZeroSignal = 0.5 * (
+            decodedSignals[0] + decodedSignals[3]
+        )
+        averagedNinetySignal = 0.5 * (
+            decodedSignals[1] + decodedSignals[2]
+        )
+        directSignal, imageSignal = self.SeparateFloatingPhasePair(
+            averagedZeroSignal, averagedNinetySignal
+        )
+        return self.EncodeSignal(directSignal), self.EncodeSignal(imageSignal)
+
+    @staticmethod
+    def BuildWidelyLinearBasis(
+        inputSignal: np.ndarray, filterLength: int
+    ) -> np.ndarray:
+        """Build causal direct and conjugate FIR regressors for one signal.
+
+        Processing details:
+            Algorithm: Reshape SISO input to one column, create one zero-padded
+            causal delayed copy per FIR tap and chain, append the conjugates in
+            the same delay order, and vertically stack chain records so a
+            common receiver filter is estimated from all available samples.
+
+        Args:
+            inputSignal: Normalized SISO vector or samples-by-chains matrix.
+            filterLength: Positive number of taps in each widely-linear branch.
+
+        Returns:
+            result: Complex regression matrix with ``2 * filterLength`` columns.
+        """
+
+        inputArray = FeedbackIqCalibration.ValidateSignal(
+            inputSignal, "inputSignal"
+        )
+        inputMatrix = (
+            inputArray.reshape(-1, 1)
+            if inputArray.ndim == 1
+            else inputArray
+        )
+        chainBasisMatrices = []
+        for chainIndex in range(inputMatrix.shape[1]):
+            inputColumn = inputMatrix[:, chainIndex]
+            directBasis = np.zeros(
+                (inputColumn.size, filterLength), dtype=np.complex128
+            )
+            for tapIndex in range(filterLength):
+                if tapIndex == 0:
+                    directBasis[:, tapIndex] = inputColumn
+                elif tapIndex < inputColumn.size:
+                    directBasis[tapIndex:, tapIndex] = inputColumn[
+                        : inputColumn.size - tapIndex
+                    ]
+            chainBasisMatrices.append(
+                np.hstack((directBasis, np.conj(directBasis)))
+            )
+        return np.vstack(chainBasisMatrices)
+
+    def Calibrate(
+        self,
+        phaseZeroSignal: np.ndarray,
+        phaseNinetySignal: np.ndarray,
+    ) -> Dict[str, object]:
+        """Fit a widely-linear FIR from raw zero-state FB to direct FB.
+
+        Processing details:
+            Algorithm: Decode both captures, separate direct and image using
+            the measured phase responses, subtract common DC from the raw
+            zero-state input, build shared causal direct/conjugate regressors,
+            solve a scale-normalized ridge system, cache both tap vectors, and
+            report separation IRR, fit NMSE, and numerical conditioning.
+
+        Args:
+            phaseZeroSignal: Raw feedback capture in the first switch state.
+            phaseNinetySignal: Raw feedback capture in the second switch state.
+
+        Returns:
+            result: Defensive calibration-metric dictionary. Fitted taps are
+                retrieved separately through ``GetFilterTaps``.
+        """
+
+        decodedZeroSignal = self.DecodeSignal(
+            phaseZeroSignal, "phaseZeroSignal"
+        )
+        decodedNinetySignal = self.DecodeSignal(
+            phaseNinetySignal, "phaseNinetySignal"
+        )
+        directSignal, imageSignal = self.SeparateFloatingPhasePair(
+            decodedZeroSignal, decodedNinetySignal
+        )
+        commonDcOffset = complex(self.parameters["commonDcOffset"])
+        centeredZeroSignal = decodedZeroSignal - commonDcOffset
+        filterLength = int(self.parameters["filterLength"])
+        basisMatrix = self.BuildWidelyLinearBasis(
+            centeredZeroSignal, filterLength
+        )
+        directMatrix = (
+            directSignal.reshape(-1, 1)
+            if directSignal.ndim == 1
+            else directSignal
+        )
+        targetVector = np.concatenate(
+            [
+                directMatrix[:, chainIndex]
+                for chainIndex in range(directMatrix.shape[1])
+            ]
+        )
+        normalMatrix = basisMatrix.conj().T @ basisMatrix
+        diagonalScale = max(
+            float(np.mean(np.real(np.diag(normalMatrix)))),
+            np.finfo(float).tiny,
+        )
+        ridgeStrength = (
+            float(self.parameters["regularization"]) * diagonalScale
+        )
+        regularizedMatrix = normalMatrix + ridgeStrength * np.eye(
+            normalMatrix.shape[0], dtype=np.complex128
+        )
+        rightHandSide = basisMatrix.conj().T @ targetVector
+        fittedCoefficients = np.linalg.solve(
+            regularizedMatrix, rightHandSide
+        )
+        fittedSignal = basisMatrix @ fittedCoefficients
+        residualSignal = targetVector - fittedSignal
+        directPower = float(np.mean(np.abs(targetVector) ** 2))
+        imagePower = float(np.mean(np.abs(imageSignal) ** 2))
+        rawPower = float(np.mean(np.abs(centeredZeroSignal) ** 2))
+        residualPower = float(np.mean(np.abs(residualSignal) ** 2))
+        tinyPower = np.finfo(float).tiny
+        zeroResponse, ninetyResponse = self.ResolvePhaseResponses()
+        phaseMatrix = np.asarray(
+            (
+                (zeroResponse, np.conj(zeroResponse)),
+                (ninetyResponse, np.conj(ninetyResponse)),
+            ),
+            dtype=np.complex128,
+        )
+        self.directFilterTaps = np.asarray(
+            fittedCoefficients[:filterLength], dtype=np.complex128
+        ).copy()
+        self.conjugateFilterTaps = np.asarray(
+            fittedCoefficients[filterLength:], dtype=np.complex128
+        ).copy()
+        self.calibrationMetrics = {
+            "calibrated": True,
+            "sampleCount": int(targetVector.size),
+            "chainCount": int(directMatrix.shape[1]),
+            "filterLength": filterLength,
+            "regularization": float(self.parameters["regularization"]),
+            "ridgeStrength": float(ridgeStrength),
+            "directPower": directPower,
+            "imagePower": imagePower,
+            "rawZeroStatePower": rawPower,
+            "imageToDirectDb": float(
+                10.0
+                * np.log10(max(imagePower, tinyPower) / max(directPower, tinyPower))
+            ),
+            "fitNmseDb": float(
+                10.0
+                * np.log10(
+                    max(residualPower, tinyPower)
+                    / max(directPower, tinyPower)
+                )
+            ),
+            "normalMatrixConditionNumber": float(
+                np.linalg.cond(regularizedMatrix)
+            ),
+            "phaseMatrixConditionNumber": float(np.linalg.cond(phaseMatrix)),
+            "commonDcOffset": complex(commonDcOffset),
+            "phaseResponses": (zeroResponse, ninetyResponse),
+        }
+        self.calibrationSignature = self.CalibrationSignature()
+        return self.GetCalibrationMetrics()
+
+    def Apply(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Apply the fitted widely-linear FIR to one raw feedback capture.
+
+        Processing details:
+            Algorithm: Require a completed calibration, decode the public raw
+            feedback array, subtract the same common DC used for calibration,
+            convolve causal direct and conjugate branches independently for
+            every chain, sum them, and encode the corrected direct observation.
+
+        Args:
+            inputSignal: Raw first-state feedback vector or matrix.
+
+        Returns:
+            result: Public compensated feedback signal with matching shape and
+                the configured floating or integer-code representation.
+        """
+
+        self.RequireCurrentCalibration()
+        if self.directFilterTaps is None or self.conjugateFilterTaps is None:
+            raise RuntimeError("feedback I/Q filter state is incomplete")
+        decodedSignal = self.DecodeSignal(inputSignal, "inputSignal")
+        commonDcOffset = complex(self.parameters["commonDcOffset"])
+        centeredSignal = decodedSignal - commonDcOffset
+        inputWasVector = centeredSignal.ndim == 1
+        inputMatrix = (
+            centeredSignal.reshape(-1, 1)
+            if inputWasVector
+            else centeredSignal
+        )
+        correctedMatrix = np.empty_like(inputMatrix)
+        for chainIndex in range(inputMatrix.shape[1]):
+            inputColumn = inputMatrix[:, chainIndex]
+            directOutput = np.convolve(
+                inputColumn, self.directFilterTaps, mode="full"
+            )[: inputColumn.size]
+            conjugateOutput = np.convolve(
+                np.conj(inputColumn),
+                self.conjugateFilterTaps,
+                mode="full",
+            )[: inputColumn.size]
+            correctedMatrix[:, chainIndex] = directOutput + conjugateOutput
+        correctedSignal = (
+            correctedMatrix[:, 0] if inputWasVector else correctedMatrix
+        )
+        return self.EncodeSignal(correctedSignal)
+
+    def GetFilterTaps(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return defensive copies of fitted direct and conjugate FIR taps.
+
+        Processing details:
+            Algorithm: Require a completed atomic calibration and copy both
+            coefficient vectors so external mutation cannot corrupt later Apply
+            operations.
+
+        Returns:
+            result: ``(directFilterTaps, conjugateFilterTaps)`` complex arrays.
+        """
+
+        self.RequireCurrentCalibration()
+        if self.directFilterTaps is None or self.conjugateFilterTaps is None:
+            raise RuntimeError("feedback I/Q filter state is incomplete")
+        return self.directFilterTaps.copy(), self.conjugateFilterTaps.copy()
+
+    def GetCalibrationMetrics(self) -> Dict[str, object]:
+        """Return a defensive copy of the latest calibration diagnostics.
+
+        Processing details:
+            Algorithm: Require a completed calibration, copy the ordinary
+            scalar/tuple metric mapping, and defensively copy any array-valued
+            entry should future diagnostics add one.
+
+        Returns:
+            result: Independent dictionary describing separation and FIR fit.
+        """
+
+        self.RequireCurrentCalibration()
+        if self.calibrationMetrics is None:
+            raise RuntimeError("feedback I/Q calibration metrics are missing")
+        return {
+            metricName: (
+                metricValue.copy()
+                if isinstance(metricValue, np.ndarray)
+                else metricValue
+            )
+            for metricName, metricValue in self.calibrationMetrics.items()
+        }
+
+
 @dataclass(frozen=True)
 class SignalProcessingResult:
     """Store one signal-processing pass and all estimated impairments."""

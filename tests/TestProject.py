@@ -83,7 +83,11 @@ from inc.lib.ParseWifi import (
     DescriptorLdpcPhysicalLayout,
     ParseWifi,
 )
-from inc.utils.SigProc import PowerCalibration, SigProc
+from inc.utils.SigProc import (
+    FeedbackIqCalibration,
+    PowerCalibration,
+    SigProc,
+)
 from inc.lib.WaveGenWifi import (
     NormalizeFrameFormat,
     WaveGenWifi,
@@ -5421,6 +5425,642 @@ def CheckPeriodicThermalEdgeCases() -> None:
     )
 
 
+def CheckFeedbackIqPhasePairCalibration() -> None:
+    """Verify 0/90-degree FB I/Q separation and Channel integration.
+
+    Processing details:
+        Algorithm: Solve ideal and measured nonideal phase-pair systems,
+        prove that Tx/PA image content remains in the direct component, use
+        symmetric ABBA acquisition to cancel linear complex drift, remove a
+        known common receiver DC offset, fit and apply a widely-linear FIR,
+        reject stale live-parameter coefficients, then exercise Channel
+        phase-pair and cached-filter modes through floating SISO, fixed-point
+        MIMO, thermal scheduling, and the dual-output ILC adapter. Finally,
+        reject invalid modes, singular phase states, and filter controls.
+
+    Returns:
+        result: None. Assertions expose calibration, routing, state, shape,
+            fixed-point, and validation regressions.
+    """
+
+    randomGenerator = np.random.default_rng(20260826)
+    sampleCount = 2048
+    sourceSignal = 0.16 * (
+        randomGenerator.normal(size=sampleCount)
+        + 1j * randomGenerator.normal(size=sampleCount)
+    )
+
+    # The direct component is the complete physical PA observation, including
+    # a deliberate Tx/PA-created conjugate term and nonlinear envelope term.
+    # Only the second component may contain the image created by the FB mixer.
+    transmitterImageCoefficient = 0.11 - 0.025j
+    physicalPaOutput = (
+        sourceSignal
+        + transmitterImageCoefficient * np.conj(sourceSignal)
+        + (0.08 - 0.015j)
+        * sourceSignal
+        * np.abs(sourceSignal) ** 2
+    )
+    feedbackDirectCoefficient = 0.96 + 0.07j
+    feedbackImageCoefficient = 0.075 - 0.028j
+    expectedDirectSignal = feedbackDirectCoefficient * physicalPaOutput
+    expectedImageSignal = (
+        feedbackImageCoefficient * np.conj(physicalPaOutput)
+    )
+    idealZeroCapture = expectedDirectSignal + expectedImageSignal
+    idealNinetyCapture = (
+        1j * expectedDirectSignal - 1j * expectedImageSignal
+    )
+    idealCalibration = FeedbackIqCalibration(
+        parameters={"width": 0}
+    )
+    separatedDirectSignal, separatedImageSignal = (
+        idealCalibration.SeparatePhasePair(
+            idealZeroCapture,
+            idealNinetyCapture,
+        )
+    )
+    assert np.allclose(
+        separatedDirectSignal,
+        expectedDirectSignal,
+        rtol=1.0e-13,
+        atol=1.0e-13,
+    )
+    assert np.allclose(
+        separatedImageSignal,
+        expectedImageSignal,
+        rtol=1.0e-13,
+        atol=1.0e-13,
+    )
+    assert not np.allclose(
+        separatedDirectSignal,
+        feedbackDirectCoefficient * sourceSignal,
+    )
+
+    # Measured switch responses need not have equal amplitude or an exact
+    # ninety-degree separation. Matrix inversion must recover both components
+    # and a known common receiver DC term must be removed before solving.
+    zeroPhaseResponse = 0.93 * np.exp(1j * 0.08)
+    ninetyPhaseResponse = 1.07 * np.exp(
+        1j * (0.5 * np.pi - 0.06)
+    )
+    commonDcOffset = 0.021 - 0.014j
+    nonidealZeroCapture = (
+        zeroPhaseResponse * expectedDirectSignal
+        + np.conj(zeroPhaseResponse) * expectedImageSignal
+        + commonDcOffset
+    )
+    nonidealNinetyCapture = (
+        ninetyPhaseResponse * expectedDirectSignal
+        + np.conj(ninetyPhaseResponse) * expectedImageSignal
+        + commonDcOffset
+    )
+    nonidealCalibration = FeedbackIqCalibration(
+        parameters={
+            "phaseResponses": (
+                zeroPhaseResponse,
+                ninetyPhaseResponse,
+            ),
+            "commonDcOffset": commonDcOffset,
+            "width": 0,
+        }
+    )
+    nonidealDirectSignal, nonidealImageSignal = (
+        nonidealCalibration.SeparatePhasePair(
+            nonidealZeroCapture,
+            nonidealNinetyCapture,
+        )
+    )
+    assert np.allclose(
+        nonidealDirectSignal,
+        expectedDirectSignal,
+        rtol=2.0e-13,
+        atol=2.0e-13,
+    )
+    assert np.allclose(
+        nonidealImageSignal,
+        expectedImageSignal,
+        rtol=2.0e-13,
+        atol=2.0e-13,
+    )
+
+    # A simple AB pair turns any capture-to-capture gain or phase change into
+    # a false image. Symmetric A-B-B-A averaging gives both states the same
+    # effective center time and cancels an exactly linear complex drift.
+    driftSignal = sourceSignal[:512]
+    complexDriftPerInterval = 0.012 + 0.017j
+    zeroFirstCapture = (
+        1.0 - 1.5 * complexDriftPerInterval
+    ) * driftSignal
+    ninetyFirstCapture = (
+        1.0 - 0.5 * complexDriftPerInterval
+    ) * 1j * driftSignal
+    ninetySecondCapture = (
+        1.0 + 0.5 * complexDriftPerInterval
+    ) * 1j * driftSignal
+    zeroSecondCapture = (
+        1.0 + 1.5 * complexDriftPerInterval
+    ) * driftSignal
+    _, ordinaryAbImage = idealCalibration.SeparatePhasePair(
+        zeroFirstCapture,
+        ninetyFirstCapture,
+    )
+    abbaDirectSignal, abbaImageSignal = (
+        idealCalibration.SeparateAbbaPhasePair(
+            zeroFirstCapture,
+            ninetyFirstCapture,
+            ninetySecondCapture,
+            zeroSecondCapture,
+        )
+    )
+    ordinaryImageRms = float(
+        np.sqrt(np.mean(np.abs(ordinaryAbImage) ** 2))
+    )
+    abbaImageRms = float(
+        np.sqrt(np.mean(np.abs(abbaImageSignal) ** 2))
+    )
+    assert ordinaryImageRms > 1.0e-3
+    assert abbaImageRms < ordinaryImageRms * 1.0e-10
+    assert np.allclose(
+        abbaDirectSignal,
+        driftSignal,
+        rtol=1.0e-13,
+        atol=1.0e-13,
+    )
+
+    # A delayed image path requires a widely-linear FIR, not only one scalar
+    # conjugate coefficient. The fitted filter must materially improve a new
+    # single-state capture and expose stable diagnostic and tap snapshots.
+    learningSignal = 0.14 * (
+        randomGenerator.normal(size=4096)
+        + 1j * randomGenerator.normal(size=4096)
+    )
+    feedbackImageTaps = np.asarray(
+        (0.12 + 0.03j, -0.04 + 0.02j, 0.02 - 0.01j),
+        dtype=np.complex128,
+    )
+    delayedImageSignal = np.convolve(
+        np.conj(learningSignal),
+        feedbackImageTaps,
+        mode="full",
+    )[: learningSignal.size]
+    learningZeroCapture = learningSignal + delayedImageSignal
+    learningNinetyCapture = (
+        1j * learningSignal - 1j * delayedImageSignal
+    )
+    firCalibration = FeedbackIqCalibration(
+        parameters={
+            "filterLength": 9,
+            "regularization": 1.0e-10,
+            "width": 0,
+        }
+    )
+    firMetrics = firCalibration.Calibrate(
+        learningZeroCapture,
+        learningNinetyCapture,
+    )
+    correctedLearningSignal = firCalibration.Apply(
+        learningZeroCapture
+    )
+    rawResidualPower = float(
+        np.mean(np.abs(learningZeroCapture - learningSignal) ** 2)
+    )
+    correctedResidualPower = float(
+        np.mean(np.abs(correctedLearningSignal - learningSignal) ** 2)
+    )
+    directFilterTaps, conjugateFilterTaps = (
+        firCalibration.GetFilterTaps()
+    )
+    assert firMetrics["calibrated"] is True
+    assert firMetrics["sampleCount"] == learningSignal.size
+    assert firMetrics["chainCount"] == 1
+    assert firMetrics["filterLength"] == 9
+    assert firMetrics["imageToDirectDb"] < -15.0
+    assert firMetrics["fitNmseDb"] < -100.0
+    assert directFilterTaps.shape == (9,)
+    assert conjugateFilterTaps.shape == (9,)
+    assert correctedResidualPower < rawResidualPower * 1.0e-8
+    copiedMetrics = firCalibration.GetCalibrationMetrics()
+    copiedDirectTaps, copiedConjugateTaps = (
+        firCalibration.GetFilterTaps()
+    )
+    copiedDirectTaps[0] = 99.0 + 0.0j
+    copiedConjugateTaps[0] = 99.0 + 0.0j
+    assert copiedMetrics == firMetrics
+    retainedDirectTaps, retainedConjugateTaps = (
+        firCalibration.GetFilterTaps()
+    )
+    assert retainedDirectTaps[0] != copiedDirectTaps[0]
+    assert retainedConjugateTaps[0] != copiedConjugateTaps[0]
+
+    # Every live ChainMap input that changes the fitted numerical meaning must
+    # make Apply reject stale taps. UpdateParameters follows the same rule.
+    liveMutationCases = (
+        (
+            "phaseResponses",
+            (1.0 + 0.0j, np.exp(1j * 1.42)),
+        ),
+        ("commonDcOffset", 0.001 + 0.002j),
+        ("filterLength", 3),
+        ("regularization", 2.0e-6),
+        ("width", 16),
+    )
+    for parameterName, changedValue in liveMutationCases:
+        liveParameters = {
+            "phaseResponses": (1.0 + 0.0j, 0.0 + 1.0j),
+            "commonDcOffset": 0.0 + 0.0j,
+            "filterLength": 1,
+            "regularization": 1.0e-6,
+            "width": 0,
+        }
+        liveCalibration = FeedbackIqCalibration(
+            parameters=liveParameters
+        )
+        liveCalibration.Calibrate(
+            idealZeroCapture,
+            idealNinetyCapture,
+        )
+        liveParameters[parameterName] = changedValue
+        try:
+            liveCalibration.Apply(idealZeroCapture)
+        except RuntimeError as error:
+            assert "Calibrate" in str(error) or "stale" in str(error)
+        else:
+            raise AssertionError(
+                "live FeedbackIqCalibration change reused stale taps: "
+                f"{parameterName}"
+            )
+        for staleAccessor in (
+            liveCalibration.GetFilterTaps,
+            liveCalibration.GetCalibrationMetrics,
+        ):
+            try:
+                staleAccessor()
+            except RuntimeError as error:
+                assert "Calibrate" in str(error) or "stale" in str(error)
+            else:
+                raise AssertionError(
+                    "live FeedbackIqCalibration change exposed stale "
+                    f"artifacts: {parameterName}"
+                )
+    updatedCalibration = FeedbackIqCalibration(
+        parameters={"width": 0}
+    )
+    updatedCalibration.Calibrate(
+        idealZeroCapture,
+        idealNinetyCapture,
+    )
+    updatedCalibration.UpdateParameters(regularization=3.0e-6)
+    try:
+        updatedCalibration.Apply(idealZeroCapture)
+    except RuntimeError as error:
+        assert "Calibrate" in str(error)
+    else:
+        raise AssertionError("UpdateParameters retained stale FB I/Q taps")
+
+    # Channel must advance one physical PA thermal period and derive both raw
+    # FB states from that one common PA output. Its phase-pair return is the
+    # separated direct term, while diagnostics retain both raw observations.
+    thermalSampleRateHz = 100.0e3
+    thermalInput = 0.21 * (
+        randomGenerator.normal(size=512)
+        + 1j * randomGenerator.normal(size=512)
+    )
+    phasePairThermalConfig = ThermalConfig(
+        enabled=True,
+        modelName="single_rc",
+        sampleRateHz=thermalSampleRateHz,
+        thermalResistancesCPerW=(12.0,),
+        thermalTimeConstantsSec=(0.02,),
+        thermalUpdateIntervalSamples=32,
+        idleDissipatedPowerW=0.0,
+        referenceOutputPowerDbm=25.0,
+        gainTemperatureCoefficientDbPerC=-0.01,
+        maximumJunctionTemperatureC=150.0,
+    )
+    thermalPhasePairChannel = Channel(
+        paModel=PaModel(
+            parameters={
+                "modelName": "wiener",
+                "thermalConfig": phasePairThermalConfig,
+                "width": 0,
+            }
+        ),
+        parameters={
+            "sampleMode": "fb",
+            "sampleRateHz": thermalSampleRateHz,
+            "thermalRunMode": "transient",
+            "thermalDutyCycle": 1.0,
+            "fbIqGainImbalanceDb": 1.4,
+            "fbIqPhaseImbalanceDegrees": 6.0,
+            "fbDcOffset": 0.012 - 0.008j,
+            "fbPhasePairResponses": (
+                zeroPhaseResponse,
+                ninetyPhaseResponse,
+            ),
+            "fbThirdOrderCoefficient": 0.08 - 0.02j,
+            "fbIqCompensationMode": "phase_pair",
+            "fbIqCompensationFilterLength": 5,
+            "fbIqCompensationRegularization": 1.0e-10,
+            "width": 0,
+        },
+    )
+    if thermalPhasePairChannel.paModel is None:
+        raise AssertionError("thermal phase-pair Channel requires a PA")
+    originalThermalProcessor = getattr(
+        thermalPhasePairChannel.paModel,
+        "ProcessThermalPeriodFloating",
+    )
+    originalFeedbackStateProcessor = (
+        thermalPhasePairChannel.ApplyFeedbackChannelEffectsAtResponse
+    )
+    with patch.object(
+        thermalPhasePairChannel.paModel,
+        "ProcessThermalPeriodFloating",
+        wraps=originalThermalProcessor,
+    ) as thermalProcessorMock, patch.object(
+        thermalPhasePairChannel,
+        "ApplyFeedbackChannelEffectsAtResponse",
+        wraps=originalFeedbackStateProcessor,
+    ) as feedbackStateMock:
+        thermalChannelOutput, thermalFeedbackOutput = (
+            thermalPhasePairChannel.Process(thermalInput)
+        )
+        assert thermalProcessorMock.call_count == 1
+        assert feedbackStateMock.call_count == 2
+    thermalMetrics = thermalPhasePairChannel.GetThermalMetrics()
+    rawZeroFeedback, rawNinetyFeedback = (
+        thermalPhasePairChannel.GetLastFeedbackPhasePair()
+    )
+    channelCalibrationMetrics = (
+        thermalPhasePairChannel.GetFeedbackIqCalibrationMetrics()
+    )
+    replayCalibration = FeedbackIqCalibration(
+        parameters={
+            "phaseResponses": (
+                zeroPhaseResponse,
+                ninetyPhaseResponse,
+            ),
+            "commonDcOffset": 0.012 - 0.008j,
+            "filterLength": 5,
+            "regularization": 1.0e-10,
+            "width": 0,
+        }
+    )
+    replayDirectFeedback, _ = replayCalibration.SeparatePhasePair(
+        rawZeroFeedback,
+        rawNinetyFeedback,
+    )
+    assert thermalChannelOutput.shape == thermalInput.shape
+    assert thermalFeedbackOutput.shape == thermalInput.shape
+    assert rawZeroFeedback.shape == thermalInput.shape
+    assert rawNinetyFeedback.shape == thermalInput.shape
+    assert channelCalibrationMetrics["calibrated"] is True
+    assert np.allclose(
+        thermalFeedbackOutput,
+        replayDirectFeedback,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    assert np.isclose(
+        thermalMetrics["elapsedTimeSec"],
+        thermalInput.size / thermalSampleRateHz,
+        rtol=0.0,
+        atol=1.0e-15,
+    )
+
+    # Switching only the mode must reuse the fitted filter. A new filter-only
+    # Channel has no calibration and must fail instead of silently using raw FB.
+    savedRawZeroFeedback = rawZeroFeedback.copy()
+    savedRawNinetyFeedback = rawNinetyFeedback.copy()
+    savedChannelMetrics = dict(channelCalibrationMetrics)
+    thermalPhasePairChannel.UpdateParameters(
+        fbIqCompensationMode="filter"
+    )
+    _, cachedFilterOutput = thermalPhasePairChannel.Process(thermalInput)
+    assert cachedFilterOutput.shape == thermalInput.shape
+    assert np.all(np.isfinite(cachedFilterOutput))
+    retainedRawPair = (
+        thermalPhasePairChannel.GetLastFeedbackPhasePair()
+    )
+    assert np.array_equal(retainedRawPair[0], savedRawZeroFeedback)
+    assert np.array_equal(retainedRawPair[1], savedRawNinetyFeedback)
+    assert (
+        thermalPhasePairChannel.GetFeedbackIqCalibrationMetrics()
+        == savedChannelMetrics
+    )
+    uncalibratedFilterChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            "sampleMode": "fb",
+            "fbIqCompensationMode": "filter",
+            "width": 0,
+        },
+    )
+    try:
+        uncalibratedFilterChannel.Process(thermalInput)
+    except RuntimeError as error:
+        assert "phase_pair" in str(error)
+        assert "calibration" in str(error)
+    else:
+        raise AssertionError("uncalibrated filter mode was accepted")
+
+    # DpdIlc must consume the corrected second member of the Channel tuple.
+    # One iteration plus final replay is deterministic here, so the final
+    # reported feedback must equal separation of Channel's retained raw pair.
+    ilcReference = 0.18 * (
+        randomGenerator.normal(size=1024)
+        + 1j * randomGenerator.normal(size=1024)
+    )
+    ilcPhasePairChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            "sampleMode": "fb",
+            "sampleRateHz": 20.0e6,
+            "fbIqGainImbalanceDb": 1.8,
+            "fbIqPhaseImbalanceDegrees": -7.0,
+            "fbIqCompensationMode": "phase_pair",
+            "fbIqCompensationFilterLength": 5,
+            "fbIqCompensationRegularization": 1.0e-10,
+            "width": 0,
+        },
+    )
+    phasePairIlcResult = RunScalarPIlc(
+        ilcReference,
+        ilcPhasePairChannel,
+        ILCConfig(
+            numIterations=1,
+            learningRate=0.2,
+            maxAmplitude=1.25,
+        ),
+        sampleRateHz=20.0e6,
+    )
+    ilcRawZero, ilcRawNinety = (
+        ilcPhasePairChannel.GetLastFeedbackPhasePair()
+    )
+    ilcReplayCalibration = FeedbackIqCalibration(
+        parameters={"width": 0}
+    )
+    expectedIlcFeedback, _ = (
+        ilcReplayCalibration.SeparatePhasePair(
+            ilcRawZero,
+            ilcRawNinety,
+        )
+    )
+    assert phasePairIlcResult.feedbackOutputSignal is not None
+    assert np.allclose(
+        phasePairIlcResult.feedbackOutputSignal,
+        expectedIlcFeedback,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    assert not np.allclose(
+        phasePairIlcResult.feedbackOutputSignal,
+        ilcRawZero,
+    )
+
+    # Public width zero remains normalized floating data. Width 16 accepts and
+    # returns integer-valued complex codes for a samples-by-two-chains matrix.
+    floatingSisoChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            "sampleMode": "fb",
+            "fbIqCompensationMode": "phase_pair",
+            "width": 0,
+        },
+    )
+    floatingSisoOutput, floatingSisoFeedback = (
+        floatingSisoChannel.Process(ilcReference[:256])
+    )
+    assert floatingSisoOutput.dtype == np.complex128
+    assert floatingSisoFeedback.dtype == np.complex128
+    assert np.max(np.abs(floatingSisoOutput)) < 1.0
+    fixedSisoInput = FixedPoint(16).EncodeComplex(
+        ilcReference[:256]
+    )
+    fixedSisoChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            "sampleMode": "fb",
+            "fbIqCompensationMode": "phase_pair",
+            "width": 16,
+        },
+    )
+    fixedSisoOutput, fixedSisoFeedback = fixedSisoChannel.Process(
+        fixedSisoInput
+    )
+    for fixedSignal in (fixedSisoOutput, fixedSisoFeedback):
+        assert fixedSignal.shape == fixedSisoInput.shape
+        assert np.array_equal(fixedSignal.real, np.rint(fixedSignal.real))
+        assert np.array_equal(fixedSignal.imag, np.rint(fixedSignal.imag))
+    mimoFloatingInput = np.column_stack(
+        (
+            ilcReference[:256],
+            0.71 * ilcReference[:256][::-1] * np.exp(0.31j),
+        )
+    )
+    fixedFormat = FixedPoint(16)
+    fixedMimoInput = fixedFormat.EncodeComplex(mimoFloatingInput)
+    fixedMimoChannel = Channel(
+        paModel=MimoPaModel(
+            parameters={"numTransmitChains": 2, "width": 0}
+        ),
+        parameters={
+            "sampleMode": "fb",
+            "fbIqGainImbalanceDb": 1.0,
+            "fbIqPhaseImbalanceDegrees": 4.0,
+            "fbIqCompensationMode": "phase_pair",
+            "fbIqCompensationFilterLength": 3,
+            "width": 16,
+        },
+    )
+    fixedMimoOutput, fixedMimoFeedback = fixedMimoChannel.Process(
+        fixedMimoInput
+    )
+    fixedRawZero, fixedRawNinety = (
+        fixedMimoChannel.GetLastFeedbackPhasePair()
+    )
+    for fixedSignal in (
+        fixedMimoOutput,
+        fixedMimoFeedback,
+        fixedRawZero,
+        fixedRawNinety,
+    ):
+        assert fixedSignal.shape == fixedMimoInput.shape
+        assert fixedSignal.dtype == np.complex128
+        assert np.array_equal(fixedSignal.real, np.rint(fixedSignal.real))
+        assert np.array_equal(fixedSignal.imag, np.rint(fixedSignal.imag))
+        assert np.max(np.abs(fixedSignal.real)) <= 32767
+        assert np.max(np.abs(fixedSignal.imag)) <= 32767
+    assert fixedMimoChannel.GetFeedbackIqCalibrationMetrics()[
+        "chainCount"
+    ] == 2
+
+    # Invalid mode names, incompatible forward acquisition, singular switch
+    # responses, and illegal filter controls must fail with allowed values.
+    invalidChannelCases = (
+        (
+            {"fbIqCompensationMode": "pair"},
+            "fbIqCompensationMode",
+            "'none', 'phase_pair', or 'filter'",
+        ),
+        (
+            {
+                "sampleMode": "forward",
+                "fbIqCompensationMode": "phase_pair",
+            },
+            "fbIqCompensationMode",
+            "sampleMode='fb'",
+        ),
+        (
+            {
+                "fbPhasePairResponses": (
+                    1.0 + 0.0j,
+                    2.0 + 0.0j,
+                )
+            },
+            "fbPhasePairResponses",
+            "0 or 180",
+        ),
+        (
+            {"fbIqCompensationFilterLength": 0},
+            "fbIqCompensationFilterLength",
+            "[1, +inf)",
+        ),
+        (
+            {"fbIqCompensationRegularization": 0.0},
+            "fbIqCompensationRegularization",
+            "(0, +inf)",
+        ),
+    )
+    for invalidParameters, parameterName, allowedText in invalidChannelCases:
+        try:
+            Channel(parameters=invalidParameters)
+        except (TypeError, ValueError) as error:
+            assert parameterName in str(error)
+            assert allowedText in str(error)
+        else:
+            raise AssertionError(
+                f"invalid Channel setting accepted: {parameterName}"
+            )
+    invalidCalibrationCases = (
+        ({"phaseResponses": (1.0 + 0.0j, -1.0 + 0.0j)}, "phaseResponses"),
+        ({"commonDcOffset": complex(np.inf, 0.0)}, "commonDcOffset"),
+        ({"filterLength": 0}, "filterLength"),
+        ({"regularization": -1.0}, "regularization"),
+    )
+    for invalidParameters, parameterName in invalidCalibrationCases:
+        try:
+            FeedbackIqCalibration(parameters=invalidParameters)
+        except (TypeError, ValueError) as error:
+            assert parameterName in str(error)
+        else:
+            raise AssertionError(
+                "invalid FeedbackIqCalibration setting accepted: "
+                f"{parameterName}"
+            )
+
+
 def CheckChannelIqEnableControls() -> None:
     """Verify independent Tx and feedback I/Q-stage enable controls.
 
@@ -9068,6 +9708,7 @@ def RunTests() -> None:
     CheckThermalDisableAndCalibrationBypass()
     CheckChannelPeriodicThermalModes()
     CheckPeriodicThermalEdgeCases()
+    CheckFeedbackIqPhasePairCalibration()
     CheckChannelIqEnableControls()
     CheckChannelDualOutputContract()
     CheckChannelModel()

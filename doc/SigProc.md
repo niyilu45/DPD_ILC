@@ -1,6 +1,6 @@
 # 信号同步、补偿与功率标定的物理原理和推导
 
-本文对应 `inc/utils/SigProc.py`。该模块位于“测量/仿真输出”和“性能指标计算”之间，专门处理整数时延、分数时延、载波频偏、采样频偏、公共复增益和 dBm/RMS 功率标定。`Analysis` 只消费校正后的信号并计算 SNR、EVM、ACLR，避免把同步误差错误地解释为 PA 非线性。
+本文对应 `inc/utils/SigProc.py`。该模块位于“测量/仿真输出”和“性能指标计算”之间，专门处理整数时延、分数时延、载波频偏、采样频偏、公共复增益、dBm/RMS功率标定，以及0°/90°反馈I/Q相位对分离与广义线性逆滤波。`Analysis` 只消费校正后的信号并计算 SNR、EVM、ACLR，避免把同步误差或板载反馈接收机镜像错误地解释为 PA 非线性。
 
 整数lag搜索现已批量向量化，并保留第一个并列峰的选择语义；不等长重叠搜索使用三段FFT相关、无全局差分的分层区间能量与Cauchy-Schwarz边界；有效突发短空洞按连续False区间处理；0 Hz CFO使用独立副本快路径。公式、等价性边界和参考耗时见 [Performance.md](./Performance.md#3-sigproc同步路径)。
 
@@ -405,12 +405,22 @@ classDiagram
         +confidence
         +ToDict()
     }
+    class FeedbackIqCalibration {
+        +SeparatePhasePair(phaseZeroSignal, phaseNinetySignal)
+        +SeparateAbbaPhasePair(zeroFirst, ninetyFirst, ninetySecond, zeroSecond)
+        +Calibrate(phaseZeroSignal, phaseNinetySignal)
+        +Apply(inputSignal)
+        +GetFilterTaps()
+        +GetCalibrationMetrics()
+    }
     SigProc --> SignalProcessingResult : Process returns
     SigProc --> SignalOverlapResult : EstimateSignalOverlap returns
+    FeedbackIqCalibration --> FixedPoint : public boundary
+    Channel --> FeedbackIqCalibration : phase_pair and filter
     Analysis --> SigProc : preprocessing
 ```
 
-**图 2 说明：**`SigProc` 持有参考信号、采样率和估计配置；`Process` 返回不可变的 `SignalProcessingResult`。静态公共区间估计返回不可变的 `SignalOverlapResult`，因此Analysis和ParseWifi可以复用同一相关算法。样点数组用于后续指标计算，两个结果类的 `ToDict()` 都只输出适合 JSON/CSV 记录的标量。
+**图 2 说明：**`SigProc` 持有参考信号、采样率和估计配置；`Process` 返回不可变的 `SignalProcessingResult`。静态公共区间估计返回不可变的 `SignalOverlapResult`，因此Analysis和ParseWifi可以复用同一相关算法。样点数组用于后续指标计算，两个结果类的 `ToDict()` 都只输出适合 JSON/CSV 记录的标量。独立的 `FeedbackIqCalibration` 不参与Analysis同步；它利用I/Q变频器之前的两种相位开关状态，把反馈接收机产生的共轭镜像从物理直接观测中分离，并为后续单状态采样拟合逆滤波器。
 
 ---
 
@@ -1185,3 +1195,176 @@ activeVoltageRms = powerCalibration.CalculateActiveRmsPerChain(
 )[0]
 measuredPowerDbm = powerCalibration.RmsToDbm(activeVoltageRms)
 ```
+
+---
+
+## 14. 0°/90°反馈I/Q分离与单采样补偿
+
+`FeedbackIqCalibration` 解决的是板载反馈接收机自身的I/Q镜像，不是Tx I/Q校准，也不改写PA输出。硬件或Channel在反馈I/Q变频器输入之前设置两个已测复响应 $r_0$、$r_1$。Channel旋转的是PA输出的低功率反馈观测支路：开关位于I/Q前反馈放大、非线性和时频偏之后，既不是PA输入预旋转，也不是ADC之后的数字旋转。把开关之前的物理观测记为 $u[n]$；它可以包含Tx I/Q镜像、PA非线性和前级反馈频响。若FB I/Q变频器的直接、共轭系数为 $\alpha$、$\beta$，则定义直接观测 $s[n]=\alpha u[n]$、接收机镜像 $q[n]=\beta u^{*}[n]$。两次采样共有的接收机DC为 $d$，于是：
+
+```math
+z_0[n]-d
+=
+r_0s[n]+r_0^{*}q[n],
+```
+
+```math
+z_1[n]-d
+=
+r_1s[n]+r_1^{*}q[n].
+```
+
+逐样点写成二乘二系统：
+
+```math
+\begin{bmatrix}
+z_0[n]-d\\
+z_1[n]-d
+\end{bmatrix}
+=
+\begin{bmatrix}
+r_0&r_0^{*}\\
+r_1&r_1^{*}
+\end{bmatrix}
+\begin{bmatrix}
+s[n]\\
+q[n]
+\end{bmatrix}.
+```
+
+只要两个响应的相对相位不是0°或180°，混合矩阵就可逆。理想配置 $r_0=1$、$r_1=j$ 时，有：
+
+```math
+s[n]
+=
+\frac{z_0[n]-d-j\left(z_1[n]-d\right)}{2},
+```
+
+```math
+q[n]
+=
+\frac{z_0[n]-d+j\left(z_1[n]-d\right)}{2}.
+```
+
+因此该方法不会错误地假设PA输出“没有镜像”。Tx端或PA已经产生的频谱内容包含在 $u[n]$ 中，会随 $r_k$ 旋转并通过直接观测 $s[n]$ 保留下来；只有I/Q变频器内部产生的共轭响应随 $r_k^{*}$ 旋转并落入 $q[n]$。
+
+### 14.1 从相位对标定到单状态FIR
+
+相位对适合周期标定，但实时训练通常希望每次只采一路。`Calibrate` 先用上式得到直接参考 $s[n]$，再以第一状态的去DC原始采样 $v_0[n]=z_0[n]-d$ 构造因果广义线性FIR：
+
+```math
+\widehat{s}[n]
+=
+\sum_{l=0}^{L-1}a_lv_0[n-l]
++
+\sum_{l=0}^{L-1}b_lv_0^{*}[n-l].
+```
+
+直接抽头 $a_l$ 恢复普通频响，共轭抽头 $b_l$ 抵消镜像频响。把所有样点写入矩阵 $A$，系数向量记为 $c$，求解尺度归一化岭回归：
+
+```math
+c
+=
+\left(A^{H}A+\lambda_s I\right)^{-1}A^{H}s,
+```
+
+```math
+\lambda_s
+=
+\lambda
+\frac{1}{2L}
+\sum_k
+\left[A^{H}A\right]_{k,k}.
+```
+
+`regularization` 给出无量纲的 $\lambda$；实现再按输入基函数的平均能量缩放，使同一推荐值能覆盖不同波形幅度。SISO直接拟合；MIMO把各列样本纵向堆叠，估计一组所有链共用的反馈接收机抽头，再逐列应用。若每条链拥有不同I/Q接收机，应分别构造校准对象。
+
+`SeparateAbbaPhasePair` 支持0°、90°、90°、0°的ABBA采样。它分别平均首尾0°记录和中间两次90°记录，使围绕序列中点近似线性的增益/相位漂移一阶抵消；Channel的自动 `phase_pair` 模式目前执行普通两状态采样，ABBA需要用户把四次仪表记录直接交给该类。
+
+### 14.2 `FeedbackIqCalibration`参数
+
+构造签名为：
+
+```python
+FeedbackIqCalibration(
+    parameters=None,
+    width=None,
+    **parameterOverrides,
+)
+```
+
+| 参数 | 默认值 | 允许值 | 物理含义 |
+|---|---:|---|---|
+| `phaseResponses` | `(1+0j, 0+1j)` | 恰好两个有限非零复数，分离矩阵非奇异 | 标称0°和90°开关在I/Q变频器输入处的实测复电压响应；不要求幅度相等 |
+| `commonDcOffset` | `0+0j` | 一个有限复数 | 两路采样共有、以内部归一化幅度表示的反馈接收机DC |
+| `filterLength` | `1` | 正整数 | 直接和共轭支路各自的因果FIR抽头数；频率选择性I/Q误差需要大于1 |
+| `regularization` | `1e-6` | 有限正实数 | 尺度归一化岭系数；增大可降低病态拟合和噪声放大，但会增加偏差 |
+| `width` | `16` | 整数0至53 | 公开I/Q边界；0为归一化浮点，正值为有符号整数码 |
+
+建议先用 `filterLength=1`、`regularization=1e-6` 验证平坦I/Q失配。只有实测镜像随频率明显变化时才逐步增加抽头数；抽头过多而训练样本不足会使条件数升高。`phaseResponses` 应填开关的实测复响应而不是只写标称角度；两响应越接近共线，`phaseMatrixConditionNumber` 越大，噪声增强越明显。
+
+所有默认值都位于构造函数内部并通过ChainMap解析。未知键会发出警告并忽略，已识别但类型或范围非法的值会报错。`UpdateParameters(...)` 是事务更新：验证失败会恢复旧配置，成功写入任何已识别项都会使已有FIR失效。
+
+### 14.3 主要方法与诊断
+
+| 方法 | 输入 | 返回值或作用 |
+|---|---|---|
+| `SeparatePhasePair(phaseZeroSignal, phaseNinetySignal)` | 两个同形状公开SISO/MIMO数组 | 返回公开约定下的 `(directSignal, imageSignal)` |
+| `SeparateAbbaPhasePair(zeroFirst, ninetyFirst, ninetySecond, zeroSecond)` | 四个同形状公开数组 | 返回抑制一阶漂移后的直接项和镜像项 |
+| `Calibrate(phaseZeroSignal, phaseNinetySignal)` | 原始两状态公开采样 | 拟合并缓存广义线性FIR，返回诊断字典 |
+| `Apply(inputSignal)` | 第一相位状态的单路原始采样 | 应用当前直接/共轭FIR并返回补偿后的直接观测 |
+| `GetFilterTaps()` | 无 | 返回 `(directFilterTaps, conjugateFilterTaps)` 防御性副本 |
+| `GetCalibrationMetrics()` | 无 | 返回当前标定诊断的防御性字典 |
+| `Invalidate()` | 无 | 同时清除两组抽头、签名与诊断 |
+| `GetParameters()` / `UpdateParameters(...)` | 无 / 关键字覆盖 | 查询解析后配置或事务更新 |
+
+诊断中的 `imageToDirectDb` 定义为镜像功率除以直接功率，越负越好；`fitNmseDb` 是单状态FIR相对相位对直接参考的拟合NMSE，也越负越好。`phaseMatrixConditionNumber` 反映相位对几何条件，`normalMatrixConditionNumber` 反映正则化后FIR求解条件。`ridgeStrength` 是输入尺度换算后的实际岭强度。
+
+独立使用示例：
+
+```python
+from inc.utils.SigProc import FeedbackIqCalibration
+
+
+feedbackCalibration = FeedbackIqCalibration(
+    parameters={
+        "phaseResponses": (1.0 + 0.0j, 0.02 + 0.98j),
+        "commonDcOffset": 0.002 - 0.001j,
+        "filterLength": 3,
+        "regularization": 1.0e-6,
+        "width": 0,
+    }
+)
+directSignal, imageSignal = feedbackCalibration.SeparatePhasePair(
+    phaseZeroCapture,
+    phaseNinetyCapture,
+)
+metrics = feedbackCalibration.Calibrate(
+    phaseZeroCapture,
+    phaseNinetyCapture,
+)
+correctedSingleCapture = feedbackCalibration.Apply(nextZeroCapture)
+directTaps, conjugateTaps = feedbackCalibration.GetFilterTaps()
+print(metrics["imageToDirectDb"], metrics["fitNmseDb"])
+```
+
+### 14.4 定点公开边界
+
+`width=0` 时输入输出为归一化浮点复数。`width>0` 时容器仍为 `numpy.complex128`，但每个I/Q分量是有符号整数码；例如16位的正常样值量级可以是8191，而不是小于1的小数。`SeparatePhasePair`、`SeparateAbbaPhasePair`、`Calibrate` 和 `Apply` 均在入口解码一次，内部保持双精度浮点矩阵计算，在出口按同一位宽编码一次。两种模式的数组类型和形状一致，数值约定不同。
+
+`commonDcOffset`、`phaseResponses`、FIR抽头和诊断始终使用内部归一化物理数值，不改写成整数码。Channel调用该类时，Channel已经解码自己的公开边界，所以内部固定构造 `FeedbackIqCalibration(width=0)`；最终 `fbOut` 只由Channel统一编码一次，避免重复量化。
+
+### 14.5 缓存有效性和使用限制
+
+`Apply`、`GetFilterTaps` 和 `GetCalibrationMetrics` 都要求先成功执行 `Calibrate`。以下任一情况会让缓存失效或在使用时被判为陈旧：
+
+- 修改 `phaseResponses`、`commonDcOffset`、`filterLength`、`regularization` 或 `width`；
+- `UpdateParameters(...)` 成功写入任何已识别配置；
+- 直接修改构造时传入的活动参数映射，使当前签名与拟合签名不同；
+- 显式调用 `Invalidate()`。
+
+相位对的两个数组必须形状相同，且应来自同一PA输出波形和相同时间参考。两次采样之间的随机噪声与ADC量化可以独立，但强削顶、严重接收机非线性、快速漂移或错误的开关响应都会降低分离精度。`filter`只能重建已经标定过的确定性I/Q逆响应；它不能凭一组旧抽头补偿后来改变的反馈FIR、CFO、ADC满量程或公开位宽。
+
+Channel集成提供三种模式：`none`保留单路原始反馈；`phase_pair`对同一个已经计算完成的PA输出做两次接收采样、返回直接项并缓存FIR；`filter`只采第一状态并应用缓存。正确顺序是先显式设置 `sampleMode="fb"` 和 `fbIqCompensationMode="phase_pair"` 完成一次标定，再只把补偿模式切到 `"filter"`。Channel会把PA身份、公共相位、确定性反馈链、I/Q参数、相位响应、滤波控制、ADC和公开位宽纳入签名；敏感配置改变后必须重新执行相位对标定。
+
+这套反馈I/Q标定与PA输出功率标定位于不同参考面。`PowerCalibration` 始终观察PA后耦合前、相位开关和所有接收非理想之前的干净PA物理输出；0°/90°采样不会改变 `outputPowerDbm` 目标，也不会用补偿后的 `fbOut` 反推PA功率。DPD训练使用补偿后的 `fbOut`，最终EVM、SNR、ACLR、IRR和输出功率仍使用同一轮的 `chOut`。

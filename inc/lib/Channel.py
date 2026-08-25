@@ -31,13 +31,13 @@ if __package__ and "." in __package__:
         FindUnknownParameterNames,
     )
     from ..utils.FixedPoint import FixedPoint
-    from ..utils.SigProc import PowerCalibration
+    from ..utils.SigProc import FeedbackIqCalibration, PowerCalibration
 else:
     from utils.ConfigUtils import (
         FindUnknownParameterNames,
     )
     from utils.FixedPoint import FixedPoint
-    from utils.SigProc import PowerCalibration
+    from utils.SigProc import FeedbackIqCalibration, PowerCalibration
 
 
 class Channel:
@@ -109,6 +109,10 @@ class Channel:
                 "fbIqGainImbalanceDb": 0.0,
                 "fbIqPhaseImbalanceDegrees": 0.0,
                 "fbDcOffset": 0.0 + 0.0j,
+                "fbIqCompensationMode": "none",
+                "fbPhasePairResponses": (1.0 + 0.0j, 0.0 + 1.0j),
+                "fbIqCompensationFilterLength": 1,
+                "fbIqCompensationRegularization": 1.0e-6,
                 "fbThirdOrderCoefficient": 0.0 + 0.0j,
                 "fbClipAmplitude": None,
                 "fbAdcWidth": None,
@@ -180,6 +184,15 @@ class Channel:
         self._lastActualPaInput: Optional[np.ndarray] = None
         self._lastCalibrationOutputPowerDbm: Optional[
             Union[float, Tuple[float, ...]]
+        ] = None
+        self._feedbackIqCalibration: Optional[
+            FeedbackIqCalibration
+        ] = None
+        self._feedbackIqCalibrationSignature: Optional[
+            Tuple[object, ...]
+        ] = None
+        self._lastFeedbackPhasePair: Optional[
+            Tuple[np.ndarray, np.ndarray]
         ] = None
         self._activeRandomSeed: Optional[int] = None
         self._randomGenerator = np.random.default_rng()
@@ -333,6 +346,34 @@ class Channel:
             self._activeRandomSeed = previousSeed
             self.SynchronizeRandomGenerator(forceReset=True)
             raise
+        calibrationSensitiveNames = {
+            "sampleRateHz",
+            "phaseDegrees",
+            "fbGainDb",
+            "fbPhaseDegrees",
+            "fbFirTaps",
+            "fbIntegerDelaySamples",
+            "fbFractionalDelaySamples",
+            "fbCarrierFrequencyOffsetHz",
+            "fbSamplingFrequencyOffsetPpm",
+            "fbIqImbalanceEnabled",
+            "fbIqGainImbalanceDb",
+            "fbIqPhaseImbalanceDegrees",
+            "fbDcOffset",
+            "fbPhasePairResponses",
+            "fbIqCompensationFilterLength",
+            "fbIqCompensationRegularization",
+            "fbThirdOrderCoefficient",
+            "fbClipAmplitude",
+            "fbAdcWidth",
+            "fbAdcFullScale",
+            "width",
+        }
+        if any(
+            parameterName in calibrationSensitiveNames
+            for parameterName in recognizedOverrides
+        ):
+            self.ResetFeedbackIqCalibration()
 
     def ValidateParameters(self) -> None:
         """Validate phase, noise, physical scaling, seed, and interface width.
@@ -377,6 +418,111 @@ class Channel:
             raise ValueError(
                 "sampleMode has an invalid value. Allowed values: "
                 "'forward' or 'fb'."
+            )
+        fbIqCompensationMode = self.parameters[
+            "fbIqCompensationMode"
+        ]
+        if (
+            not isinstance(fbIqCompensationMode, str)
+            or fbIqCompensationMode.strip().lower()
+            not in ("none", "phase_pair", "filter")
+        ):
+            raise ValueError(
+                "fbIqCompensationMode has an invalid value. Allowed values: "
+                "'none', 'phase_pair', or 'filter'."
+            )
+        normalizedCompensationMode = fbIqCompensationMode.strip().lower()
+        if (
+            normalizedCompensationMode == "phase_pair"
+            and sampleMode.strip().lower() != "fb"
+        ):
+            raise ValueError(
+                "fbIqCompensationMode='phase_pair' requires "
+                "sampleMode='fb' so the two embedded feedback captures can "
+                "be acquired before DPD training"
+            )
+        fbPhasePairResponses = self.parameters["fbPhasePairResponses"]
+        if isinstance(fbPhasePairResponses, (str, bytes)) or not (
+            isinstance(fbPhasePairResponses, Sequence)
+            or isinstance(fbPhasePairResponses, np.ndarray)
+        ):
+            raise TypeError(
+                "fbPhasePairResponses has an invalid type. Allowed values: "
+                "a sequence of exactly two finite nonzero complex responses."
+            )
+        if len(fbPhasePairResponses) != 2:
+            raise ValueError(
+                "fbPhasePairResponses has an invalid length. Allowed value: "
+                "exactly two responses for the nominal 0- and 90-degree "
+                "states."
+            )
+        try:
+            phaseResponseArray = np.asarray(
+                fbPhasePairResponses, dtype=np.complex128
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise TypeError(
+                "fbPhasePairResponses must contain finite complex scalars"
+            ) from error
+        if not np.all(np.isfinite(phaseResponseArray)):
+            raise ValueError(
+                "fbPhasePairResponses has an invalid value. Every response "
+                "must be finite."
+            )
+        if np.any(np.abs(phaseResponseArray) <= np.finfo(float).tiny):
+            raise ValueError(
+                "fbPhasePairResponses has an invalid value. Responses must "
+                "be nonzero."
+            )
+        phaseSeparationMatrix = np.asarray(
+            (
+                (
+                    phaseResponseArray[0],
+                    np.conj(phaseResponseArray[0]),
+                ),
+                (
+                    phaseResponseArray[1],
+                    np.conj(phaseResponseArray[1]),
+                ),
+            ),
+            dtype=np.complex128,
+        )
+        phaseResponseScale = float(np.max(np.abs(phaseResponseArray)))
+        if (
+            abs(np.linalg.det(phaseSeparationMatrix))
+            <= np.finfo(float).eps * phaseResponseScale**2
+        ):
+            raise ValueError(
+                "fbPhasePairResponses cannot separate direct and image "
+                "components. Their relative phase must not be 0 or 180 "
+                "degrees."
+            )
+        fbIqCompensationFilterLength = self.parameters[
+            "fbIqCompensationFilterLength"
+        ]
+        if (
+            not isinstance(fbIqCompensationFilterLength, int)
+            or isinstance(fbIqCompensationFilterLength, bool)
+            or fbIqCompensationFilterLength < 1
+        ):
+            raise ValueError(
+                "fbIqCompensationFilterLength has an invalid value. Allowed "
+                "range: integer in [1, +inf) taps."
+            )
+        fbIqCompensationRegularization = self.parameters[
+            "fbIqCompensationRegularization"
+        ]
+        if (
+            not isinstance(
+                fbIqCompensationRegularization, (int, float)
+            )
+            or isinstance(fbIqCompensationRegularization, bool)
+            or not np.isfinite(fbIqCompensationRegularization)
+            or float(fbIqCompensationRegularization) <= 0.0
+        ):
+            raise ValueError(
+                "fbIqCompensationRegularization has an invalid value. "
+                "Allowed range: finite real number in (0, +inf)."
             )
         sampleRateHz = self.parameters["sampleRateHz"]
         if (
@@ -857,6 +1003,7 @@ class Channel:
         self._lastTransmitterOutput = None
         self._lastActualPaInput = None
         self._lastCalibrationOutputPowerDbm = None
+        self.ResetFeedbackIqCalibration()
 
     @staticmethod
     def ResolveCalibrationTargets(
@@ -1518,6 +1665,203 @@ class Channel:
                 "GetLastCalibrationMetrics"
             )
         return self._powerCalibration.GetLastCalibrationMetrics()
+
+    def FeedbackIqCalibrationSignature(self) -> Tuple[object, ...]:
+        """Return the configuration identity of one valid FB I/Q inverse.
+
+        Processing details:
+            Algorithm: Normalize every feedback-path value that can change the
+            phase-pair separation or single-capture inverse into immutable
+            scalar tuples. The compensation-mode selector is intentionally
+            excluded so a filter learned in ``phase_pair`` mode remains usable
+            after an explicit switch to ``filter`` mode.
+
+        Returns:
+            result: Immutable signature used to reject stale cached filters.
+        """
+
+        self.ValidateParameters()
+        phaseResponses = tuple(
+            complex(responseValue)
+            for responseValue in cast(
+                Sequence[complex],
+                self.parameters["fbPhasePairResponses"],
+            )
+        )
+        feedbackFirTaps = tuple(
+            complex(tapValue) for tapValue in self.ResolveFeedbackFirTaps()
+        )
+        return (
+            id(self.paModel),
+            float(self.parameters["sampleRateHz"]),
+            float(self.parameters["phaseDegrees"]),
+            float(self.parameters["fbGainDb"]),
+            float(self.parameters["fbPhaseDegrees"]),
+            feedbackFirTaps,
+            int(self.parameters["fbIntegerDelaySamples"]),
+            float(self.parameters["fbFractionalDelaySamples"]),
+            float(self.parameters["fbCarrierFrequencyOffsetHz"]),
+            float(self.parameters["fbSamplingFrequencyOffsetPpm"]),
+            bool(self.parameters["fbIqImbalanceEnabled"]),
+            float(self.parameters["fbIqGainImbalanceDb"]),
+            float(self.parameters["fbIqPhaseImbalanceDegrees"]),
+            complex(self.parameters["fbDcOffset"]),
+            phaseResponses,
+            int(self.parameters["fbIqCompensationFilterLength"]),
+            float(self.parameters["fbIqCompensationRegularization"]),
+            complex(self.parameters["fbThirdOrderCoefficient"]),
+            (
+                None
+                if self.parameters["fbClipAmplitude"] is None
+                else float(self.parameters["fbClipAmplitude"])
+            ),
+            self.parameters["fbAdcWidth"],
+            float(self.parameters["fbAdcFullScale"]),
+            int(self.parameters["width"]),
+        )
+
+    def ResetFeedbackIqCalibration(self) -> None:
+        """Invalidate every cached FB phase-pair calibration artifact.
+
+        Processing details:
+            Algorithm: Discard the calibration object, its configuration
+            signature, and the latest raw pair together so a PA replacement or
+            feedback-path update cannot silently reuse stale coefficients.
+
+        Returns:
+            result: None. ``filter`` mode requires a new successful phase-pair
+                acquisition before it can process another signal.
+        """
+
+        self._feedbackIqCalibration = None
+        self._feedbackIqCalibrationSignature = None
+        self._lastFeedbackPhasePair = None
+
+    def ConfigureFeedbackIqCalibration(self) -> FeedbackIqCalibration:
+        """Create or synchronize the normalized-domain FB I/Q calibrator.
+
+        Processing details:
+            Algorithm: Translate Channel parameter names into the reusable
+            signal-processing class vocabulary, always select width zero because
+            the Channel has already decoded its public boundary, and rebuild the
+            helper only when its own resolved configuration differs. Rebuilding
+            deliberately invalidates any old filter.
+
+        Returns:
+            result: Configured floating-domain calibration object.
+        """
+
+        self.ValidateParameters()
+        desiredParameters: Dict[str, object] = {
+            "phaseResponses": tuple(
+                complex(responseValue)
+                for responseValue in cast(
+                    Sequence[complex],
+                    self.parameters["fbPhasePairResponses"],
+                )
+            ),
+            "commonDcOffset": (
+                complex(self.parameters["fbDcOffset"])
+                if bool(self.parameters["fbIqImbalanceEnabled"])
+                else 0.0 + 0.0j
+            ),
+            "filterLength": int(
+                self.parameters["fbIqCompensationFilterLength"]
+            ),
+            "regularization": float(
+                self.parameters["fbIqCompensationRegularization"]
+            ),
+            "width": 0,
+        }
+        if self._feedbackIqCalibration is None:
+            self._feedbackIqCalibration = FeedbackIqCalibration(
+                parameters=desiredParameters
+            )
+        elif self._feedbackIqCalibration.GetParameters() != desiredParameters:
+            self._feedbackIqCalibration = FeedbackIqCalibration(
+                parameters=desiredParameters
+            )
+            self._feedbackIqCalibrationSignature = None
+        return self._feedbackIqCalibration
+
+    def RequireCurrentFeedbackIqCalibration(
+        self,
+    ) -> FeedbackIqCalibration:
+        """Return a valid cached inverse or reject stale filter operation.
+
+        Processing details:
+            Algorithm: Compare the live PA/feedback configuration signature with
+            the signature stored after the latest successful phase-pair fit.
+            Any mismatch atomically clears the cache and raises an actionable
+            error instead of applying coefficients at the wrong reference plane.
+
+        Returns:
+            result: Current calibrated floating-domain compensation object.
+        """
+
+        currentSignature = self.FeedbackIqCalibrationSignature()
+        if (
+            self._feedbackIqCalibration is None
+            or self._feedbackIqCalibrationSignature is None
+        ):
+            raise RuntimeError(
+                "fbIqCompensationMode='filter' requires a valid feedback I/Q "
+                "calibration. Run Channel.Process once with sampleMode='fb' "
+                "and fbIqCompensationMode='phase_pair', then switch only the "
+                "compensation mode to 'filter'."
+            )
+        if self._feedbackIqCalibrationSignature != currentSignature:
+            self.ResetFeedbackIqCalibration()
+            raise RuntimeError(
+                "the cached feedback I/Q compensation filter is stale because "
+                "the PA, feedback path, phase responses, filter controls, or "
+                "public width changed. Re-run phase_pair calibration before "
+                "using fbIqCompensationMode='filter'."
+            )
+        return self._feedbackIqCalibration
+
+    def GetLastFeedbackPhasePair(
+        self,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return defensive public copies of the latest raw phase captures.
+
+        Processing details:
+            Algorithm: Require a completed phase-pair Channel pass, encode both
+            internally normalized captures through the current public
+            FixedPoint boundary, and copy each result independently.
+
+        Returns:
+            result: Raw nominal-zero and nominal-ninety feedback arrays in the
+                Channel's configured floating or fixed integer-code convention.
+        """
+
+        if self._lastFeedbackPhasePair is None:
+            raise RuntimeError(
+                "phase_pair processing must complete before "
+                "GetLastFeedbackPhasePair"
+            )
+        self.RequireCurrentFeedbackIqCalibration()
+        interfaceFormat = FixedPoint(self.width)
+        return tuple(
+            interfaceFormat.EncodeComplex(phaseSignal).copy()
+            for phaseSignal in self._lastFeedbackPhasePair
+        )
+
+    def GetFeedbackIqCalibrationMetrics(self) -> Dict[str, object]:
+        """Return defensive metrics for the latest current phase-pair fit.
+
+        Processing details:
+            Algorithm: Require a non-stale configuration signature, delegate to
+            the reusable calibrator's defensive metric getter, and copy the
+            result once more at the Channel boundary.
+
+        Returns:
+            result: Independent dictionary containing phase separation, image
+                ratio, FIR fit NMSE, and conditioning diagnostics.
+        """
+
+        calibration = self.RequireCurrentFeedbackIqCalibration()
+        return dict(calibration.GetCalibrationMetrics())
 
     def SynchronizeRandomGenerator(
         self, forceReset: bool = False
@@ -2661,12 +3005,31 @@ class Channel:
             result: Feedback analog baseband waveform immediately before noise.
         """
 
+        timingOutput = self.ApplyFeedbackPreIqImpairments(inputSignal)
+        return self.ApplyFeedbackIqImbalance(timingOutput)
+
+    def ApplyFeedbackPreIqImpairments(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Evaluate all embedded feedback effects before I/Q conversion.
+
+        Processing details:
+            Algorithm: Apply feedback coupling/FIR response, receiver
+            third-order compression and clipping, then timing, sampling-rate,
+            and carrier-frequency offsets. Stop immediately before the I/Q
+            imbalance/DC stage so a measured calibration phase-switch response
+            can be inserted at one unambiguous physical reference plane.
+
+        Args:
+            inputSignal: Normalized PA observation after common phase rotation.
+
+        Returns:
+            result: Feedback waveform at the input of the imperfect I/Q stage.
+        """
+
         linearOutput = self.ApplyFeedbackLinearResponse(inputSignal)
         nonlinearOutput = self.ApplyFeedbackNonlinearity(linearOutput)
-        timingOutput = self.ApplyFeedbackTimingAndFrequency(
-            nonlinearOutput
-        )
-        return self.ApplyFeedbackIqImbalance(timingOutput)
+        return self.ApplyFeedbackTimingAndFrequency(nonlinearOutput)
 
     def FeedbackDirectSmallSignalGain(self) -> complex:
         """Return the feedback path's analytic direct small-signal coefficient.
@@ -2722,7 +3085,71 @@ class Channel:
 
         if self.sampleMode == "forward":
             return self.ApplyForwardChannelEffects(paOutputSignal)
-        return self.ApplyFeedbackChannelEffects(paOutputSignal)
+        return self.ApplyCompensatedFeedbackChannelEffects(paOutputSignal)
+
+    def ApplyCompensatedFeedbackChannelEffects(
+        self, paOutputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply the selected raw, phase-pair, or cached-filter FB path.
+
+        Processing details:
+            Algorithm: Preserve the historical single raw capture in ``none``
+            mode. In ``phase_pair`` mode evaluate two measured switch responses
+            from the same supplied PA output, separate direct and image terms,
+            fit and cache a widely-linear FIR, and return the direct term. In
+            ``filter`` mode evaluate only the first switch state and apply the
+            most recent non-stale cached inverse.
+
+        Args:
+            paOutputSignal: One already evaluated normalized PA-output waveform
+                after post-PA coupling.
+
+        Returns:
+            result: Normalized feedback observation selected for DPD training.
+        """
+
+        self.ValidateParameters()
+        compensationMode = str(
+            self.parameters["fbIqCompensationMode"]
+        ).strip().lower()
+        if compensationMode == "none":
+            return self.ApplyFeedbackChannelEffects(paOutputSignal)
+        phaseResponses = tuple(
+            complex(responseValue)
+            for responseValue in cast(
+                Sequence[complex],
+                self.parameters["fbPhasePairResponses"],
+            )
+        )
+        if compensationMode == "filter":
+            calibration = self.RequireCurrentFeedbackIqCalibration()
+            rawFeedbackOutput = self.ApplyFeedbackChannelEffectsAtResponse(
+                paOutputSignal, phaseResponses[0]
+            )
+            return calibration.Apply(rawFeedbackOutput)
+
+        # The caller supplies one already evaluated PA output, so both receiver
+        # states differ only in the extra phase-switch response and independent
+        # receiver noise/quantization realizations.
+        phaseZeroFeedback = self.ApplyFeedbackChannelEffectsAtResponse(
+            paOutputSignal, phaseResponses[0]
+        )
+        phaseNinetyFeedback = self.ApplyFeedbackChannelEffectsAtResponse(
+            paOutputSignal, phaseResponses[1]
+        )
+        calibration = self.ConfigureFeedbackIqCalibration()
+        directFeedback, _ = calibration.SeparatePhasePair(
+            phaseZeroFeedback, phaseNinetyFeedback
+        )
+        calibration.Calibrate(phaseZeroFeedback, phaseNinetyFeedback)
+        self._feedbackIqCalibrationSignature = (
+            self.FeedbackIqCalibrationSignature()
+        )
+        self._lastFeedbackPhasePair = (
+            np.array(phaseZeroFeedback, dtype=np.complex128, copy=True),
+            np.array(phaseNinetyFeedback, dtype=np.complex128, copy=True),
+        )
+        return directFeedback
 
     def ApplyForwardChannelEffects(
         self, paOutputSignal: np.ndarray
@@ -2764,10 +3191,58 @@ class Channel:
                 error calculation, and coefficient updates.
         """
 
+        return self.ApplyFeedbackChannelEffectsAtResponse(
+            paOutputSignal, 1.0 + 0.0j
+        )
+
+    def ApplyFeedbackChannelEffectsAtResponse(
+        self,
+        paOutputSignal: np.ndarray,
+        phaseResponse: complex,
+    ) -> np.ndarray:
+        """Evaluate one measured phase-switch state before FB I/Q error.
+
+        Processing details:
+            Algorithm: Apply the existing common ``phaseDegrees`` rotation and
+            every feedback impairment up to the I/Q-converter input, multiply
+            by the supplied measured complex response of the additional phase
+            switch, then execute feedback I/Q/DC, noise, and ADC stages. This
+            explicit reference plane makes unequal measured switch magnitudes
+            separable even when an earlier feedback amplifier is nonlinear.
+
+        Args:
+            paOutputSignal: Normalized PA output after post-PA coupling.
+            phaseResponse: Finite nonzero complex voltage response measured for
+                the selected phase-switch state.
+
+        Returns:
+            result: Raw normalized feedback waveform for that switch state.
+        """
+
         self.ValidateParameters()
+        try:
+            complexPhaseResponse = complex(phaseResponse)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise TypeError(
+                "phaseResponse must be one finite nonzero complex scalar"
+            ) from error
+        if (
+            not np.isfinite(complexPhaseResponse)
+            or abs(complexPhaseResponse) <= np.finfo(float).tiny
+        ):
+            raise ValueError(
+                "phaseResponse must be one finite nonzero complex scalar"
+            )
         phaseRotatedSignal = self.ApplyPhaseRotation(paOutputSignal)
-        feedbackAnalogSignal = self.ApplyFeedbackAnalogImpairments(
+        preIqFeedbackSignal = self.ApplyFeedbackPreIqImpairments(
             phaseRotatedSignal
+        )
+        switchedFeedbackSignal = np.asarray(
+            preIqFeedbackSignal * complexPhaseResponse,
+            dtype=np.complex128,
+        )
+        feedbackAnalogSignal = self.ApplyFeedbackIqImbalance(
+            switchedFeedbackSignal
         )
         noisyFeedbackSignal = self.AddNoise(feedbackAnalogSignal)
         return self.ApplyFeedbackAdc(noisyFeedbackSignal)
@@ -3217,7 +3692,9 @@ class Channel:
         channelOutput = self.ApplyForwardChannelEffects(coupledPaOutput)
         if self.sampleMode == "forward":
             return channelOutput, channelOutput.copy()
-        feedbackOutput = self.ApplyFeedbackChannelEffects(coupledPaOutput)
+        feedbackOutput = self.ApplyCompensatedFeedbackChannelEffects(
+            coupledPaOutput
+        )
         return channelOutput, feedbackOutput
 
     def Process(
@@ -3258,6 +3735,16 @@ class Channel:
         """
 
         self.ValidateParameters()
+        if (
+            self.sampleMode == "fb"
+            and str(self.parameters["fbIqCompensationMode"])
+            .strip()
+            .lower()
+            == "filter"
+        ):
+            # Fail before power calibration or a live PA/thermal evaluation so
+            # an absent or stale inverse cannot consume a transmission period.
+            self.RequireCurrentFeedbackIqCalibration()
         # Reject cross-module reference-plane mismatches before a closed-loop
         # calibration can commit a new target or analog drive.
         self.ValidateThermalReferencePlanes()
