@@ -203,9 +203,9 @@ flowchart LR
 
 ### 7.3 Channel
 
-`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码。提供目标功率时，Channel先保存并暂停PA热状态。内部 `PowerCalibration` 把原始有效区归一化波形缩放成合法公开码，并用 `calibrationDigitalHeadroomDb=6.0` 默认保留6 dB每分量峰值余量；码值解码以后，闭环才调整隐藏的逐链模拟驱动，然后执行Tx I/Q、PA前耦合和参考温度各路PA。PA输出经过公开边界量化再解码，功率检测器只统计有效突发，因此输入和输出量化误差都进入闭环，但驱动增加不再要求生成越界整数码。
+`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码。提供目标功率时，Channel先保存并暂停PA热状态。内部 `PowerCalibration` 把原始有效区归一化波形缩放成合法公开码，并用 `calibrationDigitalHeadroomDb=6.0` 默认保留6 dB每分量峰值余量；码值解码以后，闭环才调整隐藏的逐链模拟驱动，然后执行Tx I/Q、PA前耦合和参考温度各路PA。PA输出经过公开边界量化再解码，功率检测器只统计有效突发，因此输入和输出量化误差都进入闭环，但驱动增加不再要求生成越界整数码。该功率检测器观察的是接收分叉前的干净物理PA输出，不是raw `fbOut` 定点码的表观功率。
 
-成功后，Channel提交模拟驱动，恢复原热状态，并用同一公开码和已提交驱动通过真实温度PA、PA后耦合与 `sampleMode` 采样路径一次，再编码返回。校准试探不发热，正式返回波形仍包含温漂。目标为 `None` 时，`Channel.Process` 解码公开输入，应用最近一次已经提交的模拟驱动，再执行单次耦合PA与采样链路；从未校准时该驱动为0 dB。`Channel.ProcessPaOutput` 用于已有逐PA输出，从PA后耦合开始处理，不重复施加PA前驱动。
+成功后，Channel提交模拟驱动，恢复原热状态，并用同一公开码和已提交驱动通过真实温度PA/热周期一次；PA后耦合节点随后分出 `chOut` 与 `fbOut`，两路分别编码成相同公开定点格式后以二元组返回。校准试探不发热，正式两路波形仍包含同一次温漂。目标为 `None` 时，`Channel.Process` 解码公开输入，应用最近一次已经提交的模拟驱动，再执行单次耦合PA并返回两路；从未校准时该驱动为0 dB。`Channel.ProcessPaOutput` 是按 `sampleMode` 选一路的兼容入口，用于已有逐PA输出。
 
 ```mermaid
 flowchart LR
@@ -215,17 +215,18 @@ flowchart LR
     txIq --> pre["浮点PA前耦合<br/>复系数/FIR/时延"]
     pre --> pa["各路浮点PA<br/>Rapp/Wiener/GMP/Doherty"]
     pa --> post["浮点PA后耦合<br/>复系数/FIR/时延"]
-    post --> phase["浮点相位旋转"]
-    phase --> mode{"sampleMode"}
-    mode -->|forward| forward["前向仪表浮点路径"]
-    mode -->|fb| fb["反馈模拟非理想<br/>可选内部ADC"]
-    forward --> noise["物理mV/dBm换算后的浮点噪声"]
-    fb --> noise
-    noise --> encode["FixedPoint.EncodeComplex"]
-    encode --> publicOutput["公开整数码"]
+    post --> branch{"同一PA/热状态分叉"}
+    branch --> forward["前向仪表浮点路径"]
+    branch --> fb["反馈模拟非理想<br/>可选内部ADC"]
+    forward --> forwardNoise["独立浮点噪声"]
+    fb --> feedbackNoise["独立浮点噪声"]
+    forwardNoise --> encodeCh["FixedPoint.EncodeComplex"]
+    feedbackNoise --> encodeFb["FixedPoint.EncodeComplex"]
+    encodeCh --> chOut["chOut公开整数码"]
+    encodeFb --> fbOut["fbOut公开整数码"]
 ```
 
-**图 3 说明**：6 dB数字余量属于公开码的构造条件，不是PA输出回退，也不是额外衰减PA输出。公开码解码后，隐藏模拟驱动位于Tx I/Q和PA之前；耦合复增益、FIR和分数时延滤波也都在内部浮点域计算，最后只在公开出口量化一次。因此启用校准或耦合不会改变调用方看到的数据类型。例如16位接口中的10 mV噪声不是码值10。模块先用 `maximumOutputPowerDbm` 和 `loadResistanceOhm` 求出归一化RMS，再乘以32768并舍入成最终公开噪声码。浮点和定点模式因此代表相同物理耦合与噪声。
+**图 3 说明**：6 dB数字余量属于公开码的构造条件，不是PA输出回退，也不是额外衰减PA输出。公开码解码后，隐藏模拟驱动位于Tx I/Q和PA之前；耦合复增益、FIR和分数时延滤波也都在内部浮点域计算，两路各自在公开出口量化一次。因此启用校准或耦合不会改变调用方看到的数据类型。例如16位接口中的10 mV噪声不是码值10。模块先用 `maximumOutputPowerDbm` 和 `loadResistanceOhm` 求出归一化RMS，再乘以32768并舍入成最终公开噪声码。浮点和定点模式因此代表相同物理耦合与噪声。
 
 完成校准后，三个发送参考面有明确区别：
 
@@ -238,8 +239,8 @@ flowchart LR
 `width` 与 `fbAdcWidth` 是两个不同边界：
 
 - `width` 定义Channel函数公开输入和输出的I/Q整数码；默认16，设为0时公开接口旁路量化。
-- `fbAdcWidth` 只在 `sampleMode="fb"` 时模拟板载反馈ADC；默认 `None`，表示不增加该内部量化。
-- 当两者同时启用时，信号先在反馈链内部按 `fbAdcWidth` 量化并解码回浮点，随后在函数出口再按公开 `width` 编码。这样可以独立研究反馈ADC精度和软件接口位宽。
+- `fbAdcWidth` 只在 `fbOut` 内模拟板载反馈ADC；默认 `None`，表示不增加该内部量化。兼容单输出接口只有 `sampleMode="fb"` 时返回这一路。
+- 当两者同时启用时，`fbOut` 先在反馈链内部按 `fbAdcWidth` 量化并解码回浮点，随后在函数出口再按公开 `width` 编码；`chOut` 只经过公开 `width`。这样可以独立研究反馈ADC精度和软件接口位宽。
 
 ### 7.4 Analysis
 
@@ -268,7 +269,7 @@ flowchart LR
     encode --> publicResult["公开整数码结果"]
 ```
 
-**图 3 说明**：MSE、NMSE 和学习更新都在物理归一化域计算；`ILCResult.learnedInput`、`ILCResult.outputSignal` 以及逐轮输入输出在返回调用方时重新编码为整数码。
+**图 3 说明**：MSE、NMSE和学习更新都在物理归一化域对 `fbOut` 计算；`ILCResult.learnedInput`、保存 `chOut` 的 `outputSignal`、保存反馈的 `feedbackOutputSignal` 以及逐轮两路波形在返回调用方时分别重新编码为整数码。最终Analysis只解码和分析 `chOut`。
 
 ## 9. 量化误差与饱和
 

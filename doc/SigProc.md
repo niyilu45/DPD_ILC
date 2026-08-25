@@ -37,7 +37,7 @@ y[m]
 
 这里的目标不是把 $v[m]$ 也消除，而是只消除不应计入 PA/DPD 性能的确定性同步误差。
 
-当波形来自 `Channel(sampleMode="fb")` 时，$v[m]$ 还可能包含板载反馈接收机的频率选择性响应、I/Q镜像、DC、三阶非线性、限幅和ADC量化。SigProc可以估计整数/分数时延、CFO、SFO和单一公共复增益，但不会假装能够用一个标量消除所有反馈链非理想：
+当波形来自 `Channel.Process(...)` 的第二个输出 `fbOut` 时，$v[m]$ 还可能包含板载反馈接收机的频率选择性响应、I/Q镜像、DC、三阶非线性、限幅和ADC量化。SigProc可以估计整数/分数时延、CFO、SFO和单一公共复增益，但不会假装能够用一个标量消除所有反馈链非理想：
 
 - 反馈FIR需要额外的频率响应校准或均衡；
 - I/Q不平衡包含共轭镜像项，需要广义线性校准；
@@ -481,14 +481,16 @@ processingResult = resultAnalysis.GetLastSignalProcessingResult()
 3. CFO 相位解缠要求相邻估计窗口之间的相位变化不过度模糊；极大 CFO 应先使用前导重复结构做粗频偏估计。
 4. 单一线性采样频偏模型不描述采样时钟抖动或随时间变化的非线性漂移。
 5. 公共复增益只消除统一幅相误差，不等于频率选择性信道均衡；真实 OTA MIMO 测量仍需要信道估计和均衡。
-6. 对 `sampleMode="fb"` 的Channel波形，同步可以补偿配置的时延、CFO、SFO和一部分公共增益/相位，但不能自动校正反馈FIR、I/Q镜像、三阶失真、限幅或ADC量化；这些残差应与forward仪表结果分开解释。
+6. 对Channel的 `fbOut`，同步可以补偿配置的时延、CFO、SFO和一部分公共增益/相位，但不能自动校正反馈FIR、I/Q镜像、三阶失真、限幅或ADC量化；这些残差应与同次返回的 `chOut` 主路结果分开解释。
 6. 插值会改变记录边缘；测量采集应在帧前后保留足够保护样点，避免时延补偿后丢失有效数据。
 
 ---
 
 ## 13. PA输出dBm、输出回退与复包络标定
 
-`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它负责dBm/RMS换算、根据额定输出功率产生第一次输入驱动预设，并闭环调整PA输入；PA非线性仍由绑定的PA模型或仪表实现。它不会在PA输出端乘常数增益来伪造目标功率。若绑定对象同时提供 `SuspendThermalModel` 与 `RestoreThermalModel`，公开入口 `Calibrate` 还会统一包围一个“暂停热效应—纯电闭环—恢复热状态”的事务。因此通过Channel使用和直接绑定热PA使用都在参考温度电模型上校准。普通业务代码仍推荐调用 `Channel.Process(rawSignal, outputPowerDbm=...)`，由Channel在内部组合本工具。
+`PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它负责dBm/RMS换算、根据额定输出功率产生第一次输入驱动预设，并闭环调整PA输入；PA非线性仍由绑定的PA模型或仪表实现。它不会在PA输出端乘常数增益来伪造目标功率。若绑定对象同时提供 `SuspendThermalModel` 与 `RestoreThermalModel`，公开入口 `Calibrate` 还会统一包围一个“暂停热效应—纯电闭环—恢复热状态”的事务。因此通过Channel使用和直接绑定热PA使用都在参考温度电模型上校准。普通业务代码仍推荐调用 `chOut, fbOut = Channel.Process(rawSignal, outputPowerDbm=...)`，由Channel在内部组合本工具。
+
+这里的 `outputPowerDbm` 只表示PA后耦合前、接收链非理想之前的干净物理PA输出功率。`PowerCalibration` 不读取raw `fbOut` 的表观RMS，也不会把 `fbGainDb`、反馈FIR、反馈非线性、噪声或ADC量化误当成发射功率误差。用户口中的“DPD校准”是后续学习过程：它把 `fbOut` 交给本文件的同步工具计算训练误差；最终EVM、SNR、ACLR、IRR和功率则对 `chOut` 计算。
 
 工程约定复包络 RMS 幅度等于纯电阻端口上的 RF RMS 电压。设端口电阻为 $R$，RMS 电压为 $V_{\mathrm{RMS}}$，则端口平均功率为
 

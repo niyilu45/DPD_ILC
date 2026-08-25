@@ -3066,14 +3066,15 @@ class Analysis:
         """Analyze every stored SISO ILC output after learning has finished.
 
         Processing details:
-            Algorithm: Validate native iteration records, feed each stored PA
-            output through the ordinary ``Analyze`` path, combine RF metrics
-            with algorithm diagnostics, and select the measured candidate with
-            minimum strict Wi-Fi EVM outside the ILC algorithm.
+            Algorithm: Validate native iteration records, feed each stored
+            forward ``chOut`` through the ordinary ``Analyze`` path, combine
+            those RF metrics with feedback-derived algorithm diagnostics, and
+            select the candidate with minimum strict Wi-Fi EVM outside ILC.
 
         Args:
             ilcHistory: Native ``DpdIlc.ILCIteration`` records containing each
-                measured input/output pair and algorithm MSE diagnostics.
+                measured input/chOut pair, optional fbOut, and feedback-domain
+                algorithm MSE diagnostics.
 
         Returns:
             result: Independent performance history plus the EVM-best measured
@@ -3103,12 +3104,23 @@ class Analysis:
             outputSignal = np.asarray(
                 iterationRecord.outputSignal, dtype=np.complex128
             )
+            if inputSignal.shape != self.referenceSignal.shape:
+                raise ValueError(
+                    "ILC iteration inputs must match the analysis reference"
+                )
+            if outputSignal.ndim != self.referenceSignal.ndim:
+                raise ValueError(
+                    "ILC iteration chOut must preserve reference rank"
+                )
+            if outputSignal.size == 0:
+                raise ValueError("ILC iteration chOut cannot be empty")
             if (
-                inputSignal.shape != self.referenceSignal.shape
-                or outputSignal.shape != self.referenceSignal.shape
+                outputSignal.ndim == 2
+                and outputSignal.shape[1]
+                != self.referenceSignal.shape[1]
             ):
                 raise ValueError(
-                    "ILC iteration signals must match the analysis reference"
+                    "ILC iteration chOut must preserve the channel count"
                 )
             if not np.all(np.isfinite(inputSignal)) or not np.all(
                 np.isfinite(outputSignal)
@@ -3238,9 +3250,10 @@ class Analysis:
 
         Processing details:
             Algorithm: Require one equal-length history per transmit chain,
-            column-stack the input and PA output stored at each common round,
-            aggregate native per-chain MSE diagnostics, evaluate the complete
-            matrix through MIMO ``Analysis``, and select the minimum-EVM round.
+            column-stack the input and forward chOut stored at each common
+            round, aggregate feedback-domain per-chain MSE diagnostics,
+            evaluate the complete matrix through MIMO ``Analysis``, and select
+            the minimum-EVM round.
 
         Args:
             chainHistories: Ordered native ILC histories, one sequence for each
@@ -3322,12 +3335,17 @@ class Analysis:
                     for chainRecord in chainRecords
                 ]
             )
+            if inputMatrix.shape != self.referenceSignal.shape:
+                raise ValueError(
+                    "MIMO iteration inputs must match the analysis reference"
+                )
             if (
-                inputMatrix.shape != self.referenceSignal.shape
-                or outputMatrix.shape != self.referenceSignal.shape
+                outputMatrix.shape[0] == 0
+                or outputMatrix.shape[1]
+                != self.referenceSignal.shape[1]
             ):
                 raise ValueError(
-                    "MIMO iteration matrices must match the analysis reference"
+                    "MIMO iteration chOut must preserve the channel count"
                 )
             signalMetrics = self.Analyze(outputMatrix)
             rawMse = float(

@@ -4200,7 +4200,7 @@ def EvaluateChannelDpdStage(
         referenceSignal, dtype=np.complex128
     )
     measuredMatrix = np.asarray(
-        channel.ProcessFloating(dacInputSignal),
+        channel.ProcessOutputPathsFloating(dacInputSignal)[0],
         dtype=np.complex128,
     )
     if measuredMatrix.shape != referenceMatrix.shape:

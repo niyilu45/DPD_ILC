@@ -45,9 +45,14 @@ from inc.lib.DpdIlc import (
     CalculateIterationMetrics,
     FitMimoGmpPredistorter,
     ILCConfig,
+    RunAugmentedIqIlc,
     RunComplexGainIlc,
+    RunDirectionalGaussNewtonIlc,
+    RunFirIlc,
     RunFrequencyDomainIlc,
     RunMimoFrequencyDomainIlc,
+    RunParameterDomainIlc,
+    RunScalarPIlc,
 )
 from inc.lib.Fec import (
     BuildDescriptorLdpcMatrices,
@@ -2978,7 +2983,13 @@ def CheckIlcFeedbackSynchronization() -> None:
         referenceSignal.size + delaySamples
     )
     for iterationRecord in ilcResult.history:
-        assert iterationRecord.outputSignal.shape == referenceSignal.shape
+        assert iterationRecord.outputSignal.size == (
+            referenceSignal.size + delaySamples
+        )
+        assert iterationRecord.feedbackOutputSignal is not None
+        assert iterationRecord.feedbackOutputSignal.size == (
+            referenceSignal.size + delaySamples
+        )
         assert iterationRecord.integerDelaySamples == delaySamples
         assert abs(
             iterationRecord.carrierFrequencyOffsetHz
@@ -4209,10 +4220,11 @@ def CheckPaThermalModel() -> None:
         },
     )
     rawInput = np.full(2000, 0.35 + 0.0j)
-    firstOutput = thermalChannel.Process(
+    firstOutput, firstFeedbackOutput = thermalChannel.Process(
         rawInput,
         outputPowerDbm=20.0,
     )
+    assert firstFeedbackOutput.shape == firstOutput.shape
     firstRms = float(np.sqrt(np.mean(np.abs(firstOutput) ** 2)))
     firstMetrics = thermalChannel.GetThermalMetrics()
     firstCalibrationMetrics = (
@@ -4243,10 +4255,11 @@ def CheckPaThermalModel() -> None:
     # suspended, the hot snapshot is restored, and only the real frame advances
     # thermal time. Consequently the fixed reference drive still exhibits
     # temperature-dependent output drift.
-    secondOutput = thermalChannel.Process(
+    secondOutput, secondFeedbackOutput = thermalChannel.Process(
         rawInput,
         outputPowerDbm=20.0,
     )
+    assert secondFeedbackOutput.shape == secondOutput.shape
     secondRms = float(np.sqrt(np.mean(np.abs(secondOutput) ** 2)))
     secondMetrics = thermalChannel.GetThermalMetrics()
     assert secondMetrics["endingJunctionTemperatureC"] > firstMetrics[
@@ -4793,9 +4806,13 @@ def CheckThermalDisableAndCalibrationBypass() -> None:
         ),
         parameters={"width": 0},
     )
-    targetFreeOutput = disabledChannel.Process(floatingInput)
+    targetFreeOutput, targetFreeFeedbackOutput = disabledChannel.Process(
+        floatingInput
+    )
     assert targetFreeOutput.shape == floatingInput.shape
+    assert targetFreeFeedbackOutput.shape == floatingInput.shape
     assert np.all(np.isfinite(targetFreeOutput))
+    assert np.all(np.isfinite(targetFreeFeedbackOutput))
     assert disabledChannel.GetThermalMetrics() == {"enabled": False}
 
 
@@ -4908,10 +4925,11 @@ def CheckChannelPeriodicThermalModes() -> None:
             "the first steady-state period ran without a power target"
         )
 
-    firstSteadyOutput = steadyChannel.Process(
+    firstSteadyOutput, firstSteadyFeedbackOutput = steadyChannel.Process(
         periodicInput,
         outputPowerDbm=18.0,
     )
+    assert firstSteadyFeedbackOutput.shape == firstSteadyOutput.shape
     firstSteadyMetrics = steadyChannel.GetThermalMetrics()
     firstCalibrationMetrics = steadyChannel.GetLastCalibrationMetrics()
     assert firstCalibrationMetrics["converged"]
@@ -4956,7 +4974,10 @@ def CheckChannelPeriodicThermalModes() -> None:
     # Omitting the target after the first accepted request must reuse 18 dBm
     # and recalibrate. Scaling the raw active samples by five therefore leaves
     # the accepted steady-state output unchanged rather than reducing it by 5x.
-    secondSteadyOutput = steadyChannel.Process(0.2 * periodicInput)
+    secondSteadyOutput, secondSteadyFeedbackOutput = steadyChannel.Process(
+        0.2 * periodicInput
+    )
+    assert secondSteadyFeedbackOutput.shape == secondSteadyOutput.shape
     secondSteadyMetrics = steadyChannel.GetThermalMetrics()
     secondCalibrationMetrics = steadyChannel.GetLastCalibrationMetrics()
     assert secondCalibrationMetrics["converged"]
@@ -5047,11 +5068,12 @@ def CheckChannelPeriodicThermalModes() -> None:
     )
     mimoInput = np.column_stack((periodicInput, secondChain))
     assert np.allclose(mimoChannel.GetActualDutyCycle(mimoInput), (0.2, 0.1))
-    mimoOutput = mimoChannel.Process(
+    mimoOutput, mimoFeedbackOutput = mimoChannel.Process(
         mimoInput,
         outputPowerDbm=(16.0, 16.0),
     )
     assert mimoOutput.shape == mimoInput.shape
+    assert mimoFeedbackOutput.shape == mimoInput.shape
     assert np.allclose(mimoChannel.GetActualDutyCycle(), (0.2, 0.1))
     completeMimoMetrics = mimoChannel.GetThermalMetrics()
     mimoMetrics = completeMimoMetrics["chains"]
@@ -5364,12 +5386,14 @@ def CheckPeriodicThermalEdgeCases() -> None:
             "width": 0,
         },
     )
-    firstIqOutput = iqChannel.Process(
+    firstIqOutput, firstIqFeedbackOutput = iqChannel.Process(
         periodicInput, outputPowerDbm=18.0
     )
     firstIqMetrics = iqChannel.GetThermalMetrics()
     firstIqCalibration = iqChannel.GetLastCalibrationMetrics()
-    secondIqOutput = iqChannel.Process(0.2 * periodicInput)
+    secondIqOutput, secondIqFeedbackOutput = iqChannel.Process(
+        0.2 * periodicInput
+    )
     secondIqMetrics = iqChannel.GetThermalMetrics()
     secondIqCalibration = iqChannel.GetLastCalibrationMetrics()
     assert firstIqMetrics["thermalRunMode"] == "steady_state"
@@ -5386,6 +5410,12 @@ def CheckPeriodicThermalEdgeCases() -> None:
     assert np.allclose(
         secondIqOutput,
         firstIqOutput,
+        rtol=1.0e-9,
+        atol=1.0e-12,
+    )
+    assert np.allclose(
+        secondIqFeedbackOutput,
+        firstIqFeedbackOutput,
         rtol=1.0e-9,
         atol=1.0e-12,
     )
@@ -5535,8 +5565,16 @@ def CheckChannelIqEnableControls() -> None:
             "fbIqImbalanceEnabled": False,
         },
     )
-    txOnlyForwardOutput = txOnlyForwardChannel.Process(testSignal)
-    txOnlyEmbeddedOutput = txOnlyEmbeddedChannel.Process(testSignal)
+    (
+        txOnlyForwardOutput,
+        txOnlyForwardFeedbackOutput,
+    ) = txOnlyForwardChannel.Process(testSignal)
+    (
+        txOnlyEmbeddedOutput,
+        txOnlyEmbeddedFeedbackOutput,
+    ) = txOnlyEmbeddedChannel.Process(testSignal)
+    assert np.allclose(txOnlyForwardFeedbackOutput, txOnlyForwardOutput)
+    assert np.allclose(txOnlyEmbeddedFeedbackOutput, txOnlyEmbeddedOutput)
     assert np.allclose(txOnlyEmbeddedOutput, txOnlyForwardOutput)
     assert np.allclose(
         txOnlyForwardChannel.GetLastTransmitterOutput(),
@@ -5560,7 +5598,10 @@ def CheckChannelIqEnableControls() -> None:
         paModel=PaModel(modelName="wiener", width=0),
         parameters=liveIqParameters,
     )
-    allDisabledOutput = liveIqChannel.Process(testSignal)
+    allDisabledOutput, allDisabledFeedbackOutput = liveIqChannel.Process(
+        testSignal
+    )
+    assert np.array_equal(allDisabledFeedbackOutput, allDisabledOutput)
     assert liveIqChannel.TransmitterIqCoefficients() == (
         1.0 + 0.0j,
         0.0 + 0.0j,
@@ -5584,12 +5625,15 @@ def CheckChannelIqEnableControls() -> None:
         1.0 + 0.0j,
         0.0 + 0.0j,
     )
-    txOnlyLiveOutput = liveIqChannel.Process(testSignal)
+    txOnlyLiveOutput, txOnlyLiveFeedbackOutput = liveIqChannel.Process(
+        testSignal
+    )
     txOnlyLiveDrive = liveIqChannel.ApplyTransmitterIqImbalance(testSignal)
     expectedTxOnlyLiveOutput = liveIqChannel.paModel.Process(
         txOnlyLiveDrive
     )
     assert np.allclose(txOnlyLiveOutput, expectedTxOnlyLiveOutput)
+    assert np.allclose(txOnlyLiveFeedbackOutput, expectedTxOnlyLiveOutput)
     assert np.allclose(
         liveIqChannel.GetLastTransmitterOutput(), txOnlyLiveDrive
     )
@@ -5611,13 +5655,17 @@ def CheckChannelIqEnableControls() -> None:
         1.0 + 0.0j,
         0.0 + 0.0j,
     )
-    feedbackOnlyLiveOutput = liveIqChannel.Process(testSignal)
+    (
+        feedbackOnlyLiveChannelOutput,
+        feedbackOnlyLiveOutput,
+    ) = liveIqChannel.Process(testSignal)
     expectedFeedbackOnlyLiveOutput = (
         liveIqChannel.ApplyFeedbackIqImbalance(allDisabledOutput)
     )
     assert np.allclose(
         feedbackOnlyLiveOutput, expectedFeedbackOnlyLiveOutput
     )
+    assert np.allclose(feedbackOnlyLiveChannelOutput, allDisabledOutput)
     assert np.array_equal(
         liveIqChannel.GetLastTransmitterOutput(), testSignal
     )
@@ -5660,13 +5708,27 @@ def CheckChannelIqEnableControls() -> None:
             "width": 16,
         },
     )
-    idealFixedOutput = idealFixedChannel.Process(mimoFixedInput)
-    disabledFixedOutput = disabledFixedChannel.Process(mimoFixedInput)
-    enabledFixedOutput = enabledFixedChannel.Process(mimoFixedInput)
+    idealFixedOutput, idealFixedFeedbackOutput = idealFixedChannel.Process(
+        mimoFixedInput
+    )
+    (
+        disabledFixedOutput,
+        disabledFixedFeedbackOutput,
+    ) = disabledFixedChannel.Process(mimoFixedInput)
+    enabledFixedOutput, enabledFixedFeedbackOutput = (
+        enabledFixedChannel.Process(mimoFixedInput)
+    )
     assert disabledFixedOutput.shape == mimoFixedInput.shape
     assert disabledFixedOutput.dtype == np.complex128
     assert np.array_equal(disabledFixedOutput, idealFixedOutput)
+    assert np.array_equal(
+        disabledFixedFeedbackOutput, idealFixedFeedbackOutput
+    )
+    assert np.array_equal(disabledFixedFeedbackOutput, disabledFixedOutput)
     assert not np.array_equal(enabledFixedOutput, idealFixedOutput)
+    assert not np.array_equal(
+        enabledFixedFeedbackOutput, idealFixedFeedbackOutput
+    )
     assert np.array_equal(
         disabledFixedChannel.GetLastTransmitterOutput(),
         fixedFormat.DecodeComplex(mimoFixedInput),
@@ -5691,6 +5753,345 @@ def CheckChannelIqEnableControls() -> None:
                     f"{parameterName} accepted non-boolean "
                     f"{invalidValue!r}"
                 )
+
+
+def CheckChannelDualOutputContract() -> None:
+    """Verify parallel channel/feedback outputs and their consumers.
+
+    Processing details:
+        Algorithm: Compare ideal and feedback-impaired calibrated Channels,
+        prove that feedback-only settings leave the clean PA power target and
+        forward observation unchanged, check that one dual-output call advances
+        exactly one thermal waveform period, enforce integer-code boundaries on
+        both fixed-point outputs, then run a synthetic dual-output ILC plant.
+        The synthetic plant keeps its forward output perfect while distorting
+        feedback, so any ILC MSE or waveform update must come from ``fbOut``;
+        independent history analysis must still obtain EVM from ``chOut``.
+
+    Returns:
+        result: None. Assertions enforce reference-plane and routing contracts.
+    """
+
+    calibrationSignal = np.r_[
+        np.zeros(48, dtype=np.complex128),
+        0.31
+        * np.exp(
+            1j
+            * 2.0
+            * np.pi
+            * np.arange(1024, dtype=float)
+            / 31.0
+        ),
+        np.zeros(64, dtype=np.complex128),
+    ]
+    commonChannelParameters = {
+        "maximumOutputPowerDbm": 25.0,
+        "calibrationToleranceDb": 0.05,
+        "width": 0,
+    }
+    idealChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters=commonChannelParameters,
+    )
+    impairedFeedbackChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            **commonChannelParameters,
+            "fbGainDb": -4.0,
+            "fbPhaseDegrees": 31.0,
+            "fbFirTaps": (1.0 + 0.0j, 0.18 - 0.07j),
+            "fbIntegerDelaySamples": 2,
+            "fbThirdOrderCoefficient": -0.08 + 0.01j,
+        },
+    )
+    idealOutput, idealFeedbackOutput = idealChannel.Process(
+        calibrationSignal,
+        outputPowerDbm=17.0,
+    )
+    impairedOutput, impairedFeedbackOutput = (
+        impairedFeedbackChannel.Process(
+            calibrationSignal,
+            outputPowerDbm=17.0,
+        )
+    )
+    idealCalibrationMetrics = idealChannel.GetLastCalibrationMetrics()
+    impairedCalibrationMetrics = (
+        impairedFeedbackChannel.GetLastCalibrationMetrics()
+    )
+    assert np.allclose(idealOutput, idealFeedbackOutput)
+    assert np.allclose(impairedOutput, idealOutput)
+    assert not np.allclose(impairedFeedbackOutput, impairedOutput)
+    assert abs(
+        idealCalibrationMetrics["measuredOutputPowerDbmPerChain"][0]
+        - 17.0
+    ) <= 0.05
+    assert abs(
+        impairedCalibrationMetrics[
+            "measuredOutputPowerDbmPerChain"
+        ][0]
+        - 17.0
+    ) <= 0.05
+    assert np.allclose(
+        impairedCalibrationMetrics["analogDriveDbPerChain"],
+        idealCalibrationMetrics["analogDriveDbPerChain"],
+    )
+
+    # Splitting the common post-PA waveform must not evaluate or heat the PA
+    # twice. The elapsed time therefore advances by exactly N / Fs seconds.
+    thermalSampleRateHz = 100.0e3
+    thermalInput = np.full(200, 0.23 + 0.04j, dtype=np.complex128)
+    thermalPa = PaModel(
+        parameters={
+            "modelName": "wiener",
+            "thermalConfig": ThermalConfig.Recommended(
+                "single_rc",
+                sampleRateHz=thermalSampleRateHz,
+                thermalUpdateIntervalSamples=20,
+            ),
+            "width": 0,
+        }
+    )
+    thermalChannel = Channel(
+        paModel=thermalPa,
+        parameters={
+            "sampleRateHz": thermalSampleRateHz,
+            "thermalRunMode": "transient",
+            "fbGainDb": -3.0,
+            "width": 0,
+        },
+    )
+    elapsedTimeBeforeSec = float(
+        thermalPa.GetThermalMetrics()["elapsedTimeSec"]
+    )
+    thermalOutput, thermalFeedbackOutput = thermalChannel.Process(
+        thermalInput
+    )
+    elapsedTimeAfterSec = float(
+        thermalPa.GetThermalMetrics()["elapsedTimeSec"]
+    )
+    assert thermalOutput.shape == thermalInput.shape
+    assert thermalFeedbackOutput.shape == thermalInput.shape
+    assert np.isclose(
+        elapsedTimeAfterSec - elapsedTimeBeforeSec,
+        thermalInput.size / thermalSampleRateHz,
+    )
+
+    # Both public fixed-point branches retain the same complex-array type and
+    # integer I/Q-code convention even though the feedback values differ.
+    fixedFormat = FixedPoint(16)
+    fixedInput = fixedFormat.EncodeComplex(
+        np.asarray(
+            (0.20 + 0.10j, -0.30 + 0.04j, 0.08 - 0.21j),
+            dtype=np.complex128,
+        )
+    )
+    fixedChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=16),
+        parameters={
+            "fbGainDb": -2.0,
+            "fbPhaseDegrees": -17.0,
+            "width": 16,
+        },
+    )
+    fixedOutput, fixedFeedbackOutput = fixedChannel.Process(fixedInput)
+    for publicOutput in (fixedOutput, fixedFeedbackOutput):
+        assert publicOutput.shape == fixedInput.shape
+        assert publicOutput.dtype == np.complex128
+        assert np.array_equal(publicOutput.real, np.rint(publicOutput.real))
+        assert np.array_equal(publicOutput.imag, np.rint(publicOutput.imag))
+    assert not np.array_equal(fixedFeedbackOutput, fixedOutput)
+
+    class SyntheticDualOutputPlant:
+        """Expose a perfect forward observation and nonlinear feedback."""
+
+        def __init__(self, channelReference: np.ndarray) -> None:
+            """Retain the perfect forward waveform used by RF analysis.
+
+            Processing details:
+                Algorithm: Copy the immutable target and expose a floating
+                public boundary compatible with the normalized ILC adapter.
+
+            Args:
+                channelReference: Ideal waveform returned on the forward path.
+
+            Returns:
+                result: None. The deterministic dual-output plant is ready.
+            """
+
+            self.channelReference = np.asarray(
+                channelReference, dtype=np.complex128
+            ).copy()
+            self.width = 0
+
+        def ProcessOutputPathsFloating(
+            self, inputSignal: np.ndarray
+        ) -> tuple[np.ndarray, np.ndarray]:
+            """Return perfect ``chOut`` and input-dependent distorted fbOut.
+
+            Processing details:
+                Algorithm: Keep the forward waveform independent of the ILC
+                drive while applying a memoryless cubic response to feedback.
+                A learner incorrectly using chOut would see zero error and
+                could not change its second-round input.
+
+            Args:
+                inputSignal: Current normalized ILC drive waveform.
+
+            Returns:
+                result: Forward reference and nonlinear feedback arrays.
+            """
+
+            complexInput = np.asarray(inputSignal, dtype=np.complex128)
+            feedbackOutput = (
+                0.72 * complexInput
+                + 0.48 * complexInput * np.abs(complexInput) ** 2
+            )
+            return self.channelReference.copy(), feedbackOutput
+
+    wifiWaveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=5,
+        numDataSymbols=2,
+        sampleRateHz=80.0e6,
+        seed=619,
+        width=0,
+    ).Generate()
+    ilcReference = 0.20 * wifiWaveform.samples
+    dualOutputConfig = ILCConfig(
+        numIterations=2,
+        learningRate=0.25,
+        maxAmplitude=1.25,
+    )
+    ilcMethodRunners = (
+        (
+            "scalar",
+            lambda selectedPlant: RunScalarPIlc(
+                ilcReference,
+                selectedPlant,
+                dualOutputConfig,
+                wifiWaveform.sampleRateHz,
+            ),
+        ),
+        (
+            "complex",
+            lambda selectedPlant: RunComplexGainIlc(
+                ilcReference,
+                selectedPlant,
+                dualOutputConfig,
+                wifiWaveform.sampleRateHz,
+            ),
+        ),
+        (
+            "fir",
+            lambda selectedPlant: RunFirIlc(
+                ilcReference,
+                selectedPlant,
+                dualOutputConfig,
+                firLength=9,
+                sampleRateHz=wifiWaveform.sampleRateHz,
+            ),
+        ),
+        (
+            "frequency",
+            lambda selectedPlant: RunFrequencyDomainIlc(
+                ilcReference,
+                selectedPlant,
+                wifiWaveform.sampleRateHz,
+                wifiWaveform.bandwidthHz,
+                dualOutputConfig,
+            ),
+        ),
+        (
+            "directional",
+            lambda selectedPlant: RunDirectionalGaussNewtonIlc(
+                ilcReference,
+                selectedPlant,
+                dualOutputConfig,
+                finiteDifferenceRms=1.0e-3,
+                sampleRateHz=wifiWaveform.sampleRateHz,
+            ),
+        ),
+        (
+            "parameter",
+            lambda selectedPlant: RunParameterDomainIlc(
+                ilcReference,
+                selectedPlant,
+                dualOutputConfig,
+                nonlinearOrders=(1, 3),
+                memoryDepth=2,
+                sampleRateHz=wifiWaveform.sampleRateHz,
+            ),
+        ),
+        (
+            "augmented",
+            lambda selectedPlant: RunAugmentedIqIlc(
+                ilcReference,
+                selectedPlant,
+                dualOutputConfig,
+                wifiWaveform.sampleRateHz,
+            ),
+        ),
+    )
+    methodResults = {}
+    for methodName, methodRunner in ilcMethodRunners:
+        methodResult = methodRunner(
+            SyntheticDualOutputPlant(ilcReference)
+        )
+        methodResults[methodName] = methodResult
+        assert len(methodResult.history) == 2
+        assert np.array_equal(methodResult.outputSignal, ilcReference)
+        assert methodResult.feedbackOutputSignal is not None
+        assert not np.allclose(
+            methodResult.feedbackOutputSignal,
+            methodResult.outputSignal,
+        )
+        firstIteration = methodResult.history[0]
+        secondIteration = methodResult.history[1]
+        assert np.array_equal(firstIteration.outputSignal, ilcReference)
+        assert firstIteration.feedbackOutputSignal is not None
+        assert not np.allclose(
+            firstIteration.feedbackOutputSignal,
+            firstIteration.outputSignal,
+        )
+        explicitlyAlignedFeedback = SigProc(
+            ilcReference,
+            wifiWaveform.sampleRateHz,
+        ).Process(firstIteration.feedbackOutputSignal).processedSignal
+        expectedFeedbackMse = float(
+            np.mean(
+                np.abs(ilcReference - explicitlyAlignedFeedback) ** 2
+            )
+        )
+        assert np.isclose(firstIteration.mse, expectedFeedbackMse), methodName
+        assert firstIteration.mse > 0.0, methodName
+        assert not np.allclose(
+            secondIteration.inputSignal,
+            firstIteration.inputSignal,
+        ), methodName
+
+    ilcResult = methodResults["frequency"]
+    firstIteration = ilcResult.history[0]
+
+    ilcAnalysis = Analysis(
+        ilcReference,
+        wifiWaveform,
+        parameters={"width": 0},
+    )
+    analyzedHistory = ilcAnalysis.AnalyzeIlcHistory(ilcResult.history)
+    directChannelMetrics = ilcAnalysis.Analyze(firstIteration.outputSignal)
+    directFeedbackMetrics = ilcAnalysis.Analyze(
+        firstIteration.feedbackOutputSignal
+    )
+    assert np.isclose(
+        analyzedHistory.history[0].evmDb,
+        directChannelMetrics["evmDb"],
+    )
+    assert (
+        analyzedHistory.history[0].evmDb
+        < directFeedbackMetrics["evmDb"]
+    )
+    assert np.array_equal(analyzedHistory.bestOutputSignal, ilcReference)
 
 
 def CheckChannelModel() -> None:
@@ -5792,10 +6193,12 @@ def CheckChannelModel() -> None:
         expectedTxOutput,
     )
     expectedForwardOutput = txPaModel.Process(expectedTxOutput)
+    txChannelOutput, txFeedbackOutput = txIqChannel.Process(testSignal)
     assert np.allclose(
-        txIqChannel.Process(testSignal),
+        txChannelOutput,
         expectedForwardOutput,
     )
+    assert not np.allclose(txFeedbackOutput, txChannelOutput)
     assert np.allclose(
         txIqChannel.GetLastTransmitterOutput(), expectedTxOutput
     )
@@ -5831,8 +6234,12 @@ def CheckChannelModel() -> None:
     expectedCombinedIqOutput = combinedIqChannel.ApplyFeedbackIqImbalance(
         combinedPaOutput
     )
+    combinedChannelOutput, combinedFeedbackOutput = (
+        combinedIqChannel.Process(testSignal)
+    )
+    assert np.allclose(combinedChannelOutput, combinedPaOutput)
     assert np.allclose(
-        combinedIqChannel.Process(testSignal),
+        combinedFeedbackOutput,
         expectedCombinedIqOutput,
     )
 
@@ -6135,7 +6542,9 @@ def CheckChannelModel() -> None:
         },
     )
     expectedOutput = 1j * paModel.Process(testSignal)
-    assert np.allclose(paChannel.Process(testSignal), expectedOutput)
+    channelOutput, feedbackOutput = paChannel.Process(testSignal)
+    assert np.allclose(channelOutput, expectedOutput)
+    assert np.allclose(feedbackOutput, expectedOutput)
     assert np.allclose(
         paChannel.SmallSignalGain(),
         1j * paModel.SmallSignalGain(),
@@ -6176,7 +6585,7 @@ def CheckChannelModel() -> None:
             "width": 0,
         },
     )
-    calibratedOutput = calibratedChannel.Process(
+    calibratedOutput, calibratedFeedbackOutput = calibratedChannel.Process(
         rawBurst,
         outputPowerDbm=18.0,
     )
@@ -6192,6 +6601,7 @@ def CheckChannelModel() -> None:
         calibratedOutput,
         calibratedChannel.GetLastPaOutput(),
     )
+    assert np.array_equal(calibratedFeedbackOutput, calibratedOutput)
     assert calibratedChannel.GetLastPaInput().shape == rawBurst.shape
     assert not np.allclose(
         calibratedChannel.GetLastPaInput(),
@@ -6394,7 +6804,7 @@ def CheckChannelModel() -> None:
             "width": 0,
         },
     )
-    mimoOutput = mimoChannel.Process(
+    mimoOutput, mimoFeedbackOutput = mimoChannel.Process(
         mimoRawBurst,
         outputPowerDbm=(17.0, 19.0),
     )
@@ -6402,6 +6812,7 @@ def CheckChannelModel() -> None:
         mimoChannel.GetLastCalibrationMetrics()
     )
     assert mimoOutput.shape == mimoRawBurst.shape
+    assert mimoFeedbackOutput.shape == mimoRawBurst.shape
     assert (
         mimoChannel.GetParameters()["jointPowerCalibration"]
         is None
@@ -6445,7 +6856,7 @@ def CheckChannelModel() -> None:
             "width": 16,
         },
     )
-    fixedGmpOutput = fixedGmpChannel.Process(
+    fixedGmpOutput, fixedGmpFeedbackOutput = fixedGmpChannel.Process(
         fixedWifiWaveform.samples,
         outputPowerDbm=20.0,
     )
@@ -6464,6 +6875,7 @@ def CheckChannelModel() -> None:
         fixedGmpChannel.GetLastPaInput(),
         fixedGmpChannel.GetLastPaOutput(),
         fixedGmpOutput,
+        fixedGmpFeedbackOutput,
     ):
         assert publicWaveform.dtype == np.complex128
         assert np.array_equal(
@@ -6500,7 +6912,10 @@ def CheckChannelModel() -> None:
     fixedGmpChannel.UpdateParameters(
         calibrationDigitalHeadroomDb=9.0
     )
-    largerHeadroomOutput = fixedGmpChannel.Process(
+    (
+        largerHeadroomOutput,
+        largerHeadroomFeedbackOutput,
+    ) = fixedGmpChannel.Process(
         fixedWifiWaveform.samples,
         outputPowerDbm=20.0,
     )
@@ -6522,6 +6937,7 @@ def CheckChannelModel() -> None:
         largerHeadroomMetrics["measuredOutputPowerDbmPerChain"][0]
         - 20.0
     ) <= 0.25
+    assert largerHeadroomFeedbackOutput.shape == largerHeadroomOutput.shape
     largerHeadroomOutputMetrics = Analysis(
         largerHeadroomOutput,
         transmittedSignal=largerHeadroomOutput,
@@ -6534,9 +6950,10 @@ def CheckChannelModel() -> None:
     # A failed replacement request must not commit its trial analog drive.
     # Reusing the previously accepted public codes must therefore reproduce
     # the same deterministic channel output after the failure.
-    stableOutputBeforeFailure = fixedGmpChannel.Process(
-        largerHeadroomInput
-    )
+    (
+        stableOutputBeforeFailure,
+        stableFeedbackBeforeFailure,
+    ) = fixedGmpChannel.Process(largerHeadroomInput)
     fixedGmpChannel.UpdateParameters(
         calibrationToleranceDb=1.0e-6,
         maximumCalibrationIterations=1,
@@ -6553,11 +6970,15 @@ def CheckChannelModel() -> None:
         assert failedReplacementMetrics["converged"] is False
     else:
         raise AssertionError("a one-trial replacement unexpectedly converged")
-    stableOutputAfterFailure = fixedGmpChannel.Process(
-        largerHeadroomInput
-    )
+    (
+        stableOutputAfterFailure,
+        stableFeedbackAfterFailure,
+    ) = fixedGmpChannel.Process(largerHeadroomInput)
     assert np.array_equal(
         stableOutputAfterFailure, stableOutputBeforeFailure
+    )
+    assert np.array_equal(
+        stableFeedbackAfterFailure, stableFeedbackBeforeFailure
     )
 
     fixedPa = PaModel(parameters={"modelName": "gmp", "width": 16})
@@ -6571,10 +6992,11 @@ def CheckChannelModel() -> None:
         },
     )
     fixedInput = FixedPoint(16).EncodeComplex(testSignal)
-    fixedOutput = fixedChannel.Process(fixedInput)
-    assert fixedOutput.dtype == np.complex128
-    assert np.array_equal(fixedOutput.real, np.rint(fixedOutput.real))
-    assert np.array_equal(fixedOutput.imag, np.rint(fixedOutput.imag))
+    fixedOutput, fixedFeedbackOutput = fixedChannel.Process(fixedInput)
+    for publicOutput in (fixedOutput, fixedFeedbackOutput):
+        assert publicOutput.dtype == np.complex128
+        assert np.array_equal(publicOutput.real, np.rint(publicOutput.real))
+        assert np.array_equal(publicOutput.imag, np.rint(publicOutput.imag))
 
     invalidConfigurations = (
         {"sampleMode": "instrument"},
@@ -8544,6 +8966,7 @@ def RunTests() -> None:
     CheckChannelPeriodicThermalModes()
     CheckPeriodicThermalEdgeCases()
     CheckChannelIqEnableControls()
+    CheckChannelDualOutputContract()
     CheckChannelModel()
     CheckWifiFormats()
     CheckWifiBandwidths()

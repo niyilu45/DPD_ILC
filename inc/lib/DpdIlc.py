@@ -100,7 +100,7 @@ class ILCConfig:
 
 @dataclass(frozen=True)
 class ILCIteration:
-    """Store native ILC diagnostics and the corresponding measured signals."""
+    """Store DPD-feedback diagnostics and the parallel channel observation."""
 
     iteration: int
     mse: float
@@ -118,15 +118,17 @@ class ILCIteration:
     carrierFrequencyOffsetHz: float = 0.0
     samplingFrequencyOffsetPpm: float = 0.0
     feedbackComplexGain: complex = 1.0 + 0.0j
+    feedbackOutputSignal: Optional[np.ndarray] = None
 
 
 @dataclass
 class ILCResult:
-    """Return the learned predistorted waveform and convergence history."""
+    """Return learned input, channel/feedback outputs, and convergence data."""
 
     learnedInput: np.ndarray
     outputSignal: np.ndarray
     history: List[ILCIteration]
+    feedbackOutputSignal: Optional[np.ndarray] = None
 
 
 def ResolvePaWidth(paModel: Any) -> int:
@@ -171,29 +173,83 @@ class NormalizedPaAdapter:
         self.width = 0
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
-        """Process normalized samples while hiding external integer codes.
+        """Return the feedback observation used by DPD coefficient learning.
 
         Processing details:
-            Algorithm: Prefer a PA's direct floating calculation when it is
-            available. Otherwise encode normalized samples to public codes,
-            call the public PA, and decode its returned codes exactly once.
+            Algorithm: Obtain both observations through ``ProcessOutputs`` and
+            return the feedback branch. A conventional single-output PA is
+            mapped to identical channel and feedback branches, preserving all
+            existing PA-only ILC behavior.
 
         Args:
             inputSignal: Normalized physical complex samples.
 
         Returns:
-            result: Normalized floating PA output samples.
+            result: Normalized floating feedback samples.
+        """
+
+        _, feedbackOutput = self.ProcessOutputs(inputSignal)
+        return feedbackOutput
+
+    def ProcessOutputs(
+        self, inputSignal: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return normalized channel and feedback observations together.
+
+        Processing details:
+            Algorithm: Prefer Channel's one-PA-evaluation floating dual-output
+            protocol. Otherwise use a conventional floating PA output for both
+            roles. At a fixed public boundary, encode once, accept either the
+            new two-array Channel return or a legacy single PA array, and
+            decode every returned branch exactly once.
+
+        Args:
+            inputSignal: Normalized physical complex samples.
+
+        Returns:
+            result: ``(chOut, fbOut)`` in normalized floating units.
         """
 
         complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        # Generic ILC wrappers may receive an adapter that was already created
+        # by an algorithm-specific entry point. Preserve its two physical
+        # branches instead of calling its feedback-only Process compatibility
+        # method and accidentally duplicating fbOut into the chOut position.
+        if isinstance(self.paModel, NormalizedPaAdapter):
+            return self.paModel.ProcessOutputs(complexInput)
+        outputPathsProcessor = getattr(
+            self.paModel, "ProcessOutputPathsFloating", None
+        )
+        if callable(outputPathsProcessor):
+            rawChannelOutput, rawFeedbackOutput = outputPathsProcessor(
+                complexInput
+            )
+            return (
+                np.asarray(rawChannelOutput, dtype=np.complex128),
+                np.asarray(rawFeedbackOutput, dtype=np.complex128),
+            )
         floatingProcessor = getattr(self.paModel, "ProcessFloating", None)
         if callable(floatingProcessor):
-            return np.asarray(
+            floatingOutput = np.asarray(
                 floatingProcessor(complexInput), dtype=np.complex128
             )
+            return floatingOutput, floatingOutput.copy()
         publicInput = self.interfaceFormat.EncodeComplex(complexInput)
-        publicOutput = self.paModel.Process(publicInput)
-        return self.interfaceFormat.DecodeComplex(publicOutput)
+        rawPublicOutput = self.paModel.Process(publicInput)
+        if isinstance(rawPublicOutput, tuple):
+            if len(rawPublicOutput) != 2:
+                raise ValueError(
+                    "a multi-output plant must return exactly "
+                    "(chOut, fbOut)"
+                )
+            publicChannelOutput, publicFeedbackOutput = rawPublicOutput
+        else:
+            publicChannelOutput = rawPublicOutput
+            publicFeedbackOutput = rawPublicOutput
+        return (
+            self.interfaceFormat.DecodeComplex(publicChannelOutput),
+            self.interfaceFormat.DecodeComplex(publicFeedbackOutput),
+        )
 
 
 def EncodeIlcResult(
@@ -202,9 +258,9 @@ def EncodeIlcResult(
     """Encode all signal-valued ILC result fields for the public interface.
 
     Processing details:
-        Algorithm: Encode the selected input, clean PA output, and every
-        iteration input/output pair while preserving already calculated
-        normalized-domain MSE and synchronization diagnostics.
+        Algorithm: Encode the selected input, final channel and feedback
+        outputs, and every iteration's input plus parallel observations while
+        preserving feedback-domain MSE and synchronization diagnostics.
 
     Args:
         result: Normalized floating-point ILC result.
@@ -225,6 +281,13 @@ def EncodeIlcResult(
             outputSignal=interfaceFormat.EncodeComplex(
                 iterationRecord.outputSignal
             ),
+            feedbackOutputSignal=(
+                None
+                if iterationRecord.feedbackOutputSignal is None
+                else interfaceFormat.EncodeComplex(
+                    iterationRecord.feedbackOutputSignal
+                )
+            ),
         )
         for iterationRecord in result.history
     ]
@@ -232,6 +295,11 @@ def EncodeIlcResult(
         learnedInput=interfaceFormat.EncodeComplex(result.learnedInput),
         outputSignal=interfaceFormat.EncodeComplex(result.outputSignal),
         history=publicHistory,
+        feedbackOutputSignal=(
+            None
+            if result.feedbackOutputSignal is None
+            else interfaceFormat.EncodeComplex(result.feedbackOutputSignal)
+        ),
     )
 
 
@@ -241,6 +309,8 @@ def CalculateIterationMetrics(
     measuredOutput: np.ndarray,
     inputSignal: np.ndarray,
     signalProcessingResult: Optional[SignalProcessingResult] = None,
+    channelOutputSignal: Optional[np.ndarray] = None,
+    feedbackOutputSignal: Optional[np.ndarray] = None,
 ) -> ILCIteration:
     """Calculate algorithm-native MSE diagnostics for one measured iteration.
 
@@ -248,16 +318,23 @@ def CalculateIterationMetrics(
     linear-compensated MSE removes the least-squares common complex gain and
     is therefore a useful modulation-error proxy when richer metadata is
     unavailable. Exact Wi-Fi EVM/SNR/ACLR and two-tone IM3/IM5/IM7 are
-    intentionally absent; the matching analysis object evaluates stored
-    outputs after the ILC run has completed.
+    intentionally absent; the matching analysis object evaluates the stored
+    forward ``channelOutputSignal`` after the ILC run has completed. All MSE,
+    gain, delay, CFO, and SFO diagnostics continue to describe feedback.
 
     Args:
         iteration: One-based ILC iteration index.
         targetSignal: Ideal time-domain output target.
-        measuredOutput: PA feedback captured for the current input waveform.
+        measuredOutput: Synchronized PA feedback used by the ILC update.
         inputSignal: PA input waveform used to produce ``measuredOutput``.
         signalProcessingResult: Optional synchronization and common-gain
             estimates applied before the learning-domain metrics.
+        channelOutputSignal: Optional raw forward output from the same PA
+            evaluation. When omitted, the measured signal is used for legacy
+            single-output PA compatibility.
+        feedbackOutputSignal: Optional raw embedded-feedback output retained
+            for feedback-link diagnostics. When omitted, ``measuredOutput`` is
+            retained.
 
     Returns:
         result: Complete immutable diagnostics for one ILC iteration.
@@ -268,18 +345,39 @@ def CalculateIterationMetrics(
         measuredOutput, dtype=np.complex128
     ).reshape(-1)
     complexInput = np.asarray(inputSignal, dtype=np.complex128).reshape(-1)
+    complexChannelOutput = np.asarray(
+        measuredOutput if channelOutputSignal is None else channelOutputSignal,
+        dtype=np.complex128,
+    ).reshape(-1)
+    complexFeedbackOutput = np.asarray(
+        (
+            measuredOutput
+            if feedbackOutputSignal is None
+            else feedbackOutputSignal
+        ),
+        dtype=np.complex128,
+    ).reshape(-1)
     if complexTarget.size == 0 or complexTarget.shape != complexMeasured.shape:
         raise ValueError("targetSignal and measuredOutput must have equal length")
     if complexInput.shape != complexTarget.shape:
         raise ValueError(
             "inputSignal and targetSignal must have equal length"
         )
+    # Keep raw receiver records even when an external instrument adds padding
+    # or returns a cropped capture. The learning-domain measuredOutput is the
+    # independently synchronized target-length vector; Analysis owns the
+    # separate alignment of raw chOut and must never receive fbOut disguised as
+    # a forward observation merely to make array lengths equal.
     if not np.all(np.isfinite(complexTarget)) or not np.all(
         np.isfinite(complexMeasured)
     ):
         raise ValueError("iteration metric signals must contain finite samples")
     if not np.all(np.isfinite(complexInput)):
         raise ValueError("inputSignal must contain finite samples")
+    if not np.all(np.isfinite(complexChannelOutput)):
+        raise ValueError("channelOutputSignal must contain finite samples")
+    if not np.all(np.isfinite(complexFeedbackOutput)):
+        raise ValueError("feedbackOutputSignal must contain finite samples")
     if (
         signalProcessingResult is not None
         and signalProcessingResult.processedSignal.shape
@@ -328,7 +426,8 @@ def CalculateIterationMetrics(
         complexGainPhaseDegrees=float(np.degrees(np.angle(complexGain))),
         inputPeak=float(np.max(np.abs(complexInput))),
         inputSignal=complexInput.copy(),
-        outputSignal=complexMeasured.copy(),
+        outputSignal=complexChannelOutput.copy(),
+        feedbackOutputSignal=complexFeedbackOutput.copy(),
         integerDelaySamples=(
             0
             if signalProcessingResult is None
@@ -399,16 +498,21 @@ def LimitAmplitude(inputSignal: np.ndarray, maxAmplitude: float) -> np.ndarray:
     return limitedSignal
 
 
-def MeasurePaOutput(
+def MeasurePaOutputs(
     paModel: Any,
     inputSignal: np.ndarray,
     config: ILCConfig,
     randomGenerator: np.random.Generator,
-) -> np.ndarray:
-    """Average repeated noisy feedback captures of the same PA waveform.
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Average parallel channel and noisy feedback observations.
 
     Processing details:
-        Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+        Algorithm: Ask the normalized plant adapter for both outputs from each
+        PA evaluation. Apply the optional synthetic acquisition SNR only to
+        the feedback branch, average both branches over the configured capture
+        count, and require every repeated observation to preserve its shape.
+        A conventional single-output PA is mapped to identical branches before
+        feedback-only noise is added.
 
     Args:
         paModel: PA object exposing Process and SmallSignalGain operations.
@@ -417,36 +521,99 @@ def MeasurePaOutput(
         randomGenerator: NumPy random generator that makes results reproducible.
 
     Returns:
-        result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
+        result: Averaged ``(chOut, fbOut)`` normalized floating waveforms.
     """
 
-    accumulatedOutput: Optional[np.ndarray] = None
+    normalizedPaModel = (
+        paModel
+        if isinstance(paModel, NormalizedPaAdapter)
+        else NormalizedPaAdapter(paModel)
+    )
+    accumulatedChannelOutput: Optional[np.ndarray] = None
+    accumulatedFeedbackOutput: Optional[np.ndarray] = None
     expectedShape: Optional[Tuple[int, ...]] = None
     for captureIndex in range(config.feedbackAverages):
-        noiselessOutput = paModel.Process(inputSignal)
-        noisyOutput = np.asarray(
+        channelOutput, noiselessFeedbackOutput = (
+            normalizedPaModel.ProcessOutputs(inputSignal)
+        )
+        channelVector = np.asarray(
+            channelOutput, dtype=np.complex128
+        ).reshape(-1)
+        noisyFeedbackOutput = np.asarray(
             AddAwgn(
-                noiselessOutput,
+                noiselessFeedbackOutput,
                 config.feedbackSnrDb,
                 randomGenerator,
             ),
             dtype=np.complex128,
         ).reshape(-1)
-        if captureIndex == 0:
-            expectedShape = noisyOutput.shape
-            accumulatedOutput = np.zeros_like(
-                noisyOutput, dtype=np.complex128
-            )
-        elif noisyOutput.shape != expectedShape:
+        if channelVector.shape != noisyFeedbackOutput.shape:
             raise ValueError(
-                "all repeated PA feedback captures must have equal length"
+                "channel and feedback outputs must have equal length"
             )
-        if accumulatedOutput is None:
-            raise RuntimeError("feedback accumulation was not initialized")
-        accumulatedOutput += noisyOutput
-    if accumulatedOutput is None:
-        raise RuntimeError("feedback acquisition produced no captures")
-    return accumulatedOutput / float(config.feedbackAverages)
+        if captureIndex == 0:
+            expectedShape = noisyFeedbackOutput.shape
+            accumulatedChannelOutput = np.zeros_like(
+                channelVector, dtype=np.complex128
+            )
+            accumulatedFeedbackOutput = np.zeros_like(
+                noisyFeedbackOutput, dtype=np.complex128
+            )
+        elif (
+            channelVector.shape != expectedShape
+            or noisyFeedbackOutput.shape != expectedShape
+        ):
+            raise ValueError(
+                "all repeated channel and feedback captures must have "
+                "equal length"
+            )
+        if (
+            accumulatedChannelOutput is None
+            or accumulatedFeedbackOutput is None
+        ):
+            raise RuntimeError("output accumulation was not initialized")
+        accumulatedChannelOutput += channelVector
+        accumulatedFeedbackOutput += noisyFeedbackOutput
+    if (
+        accumulatedChannelOutput is None
+        or accumulatedFeedbackOutput is None
+    ):
+        raise RuntimeError("parallel output acquisition produced no captures")
+    averagingScale = float(config.feedbackAverages)
+    return (
+        accumulatedChannelOutput / averagingScale,
+        accumulatedFeedbackOutput / averagingScale,
+    )
+
+
+def MeasurePaOutput(
+    paModel: Any,
+    inputSignal: np.ndarray,
+    config: ILCConfig,
+    randomGenerator: np.random.Generator,
+) -> np.ndarray:
+    """Return only the averaged feedback branch for compatibility.
+
+    Processing details:
+        Algorithm: Delegate the physical acquisition to ``MeasurePaOutputs``
+        and select its feedback element. All DPD coefficient updates use this
+        branch; callers needing final RF metrics must retain the channel branch
+        returned by ``MeasurePaOutputs`` instead.
+
+    Args:
+        paModel: PA or Channel object exposing a process operation.
+        inputSignal: Normalized input waveform.
+        config: ILC acquisition configuration.
+        randomGenerator: Reproducible generator for optional feedback noise.
+
+    Returns:
+        result: Averaged normalized feedback waveform.
+    """
+
+    _, feedbackOutput = MeasurePaOutputs(
+        paModel, inputSignal, config, randomGenerator
+    )
+    return feedbackOutput
 
 
 def RunFrequencyDomainIlc(
@@ -465,8 +632,9 @@ def RunFrequencyDomainIlc(
     synthesize out-of-band cancellation components needed to reduce ACLR.
 
     Performance reporting is completely outside this function. Every measured
-    input/output pair is retained in ``ILCIteration`` so ``Analysis`` can
-    calculate Wi-Fi EVM/SNR/ACLR or two-tone IM3/IM5/IM7 after return.
+    input, forward chOut, and feedback fbOut are retained in ``ILCIteration``.
+    Analysis therefore calculates RF metrics from chOut after return while
+    MSE, synchronization, and coefficient updates remain feedback-derived.
 
     Args:
         referenceSignal: Ideal complex baseband PA output target.
@@ -476,8 +644,8 @@ def RunFrequencyDomainIlc(
         config: Algorithm, constraint, and feedback-measurement settings.
 
     Returns:
-        result: Best measured PA input, its clean PA output, and iteration
-        diagnostics.
+        result: Best measured PA input, its channel and feedback outputs, and
+            feedback-domain iteration diagnostics.
     """
 
     config.Validate()
@@ -485,7 +653,13 @@ def RunFrequencyDomainIlc(
     targetSignal = interfaceFormat.DecodeComplex(
         referenceSignal
     ).reshape(-1)
-    normalizedPaModel = NormalizedPaAdapter(paModel)
+    # Reuse a caller-provided normalized adapter so nested algorithm wrappers
+    # cannot collapse its channel and feedback observations into one branch.
+    normalizedPaModel = (
+        paModel
+        if isinstance(paModel, NormalizedPaAdapter)
+        else NormalizedPaAdapter(paModel)
+    )
     if targetSignal.size == 0:
         raise ValueError("referenceSignal cannot be empty")
     if sampleRateHz <= 0.0 or channelBandwidthHz <= 0.0:
@@ -581,7 +755,7 @@ def RunFrequencyDomainIlc(
         parameters=config.feedbackSynchronizationParameters,
     )
     for iteration in range(config.numIterations):
-        measuredOutput = MeasurePaOutput(
+        channelOutput, measuredOutput = MeasurePaOutputs(
             normalizedPaModel, inputSignal, config, randomGenerator
         )
         signalProcessingResult = feedbackProcessor.Process(measuredOutput)
@@ -591,15 +765,17 @@ def RunFrequencyDomainIlc(
         # amplitude convention, while delay, CFO, SFO, common magnitude, and
         # common phase cannot contaminate the nonlinear learning residual.
         errorSignal = targetSignal - alignedOutput
-        # Metrics retain the synchronized, gain-normalized waveform used to
-        # judge nonlinear shape. The returned final output remains the clean
-        # physical PA output at the selected input.
+        # Metrics use synchronized feedback to judge nonlinear shape, while
+        # the iteration record retains the parallel forward output for RF
+        # performance analysis outside the learning algorithm.
         iterationMetrics = CalculateIterationMetrics(
             iteration + 1,
             targetSignal,
             signalProcessingResult.processedSignal,
             inputSignal,
             signalProcessingResult,
+            channelOutput,
+            measuredOutput,
         )
         selectionError = 10.0 ** (
             iterationMetrics.linearCompensatedNmseDb / 10.0
@@ -616,12 +792,15 @@ def RunFrequencyDomainIlc(
             inputSignal + updateSignal, config.maxAmplitude
         )
 
-    finalOutput = normalizedPaModel.Process(bestInput)
+    finalChannelOutput, finalFeedbackOutput = (
+        normalizedPaModel.ProcessOutputs(bestInput)
+    )
     return EncodeIlcResult(
         ILCResult(
             learnedInput=bestInput,
-            outputSignal=finalOutput,
+            outputSignal=finalChannelOutput,
             history=history,
+            feedbackOutputSignal=finalFeedbackOutput,
         ),
         interfaceFormat,
     )
@@ -1329,7 +1508,13 @@ def RunWaveformUpdate(
     targetSignal = interfaceFormat.DecodeComplex(
         referenceSignal
     ).reshape(-1)
-    normalizedPaModel = NormalizedPaAdapter(paModel)
+    # Algorithm-specific entry points may already have normalized the plant.
+    # Reusing that adapter preserves its distinct channel and feedback paths.
+    normalizedPaModel = (
+        paModel
+        if isinstance(paModel, NormalizedPaAdapter)
+        else NormalizedPaAdapter(paModel)
+    )
     if targetSignal.size == 0:
         raise ValueError("referenceSignal cannot be empty")
     if (
@@ -1351,7 +1536,7 @@ def RunWaveformUpdate(
     )
 
     for iteration in range(config.numIterations):
-        measuredOutput = MeasureOutput(
+        channelOutput, measuredOutput = MeasurePaOutputs(
             normalizedPaModel, inputSignal, config, randomGenerator
         )
         signalProcessingResult = feedbackProcessor.Process(measuredOutput)
@@ -1363,6 +1548,8 @@ def RunWaveformUpdate(
             signalProcessingResult.processedSignal,
             inputSignal,
             signalProcessingResult,
+            channelOutput,
+            measuredOutput,
         )
         selectionError = 10.0 ** (
             iterationMetrics.linearCompensatedNmseDb / 10.0
@@ -1378,11 +1565,15 @@ def RunWaveformUpdate(
             inputSignal + updateSignal, config.maxAmplitude
         )
 
+    finalChannelOutput, finalFeedbackOutput = (
+        normalizedPaModel.ProcessOutputs(bestInput)
+    )
     return EncodeIlcResult(
         ILCResult(
             learnedInput=bestInput,
-            outputSignal=normalizedPaModel.Process(bestInput),
+            outputSignal=finalChannelOutput,
             history=history,
+            feedbackOutputSignal=finalFeedbackOutput,
         ),
         interfaceFormat,
     )
@@ -1725,8 +1916,8 @@ def RunDirectionalGaussNewtonIlc(
         sampleRateHz: Complex sample rate in samples per second.
 
     Returns:
-        result: Best measured PA input, its clean PA output, and iteration
-        diagnostics.
+        result: Best measured PA input, its channel and feedback outputs, and
+            feedback-domain iteration diagnostics.
     """
 
     interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
@@ -1896,7 +2087,7 @@ def RunParameterDomainIlc(
     for iteration in range(config.numIterations):
         inputSignal = normalizedBasis @ normalizedCoefficients
         inputSignal = LimitAmplitude(inputSignal, config.maxAmplitude)
-        measuredOutput = MeasureOutput(
+        channelOutput, measuredOutput = MeasurePaOutputs(
             normalizedPaModel, inputSignal, config, randomGenerator
         )
         signalProcessingResult = feedbackProcessor.Process(measuredOutput)
@@ -1908,6 +2099,8 @@ def RunParameterDomainIlc(
             signalProcessingResult.processedSignal,
             inputSignal,
             signalProcessingResult,
+            channelOutput,
+            measuredOutput,
         )
         selectionError = 10.0 ** (
             iterationMetrics.linearCompensatedNmseDb / 10.0
@@ -1921,11 +2114,15 @@ def RunParameterDomainIlc(
         )
         normalizedCoefficients += config.learningRate * coefficientUpdate
 
+    finalChannelOutput, finalFeedbackOutput = (
+        normalizedPaModel.ProcessOutputs(bestInput)
+    )
     return EncodeIlcResult(
         ILCResult(
             learnedInput=bestInput,
-            outputSignal=normalizedPaModel.Process(bestInput),
+            outputSignal=finalChannelOutput,
             history=history,
+            feedbackOutputSignal=finalFeedbackOutput,
         ),
         interfaceFormat,
     )
@@ -2089,6 +2286,7 @@ class MimoIlcResult:
     learnedInput: np.ndarray
     outputSignal: np.ndarray
     chainResults: Tuple[ILCResult, ...]
+    feedbackOutputSignal: Optional[np.ndarray] = None
 
 class MimoGmpPredistorter:
     """Apply one independently fitted GMP predistorter to each PA input."""
@@ -2197,6 +2395,14 @@ def RunMimoFrequencyDomainIlc(
             )
         )
     resultTuple = tuple(chainResults)
+    feedbackOutputs = [
+        (
+            chainResult.outputSignal
+            if chainResult.feedbackOutputSignal is None
+            else chainResult.feedbackOutputSignal
+        )
+        for chainResult in resultTuple
+    ]
     return MimoIlcResult(
         learnedInput=np.column_stack(
             [chainResult.learnedInput for chainResult in resultTuple]
@@ -2205,6 +2411,7 @@ def RunMimoFrequencyDomainIlc(
             [chainResult.outputSignal for chainResult in resultTuple]
         ),
         chainResults=resultTuple,
+        feedbackOutputSignal=np.column_stack(feedbackOutputs),
     )
 
 def FitMimoGmpPredistorter(

@@ -229,9 +229,9 @@ flowchart LR
 | `Channel.ApplyFeedbackAdc` | P/N | 对反馈接收机内部I/Q分量执行独立满量程限幅、舍入与有限位宽量化，再解码回内部浮点域 | Channel §4.5 |
 | `Channel.ApplyFeedbackAnalogImpairments` | P/E | 依次组合反馈增益/FIR、非线性/限幅、时频偏和I/Q/DC，保证可重复的物理处理顺序 | Channel §1.2、§4 |
 | `Channel.FeedbackDirectSmallSignalGain` | P/N | 返回反馈FIR直流和、反馈增益/相位及I/Q直通分量组成的小信号复增益；不把镜像、DC、噪声和量化当成确定性标量增益 | Channel §4、§4.6 |
-| `Channel.ApplyChannelEffects` | P/E | 先执行公共相位；forward模式跳过全部fb专用参数，fb模式执行完整反馈模拟链；随后加入公共AWGN，最后仅在fb模式执行反馈ADC | Channel §1–§4 |
+| `Channel.ApplyForwardChannelEffects`, `Channel.ApplyFeedbackChannelEffects`, `Channel.ApplyChannelEffects` | P/E | 主路执行公共相位与测量噪声，反馈路执行公共相位、完整FB模拟链、独立噪声与ADC；兼容入口仍按sampleMode选一路，公开Process则同时返回两路 | Channel §1–§4 |
 | `Channel.ProcessPaOutput` | E/N | 把已有逐PA公开输出解码后先执行PA后耦合，再执行一次forward/fb采样链路并编码；功率闭环因此不包含接收噪声或PA后串扰 | Channel §1、§1.3、§6.2 |
-| `Channel.ProcessBoundPaThermalPeriodFloating`, `Channel.ProcessFloating`, `Channel.Process` | P/N/E | 内部周期入口先验证三个跨模块热参考面，再把Channel的稳态/瞬态、数据窗占空比和收敛条件交给绑定PA；默认稳态模式的每次 `Process` 都执行参考温度功率校准，首次必须显式给出目标，后续省略时复用最近成功目标；恢复热状态后只提交一个周期并返回数据窗的浮点或定点公开波形 | Channel §1、§1.3–§1.5、§3.4、§6.1–§6.8、§10 |
+| `Channel.ProcessBoundPaThermalPeriodFloating`, `Channel.ProcessCoupledPaFloating`, `Channel.ProcessFloating`, `Channel.ProcessOutputPathsFloating`, `Channel.Process` | P/N/E | 内部周期入口先验证三个跨模块热参考面；公共核心只提交一次PA热周期和PA后耦合，再从同一状态分叉出chOut与fbOut。兼容浮点入口仍按sampleMode选一路；公开Process始终分别编码并返回两路 | Channel §1、§1.3–§1.5、§3.4、§6.1–§6.8、§10 |
 | `Channel.SmallSignalGain` | P/N | forward模式返回已提交SISO模拟drive、Tx I/Q直接系数、PA小信号增益与公共相位之积；fb模式再乘反馈直通小信号系数；DC、镜像、噪声和量化不伪装成标量增益 | Channel §2、§4、§6.2、§6.5 |
 
 ### 4.2 `ChannelAnalyse.py`：MIMO通道测量
@@ -257,11 +257,11 @@ flowchart LR
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
 | `ILCConfig.Validate` | E | 校验学习率、正则化、峰值、平均次数、投影带宽和可选反馈同步映射；不保存EVM、SNR或ACLR计算器 | DpdIlc §6、DPD-ILC §3.3、§3.11–§3.12 |
-| `DpdIlc.CalculateIterationMetrics` | N/P | 计算参考域 Raw MSE、复增益正交残差和输入峰值，并保存该轮输入、同步归一化输出及反馈同步估计；不计算任何RF性能指标 | DpdIlc §6–§7、Analysis §5.5 |
+| `DpdIlc.CalculateIterationMetrics` | N/P | 用同步fbOut计算Raw MSE、复增益正交残差和输入峰值；同一记录另存原始chOut供Analysis计算RF指标，并保留原始fbOut与反馈同步估计 | DpdIlc §6–§7、Analysis §5.5 |
 | `DpdIlc.NextPowerOfTwo` | N | 选择零填充 FFT 长度；提高采样密度/效率但不创造物理分辨率 | DPD-ILC §3.14 |
 | `DpdIlc.LimitAmplitude` | N/P | 把复样点投影到峰值圆盘，模拟 DAC/PA 输入约束 | DPD-ILC §3.11、§3.14 |
-| `DpdIlc.MeasurePaOutput` | P/N | 重复 PA 反馈、添加 AWGN 并平均，噪声方差降为 $1/R$；允许反馈长度不同于输入但同一轮各次捕获必须等长 | DpdIlc §4、DPD-ILC §3.12、§3.14 |
-| `DpdIlc.RunFrequencyDomainIlc` | P/N | 每轮先进行时延、CFO、SFO和公共复增益对齐，再在参考域执行小信号频响逆、带宽投影、峰值投影和LC-NMSE候选保留 | DpdIlc §6–§7、DPD-ILC §3.4、§3.14 |
+| `DpdIlc.MeasurePaOutputs`, `DpdIlc.MeasurePaOutput` | P/N | 从同一次plant调用取得chOut与fbOut；可选反馈SNR只叠加到fbOut，重复捕获对两路分别平均。兼容单输出PA映射为两路相同，单输出封装只返回fbOut | DpdIlc §4、DPD-ILC §3.12、§3.14 |
+| `DpdIlc.RunFrequencyDomainIlc` | P/N | 每轮只对fbOut进行时延、CFO、SFO与公共复增益对齐，再执行小信号频响逆、带宽投影、峰值投影和LC-NMSE候选保留；并行chOut仅用于独立RF性能验收 | DpdIlc §6–§7、DPD-ILC §3.4、§3.14 |
 | `DpdIlc.BuildFeatureSpecs` | N | 枚举 GMP 主/滞后/超前包络基函数 | DPD-ILC §3.7、§3.14 |
 | `DpdIlc.DelayedSlice`, `DpdIlc.GetDelayed` | N | 因果零填充延迟和块内缓存；保持基函数时序一致 | DPD-ILC §3.14 |
 | `DpdIlc.BuildGmpBasisChunk` | N/P | 在有限块内计算 GMP 基矩阵 | DPD-ILC §3.7、§3.14 |
@@ -274,7 +274,7 @@ flowchart LR
 |---|---|---|---|
 | `DpdIlc.MeasureOutput` | P/N | 复用支持变长采集的重复带噪反馈平均 | DpdIlc §4、DPD-ILC §3.12、§3.14 |
 | `DpdIlc.SelectionError` | N | 去除公共复增益后的归一化正交残差；是无帧元数据时的 EVM 代理 | Analysis §5.6–§5.7 |
-| `DpdIlc.RunWaveformUpdate` | E/N | 统一执行“测量→时延/CFO/SFO/复增益对齐→参考域误差与MSE→最佳轮保留→更新→峰值投影” | DpdIlc §6–§7、Analysis §5.9、DPD-ILC §3 |
+| `DpdIlc.RunWaveformUpdate` | E/N | 统一执行“同次采集chOut/fbOut→仅对fbOut同步和求MSE→最佳轮保留→更新→峰值投影”，chOut随迭代记录供Analysis独立验收 | DpdIlc §6–§7、Analysis §5.9、DPD-ILC §3 |
 | `DpdIlc.EstimateComplexGain` | P/N | 低功率探测反馈先同步，再恢复PA输出域并估计最小二乘复增益 | DpdIlc §6、Analysis §3、DPD-ILC §3.14 |
 | `DpdIlc.RunScalarPIlc` 及其 `DpdIlc.BuildUpdate` | P/N | $\Delta u=\mu e$ | DPD-ILC §3.1 |
 | `DpdIlc.RunComplexGainIlc` 及其 `DpdIlc.BuildUpdate` | P/N | 公共复增益先由统一反馈链对齐为1，再按 $\Delta u=\mu e/(1+\lambda)$ 执行正则化标量逆 | DpdIlc §6、DPD-ILC §3.2 |
@@ -513,7 +513,7 @@ flowchart LR
 | `MimoPaModel.ProcessChainFloating` | P/E | Apply one chain's input gain, nonlinear PA, output gain, and optional power calibration in normalized floating units. | [PaModel.md](./PaModel.md) |
 | `IQImbalancePA.Width`, `IQImbalancePA.ProcessFloating` | P/E | Inherit the wrapped PA width and evaluate direct plus conjugate image paths in floating units. | [PaModel.md](./PaModel.md) |
 | `DpdIlc.ResolvePaWidth` | E | Read the PA interface width and preserve width zero for third-party floating PA models. | [DpdIlc.md](./DpdIlc.md) |
-| `NormalizedPaAdapter.__init__`, `NormalizedPaAdapter.Process` | E/P | Hide integer-code transport from the ILC update law so learning always uses normalized physical amplitudes. | [DpdIlc.md](./DpdIlc.md) |
+| `NormalizedPaAdapter.__init__`, `NormalizedPaAdapter.Process`, `NormalizedPaAdapter.ProcessOutputs` | E/P | Hide integer-code transport from ILC, map legacy PA output to both paths, retain Channel chOut for final analysis, and return fbOut to every learning update. A nested adapter delegates to the existing two-path adapter instead of collapsing fbOut into both positions. | [DpdIlc.md](./DpdIlc.md) |
 | `DpdIlc.EncodeIlcResult` | E/N | Encode selected and per-iteration waveform fields as public integer codes without altering normalized-domain MSE values. | [DpdIlc.md](./DpdIlc.md) |
 | `MimoPaChain.Width` | E | Expose the parent MIMO PA width to the per-chain SISO ILC adapter. | [DpdIlc.md](./DpdIlc.md) |
 

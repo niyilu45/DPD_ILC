@@ -20,7 +20,7 @@
 1. 每次只改变一个模块的参数组，其他非理想使用0或 `None`。
 2. 所有对比使用同一个随机种子、同一段输入波形和同一参考面。
 3. I/Q测试使用单位PA，排除PA压缩、记忆和温度影响。
-4. Tx I/Q测试使用forward参考面，FB I/Q测试直接从已知PA输出进入 `ProcessPaOutput`。
+4. `Channel.Process` 总是从同一次PA/热周期返回 `(chOut, fbOut)`；Tx I/Q隔离测试使用 `chOut`，DPD/ILC训练使用 `fbOut`。FB I/Q最小测试仍可从已知PA输出进入按 `sampleMode` 选路的兼容 `ProcessPaOutput`。
 5. 温漂测试只需调用 `Channel.Process(rawSignal, outputPowerDbm=...)`；默认 `steady_state` 会在每次调用时执行参考温度功率校准，再按完整周期稳态温度曲线处理。需要观察冷启动历史时显式选择 `transient`。
 6. 参数比较至少包含理想、轻微和压力三档，并给出预期单调趋势。
 7. 理想双精度结果可能显示低于 `-200 dBc` 的 `irrDb` 或极小EVM，这只代表数值残差，不代表真实仪器动态范围。
@@ -154,7 +154,6 @@ def RunTxIqComparison() -> dict:
         channel = Channel(
             paModel=IdentityPa(),
             parameters={
-                "sampleMode": "forward",
                 "sampleRateHz": sampleRateHz,
                 "txIqImbalanceEnabled": iqImbalanceEnabled,
                 "txIqGainImbalanceDb": gainImbalanceDb,
@@ -164,7 +163,8 @@ def RunTxIqComparison() -> dict:
                 "width": 0,
             },
         )
-        measuredSignal = channel.Process(referenceSignal)
+        chOut, fbOut = channel.Process(referenceSignal)
+        measuredSignal = chOut
         comparisonResults[scenarioName] = AnalyzeKnownWaveforms(
             referenceSignal,
             measuredSignal,
@@ -202,7 +202,7 @@ for scenarioName, metrics in txIqResults.items():
 
 - 增益误差或相位误差增大时，`irrDb` 应上升、趋近0，EVM也应升高。
 - Disabled gate应与Ideal enabled逐样点一致，证明False不是仅关闭镜像项，而是同时旁路增益、相位和DC。
-- `sampleMode="forward"` 仍然能看到Tx I/Q误差，因为它位于PA之前。
+- `chOut` 和 `fbOut` 都能看到Tx I/Q误差，因为它位于分叉及PA之前；这里选 `chOut` 隔离FB链。
 - `GetLastTransmitterOutput()` 应与单位PA输出一致。
 - 如果Ideal场景的 `irrDb` 仍只有 `-20` 至 `-30 dBc`，应先检查输入是否近似proper complex，以及Analysis是否使用了同一参考波形。
 
@@ -411,7 +411,7 @@ fosterChannel = Channel(
     },
 )
 
-receivedSignal = fosterChannel.Process(
+chOut, fbOut = fosterChannel.Process(
     rawSignal,
     outputPowerDbm=20.0,
 )
@@ -517,10 +517,11 @@ def RunStaticTemperatureComparison() -> dict:
             thermalResistanceCPerW=20.0,
             thermalTimeConstantSec=0.02,
         )
-        outputSignals[temperatureC] = channel.Process(
+        chOut, fbOut = channel.Process(
             rawSignal,
             outputPowerDbm=20.0,
         )
+        outputSignals[temperatureC] = chOut
         thermalMetrics[temperatureC] = channel.GetThermalMetrics()
 
     coldReference = outputSignals[25.0]
@@ -562,7 +563,7 @@ for temperatureC, metrics in staticTemperatureResults.items():
 
 ### 6.1 测试边界和两种运行模式
 
-动态自热测试仍包含“参考温度功率校准”和“真实温度发射”两个物理阶段，但它们已经封装在 `Channel.Process(rawSignal, outputPowerDbm=...)` 内部。用户不用关闭温度模型、调用校准器或构造空闲波形。
+动态自热测试仍包含“参考温度功率设定闭环”和“真实温度发射”两个物理阶段，但它们已经封装在 `Channel.Process(rawSignal, outputPowerDbm=...)` 内部。这里的目标始终是干净物理PA输出功率，不是raw `fbOut` 表观功率。用户不用关闭温度模型、调用校准器或构造空闲波形；正式发射只执行一个热周期并同时返回 `chOut` 与 `fbOut`。
 
 Channel把每次输入看成一个数据窗口，再根据 `thermalDutyCycle` 自动补足窗口外空闲。两种模式的区别如下：
 
@@ -579,6 +580,9 @@ flowchart TD
     mode -->|transient| live["读取当前实时热状态"]
     solve --> data["处理数据窗口；内部空闲也冷却"]
     live --> data
+    data --> branch{"同一PA/热周期后分叉"}
+    branch --> channelOutput["chOut：最终RF分析"]
+    branch --> feedbackOutput["fbOut：DPD/ILC训练"]
     data --> idle["自动推进窗口外空闲"]
     idle --> metrics["保存占空比、温度曲线和周期指标"]
 ```
@@ -606,7 +610,7 @@ def RunSteadyResistanceScenario(
         thermalRunMode="steady_state",
         thermalDutyCycle=0.50,
     )
-    channel.Process(rawSignal, outputPowerDbm=20.0)
+    chOut, fbOut = channel.Process(rawSignal, outputPowerDbm=20.0)
     thermalMetrics = channel.GetThermalMetrics()
     return {
         "periodStartC": thermalMetrics[
@@ -668,7 +672,7 @@ def RunDutyCycleScenario(
 
     # This pre-processing query predicts activity at the current PA input.
     predictedActualDuty = channel.GetActualDutyCycle(rawSignal)
-    channel.Process(rawSignal, outputPowerDbm=20.0)
+    chOut, fbOut = channel.Process(rawSignal, outputPowerDbm=20.0)
     thermalMetrics = channel.GetThermalMetrics()
     return {
         "configuredDutyCycle": thermalMetrics["configuredDutyCycle"],
@@ -740,7 +744,9 @@ def RunTransientWarmup() -> list:
     )
     periodRecords = []
     for periodIndex in range(12):
-        channel.Process(rawSignal, outputPowerDbm=20.0)
+        chOut, fbOut = channel.Process(
+            rawSignal, outputPowerDbm=20.0
+        )
         thermalMetrics = channel.GetThermalMetrics()
         periodRecords.append(
             {
@@ -857,7 +863,7 @@ def DrawPeriodicTemperature(channel: Channel) -> None:
 1. 确认比较使用同一输入数组，而不是相同配置重新生成的另一段随机波形。
 2. 确认 `width=0`，先排除公开定点量化；验证通过后再单独加入定点系统。
 3. 确认Analysis使用 `transmittedSignal=referenceSignal`，没有进入盲Descriptor解析。
-4. Tx I/Q必须通过 `Process`，FB I/Q必须通过fb模式或 `ProcessPaOutput`；不要混淆参考面。
+4. Tx I/Q必须通过 `Process` 并在 `chOut` 观察；DPD训练取同次 `fbOut`。只有兼容最小测试才用fb模式的 `ProcessPaOutput`；不要混淆参考面。
 5. 默认稳态模式第一次调用必须传 `outputPowerDbm`；后续即使省略也会复用最近目标并重新执行参考温度校准。该校准不会闭环稳定热态输出。
 6. 检查 `thermalDutyCycle` 表示数据窗口占完整周期，而不是数组非零比例；用 `GetActualDutyCycle()` 核对真实RF占空比。
 7. 检查是否把自动窗口外空闲又传给 `AdvanceThermalIdle`，从而重复计算冷却时间。

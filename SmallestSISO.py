@@ -93,7 +93,7 @@ def RunSisoMode(
     # output power. Channel owns the complete hidden closed loop: it changes
     # PA input drive, measures clean PA output, converges to the target, and
     # applies receiver phase/noise once after calibration has completed.
-    baselineOutput = channel.Process(
+    baselineOutput, baselineFeedbackOutput = channel.Process(
         waveform.samples,
         outputPowerDbm=paOutputPowerDbm,
     )
@@ -123,6 +123,10 @@ def RunSisoMode(
         maxAmplitude=2.0,
         randomSeed=1019,
     )
+    # Channel exposes both receiver branches to ILC. The learning residual and
+    # coefficient update use fbOut after the embedded feedback impairments,
+    # while each stored iteration keeps the parallel chOut for independent
+    # EVM and ACLR evaluation.
     ilcResult = RunFrequencyDomainIlc(
         referenceSignal,
         channel,
@@ -136,7 +140,7 @@ def RunSisoMode(
     ilcAnalysisResult = resultAnalysis.AnalyzeIlcHistory(
         ilcResult.history
     )
-    selectedIlcOutput = channel.Process(
+    selectedIlcOutput, selectedFeedbackOutput = channel.Process(
         ilcAnalysisResult.bestInputSignal,
         outputPowerDbm=paOutputPowerDbm,
     )
@@ -148,6 +152,8 @@ def RunSisoMode(
         {
             "PA + channel baseline": baselineOutput,
             "Frequency-domain ILC + channel": selectedIlcOutput,
+            "PA + feedback baseline": baselineFeedbackOutput,
+            "Frequency-domain ILC feedback": selectedFeedbackOutput,
         }
     )
     resultAnalysis.PrintConvergence(

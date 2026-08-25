@@ -260,7 +260,7 @@ channel = Channel(
         "width": 0,
     },
 )
-predictedOutput = channel.Process(
+predictedChOut, predictedFbOut = channel.Process(
     measuredDataWindow,
     outputPowerDbm=20.0,
 )
@@ -268,7 +268,7 @@ thermalMetrics = channel.GetThermalMetrics()
 measuredActualDuty = channel.GetActualDutyCycle()
 ```
 
-第一次稳态调用必须给出 `outputPowerDbm`。Channel每次稳态处理都会先在参考温度电模型上重新校准，再用收敛的周期温度曲线处理；校准试探不推进热时间，也不会把热态输出重新稳定到目标功率。验收时比较 `periodStartingJunctionTemperatureC` 和 `periodEndingJunctionTemperatureC`，而不是数据窗口结束字段 `dataEndingJunctionTemperatureC`。后者在发送结束时本来就可能位于温度峰值。
+第一次稳态调用必须给出 `outputPowerDbm`。Channel每次稳态处理都会先在参考温度电模型上重新执行PA功率设定闭环，再用收敛的周期温度曲线处理一次PA并同时返回 `(predictedChOut, predictedFbOut)`；两路共享同一热轨迹。PA功率目标定义在干净PA物理输出面，不是raw反馈波形的表观功率。功率闭环试探不推进热时间，也不会把热态输出重新稳定到目标功率。验收EVM、SNR、ACLR和功率时使用 `predictedChOut`；DPD/ILC训练使用 `predictedFbOut`。温度验收比较 `periodStartingJunctionTemperatureC` 和 `periodEndingJunctionTemperatureC`，而不是数据窗口结束字段 `dataEndingJunctionTemperatureC`。后者在发送结束时本来就可能位于温度峰值。
 
 单RC或每条Foster支路在一个冻结耗散周期内可写为：
 
@@ -1008,14 +1008,14 @@ fittedChannel = Channel(
 )
 
 for validationFrame in validationFrames:
-    predictedOutput = fittedChannel.Process(
+    predictedChOut, predictedFbOut = fittedChannel.Process(
         validationFrame["inputSignal"],
         outputPowerDbm=validationFrame["referenceOutputPowerDbm"],
     )
     predictedThermalMetrics = fittedChannel.GetThermalMetrics()
     predictedActualDuty = fittedChannel.GetActualDutyCycle()
-    # Compare predictedOutput and predictedThermalMetrics against a held-out
-    # measured period. Do not reuse the fitting capture as validation.
+    # Compare predictedChOut and predictedThermalMetrics against a held-out
+    # measured period. Use predictedFbOut only for DPD-training validation.
     assert predictedThermalMetrics["steadyStateConverged"]
     assert predictedThermalMetrics["steadyStateErrorC"] <= 1.0e-4
 ```

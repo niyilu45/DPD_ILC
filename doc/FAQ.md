@@ -1250,7 +1250,7 @@ theoreticalIrrDb = 10.0 * np.log10(
 | Tx I/Q | `txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees`、`txDcOffset` | 是 | 可用模拟校准或增广GMP联合补偿 |
 | FB I/Q | `fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees`、`fbDcOffset` | 否，只污染fb观测 | 先做接收机校准或去嵌入，不应由发射DPD直接补偿 |
 
-在本工程中，Tx I/Q位于PA之前，对 `sampleMode="forward"` 和 `sampleMode="fb"` 都生效；FB I/Q只在 `sampleMode="fb"` 生效。若板载fb的EVM/IRR改善但forward仪表变差，通常意味着训练器正在补偿FB接收机自身误差。
+在本工程中，Tx I/Q位于PA和输出分叉之前，因此公开 `Channel.Process` 返回的 `chOut` 与 `fbOut` 都包含它；FB I/Q只进入 `fbOut`。`sampleMode` 仅供兼容单输出接口选路。若板载 `fbOut` 的EVM/IRR改善但 `chOut` 变差，通常意味着训练器正在补偿FB接收机自身误差。
 
 若链路可近似为
 
@@ -2478,3 +2478,49 @@ welchFrequencyHz, welchPeriodogram = AveragePeriodogram(
 ### 10. 一句话总结
 
 整段FFT把整条记录主要用于“看得更细”，Welch把同一记录主要用于“看得更稳”；窗函数再用更宽主瓣换取更低泄漏。确定性窄带谱线优先长记录或精确频率投影，随机宽带功率、噪声底和ACLR优先分段加窗平均，任何比较都必须保持记录区间、窗、分段长度和归一化方式一致。
+
+## Q8：为什么Channel.Process要同时返回chOut和fbOut？
+
+实际DPD系统同时存在两个参考面：前向主路是希望最终改善的真实发射输出，反馈路是训练算法能够及时采集的观察信号。一次调用固定写成：
+
+```python
+chOut, fbOut = channel.Process(inputSignal, outputPowerDbm=20.0)
+```
+
+两路来自同一次PA计算、同一段PA记忆状态和同一个热周期，然后才分叉。这样比较主路与反馈路时，不会把第二次调用造成的噪声、温度或记忆状态差异误认为反馈链误差。
+
+用途必须分开：
+
+- `fbOut` 进入DPD/ILC同步、公共复增益估计、MSE和系数更新；
+- `chOut` 进入最终EVM、SNR、ACLR、IRR、功率和双音互调分析；
+- `sampleMode` 只保留给旧的单输出接口，不改变上述二元组顺序。
+
+设第 $k$ 轮输入为 $u_k$，公共PA/热状态算子为 $P_k$，前向和反馈接收算子分别为 $H_{\mathrm{ch}}$ 与 $H_{\mathrm{fb}}$，则：
+
+```math
+v_k=P_k(u_k),
+```
+
+```math
+chOut_k=H_{\mathrm{ch}}(v_k),
+\qquad
+fbOut_k=H_{\mathrm{fb}}(v_k).
+```
+
+训练误差由 `fbOut` 构造：
+
+```math
+e_{k,\mathrm{train}}
+=
+x-S(fbOut_k),
+```
+
+最终性能由 `chOut` 构造：
+
+```math
+\mathrm{Metrics}_k=A(chOut_k,x).
+```
+
+这里还必须区分另一种容易混淆的“校准”。`PowerCalibration.outputPowerDbm` 是PA功率设定闭环的目标，它仍定义在PA后耦合前、接收非理想之前的干净物理PA输出面；它不是raw `fbOut` 的表观功率。比如 `fbGainDb=-6 dB` 时，20 dBm物理PA输出的反馈样值功率可以显得约低6 dB，但功率控制器不能因此把PA错误推到26 dBm。DPD/ILC所谓“校准或训练”才使用 `fbOut`。
+
+如果只用 `fbOut` 同时训练和验收，反馈接收机自己的FIR、I/Q镜像、非线性、限幅和ADC误差可能被误判为PA失真；如果只用 `chOut` 训练，则又绕过了真实板载反馈链。双输出接口正是为了让“实际训练条件”和“真实最终性能”同时可见而不混淆。

@@ -29,16 +29,17 @@ flowchart LR
     wave["WaveGenWifi.Generate<br/>生成SISO或MIMO Wi-Fi原始信号"] --> channelCalibration
     pa["PaModel或MimoPaModel"] --> channelCalibration
     channelCalibration --> reference["Channel.GetLastPaInput<br/>期望PA输出及ILC初始输入"]
-    channelCalibration --> sampleMode{"Channel sampleMode"}
-    sampleMode -->|forward| baseline["前向仪表baseline"]
-    sampleMode -->|fb| feedback["板载反馈接收机观测"]
+    channelCalibration --> branch{"同一次PA/热周期分叉"}
+    branch --> baseline["chOut：前向仪表观测"]
+    branch --> feedback["fbOut：板载反馈接收机观测"]
     reference --> ilc["DpdIlc中的Run...Ilc"]
     pa --> ilc
     feedback --> ilc
     config["ILCConfig<br/>仅含算法和反馈参数"] --> ilc
     ilc --> learned["ILCResult.learnedInput<br/>LC-NMSE最佳轮输入"]
-    ilc --> output["ILCResult.outputSignal<br/>LC-NMSE最佳轮干净输出"]
-    ilc --> history["ILCResult.history<br/>原生MSE及每轮输入/PA输出"]
+    ilc --> output["ILCResult.outputSignal<br/>最佳输入对应chOut"]
+    ilc --> feedbackOutput["ILCResult.feedbackOutputSignal<br/>同次求值得到的fbOut"]
+    ilc --> history["ILCResult.history<br/>反馈MSE + 每轮chOut/fbOut"]
     history --> analysis["Analysis.AnalyzeIlcHistory<br/>逐轮功率/SNR/EVM/ACLR"]
     analysis --> analyzedHistory["ILCAnalysisResult.history<br/>完整性能历史"]
     analysis --> evmBest["bestInputSignal<br/>严格EVM最佳轮输入"]
@@ -57,9 +58,9 @@ flowchart LR
 - `PaModel` 或 `MimoPaModel` 是ILC反复测量的plant。
 - `DpdIlc.py` 只负责算法，不负责选择benchmark场景或保存整套测试报告。
 - `ILCConfig` 不保存任何EVM、SNR或ACLR计算器；它只控制学习更新、幅度约束和反馈采集。
-- `DpdIlc.py` 不接收任何EVM、SNR或ACLR回调；每轮只计算算法原生MSE并保存对应输入和PA输出。
-- ILC返回后，`Analysis.AnalyzeIlcHistory` 才逐轮计算模拟输出功率、SNR、EVM和ACLR，并在分析层按严格EVM选择最佳实测轮。
-- 仪表闭环训练可把 `sampleMode="forward"` 的Channel作为plant；板载闭环训练把 `sampleMode="fb"` 的Channel作为plant。无论训练来自哪一路，最终性能都应通过独立forward采样评价，避免把反馈接收机自身的失真误认为PA失真。
+- `DpdIlc.py` 不接收任何EVM、SNR或ACLR回调；每轮只用 `fbOut` 完成同步、公共复增益对齐、MSE和系数更新，同时保存同次plant求值得到的 `chOut`。
+- ILC返回后，`Analysis.AnalyzeIlcHistory` 对每轮 `ILCIteration.outputSignal` 中的 `chOut` 计算模拟输出功率、SNR、EVM和ACLR；它不会把反馈接收机非理想计入最终PA指标。
+- Channel作为plant时不再依赖 `sampleMode` 选择训练路径：`NormalizedPaAdapter` 固定用第二个输出 `fbOut` 训练，并保留第一个输出 `chOut` 评价。兼容单输出PA会被映射为两路相同，保持原有行为；若调用方传入的已经是 `NormalizedPaAdapter`，内部不会再把它当成普通单输出PA而折叠双分支，嵌套适配仍完整透传 `(chOut, fbOut)`。
 - `ILCAnalysisResult.bestInputSignal` 只对当前重复波形直接有效；拟合部署模型后，才能处理独立的新Wi-Fi帧。
 
 ---
@@ -154,20 +155,21 @@ paOutputPowerDbm = 20.0
 channel = Channel(
     paModel=paModel,
     parameters={
-        "sampleMode": "forward",
         "sampleRateHz": waveform.sampleRateHz,
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
     }
 )
-baselineOutput = channel.Process(
+baselineChOut, baselineFbOut = channel.Process(
     waveform.samples,
     outputPowerDbm=paOutputPowerDbm,
 )
 referenceSignal = channel.GetLastPaInput()
 ```
 
-对调用方公开的工作点是 `paOutputPowerDbm`。20 dBm相对25 dBm额定极限的5 dB回退只作为第一次驱动预设。Channel内部会保存并暂停PA热状态，把重新缩放的数字Tx输入依次送入Tx I/Q、PA前耦合与参考温度 `paModel`，对PA输出的有效Wi-Fi突发测量功率，再更新预设并重试；收敛后恢复原热状态，并用收敛输入真实处理一次。`GetLastPaInput()` 为兼容旧名称保留，返回Tx I/Q之前的收敛数字输入；`GetLastActualPaInput()` 返回正式处理时Tx I/Q和PA前耦合之后真正进入PA的波形；`GetLastPaOutput()` 返回无热参考校准的最后一次PA观测。整个过程不对PA输出做后级常数缩放，因此返回波形的EVM和ACLR反映恢复温度后的实际压缩工作点。
+对调用方公开的工作点是 `paOutputPowerDbm`。20 dBm相对25 dBm额定极限的5 dB回退只作为第一次驱动预设。Channel内部会保存并暂停PA热状态，把重新缩放的数字Tx输入依次送入Tx I/Q、PA前耦合与参考温度 `paModel`，对PA后耦合前的干净物理输出测量有效Wi-Fi突发功率，再更新预设并重试；收敛后恢复原热状态，并用收敛输入真实处理一次。`GetLastPaInput()` 为兼容旧名称保留，返回Tx I/Q之前的收敛数字输入；`GetLastActualPaInput()` 返回正式处理时Tx I/Q和PA前耦合之后真正进入PA的波形；`GetLastPaOutput()` 返回无热参考校准的最后一次PA观测。整个过程不对PA输出做后级常数缩放，因此返回波形的EVM和ACLR反映恢复温度后的实际压缩工作点。
+
+这里必须区分“PA功率设定闭环”和“DPD/ILC校准训练”。`PowerCalibration.outputPowerDbm` 始终指干净PA物理输出参考面，不会拿含 `fbGainDb`、反馈FIR、反馈非线性、噪声或ADC量化的raw `fbOut` 功率与目标比较；只有后续DPD/ILC同步、MSE和系数更新才使用 `fbOut`。
 
 #### 4.3.1 前向仪表和板载反馈如何接入ILC
 
@@ -194,22 +196,12 @@ y_{\mathrm{PA}}[n]
 \right).
 ```
 
-这里 $F_{\mathrm{fb}}$ 代表可配置的反馈FIR、增益/相位、时延、CFO/SFO、I/Q不平衡、DC、三阶非线性和限幅。若直接令ILC满足 $z_{\mathrm{fb}}\approx x$，算法学习的是“PA与反馈接收机组合”的逆，而不一定是PA本身的逆。因此推荐同时建立两个Channel：
+这里 $F_{\mathrm{fb}}$ 代表可配置的反馈FIR、增益/相位、时延、CFO/SFO、I/Q不平衡、DC、三阶非线性和限幅。若直接令ILC满足 $z_{\mathrm{fb}}\approx x$，算法学习的是“PA与反馈接收机组合”的逆，而不一定是PA本身的逆。因此推荐用同一个Channel的一次求值得到两个输出：
 
 ```python
-forwardChannel = Channel(
+channel = Channel(
     paModel=paModel,
     parameters={
-        "sampleMode": "forward",
-        "sampleRateHz": waveform.sampleRateHz,
-        "noiseSnrDb": 50.0,
-        "width": 0,
-    },
-)
-feedbackChannel = Channel(
-    paModel=paModel,
-    parameters={
-        "sampleMode": "fb",
         "sampleRateHz": waveform.sampleRateHz,
         "fbGainDb": -6.0,
         "fbFirTaps": (1.0 + 0.0j, 0.08 - 0.03j),
@@ -222,25 +214,36 @@ feedbackChannel = Channel(
         "width": 0,
     },
 )
+chOut, fbOut = channel.Process(
+    waveform.samples,
+    outputPowerDbm=20.0,
+)
 ```
 
-- 仪表闭环ILC：把 `forwardChannel` 作为plant，反馈精度通常更高，但依赖仪表控制和传输时延。
-- 板载闭环ILC：把 `feedbackChannel` 作为plant，实时性更好，但必须校准或补偿反馈接收机非理想。
-- 最终验收：把选中的DPD输入送入同一个PA，再由 `forwardChannel` 采集，并交给Analysis计算EVM、ACLR和功率。
+- DPD/ILC训练：把 `channel` 作为plant；内部适配器固定使用 `fbOut`，因此必须校准或补偿反馈接收机非理想。
+- 最终验收：把同一次plant求值得到的 `chOut` 交给Analysis计算EVM、SNR、ACLR、IRR和功率。
+- 若使用外部仪表闭环，应让自定义plant也遵守 `(chOut, fbOut)` 契约，把实际训练观测放在第二项。
 
-`phaseDegrees` 和三种噪声控制是两条路径的公共参数；所有以 `fb` 开头的参数只在fb模式生效。完整处理次序和参数定义见 [Channel.md](./Channel.md)。
+`phaseDegrees` 和三种噪声控制是两条路径的公共配置；两路各生成独立噪声样值。所有以 `fb` 开头的参数只作用于 `fbOut`。完整处理次序和参数定义见 [Channel.md](./Channel.md)。
 
 ### 4.4 PA对象接口要求
 
-所有ILC入口要求 `paModel` 至少提供：
+所有ILC入口兼容普通单输出PA：
 
 ```python
 outputSignal = paModel.Process(inputSignal)
 ```
 
+Channel或新的双输出plant推荐提供：
+
+```python
+chOut, fbOut = plant.Process(inputSignal)
+```
+
 `Process` 必须满足：
 
-- 输入必须是一维复数组；输出允许比输入更长或更短，ILC会先同步并提取到参考网格；
+- 输入必须是一维复数组；每个输出允许比输入更长或更短，ILC会先同步反馈并提取到参考网格；
+- 二元组必须严格按 `(chOut, fbOut)` 排列；DPD学习只读取第二项，第一项只用于RF性能分析；
 - 同一轮启用 `feedbackAverages` 时，各次反馈采集的长度必须一致；
 - 对相同输入可重复测量；
 - 输出为有限复数；
@@ -251,7 +254,7 @@ outputSignal = paModel.Process(inputSignal)
 
 ## 5. 最小可运行SISO示例
 
-工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。示例直接使用默认GMP系数，不再把非线性系数额外缩放为25%。默认各阶系数和形成单调Rapp型稳态曲线，较小的主记忆、滞后和超前动态项按阶零和，因此连续高幅样点不会因重复计入记忆压缩而快速下坠；20 dBm工作点由`Channel.Process(..., outputPowerDbm=20.0)`内部调整PA输入得到。这个最小示例固定运行4轮，使当前确定性场景中的浮点和16位模式都在局部稳定区同时改善EVM与ACLR；更长迭代及停止准则比较留给Benchmark场景。PA后接入 `sampleMode="forward"`、0度移相和10 mV复包络总RMS白噪声的 `Channel`，表示实验室仪表闭环。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
+工程根目录的 `SmallestSISO.py` 生成EHT 20 MHz信号，运行GMP PA baseline和频域ILC，并以完全相同的场景依次比较浮点与16位定点接口。示例直接使用默认GMP系数，不再把非线性系数额外缩放为25%。默认各阶系数和形成单调Rapp型稳态曲线，较小的主记忆、滞后和超前动态项按阶零和，因此连续高幅样点不会因重复计入记忆压缩而快速下坠；20 dBm工作点由`Channel.Process(..., outputPowerDbm=20.0)`内部调整PA输入得到。这个最小示例固定运行4轮，使当前确定性场景中的浮点和16位模式都在局部稳定区同时改善EVM与ACLR；更长迭代及停止准则比较留给Benchmark场景。Channel在同一次PA求值后返回带0度公共移相和10 mV复包络总RMS白噪声的 `chOut` 与完整反馈链 `fbOut`；ILC用后者训练，Analysis用前者验收。下面的最小调用显式写出20 dBm工作点和25 dBm额定极限：
 
 ```python
 from SmallestSISO import RunSisoMode
@@ -303,7 +306,7 @@ V_{\mathrm{out,RMS}}
 
 20 dBm相对25 dBm极限具有5 dB输出回退。提高目标输出功率会提高归一化驱动，把PA推向更深压缩；降低目标输出功率则增加回退量。功率闭环只观测PA有效突发，不观测Channel接收噪声；因此10 mV噪声不会反向改变PA隐藏驱动预设。50%占空比的长关断区不会让PA报告功率额外降低3.01 dB。
 
-ILC运行期间完全不计算EVM。`DpdIlc` 仅按线性补偿NMSE保留一个算法原生候选，同时在 `history` 中保存所有已测轮的输入和实际反馈输出。当plant为 `Channel` 时，该反馈就是经过PA和 `sampleMode` 所选采样链路后的波形：forward用于仪表闭环，fb用于含板载反馈接收机非理想的闭环。运行结束后，直接调用 `resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 可以观察该训练观测，但最终验收应把最佳输入通过独立forward Channel复测，再计算严格的数据子载波EVM、SNR、ACLR和实际接收功率。禁止为了指标好看而替换或缩放 `outputSignal`。若需要在规定dBm工作点复测最佳输入，调用forward Channel的 `Process(bestInputSignal, outputPowerDbm=targetPowerDbm)`；Channel内部校准干净PA输出并在收敛后施加仪表路径影响。
+ILC运行期间完全不计算EVM。`DpdIlc` 仅按 `fbOut` 同步后的线性补偿NMSE保留算法原生候选，同时在 `history` 中保存所有已测轮的输入、同轮 `chOut` 和raw `fbOut`。`ILCIteration.outputSignal` 是用于最终RF分析的原始 `chOut`；`feedbackOutputSignal` 是原始训练观测；MSE、时延、CFO、SFO和公共复增益字段均描述后者。外部仪表允许让两路记录具有不同的前后补零或裁剪长度：学习器只把同步后的目标长度 `fbOut` 用于更新，历史仍保留原始 `chOut`，再由 `Analysis` 独立完成主路同步，绝不会为了凑长度而把 `fbOut` 冒充 `chOut`。运行结束后，`resultAnalysis.AnalyzeIlcHistory(ilcResult.history)` 对每轮 `chOut` 计算严格数据子载波EVM、SNR、ACLR和实际接收功率。禁止为了指标好看而替换或缩放 `outputSignal`。若需要在规定dBm工作点复测最佳输入，应使用 `finalChOut, finalFbOut = channel.Process(bestInputSignal, outputPowerDbm=targetPowerDbm)`，并只把 `finalChOut` 送给最终Analysis。
 
 ---
 
@@ -444,14 +447,16 @@ ILCResult(
     learnedInput=...,
     outputSignal=...,
     history=...,
+    feedbackOutputSignal=...,
 )
 ```
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
 | `learnedInput` | 一维复数数组 | `DpdIlc` 按LC-NMSE选择的算法原生候选 |
-| `outputSignal` | 一维复数数组 | `paModel.Process(learnedInput)` 的干净输出 |
-| `history` | `List[ILCIteration]` | 每个已测轮的原生诊断、输入和PA反馈输出 |
+| `outputSignal` | 一维复数数组 | 最佳输入重新求值时的 `chOut`，用于最终RF指标 |
+| `feedbackOutputSignal` | 一维复数数组或 `None` | 与最终 `outputSignal` 同次求值得到的raw `fbOut`；普通单输出PA兼容时与前者相同 |
+| `history` | `List[ILCIteration]` | 每个已测轮的反馈域原生诊断、输入、`chOut`和`fbOut` |
 
 ### 7.1 `numIterations` 的准确含义
 
@@ -495,14 +500,15 @@ k^\star
 | `complexGainPhaseDegrees` | 当前公共相位 | 用于区分线性相位项 |
 | `inputPeak` | 当前PA输入最大幅度 | 用于检查峰值约束是否激活 |
 | `inputSignal` | 当前轮PA输入复数组 | 供后续外部选择与复测 |
-| `outputSignal` | 当前轮已同步并去公共复增益的参考域反馈 | 与参考等长，供Analysis统一计算RF性能 |
+| `outputSignal` | 当前轮同次plant求值得到的raw `chOut` | 供Analysis计算最终参考面RF性能 |
+| `feedbackOutputSignal` | 当前轮raw `fbOut` 或 `None` | DPD/ILC同步、MSE和更新所使用的物理反馈观测 |
 | `integerDelaySamples` | ILC内部估计的整数时延 | 正值表示反馈晚于参考 |
 | `fractionalDelaySamples` | ILC内部估计的分数时延 | 与整数时延共同决定重采样位置 |
 | `carrierFrequencyOffsetHz` | ILC内部估计的载波频偏 | 单位Hz |
 | `samplingFrequencyOffsetPpm` | ILC内部估计的采样频偏 | 单位ppm |
 | `feedbackComplexGain` | 同步后参考到反馈的最小二乘复增益 | 保留原始幅度和相位关系供审计 |
 
-`Analysis.AnalyzeIlcHistory` 返回的 `ILCPerformanceIteration` 在上述原生字段之外增加 `outputPowerDbm`、`snrDb`、`evmAlignedMse`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`，并把同步估计展开为 `feedbackIntegerDelaySamples`、`feedbackFractionalDelaySamples`、`feedbackCarrierFrequencyOffsetHz`、`feedbackSamplingFrequencyOffsetPpm`、`feedbackComplexGainMagnitudeDb` 和 `feedbackComplexGainPhaseDegrees`。这些字段也会写入收敛CSV。
+`Analysis.AnalyzeIlcHistory` 返回的 `ILCPerformanceIteration` 在上述原生字段之外，使用 `outputSignal` 中的 `chOut` 增加 `outputPowerDbm`、`snrDb`、`evmAlignedMse`、`evmDb`、`evmPercent`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`；反馈同步估计则展开为 `feedbackIntegerDelaySamples`、`feedbackFractionalDelaySamples`、`feedbackCarrierFrequencyOffsetHz`、`feedbackSamplingFrequencyOffsetPpm`、`feedbackComplexGainMagnitudeDb` 和 `feedbackComplexGainPhaseDegrees`。因此一行记录同时包含主路RF指标和反馈域训练诊断，但二者不会混用参考面。
 
 ---
 
@@ -725,13 +731,13 @@ noiseAwareAnalysis = resultAnalysis.AnalyzeIlcHistory(
 
 理想独立噪声下，平均后的噪声方差为单次测量的 `1/R`。
 
-如果plant已经是配置了 `noiseAmpMv`、`noisePwrDbm` 或 `noiseSnrDb` 的Channel，应把 `ILCConfig.feedbackSnrDb` 保持为 `None`，否则会同时叠加Channel接收噪声和ILC内部抽象反馈噪声。对于板载反馈实验，Channel还可用 `sampleMode="fb"` 加入反馈接收机的确定性非理想；这些非理想不会被 `feedbackAverages` 消除。
+如果plant已经是配置了 `noiseAmpMv`、`noisePwrDbm` 或 `noiseSnrDb` 的Channel，应把 `ILCConfig.feedbackSnrDb` 保持为 `None`，否则会在 `fbOut` 上同时叠加Channel接收噪声和ILC内部抽象反馈噪声。Channel的 `fb...` 参数会直接加入 `fbOut` 的确定性非理想；这些非理想不会被 `feedbackAverages` 消除。`chOut` 的独立噪声用于最终Analysis，不参与DPD系数更新。
 
 ### 10.2 结果解释
 
-- `history` 中的逐轮指标使用当轮含噪平均反馈。
-- `ILCResult.outputSignal` 会对最佳输入重新调用一次干净的 `paModel.Process`。
-- 因此逐轮含噪EVM与最终干净EVM不是同一种观测条件，数值不要求完全相同。
+- `history` 中的MSE和同步诊断使用当轮平均 `fbOut`，RF指标使用同轮平均 `chOut`。
+- `ILCResult.outputSignal` 与 `feedbackOutputSignal` 会对最佳输入重新调用一次plant并分别保存两路；不会为两路各运行一次PA。
+- 因此反馈NMSE与主路EVM不是同一种观测条件，趋势和最佳轮不要求完全相同。
 - `feedbackAverages=4` 约增加到单次反馈4倍的采集调用量。
 - 多次平均和较强正则化通常提高稳定性，但不保证每个随机种子的最终EVM都优于更激进的单次反馈方法。
 
@@ -1174,13 +1180,12 @@ mimoPaModel = MimoPaModel(
 channel = Channel(
     paModel=mimoPaModel,
     parameters={
-        "sampleMode": "forward",
         "sampleRateHz": waveform.sampleRateHz,
         "loadResistanceOhm": 50.0,
         "maximumOutputPowerDbm": 25.0,
     }
 )
-baselineOutput = channel.Process(
+baselineChOut, baselineFbOut = channel.Process(
     waveform.samples,
     outputPowerDbm=targetOutputPowerDbmPerChain,
 )
@@ -1207,7 +1212,7 @@ mimoIlcAnalysis = resultAnalysis.AnalyzeMimoIlcHistory(
         for chainResult in mimoResult.chainResults
     )
 )
-selectedMimoOutput = channel.Process(
+selectedMimoChOut, selectedMimoFbOut = channel.Process(
     mimoIlcAnalysis.bestInputSignal,
     outputPowerDbm=targetOutputPowerDbmPerChain,
 )
@@ -1222,16 +1227,16 @@ mimoPredistorter = FitMimoGmpPredistorter(
     ridgeFactor=1e-6,
 )
 rawDeployedInput = mimoPredistorter.Process(referenceSignal)
-deployedOutput = channel.Process(
+deployedChOut, deployedFbOut = channel.Process(
     rawDeployedInput,
     outputPowerDbm=targetOutputPowerDbmPerChain,
 )
 physicalAnalysis = Analysis(referenceSignal, waveform)
 physicalAnalysis.AnalyzeStages(
     {
-        "MIMO PA baseline": baselineOutput,
-        "MIMO ILC": selectedMimoOutput,
-        "MIMO GMP deployment": deployedOutput,
+        "MIMO PA baseline": baselineChOut,
+        "MIMO ILC": selectedMimoChOut,
+        "MIMO GMP deployment": deployedChOut,
     }
 )
 physicalAnalysis.Print()
@@ -1243,7 +1248,8 @@ physicalAnalysis.PrintMimo()
 | 字段 | 形状或类型 | 含义 |
 |---|---|---|
 | `learnedInput` | `(samples, chains)` | 每路最佳已测ILC输入组成的矩阵 |
-| `outputSignal` | `(samples, chains)` | 每路最佳输入对应的PA输出 |
+| `outputSignal` | `(samples, chains)` | 每路最佳输入对应的 `chOut` |
+| `feedbackOutputSignal` | `(samples, chains)`或 `None` | 每路最终 `fbOut`；用于反馈参考面诊断 |
 | `chainResults` | `Tuple[ILCResult, ...]` | 按物理链顺序保存的SISO结果 |
 
 读取第2路逐轮历史：
@@ -1265,7 +1271,7 @@ channel = Channel(
         "maximumOutputPowerDbm": 25.0,
     },
 )
-receivedSignal = channel.Process(
+chOut, fbOut = channel.Process(
     waveform.samples,
     outputPowerDbm=(22.0, 21.0, 20.0, 19.0),
 )

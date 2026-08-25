@@ -1146,14 +1146,14 @@ G_p\left(g_p a(r)r\right).
 
 | 外部配置 | 实际作用 | 是否改变归一化 PA 曲线 |
 |---|---|---|
-| `Channel.Process(..., outputPowerDbm=...)` | 闭环调整 PA 输入缩放，直到 PA 自身有效输出达到目标 dBm | 否；它让波形沿同一条曲线移动到不同工作点 |
+| `Channel.Process(..., outputPowerDbm=...)` | 闭环调整PA输入缩放，直到接收非理想之前的干净PA自身有效输出达到目标dBm；正式一次PA/热周期再返回 `(chOut, fbOut)` | 否；它让波形沿同一条曲线移动到不同工作点 |
 | `maximumOutputPowerDbm` | 定义归一化输出与绝对 dBm 的标尺，并限制允许目标 | 否 |
 | `inputPowerDbPerChain` | 在每路 PA 前乘电压比例，改变驱动和压缩深度 | 否；改变外部输入轴上的工作点 |
 | `outputPowerDbPerChain` | PA 后施加常数相对增益 | 不改变内部压缩，只让观察到的 AM-AM 曲线竖直缩放 |
 | `targetOutputPowerDbmPerChain` | `MimoPaModel` 的兼容性 PA 后绝对缩放接口 | 不改变内部压缩；主测试流程应优先用 Channel 闭环 |
 | `width` | 在 PA 公开输入和输出边界量化 I/Q 码值 | 不改变内部浮点方程，但会让低幅度曲线出现量化台阶，过大码值还会剪切 |
 
-例如把 `outputPowerDbm` 从 15 dBm 改为 22 dBm，不是把 `linearGain` 改大，而是由 Channel 自动增加 PA 驱动，使波形在同一条增益曲线上向压缩区移动。因此输出功率升高时，测得增益、EVM 和 ACLR 可以同时恶化。
+例如把 `outputPowerDbm` 从15 dBm改为22 dBm，不是把 `linearGain` 改大，而是由Channel自动增加PA驱动，使波形在同一条增益曲线上向压缩区移动。因此输出功率升高时，测得增益、EVM和ACLR可以同时恶化。这个目标始终定义在PA后耦合前、反馈接收机之前的干净物理输出面；即使 `fbGainDb=-6 dB`，也不会把raw `fbOut` 的表观功率当成PA少了6 dB而继续推高驱动。
 
 ### 4.9.7 典型调参目标与推荐配置
 
@@ -1707,7 +1707,7 @@ classDiagram
 
 **图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Rapp、Wiener、GMP或Doherty。Doherty的Carrier和Peaking又各自选择Wiener或GMP。`ThermalConfig.Recommended` 为static、single_rc和foster返回完整可运行的模型专用起点，`Validate` 继续负责物理边界校验。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口；它把公共周期作为原子热事务，任何一路处理或互热迭代失败都会恢复全部PA的周期前状态和旧metrics。`IQImbalancePA` 不只代理普通 `Process`，还透明代理周期热处理、热状态暂停/恢复、metrics、实际占空比、复位和额外空闲，因此用它包装热PA不会让Channel误判为无热模型。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
 
-如果需要区分实验室前向仪表与板载反馈接收机，应把同一份干净PA输出交给两个独立Channel。`sampleMode="forward"` 跳过反馈专用非理想，用于最终主路EVM/ACLR评价；`sampleMode="fb"` 可增加反馈FIR、时频偏、I/Q/DC、接收机非线性、限幅和ADC量化，用于模拟板载闭环。反馈链参数属于观察接收机，不属于PA模型系数，不能写入Wiener或GMP来混合拟合。
+需要区分实验室前向仪表与板载反馈接收机时，完整Channel会在同一次PA计算和同一个热周期后分叉，公开返回 `(chOut, fbOut)`。前者跳过反馈专用非理想，用于最终EVM、SNR、ACLR、IRR和功率评价；后者增加反馈FIR、时频偏、I/Q/DC、接收机非线性、限幅和ADC量化，用于DPD/ILC同步、MSE和更新。`sampleMode` 只供兼容单输出入口选路。反馈链参数属于观察接收机，不属于PA模型系数，不能写入Wiener或GMP来混合拟合。
 
 ```python
 from inc.lib.PaModel import (
@@ -1868,7 +1868,7 @@ flowchart LR
 因此普通温度测试可以直接重复调用：
 
 ```python
-receivedSignal = channel.Process(
+chOut, fbOut = channel.Process(
     rawSignal,
     outputPowerDbm=22.0,
 )
@@ -2355,7 +2355,7 @@ D_{\mathrm{actual}}P_{\mathrm{on}}
 predictedActualDuty = channel.GetActualDutyCycle(rawSignal)
 
 # Query the accepted result after one complete thermal period.
-receivedSignal = channel.Process(rawSignal, outputPowerDbm=20.0)
+chOut, fbOut = channel.Process(rawSignal, outputPowerDbm=20.0)
 acceptedActualDuty = channel.GetActualDutyCycle()
 ```
 
@@ -2974,7 +2974,7 @@ rawSignalWithIdle[rawSignalWithIdle.size // 2 :] = 0.0
 # The first steady-state call requires a power target.  Channel calibrates at
 # the reference temperature and then evaluates the accepted waveform on the
 # converged periodic temperature curve.
-receivedSignal = channel.Process(
+chOut, fbOut = channel.Process(
     rawSignalWithIdle,
     outputPowerDbm=22.0,
 )

@@ -1,10 +1,10 @@
-"""Model transmitter, coupled PA, and forward or feedback sampling paths.
+"""Model transmitter, coupled PA, and parallel channel/feedback outputs.
 
 The channel can apply transmitter I/Q imbalance, causal complex coupling paths
-before a multi-chain PA bank, and coupling after its nonlinear outputs. It then
-selects either a forward instrument observation or a nonideal embedded feedback
-receiver with an independent I/Q imbalance. Public fixed-point boundaries use
-raw integer I/Q codes while every physical operation remains floating point.
+before a multi-chain PA bank, and coupling after its nonlinear outputs. One PA
+evaluation then branches into a forward channel observation and a nonideal
+embedded-feedback observation. Public fixed-point boundaries use raw integer
+I/Q codes while every physical operation remains floating point.
 """
 
 from collections import ChainMap
@@ -40,7 +40,7 @@ else:
 
 
 class Channel:
-    """Apply PA processing, constant phase rotation, and optional AWGN.
+    """Apply one PA evaluation and expose channel plus feedback observations.
 
     ``noiseAmpMv`` is the RMS magnitude of the complete complex noise
     envelope, not the RMS of each individual I or Q component. Therefore the
@@ -205,12 +205,14 @@ class Channel:
 
     @property
     def SampleMode(self) -> str:
-        """Return the normalized forward or embedded-feedback sample mode.
+        """Return the legacy single-output compatibility sample mode.
 
         Processing details:
             Algorithm: Strip surrounding whitespace, convert the configured
             name to lowercase, and return the validated canonical value so
-            live caller-owned mapping changes affect the next capture.
+            live caller-owned mapping changes affect ``ProcessFloating``,
+            ``ProcessPaOutput``, and ``SmallSignalGain``. Public ``Process``
+            always returns both paths and does not discard either one.
 
         Returns:
             result: ``"forward"`` for instrument sampling or ``"fb"`` for
@@ -2701,13 +2703,13 @@ class Channel:
     def ApplyChannelEffects(
         self, paOutputSignal: np.ndarray
     ) -> np.ndarray:
-        """Apply the selected forward-instrument or feedback sample path.
+        """Apply the legacy sampleMode-selected receiver path.
 
         Processing details:
-            Algorithm: Validate and apply the common phase first. Forward mode
-            then adds only configured measurement noise. Feedback mode applies
-            the complete embedded analog impairment chain, adds noise, and
-            finally quantizes through the optional feedback ADC.
+            Algorithm: Delegate to the explicit forward or feedback helper
+            selected by ``sampleMode``. This compatibility entry remains
+            single-output; the public ``Process`` method now returns both
+            receiver paths independently of ``sampleMode``.
 
         Args:
             paOutputSignal: Normalized floating PA output samples.
@@ -2716,10 +2718,52 @@ class Channel:
             result: Normalized floating receiver-input samples.
         """
 
+        if self.sampleMode == "forward":
+            return self.ApplyForwardChannelEffects(paOutputSignal)
+        return self.ApplyFeedbackChannelEffects(paOutputSignal)
+
+    def ApplyForwardChannelEffects(
+        self, paOutputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Create the forward channel observation used for final RF metrics.
+
+        Processing details:
+            Algorithm: Apply the common PA-to-receiver phase rotation and the
+            configured measurement noise without applying any embedded-
+            feedback FIR, nonlinearity, oscillator, I/Q, or ADC impairment.
+
+        Args:
+            paOutputSignal: Normalized PA output after post-PA coupling.
+
+        Returns:
+            result: Forward channel waveform used by Analysis for EVM, SNR,
+                ACLR, power, IRR, and two-tone measurements.
+        """
+
         self.ValidateParameters()
         phaseRotatedSignal = self.ApplyPhaseRotation(paOutputSignal)
-        if self.sampleMode == "forward":
-            return self.AddNoise(phaseRotatedSignal)
+        return self.AddNoise(phaseRotatedSignal)
+
+    def ApplyFeedbackChannelEffects(
+        self, paOutputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Create the embedded-feedback observation used by DPD learning.
+
+        Processing details:
+            Algorithm: Apply the common phase rotation, the complete feedback
+            analog impairment chain, independently generated measurement
+            noise, and the optional feedback ADC in their physical order.
+
+        Args:
+            paOutputSignal: Normalized PA output after post-PA coupling.
+
+        Returns:
+            result: Feedback waveform presented to ILC synchronization,
+                error calculation, and coefficient updates.
+        """
+
+        self.ValidateParameters()
+        phaseRotatedSignal = self.ApplyPhaseRotation(paOutputSignal)
         feedbackAnalogSignal = self.ApplyFeedbackAnalogImpairments(
             phaseRotatedSignal
         )
@@ -3085,22 +3129,24 @@ class Channel:
         normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
         return interfaceFormat.EncodeComplex(normalizedPaOutput)
 
-    def ProcessFloating(
+    def ProcessCoupledPaFloating(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
-        """Evaluate Tx I/Q, coupled PA paths, and the selected sampler.
+        """Evaluate the transmitter, PA bank, and post-PA coupling once.
 
         Processing details:
             Algorithm: Apply the committed post-DAC calibration drive, Tx I/Q
             mismatch, additive complex FIR coupling before the PA bank, all
-            nonlinear branches, output coupling, and finally the forward-
-            instrument or embedded-feedback receive path.
+            nonlinear branches over one thermal period, and output coupling.
+            Stop at the common branch point so forward and feedback outputs
+            can be generated without evaluating or heating the PA twice.
 
         Args:
             inputSignal: Normalized digital Tx input vector or matrix.
 
         Returns:
-            result: Normalized floating receiver-input waveform.
+            result: Normalized floating waveform at the common receiver
+                branch point before common phase and receiver impairments.
         """
 
         normalizedInput = self.ValidateSignal(
@@ -3120,10 +3166,54 @@ class Channel:
         normalizedPaOutput = self.ProcessBoundPaThermalPeriodFloating(
             actualPaInput
         )
-        coupledPaOutput = self.ApplyPostPaCoupling(
-            normalizedPaOutput
-        )
+        return self.ApplyPostPaCoupling(normalizedPaOutput)
+
+    def ProcessFloating(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Evaluate the legacy sampleMode-selected floating receiver path.
+
+        Processing details:
+            Algorithm: Evaluate the common transmitter, PA, thermal period,
+            and output coupling once, then apply only the path selected by
+            ``sampleMode``. New DPD code should use
+            ``ProcessOutputPathsFloating`` so it receives both observations.
+
+        Args:
+            inputSignal: Normalized digital Tx input vector or matrix.
+
+        Returns:
+            result: Legacy single floating output selected by ``sampleMode``.
+        """
+
+        coupledPaOutput = self.ProcessCoupledPaFloating(inputSignal)
         return self.ApplyChannelEffects(coupledPaOutput)
+
+    def ProcessOutputPathsFloating(
+        self, inputSignal: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return forward and feedback observations from one PA evaluation.
+
+        Processing details:
+            Algorithm: Run the transmitter, coupled PA bank, and thermal
+            period exactly once. Split the common post-PA waveform into the
+            forward measurement path and the full embedded-feedback path.
+            Independent noise realizations are generated for the two receiver
+            branches, while their PA memory and temperature state are shared.
+
+        Args:
+            inputSignal: Normalized digital Tx input vector or matrix.
+
+        Returns:
+            result: ``(chOut, fbOut)`` in normalized floating units. ``chOut``
+                is the forward measurement waveform and ``fbOut`` is the DPD
+                feedback waveform.
+        """
+
+        coupledPaOutput = self.ProcessCoupledPaFloating(inputSignal)
+        channelOutput = self.ApplyForwardChannelEffects(coupledPaOutput)
+        feedbackOutput = self.ApplyFeedbackChannelEffects(coupledPaOutput)
+        return channelOutput, feedbackOutput
 
     def Process(
         self,
@@ -3131,8 +3221,8 @@ class Channel:
         outputPowerDbm: Optional[
             Union[float, Sequence[float], np.ndarray]
         ] = None,
-    ) -> np.ndarray:
-        """Evaluate the complete transmitter-to-receiver path at the boundary.
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return channel and feedback outputs at the public boundary.
 
         Processing details:
             Algorithm: When ``outputPowerDbm`` is provided, first run the
@@ -3148,14 +3238,17 @@ class Channel:
             target reuses the most recent successful target and repeats the
             reference-temperature calibration; the first such call therefore
             requires an explicit target. The accepted waveform is then
-            evaluated on the periodic steady-state temperature curve.
+            evaluated on the periodic steady-state temperature curve exactly
+            once and split into both receiver branches. DPD/ILC uses
+            ``fbOut``; final RF metrics use ``chOut``.
 
         Args:
             inputSignal: Public digital Tx vector or samples-by-chains matrix.
             outputPowerDbm: Optional shared target dBm or per-chain sequence.
 
         Returns:
-            result: Public receiver waveform with matching shape and type.
+            result: ``(chOut, fbOut)`` with matching input shape and public
+                floating or integer-code convention for both arrays.
         """
 
         self.ValidateParameters()
@@ -3190,8 +3283,13 @@ class Channel:
         normalizedInput = interfaceFormat.DecodeComplex(
             self.ValidateSignal(processingInput, "inputSignal")
         )
-        normalizedOutput = self.ProcessFloating(normalizedInput)
-        return interfaceFormat.EncodeComplex(normalizedOutput)
+        normalizedChannelOutput, normalizedFeedbackOutput = (
+            self.ProcessOutputPathsFloating(normalizedInput)
+        )
+        return (
+            interfaceFormat.EncodeComplex(normalizedChannelOutput),
+            interfaceFormat.EncodeComplex(normalizedFeedbackOutput),
+        )
 
     def SmallSignalGain(self) -> complex:
         """Return the deterministic direct small-signal sampling-path gain.

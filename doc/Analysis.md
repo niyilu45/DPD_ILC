@@ -1173,30 +1173,36 @@ P_{\mathrm{NL},k}
 =20\log_{10}(\mathrm{EVM}_{\mathrm{rms}}).
 ```
 
-代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子。`DpdIlc` 在迭代期间完全不调用该方法，但会先调用独立的 `SigProc`，把每轮反馈同步并除去公共复增益，再使用该参考域波形计算原生MSE和ILC更新。`ILCIteration` 保存原生MSE、当前输入、参考域对齐输出以及本轮同步估计。ILC结束后，`Analysis.AnalyzeIlcHistory` 对每轮对齐输出调用普通 `Analyze`，把SNR、EVM、ACLR和原生MSE合并为 `ILCPerformanceIteration`，并在分析层按严格EVM在线维护最佳轮。该轮已经得到的metrics会直接复用，只复制当前最佳输入和输出，不在循环结束后再次分析最佳波形。MIMO对应使用 `AnalyzeMimoIlcHistory`，它先按轮组合全部PA链，再执行完整空间解映射。
+代码中的 `Analysis.CalculateEvmAlignedMse` 实现上述完整算子。`DpdIlc` 在迭代期间完全不调用该方法，而是把每次Channel求值得到的第二个输出 `fbOut` 交给独立 `SigProc`，同步并除去公共复增益后计算原生MSE和ILC更新。`ILCIteration.feedbackOutputSignal` 保存raw `fbOut`，同步估计和原生MSE也都描述反馈域；同一次PA/热周期分出的第一个输出 `chOut` 则原样保存在 `ILCIteration.outputSignal`。若外部仪表给两路添加不同数量的补零或裁剪，学习器只同步 `fbOut`，`AnalyzeIlcHistory` 会再次独立同步原始 `chOut`，不会用反馈波形替换主路波形。ILC结束后，`Analysis.AnalyzeIlcHistory` 只对后者调用普通 `Analyze`，把主路SNR、EVM、ACLR与反馈域原生MSE合并为 `ILCPerformanceIteration`，并在分析层按严格主路EVM在线维护最佳轮。MIMO对应使用 `AnalyzeMimoIlcHistory`，它先按轮组合全部PA链，再执行完整空间解映射。
 
 ```mermaid
 flowchart LR
-    capture["第 k 轮原始反馈"] --> ilcSync["DpdIlc内部SigProc<br/>时延 / CFO / SFO / 复增益"]
+    plant["第 k 轮一次PA/热周期"] --> branch{"同一状态分叉"}
+    branch --> channelOutput["chOut：主路"]
+    branch --> capture["fbOut：原始反馈"]
+    capture --> ilcSync["DpdIlc内部SigProc<br/>时延 / CFO / SFO / 复增益"]
     ilcSync --> ilc["DpdIlc：参考域误差与全部迭代"]
-    ilc --> history["ILCIteration：输入、对齐输出、原生MSE、同步估计"]
+    ilc --> history["ILCIteration：输入、chOut、fbOut<br/>反馈MSE与同步估计"]
+    channelOutput --> history
     history --> postAnalysis["Analysis.AnalyzeIlcHistory"]
-    history --> feedback["第 k 轮已保存参考域输出"]
-    reference["目标 x"] --> postAnalysis
-    postAnalysis --> raw["Raw MSE"]
-    feedback --> raw
-    reference --> ls["最小二乘复增益 ĝ_k"]
-    feedback --> ls
+    ilcSync --> alignedFeedback["同步后的fbOut"]
+    reference["目标 x"] --> raw["反馈域Raw MSE"]
+    alignedFeedback --> raw
+    reference --> ls["反馈域最小二乘复增益 ĝ_k"]
+    alignedFeedback --> ls
     ls --> lc["LC-MSE：删除公共增益/相位"]
     reference --> receiver["相同 Wi-Fi 接收算子 A"]
-    feedback --> receiver
+    channelOutput --> receiver
     receiver --> tones["参考 S 与测量 R_k"]
     tones --> evmMse["EVM-MSE = ||R_k-S||² / ||S||²"]
+    raw --> postAnalysis
+    lc --> postAnalysis
+    evmMse --> postAnalysis
     evmMse --> identity["EVM(dB) = 10 log10(EVM-MSE)"]
     evmMse --> best["Analysis层选择EVM最佳轮"]
 ```
 
-**图 5-2 说明**：算法层先完成反馈同步、复增益对齐和学习，再保存每轮参考域波形；分析层随后统一计算RF指标。此处Raw MSE已经不含原始采集的公共增益、公共相位和主要同步误差，用来判断参考域整帧波形是否跟踪目标；LC-MSE继续去除残余的微小公共线性项；EVM-MSE通过与最终EVM完全相同的Wi-Fi接收链得到，因此仍是判断调制质量和选择最终轮次的首选指标。物理PA输出幅度没有丢失：它保存在 `feedbackComplexGain` 中，而 `ILCResult.outputSignal` 仍返回最佳输入对应的原始干净PA输出。
+**图 5-2 说明**：算法层先在 `fbOut` 上完成同步、复增益对齐和学习，同时保存同轮 `chOut`；分析层随后只在 `chOut` 上计算RF指标。Raw MSE和LC-MSE回答“反馈观测是否跟踪目标”，EVM-MSE回答“前向主路调制质量是否改善”。因此反馈链存在频响、镜像、非线性、限幅或量化时，两类曲线不必同趋势，这不是Analysis计算错误。`feedbackComplexGain` 保留反馈物理幅相，`ILCResult.outputSignal` 返回最佳输入对应的 `chOut`，`ILCResult.feedbackOutputSignal` 返回同次求值得到的raw `fbOut`。
 
 ### 5.9 三种 MSE 应当怎样联合阅读
 
@@ -1231,7 +1237,8 @@ flowchart LR
 | `complexGainPhaseDegrees` | 对齐输出的残余公共相位 | 通常接近0度 |
 | `inputPeak` | 当前 ILC 输入峰值 | 参考幅度单位，防止削顶 |
 | `inputSignal` | 当前轮进入PA的复波形 | 供外部复测或标签拟合 |
-| `outputSignal` | 当前轮同步、复增益归一化后的参考域反馈 | 与参考等长，供Analysis逐轮计算RF性能 |
+| `outputSignal` | 当前轮raw `chOut` | 前向主路参考面，供Analysis逐轮计算RF性能 |
+| `feedbackOutputSignal` | 当前轮raw `fbOut` 或 `None` | DPD/ILC同步、MSE和更新所用反馈观测 |
 | `integerDelaySamples` | 原始反馈的整数时延估计 | 样点 |
 | `fractionalDelaySamples` | 原始反馈的分数时延估计 | 样点 |
 | `carrierFrequencyOffsetHz` | 原始反馈的载波频偏估计 | Hz |
@@ -1887,7 +1894,6 @@ paModel = PaModel(
 channel = Channel(
     paModel=paModel,
     parameters={
-        "sampleMode": "forward",
         "sampleRateHz": wifiWaveform.sampleRateHz,
         "phaseDegrees": 90,
         "noiseAmpMv": 10.0,
@@ -1899,7 +1905,7 @@ channel = Channel(
         "width": 0,
     },
 )
-receivedSignal = channel.Process(
+chOut, fbOut = channel.Process(
     wifiWaveform.samples,
     outputPowerDbm=20.0,
 )
@@ -1914,29 +1920,31 @@ resultAnalysis = Analysis(
         "width": 0,
     },
 )
-metrics = resultAnalysis.Analyze(receivedSignal)
+metrics = resultAnalysis.Analyze(chOut)
 
 print(channel.GetLastCalibrationMetrics())
 print(metrics)
 ```
 
-90度固定相位会由公共复增益补偿，不应单独恶化EVM；PA非线性和10 mV随机噪声仍保留在误差中。`metrics["outputPowerDbm"]` 表示接收波形的分析结果，而 `channel.GetLastCalibrationMetrics()` 保留不含接收噪声的PA闭环实测功率。这里显式使用 `sampleMode="forward"`，所以全部反馈专用 `fb...` 参数都会被跳过，指标代表前向仪表对主路输出的独立评价。
+90度固定相位会由公共复增益补偿，不应单独恶化EVM；PA非线性和10 mV随机噪声仍保留在误差中。`metrics["outputPowerDbm"]` 表示 `chOut` 所在前向主路参考面的分析结果，而 `channel.GetLastCalibrationMetrics()` 保留不含接收噪声的PA功率闭环实测值。`PowerCalibration.outputPowerDbm` 始终定义在干净PA物理输出面，不是含反馈增益、FIR、非线性、噪声和ADC的raw `fbOut` 表观功率。
 
-如果DPD或ILC使用 `sampleMode="fb"` 的板载反馈波形进行更新，不应把同一份反馈波形作为最终黄金结果。反馈接收机的FIR、CFO/SFO、I/Q镜像和ADC量化有一部分可以由同步或公共复增益补偿减弱，但反馈非线性、限幅、镜像与量化噪声不能被一个标量增益完全消除。推荐把同一个干净PA输出分别送入两个Channel：
+DPD或ILC使用 `fbOut` 板载反馈波形进行更新时，不应把同一份反馈波形作为最终黄金结果。反馈接收机的FIR、CFO/SFO、I/Q镜像和ADC量化有一部分可以由同步或公共复增益补偿减弱，但反馈非线性、限幅、镜像与量化噪声不能被一个标量增益完全消除。推荐从同一次Channel求值得到两路：
 
 ```python
-forwardCapture = forwardChannel.ProcessPaOutput(cleanPaOutput)
-feedbackCapture = feedbackChannel.ProcessPaOutput(cleanPaOutput)
+chOut, fbOut = channel.Process(
+    wifiWaveform.samples,
+    outputPowerDbm=20.0,
+)
 
 forwardMetrics = Analysis(
-    forwardCapture,
+    chOut,
     transmittedSignal=referenceSignal,
     sampleRateHz=wifiWaveform.sampleRateHz,
     channelBandwidthHz=wifiWaveform.bandwidthHz,
     parameters={"width": 0},
 ).Analyze()
 feedbackMetrics = Analysis(
-    feedbackCapture,
+    fbOut,
     transmittedSignal=referenceSignal,
     sampleRateHz=wifiWaveform.sampleRateHz,
     channelBandwidthHz=wifiWaveform.bandwidthHz,
@@ -1944,7 +1952,7 @@ feedbackMetrics = Analysis(
 ).Analyze()
 ```
 
-`feedbackMetrics` 用来诊断板载观察链；`forwardMetrics` 用来验收真实主路EVM、ACLR和功率。两者的差值可以反映反馈链校准残差，但不能直接全部归因于PA。
+`feedbackMetrics` 用来诊断板载观察链；`forwardMetrics` 用来验收真实主路EVM、SNR、ACLR、IRR和功率。两者严格共享一次PA记忆/热状态，差值可以反映反馈链校准残差，但不能直接全部归因于PA。
 
 ### 11.4 非Wi-Fi波形的发送辅助分析
 
