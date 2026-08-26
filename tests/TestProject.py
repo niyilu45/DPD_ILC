@@ -1251,6 +1251,561 @@ def CheckWifiBandwidths() -> None:
             assert waveform.pilotSubcarriers.size == pilotToneCount
 
 
+def CheckWifiSpectralMaskAnalysis() -> None:
+    """Verify Wi-Fi mask templates, parsing modes, and spectral decisions.
+
+    Processing details:
+        Algorithm: Check every supported VHT/HE/EHT mask breakpoint, exercise
+        explicit-reference, blind, metadata-assisted, and raw-assisted format
+        resolution, inject deterministic upper/lower out-of-band violations,
+        verify per-chain MIMO decisions, reject insufficient sample rates,
+        and preserve the fixed-point public-code boundary.
+
+    Returns:
+        result: None. Assertions expose template, parser, PSD, margin, and
+            result-schema regressions before a mask implementation is used.
+    """
+
+    templateBandwidths = {
+        "VHT": (20, 40, 80, 160),
+        "HE": (20, 40, 80, 160),
+        "EHT": (20, 40, 80, 160, 320),
+    }
+    aliasByFormat = {
+        "VHT": "11ac",
+        "HE": "11ax",
+        "EHT": "11be",
+    }
+    expectedOffsetsMhzByFormat = {
+        "VHT": {
+            20: (9.0, 11.0, 20.0, 30.0),
+            40: (19.0, 21.0, 40.0, 60.0),
+            80: (39.0, 41.0, 80.0, 120.0),
+            160: (79.0, 81.0, 160.0, 240.0),
+        },
+        "HE": {
+            20: (9.75, 10.25, 20.0, 30.0),
+            40: (19.5, 20.5, 40.0, 60.0),
+            80: (39.5, 40.5, 80.0, 120.0),
+            160: (79.5, 80.5, 160.0, 240.0),
+        },
+        "EHT": {
+            20: (9.75, 10.5, 20.0, 30.0),
+            40: (19.5, 20.5, 40.0, 60.0),
+            80: (39.5, 40.5, 80.0, 120.0),
+            160: (79.5, 80.5, 160.0, 240.0),
+            320: (159.5, 160.5, 320.0, 480.0),
+        },
+    }
+    for frameFormat, bandwidthValuesMhz in templateBandwidths.items():
+        for bandwidthMhz in bandwidthValuesMhz:
+            template = Analysis.ResolveWifiSpectralMaskTemplate(
+                frameFormat,
+                bandwidthMhz,
+            )
+            assert isinstance(template, dict)
+            assert set(template) == {
+                "frameFormat",
+                "bandwidthMhz",
+                "templateName",
+                "frequencyOffsetsHz",
+                "limitsDb",
+                "resolutionBandwidthHz",
+                "videoBandwidthHz",
+                "minimumSampleRateHz",
+            }
+            assert template["frameFormat"] == frameFormat
+            assert template["bandwidthMhz"] == bandwidthMhz
+            assert frameFormat in template["templateName"]
+            assert str(bandwidthMhz) in template["templateName"]
+            bandwidthHz = float(bandwidthMhz) * 1.0e6
+            assert np.array_equal(
+                np.asarray(template["frequencyOffsetsHz"], dtype=float),
+                np.asarray(
+                    expectedOffsetsMhzByFormat[frameFormat][bandwidthMhz],
+                    dtype=float,
+                )
+                * 1.0e6,
+            )
+            assert tuple(template["limitsDb"]) == (
+                0.0,
+                -20.0,
+                -28.0,
+                -40.0,
+            )
+            assert template["resolutionBandwidthHz"] == 100.0e3
+            assert template["videoBandwidthHz"] == (
+                30.0e3 if frameFormat == "VHT" else 7.5e3
+            )
+            assert template["minimumSampleRateHz"] == (
+                3.0 * bandwidthHz
+                + template["resolutionBandwidthHz"]
+            )
+
+            aliasTemplate = Analysis.ResolveWifiSpectralMaskTemplate(
+                aliasByFormat[frameFormat],
+                bandwidthMhz,
+            )
+            assert aliasTemplate == template
+
+    for invalidFormat, invalidBandwidthMhz in (
+        ("VHT", 320),
+        ("HE", 320),
+        ("EHT", 10),
+        ("unknown", 20),
+    ):
+        try:
+            Analysis.ResolveWifiSpectralMaskTemplate(
+                invalidFormat,
+                invalidBandwidthMhz,
+            )
+        except (TypeError, ValueError) as error:
+            assert "frameFormat" in str(error) or "bandwidthMhz" in str(
+                error
+            )
+        else:
+            raise AssertionError(
+                "an unsupported Wi-Fi spectral-mask template was accepted"
+            )
+
+    expectedResultNames = {
+        "assessmentType",
+        "certificationResult",
+        "frameFormat",
+        "bandwidthMhz",
+        "templateName",
+        "passed",
+        "minimumMarginDb",
+        "maximumViolationDb",
+        "worstFrequencyHz",
+        "frequencyBinsHz",
+        "maskLimitDb",
+        "evaluationMask",
+        "perChain",
+    }
+    expectedChainNames = {
+        "passed",
+        "minimumMarginDb",
+        "maximumViolationDb",
+        "worstFrequencyHz",
+        "measuredPsdDb",
+        "marginDb",
+    }
+    generatedWaveforms = {}
+    for formatIndex, frameFormat in enumerate(("VHT", "HE", "EHT")):
+        generatedWaveform = WaveGenWifi(
+            frameFormat=frameFormat,
+            bandwidthMhz=20,
+            mcs=0,
+            numDataSymbols=16,
+            sampleRateHz=80.0e6,
+            seed=710 + formatIndex,
+            width=0,
+        ).Generate()
+        generatedWaveforms[frameFormat] = generatedWaveform
+        explicitAnalysis = Analysis(
+            generatedWaveform.samples,
+            generatedWaveform,
+            parameters={"maxSegmentLength": 4096, "width": 0},
+        )
+        with patch.object(
+            explicitAnalysis,
+            "PrepareMeasuredSignal",
+            side_effect=AssertionError(
+                "raw spectral-mask measurement must not use EVM resampling"
+            ),
+        ):
+            maskResult = explicitAnalysis.MeasureWifiSpectralMask(
+                generatedWaveform.samples
+            )
+        assert expectedResultNames.issubset(maskResult)
+        assert maskResult["frameFormat"] == frameFormat
+        assert maskResult["bandwidthMhz"] == 20
+        assert maskResult["assessmentType"] == "relativeDbrPrecheck"
+        assert maskResult["certificationResult"] is None
+        assert isinstance(maskResult["passed"], bool)
+        assert np.isfinite(maskResult["minimumMarginDb"])
+        assert np.isfinite(maskResult["maximumViolationDb"])
+        assert len(maskResult["perChain"]) == 1
+        assert set(maskResult["perChain"][0]) == expectedChainNames
+        assert (
+            maskResult["perChain"][0]["passed"]
+            is maskResult["passed"]
+        )
+
+        frequencyBinsHz = np.asarray(
+            maskResult["frequencyBinsHz"], dtype=float
+        )
+        maskLimitDb = np.asarray(maskResult["maskLimitDb"], dtype=float)
+        evaluationMask = np.asarray(
+            maskResult["evaluationMask"], dtype=bool
+        )
+        measuredPsdDb = np.asarray(
+            maskResult["perChain"][0]["measuredPsdDb"], dtype=float
+        )
+        marginDb = np.asarray(
+            maskResult["perChain"][0]["marginDb"], dtype=float
+        )
+        assert frequencyBinsHz.ndim == 1
+        assert frequencyBinsHz.size >= 16
+        assert np.all(np.diff(frequencyBinsHz) > 0.0)
+        assert maskLimitDb.shape == frequencyBinsHz.shape
+        assert evaluationMask.shape == frequencyBinsHz.shape
+        assert measuredPsdDb.shape == frequencyBinsHz.shape
+        assert marginDb.shape == frequencyBinsHz.shape
+        assert np.count_nonzero(evaluationMask) > 0
+        assert np.all(np.isfinite(maskLimitDb[evaluationMask]))
+        assert np.all(np.isfinite(measuredPsdDb[evaluationMask]))
+        assert np.all(np.isfinite(marginDb[evaluationMask]))
+        assert np.allclose(
+            marginDb[evaluationMask],
+            maskLimitDb[evaluationMask] - measuredPsdDb[evaluationMask],
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+        assert np.isclose(
+            maskResult["equivalentResolutionBandwidthHz"],
+            maskResult["resolutionBandwidthHz"],
+            rtol=0.0,
+            atol=1.0e-8,
+        )
+        assert np.isclose(
+            maskResult["minimumMarginDb"],
+            np.min(marginDb[evaluationMask]),
+            atol=1.0e-12,
+        )
+        assert np.isclose(
+            maskResult["maximumViolationDb"],
+            max(0.0, -maskResult["minimumMarginDb"]),
+            atol=1.0e-12,
+        )
+
+    passingHeMask = Analysis(
+        generatedWaveforms["HE"].samples,
+        generatedWaveforms["HE"],
+        parameters={"maxSegmentLength": 4096, "width": 0},
+    ).MeasureWifiSpectralMask(generatedWaveforms["HE"].samples)
+    assert passingHeMask["passed"] is True
+    assert passingHeMask["minimumMarginDb"] > 0.0
+    assert passingHeMask["maximumViolationDb"] == 0.0
+
+    preparedHeAnalysis = Analysis(
+        generatedWaveforms["HE"].samples,
+        generatedWaveforms["HE"],
+        parameters={"maxSegmentLength": 4096, "width": 0},
+    )
+    preparedHeSignal = preparedHeAnalysis.PrepareMeasuredSignal(
+        generatedWaveforms["HE"].samples
+    )
+    preparedHeMask = (
+        preparedHeAnalysis.CalculatePreparedWifiSpectralMask(
+            preparedHeSignal
+        )
+    )
+    assert preparedHeMask["frameFormat"] == "HE"
+    assert preparedHeMask["passed"] is True
+    assert np.isclose(
+        preparedHeMask["minimumMarginDb"],
+        passingHeMask["minimumMarginDb"],
+        rtol=0.0,
+        atol=0.0,
+    )
+    unchangedAnalysisMetrics = preparedHeAnalysis.Analyze(
+        generatedWaveforms["HE"].samples
+    )
+    assert set(unchangedAnalysisMetrics) == {
+        "snrDb",
+        "evmDb",
+        "evmPercent",
+        "irrDb",
+        "aclrLowerDb",
+        "aclrUpperDb",
+        "aclrWorstDb",
+        "outputPowerDbm",
+    }
+
+    modeWaveform = generatedWaveforms["EHT"]
+    modeMeasured = 0.83 * np.exp(1j * 0.27) * modeWaveform.samples
+    blindAnalysis = Analysis(
+        modeMeasured,
+        parseParameters={"sampleRateHz": modeWaveform.sampleRateHz},
+        parameters={"maxSegmentLength": 4096, "width": 0},
+    )
+    blindMask = blindAnalysis.MeasureWifiSpectralMask()
+    assert blindAnalysis.GetAnalysisMode() == "blind"
+    assert blindMask["frameFormat"] == "EHT"
+    assert blindMask["bandwidthMhz"] == 20
+
+    objectAssistedAnalysis = Analysis(
+        modeMeasured,
+        transmittedSignal=modeWaveform,
+        parameters={"maxSegmentLength": 4096, "width": 0},
+    )
+    objectAssistedMask = (
+        objectAssistedAnalysis.MeasureWifiSpectralMask()
+    )
+    assert objectAssistedAnalysis.GetAnalysisMode() == "transmitAssisted"
+    assert objectAssistedAnalysis.GetParsedWifiFrame() is None
+    assert objectAssistedMask["frameFormat"] == "EHT"
+    assert objectAssistedMask["bandwidthMhz"] == 20
+
+    rawAssistedAnalysis = Analysis(
+        modeMeasured,
+        transmittedSignal=modeWaveform.samples,
+        sampleRateHz=modeWaveform.sampleRateHz,
+        channelBandwidthHz=modeWaveform.bandwidthHz,
+        parameters={"maxSegmentLength": 4096, "width": 0},
+    )
+    assert rawAssistedAnalysis.GetParsedWifiFrame() is None
+    try:
+        rawAssistedAnalysis.MeasureWifiSpectralMask()
+    except ValueError as error:
+        assert "wifiMaskFrameFormat" in str(error)
+    else:
+        raise AssertionError(
+            "raw-assisted mask analysis must not parse or guess a format"
+        )
+
+    rawObjectFallbackAnalysis = Analysis(
+        modeMeasured,
+        transmittedSignal=modeWaveform.samples,
+        sampleRateHz=modeWaveform.sampleRateHz,
+        channelBandwidthHz=modeWaveform.bandwidthHz,
+        parameters={
+            "maxSegmentLength": 4096,
+            "wifiMaskFrameFormat": "11be",
+            "width": 0,
+        },
+    )
+    rawObjectFallbackMask = (
+        rawObjectFallbackAnalysis.MeasureWifiSpectralMask()
+    )
+    assert rawObjectFallbackMask["frameFormat"] == "EHT"
+    assert rawObjectFallbackMask["bandwidthMhz"] == 20
+
+    dataSlice = modeWaveform.fieldSlices[modeWaveform.dataFieldName]
+    rawDataReference = modeWaveform.samples[dataSlice]
+    rawDataMeasured = 0.91 * np.exp(-1j * 0.18) * rawDataReference
+    rawFallbackAnalysis = Analysis(
+        rawDataMeasured,
+        transmittedSignal=rawDataReference,
+        sampleRateHz=modeWaveform.sampleRateHz,
+        channelBandwidthHz=modeWaveform.bandwidthHz,
+        parameters={
+            "maxSegmentLength": 4096,
+            "wifiMaskFrameFormat": "11be",
+            "width": 0,
+        },
+    )
+    rawFallbackMask = rawFallbackAnalysis.MeasureWifiSpectralMask()
+    assert rawFallbackMask["frameFormat"] == "EHT"
+    assert rawFallbackMask["bandwidthMhz"] == 20
+
+    unresolvedRawAnalysis = Analysis(
+        rawDataMeasured,
+        transmittedSignal=rawDataReference,
+        sampleRateHz=modeWaveform.sampleRateHz,
+        channelBandwidthHz=modeWaveform.bandwidthHz,
+        parameters={"maxSegmentLength": 4096, "width": 0},
+    )
+    try:
+        unresolvedRawAnalysis.MeasureWifiSpectralMask()
+    except ValueError as error:
+        assert "wifiMaskFrameFormat" in str(error)
+    else:
+        raise AssertionError(
+            "descriptor-free raw-assisted mask analysis must require a "
+            "frame-format fallback"
+        )
+
+    sampleIndices = np.arange(
+        modeWaveform.samples.shape[0], dtype=float
+    )
+    upperLeakFrequencyHz = 0.75 * modeWaveform.bandwidthHz
+    upperLeak = 0.20 * np.exp(
+        1j
+        * 2.0
+        * np.pi
+        * upperLeakFrequencyHz
+        * sampleIndices
+        / modeWaveform.sampleRateHz
+    )
+    upperViolation = Analysis(
+        modeWaveform.samples,
+        modeWaveform,
+        parameters={"maxSegmentLength": 4096, "width": 0},
+    ).MeasureWifiSpectralMask(modeWaveform.samples + upperLeak)
+    assert upperViolation["passed"] is False
+    assert upperViolation["minimumMarginDb"] < 0.0
+    assert upperViolation["maximumViolationDb"] > 0.0
+    assert upperViolation["worstFrequencyHz"] > 0.0
+
+    lowerLeak = 0.20 * np.exp(
+        -1j
+        * 2.0
+        * np.pi
+        * upperLeakFrequencyHz
+        * sampleIndices
+        / modeWaveform.sampleRateHz
+    )
+    lowerViolation = Analysis(
+        modeWaveform.samples,
+        modeWaveform,
+        parameters={"maxSegmentLength": 4096, "width": 0},
+    ).MeasureWifiSpectralMask(modeWaveform.samples + lowerLeak)
+    assert lowerViolation["passed"] is False
+    assert lowerViolation["minimumMarginDb"] < 0.0
+    assert lowerViolation["maximumViolationDb"] > 0.0
+    assert lowerViolation["worstFrequencyHz"] < 0.0
+
+    mimoWaveform = WaveGenWifi(
+        frameFormat="HE",
+        bandwidthMhz=20,
+        mcs=0,
+        numDataSymbols=16,
+        sampleRateHz=80.0e6,
+        numTransmitAntennas=2,
+        numSpatialStreams=2,
+        spatialMapping="dft",
+        seed=719,
+        width=0,
+    ).Generate()
+    mimoAnalysis = Analysis(
+        mimoWaveform.samples,
+        mimoWaveform,
+        parameters={"maxSegmentLength": 4096, "width": 0},
+    )
+    mimoSamples = mimoWaveform.samples.copy()
+    mimoSampleIndices = np.arange(mimoSamples.shape[0], dtype=float)
+    mimoSamples[:, 1] += 0.20 * np.exp(
+        1j
+        * 2.0
+        * np.pi
+        * 0.75
+        * mimoWaveform.bandwidthHz
+        * mimoSampleIndices
+        / mimoWaveform.sampleRateHz
+    )
+    with patch(
+        "inc.lib.Analysis.AveragePeriodogram",
+        wraps=AveragePeriodogram,
+    ) as periodogramMock:
+        mimoResult = mimoAnalysis.MeasureWifiSpectralMask(mimoSamples)
+        assert periodogramMock.call_count == 2
+    assert len(mimoResult["perChain"]) == 2
+    assert mimoResult["perChain"][0]["passed"] is True
+    assert mimoResult["perChain"][1]["passed"] is False
+    assert mimoResult["passed"] is False
+    assert np.isclose(
+        mimoResult["minimumMarginDb"],
+        min(
+            chainResult["minimumMarginDb"]
+            for chainResult in mimoResult["perChain"]
+        ),
+        atol=1.0e-12,
+    )
+
+    lowRateWaveform = WaveGenWifi(
+        frameFormat="VHT",
+        bandwidthMhz=20,
+        mcs=0,
+        numDataSymbols=4,
+        sampleRateHz=40.0e6,
+        seed=720,
+        width=0,
+    ).Generate()
+    lowRateAnalysis = Analysis(
+        lowRateWaveform.samples,
+        lowRateWaveform,
+        width=0,
+    )
+    try:
+        lowRateAnalysis.MeasureWifiSpectralMask(lowRateWaveform.samples)
+    except ValueError as error:
+        assert "sampleRateHz" in str(error)
+        assert "spectral mask" in str(error).lower()
+    else:
+        raise AssertionError(
+            "mask analysis accepted a sample rate below its outer offset"
+        )
+
+    minimumMaskSampleRateHz = 60.1e6
+    exactRateRandom = np.random.default_rng(722)
+    exactRateReference = (
+        exactRateRandom.normal(size=8192)
+        + 1j * exactRateRandom.normal(size=8192)
+    )
+    exactRateAnalysis = Analysis(
+        exactRateReference,
+        transmittedSignal=exactRateReference,
+        sampleRateHz=minimumMaskSampleRateHz,
+        channelBandwidthHz=20.0e6,
+        parameters={
+            "maxSegmentLength": 4096,
+            "wifiMaskFrameFormat": "EHT",
+            "width": 0,
+        },
+    )
+    exactRateResult = exactRateAnalysis.MeasureWifiSpectralMask()
+    assert exactRateResult["sampleRateHz"] == minimumMaskSampleRateHz
+    assert (
+        np.isclose(
+            exactRateResult["equivalentResolutionBandwidthHz"],
+            exactRateResult["resolutionBandwidthHz"],
+            rtol=0.0,
+            atol=1.0e-8,
+        )
+    )
+    flatFrequencyBinsHz = np.fft.fftshift(
+        np.fft.fftfreq(1024, d=1.0 / minimumMaskSampleRateHz)
+    )
+    with patch(
+        "inc.lib.Analysis.AveragePeriodogram",
+        return_value=(
+            flatFrequencyBinsHz,
+            np.ones(flatFrequencyBinsHz.size, dtype=float),
+        ),
+    ):
+        flatSpectrumResult = exactRateAnalysis.MeasureWifiSpectralMask()
+    assert np.allclose(
+        flatSpectrumResult["perChain"][0]["measuredPsdDb"],
+        0.0,
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+
+    fixedWaveform = WaveGenWifi(
+        frameFormat="VHT",
+        bandwidthMhz=20,
+        mcs=0,
+        numDataSymbols=16,
+        sampleRateHz=80.0e6,
+        seed=721,
+        width=16,
+    ).Generate()
+    fixedAnalysis = Analysis(
+        fixedWaveform.samples,
+        fixedWaveform,
+        parameters={"maxSegmentLength": 4096, "width": 16},
+    )
+    fixedResult = fixedAnalysis.MeasureWifiSpectralMask(
+        fixedWaveform.samples
+    )
+    assert fixedResult["frameFormat"] == "VHT"
+    assert fixedResult["bandwidthMhz"] == 20
+    assert isinstance(fixedResult["passed"], bool)
+    assert np.isfinite(fixedResult["minimumMarginDb"])
+    assert np.isfinite(fixedResult["maximumViolationDb"])
+    assert np.array_equal(
+        fixedWaveform.samples.real,
+        np.rint(fixedWaveform.samples.real),
+    )
+    assert np.array_equal(
+        fixedWaveform.samples.imag,
+        np.rint(fixedWaveform.samples.imag),
+    )
+
+
 def CheckSampleRateConfiguration() -> None:
     """Verify direct sample-rate control and legacy oversampling fallback.
 
@@ -9714,6 +10269,7 @@ def RunTests() -> None:
     CheckChannelModel()
     CheckWifiFormats()
     CheckWifiBandwidths()
+    CheckWifiSpectralMaskAnalysis()
     CheckSampleRateConfiguration()
     CheckMimoSpatialStructure()
     CheckMimoPaAndDpd()

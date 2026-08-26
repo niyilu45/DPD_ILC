@@ -1,6 +1,6 @@
 # DPD-ILC VHT/HE/EHT Wi-Fi与双音仿真工程
 
-本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Rapp、Wiener、GMP或Doherty PA、闭环输出功率校准和全部适用ILC更新律。MIMO Channel还可在PA前后加入方向不对称、具有独立FIR和时延的通道耦合。Wi-Fi路径输出功率、SNR、EVM、IRR、ACLR和功率-EVM曲线；双音路径既能比较所有SISO ILC的IM3/IM5/IM7，也能独立扫描四种PA的频率响应、记忆效应和10至25 dBm输出功率特性。
+本工程按照 `doc/DPD-ILC.md` 的推荐路线实现：激励既可以由 `WaveGenWifi` 生成802.11ac/VHT、802.11ax/HE或802.11be/EHT Wi-Fi复基带帧，也可以由 `WaveGenTwoTone` 生成双音测试波形。两类信号共用Rapp、Wiener、GMP或Doherty PA、闭环输出功率校准和全部适用ILC更新律。MIMO Channel还可在PA前后加入方向不对称、具有独立FIR和时延的通道耦合。Wi-Fi路径输出功率、SNR、EVM、IRR、ACLR、相对发射频谱Mask和功率-EVM曲线；双音路径既能比较所有SISO ILC的IM3/IM5/IM7，也能独立扫描四种PA的频率响应、记忆效应和10至25 dBm输出功率特性。
 
 ## 理论文档
 
@@ -16,7 +16,7 @@
 - [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
 - [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：10 bit seed、短块LDPC、历史CRC兼容、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
 - [Wi-Fi 元数据契约](doc/WifiMetadata.md)：`MCSInfo` 与 `WifiWaveform` 的字段、数组形状和模块边界。
-- [结果计算物理原理与推导](doc/Analysis.md)：同步后 SNR、EVM、Welch PSD、ACLR 和功率-EVM 曲线。
+- [结果计算物理原理与推导](doc/Analysis.md)：同步后SNR/EVM/IRR/ACLR、原始capture的VHT/HE/EHT相对发射频谱Mask、Welch PSD和功率-EVM曲线。
 - [双音IM分析与ILC比较](doc/TwoToneAnalysis.md)：精确频率投影、IM3/IM5/IM7专用接口、dBc与绝对dBFS、逐轮选择和全方法Benchmark。
 - [定点接口原理与用法](doc/FixedPoint.md)：浮点旁路、公开整数码、内部缩放、舍入、饱和，以及 WaveGenWifi、PaModel、Analysis 的统一数据边界。
 - [Analysis、Channel与PaModel性能优化说明](doc/Performance.md)：同步向量化、稳定区间能量、MIMO调用内中间量复用、不可变协议布局缓存、GMP延迟复用、Channel理想级旁路、参考耗时和安全使用边界。
@@ -982,6 +982,7 @@ flowchart TD
     prepared --> evm["Analysis.CalculatePreparedEvm"]
     prepared --> evmMse["CalculatePreparedEvmAlignedMse"]
     prepared --> aclr["Analysis.CalculatePreparedAclr"]
+    prepared --> wifiMask["Analysis.CalculatePreparedWifiSpectralMask<br/>显式预处理入口"]
     prepared --> chainSnr["CalculatePreparedSnrPerChain"]
     prepared --> chainAclr["CalculatePreparedAclrPerChain"]
     prepared --> streamEvm["CalculatePreparedEvmPerSpatialStream"]
@@ -991,6 +992,12 @@ flowchart TD
     demod --> frameProcess["FrameProcess.DemodulatePreparedWifiData"]
     frameProcess --> undo["去 CP / FFT / 撤销 CSD 与空间映射 Q"]
     aclr --> psd["AveragePeriodogram"]
+    wifiMask --> psd
+    maskTemplate["ResolveWifiSpectralMaskTemplate<br/>VHT / HE / EHT"] --> wifiMask
+    wifiMask --> maskResult["逐传导链 dBr、Margin 与 PASS"]
+    context --> maskMeasure["Analysis.MeasureWifiSpectralMask"]
+    maskMeasure --> rawGate["原始解码capture<br/>整数重叠定位 + Data字段门控"]
+    rawGate --> wifiMask
 
     snr --> metrics["普通指标字典"]
     evm --> metrics
@@ -1023,6 +1030,7 @@ flowchart TD
 - 每次 `Analyze` 只调用一次 `SigProc.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
 - SNR 直接计算校正后数据字段与参考的残差功率；EVM 由 `FrameProcess` 根据 `WifiWaveform` 的数据字段位置去循环前缀、FFT、撤销 CSD 和空间解映射，再与采用相同接收路径得到的参考星座比较。
 - ACLR 通过 `AveragePeriodogram` 获得平均功率谱，然后分别积分主信道、下邻道和上邻道功率。
+- `MeasureWifiSpectralMask` 是独立入口，不会让普通 `Analyze` 额外计算一次频谱。公开入口直接解码原始capture，只做整数重叠定位和Data字段门控，不执行EVM路径的CFO、分数时延、SFO、公共复增益补偿或插值重采样，避免这些处理改变发射谱。它按元数据自动选择VHT/HE/EHT模板；无元数据的NumPy发送辅助方式必须显式提供 `wifiMaskFrameFormat`、`sampleRateHz` 和 `channelBandwidthHz`。每条传导链独立归一化为dBr并判定，汇总PASS要求所有链通过。
 - `Analyze` 直接返回包含模拟输出功率、SNR、EVM、IRR和ACLR的普通Python字典；调用方用 `metrics["outputPowerDbm"]`、`metrics["evmDb"]` 和 `metrics["irrDb"]` 读取结果。`irrDb` 保留兼容字段名，但表示镜像相对期望分量的 dBc，负数越负越好。功率在同步后、公共复增益补偿前计算，并按逐链峰值相对门限只统计有效突发样点；帧外补零和长占空比静默不参与RMS，短暂OFDM过零仍被保留。字典也可以直接交给 `Print`，或由 `Save` 写入JSON/CSV。
 - `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
 - `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、模拟输出功率、公共复增益幅相和输入峰值。
@@ -1781,8 +1789,9 @@ print(assistedMetrics["evmDb"])
 | `signalProcessingParameters` | `None` | 显式构造参数；作为普通覆盖字典传给 `SigProc`，`None` 使用其内部默认值。旧版 `parameters={"signalProcessingParameters": {...}}` 写法仍兼容。 |
 | `parseParameters` | `None` | 盲分析路径把完整映射传给 `ParseWifi`；发送辅助路径为兼容旧调用接受其中的 `sampleRateHz` 和 `channelBandwidthHz`，但仍不调用Parser。其他Parser专用键警告后忽略。 |
 | `transmittedSignal` | `None` | 可选发送NumPy数组或 `WifiWaveform`；一旦提供就直接作为Reference并彻底绕过 `ParseWifi`。 |
-| `sampleRateHz` | `None` | 纯NumPy发送辅助模式的可选物理采样率；未提供时使用归一化采样率1，补偿仍有效，但CFO数值不具有实际Hz单位。 |
-| `channelBandwidthHz` | `None` | 纯NumPy发送辅助模式的可选信道带宽；与实际 `sampleRateHz` 同时提供后才计算ACLR，否则三个ACLR键返回 `NaN`。 |
+| `sampleRateHz` | `None` | 纯NumPy发送辅助模式的可选物理采样率；未提供时使用归一化采样率1，补偿仍有效，但CFO数值不具有实际Hz单位。相对发射频谱Mask必须使用实际采样率。 |
+| `channelBandwidthHz` | `None` | 纯NumPy发送辅助模式的可选信道带宽；与实际 `sampleRateHz` 同时提供后才计算ACLR，否则三个ACLR键返回 `NaN`；无 `WifiWaveform` 元数据时也是选择Mask带宽的必需项。 |
+| `wifiMaskFrameFormat` | `None` | 只用于没有 `WifiWaveform` 元数据的Mask回退路径；接受VHT/11ac、HE/11ax或EHT/11be。代码不会根据NumPy频谱猜测格式。 |
 | `assistedMaximumOffsetSamples` | `2000` | 发送辅助相关允许搜索的接收端最大前置偏移样点数。 |
 | `assistedReferenceSearchSamples` | `32768` | 每个候选偏移最多参与归一化相关的样点数。 |
 | `assistedMinimumCorrelation` | `0.12` | 发送辅助公共区间的最低归一化相关幅度。 |
@@ -1850,6 +1859,9 @@ assert resultAnalysis.width == 16
 | `AnalyzeTwoTone(measuredSignal, waveform=None, ...)` | PA输出和 `TwoToneWaveform`或NumPy/list | 一次返回双音基波、IM3/IM5/IM7的上下侧dBc、每阶较差侧、综合最差互调和模拟PA输出参考面 `outputPowerDbm` 字典；功率先按接收样值位宽解码并排除长静默，原始样值必须提供 `sampleRateHz` 与 `toneFrequenciesHz`。 |
 | `CalculateIm3/CalculateIm5/CalculateIm7(measuredSignal, waveform=None, ...)` | PA输出和 `TwoToneWaveform`或NumPy/list | 分别返回该阶上下侧频率、dBc、绝对dBFS、较差侧和同一次分析得到的 `outputPowerDbm`；支持与 `AnalyzeTwoTone` 相同的原始样值参数。 |
 | `CalculateAclr(measuredSignal)` | 待测输出 | 返回 `(aclrLowerDb, aclrUpperDb, aclrWorstDb)`。 |
+| `ResolveWifiSpectralMaskTemplate(frameFormat, bandwidthMhz)` | 制式名称和标称MHz带宽 | 静态解析VHT/HE/EHT相对Mask；返回正频率四个折点、`(0, -20, -28, -40)` dBr限值、RBW/VBW元数据和包含100 kHz边界护带的最低采样率。EHT可解析320 MHz模板，但当前波形生成和盲解析仍不支持320 MHz。 |
+| `CalculatePreparedWifiSpectralMask(preparedSignal)` | 调用方显式准备、且已经与本Analysis参考网格对齐的信号 | 不再做任何同步；按FFT bin代表的频率区间与居中100 kHz矩形RBW窗口的重叠比例加权线性功率，边缘bin允许分数权重，使等效RBW在浮点容差内等于100 kHz，再逐链计算dBr、Margin和relative预检PASS。该高级入口不会撤销调用方此前对样值做过的处理。 |
+| `MeasureWifiSpectralMask(measuredSignal=None)` | 可选原始待测Wi-Fi capture | 推荐公开入口；只做接口解码、整数重叠定位和Data字段门控，不做CFO/分数时延/SFO/复增益补偿或插值重采样。发送辅助和盲模式可省略输入，显式Reference模式必须传入。结果以 `assessmentType="relativeDbrPrecheck"`、`certificationResult=None` 明确不提供认证结论。 |
 | `DemodulateWifiData(measuredSignal)` | 待测输出 | 返回 VHT/HE/EHT 数据子载波星座。 |
 | `AnalyzeIlcHistory(ilcHistory)` | SISO原生ILC历史 | 逐轮计算输出功率/SNR/EVM/ACLR，并返回EVM最佳轮及完整 `ILCPerformanceIteration` 历史。 |
 | `AnalyzeMimoIlcHistory(chainHistories)` | 每条PA链的原生ILC历史 | 按轮组合MIMO矩阵、执行空间流性能分析并返回EVM最佳轮。 |
@@ -1860,6 +1872,52 @@ assert resultAnalysis.width == 16
 | `SaveConvergence(ilcHistory, outputDirectory)` | Analysis生成的性能历史、输出路径 | 写入包含三级MSE、输出功率、SNR、EVM、ACLR和线性项诊断的 `ilc_convergence.csv`。 |
 | `AnalyzePowerEvmCurve(outputPowerDbmValues, methodEvaluators)` | 递增输出dBm点、`{方法名: 求值器}` 映射 | 按输出回退驱动PA，把每种方法标定到相同输出功率后计算EVM。 |
 | `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取实例解析后的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
+
+最小Mask测量与画图示例：
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+from inc.lib.Analysis import Analysis
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+
+wifiWaveform = WaveGenWifi(
+    frameFormat="HE",
+    bandwidthMhz=20,
+    sampleRateHz=80.0e6,
+    numDataSymbols=16,
+    width=0,
+).Generate()
+resultAnalysis = Analysis(wifiWaveform.samples, wifiWaveform, width=0)
+maskResult = resultAnalysis.MeasureWifiSpectralMask(wifiWaveform.samples)
+
+print(maskResult["assessmentType"], maskResult["passed"])
+print(maskResult["certificationResult"])  # None：不是认证结论
+print(maskResult["minimumMarginDb"], maskResult["worstFrequencyHz"])
+
+frequencyMhz = np.asarray(maskResult["frequencyBinsHz"]) / 1.0e6
+evaluationMask = np.asarray(maskResult["evaluationMask"], dtype=bool)
+chain0 = maskResult["perChain"][0]
+plt.plot(
+    frequencyMhz[evaluationMask],
+    np.asarray(chain0["measuredPsdDb"])[evaluationMask],
+    label="Measured chain 0",
+)
+plt.plot(
+    frequencyMhz[evaluationMask],
+    np.asarray(maskResult["maskLimitDb"])[evaluationMask],
+    label="Relative mask",
+)
+plt.xlabel("Baseband frequency (MHz)")
+plt.ylabel("Relative spectral level (dBr / 100 kHz equivalent RBW)")
+plt.grid(True)
+plt.legend()
+plt.show()
+```
+
+`MeasureWifiSpectralMask` 不嵌入普通 `Analyze()`，因此只需要EVM/SNR时不会多做一次PSD。返回的 `passed` 只表示当前单capture、逐链relative dBr预检通过；`assessmentType="relativeDbrPrecheck"` 且 `certificationResult=None` 是机器可读的非认证声明。完整结果字段、折点表、三种模式的元数据回退和非认证边界见 [Analysis.md的Wi-Fi频谱Mask章节](doc/Analysis.md#16-wi-fi相对发射频谱mask)。
 
 `Analyze` 返回字典的固定键包括 `outputPowerDbm`、`snrDb`、`evmDb`、`evmPercent`、`irrDb`、`aclrLowerDb`、`aclrUpperDb` 和 `aclrWorstDb`。其中 `irrDb=10*log10(Pimage/Pdesired)`，单位 dBc，越负越好；传统正值IRR等于它的相反数。SISO的 `outputPowerDbm` 是单端口功率；MIMO的该字段是所有独立PA端口在线性功率域求和后的结果，每路功率和IRR分别位于 `GetLastMimoMetrics()["outputPowerDbmPerChain"]` 与 `GetLastMimoMetrics()["irrDbPerChain"]`。需要IRR拟合质量时使用 `MeasureIrr()`，其结果还包含镜像幅度比、拟合残差和回归条件数。`ILCPerformanceIteration` 把RF性能字段与一轮原生MSE诊断组合起来；`ILCAnalysisResult.bestMetrics` 也保存同一普通指标字典。`PowerEvmCurve` 保存 `outputPowerDbmValues`、`driveScaleValues`、`targetOutputRmsValues` 以及各方法的EVM数组。
 
@@ -2862,6 +2920,7 @@ print([item.ToDict() for item in result.improvements])
 - EVM：使用同一份 `SigProc` 校正信号，由 `FrameProcess` 对当前格式的 `VHT-Data`、`HE-Data` 或 `EHT-Data` 去循环前缀、FFT、撤销 CSD 和空间解映射后，在数据子载波上相对同路径参考星座计算 RMS EVM，同时输出 dB 与百分比。
 - 每轮 MSE：Raw MSE 保留绝对增益、相位及整帧误差；LC-MSE 删除最优公共复增益，是一般复基带的 EVM 代理；EVM-MSE 使用完整 Wi-Fi 接收链，并严格满足 `EVM-MSE = EVM_rms²` 与 `EVM(dB) = 10·log10(EVM-MSE)`。详细推导见 [结果计算物理原理与推导](doc/Analysis.md#55-为什么原始-mse-不能总是反映-evm)。
 - ACLR：主信道功率与上下相邻同带宽信道功率之比，输出上下邻道和较差值。为完整覆盖两个邻道，命令行采样倍率限制为 4 或 8。
+- Wi-Fi相对发射频谱Mask：对当前VHT/HE/EHT数据字段做逐链Welch频谱估计，以FFT bin频率区间和居中100 kHz矩形RBW窗口的重叠比例作为权重，在线性功率域合成在浮点容差内等于100 kHz的等效RBW，再相对每链带内峰值归一化为dBr；`marginDb = maskLimitDb - measuredPsdDb`，最小Margin不小于0才通过relative预检。分数边缘权重避免对平坦噪声少计1至2 dB。结果以 `assessmentType="relativeDbrPrecheck"` 和 `certificationResult=None` 明确它不是Combined绝对dBm/MHz、仪表VBW、多包统计或认证结论。
 - 功率-EVM：横轴为每路PA绝对输出功率dBm，默认扫描10至25 dBm。`PowerCalibration` 把相对25 dBm额定上限的输出回退换成目标输出RMS，再通过PA实测闭环反求输入驱动；`Analysis` 只分析各工作点的实测波形。定点PA码直接用于EVM，物理电压标定不回灌分析接口。纵轴为RMS EVM dB，数值越低表示性能越好。
 - 双音IMD：IM3、IM5、IM7分别在解析频率位置做Hann窗精确复投影，并相对同侧基波以dBc表示；越负越好。各方法最终在闭环相同PA输出功率下比较。
 

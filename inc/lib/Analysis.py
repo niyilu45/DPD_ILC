@@ -124,6 +124,59 @@ class MimoSignalMetrics(TypedDict):
     outputPowerDbmPerChain: Tuple[float, ...]
 
 
+class WifiSpectralMaskTemplate(TypedDict):
+    """Define one VHT, HE, or EHT relative emission-mask template."""
+
+    frameFormat: str
+    bandwidthMhz: int
+    templateName: str
+    frequencyOffsetsHz: Tuple[float, float, float, float]
+    limitsDb: Tuple[float, float, float, float]
+    resolutionBandwidthHz: float
+    videoBandwidthHz: float
+    minimumSampleRateHz: float
+
+
+class WifiSpectralMaskChainMeasurement(TypedDict):
+    """Define one conducted transmit-chain spectral-mask result."""
+
+    passed: bool
+    minimumMarginDb: float
+    maximumViolationDb: float
+    worstFrequencyHz: float
+    measuredPsdDb: np.ndarray
+    marginDb: np.ndarray
+
+
+class WifiSpectralMaskMeasurement(TypedDict):
+    """Define the dictionary returned by Wi-Fi spectral-mask analysis."""
+
+    assessmentType: str
+    certificationResult: Optional[bool]
+    frameFormat: str
+    bandwidthMhz: int
+    sampleRateHz: float
+    templateName: str
+    analysisMode: str
+    metadataSource: str
+    measurementScope: str
+    resolutionBandwidthHz: float
+    equivalentResolutionBandwidthHz: float
+    videoBandwidthHz: float
+    frequencyResolutionHz: float
+    frequencyBinsHz: np.ndarray
+    maskLimitDb: np.ndarray
+    evaluationMask: np.ndarray
+    templateFrequencyOffsetsHz: Tuple[float, float, float, float]
+    templateLimitsDb: Tuple[float, float, float, float]
+    perChain: Tuple[WifiSpectralMaskChainMeasurement, ...]
+    passed: bool
+    minimumMarginDb: float
+    maximumViolationDb: float
+    worstChainIndex: int
+    worstFrequencyHz: float
+
+
 @dataclass
 class PowerEvmCurve:
     """Store a multi-method EVM sweep over absolute PA output powers."""
@@ -290,6 +343,7 @@ class Analysis:
         ``resultAnalysis = Analysis(referenceSignal, waveform)``
         ``resultAnalysis = Analysis(None, waveform)``
         ``metrics = resultAnalysis.Analyze(paOutput)``
+        ``mask = resultAnalysis.MeasureWifiSpectralMask(paOutput)``
         ``irrMeasurement = resultAnalysis.MeasureIrr(paOutput)``
         ``receiveAnalysis = Analysis(receivedWifiFrame)``
         ``metrics = receiveAnalysis.Analyze()``
@@ -371,6 +425,7 @@ class Analysis:
                 "activeGapToleranceSamples": 16,
                 "sampleRateHz": None,
                 "channelBandwidthHz": None,
+                "wifiMaskFrameFormat": None,
                 "assistedMaximumOffsetSamples": 2000,
                 "assistedReferenceSearchSamples": 32768,
                 "assistedMinimumCorrelation": 0.12,
@@ -832,6 +887,29 @@ class Analysis:
             raise ValueError(
                 "channelBandwidthHz must be finite and positive when supplied"
             )
+        wifiMaskFrameFormat = self.parameters["wifiMaskFrameFormat"]
+        if wifiMaskFrameFormat is not None:
+            if not isinstance(wifiMaskFrameFormat, str):
+                raise TypeError(
+                    "wifiMaskFrameFormat must be a string or None"
+                )
+            normalizedMaskFormat = wifiMaskFrameFormat.strip().upper()
+            supportedMaskFormats = {
+                "VHT",
+                "HE",
+                "EHT",
+                "11AC",
+                "11AX",
+                "11BE",
+                "802.11AC",
+                "802.11AX",
+                "802.11BE",
+            }
+            if normalizedMaskFormat not in supportedMaskFormats:
+                raise ValueError(
+                    "wifiMaskFrameFormat must be VHT/11ac, HE/11ax, "
+                    "EHT/11be, or None"
+                )
         if (
             resolvedBandwidth is not None
             and float(resolvedSampleRate)
@@ -1910,6 +1988,570 @@ class Analysis:
             preparedSignal
         )
         return perChainAclr
+
+    @staticmethod
+    def ResolveWifiSpectralMaskTemplate(
+        frameFormat: str,
+        bandwidthMhz: int,
+    ) -> WifiSpectralMaskTemplate:
+        """Resolve one relative VHT, HE, or EHT emission-mask template.
+
+        Processing details:
+            Algorithm: Normalize IEEE-generation aliases, select the four
+            positive-frequency breakpoints associated with the requested
+            channel width, and pair them with the 0, -20, -28, and -40 dBr
+            limits. The table is function-local so the module retains no
+            mutable or hidden global configuration.
+
+        Args:
+            frameFormat: VHT/11ac, HE/11ax, or EHT/11be PHY name.
+            bandwidthMhz: Nominal channel width in megahertz.
+
+        Returns:
+            result: Ordinary dictionary containing the symmetric mask's
+                positive-frequency breakpoints and measurement bandwidths.
+        """
+
+        if not isinstance(frameFormat, str):
+            raise TypeError("frameFormat must be a string")
+        if not isinstance(bandwidthMhz, int) or isinstance(
+            bandwidthMhz, bool
+        ):
+            raise TypeError("bandwidthMhz must be an integer")
+        formatAliases = MappingProxyType(
+            {
+                "VHT": "VHT",
+                "11AC": "VHT",
+                "802.11AC": "VHT",
+                "HE": "HE",
+                "11AX": "HE",
+                "802.11AX": "HE",
+                "EHT": "EHT",
+                "11BE": "EHT",
+                "802.11BE": "EHT",
+            }
+        )
+        normalizedInput = frameFormat.strip().upper()
+        if normalizedInput not in formatAliases:
+            raise ValueError(
+                "frameFormat must be VHT/11ac, HE/11ax, or EHT/11be"
+            )
+        normalizedFormat = formatAliases[normalizedInput]
+        vhtBreakpointsMhz = MappingProxyType(
+            {
+                20: (9.0, 11.0, 20.0, 30.0),
+                40: (19.0, 21.0, 40.0, 60.0),
+                80: (39.0, 41.0, 80.0, 120.0),
+                160: (79.0, 81.0, 160.0, 240.0),
+            }
+        )
+        heBreakpointsMhz = MappingProxyType(
+            {
+                20: (9.75, 10.25, 20.0, 30.0),
+                40: (19.5, 20.5, 40.0, 60.0),
+                80: (39.5, 40.5, 80.0, 120.0),
+                160: (79.5, 80.5, 160.0, 240.0),
+            }
+        )
+        ehtBreakpointsMhz = MappingProxyType(
+            {
+                20: (9.75, 10.5, 20.0, 30.0),
+                40: (19.5, 20.5, 40.0, 60.0),
+                80: (39.5, 40.5, 80.0, 120.0),
+                160: (79.5, 80.5, 160.0, 240.0),
+                320: (159.5, 160.5, 320.0, 480.0),
+            }
+        )
+        breakpointsByFormat = MappingProxyType(
+            {
+                "VHT": vhtBreakpointsMhz,
+                "HE": heBreakpointsMhz,
+                "EHT": ehtBreakpointsMhz,
+            }
+        )
+        selectedBreakpoints = breakpointsByFormat[normalizedFormat]
+        if bandwidthMhz not in selectedBreakpoints:
+            supportedWidths = ", ".join(
+                str(value) for value in selectedBreakpoints
+            )
+            raise ValueError(
+                f"{normalizedFormat} spectral-mask bandwidthMhz must be "
+                f"one of {supportedWidths}"
+            )
+        frequencyOffsetsHz = tuple(
+            float(value) * 1.0e6
+            for value in selectedBreakpoints[bandwidthMhz]
+        )
+        return {
+            "frameFormat": normalizedFormat,
+            "bandwidthMhz": bandwidthMhz,
+            "templateName": (
+                f"{normalizedFormat}-{bandwidthMhz}MHz-relative-SEM"
+            ),
+            "frequencyOffsetsHz": cast(
+                Tuple[float, float, float, float],
+                frequencyOffsetsHz,
+            ),
+            "limitsDb": (0.0, -20.0, -28.0, -40.0),
+            "resolutionBandwidthHz": 100.0e3,
+            "videoBandwidthHz": (
+                30.0e3 if normalizedFormat == "VHT" else 7.5e3
+            ),
+            # A complete centered RBW window must fit at both outer mask
+            # breakpoints. The extra nominal RBW avoids advertising the
+            # Nyquist span itself as a usable measurement clock.
+            "minimumSampleRateHz": (
+                2.0 * frequencyOffsetsHz[-1] + 100.0e3
+            ),
+        }
+
+    def CalculatePreparedWifiSpectralMask(
+        self, preparedSignal: np.ndarray
+    ) -> WifiSpectralMaskMeasurement:
+        """Measure a prepared Wi-Fi signal against its automatic mask.
+
+        Processing details:
+            Algorithm: Resolve format and bandwidth from retained Wi-Fi
+            metadata or an explicit metadata-less fallback, time-gate the
+            format-specific data field, calculate one Welch spectrum per
+            conducted transmit chain, integrate adjacent bins into a
+            100 kHz-equivalent resolution bandwidth, normalize each chain to
+            its own in-band peak spectral density, interpolate the symmetric
+            dBr template, and report limit-minus-measurement margin only over
+            the transition and out-of-band regions. All chains must pass.
+
+        Args:
+            preparedSignal: Finite signal already mapped to this Analysis
+                instance's reference grid. It may come from
+                ``PrepareMeasuredSignal`` when the caller intentionally wants
+                to score an externally compensated waveform.
+
+        Returns:
+            result: Detailed ordinary dictionary containing template,
+                frequency, per-chain PSD, margin, and pass/fail data.
+        """
+
+        self.ValidateParameters()
+        complexMeasured = self.ValidatePreparedSignal(preparedSignal)
+        measuredMatrix = (
+            complexMeasured.reshape(-1, 1)
+            if complexMeasured.ndim == 1
+            else complexMeasured
+        )
+        if self.waveform is not None:
+            resolvedFormat = self.waveform.frameFormat
+            bandwidthMhzFloat = self.waveform.bandwidthHz / 1.0e6
+            metadataSource = (
+                "parsedWifiFrame"
+                if self.analysisMode == "blind"
+                else "wifiWaveform"
+            )
+            dataSlice = self.waveform.fieldSlices[
+                self.waveform.dataFieldName
+            ]
+            if (
+                dataSlice.start is None
+                or dataSlice.stop is None
+                or dataSlice.start < 0
+                or dataSlice.stop > measuredMatrix.shape[0]
+                or dataSlice.stop <= dataSlice.start
+            ):
+                raise ValueError(
+                    "Wi-Fi data-field slice is outside preparedSignal"
+                )
+            analysisMatrix = measuredMatrix[dataSlice, :]
+            measurementScope = "dataField"
+        else:
+            resolvedFormatValue = self.parameters["wifiMaskFrameFormat"]
+            if resolvedFormatValue is None:
+                raise ValueError(
+                    "Wi-Fi spectral-mask analysis requires frame metadata; "
+                    "supply a WifiWaveform, use blind analysis for a complete "
+                    "project-generated frame, or set wifiMaskFrameFormat "
+                    "with sampleRateHz and channelBandwidthHz"
+                )
+            if self.channelBandwidthHz is None:
+                raise ValueError(
+                    "channelBandwidthHz is required with "
+                    "wifiMaskFrameFormat"
+                )
+            resolvedFormat = cast(str, resolvedFormatValue)
+            bandwidthMhzFloat = self.channelBandwidthHz / 1.0e6
+            metadataSource = "configuredFallback"
+            activeDetector = PowerCalibration(
+                parameters={
+                    "loadResistanceOhm": self.parameters[
+                        "loadResistanceOhm"
+                    ],
+                    "maximumOutputPowerDbm": self.parameters[
+                        "maximumOutputPowerDbm"
+                    ],
+                    "activePowerThresholdDb": self.parameters[
+                        "activePowerThresholdDb"
+                    ],
+                    "activeGapToleranceSamples": self.parameters[
+                        "activeGapToleranceSamples"
+                    ],
+                    "width": 0,
+                }
+            )
+            activeMask = activeDetector.FindActiveSampleMask(
+                measuredMatrix
+            )
+            activeMatrix = (
+                activeMask.reshape(-1, 1)
+                if activeMask.ndim == 1
+                else activeMask
+            )
+            activeIndices = np.flatnonzero(np.any(activeMatrix, axis=1))
+            if activeIndices.size == 0:
+                raise ValueError(
+                    "unable to locate an active Wi-Fi measurement interval"
+                )
+            analysisMatrix = measuredMatrix[
+                int(activeIndices[0]):int(activeIndices[-1]) + 1,
+                :,
+            ]
+            measurementScope = "activeAssistedOverlap"
+        roundedBandwidthMhz = int(round(bandwidthMhzFloat))
+        if not np.isclose(
+            bandwidthMhzFloat,
+            float(roundedBandwidthMhz),
+            rtol=0.0,
+            atol=1.0e-9,
+        ):
+            raise ValueError(
+                "Wi-Fi mask bandwidth must be an integer number of MHz"
+            )
+        template = self.ResolveWifiSpectralMaskTemplate(
+            resolvedFormat,
+            roundedBandwidthMhz,
+        )
+        if self.sampleRateHz < template["minimumSampleRateHz"]:
+            raise ValueError(
+                "sampleRateHz does not cover the complete Wi-Fi spectral "
+                f"mask; {template['templateName']} requires at least "
+                f"{template['minimumSampleRateHz']:g} Hz"
+            )
+        if analysisMatrix.shape[0] < 16:
+            raise ValueError(
+                "Wi-Fi data field is too short for spectral-mask analysis"
+            )
+
+        perChainSpectra = []
+        frequencyBins = None
+        frequencyResolutionHz = 0.0
+        rbwWeights = np.ones(1, dtype=float)
+        equivalentResolutionBandwidthHz = 0.0
+        for chainIndex in range(analysisMatrix.shape[1]):
+            chainBins, chainPsd = AveragePeriodogram(
+                analysisMatrix[:, chainIndex],
+                self.sampleRateHz,
+                int(self.parameters["maxSegmentLength"]),
+            )
+            if chainBins.size < 2:
+                raise RuntimeError(
+                    "unable to resolve Wi-Fi spectral-mask frequency bins"
+                )
+            chainResolutionHz = float(chainBins[1] - chainBins[0])
+            if (
+                chainResolutionHz
+                > template["resolutionBandwidthHz"]
+            ):
+                raise ValueError(
+                    "Wi-Fi data field is too short for the 100 kHz mask "
+                    "resolution bandwidth"
+                )
+            if frequencyBins is None:
+                frequencyBins = chainBins
+                frequencyResolutionHz = chainResolutionHz
+                halfRbwHz = (
+                    0.5 * template["resolutionBandwidthHz"]
+                )
+                maximumOffsetIndex = int(
+                    np.ceil(
+                        halfRbwHz / frequencyResolutionHz + 0.5
+                    )
+                )
+                binOffsetsHz = (
+                    np.arange(
+                        -maximumOffsetIndex,
+                        maximumOffsetIndex + 1,
+                        dtype=float,
+                    )
+                    * frequencyResolutionHz
+                )
+                binLowerEdgesHz = (
+                    binOffsetsHz - 0.5 * frequencyResolutionHz
+                )
+                binUpperEdgesHz = (
+                    binOffsetsHz + 0.5 * frequencyResolutionHz
+                )
+                overlapWidthsHz = np.maximum(
+                    0.0,
+                    np.minimum(binUpperEdgesHz, halfRbwHz)
+                    - np.maximum(binLowerEdgesHz, -halfRbwHz),
+                )
+                nonzeroWeights = overlapWidthsHz > (
+                    np.finfo(float).eps
+                    * template["resolutionBandwidthHz"]
+                )
+                firstWeightIndex = int(np.flatnonzero(nonzeroWeights)[0])
+                lastWeightIndex = int(
+                    np.flatnonzero(nonzeroWeights)[-1]
+                )
+                rbwWeights = (
+                    overlapWidthsHz[
+                        firstWeightIndex:lastWeightIndex + 1
+                    ]
+                    / frequencyResolutionHz
+                )
+                equivalentResolutionBandwidthHz = (
+                    float(np.sum(rbwWeights))
+                    * frequencyResolutionHz
+                )
+            elif not np.array_equal(frequencyBins, chainBins):
+                raise RuntimeError(
+                    "conducted chains produced inconsistent frequency bins"
+                )
+            halfKernelLength = rbwWeights.size // 2
+            if halfKernelLength == 0:
+                rbwSpectrum = chainPsd.copy()
+            else:
+                periodicPsd = np.pad(
+                    chainPsd,
+                    (halfKernelLength, halfKernelLength),
+                    mode="wrap",
+                )
+                rbwSpectrum = np.convolve(
+                    periodicPsd,
+                    rbwWeights,
+                    mode="valid",
+                )
+            perChainSpectra.append(rbwSpectrum)
+        if frequencyBins is None:
+            raise RuntimeError("unable to calculate a Wi-Fi mask spectrum")
+
+        absoluteFrequency = np.abs(frequencyBins)
+        offsets = template["frequencyOffsetsHz"]
+        limits = template["limitsDb"]
+        interpolationOffsets = np.asarray(
+            (0.0, *offsets), dtype=float
+        )
+        interpolationLimits = np.asarray(
+            (limits[0], *limits), dtype=float
+        )
+        maskLimitDb = np.interp(
+            absoluteFrequency,
+            interpolationOffsets,
+            interpolationLimits,
+            left=limits[0],
+            right=limits[-1],
+        )
+        usableFrequencyLimitHz = (
+            0.5 * self.sampleRateHz
+            - 0.5 * equivalentResolutionBandwidthHz
+        )
+        if usableFrequencyLimitHz < offsets[-1]:
+            raise ValueError(
+                "sampleRateHz leaves no complete resolution-bandwidth bin "
+                "at the outer Wi-Fi mask breakpoint"
+            )
+        evaluationMask = (
+            (absoluteFrequency > offsets[0])
+            & (absoluteFrequency <= usableFrequencyLimitHz)
+        )
+        if not np.any(evaluationMask):
+            raise RuntimeError("Wi-Fi mask has no evaluable frequency bins")
+
+        chainMeasurements = []
+        for rbwSpectrum in perChainSpectra:
+            referenceMask = absoluteFrequency <= offsets[0]
+            referencePsd = float(np.max(rbwSpectrum[referenceMask]))
+            if not np.isfinite(referencePsd) or referencePsd <= 0.0:
+                raise ValueError(
+                    "Wi-Fi spectrum has no positive in-band reference power"
+                )
+            measuredPsdDb = 10.0 * np.log10(
+                np.maximum(rbwSpectrum / referencePsd, 1.0e-30)
+            )
+            marginDb = maskLimitDb - measuredPsdDb
+            evaluatedIndices = np.flatnonzero(evaluationMask)
+            localWorstIndex = int(
+                np.argmin(marginDb[evaluationMask])
+            )
+            worstIndex = int(evaluatedIndices[localWorstIndex])
+            minimumMarginDb = float(marginDb[worstIndex])
+            chainMeasurements.append(
+                {
+                    "passed": bool(minimumMarginDb >= 0.0),
+                    "minimumMarginDb": minimumMarginDb,
+                    "maximumViolationDb": float(
+                        max(0.0, -minimumMarginDb)
+                    ),
+                    "worstFrequencyHz": float(
+                        frequencyBins[worstIndex]
+                    ),
+                    "measuredPsdDb": measuredPsdDb,
+                    "marginDb": marginDb,
+                }
+            )
+        minimumMargins = np.asarray(
+            [
+                chainMeasurement["minimumMarginDb"]
+                for chainMeasurement in chainMeasurements
+            ],
+            dtype=float,
+        )
+        worstChainIndex = int(np.argmin(minimumMargins))
+        worstMeasurement = chainMeasurements[worstChainIndex]
+        return {
+            "assessmentType": "relativeDbrPrecheck",
+            "certificationResult": None,
+            "frameFormat": template["frameFormat"],
+            "bandwidthMhz": template["bandwidthMhz"],
+            "sampleRateHz": self.sampleRateHz,
+            "templateName": template["templateName"],
+            "analysisMode": self.analysisMode,
+            "metadataSource": metadataSource,
+            "measurementScope": measurementScope,
+            "resolutionBandwidthHz": template[
+                "resolutionBandwidthHz"
+            ],
+            "equivalentResolutionBandwidthHz": (
+                equivalentResolutionBandwidthHz
+            ),
+            "videoBandwidthHz": template["videoBandwidthHz"],
+            "frequencyResolutionHz": frequencyResolutionHz,
+            "frequencyBinsHz": frequencyBins,
+            "maskLimitDb": maskLimitDb,
+            "evaluationMask": evaluationMask,
+            "templateFrequencyOffsetsHz": offsets,
+            "templateLimitsDb": limits,
+            "perChain": cast(
+                Tuple[WifiSpectralMaskChainMeasurement, ...],
+                tuple(chainMeasurements),
+            ),
+            "passed": bool(
+                all(
+                    chainMeasurement["passed"]
+                    for chainMeasurement in chainMeasurements
+                )
+            ),
+            "minimumMarginDb": float(
+                worstMeasurement["minimumMarginDb"]
+            ),
+            "maximumViolationDb": float(
+                worstMeasurement["maximumViolationDb"]
+            ),
+            "worstChainIndex": worstChainIndex,
+            "worstFrequencyHz": float(
+                worstMeasurement["worstFrequencyHz"]
+            ),
+        }
+
+    def MeasureWifiSpectralMask(
+        self, measuredSignal: Optional[np.ndarray] = None
+    ) -> WifiSpectralMaskMeasurement:
+        """Measure a raw Wi-Fi capture against its relative spectral mask.
+
+        Processing details:
+            Algorithm: Select the explicit measured signal or the retained
+            assisted/blind capture, decode the public fixed-point boundary,
+            locate only the integer common interval without filtering or
+            resampling the capture, map it onto the reference sample grid,
+            and delegate the data field to the per-chain mask evaluator.
+            EVM-oriented CFO, fractional-delay, SFO, and complex-gain
+            compensation are intentionally excluded because they can alter
+            the transmitter spectrum being measured. This method remains
+            separate from ``Analyze`` so callers do not pay for an additional
+            spectrum when only EVM or ACLR is requested.
+
+        Args:
+            measuredSignal: Optional public floating or fixed-point capture.
+                Omit it in transmit-assisted and blind modes.
+
+        Returns:
+            result: Detailed relative dBr mask measurement dictionary.
+        """
+
+        selectedSignal = measuredSignal
+        if selectedSignal is None:
+            if self.defaultMeasuredSignal is None:
+                raise ValueError(
+                    "measuredSignal is required when Analysis was constructed "
+                    "in explicit-reference mode"
+                )
+            selectedSignal = self.defaultMeasuredSignal
+        self.ValidateParameters()
+        decodedSignal = self.interfaceFormat.DecodeComplex(selectedSignal)
+        referenceMatrix = (
+            self.referenceSignal.reshape(-1, 1)
+            if self.referenceSignal.ndim == 1
+            else self.referenceSignal
+        )
+        inputWasVector = self.referenceSignal.ndim == 1
+        if inputWasVector and decodedSignal.ndim == 1:
+            measuredMatrix = decodedSignal.reshape(-1, 1)
+        elif decodedSignal.ndim == 2:
+            measuredMatrix = decodedSignal
+        else:
+            raise ValueError(
+                "measuredSignal must have one column per transmit chain"
+            )
+        if measuredMatrix.shape[1] != referenceMatrix.shape[1]:
+            raise ValueError(
+                "measuredSignal must have one column per transmit chain"
+            )
+        if measuredMatrix.shape[0] == 0 or not np.all(
+            np.isfinite(measuredMatrix)
+        ):
+            raise ValueError("measuredSignal must contain finite samples")
+
+        overlap = SigProc.EstimateSignalOverlap(
+            measuredMatrix,
+            referenceMatrix,
+            cast(
+                int,
+                self.parameters["assistedMaximumOffsetSamples"],
+            ),
+            cast(
+                int,
+                self.parameters["assistedReferenceSearchSamples"],
+            ),
+            cast(
+                float,
+                self.parameters["assistedMinimumCorrelation"],
+            ),
+        )
+        referenceStart = overlap.referenceStartSample
+        referenceStop = referenceStart + overlap.overlapLength
+        measuredStart = overlap.receivedStartSample
+        measuredStop = measuredStart + overlap.overlapLength
+        if self.waveform is not None:
+            dataSlice = self.waveform.fieldSlices[
+                self.waveform.dataFieldName
+            ]
+            dataStart = 0 if dataSlice.start is None else dataSlice.start
+            dataStop = (
+                referenceMatrix.shape[0]
+                if dataSlice.stop is None
+                else dataSlice.stop
+            )
+            if referenceStart > dataStart or referenceStop < dataStop:
+                raise ValueError(
+                    "measuredSignal does not contain the complete Wi-Fi "
+                    "data field required for spectral-mask analysis"
+                )
+        referenceGrid = np.zeros_like(referenceMatrix)
+        referenceGrid[referenceStart:referenceStop, :] = measuredMatrix[
+            measuredStart:measuredStop,
+            :,
+        ]
+        preparedSignal = (
+            referenceGrid[:, 0] if inputWasVector else referenceGrid
+        )
+        return self.CalculatePreparedWifiSpectralMask(preparedSignal)
 
     def Analyze(
         self, measuredSignal: Optional[np.ndarray] = None

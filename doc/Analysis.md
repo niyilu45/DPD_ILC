@@ -1,13 +1,14 @@
-# 结果计算：SNR、EVM、IRR、ACLR 与功率–EVM 曲线原理
+# 结果计算：SNR、EVM、IRR、ACLR、Wi-Fi频谱Mask与功率–EVM曲线原理
 
-本文解释 `inc/lib/Analysis.py` 中结果统计的物理含义和公式推导。分析器始终需要一段发送参考样值，但参考来源有三种：调用方显式提供理想参考、调用方提供实际发送波形，或者在完全盲分析时由 `ParseWifi` 从接收帧恢复。只有严格的Wi-Fi子载波EVM需要 `WifiWaveform` 元数据；已知发送NumPy样值时无需猜测MCS、GI或seed，也能直接计算波形域EVM和SNR。待测信号可以来自PA模型、Channel、线缆、接收机、仪器抓包、普通算法输出、ILC或部署型DPD；Analysis对来源没有强制依赖，统一计算：
+本文解释 `inc/lib/Analysis.py` 中结果统计的物理含义和公式推导。分析器始终需要一段发送参考样值，但参考来源有三种：调用方显式提供理想参考、调用方提供实际发送波形，或者在完全盲分析时由 `ParseWifi` 从接收帧恢复。严格的Wi-Fi子载波EVM需要 `WifiWaveform` 元数据；Wi-Fi Mask至少需要可靠的格式、带宽和采样率。已知发送NumPy样值时无需猜测MCS、GI或seed，也能直接计算波形域EVM和SNR；若另外显式给出Mask所需物理元数据，还能走不解析Descriptor的回退测量。待测信号可以来自PA模型、Channel、线缆、接收机、仪器抓包、普通算法输出、ILC或部署型DPD；Analysis对来源没有强制依赖，统一计算：
 
 - 数据字段时域 SNR；
 - Wi-Fi 数据子载波 RMS EVM；
 - 上、下邻道 ACLR；
+- VHT/HE/EHT逐传导链相对发射频谱Mask；
 - 多方法功率–EVM 曲线。
 
-> **重要定义**：进入指标计算前，`Analysis` 会调用 `SigProc` 消除整数/分数时延、载波频偏、采样频偏和最佳公共复增益。这里的 SNR 是校正后理想信号功率与全部残差功率之比；残差仍包含随机噪声、PA 非线性、记忆失真和同步估计残差，因此不一定等于仪器意义上的纯热噪声 SNR。
+> **重要定义**：普通 `Analyze`、SNR、EVM、IRR和ACLR路径会调用 `SigProc` 消除整数/分数时延、载波频偏、采样频偏和最佳公共复增益。这里的 SNR 是校正后理想信号功率与全部残差功率之比；残差仍包含随机噪声、PA 非线性、记忆失真和同步估计残差，因此不一定等于仪器意义上的纯热噪声 SNR。公开 `MeasureWifiSpectralMask` 是例外：为避免重采样、复增益补偿和边界插值改变原始发射谱，它只对接口解码后的原始capture做整数重叠定位与数据字段门控，不进入EVM的CFO、分数时延、SFO或复增益校正链。
 
 > **性能说明**：一次MIMO `Analyze()`中，汇总/逐流EVM共享各一次参考和测量解调，汇总/逐链ACLR共享每链一次PSD；功率-EVM扫描只计算EVM，ILC最佳轮直接复用逐轮已算指标。公开参考、Wi-Fi元数据、测量波形及最终metrics都不会跨调用缓存，避免调用方修改对象后得到陈旧结果。优化原理、典型耗时和使用建议见 [Performance.md](./Performance.md)。
 
@@ -40,9 +41,19 @@ flowchart TB
     corrected --> J["数据字段 Welch PSD"]
     J --> K["主信道与上下邻道积分"]
     K --> L["ACLR-L / ACLR-U / Worst"]
+    C --> maskCapture["原始解码capture"]
+    assistedReceive --> maskCapture
+    parser --> maskCapture
+    A --> maskGate["整数重叠定位 + Data字段门控"]
+    maskCapture --> maskGate
+    maskGate --> maskRbw["Welch + 100 kHz重叠加权RBW"]
+    metadata --> maskTemplate["自动选择VHT / HE / EHT模板"]
+    maskTemplate --> maskCompare["逐链dBr与Mask比较"]
+    maskRbw --> maskCompare
+    maskCompare --> maskResult["Margin / PASS / 画图数组"]
 ```
 
-**图 1 说明**：显式Reference模式不调用Parser；发送辅助模式只对两路样值做公共区间搜索，也不调用Parser；只有盲模式先由 `ParseWifi` 恢复参考和元数据。之后每个待测信号只执行一次 `SigProc.Process`，SNR、EVM、ACLR共用同一份校正样点。具有 `WifiWaveform` 元数据时，EVM由 `FrameProcess` 在去CP、FFT、撤销CSD和空间解映射后的数据子载波上计算；纯NumPy发送辅助模式则在公共时域样值上计算归一化EVM。三者观察的是不同维度，不能用单一指标替代全部结果。
+**图 1 说明**：显式Reference模式不调用Parser；发送辅助模式只对两路样值做公共区间搜索，也不调用Parser；只有盲模式先由 `ParseWifi` 恢复参考和元数据。普通 `Analyze` 让SNR、EVM和ACLR共用同一份 `SigProc` 校正样点；具有 `WifiWaveform` 元数据时，EVM再由 `FrameProcess` 完成去CP、FFT、撤销CSD和空间解映射。Wi-Fi频谱Mask使用独立的 `MeasureWifiSpectralMask` 原始capture路径：只做整数重叠定位和Data字段门控，再直接估计频谱，不执行CFO、分数时延、SFO、公共复增益或插值重采样。这样既保留真实带外谱，也避免普通 `Analyze` 为只测EVM额外生成PSD。各指标观察的是不同维度，不能用单一指标替代全部结果。
 
 ### 1.1 三种Analysis构造方式
 
@@ -1403,7 +1414,7 @@ P_{\mathrm{upper}}=\sum_{k\in\mathcal B_{\mathrm{upper}}}\hat P[k].
 
 ---
 
-## 7. 为什么 EVM 和 ACLR 必须同时看
+## 7. 为什么 EVM、ACLR和Mask必须同时看
 
 ```mermaid
 flowchart TB
@@ -1411,11 +1422,13 @@ flowchart TB
     A --> C["带外泄漏"]
     B --> D["EVM / 时域残差 SNR"]
     C --> E["ACLR"]
+    C --> G["逐频率Wi-Fi相对Mask"]
     F["某些补偿可能改善带内<br/>但放大带外或峰值"] -.-> D
     F -.-> E
+    F -.-> G
 ```
 
-**图 6 说明**：EVM 主要关注接收星座，ACLR 主要关注对邻道的干扰。某个算法可能把带内拟合得很好，却产生过高峰值或带外噪声；也可能频谱改善明显但星座仍受记忆误差影响。所以至少需要联合查看 EVM、ACLR 和输入峰值/收敛性。
+**图 6 说明**：EVM主要关注接收星座，ACLR把邻道泄漏积分成标量，Mask逐频率检查模板折点和远端底线。某个算法可能把带内拟合得很好，却产生过高峰值或窄带带外尖峰；这个尖峰可能被ACLR宽带积分稀释，却被Mask立即发现。也可能频谱改善明显但星座仍受记忆误差影响。所以至少需要联合查看EVM、ACLR、Mask和输入峰值/收敛性。
 
 ---
 
@@ -1752,6 +1765,9 @@ ILC 每轮收敛结果另外输出：
 | 单独IM3、IM5、IM7 | `Analysis.CalculateIm3` / `CalculateIm5` / `CalculateIm7` |
 | Welch PSD | `AveragePeriodogram` |
 | ACLR | `Analysis.CalculateAclr` |
+| Wi-Fi相对Mask模板 | `Analysis.ResolveWifiSpectralMaskTemplate` |
+| 调用方显式预处理后的Wi-Fi相对Mask | `Analysis.CalculatePreparedWifiSpectralMask` |
+| 原始capture的Wi-Fi相对Mask | `Analysis.MeasureWifiSpectralMask` |
 | 指标字典汇总 | `Analysis.Analyze` |
 | 多阶段批量统计 | `Analysis.AnalyzeStages` |
 | SISO逐轮ILC性能与EVM最佳轮 | `Analysis.AnalyzeIlcHistory` |
@@ -2386,7 +2402,7 @@ Analysis(
 
 两种结果都是普通字典。定点调用中的 `referenceSignal` 和 `receivedSignal` 必须来自相同位宽的模块公开接口，不能把已解码的小于1浮点值或已经换算成伏特的功率标定副本冒充整数码。`width=` 直接参数仍可作为最高优先级便捷写法；放入 `parameters` 时则与其他Analysis配置共同进入 `ChainMap`。可以通过 `resultAnalysis.GetParameters()["width"]` 或 `resultAnalysis.width` 读取最终解析值。定点码值、舍入、饱和和EVM近似推导见 [FixedPoint.md](./FixedPoint.md)。
 
-盲模式会把完整 `parseParameters` 交给 `ParseWifi`。发送辅助模式不会调用Parser，但为兼容旧程序，可从该映射转交 `sampleRateHz` 和 `channelBandwidthHz`；直接Analysis参数仍具有更高优先级。纯NumPy发送辅助模式中，采样率让CFO估计使用真实Hz单位，带宽与采样率一起定义ACLR积分频带。发送辅助模式即使没有这两个物理量，也会继续完成时延、归一化CFO、SFO、复增益、EVM和SNR计算，只把无法定义的ACLR返回为 `NaN`。
+盲模式会把完整 `parseParameters` 交给 `ParseWifi`。发送辅助模式不会调用Parser，但为兼容旧程序，可从该映射转交 `sampleRateHz` 和 `channelBandwidthHz`；直接Analysis参数仍具有更高优先级。纯NumPy发送辅助模式中，采样率让CFO估计使用真实Hz单位，带宽与采样率一起定义ACLR积分频带。发送辅助模式即使没有这两个物理量，也会继续完成时延、归一化CFO、SFO、复增益、EVM和SNR计算，只把无法定义的ACLR返回为 `NaN`。纯NumPy Mask还必须通过Analysis的 `parameters` 或关键字覆盖提供 `wifiMaskFrameFormat`；该配置不放在 `parseParameters` 中，因为此路径明确不调用Parser。
 
 ### 11.11 不依赖ILC的功率–EVM扫描
 
@@ -2503,6 +2519,7 @@ EVM/SNR 去除了一个标量增益和相位。如果要研究 AM-AM 平均增�
 |---|---|---|
 | 判断带内调制质量 | EVM | SNR、星座图 |
 | 判断邻道干扰 | ACLR | 频谱图、远端带外 |
+| 定位Wi-Fi逐频率带外超限 | 相对发射频谱Mask最小Margin | ACLR、上下边带最差频率、绝对仪表复测 |
 | 判断 ILC 迭代是否收敛 | EVM/NMSE 历史 | 输入峰值、ACLR |
 | 判断跨功率泛化 | 功率–EVM 曲线 | 各点 ACLR、系数稳定性 |
 | 判断 IQ 镜像 | 上下邻道不对称、镜像谱 | EVM、镜像抑制度 |
@@ -2517,7 +2534,10 @@ EVM/SNR 去除了一个标量增益和相位。如果要研究 AM-AM 平均增�
 - [P. D. Welch, “The Use of Fast Fourier Transform for the Estimation of Power Spectra,” 1967](https://doi.org/10.1109/TAU.1967.1161901)
 - [ETSI TS 138 104：ACLR 的滤波平均功率比定义示例，见 6.6.3](https://www.etsi.org/deliver/etsi_TS/138100_138199/138104/16.21.00_60/ts_138104v162100p.pdf)
 - [IEEE 802.11ax-2021 标准页面](https://standards.ieee.org/ieee/802.11ax/7180/)
-- [IEEE 802.11be-2024 标准页面](https://standards.ieee.org/ieee/802.11be/7516/)
+- [IEEE 802.11be-2024最终标准页面](https://standards.ieee.org/ieee/802.11be/7516/)
+- [Rohde & Schwarz：802.11ac Technology Introduction，含VHT Mask折点及100 kHz/30 kHz测量带宽](https://scdn.rohde-schwarz.com/ur/pws/dl_downloads/dl_application/application_notes/1ma192/1MA192_7e_80211ac_technology.pdf)
+- [Rohde & Schwarz：IEEE 802.11ax Technology Introduction，含HE Mask折点及100 kHz/7.5 kHz测量带宽](https://scdn.rohde-schwarz.com/ur/pws/dl_downloads/premiumdownloads/premium_dl_brochures_and_datasheets/premium_dl_whitepaper/IEEE-802-11ax-Technology-Introduction_wp_3609-9470-52_v0100.pdf)
+- [Rohde & Schwarz：IEEE 802.11be Technology Introduction，Version 01.00，含EHT折点、320 MHz Mask与puncturing背景](https://scdn.rohde-schwarz.com/ur/pws/dl_downloads/premiumdownloads/premium_dl_brochures_and_datasheets/premium_dl_whitepaper/IEEE-802-11be-technology-introduction_wp_en_3683-4026-52_v0100.pdf)
 
 ETSI 链接用于说明 ACLR 的通用物理定义，不表示本工程采用 3GPP 的具体测量滤波器或限值；本工程的实际积分窗口以 `inc/lib/Analysis.py` 为准。
 
@@ -2778,3 +2798,409 @@ print(irrMeasurement["residualPowerRatio"])
 - IRR 随频率明显变化：需要带记忆的共轭支路，而不仅是一阶 $x^*$ 系数。
 - IRR 随输出功率变化：可能存在 PA 与 IQ 调制器级联产生的共轭非线性。
 - 使用真实仪器时，应先测量接收机自身 IRR；否则会把反馈接收机镜像错误地当成发射机镜像。
+
+---
+
+## 16. Wi-Fi相对发射频谱Mask
+
+### 16.1 指标目标与三个API
+
+发射频谱Mask回答“每个频偏处允许出现多高的相对谱密度”。它与ACLR的区别是：ACLR把一整段邻道功率积分成一个数；Mask逐频率比较曲线，能够指出最差链、最差频率和超限量。实现故意不把Mask计算嵌入 `Analyze()`，否则只需要EVM或SNR的调用也会额外执行每链Welch频谱。
+
+三个公开入口的职责为：
+
+| API | 输入 | 是否同步 | 用途 |
+|---|---|---|---|
+| `Analysis.ResolveWifiSpectralMaskTemplate(frameFormat, bandwidthMhz)` | 制式名称和标称带宽 | 否 | 静态查询折点、dBr限值、RBW/VBW元数据和带100 kHz边界护带的最低采样率；不需要构造 `Analysis` 实例 |
+| `Analysis.CalculatePreparedWifiSpectralMask(preparedSignal)` | 调用方显式准备且已匹配Analysis参考网格的信号 | 否 | 高级内核；不改变样值，也不替调用方执行或撤销任何同步、重采样与增益处理 |
+| `Analysis.MeasureWifiSpectralMask(measuredSignal=None)` | 原始浮点或定点接收capture | 仅整数定位 | 推荐公开总入口；接口解码后只做整数重叠定位和Data字段门控，再调用频谱内核 |
+
+`MeasureWifiSpectralMask` 返回独立的普通字典，不会改变最近一次 `Analyze()` 的指标字典。发送辅助或盲模式在构造时已经保存接收波形，因此可以省略 `measuredSignal`；显式Reference模式没有保存待测输出，必须传入。这里刻意不复用 `PrepareMeasuredSignal`：CFO旋转、分数时延/SFO插值、公共复增益相除和边界裁剪都可能改变原始频谱或噪声底，而发射Mask应该观察capture本身。只有调用方明确选择 `CalculatePreparedWifiSpectralMask` 时，才对调用方已经预处理好的数组评分。
+
+### 16.2 VHT、HE与EHT模板折点
+
+令复基带中心为0 Hz，$u=|f|$。表中只列正频率的四个折点 $A$、$B$、$C$、$D$；负频率一侧关于0 Hz对称。对应相对限值依次为0、-20、-28和-40 dBr，折点之间在dB域线性插值。
+
+| 格式 | 带宽MHz | $A$ MHz，0 dBr | $B$ MHz，-20 dBr | $C$ MHz，-28 dBr | $D$ MHz，-40 dBr |
+|---|---:|---:|---:|---:|---:|
+| VHT/11ac | 20 | 9.0 | 11.0 | 20.0 | 30.0 |
+| VHT/11ac | 40 | 19.0 | 21.0 | 40.0 | 60.0 |
+| VHT/11ac | 80 | 39.0 | 41.0 | 80.0 | 120.0 |
+| VHT/11ac | 160 | 79.0 | 81.0 | 160.0 | 240.0 |
+| HE/11ax | 20 | 9.75 | 10.25 | 20.0 | 30.0 |
+| HE/11ax | 40 | 19.5 | 20.5 | 40.0 | 60.0 |
+| HE/11ax | 80 | 39.5 | 40.5 | 80.0 | 120.0 |
+| HE/11ax | 160 | 79.5 | 80.5 | 160.0 | 240.0 |
+| EHT/11be | 20 | 9.75 | 10.5 | 20.0 | 30.0 |
+| EHT/11be | 40 | 19.5 | 20.5 | 40.0 | 60.0 |
+| EHT/11be | 80 | 39.5 | 40.5 | 80.0 | 120.0 |
+| EHT/11be | 160 | 79.5 | 80.5 | 160.0 | 240.0 |
+| EHT/11be | 320 | 159.5 | 160.5 | 320.0 | 480.0 |
+
+VHT模板返回 `resolutionBandwidthHz=100000` 和 `videoBandwidthHz=30000`；HE/EHT模板返回100 kHz RBW与7.5 kHz VBW。`frameFormat` 同时接受 `VHT`/`11ac`/`802.11ac`、`HE`/`11ax`/`802.11ax` 和 `EHT`/`11be`/`802.11be`，结果总是规范化为VHT、HE或EHT。
+
+EHT 20 MHz的第二折点按IEEE 802.11be-2024与Rohde & Schwarz《IEEE 802.11be Technology Introduction》Version 01.00表值采用10.5 MHz；HE 20 MHz仍按IEEE 802.11ax资料采用10.25 MHz。其余20/40/80/160 MHz折点看起来大体继承HE形状，但实现保留独立EHT表，避免把两个版本的20 MHz第二折点误合并。
+
+320 MHz需要特别区分两层能力：`ResolveWifiSpectralMaskTemplate("EHT", 320)` 已能返回折点，但当前 `WaveGenWifi` 和 `ParseWifi` 的带宽集合仍只有20/40/80/160 MHz。因此320 MHz只能用于调用方自行提供元数据与满足采样覆盖的外部波形，不能由当前工程生成，也不能从当前工程描述字段盲解析。
+
+### 16.3 dB域分段插值
+
+相对Mask函数记为 $L(f)$。在带内参考区：
+
+```math
+L(f)=0,\qquad 0\leq u\leq A.
+```
+
+从0 dBr下降到-20 dBr：
+
+```math
+L(f)=-20\frac{u-A}{B-A},\qquad A<u\leq B.
+```
+
+从-20 dBr下降到-28 dBr：
+
+```math
+L(f)=-20-8\frac{u-B}{C-B},\qquad B<u\leq C.
+```
+
+从-28 dBr下降到-40 dBr：
+
+```math
+L(f)=-28-12\frac{u-C}{D-C},\qquad C<u\leq D.
+```
+
+外侧继续保持-40 dBr：
+
+```math
+L(f)=-40,\qquad u>D.
+```
+
+代码使用 `numpy.interp` 在上述折点间直接对dB数值插值，不在线性功率域插值。`evaluationMask` 从 $u>A$ 开始；$u\leq A$ 的带内样点只用于建立0 dBr参考，不参与PASS判定。
+
+### 16.4 Welch频谱、100 kHz等效RBW与dBr归一化
+
+每条传导链先独立调用 `AveragePeriodogram`。设Welch分段FFT长度为 $N$，频率间隔为
+
+```math
+\Delta f=\frac{f_s}{N}.
+```
+
+每个FFT频点代表一个宽度为 $\Delta f$ 的频率区间。对第 $q$ 个bin定义
+
+```math
+\mathcal I_q
+=
+\left[
+f_q-\frac{\Delta f}{2},
+f_q+\frac{\Delta f}{2}
+\right].
+```
+
+在待评价中心频率 $f_k$ 处，定义宽度严格为 $B_{\mathrm{RBW}}=100\,000$ Hz的居中矩形RBW窗口
+
+```math
+\mathcal R_k
+=
+\left[
+f_k-\frac{B_{\mathrm{RBW}}}{2},
+f_k+\frac{B_{\mathrm{RBW}}}{2}
+\right].
+```
+
+bin与RBW窗口的重叠长度为
+
+```math
+\ell_{k,q}
+=
+\max\left(
+0,
+\min\left(
+f_q+\frac{\Delta f}{2},
+f_k+\frac{B_{\mathrm{RBW}}}{2}
+\right)
+-
+\max\left(
+f_q-\frac{\Delta f}{2},
+f_k-\frac{B_{\mathrm{RBW}}}{2}
+\right)
+\right).
+```
+
+线性功率权重取该bin被RBW覆盖的比例：
+
+```math
+w_{k,q}
+=
+\frac{\ell_{k,q}}{\Delta f},
+\qquad
+0\leq w_{k,q}\leq1.
+```
+
+因此完全落在窗口内的中心和内部bin使用权重1，两侧边缘bin可以使用0到1之间的分数权重。第 $c$ 条链的RBW功率为
+
+```math
+S_c[k]
+=
+\sum_q w_{k,q}\hat P_c[q].
+```
+
+离散时间频谱以 $f_s$ 为周期，`fftshift` 数组的负、正奈奎斯特端点是同一周期接缝。因此RBW卷积在数组两端使用周期回绕：窗口靠近 $-f_s/2$ 时缺少的左侧区间从 $+f_s/2$ 一端取得，靠近 $+f_s/2$ 时反向取得，而不是在边界外补零。这样最低允许采样率下贴近奈奎斯特边界的完整RBW也不会丢失功率。
+
+在完整RBW可测的有效频点上，全部重叠长度之和严格覆盖矩形窗口：
+
+```math
+B_{\mathrm{eq}}
+=
+\Delta f\sum_q w_{k,q}
+=
+B_{\mathrm{RBW}}
+=
+100\,000\ \mathrm{Hz}.
+```
+
+所以 `equivalentResolutionBandwidthHz` 在浮点容差内等于100 kHz，不再因FFT栅格只能选择整数个bin而变窄。若平坦噪声的双边PSD为 $N_0$，每个bin的期望功率为 $N_0\Delta f$，则
+
+```math
+\mathbb E\left[S_c[k]\right]
+=
+N_0\Delta f\sum_q w_{k,q}
+=
+N_0B_{\mathrm{RBW}}.
+```
+
+这说明分数边缘权重不会少计平坦噪声；若简单丢弃超出100 kHz的边缘bin，等效带宽偏窄时可能产生约1至2 dB的低估。若原始频率分辨率粗于100 kHz，函数仍拒绝给出Mask结论。
+
+每条链使用自身带内参考峰值
+
+```math
+R_c=\max_{|f_k|\leq A}S_c[k]
+```
+
+归一化为相对谱电平：
+
+```math
+P_{c,\mathrm{dBr}}[k]
+=
+10\log_{10}
+\left(
+\max\left(
+\frac{S_c[k]}{R_c},10^{-30}
+\right)
+\right).
+```
+
+因此 `perChain[c]["measuredPsdDb"]` 的物理含义是“相对该链带内峰值的100 kHz等效RBW谱电平”，实际单位是dBr。字段名保留 `Db` 是为了表示数组已经在对数域，并不表示绝对dBm或dBm/MHz。常数增益或公共相位不会改变相对Mask，但非线性频谱再生、削顶和带外噪声会降低Margin。
+
+模板中的 `videoBandwidthHz` 是标准测量设置元数据。当前数值实现通过Hann窗、50%重叠和多段线性功率平均降低方差，没有再实现仪表的检波后VBW低通。因此返回的7.5 kHz或30 kHz不能解释成“软件已经精确复现该VBW滤波器”。
+
+### 16.5 原始capture整数定位、数据字段门控与三种Analysis模式
+
+频谱估计必须避免把帧外补零、突发启停边缘和不同前导结构混为PA带外失真，也必须避免为了EVM对齐而对capture做分数插值。公开 `MeasureWifiSpectralMask` 的顺序固定为：
+
+1. 按 `width` 解码公开浮点或整数I/Q码，保留原始capture的复样值；
+2. 依据已知发送参考或盲解析结果寻找整数样点重叠，不估计或校正分数时延；
+3. 用 `WifiWaveform.fieldSlices[dataFieldName]` 映射到接收capture中的VHT/HE/EHT Data字段；
+4. 对这段未经CFO、SFO、复增益和插值重采样的样值直接计算逐链Welch频谱与Mask。
+
+Mask内核按可用元数据选择测量区间：
+
+| Analysis路径 | 格式与带宽来源 | 测量区间 | `metadataSource` | Parser |
+|---|---|---|---|---|
+| 显式Reference加 `WifiWaveform` | `waveform.frameFormat`、`waveform.bandwidthHz` | 原始capture整数重叠后的 `fieldSlices[dataFieldName]` | `wifiWaveform` | 不调用 |
+| 发送 `WifiWaveform` 辅助 | 发送对象元数据 | 原始接收capture整数重叠后的VHT/HE/EHT Data字段 | `wifiWaveform` | 不调用 |
+| 纯NumPy发送辅助 | `wifiMaskFrameFormat` 与 `channelBandwidthHz` | 活动检测得到的公共重叠包络 | `configuredFallback` | 不调用 |
+| 只有接收帧的盲分析 | `ParseWifi` 恢复的 `WifiWaveform` | Parser定位包后保留的原始Data字段capture | `parsedWifiFrame` | 只为恢复元数据与整数边界调用 |
+
+有 `WifiWaveform` 时，`measurementScope="dataField"`。程序按当前格式的 `VHT-Data`、`HE-Data` 或 `EHT-Data` 切片，不需要用户手工计算起止点。纯NumPy回退没有字段边界，程序用 `PowerCalibration.FindActiveSampleMask` 排除前后长补零，再取第一个到最后一个活动样点之间的公共包络，结果标为 `measurementScope="activeAssistedOverlap"`。这一路径不能仅靠频谱可靠地区分VHT、HE与EHT，所以不会猜测格式；缺少 `wifiMaskFrameFormat` 时直接提示调用方补充配置。
+
+`CalculatePreparedWifiSpectralMask` 是显式高级入口：它假设调用方已经把 `preparedSignal` 对齐到本Analysis的参考网格，然后直接门控与评分。它本身不调用 `PrepareMeasuredSignal`。如果调用方此前主动执行了CFO校正、分数时延/SFO重采样或复增益补偿，Mask看到的就是处理后的频谱；需要观察真实发射capture时应使用 `MeasureWifiSpectralMask`。
+
+最小显式Reference示例：
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+
+wifiWaveform = WaveGenWifi(
+    frameFormat="HE",
+    bandwidthMhz=20,
+    sampleRateHz=80.0e6,
+    numDataSymbols=16,
+    width=0,
+).Generate()
+resultAnalysis = Analysis(wifiWaveform.samples, wifiWaveform, width=0)
+maskResult = resultAnalysis.MeasureWifiSpectralMask(wifiWaveform.samples)
+
+print(maskResult["passed"])
+print(maskResult["minimumMarginDb"])
+print(maskResult["worstFrequencyHz"])
+```
+
+已知发送 `WifiWaveform` 时可以省略测量实参，而且仍然不调用Parser：
+
+```python
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=wifiWaveform,
+    width=0,
+)
+maskResult = resultAnalysis.MeasureWifiSpectralMask()
+```
+
+纯NumPy发送辅助模式没有中性元数据，必须显式提供三个物理量：
+
+```python
+resultAnalysis = Analysis(
+    receivedSamples,
+    transmittedSignal=transmittedSamples,
+    sampleRateHz=80.0e6,
+    channelBandwidthHz=20.0e6,
+    parameters={
+        "wifiMaskFrameFormat": "11be",
+        "width": 0,
+    },
+)
+maskResult = resultAnalysis.MeasureWifiSpectralMask()
+```
+
+完全盲分析只适用于能够由本工程 `ParseWifi` 恢复描述字段的完整帧：
+
+```python
+resultAnalysis = Analysis(
+    receivedWifiFrame,
+    parseParameters={"sampleRateHz": 80.0e6},
+    width=0,
+)
+maskResult = resultAnalysis.MeasureWifiSpectralMask()
+```
+
+### 16.6 Margin、逐链判定与结果字典
+
+第 $c$ 条链每个频率点的Margin定义为
+
+```math
+M_c[k]=L(f_k)-P_{c,\mathrm{dBr}}[k].
+```
+
+正Margin表示实测谱低于限值；负Margin表示超限。逐链最小Margin和超限量为
+
+```math
+M_{c,\min}=\min_{k\in\mathcal E}M_c[k],
+```
+
+```math
+V_c=\max\left(0,-M_{c,\min}\right),
+```
+
+其中 $\mathcal E$ 是 `evaluationMask` 选中的带外频点集合。链通过条件为 $M_{c,\min}\geq0$。MIMO矩阵的每一列被视为一个独立传导Tx端口，程序不会把多链复样值相干叠加；总 `passed` 只有在所有链都通过时才为真，总 `minimumMarginDb` 来自最差链。
+
+顶层结果字段如下：
+
+| 字段 | 含义 |
+|---|---|
+| `assessmentType` | 固定为 `"relativeDbrPrecheck"`，明确本结果只是relative dBr工程预检 |
+| `certificationResult` | 固定为 `None`；当前实现不输出IEEE或监管认证结论 |
+| `frameFormat`、`bandwidthMhz`、`templateName` | 已规范化的制式、标称带宽和模板名称 |
+| `sampleRateHz` | 本次频率轴使用的实际复采样率 |
+| `analysisMode` | `explicitReference`、`transmitAssisted` 或 `blind` |
+| `metadataSource` | `wifiWaveform`、`parsedWifiFrame` 或 `configuredFallback` |
+| `measurementScope` | `dataField` 或 `activeAssistedOverlap` |
+| `resolutionBandwidthHz` | 模板规定的100 kHz RBW |
+| `equivalentResolutionBandwidthHz` | 按bin与矩形RBW区间的重叠权重合成的 $B_{\mathrm{eq}}$；在浮点容差内等于100 kHz |
+| `videoBandwidthHz` | VHT为30 kHz，HE/EHT为7.5 kHz；仅为模板元数据 |
+| `frequencyResolutionHz` | Welch FFT相邻频率bin间隔 $\Delta f$ |
+| `frequencyBinsHz` | 从负到正排列的复基带频率轴，画图横坐标 |
+| `maskLimitDb` | 每个频率bin对应的相对Mask限值，画图曲线 |
+| `evaluationMask` | 真值表示该bin参与PASS与最差Margin搜索 |
+| `templateFrequencyOffsetsHz` | 正频率折点 $(A,B,C,D)$ |
+| `templateLimitsDb` | 折点限值 `(0, -20, -28, -40)` |
+| `perChain` | 按物理传导链排列的测量字典元组 |
+| `passed` | 所有链是否都通过本次relative dBr工程预检；不能解释为认证通过 |
+| `minimumMarginDb` | 所有链、所有有效频点中的最小Margin |
+| `maximumViolationDb` | `max(0, -minimumMarginDb)` |
+| `worstChainIndex`、`worstFrequencyHz` | 最差链的零基索引和最差复基带频率 |
+
+每个 `perChain[c]` 含有：
+
+| 字段 | 含义 |
+|---|---|
+| `passed` | 本链所有有效频点是否通过 |
+| `minimumMarginDb` | 本链最小Margin |
+| `maximumViolationDb` | 本链正值超限量；通过时为0 |
+| `worstFrequencyHz` | 本链最差复基带频率；正负号区分上下边带 |
+| `measuredPsdDb` | 与 `frequencyBinsHz` 等长的相对谱数组，实际单位dBr |
+| `marginDb` | 与频率轴等长的 `maskLimitDb - measuredPsdDb` 数组 |
+
+画图时直接使用返回数组，不要重新做FFT或重新归一化：
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+frequencyMhz = np.asarray(maskResult["frequencyBinsHz"]) / 1.0e6
+evaluationMask = np.asarray(maskResult["evaluationMask"], dtype=bool)
+chain0 = maskResult["perChain"][0]
+measuredDbr = np.asarray(chain0["measuredPsdDb"])
+limitDbr = np.asarray(maskResult["maskLimitDb"])
+
+plt.plot(
+    frequencyMhz[evaluationMask],
+    measuredDbr[evaluationMask],
+    label="Measured chain 0",
+)
+plt.plot(
+    frequencyMhz[evaluationMask],
+    limitDbr[evaluationMask],
+    label="Relative mask",
+)
+plt.xlabel("Baseband frequency (MHz)")
+plt.ylabel("Relative spectral level (dBr / 100 kHz equivalent RBW)")
+plt.grid(True)
+plt.legend()
+plt.show()
+```
+
+若要画Margin曲线，纵坐标直接使用 `chain0["marginDb"]`；0 dB水平线是通过边界。负值越小表示超限越严重。
+
+### 16.7 采样率覆盖条件
+
+最外折点为 $D=1.5B$。只覆盖折点中心需要 $f_s\geq2D=3B$，但最外折点还必须容纳一个完整的100 kHz RBW窗口。令模板RBW为 $B_{\mathrm{RBW}}=100\,000$ Hz，则最低采样率必须满足
+
+```math
+\frac{f_s}{2}
+\geq
+D+\frac{B_{\mathrm{RBW}}}{2},
+```
+
+```math
+f_{s,\min}
+=
+2D+B_{\mathrm{RBW}}
+=
+3B+100\,000.
+```
+
+因此模板字段 `minimumSampleRateHz` 直接返回 $3B+100$ kHz，而不是只返回 $3B$。例如20 MHz模板返回60.1 MHz，EHT 320 MHz模板返回960.1 MHz。
+
+重叠权重使 $B_{\mathrm{eq}}$ 在浮点容差内等于100 kHz。完成频谱估计后仍会使用实际返回的 $B_{\mathrm{eq}}$ 检查最外折点是否容得下完整RBW：
+
+```math
+\frac{f_s}{2}-\frac{B_{\mathrm{eq}}}{2}\geq D.
+```
+
+建议使用至少4倍带宽的采样率。`WaveGenWifi` 未显式指定 `sampleRateHz` 时的兼容默认 `oversampling=4` 满足20/40/80/160 MHz模板覆盖。采样率不足时函数报错，不会只测到一部分Mask却返回假PASS。
+
+### 16.8 当前实现边界与认证限制
+
+1. **只测单个capture的relative dBr Mask。** 本实现没有绝对dBm/MHz谱密度下限，也没有把相对与绝对Mask合成为Combined法规PASS。即使Analysis能计算时域模拟输出功率，也不会把归一化FFT数组冒充经过仪表幅度校准的绝对PSD。
+2. **RBW是数值等效，VBW和多包统计未实现。** 程序按FFT bin频率区间与居中100 kHz矩形窗口的重叠比例在线性功率域加权，数值等效带宽在浮点容差内等于100 kHz；这种矩形权重仍不等同于指定形状的物理仪表RBW滤波器、检波后VBW低通或认证流程中的多包/多次扫频统计。
+3. **这是传导复基带工程预筛查。** 代码不模拟天线、连接器、RF滤波器、频谱仪检波模式、监管频段绝对杂散限制或测量不确定度，结果不能作为IEEE或监管认证报告。
+4. **逐链而非空口合成。** MIMO每列独立判定，适合每个Tx端口的conducted测量；它不预测天线方向图中相干叠加后的EIRP频谱。
+5. **当前不支持puncturing和80+80 Mask。** 打孔Mask取决于被打孔20 MHz子信道的位置、数量与PPDU结构，不能用一个连续满带宽模板替代。80+80还需要两个80 MHz分段中心频率及重叠组合规则。缺少这些元数据时程序不应猜测。
+6. **320 MHz只有模板。** 当前生成器、描述字段和盲解析器尚未支持EHT 320 MHz；外部波形至少需要960.1 MHz复采样率，实际还要通过等效RBW边界检查。
+7. **WaveGenWifi本轮不增加WOLA。** `WaveGenWifi` 是可复现的基带/DPD刺激源，当前没有为了Mask认证新增逐OFDM符号WOLA或发射机重构滤波；真实发射机的符号窗、DAC、模拟滤波和突发成形都会改变带外谱。因此生成成功不代表必然通过Mask，理想生成波形也没有义务在所有估计设置下自动通过发射认证Mask。
+8. **比较必须固定估计设置。** 帧长度、`maxSegmentLength`、采样率、活动区、功率工作点和链路噪声都会改变频谱估计方差。比较PA或DPD方案时应固定这些条件，同时报告 `equivalentResolutionBandwidthHz` 和最小Margin。
+
+正式实验室验证应在校准过的WLAN分析仪上按照目标IEEE版本、监管区域和仪表厂商的测量流程复测。本软件Mask适合开发阶段发现明显带外泄漏、定位上下边带及比较DPD修改前后趋势。

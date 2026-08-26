@@ -5,7 +5,7 @@
 1. 每个函数使用了什么物理、数学或数值原理；
 2. 如果函数本身不执行物理计算，它依赖哪一个上游原理，以及为什么不应为它虚构独立的物理含义。
 
-本次审计共检查 `main.py` 和 `inc/**/*.py` 中 535 个函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis、DPD-ILC、通道测量和DpdGmp核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在五个算法内部各有一个闭包定义，因此定义位置数大于唯一函数名数；可复用ILC与MIMO ILC统一位于 `DpdIlc.py`，可部署且可增量更新的GMP及耦合感知封装位于`DpdGmp.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。
+本次审计检查 `main.py` 和 `inc/**/*.py` 中的全部函数/方法定义位置。Wi-Fi生成、帧解析、PA、Analysis、DPD-ILC、通道测量和DpdGmp核心业务模块位于 `inc/lib`，配套处理工具位于 `inc/utils`。`DpdIlc.BuildUpdate` 在多个算法内部各有闭包定义，因此定义位置数大于唯一函数名数；可复用ILC与MIMO ILC统一位于 `DpdIlc.py`，可部署且可增量更新的GMP及耦合感知封装位于`DpdGmp.py`，场景构造与benchmark报告独立位于 `tests/BenchMark.py`。文档不固化容易随提交失效的定义总数，自动化审计按当前源码逐项核对名称。
 
 ## 1. 分类规则
 
@@ -32,9 +32,9 @@ flowchart LR
     pa --> sync
     pa --> channelMeasure["ChannelAnalyse.md：平坦度、耦合、时延和条件数"]
     channelMeasure --> ilc
-    sync --> analysis["Analysis.md：MSE/SNR/EVM/ACLR"]
+    sync --> analysis["Analysis.md：MSE/SNR/EVM/ACLR/Mask"]
     analysis --> report["打印/保存/绘图"]
-    audit["本文：535 个定义位置逐项索引"] -.-> wave
+    audit["本文：当前源码全部定义逐项索引"] -.-> wave
     audit -.-> pa
     audit -.-> ilc
     audit -.-> sync
@@ -425,6 +425,9 @@ flowchart LR
 | `Analysis.IntegrateAclr` | P/N | 等宽主/邻道 PSD 积分并取较差邻道 | Analysis §6.1、§6.3 |
 | `Analysis.CalculatePreparedAclrDetails` | P/N | 对每条物理链只计算一次数据字段Welch PSD，由同一组频谱同时积分逐链ACLR并在功率域求和后积分汇总ACLR | Analysis §6、§9.3，Performance §4.2 |
 | `Analysis.CalculateAclr`, `Analysis.CalculatePreparedAclr`, `Analysis.CalculatePreparedAclrPerChain` | P/N | 数据字段Welch PSD的汇总/逐链ACLR，并统一复用 `CalculatePreparedAclrDetails` 的频谱实现 | Analysis §6、§9.3，Performance §4.2 |
+| `Analysis.ResolveWifiSpectralMaskTemplate` | P/E | 在函数内部按VHT/HE/EHT及20/40/80/160 MHz选择对称相对发射Mask折点，额外允许查询EHT 320 MHz模板；返回0/-20/-28/-40 dBr、100 kHz RBW、格式相关VBW及包含一个RBW边界护带的最低采样率，不引入模块级配置变量 | Analysis §16.1–§16.3、§16.7 |
+| `Analysis.CalculatePreparedWifiSpectralMask` | P/N | 接受调用方显式准备且已匹配Analysis参考网格的信号，不执行同步；按Wi-Fi数据字段或NumPy活动区门控，每条传导链独立计算Hann-Welch频谱，以FFT bin频率区间和居中100 kHz矩形RBW窗口的重叠比例作为线性功率权重，边缘bin允许分数权重并使等效RBW在浮点容差内等于100 kHz；RBW卷积在 `fftshift` 频谱两端按离散时间频谱周期回绕，不用零填充，因而靠近正负奈奎斯特接缝的完整窗口不会丢功率。随后按每链带内峰值归一化dBr并计算limit-minus-measurement Margin。返回的总PASS仅表示relative dBr预检，`assessmentType` 固定为 `relativeDbrPrecheck`，`certificationResult` 固定为 `None` | Analysis §16.1、§16.4–§16.8 |
+| `Analysis.MeasureWifiSpectralMask` | E/P | 对原始公开capture只执行定点接口解码、整数重叠定位和Data字段门控，再委托频谱内核；不进入EVM所用的CFO、分数时延、SFO、复增益补偿或插值重采样链，并与普通 `Analyze` 分离；继承相同的relative预检而非认证结果语义 | Analysis §16.1、§16.5–§16.8 |
 | `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让输出功率/SNR/EVM/ACLR共用一次同步结果并保存阶段映射；MIMO汇总/逐流EVM共享一次测量解调，汇总/逐链ACLR共享每链一次PSD | Analysis §1、§3.1，Performance §4 |
 | `Analysis.BuildTwoToneWaveform`, `Analysis.AnalyzeTwoTone` | P/E | 保留已有双音频率元数据，或从原始NumPy/list样值、采样率和两个明确频率构造受验证元数据；省略位宽时把整数且超出归一化范围的记录识别为默认16位，其余raw记录按浮点处理，浮点发送元数据也允许自动识别典型16位接收码，显式接收位宽可不同于发送元数据位宽；随后一次返回基波、IM3/IM5/IM7及模拟输出功率字典，不进入Wi-Fi解析路径 | Analysis §11.4、TwoToneAnalysis §2、§5、§8.1–§8.2 |
 | `Analysis.CalculateIntermodulationOrder`, `Analysis.CalculateIm3`, `Analysis.CalculateIm5`, `Analysis.CalculateIm7` | P/E | 选择3、5或7阶互调，接受元数据或原始NumPy/list输入，返回上下侧物理频率、同侧基波归一化dBc、绝对互调dBFS及同一次分析的 `outputPowerDbm`；非法阶次或缺失原始样值物理频率直接拒绝 | TwoToneAnalysis §4–§5、§8.1–§8.2 |
@@ -507,7 +510,7 @@ flowchart LR
 - 独立`DpdGmp.py`的恒等先验、因果main/lagging/leading基函数、峰值与片段权重、列归一化岭回归、增量系数混合和多功率片段边界均已在DPD-GMP文档建立公式与函数索引；
 - `ChannelAnalyse.py` 的逐路冲激探测、路径平坦度、相对耦合、相位斜率群时延和MIMO条件数，以及 `CouplingAwareDpdGmp` 的PA后目标去嵌入与PA前因果正则逆，均已在ChannelAnalyse文档建立公式和实测比较；
 - ILC 的低功率频响融合、方向 Gauss-Newton、峰值/带宽投影、反馈平均和 GMP 分块岭回归以前缺少实现级推导，本次已在 DPD-ILC §3.14 补齐；
-- prepared指标、每链/每流指标、每轮三级MSE和绘图的生产函数入口均已在本文建立索引；benchmark函数的场景含义、预期和实测结果在 `BenchMark.md` 分类说明。
+- prepared指标、每链/每流指标、Wi-Fi逐链相对发射频谱Mask、每轮三级MSE和绘图的生产函数入口均已在本文建立索引；benchmark函数的场景含义、预期和实测结果在 `BenchMark.md` 分类说明。
 
 以后新增 `inc` 函数时，应同时完成以下至少一项：
 

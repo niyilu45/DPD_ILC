@@ -831,6 +831,7 @@ assert fixedWaveform.samples.real.min() >= -32768
 5. 空间映射和 LTF 具有正确的矩阵维度与正交结构，但训练序列/SIG 不是标准逐比特一致性向量。
 6. 不包含无线多径、相位噪声或天线耦合；时延、CFO、SFO 和复增益由分析端工具补偿，而非波形生成器主动注入。
 7. EVM 分析从时域参考重新解调并撤销 CSD/空间映射，因此发送和测量波形需要保持可同步关系。
+8. 当前OFDM符号按矩形边界拼接，未为了发射一致性测试增加逐符号WOLA或重构滤波。`WaveGenWifi.Generate()` 成功只表示生成了可用的PA/DPD刺激源，不保证相对发射频谱Mask预检PASS；基于FFT bin与矩形RBW区间重叠权重的100 kHz等效RBW算法，以及 `assessmentType="relativeDbrPrecheck"`、`certificationResult=None` 的非认证边界，见 [Analysis.md §16](./Analysis.md#16-wi-fi相对发射频谱mask)。
 
 ---
 
