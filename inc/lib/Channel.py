@@ -1,11 +1,12 @@
 """Model transmitter, coupled PA, and parallel channel/feedback outputs.
 
-The channel can apply transmitter I/Q imbalance, causal complex coupling paths
-before a multi-chain PA bank, and coupling after its nonlinear outputs. One PA
-evaluation always produces a forward channel observation. Forward sampling
-copies it into the feedback return, while feedback sampling additionally
-evaluates the embedded receiver. Public fixed-point boundaries use raw integer
-I/Q codes while every physical operation remains floating point.
+The channel can apply flat or frequency-selective widely-linear transmitter and
+feedback I/Q imbalance, causal complex coupling paths before a multi-chain PA
+bank, and coupling after its nonlinear outputs. One PA evaluation always
+produces a forward channel observation. Forward sampling copies it into the
+feedback return, while feedback sampling additionally evaluates the embedded
+receiver. Public fixed-point boundaries use raw integer I/Q codes while every
+physical operation remains floating point.
 """
 
 from collections import ChainMap
@@ -97,6 +98,8 @@ class Channel:
                 "txIqImbalanceEnabled": True,
                 "txIqGainImbalanceDb": 0.0,
                 "txIqPhaseImbalanceDegrees": 0.0,
+                "txIqDirectFirTaps": None,
+                "txIqImageFirTaps": None,
                 "txDcOffset": 0.0 + 0.0j,
                 "fbGainDb": 0.0,
                 "fbPhaseDegrees": 0.0,
@@ -108,6 +111,8 @@ class Channel:
                 "fbIqImbalanceEnabled": True,
                 "fbIqGainImbalanceDb": 0.0,
                 "fbIqPhaseImbalanceDegrees": 0.0,
+                "fbIqDirectFirTaps": None,
+                "fbIqImageFirTaps": None,
                 "fbDcOffset": 0.0 + 0.0j,
                 "fbIqCompensationMode": "none",
                 "fbPhasePairResponses": (1.0 + 0.0j, 0.0 + 1.0j),
@@ -359,6 +364,8 @@ class Channel:
             "fbIqImbalanceEnabled",
             "fbIqGainImbalanceDb",
             "fbIqPhaseImbalanceDegrees",
+            "fbIqDirectFirTaps",
+            "fbIqImageFirTaps",
             "fbDcOffset",
             "fbPhasePairResponses",
             "fbIqCompensationFilterLength",
@@ -740,6 +747,41 @@ class Channel:
                     "fbFirTaps has an invalid value. Allowed values: None or "
                     "a nonempty one-dimensional sequence of finite complex "
                     "numbers."
+                )
+        for iqFirParameterName in (
+            "txIqDirectFirTaps",
+            "txIqImageFirTaps",
+            "fbIqDirectFirTaps",
+            "fbIqImageFirTaps",
+        ):
+            iqFirTaps = self.parameters[iqFirParameterName]
+            if iqFirTaps is None:
+                continue
+            if isinstance(iqFirTaps, (str, bytes)):
+                raise TypeError(
+                    f"{iqFirParameterName} has an invalid type. Allowed "
+                    "values: None or a nonempty one-dimensional sequence of "
+                    "finite complex numbers."
+                )
+            try:
+                iqFirTapArray = np.asarray(
+                    iqFirTaps, dtype=np.complex128
+                )
+            except (TypeError, ValueError, OverflowError) as error:
+                raise TypeError(
+                    f"{iqFirParameterName} has an invalid type. Allowed "
+                    "values: None or a nonempty one-dimensional sequence of "
+                    "finite complex numbers."
+                ) from error
+            if (
+                iqFirTapArray.ndim != 1
+                or iqFirTapArray.size == 0
+                or not np.all(np.isfinite(iqFirTapArray))
+            ):
+                raise ValueError(
+                    f"{iqFirParameterName} has an invalid value. Allowed "
+                    "values: None or a nonempty one-dimensional sequence of "
+                    "finite complex numbers."
                 )
         for complexParameterName in (
             "txDcOffset",
@@ -1691,6 +1733,9 @@ class Channel:
         feedbackFirTaps = tuple(
             complex(tapValue) for tapValue in self.ResolveFeedbackFirTaps()
         )
+        feedbackIqDirectFirTaps, feedbackIqImageFirTaps = (
+            self.FeedbackIqFilterTaps()
+        )
         return (
             id(self.paModel),
             float(self.parameters["sampleRateHz"]),
@@ -1705,6 +1750,8 @@ class Channel:
             bool(self.parameters["fbIqImbalanceEnabled"]),
             float(self.parameters["fbIqGainImbalanceDb"]),
             float(self.parameters["fbIqPhaseImbalanceDegrees"]),
+            tuple(complex(tapValue) for tapValue in feedbackIqDirectFirTaps),
+            tuple(complex(tapValue) for tapValue in feedbackIqImageFirTaps),
             complex(self.parameters["fbDcOffset"]),
             phaseResponses,
             int(self.parameters["fbIqCompensationFilterLength"]),
@@ -2316,61 +2363,132 @@ class Channel:
         phaseImbalanceDegrees: float,
         dcOffset: complex,
         stageName: str,
+        directFirTaps: Optional[Sequence[complex]] = None,
+        imageFirTaps: Optional[Sequence[complex]] = None,
     ) -> np.ndarray:
-        """Apply one configured transmitter or feedback I/Q impairment stage.
+        """Apply one frequency-selective widely-linear I/Q impairment stage.
 
         Processing details:
-            Algorithm: Resolve direct and image coefficients, combine the
-            original waveform with its complex conjugate, add one normalized
-            complex DC offset, and reject numeric overflow without changing
-            SISO-vector or samples-by-chains matrix shape.
+            Algorithm: Causally convolve every chain with the direct FIR,
+            convolve its complex conjugate with the image FIR, add both paths
+            and one normalized complex DC offset, retain the input record
+            length, and reject numeric overflow. One-tap FIRs reduce exactly to
+            the historical flat ``alpha*x + beta*conj(x)`` model.
 
         Args:
             inputSignal: Normalized complex waveform entering the I/Q stage.
-            gainImbalanceDb: I-to-Q gain ratio error in decibels.
-            phaseImbalanceDegrees: Departure from ideal quadrature in degrees.
+            gainImbalanceDb: Legacy I-to-Q gain ratio error in decibels.
+            phaseImbalanceDegrees: Legacy quadrature error in degrees.
             dcOffset: Normalized complex LO-leakage or receiver DC term.
             stageName: Human-readable stage name used in error diagnostics.
+            directFirTaps: Optional complete causal FIR for the desired ``x``
+                branch. None selects its legacy one-tap coefficient.
+            imageFirTaps: Optional complete causal FIR for the conjugate ``x*``
+                branch. None selects its legacy one-tap coefficient.
 
         Returns:
-            result: Same-shape waveform containing direct, image, and DC terms.
+            result: Same-shape waveform containing filtered direct, image, and
+                DC terms.
         """
 
         complexInput = self.ValidateSignal(inputSignal, "inputSignal")
-        if (
-            float(gainImbalanceDb) == 0.0
-            and float(phaseImbalanceDegrees) == 0.0
-            and complex(dcOffset) == 0.0 + 0.0j
-        ):
-            # An enabled but ideal I/Q stage is physically an identity. Keep
-            # the public method's independent-array behavior while avoiding a
-            # conjugate array and three full-waveform arithmetic passes.
-            return complexInput.copy()
         directCoefficient, imageCoefficient = (
             self.ResolveIqImbalanceCoefficients(
                 gainImbalanceDb,
                 phaseImbalanceDegrees,
             )
         )
-        iqOutput = (
-            directCoefficient * complexInput
-            + imageCoefficient * np.conj(complexInput)
-            + complex(dcOffset)
+        directTapArray = np.asarray(
+            (directCoefficient,)
+            if directFirTaps is None
+            else directFirTaps,
+            dtype=np.complex128,
         )
-        if not np.all(np.isfinite(iqOutput)):
+        imageTapArray = np.asarray(
+            (imageCoefficient,)
+            if imageFirTaps is None
+            else imageFirTaps,
+            dtype=np.complex128,
+        )
+        if (
+            directTapArray.ndim != 1
+            or directTapArray.size == 0
+            or not np.all(np.isfinite(directTapArray))
+        ):
+            raise ValueError(
+                "directFirTaps must be a nonempty one-dimensional sequence "
+                "of finite complex numbers"
+            )
+        if (
+            imageTapArray.ndim != 1
+            or imageTapArray.size == 0
+            or not np.all(np.isfinite(imageTapArray))
+        ):
+            raise ValueError(
+                "imageFirTaps must be a nonempty one-dimensional sequence "
+                "of finite complex numbers"
+            )
+        directTaps = directTapArray.reshape(-1)
+        imageTaps = imageTapArray.reshape(-1)
+        if (
+            directTaps.size == 1
+            and directTaps[0] == 1.0 + 0.0j
+            and imageTaps.size == 1
+            and imageTaps[0] == 0.0 + 0.0j
+            and complex(dcOffset) == 0.0 + 0.0j
+        ):
+            # An enabled but ideal I/Q stage is physically an identity. Keep
+            # the public method's independent-array behavior while avoiding a
+            # conjugate array and three full-waveform arithmetic passes.
+            return complexInput.copy()
+        inputWasVector = complexInput.ndim == 1
+        inputMatrix = (
+            complexInput.reshape(-1, 1)
+            if inputWasVector
+            else complexInput
+        )
+        sampleCount, chainCount = inputMatrix.shape
+        directOutput = np.empty_like(inputMatrix)
+        imageOutput = np.empty_like(inputMatrix)
+        conjugateInput = np.conj(inputMatrix)
+        for chainIndex in range(chainCount):
+            if directTaps.size == 1:
+                directOutput[:, chainIndex] = (
+                    directTaps[0] * inputMatrix[:, chainIndex]
+                )
+            else:
+                directOutput[:, chainIndex] = np.convolve(
+                    inputMatrix[:, chainIndex], directTaps, mode="full"
+                )[:sampleCount]
+            if imageTaps.size == 1:
+                imageOutput[:, chainIndex] = (
+                    imageTaps[0] * conjugateInput[:, chainIndex]
+                )
+            else:
+                imageOutput[:, chainIndex] = np.convolve(
+                    conjugateInput[:, chainIndex], imageTaps, mode="full"
+                )[:sampleCount]
+        iqOutputMatrix = (
+            directOutput + imageOutput + complex(dcOffset)
+        )
+        if not np.all(np.isfinite(iqOutputMatrix)):
             raise ValueError(
                 f"{stageName} I/Q imbalance exceeded the numeric range"
             )
-        return np.asarray(iqOutput, dtype=np.complex128)
+        if inputWasVector:
+            return np.asarray(iqOutputMatrix[:, 0], dtype=np.complex128)
+        return np.asarray(iqOutputMatrix, dtype=np.complex128)
 
     def TransmitterIqCoefficients(self) -> Tuple[complex, complex]:
-        """Return configured Tx direct and conjugate-image coefficients.
+        """Return the legacy flat Tx direct and image fallback coefficients.
 
         Processing details:
             Algorithm: Validate the live Channel configuration. Return the
             ideal direct/image pair when the Tx stage is disabled; otherwise
-            convert transmitter gain and phase mismatch parameters to the exact
-            widely-linear coefficient pair used before PA-input coupling.
+            convert transmitter gain and phase mismatch parameters to the
+            one-tap fallback pair. Explicit Tx FIR parameters replace their
+            respective branch; use ``TransmitterIqFilterTaps`` to query the
+            actual effective response.
 
         Returns:
             result: Tx direct coefficient followed by Tx image coefficient.
@@ -2385,13 +2503,15 @@ class Channel:
         )
 
     def FeedbackIqCoefficients(self) -> Tuple[complex, complex]:
-        """Return configured feedback direct and image coefficients.
+        """Return the legacy flat FB direct and image fallback coefficients.
 
         Processing details:
             Algorithm: Validate the live Channel configuration. Return the
             ideal direct/image pair when the feedback stage is disabled;
             otherwise convert receiver gain and phase mismatch parameters to
-            the exact pair used before feedback DC addition.
+            the one-tap fallback pair. Explicit FB FIR parameters replace their
+            respective branch; use ``FeedbackIqFilterTaps`` for the effective
+            response used before feedback DC addition.
 
         Returns:
             result: Feedback direct coefficient followed by image coefficient.
@@ -2405,18 +2525,101 @@ class Channel:
             float(self.parameters["fbIqPhaseImbalanceDegrees"]),
         )
 
+    def TransmitterIqFilterTaps(
+        self,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return the effective Tx direct and conjugate-image FIR taps.
+
+        Processing details:
+            Algorithm: When the Tx I/Q stage is disabled, return the exact
+            identity/zero pair. Otherwise each explicitly configured FIR is the
+            complete response of that widely-linear branch; a None branch falls
+            back to the corresponding legacy gain/phase-derived one-tap
+            coefficient. Return defensive complex vectors.
+
+        Returns:
+            result: Effective direct FIR followed by effective image FIR.
+        """
+
+        self.ValidateParameters()
+        if not bool(self.parameters["txIqImbalanceEnabled"]):
+            return (
+                np.asarray((1.0 + 0.0j,), dtype=np.complex128),
+                np.asarray((0.0 + 0.0j,), dtype=np.complex128),
+            )
+        directCoefficient, imageCoefficient = (
+            self.TransmitterIqCoefficients()
+        )
+        directFirTaps = self.parameters["txIqDirectFirTaps"]
+        imageFirTaps = self.parameters["txIqImageFirTaps"]
+        return (
+            np.asarray(
+                (directCoefficient,)
+                if directFirTaps is None
+                else directFirTaps,
+                dtype=np.complex128,
+            ).reshape(-1).copy(),
+            np.asarray(
+                (imageCoefficient,)
+                if imageFirTaps is None
+                else imageFirTaps,
+                dtype=np.complex128,
+            ).reshape(-1).copy(),
+        )
+
+    def FeedbackIqFilterTaps(
+        self,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return the effective FB direct and conjugate-image FIR taps.
+
+        Processing details:
+            Algorithm: When the feedback I/Q stage is disabled, return the
+            identity/zero pair. Otherwise use each configured FIR as that
+            branch's complete frequency-selective response and let a None
+            branch fall back to the legacy gain/phase-derived one-tap value.
+
+        Returns:
+            result: Effective feedback direct FIR followed by image FIR.
+        """
+
+        self.ValidateParameters()
+        if not bool(self.parameters["fbIqImbalanceEnabled"]):
+            return (
+                np.asarray((1.0 + 0.0j,), dtype=np.complex128),
+                np.asarray((0.0 + 0.0j,), dtype=np.complex128),
+            )
+        directCoefficient, imageCoefficient = self.FeedbackIqCoefficients()
+        directFirTaps = self.parameters["fbIqDirectFirTaps"]
+        imageFirTaps = self.parameters["fbIqImageFirTaps"]
+        return (
+            np.asarray(
+                (directCoefficient,)
+                if directFirTaps is None
+                else directFirTaps,
+                dtype=np.complex128,
+            ).reshape(-1).copy(),
+            np.asarray(
+                (imageCoefficient,)
+                if imageFirTaps is None
+                else imageFirTaps,
+                dtype=np.complex128,
+            ).reshape(-1).copy(),
+        )
+
     def ApplyTransmitterIqImbalance(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
-        """Apply Tx modulator I/Q mismatch and DC offset before every PA.
+        """Apply flat or frequency-selective Tx I/Q error before every PA.
 
         Processing details:
             Algorithm: Validate and return an unchanged complex copy when
             ``txIqImbalanceEnabled`` is False, bypassing Tx gain mismatch,
-            phase mismatch, and DC leakage together. When enabled, use the
-            common widely-linear I/Q stage with the ``tx`` parameters before
-            PA-input coupling. This impairment changes physical PA drive, PA
-            nonlinear products, both observations, and power calibration.
+            phase mismatch, both frequency-selective FIR branches, and DC
+            leakage together. When enabled, use the
+            common widely-linear FIR stage with the resolved ``tx`` direct and
+            image responses before PA-input coupling. This impairment changes
+            physical PA drive, PA nonlinear products, both observations, and
+            power calibration.
 
         Args:
             inputSignal: Digital transmitter waveform before RF modulation.
@@ -2437,6 +2640,14 @@ class Channel:
             float(self.parameters["txIqPhaseImbalanceDegrees"]),
             complex(self.parameters["txDcOffset"]),
             "transmitter",
+            cast(
+                Optional[Sequence[complex]],
+                self.parameters["txIqDirectFirTaps"],
+            ),
+            cast(
+                Optional[Sequence[complex]],
+                self.parameters["txIqImageFirTaps"],
+            ),
         )
 
     def ApplyPrePaCoupling(
@@ -2914,14 +3125,15 @@ class Channel:
     def ApplyFeedbackIqImbalance(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
-        """Apply I/Q gain/phase mismatch and complex receiver DC offset.
+        """Apply flat or frequency-selective FB I/Q error and receiver DC.
 
         Processing details:
             Algorithm: Validate and return an unchanged complex copy when
             ``fbIqImbalanceEnabled`` is False, bypassing feedback gain
-            mismatch, quadrature phase error, and DC offset together. When
-            enabled, use the shared widely-linear stage. This function appears
-            in the processing chain only for ``sampleMode="fb"``.
+            mismatch, quadrature phase error, both FIR branches, and DC offset
+            together. When
+            enabled, use the shared widely-linear FIR stage. This function
+            appears in the processing chain only for ``sampleMode="fb"``.
 
         Args:
             inputSignal: Feedback waveform after timing and frequency errors.
@@ -2942,6 +3154,14 @@ class Channel:
             float(self.parameters["fbIqPhaseImbalanceDegrees"]),
             complex(self.parameters["fbDcOffset"]),
             "feedback",
+            cast(
+                Optional[Sequence[complex]],
+                self.parameters["fbIqDirectFirTaps"],
+            ),
+            cast(
+                Optional[Sequence[complex]],
+                self.parameters["fbIqImageFirTaps"],
+            ),
         )
 
     def ApplyFeedbackAdc(
@@ -3035,8 +3255,8 @@ class Channel:
         """Return the feedback path's analytic direct small-signal coefficient.
 
         Processing details:
-            Algorithm: Multiply coupling gain/phase, FIR DC response, and the
-            direct ``x`` coefficient of the widely-linear I/Q mapping.
+            Algorithm: Multiply coupling gain/phase, ordinary FB FIR DC
+            response, and the sum of the direct widely-linear I/Q FIR taps.
             Third-order distortion vanishes at zero amplitude; delay, CFO,
             SFO, DC, noise, clipping, and ADC are not representable by one
             stationary scalar and therefore do not modify this diagnostic.
@@ -3057,12 +3277,13 @@ class Channel:
             )
         )
         firDcResponse = np.sum(self.ResolveFeedbackFirTaps())
-        directIqCoefficient, _ = self.FeedbackIqCoefficients()
+        directIqFirTaps, _ = self.FeedbackIqFilterTaps()
+        directIqDcResponse = np.sum(directIqFirTaps)
         return complex(
             feedbackGain
             * feedbackPhase
             * firDcResponse
-            * directIqCoefficient
+            * directIqDcResponse
         )
 
     def ApplyChannelEffects(
@@ -3788,11 +4009,11 @@ class Channel:
         """Return the deterministic direct small-signal sampling-path gain.
 
         Processing details:
-            Algorithm: Multiply the committed SISO analog drive, Tx I/Q direct
-            coefficient, bound PA small-signal gain, and common phase. In
-            feedback mode also multiply by the feedback I/Q and linear-path
-            direct coefficient. Image and DC terms are excluded from this
-            one-scalar result.
+            Algorithm: Multiply the committed SISO analog drive, the Tx direct
+            I/Q FIR response at DC, bound PA small-signal gain, and common
+            phase. In feedback mode also multiply by the feedback direct I/Q
+            FIR response at DC and ordinary linear path. Image and DC terms are
+            excluded. This scalar cannot describe off-DC frequency selectivity.
 
         Returns:
             result: Complex direct small-signal gain for the selected mode.
@@ -3813,9 +4034,8 @@ class Channel:
         phaseRadians = np.deg2rad(
             float(cast(float, self.parameters["phaseDegrees"]))
         )
-        transmitterDirectCoefficient, _ = (
-            self.TransmitterIqCoefficients()
-        )
+        transmitterDirectFirTaps, _ = self.TransmitterIqFilterTaps()
+        transmitterDirectDcResponse = np.sum(transmitterDirectFirTaps)
         if len(self._calibrationDriveDbPerChain) > 1:
             raise ValueError(
                 "SmallSignalGain is scalar and cannot represent multiple "
@@ -3831,7 +4051,7 @@ class Channel:
         )
         selectedPathGain = complex(
             calibrationDriveScale
-            * transmitterDirectCoefficient
+            * transmitterDirectDcResponse
             * smallSignalGainMethod()
             * np.exp(1j * phaseRadians)
         )

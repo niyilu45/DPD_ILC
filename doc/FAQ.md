@@ -755,7 +755,7 @@ IRR 的价值是把 $x^*[n]$ 这一类具有明确物理来源的误差单独量
 | `irrDb` 接近 0，且 EVM dB 接近 `irrDb` | IQ 镜像可能主导 EVM | 检查 I/Q 校准，并比较普通 GMP 与增广 GMP |
 | `irrDb` 很负，但 EVM 差 | 误差主要不是线性 IQ 镜像 | 检查 PA 非线性、噪声、同步、削顶和模型阶数 |
 | FB 模式 `irrDb` 较高、forward 仪表 `irrDb` 更负 | 反馈接收机自身存在 IQ 不平衡 | 校准或去嵌入 FB 链路，不要让 Tx DPD 补偿它 |
-| `irrDb` 随频率上升、变得不够负 | IQ 不平衡具有频率选择性 | 使用带记忆的共轭支路或频率相关 IQ 校准 |
+| `irrDb` 随频率变化、某些带边变得不够负 | IQ 不平衡具有频率选择性 | 用 `txIq...FirTaps` / `fbIq...FirTaps` 建模完整直接与镜像响应，并使用带记忆校准 |
 | `irrDb` 随功率或温度上升、趋近 0 | IQ 链路或 PA 与 IQ 失真级联后发生漂移 | 按功率和温度重新测量并分区训练 |
 
 ACLR 观察相邻信道总泄漏，IM3、IM5 和 IM7 观察特定非线性互调阶次，它们也不能唯一指出共轭镜像。因此工程上应联合观察 EVM、IRR、ACLR、输出功率和噪声，而不是用 IRR 代替所有指标。
@@ -830,7 +830,36 @@ j\frac{\phi}{2}.
 | 仅 3 度相位误差 | 约 -31.6 dBc |
 | 仅 5 度相位误差 | 约 -27.2 dBc |
 
-这些数值是当前数学模型的无噪声结果，用来解释参数影响，不是仪表合格限值。
+这些数值是两条显式FIR都为 `None` 时，旧平坦一抽头模型的无噪声结果，用来解释参数影响，不是仪表合格限值。
+
+实际宽带I/Q不平衡应写成：
+
+```math
+y[n]
+=
+\sum_k a_kx[n-k]
++
+\sum_k b_kx^*[n-k]
++d.
+```
+
+Channel分别用 `txIqDirectFirTaps` / `txIqImageFirTaps` 和 `fbIqDirectFirTaps` / `fbIqImageFirTaps` 配置这两条完整有效因果FIR。某项为 `None` 时才回退到上面的标量 $a$ 或 $b$；非None序列替代而不是乘上该标量，两条支路可独立回退。实际生效抽头应由 `TransmitterIqFilterTaps()` 或 `FeedbackIqFilterTaps()` 查询，旧 `...IqCoefficients()` 只报告增益/相位换算结果。
+
+令两条FIR的响应为 $A(f)$、$B(f)$，则：
+
+```math
+Y(f)=A(f)X(f)+B(f)X^*(-f)+d\,\delta(f).
+```
+
+对 $+f_0$ 单边复音，镜像位于 $-f_0$，所以本工程逐频点负dBc定义为：
+
+```math
+\mathit{irrDb}(f_0)
+=
+20\log_{10}\frac{|B(-f_0)|}{|A(f_0)|}.
+```
+
+这也是为什么宽带器件不能只记录一个中心频点IRR：直接支路的衰落和镜像支路的纹波都会改变带边结果。
 
 ### 4. 已知参考波形时的时域计算方法
 
@@ -1086,14 +1115,14 @@ a x[n]
 b x^*[n].
 ```
 
-因此它返回的是这一阶广义线性模型下的等效系数。测量时应同时检查：
+因此它返回的是这一阶、全记录常系数广义线性模型下的等效汇总系数，不是 $A(f)$、$B(f)$ 或逐频点IRR曲线。真实链路具有频率选择性时，即使没有PA非线性，单一 $a,b$ 也可能产生较大的 `residualPowerRatio`，并把不同子载波的镜像响应平均成一个数。测量时应同时检查：
 
 - `irrDb`：镜像系数相对直接系数的功率，单位 dBc，越负越好；
 - `imageAmplitudeRatio`：镜像与直接分量的等效幅度比；
 - `residualPowerRatio`：两项模型不能解释的残差功率比例；
 - `regressionConditionNumberPerChain`：$x$ 与 $x^*$ 是否能够可靠分离。
 
-`residualPowerRatio` 随功率快速增大，通常说明 PA 非线性、记忆、削顶或同步残差已经使线性 IRR 模型不完整。但是残差较小也不能单独证明没有非线性：对单个恒包络音调，$x^*|x|^2$ 与 $x^*$ 只是相差一个常数，高阶共轭项会被直接吸收到 $b$ 中。必须同时观察 IRR 的低功率平台和功率扫描结果。
+`residualPowerRatio` 随功率快速增大，通常说明 PA 非线性、记忆、削顶或同步残差已经使线性 IRR 模型不完整；在低功率下仍随带宽增大，则应先检查频率选择性I/Q响应。但是残差较小也不能单独证明没有非线性：对单个恒包络音调，$x^*|x|^2$ 与 $x^*$ 只是相差一个常数，高阶共轭项会被直接吸收到 $b$ 中。必须同时观察 IRR 的低功率平台、单边复音扫频和功率扫描结果。
 
 若需要从调制波形中严格区分一阶镜像和高阶镜像，可扩展为增广回归矩阵：
 
@@ -1178,7 +1207,7 @@ print(irrMeasurement["regressionConditionNumberPerChain"])
 
 `CalculateIrr` 与 `MeasureIrr` 都会先执行同步；已经调用 `PrepareMeasuredSignal` 得到校正波形时，应改用 `CalculatePreparedIrr` 或 `MeasurePreparedIrr`，避免重复同步。条件数很大说明 $x$ 与 $x^*$ 难以区分，残差较大说明常数直接项/镜像项不能解释主要失真，此时不应只看IRR数值。
 
-仿真时还可以直接读取 `Channel` 使用的理论 Tx 系数：
+平坦仿真时可以直接读取旧标量Tx系数：
 
 ```python
 import numpy as np
@@ -1200,7 +1229,33 @@ theoreticalIrrDb = 10.0 * np.log10(
 )
 ```
 
-理论系数适合验证仿真配置；从测量波形拟合得到的 `irrDb` 才包含噪声、PA、同步残差、反馈接收机和量化等实际影响。
+只有 `txIqDirectFirTaps` 和 `txIqImageFirTaps` 都为 `None` 时，上述理论系数才是实际一抽头响应。频选模型必须查询实际抽头并保留镜像频率的负号：
+
+```python
+directTaps, imageTaps = channel.TransmitterIqFilterTaps()
+sampleRateHz = 160.0e6
+toneFrequencyHz = 30.0e6
+tapIndices = np.arange(max(len(directTaps), len(imageTaps)))
+directResponse = np.sum(
+    np.pad(directTaps, (0, len(tapIndices) - len(directTaps)))
+    * np.exp(
+        -1j * 2.0 * np.pi * toneFrequencyHz
+        * tapIndices / sampleRateHz
+    )
+)
+imageAtMirror = np.sum(
+    np.pad(imageTaps, (0, len(tapIndices) - len(imageTaps)))
+    * np.exp(
+        +1j * 2.0 * np.pi * toneFrequencyHz
+        * tapIndices / sampleRateHz
+    )
+)
+irrDbAtTone = 20.0 * np.log10(
+    abs(imageAtMirror / directResponse)
+)
+```
+
+理论响应适合验证仿真配置；从测量波形拟合得到的 `irrDb` 才包含噪声、PA、同步残差、反馈接收机和量化等实际影响。要测实际IRR随频率的曲线，应扫低功率单边复音并在每个 $\pm f_0$ 频点对读取，不能把当前常系数 `MeasureIrr()` 当作频响分析器。
 
 ### 8. IRR 的典型应用场景
 
@@ -1247,8 +1302,8 @@ theoreticalIrrDb = 10.0 * np.log10(
 
 | 类型 | 工程参数 | 是否改变真实PA激励/空口 | 推荐处理 |
 |---|---|---:|---|
-| Tx I/Q | `txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees`、`txDcOffset` | 是 | 可用模拟校准或增广GMP联合补偿 |
-| FB I/Q | `fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees`、`fbDcOffset` | 否，只污染fb观测 | 先做接收机校准或去嵌入，不应由发射DPD直接补偿 |
+| Tx I/Q | `txIqGainImbalanceDb`、`txIqPhaseImbalanceDegrees`、`txIqDirectFirTaps`、`txIqImageFirTaps`、`txDcOffset` | 是 | 可用模拟校准或带记忆增广GMP联合补偿 |
+| FB I/Q | `fbIqGainImbalanceDb`、`fbIqPhaseImbalanceDegrees`、`fbIqDirectFirTaps`、`fbIqImageFirTaps`、`fbDcOffset` | 否，只污染fb观测 | 先做接收机广义线性校准或去嵌入，不应由发射DPD直接补偿 |
 
 在本工程中，Tx I/Q位于PA和观测选择之前，因此公开 `Channel.Process` 返回的 `chOut` 与 `fbOut` 都包含它。FB I/Q只有在 `sampleMode="fb"` 时才进入 `fbOut`；默认 `"forward"` 会让第二项成为第一项的数值相同副本，并完全绕过FB I/Q及其他反馈模块。兼容单输出接口也按该参数选路。若fb模式下板载 `fbOut` 的EVM/IRR改善但 `chOut` 变差，通常意味着训练器正在补偿FB接收机自身误差。
 
@@ -1302,10 +1357,10 @@ u[n]
 |---|---|---|---|
 | `fbIrr` | `ILCIteration.feedbackOutputSignal` 或 `fbOut` | 原始理想目标 $x$ | DPD、Tx、PA与FB接收机的级联镜像 |
 | `txIrr` | `ILCIteration.outputSignal` 或 `chOut` | 同一个原始理想目标 $x$ | 真正需要验收的主路镜像 |
-| Tx本征IRR | `TransmitterIqCoefficients()` 的直接与镜像系数 | 不使用迭代波形 | Tx调制器硬件或Channel配置本身的失配 |
+| Tx本征IRR | 平坦时用 `TransmitterIqCoefficients()`；频选时用 `TransmitterIqFilterTaps()` 的 $A(f),B(-f)$ | 不使用迭代波形 | Tx调制器硬件或Channel配置本身的失配；频选时应记录曲线和带内最差值 |
 | DPD输入IRR | 当前预失真输入 $u$ | 原始理想目标 $x$ | DPD为了补偿下游误差而主动注入的共轭分量 |
 
-Tx本征IRR只由 `txIqGainImbalanceDb` 和 `txIqPhaseImbalanceDegrees` 决定。DPD不会修改这些硬件参数，因此用 `TransmitterIqCoefficients()` 计算的本征IRR本来就不会随迭代变化。DPD输入IRR也不要求改善；增广DPD必须在Tx之前主动生成反向镜像，所以该参考面的IRR可能变得不够负。真正的发射验收量应当是以原始目标 $x$ 为参考，对最终 `chOut` 计算的IRR。
+Tx本征响应由旧标量回退或显式 `txIqDirectFirTaps` / `txIqImageFirTaps` 决定。DPD不会修改这些硬件配置，因此由 `TransmitterIqFilterTaps()` 计算的本征IRR曲线本来就不会随迭代变化；`TransmitterIqCoefficients()` 只适合两条FIR均为None的平坦情况。DPD输入IRR也不要求改善；增广DPD必须在Tx之前主动生成反向镜像，所以该参考面的IRR可能变得不够负。真正的发射验收量应当是以原始目标 $x$ 为参考，对最终 `chOut` 计算的IRR。
 
 #### 反馈闭环优化的是级联参考面
 
@@ -1392,7 +1447,7 @@ flowchart LR
     dpd --> txPa["Tx I/Q + PA"]
     txPa --> channelOutput["chOut：真实主路"]
     channelOutput --> txMetric["txIrr：最终验收"]
-    channelOutput --> fbIq["FB接收机<br/>C y + D y*"]
+    channelOutput --> fbIq["FB接收机<br/>h_d * y + h_i * y*"]
     fbIq --> feedbackOutput["fbOut"]
     feedbackOutput --> fbMetric["fbIrr"]
     feedbackOutput --> update["同步 / MSE / ILC更新"]
@@ -1479,7 +1534,7 @@ for iterationRecord in ilcResult.history:
 | 关闭 | 开启 | FB改善而主路不改善或变差 | 直接证明DPD正在误补偿FB |
 | 开启 | 开启 | 只能观察到级联镜像 | 必须先独立标定FB才能分离来源 |
 
-仿真中可以暂时设置 `fbIqImbalanceEnabled=False`，并关闭FB FIR、非线性、限幅、时频偏和ADC，验证主路与反馈趋势是否恢复一致。实际硬件应使用已知IRR足够负的干净信号直接注入FB接收机，绕过Tx和PA，独立估计FB的直接系数 $C$ 与镜像系数 $D$。
+仿真中可以暂时设置 `fbIqImbalanceEnabled=False`，并关闭普通 `fbFirTaps`、非线性、限幅、时频偏和ADC，验证主路与反馈趋势是否恢复一致。该开关会同时旁路FB I/Q标量、`fbIqDirectFirTaps`、`fbIqImageFirTaps` 和DC。实际硬件应使用已知IRR足够负的干净信号直接注入FB接收机，绕过Tx和PA，独立估计FB的直接FIR $h_d$ 与镜像FIR $h_i$。
 
 #### 正确的FB去嵌方法
 
@@ -1504,7 +1559,7 @@ z=C y+D y^*
      {|C|^2-|D|^2}.
 ```
 
-DPD应使用 $\widehat y$ 做同步、MSE和系数更新，而不是直接使用raw `fbOut`。如果FB I/Q失衡随频率变化，应使用widely-linear FIR，或者在每个频点对直接路径和镜像路径组成的 $2\times2$ 矩阵分别求逆，不能只使用一个平坦复系数。
+DPD应使用 $\widehat y$ 做同步、MSE和系数更新，而不是直接使用raw `fbOut`。上式只适合平坦系数。频率选择性时，令 $C(f)=H_d(f)$、$D(f)=H_i(f)$，需要在每一对共轭频点上求解相应的 $2\times2$ 系统，或拟合稳定的widely-linear FIR逆；不能只使用一个平坦复系数。直接响应存在深陷波或非最小相位时，有限长因果逆通常只能近似且可能放大噪声。
 
 最终工程流程建议为：
 
@@ -1521,21 +1576,26 @@ DPD应使用 $\widehat y$ 做同步、MSE和系数更新，而不是直接使用
 
 #### 这种方法解决了什么不可辨识问题
 
-只有一条反馈记录时，平坦FB接收机可以写成：
+只有一条反馈记录时，频率选择性FB接收机可以写成：
 
 ```math
-z[n]=C y[n]+D y^*[n]+c+v[n].
+z[n]
+=
+\left(h_d*y\right)[n]
++
+\left(h_i*y^*\right)[n]
++c+v[n].
 ```
 
 这里：
 
 - $y[n]$ 是真正的PA输出，已经包含Tx I/Q误差、PA非线性、记忆效应和真实发射镜像；
-- $C$ 是FB直接支路；
-- $D$ 是FB解调器产生的共轭镜像支路；
+- $h_d$ 是FB直接支路FIR；
+- $h_i$ 是FB解调器产生的共轭镜像支路FIR；
 - $c$ 是FB直流偏置；
 - $v[n]$ 是噪声和量化误差。
 
-只观察 $z[n]$ 时，$y[n]$ 与 $D y^*[n]$ 混在一起，无法判断镜像来自真实Tx/PA还是FB接收机。先把PA输出的低功率耦合观测经过FB增益、滤波、可能的前级非线性和时频响应，记I/Q变频器输入为：
+平坦的 $C,D$ 只是 $h_d=(C)$、$h_i=(D)$ 的一抽头特例。只观察 $z[n]$ 时，$h_d*y$ 与 $h_i*y^*$ 混在一起，无法判断镜像来自真实Tx/PA还是FB接收机。先把PA输出的低功率耦合观测经过FB增益、滤波、可能的前级非线性和时频响应，记I/Q变频器输入为：
 
 ```math
 u[n]=F_{\mathrm{pre}}\{y[n]\}.
@@ -1546,9 +1606,9 @@ u[n]=F_{\mathrm{pre}}\{y[n]\}.
 ```math
 z_\theta[n]
 =
-\alpha p_\theta u[n]
+p_\theta\left(h_d*u\right)[n]
 +
-\beta p_\theta^* u^*[n]
+p_\theta^*\left(h_i*u^*\right)[n]
 +c+v_\theta[n].
 ```
 
@@ -1567,11 +1627,11 @@ z_B[n]=j d[n]-j i[n],
 其中：
 
 ```math
-d[n]=\alpha u[n],
+d[n]=\left(h_d*u\right)[n],
 ```
 
 ```math
-i[n]=\beta u^*[n].
+i[n]=\left(h_i*u^*\right)[n].
 ```
 
 于是：
@@ -1588,7 +1648,7 @@ i[n]=\beta u^*[n].
 \frac{z_A[n]+jz_B[n]}{2}.
 ```
 
-$\widehat d$ 只去除了FB接收机自己产生的共轭项，但仍完整保留 $y$ 中真实存在的Tx镜像和PA失真。因此DPD使用 $\widehat d$ 训练时，仍然能够补偿真实发射链，而不会被FB镜像诱导到错误方向。
+$\widehat d$ 只去除了FB接收机自己产生的共轭项，但仍完整保留 $y$ 中真实存在的Tx镜像和PA失真。因此DPD使用 $\widehat d$ 训练时，仍然能够补偿真实发射链，而不会被FB镜像诱导到错误方向。它返回的是 $(h_d*u)[n]$，不是已经把直接FB频响均衡后的理想 $u[n]$。
 
 相移必须位于PA之后的低功率耦合观察支路，并且位于FB I/Q解调器之前。工程上推荐把它放在I/Q变频器输入附近：这样两个状态共用完全相同的FB前级工作点，并且不等幅的移相响应不会改变前级非线性或限幅状态。在ADC之后把数字样值乘以 $j$ 没有作用，因为此时直接项和镜像项已经混合并会一起同向旋转。在PA之前移相也不等价：PA非线性、记忆和Tx共轭响应会随输入相位状态重新求值，以上两方程不再共享同一个 $y[n]$。
 
@@ -1909,7 +1969,7 @@ directFeedback, imageFeedback = (
 
 #### 在Channel中自动标定并供ILC使用
 
-仿真中的 `phase_pair` 模式只计算一次PA和一个热周期，然后从同一个PA输出分出0度与90度两个FB观测。它把分离后的直接分量作为 `fbOut`，因此现有ILC不需要修改入口：
+仿真中的 `phase_pair` 模式只计算一次PA和一个热周期，然后从同一个PA输出分出0度与90度两个FB观测。即使FB I/Q具有独立直接/镜像FIR，标量相移仍使两项按相反方向旋转；它把分离后的直接分量 $h_d*u$ 作为 `fbOut`，因此现有ILC不需要修改入口：
 
 ```python
 from inc.lib.Channel import Channel
@@ -1924,8 +1984,18 @@ channel = Channel(
         "sampleMode": "fb",
         "sampleRateHz": 80.0e6,
         "fbIqImbalanceEnabled": True,
-        "fbIqGainImbalanceDb": 0.6,
-        "fbIqPhaseImbalanceDegrees": 2.5,
+        "fbIqGainImbalanceDb": 0.0,
+        "fbIqPhaseImbalanceDegrees": 0.0,
+        "fbIqDirectFirTaps": (
+            0.998 + 0.0j,
+            0.018 - 0.012j,
+            -0.007 + 0.004j,
+        ),
+        "fbIqImageFirTaps": (
+            0.018 + 0.010j,
+            -0.009 + 0.006j,
+            0.004 - 0.003j,
+        ),
         "fbIqCompensationMode": "phase_pair",
         "fbPhasePairResponses": (
             phaseZeroResponse,
@@ -1948,7 +2018,9 @@ channel.UpdateParameters(fbIqCompensationMode="filter")
 nextChOut, nextCorrectedFbOut = channel.Process(nextTxSignal)
 ```
 
-`chOut` 仍然是最终主路性能观测，`correctedFbOut` 是去除FB自身I/Q镜像后的DPD训练观测。`phase_pair` 适合首次标定或慢速重标定；`filter` 适合常规高速DPD迭代。若未先成功运行 `phase_pair`，或PA对象被替换、采样率、FB增益/滤波/时延/IQ/ADC、移相响应、FIR长度、正则化强度或公开位宽改变，`filter` 模式会拒绝运行并要求重新标定。
+`chOut` 仍然是最终主路性能观测，`correctedFbOut` 是去除FB自身I/Q镜像后的DPD训练观测，但仍保留直接接收响应 $h_d$。`phase_pair` 适合首次标定或慢速重标定；`filter` 适合常规高速DPD迭代。示例的3-tap频选误差从7-tap补偿器起步；`filterLength=1` 只适合平坦误差。若 $h_d$ 有深陷波或非最小相位，有限长因果逆只能近似，必须用独立记录检查 `fitNmseDb`、带边残余IRR和噪声增强。
+
+若未先成功运行 `phase_pair`，或PA对象被替换、采样率、FB增益/普通FIR/时延、FB I/Q标量/直接FIR/镜像FIR/DC、移相响应、补偿FIR长度、正则化强度、FB非线性/限幅、ADC或公开位宽改变，`filter` 模式会拒绝运行并要求重新标定。
 
 这里的 `outputPowerDbm` 仍然是干净PA输出参考面的功率目标。功率闭环不会把带FB增益、IQ误差或ADC限幅的raw反馈幅度误当成PA输出功率。
 
@@ -1956,7 +2028,7 @@ nextChOut, nextCorrectedFbOut = channel.Process(nextTxSignal)
 
 #### 这种方法不能解决什么
 
-- 它能分离FB共轭镜像，但不能仅凭FB数据把直接FB频响 $C$ 与真实PA输出 $y$ 单独拆开。平坦 $C$ 可以由公共复增益补偿；频率选择性 $C$ 仍需要低功率环回或工厂标定。
+- 它能分离FB共轭镜像，但不能仅凭FB数据把直接FB频响 $h_d$ 与真实PA输出 $y$ 单独拆开。平坦直接响应可以由公共复增益补偿；频率选择性 $h_d$ 仍需要低功率环回或工厂标定。
 - 当前 `phaseResponses` 是全带宽和所有MIMO链共用的两个复标量。若实测移相器的幅相或群时延在带内明显变化，应先做状态频响均衡、分频段标定，或将实现扩展为逐频点2乘2求逆；不能把一对标量响应当成宽带真值。
 - FB三阶非线性、限幅、ADC削顶和混叠不是可逆的线性I/Q误差。出现这些现象时应先降低FB增益或提高ADC余量。
 - 两次或四次发送的PA输出必须具有足够重复性。若DPD输入、PA记忆初态、温度或电源状态随机变化，差异项仍会泄漏到镜像估计。

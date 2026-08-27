@@ -6616,6 +6616,883 @@ def CheckFeedbackIqPhasePairCalibration() -> None:
             )
 
 
+def CheckFrequencySelectiveIqImbalance() -> None:
+    """Verify causal frequency-selective Tx and feedback I/Q imbalance.
+
+    Processing details:
+        Algorithm: Compare the new widely-linear FIR stages with independent
+        causal convolutions, recover their direct and mirror responses from two
+        exact tones, prove legacy scalar fallback and Tx/FB isolation, exercise
+        floating SISO plus fixed-point MIMO boundaries, validate live ChainMap
+        updates and bad tap settings, then verify phase-pair separation, cached
+        filter generalization, cache invalidation, and ILC feedback routing.
+
+    Returns:
+        result: None. Assertions expose response, configuration, compensation,
+            representation, and integration regressions.
+    """
+
+    def ApplyReferenceIqFir(
+        inputSignal: np.ndarray,
+        directFirTaps: tuple[complex, ...],
+        imageFirTaps: tuple[complex, ...],
+        dcOffset: complex,
+    ) -> np.ndarray:
+        """Evaluate an independent causal widely-linear FIR reference.
+
+        Processing details:
+            Algorithm: Convert vectors to one-column matrices, convolve each
+            physical chain independently with the supplied direct taps and its
+            conjugate with the image taps, truncate both causal responses to
+            the original record, add DC, and restore vector orientation.
+
+        Args:
+            inputSignal: SISO vector or samples-by-chains complex matrix.
+            directFirTaps: Complete causal response of the desired branch.
+            imageFirTaps: Complete causal response of the conjugate branch.
+            dcOffset: Complex offset added after both filtered branches.
+
+        Returns:
+            result: Reference waveform with the same shape as the input.
+        """
+
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        inputWasVector = complexInput.ndim == 1
+        inputMatrix = (
+            complexInput.reshape(-1, 1)
+            if inputWasVector
+            else complexInput
+        )
+        outputMatrix = np.empty_like(inputMatrix)
+        directTaps = np.asarray(directFirTaps, dtype=np.complex128)
+        imageTaps = np.asarray(imageFirTaps, dtype=np.complex128)
+        for chainIndex in range(inputMatrix.shape[1]):
+            inputColumn = inputMatrix[:, chainIndex]
+            directOutput = np.convolve(
+                inputColumn, directTaps, mode="full"
+            )[: inputColumn.size]
+            imageOutput = np.convolve(
+                np.conj(inputColumn), imageTaps, mode="full"
+            )[: inputColumn.size]
+            outputMatrix[:, chainIndex] = (
+                directOutput + imageOutput + dcOffset
+            )
+        return outputMatrix[:, 0] if inputWasVector else outputMatrix
+
+    randomGenerator = np.random.default_rng(20260827)
+    sourceSignal = 0.13 * (
+        randomGenerator.normal(size=2048)
+        + 1j * randomGenerator.normal(size=2048)
+    )
+
+    # None on both branches must preserve the historical scalar model. An
+    # explicit one-tap pair containing the same alpha/beta values is equivalent,
+    # while either branch can independently retain scalar fallback.
+    legacyIqParameters = {
+        "txIqGainImbalanceDb": 1.35,
+        "txIqPhaseImbalanceDegrees": -5.5,
+        "txDcOffset": 0.013 - 0.009j,
+        "fbIqGainImbalanceDb": 1.35,
+        "fbIqPhaseImbalanceDegrees": -5.5,
+        "fbDcOffset": 0.013 - 0.009j,
+        "width": 0,
+    }
+    legacyChannel = Channel(parameters=legacyIqParameters)
+    legacyDirectCoefficient, legacyImageCoefficient = (
+        legacyChannel.ResolveIqImbalanceCoefficients(1.35, -5.5)
+    )
+    expectedLegacyOutput = (
+        legacyDirectCoefficient * sourceSignal
+        + legacyImageCoefficient * np.conj(sourceSignal)
+        + (0.013 - 0.009j)
+    )
+    assert legacyChannel.GetParameters()["txIqDirectFirTaps"] is None
+    assert legacyChannel.GetParameters()["txIqImageFirTaps"] is None
+    assert legacyChannel.GetParameters()["fbIqDirectFirTaps"] is None
+    assert legacyChannel.GetParameters()["fbIqImageFirTaps"] is None
+    assert np.allclose(
+        legacyChannel.ApplyTransmitterIqImbalance(sourceSignal),
+        expectedLegacyOutput,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    assert np.allclose(
+        legacyChannel.ApplyFeedbackIqImbalance(sourceSignal),
+        expectedLegacyOutput,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    explicitFlatChannel = Channel(
+        parameters={
+            **legacyIqParameters,
+            "txIqDirectFirTaps": (legacyDirectCoefficient,),
+            "txIqImageFirTaps": (legacyImageCoefficient,),
+            "fbIqDirectFirTaps": (legacyDirectCoefficient,),
+            "fbIqImageFirTaps": (legacyImageCoefficient,),
+        }
+    )
+    assert np.allclose(
+        explicitFlatChannel.ApplyTransmitterIqImbalance(sourceSignal),
+        expectedLegacyOutput,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    assert np.allclose(
+        explicitFlatChannel.ApplyFeedbackIqImbalance(sourceSignal),
+        expectedLegacyOutput,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    hybridDirectTaps = (0.81 + 0.04j, 0.14 - 0.03j)
+    hybridImageTaps = (0.07 - 0.02j, -0.025 + 0.01j)
+    hybridChannel = Channel(
+        parameters={
+            **legacyIqParameters,
+            "txIqDirectFirTaps": hybridDirectTaps,
+            "fbIqImageFirTaps": hybridImageTaps,
+        }
+    )
+    hybridTxDirect, hybridTxImage = (
+        hybridChannel.TransmitterIqFilterTaps()
+    )
+    hybridFbDirect, hybridFbImage = hybridChannel.FeedbackIqFilterTaps()
+    assert np.array_equal(hybridTxDirect, hybridDirectTaps)
+    assert np.array_equal(hybridTxImage, (legacyImageCoefficient,))
+    assert np.array_equal(hybridFbDirect, (legacyDirectCoefficient,))
+    assert np.array_equal(hybridFbImage, hybridImageTaps)
+    assert np.allclose(
+        hybridChannel.ApplyTransmitterIqImbalance(sourceSignal),
+        ApplyReferenceIqFir(
+            sourceSignal,
+            hybridDirectTaps,
+            (legacyImageCoefficient,),
+            0.013 - 0.009j,
+        ),
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    assert np.allclose(
+        hybridChannel.ApplyFeedbackIqImbalance(sourceSignal),
+        ApplyReferenceIqFir(
+            sourceSignal,
+            (legacyDirectCoefficient,),
+            hybridImageTaps,
+            0.013 - 0.009j,
+        ),
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+
+    # Explicit FIRs are complete branch responses, not corrections multiplied
+    # by the legacy alpha/beta values. Use different Tx and FB responses and
+    # compare both SISO and two-chain results with independent convolutions.
+    txDirectTaps = (0.60 + 0.02j, 0.40 - 0.02j)
+    txImageTaps = (0.08 - 0.01j, -0.06 + 0.02j)
+    fbDirectTaps = (
+        0.75 - 0.01j,
+        -0.18 + 0.03j,
+        0.0 + 0.08j,
+    )
+    fbImageTaps = (
+        0.04 + 0.02j,
+        0.07 - 0.01j,
+        0.0 - 0.03j,
+    )
+    txDcOffset = 0.009 - 0.006j
+    fbDcOffset = -0.011 + 0.007j
+    selectiveChannel = Channel(
+        parameters={
+            "txIqGainImbalanceDb": 7.0,
+            "txIqPhaseImbalanceDegrees": 23.0,
+            "txIqDirectFirTaps": txDirectTaps,
+            "txIqImageFirTaps": txImageTaps,
+            "txDcOffset": txDcOffset,
+            "fbIqGainImbalanceDb": -6.0,
+            "fbIqPhaseImbalanceDegrees": -19.0,
+            "fbIqDirectFirTaps": fbDirectTaps,
+            "fbIqImageFirTaps": fbImageTaps,
+            "fbDcOffset": fbDcOffset,
+            "width": 0,
+        }
+    )
+    expectedTxOutput = ApplyReferenceIqFir(
+        sourceSignal,
+        txDirectTaps,
+        txImageTaps,
+        txDcOffset,
+    )
+    expectedFbOutput = ApplyReferenceIqFir(
+        sourceSignal,
+        fbDirectTaps,
+        fbImageTaps,
+        fbDcOffset,
+    )
+    assert np.allclose(
+        selectiveChannel.ApplyTransmitterIqImbalance(sourceSignal),
+        expectedTxOutput,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    assert np.allclose(
+        selectiveChannel.ApplyFeedbackIqImbalance(sourceSignal),
+        expectedFbOutput,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    sourceMatrix = np.column_stack(
+        (
+            sourceSignal,
+            0.67 * sourceSignal[::-1] * np.exp(0.39j),
+        )
+    )
+    expectedTxMatrix = ApplyReferenceIqFir(
+        sourceMatrix,
+        txDirectTaps,
+        txImageTaps,
+        txDcOffset,
+    )
+    expectedFbMatrix = ApplyReferenceIqFir(
+        sourceMatrix,
+        fbDirectTaps,
+        fbImageTaps,
+        fbDcOffset,
+    )
+    assert np.allclose(
+        selectiveChannel.ApplyTransmitterIqImbalance(sourceMatrix),
+        expectedTxMatrix,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    assert np.allclose(
+        selectiveChannel.ApplyFeedbackIqImbalance(sourceMatrix),
+        expectedFbMatrix,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+
+    # Recover two wanted tones and both conjugate images by complex least
+    # squares after the FIR startup transient. This checks the sign convention
+    # Hdirect(+f) and Himage(-f), and proves that IRR is frequency selective.
+    toneSampleCount = 4096
+    toneIndices = np.arange(toneSampleCount, dtype=float)
+    toneBinIndices = (128, 1792)
+    toneRadians = tuple(
+        2.0 * np.pi * toneBin / toneSampleCount
+        for toneBin in toneBinIndices
+    )
+    toneAmplitudes = (0.17 + 0.04j, 0.11 - 0.06j)
+    twoToneSignal = sum(
+        toneAmplitude * np.exp(1j * toneRadian * toneIndices)
+        for toneAmplitude, toneRadian in zip(
+            toneAmplitudes, toneRadians
+        )
+    )
+    toneStageCases = (
+        (
+            selectiveChannel.ApplyTransmitterIqImbalance,
+            txDirectTaps,
+            txImageTaps,
+            txDcOffset,
+        ),
+        (
+            selectiveChannel.ApplyFeedbackIqImbalance,
+            fbDirectTaps,
+            fbImageTaps,
+            fbDcOffset,
+        ),
+    )
+    for stageProcessor, directTaps, imageTaps, dcOffset in toneStageCases:
+        toneOutput = stageProcessor(twoToneSignal)
+        transientLength = max(len(directTaps), len(imageTaps)) - 1
+        fitIndices = toneIndices[transientLength:]
+        toneBasis = np.column_stack(
+            (
+                np.exp(1j * toneRadians[0] * fitIndices),
+                np.exp(1j * toneRadians[1] * fitIndices),
+                np.exp(-1j * toneRadians[0] * fitIndices),
+                np.exp(-1j * toneRadians[1] * fitIndices),
+                np.ones(fitIndices.size, dtype=np.complex128),
+            )
+        )
+        measuredToneCoefficients = np.linalg.lstsq(
+            toneBasis,
+            toneOutput[transientLength:],
+            rcond=None,
+        )[0]
+        directTapIndices = np.arange(len(directTaps), dtype=float)
+        imageTapIndices = np.arange(len(imageTaps), dtype=float)
+        expectedDirectCoefficients = tuple(
+            toneAmplitude
+            * np.sum(
+                np.asarray(directTaps)
+                * np.exp(-1j * toneRadian * directTapIndices)
+            )
+            for toneAmplitude, toneRadian in zip(
+                toneAmplitudes, toneRadians
+            )
+        )
+        expectedImageCoefficients = tuple(
+            np.conj(toneAmplitude)
+            * np.sum(
+                np.asarray(imageTaps)
+                * np.exp(1j * toneRadian * imageTapIndices)
+            )
+            for toneAmplitude, toneRadian in zip(
+                toneAmplitudes, toneRadians
+            )
+        )
+        expectedToneCoefficients = np.asarray(
+            (
+                *expectedDirectCoefficients,
+                *expectedImageCoefficients,
+                dcOffset,
+            ),
+            dtype=np.complex128,
+        )
+        assert np.allclose(
+            measuredToneCoefficients,
+            expectedToneCoefficients,
+            rtol=1.0e-10,
+            atol=1.0e-11,
+        )
+        toneIrrDb = tuple(
+            20.0
+            * np.log10(
+                abs(expectedImageCoefficient)
+                / abs(expectedDirectCoefficient)
+            )
+            for expectedDirectCoefficient, expectedImageCoefficient in zip(
+                expectedDirectCoefficients,
+                expectedImageCoefficients,
+            )
+        )
+        assert max(toneIrrDb) < 0.0
+        assert abs(toneIrrDb[1] - toneIrrDb[0]) > 5.0
+
+    # Returned tap arrays are defensive. Disabling either I/Q stage bypasses
+    # its scalar settings, both FIRs, and DC as one atomic identity operation.
+    returnedTxDirect, returnedTxImage = (
+        selectiveChannel.TransmitterIqFilterTaps()
+    )
+    returnedFbDirect, returnedFbImage = (
+        selectiveChannel.FeedbackIqFilterTaps()
+    )
+    returnedTxDirect[0] = 99.0 + 0.0j
+    returnedTxImage[0] = 99.0 + 0.0j
+    returnedFbDirect[0] = 99.0 + 0.0j
+    returnedFbImage[0] = 99.0 + 0.0j
+    retainedTxDirect, retainedTxImage = (
+        selectiveChannel.TransmitterIqFilterTaps()
+    )
+    retainedFbDirect, retainedFbImage = (
+        selectiveChannel.FeedbackIqFilterTaps()
+    )
+    assert np.array_equal(retainedTxDirect, txDirectTaps)
+    assert np.array_equal(retainedTxImage, txImageTaps)
+    assert np.array_equal(retainedFbDirect, fbDirectTaps)
+    assert np.array_equal(retainedFbImage, fbImageTaps)
+    disabledChannel = Channel(
+        parameters={
+            **selectiveChannel.GetParameters(),
+            "txIqImbalanceEnabled": False,
+            "fbIqImbalanceEnabled": False,
+        }
+    )
+    disabledTxDirect, disabledTxImage = (
+        disabledChannel.TransmitterIqFilterTaps()
+    )
+    disabledFbDirect, disabledFbImage = (
+        disabledChannel.FeedbackIqFilterTaps()
+    )
+    assert np.array_equal(disabledTxDirect, (1.0 + 0.0j,))
+    assert np.array_equal(disabledTxImage, (0.0 + 0.0j,))
+    assert np.array_equal(disabledFbDirect, (1.0 + 0.0j,))
+    assert np.array_equal(disabledFbImage, (0.0 + 0.0j,))
+    assert np.array_equal(
+        disabledChannel.ApplyTransmitterIqImbalance(sourceMatrix),
+        sourceMatrix,
+    )
+    assert np.array_equal(
+        disabledChannel.ApplyFeedbackIqImbalance(sourceMatrix),
+        sourceMatrix,
+    )
+
+    # Tx FIRs precede the PA and therefore affect both observations. FB FIRs
+    # affect only embedded feedback; forward mode must still return an exact
+    # fbOut copy without evaluating the configured FB-specific fading.
+    processInput = sourceSignal[:1024]
+    commonProcessParameters = {
+        "txIqDirectFirTaps": txDirectTaps,
+        "txIqImageFirTaps": txImageTaps,
+        "txDcOffset": txDcOffset,
+        "fbIqDirectFirTaps": fbDirectTaps,
+        "fbIqImageFirTaps": fbImageTaps,
+        "fbDcOffset": fbDcOffset,
+        "width": 0,
+    }
+    forwardSelectiveChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            **commonProcessParameters,
+            "sampleMode": "forward",
+        },
+    )
+    feedbackSelectiveChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            **commonProcessParameters,
+            "sampleMode": "fb",
+        },
+    )
+    forwardChannelOutput, forwardFeedbackOutput = (
+        forwardSelectiveChannel.Process(processInput)
+    )
+    feedbackChannelOutput, embeddedFeedbackOutput = (
+        feedbackSelectiveChannel.Process(processInput)
+    )
+    assert np.array_equal(forwardFeedbackOutput, forwardChannelOutput)
+    assert np.allclose(
+        feedbackChannelOutput,
+        forwardChannelOutput,
+        rtol=1.0e-13,
+        atol=1.0e-13,
+    )
+    assert np.allclose(
+        forwardSelectiveChannel.GetLastTransmitterOutput(),
+        ApplyReferenceIqFir(
+            processInput,
+            txDirectTaps,
+            txImageTaps,
+            txDcOffset,
+        ),
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    assert np.allclose(
+        embeddedFeedbackOutput,
+        ApplyReferenceIqFir(
+            feedbackChannelOutput,
+            fbDirectTaps,
+            fbImageTaps,
+            fbDcOffset,
+        ),
+        rtol=1.0e-13,
+        atol=1.0e-13,
+    )
+    assert not np.allclose(embeddedFeedbackOutput, feedbackChannelOutput)
+    disabledProcessChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            **commonProcessParameters,
+            "sampleMode": "fb",
+            "txIqImbalanceEnabled": False,
+            "fbIqImbalanceEnabled": False,
+        },
+    )
+    idealProcessChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={"sampleMode": "fb", "width": 0},
+    )
+    disabledChannelOutput, disabledFeedbackOutput = (
+        disabledProcessChannel.Process(processInput)
+    )
+    idealChannelOutput, idealFeedbackOutput = idealProcessChannel.Process(
+        processInput
+    )
+    assert np.allclose(disabledChannelOutput, idealChannelOutput)
+    assert np.allclose(disabledFeedbackOutput, idealFeedbackOutput)
+
+    # Floating matrices use one common response independently per chain. At a
+    # public 16-bit boundary, FB processing must equal encode(reference(decode))
+    # and Tx processing must expose the same normalized pre-PA matrix.
+    fixedFormat = FixedPoint(16)
+    fixedFloatingInput = sourceMatrix[:512]
+    fixedInput = fixedFormat.EncodeComplex(fixedFloatingInput)
+    fixedFeedbackChannel = Channel(
+        parameters={
+            "sampleMode": "fb",
+            "fbIqDirectFirTaps": fbDirectTaps,
+            "fbIqImageFirTaps": fbImageTaps,
+            "fbDcOffset": fbDcOffset,
+            "width": 16,
+        }
+    )
+    fixedFeedbackOutput = fixedFeedbackChannel.ProcessPaOutput(fixedInput)
+    decodedFixedInput = fixedFormat.DecodeComplex(fixedInput)
+    expectedFixedFeedback = fixedFormat.EncodeComplex(
+        ApplyReferenceIqFir(
+            decodedFixedInput,
+            fbDirectTaps,
+            fbImageTaps,
+            fbDcOffset,
+        )
+    )
+    assert np.array_equal(fixedFeedbackOutput, expectedFixedFeedback)
+    fixedTxChannel = Channel(
+        paModel=MimoPaModel(
+            parameters={"numTransmitChains": 2, "width": 0}
+        ),
+        parameters={
+            "sampleMode": "forward",
+            "txIqDirectFirTaps": txDirectTaps,
+            "txIqImageFirTaps": txImageTaps,
+            "txDcOffset": txDcOffset,
+            "width": 16,
+        },
+    )
+    fixedChannelOutput, fixedTxFeedbackOutput = fixedTxChannel.Process(
+        fixedInput
+    )
+    expectedFixedTransmitter = ApplyReferenceIqFir(
+        decodedFixedInput,
+        txDirectTaps,
+        txImageTaps,
+        txDcOffset,
+    )
+    assert np.allclose(
+        fixedTxChannel.GetLastTransmitterOutput(),
+        expectedFixedTransmitter,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    assert fixedChannelOutput.shape == fixedInput.shape
+    assert np.array_equal(fixedTxFeedbackOutput, fixedChannelOutput)
+    assert np.array_equal(
+        fixedChannelOutput.real, np.rint(fixedChannelOutput.real)
+    )
+    assert np.array_equal(
+        fixedChannelOutput.imag, np.rint(fixedChannelOutput.imag)
+    )
+
+    # Caller-owned mappings remain live, while UpdateParameters has higher
+    # priority and never mutates the lower layer. All four FIR names must take
+    # effect immediately and invalid transactional updates must roll back.
+    liveParameters = {
+        "txIqDirectFirTaps": (1.0 + 0.0j,),
+        "txIqImageFirTaps": (0.0 + 0.0j,),
+        "fbIqDirectFirTaps": (1.0 + 0.0j,),
+        "fbIqImageFirTaps": (0.0 + 0.0j,),
+        "width": 0,
+    }
+    liveChannel = Channel(parameters=liveParameters)
+    assert np.array_equal(
+        liveChannel.ApplyTransmitterIqImbalance(sourceSignal), sourceSignal
+    )
+    liveTxDirectTaps = (0.92 + 0.01j, 0.06 - 0.02j)
+    liveFbImageTaps = (0.05 - 0.01j, -0.015 + 0.02j)
+    liveParameters["txIqDirectFirTaps"] = liveTxDirectTaps
+    liveParameters["fbIqImageFirTaps"] = liveFbImageTaps
+    assert np.allclose(
+        liveChannel.ApplyTransmitterIqImbalance(sourceSignal),
+        ApplyReferenceIqFir(
+            sourceSignal,
+            liveTxDirectTaps,
+            (0.0 + 0.0j,),
+            0.0 + 0.0j,
+        ),
+    )
+    assert np.allclose(
+        liveChannel.ApplyFeedbackIqImbalance(sourceSignal),
+        ApplyReferenceIqFir(
+            sourceSignal,
+            (1.0 + 0.0j,),
+            liveFbImageTaps,
+            0.0 + 0.0j,
+        ),
+    )
+    updatedTxImageTaps = (0.025 + 0.012j, 0.008 - 0.006j)
+    updatedFbDirectTaps = (0.84 - 0.02j, 0.11 + 0.03j)
+    liveChannel.UpdateParameters(
+        txIqImageFirTaps=updatedTxImageTaps,
+        fbIqDirectFirTaps=updatedFbDirectTaps,
+    )
+    assert liveParameters["txIqImageFirTaps"] == (0.0 + 0.0j,)
+    assert liveParameters["fbIqDirectFirTaps"] == (1.0 + 0.0j,)
+    assert np.allclose(
+        liveChannel.ApplyTransmitterIqImbalance(sourceSignal),
+        ApplyReferenceIqFir(
+            sourceSignal,
+            liveTxDirectTaps,
+            updatedTxImageTaps,
+            0.0 + 0.0j,
+        ),
+    )
+    assert np.allclose(
+        liveChannel.ApplyFeedbackIqImbalance(sourceSignal),
+        ApplyReferenceIqFir(
+            sourceSignal,
+            updatedFbDirectTaps,
+            liveFbImageTaps,
+            0.0 + 0.0j,
+        ),
+    )
+    parametersBeforeInvalidUpdate = liveChannel.GetParameters()
+    try:
+        liveChannel.UpdateParameters(txIqImageFirTaps=())
+    except ValueError as error:
+        assert "txIqImageFirTaps" in str(error)
+    else:
+        raise AssertionError("empty live Tx image FIR was accepted")
+    assert (
+        liveChannel.GetParameters()["txIqImageFirTaps"]
+        == parametersBeforeInvalidUpdate["txIqImageFirTaps"]
+    )
+
+    invalidFirCases = (
+        ("txIqDirectFirTaps", "not taps", TypeError),
+        ("txIqImageFirTaps", (), ValueError),
+        ("fbIqDirectFirTaps", ((1.0,), (0.5,)), ValueError),
+        ("fbIqImageFirTaps", (complex(np.inf, 0.0),), ValueError),
+    )
+    for parameterName, invalidValue, expectedErrorType in invalidFirCases:
+        try:
+            Channel(parameters={parameterName: invalidValue})
+        except (TypeError, ValueError) as error:
+            assert isinstance(error, expectedErrorType)
+            assert parameterName in str(error)
+            assert "nonempty one-dimensional sequence" in str(error)
+        else:
+            raise AssertionError(
+                f"invalid frequency-selective FIR accepted: {parameterName}"
+            )
+
+    # Phase-pair separation must preserve the direct FB FIR while removing the
+    # frequency-selective image. Its learned single-state inverse must
+    # generalize to an independent record, and either live or explicit FB tap
+    # changes must invalidate the cached filter before another transmission.
+    calibrationImageTaps = (
+        0.11 + 0.03j,
+        -0.045 + 0.025j,
+        0.018 - 0.012j,
+    )
+    calibrationDcOffset = 0.012 - 0.008j
+    calibrationParameters = {
+        "sampleMode": "fb",
+        "fbIqDirectFirTaps": (1.0 + 0.0j,),
+        "fbIqImageFirTaps": calibrationImageTaps,
+        "fbDcOffset": calibrationDcOffset,
+        "fbIqCompensationMode": "phase_pair",
+        "fbIqCompensationFilterLength": 17,
+        "fbIqCompensationRegularization": 1.0e-10,
+        "width": 0,
+    }
+    calibrationChannel = Channel(parameters=calibrationParameters)
+    calibrationSignal = 0.14 * (
+        randomGenerator.normal(size=8192)
+        + 1j * randomGenerator.normal(size=8192)
+    )
+    separatedFeedback = calibrationChannel.ProcessPaOutput(
+        calibrationSignal
+    )
+    rawPhaseZero, rawPhaseNinety = (
+        calibrationChannel.GetLastFeedbackPhasePair()
+    )
+    replayCalibration = FeedbackIqCalibration(
+        parameters={
+            "commonDcOffset": calibrationDcOffset,
+            "filterLength": 17,
+            "regularization": 1.0e-10,
+            "width": 0,
+        }
+    )
+    replayDirect, replayImage = replayCalibration.SeparatePhasePair(
+        rawPhaseZero,
+        rawPhaseNinety,
+    )
+    expectedCalibrationImage = ApplyReferenceIqFir(
+        calibrationSignal,
+        (0.0 + 0.0j,),
+        calibrationImageTaps,
+        0.0 + 0.0j,
+    )
+    assert np.allclose(
+        separatedFeedback,
+        calibrationSignal,
+        rtol=1.0e-13,
+        atol=1.0e-13,
+    )
+    assert np.allclose(replayDirect, calibrationSignal)
+    assert np.allclose(replayImage, expectedCalibrationImage)
+    assert calibrationChannel.GetFeedbackIqCalibrationMetrics()[
+        "fitNmseDb"
+    ] < -100.0
+    calibrationChannel.UpdateParameters(
+        fbIqCompensationMode="filter"
+    )
+    independentSignal = 0.14 * (
+        randomGenerator.normal(size=4096)
+        + 1j * randomGenerator.normal(size=4096)
+    )
+    correctedIndependentSignal = calibrationChannel.ProcessPaOutput(
+        independentSignal
+    )
+    rawCalibrationChannel = Channel(
+        parameters={
+            **calibrationParameters,
+            "fbIqCompensationMode": "none",
+        }
+    )
+    rawIndependentSignal = rawCalibrationChannel.ProcessPaOutput(
+        independentSignal
+    )
+    rawIndependentError = float(
+        np.mean(np.abs(rawIndependentSignal - independentSignal) ** 2)
+    )
+    correctedIndependentError = float(
+        np.mean(
+            np.abs(correctedIndependentSignal - independentSignal) ** 2
+        )
+    )
+    assert correctedIndependentError < rawIndependentError * 1.0e-8
+
+    calibrationParameters["fbIqDirectFirTaps"] = (
+        0.98 + 0.0j,
+        0.01 + 0.0j,
+    )
+    try:
+        calibrationChannel.ProcessPaOutput(independentSignal)
+    except RuntimeError as error:
+        assert "stale" in str(error)
+    else:
+        raise AssertionError("live FB direct FIR reused stale calibration")
+    calibrationParameters["fbIqDirectFirTaps"] = (1.0 + 0.0j,)
+    calibrationChannel.UpdateParameters(
+        fbIqCompensationMode="phase_pair"
+    )
+    calibrationChannel.ProcessPaOutput(calibrationSignal)
+    calibrationChannel.UpdateParameters(
+        fbIqCompensationMode="filter"
+    )
+    calibrationChannel.UpdateParameters(
+        fbIqImageFirTaps=(0.09 + 0.02j, -0.03 + 0.01j)
+    )
+    assert calibrationParameters["fbIqImageFirTaps"] == (
+        calibrationImageTaps
+    )
+    try:
+        calibrationChannel.ProcessPaOutput(independentSignal)
+    except RuntimeError as error:
+        assert "calibration" in str(error)
+    else:
+        raise AssertionError("updated FB image FIR retained calibration")
+
+    # Frequency-domain ILC must receive the phase-pair or cached-filter fbOut,
+    # not the raw frequency-selective mirror. Direct FB response is identity,
+    # so corrected feedback should match the same-round forward observation.
+    ilcParameters = {
+        **calibrationParameters,
+        "fbIqDirectFirTaps": (1.0 + 0.0j,),
+        "fbIqImageFirTaps": calibrationImageTaps,
+        "fbIqCompensationMode": "phase_pair",
+    }
+    ilcChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters=ilcParameters,
+    )
+    ilcReference = 0.12 * (
+        randomGenerator.normal(size=1024)
+        + 1j * randomGenerator.normal(size=1024)
+    )
+    ilcConfig = ILCConfig(
+        numIterations=2,
+        learningRate=0.2,
+        maxAmplitude=1.25,
+    )
+    phasePairIlcResult = RunFrequencyDomainIlc(
+        ilcReference,
+        ilcChannel,
+        sampleRateHz=20.0e6,
+        channelBandwidthHz=8.0e6,
+        config=ilcConfig,
+    )
+    assert len(phasePairIlcResult.history) == 2
+    for iterationResult in phasePairIlcResult.history:
+        assert iterationResult.feedbackOutputSignal is not None
+        feedbackMismatch = float(
+            np.mean(
+                np.abs(
+                    iterationResult.feedbackOutputSignal
+                    - iterationResult.outputSignal
+                )
+                ** 2
+            )
+        )
+        outputPower = max(
+            float(np.mean(np.abs(iterationResult.outputSignal) ** 2)),
+            np.finfo(float).tiny,
+        )
+        assert feedbackMismatch / outputPower < 1.0e-24
+    ilcChannel.UpdateParameters(fbIqCompensationMode="filter")
+    filterIlcReference = 0.12 * (
+        randomGenerator.normal(size=1024)
+        + 1j * randomGenerator.normal(size=1024)
+    )
+    filterIlcResult = RunFrequencyDomainIlc(
+        filterIlcReference,
+        ilcChannel,
+        sampleRateHz=20.0e6,
+        channelBandwidthHz=8.0e6,
+        config=ilcConfig,
+    )
+    assert len(filterIlcResult.history) == 2
+    for iterationResult in filterIlcResult.history:
+        assert iterationResult.feedbackOutputSignal is not None
+        feedbackMismatch = float(
+            np.mean(
+                np.abs(
+                    iterationResult.feedbackOutputSignal
+                    - iterationResult.outputSignal
+                )
+                ** 2
+            )
+        )
+        outputPower = max(
+            float(np.mean(np.abs(iterationResult.outputSignal) ** 2)),
+            np.finfo(float).tiny,
+        )
+        assert feedbackMismatch / outputPower < 1.0e-16
+    rawIlcChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            **ilcParameters,
+            "fbIqCompensationMode": "none",
+        },
+    )
+    rawIlcChannelOutput, rawIlcFeedbackOutput = rawIlcChannel.Process(
+        ilcReference
+    )
+    rawIlcMismatch = float(
+        np.mean(np.abs(rawIlcFeedbackOutput - rawIlcChannelOutput) ** 2)
+    )
+    rawIlcOutputPower = float(
+        np.mean(np.abs(rawIlcChannelOutput) ** 2)
+    )
+    assert rawIlcMismatch / rawIlcOutputPower > 1.0e-3
+
+    # Scalar small-signal diagnostics use the direct FIR response at DC; image
+    # branches remain excluded because one scalar cannot represent a mirror.
+    gainPaModel = PaModel(modelName="wiener", width=0)
+    gainChannel = Channel(
+        paModel=gainPaModel,
+        parameters={
+            "sampleMode": "fb",
+            "txIqDirectFirTaps": txDirectTaps,
+            "txIqImageFirTaps": txImageTaps,
+            "fbIqDirectFirTaps": fbDirectTaps,
+            "fbIqImageFirTaps": fbImageTaps,
+            "width": 0,
+        },
+    )
+    expectedSmallSignalGain = (
+        np.sum(txDirectTaps)
+        * gainPaModel.SmallSignalGain()
+        * np.sum(fbDirectTaps)
+    )
+    assert np.allclose(
+        gainChannel.SmallSignalGain(), expectedSmallSignalGain
+    )
+
+
 def CheckChannelIqEnableControls() -> None:
     """Verify independent Tx and feedback I/Q-stage enable controls.
 
@@ -10264,6 +11141,7 @@ def RunTests() -> None:
     CheckChannelPeriodicThermalModes()
     CheckPeriodicThermalEdgeCases()
     CheckFeedbackIqPhasePairCalibration()
+    CheckFrequencySelectiveIqImbalance()
     CheckChannelIqEnableControls()
     CheckChannelDualOutputContract()
     CheckChannelModel()

@@ -201,12 +201,13 @@ flowchart LR
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
-| `Channel.__init__`, `Channel.Width`, `Channel.SampleMode`, `Channel.FormatUnknownParameterError`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层；未知名称按字符串相似度对全部合法名称降序提示后报错，非法值显示允许集合、类型或区间；同时校验Tx I/Q、周期热运行模式/占空比/收敛条件、公共相位/噪声、PA前后耦合、反馈链参数、联合功率闭环、随机种子和公开位宽。SampleMode还决定公开Process第二项是chOut副本还是完整FB观测 | Channel §1、§5–§6、§10 |
+| `Channel.__init__`, `Channel.Width`, `Channel.SampleMode`, `Channel.FormatUnknownParameterError`, `Channel.GetParameters`, `Channel.UpdateParameters`, `Channel.ValidateParameters` | E | 在类内建立ChainMap默认层；未知名称按字符串相似度对全部合法名称降序提示后报错，非法值显示允许集合、类型或区间；同时校验Tx/FB I/Q标量及双FIR、周期热运行模式/占空比/收敛条件、公共相位/噪声、PA前后耦合、反馈链参数、联合功率闭环、随机种子和公开位宽。SampleMode还决定公开Process第二项是chOut副本还是完整FB观测 | Channel §1、§5–§6、§10 |
 | `Channel.SetPaModel` | E | 绑定必须提供公开Process入口的PA对象，并在PA更换时清除私有功率校准状态 | Channel §1、§6 |
 | `Channel.ResolveCouplingPaths`, `Channel.HasPrePaCoupling` | P/E | 把每条源链到目的链的复增益、整数/分数时延和FIR规范为有限参数，并判断PA输入功率是否存在链间耦合依赖 | Channel §1.3、§5 |
 | `Channel.ApplyCouplingPath`, `Channel.ApplyMimoCoupling` | P/N | 对单条串扰路径依次执行FIR、分数时延、整数时延和复系数，再把所有间接路径与隐含单位直通路径线性叠加 | Channel §1.3 |
-| `Channel.ResolveIqImbalanceCoefficients`, `Channel.ApplyIqImbalanceStage` | P/N | 把I/Q增益比和正交相位误差精确换算为直接项与共轭镜像项，再以统一广义线性方程叠加Tx或FB的DC偏置；增益0 dB、相位0度且DC为0时返回独立副本 | Channel §1.2.1、§4.4、§6.2、§6.5，Performance §6 |
-| `Channel.TransmitterIqCoefficients`, `Channel.FeedbackIqCoefficients`, `Channel.ApplyTransmitterIqImbalance` | P/N/E | 分别返回Tx/FB的直接与镜像系数；各自enabled为False时报告理想系数对。Tx开启时在PA前执行增益/相位/DC非理想并同时进入forward和fb，关闭时返回数值相同的复数副本 | Channel §1.2.1、§4.4、§6.2、§6.5 |
+| `Channel.ResolveIqImbalanceCoefficients`, `Channel.ApplyIqImbalanceStage` | P/N | 前者保留旧增益/相位到标量 $\alpha,\beta$ 的精确换算；后者保留旧位置参数并允许末尾双FIR覆盖，每个非None序列作为对应支路完整有效因果响应，None独立回退标量，逐链执行 $a*x+b*x^*$ 后添加一次DC | Channel §1.2.1、§4.4、§6.2、§6.5，Performance §6 |
+| `Channel.TransmitterIqCoefficients`, `Channel.FeedbackIqCoefficients` | P/N/E | 只返回Tx/FB由旧增益/相位换算的标量直接与镜像系数；各自enabled为False时报告理想系数对，显式FIR启用时不能把此结果当成实际全带响应 | Channel §1.2.1、§4.4、§6.2、§6.5 |
+| `Channel.TransmitterIqFilterTaps`, `Channel.FeedbackIqFilterTaps`, `Channel.ApplyTransmitterIqImbalance` | P/N/E | 分别解析实际生效的Tx/FB直接与共轭FIR并返回防御性副本：每支路非None时替代标量、None时回退一抽头；Tx开启时在PA前执行频选双FIR/DC并同时进入forward和fb，关闭时使用单位/零抽头并返回数值相同副本 | Channel §1.2.1、§4.4、§6.2、§6.5、§7.10 |
 | `Channel.ApplyPrePaCoupling`, `Channel.ApplyPostPaCoupling` | P/N | 分别在Tx I/Q之后、非线性PA之前和干净PA输出之后应用不同耦合矩阵；前者改变PA实际激励，后者只改变观测到的多路叠加 | Channel §1.3 |
 | `Channel.ProcessBoundPaFloating`, `Channel.ProcessPaBankForCalibration` | P/N/E | 在内部浮点域运行绑定PA；兼容校准回调采用“已提交模拟驱动→Tx I/Q→PA前耦合→各路PA”，并返回尚未经过PA后耦合和接收噪声的逐PA输出 | Channel §1.3–§1.4、§6 |
 | `Channel.ResolveCalibrationDriveDbPerChain`, `Channel.ApplyCalibrationDrive`, `Channel.SetCalibrationDriveDb`, `Channel.ProcessCalibrationDrive` | P/N/E | 在公开码解码后、Tx I/Q与PA前耦合之前校验和应用逐链模拟驱动；所有drive为0 dB时返回独立副本；探测迭代不改状态，收敛时原子提交，校准参考面排除PA后耦合与接收链 | Channel §1.4、§5–§6.3，Performance §6 |
@@ -225,20 +226,20 @@ flowchart LR
 | `Channel.ResolveFeedbackFirTaps`, `Channel.ApplyFeedbackLinearResponse` | P/N | 将可选反馈FIR规范为非空有限复抽头，并按每链执行因果卷积、反馈电压增益和附加相位；单抽头1、0 dB和0度时返回独立副本 | Channel §1.2、§4.1，Performance §6 |
 | `Channel.ApplyFeedbackNonlinearity` | P/N | 使用 $v+c_3|v|^2v$ 模拟观察接收机三阶AM-AM/AM-PM，并可执行保持相位的复包络径向限幅；三阶系数为0且无限幅时返回独立副本 | Channel §4.2，Performance §6 |
 | `Channel.ApplyFeedbackTimingAndFrequency` | P/N | 通过插值模拟分数时延和SFO，补入整数时延，再按真实采样率施加CFO相位斜坡 | Channel §4.3 |
-| `Channel.ApplyFeedbackIqImbalance` | P/N/E | 仅在fb模式且 `fbIqImbalanceEnabled=True` 时使用独立的I/Q直接项、共轭镜像项和复直流偏置；False时增益/相位/DC整级旁路，forward模式始终跳过该接收机误差 | Channel §4.4、§6.5 |
+| `Channel.ApplyFeedbackIqImbalance` | P/N/E | 仅在fb模式且 `fbIqImbalanceEnabled=True` 时使用实际直接FIR、共轭镜像FIR和复直流偏置；False时标量/FIR/DC整级旁路，forward模式始终跳过该接收机误差 | Channel §4.4、§6.5 |
 | `Channel.ApplyFeedbackPreIqImpairments` | P/N/E | 依次执行反馈增益/FIR、接收机三阶与限幅、时延/SFO/CFO，并停在I/Q变频器输入参考面；0°/90°相位开关在这一节点插入，因此不会把开关幅度误差送入前级非线性 | Channel §1.2、§4.1–§4.4、§6.5.2 |
-| `Channel.FeedbackIqCalibrationSignature`, `Channel.ResetFeedbackIqCalibration` | E | 用PA对象身份、公共相位、完整确定性FB链、0°/90°实测响应、FIR控制和公开位宽形成缓存身份；任何敏感项改变时原子清除相位对、滤波器和诊断，补偿模式本身不进入身份，因而允许标定后只把 `phase_pair` 切换为 `filter` | Channel §1.2、§6.5.2、§7.11 |
+| `Channel.FeedbackIqCalibrationSignature`, `Channel.ResetFeedbackIqCalibration` | E | 用PA对象身份、公共相位、完整确定性FB链、FB I/Q实际双FIR/DC、0°/90°实测响应、补偿FIR控制和公开位宽形成缓存身份；任何敏感项改变时原子清除相位对、滤波器和诊断，补偿模式本身不进入身份，因而允许标定后只把 `phase_pair` 切换为 `filter` | Channel §1.2、§6.5.2、§7.11 |
 | `Channel.ConfigureFeedbackIqCalibration`, `Channel.RequireCurrentFeedbackIqCalibration` | P/N/E | 把Channel已解码的浮点FB参考面映射到 `FeedbackIqCalibration(width=0)`；前者建立相位分离与岭回归配置，后者在单采样滤波前检查缓存存在且与当前链路签名一致，拒绝缺失或陈旧逆响应 | Channel §1.2、§6.5.2、§7.11；SigProc §14 |
 | `Channel.GetLastFeedbackPhasePair`, `Channel.GetFeedbackIqCalibrationMetrics` | N/E | 在一次成功的 `phase_pair` 处理后，以Channel当前浮点或定点公开约定返回两路原始相位采样的防御性副本，并返回镜像比、拟合NMSE和矩阵条件数等防御性诊断；无标定或缓存失效时明确报错 | Channel §6.5.2、§7.11；SigProc §14 |
 | `Channel.ApplyFeedbackAdc` | P/N | 对反馈接收机内部I/Q分量执行独立满量程限幅、舍入与有限位宽量化，再解码回内部浮点域 | Channel §4.5 |
 | `Channel.ApplyFeedbackAnalogImpairments` | P/E | 依次组合反馈增益/FIR、非线性/限幅、时频偏和I/Q/DC，保证可重复的物理处理顺序 | Channel §1.2、§4 |
-| `Channel.FeedbackDirectSmallSignalGain` | P/N | 返回反馈FIR直流和、反馈增益/相位及I/Q直通分量组成的小信号复增益；不把镜像、DC、噪声和量化当成确定性标量增益 | Channel §4、§4.6 |
-| `Channel.ApplyFeedbackChannelEffectsAtResponse` | P/N/E | 先执行公共相位和全部I/Q前反馈非理想，再乘有限非零的实测相位开关复响应，随后执行FB I/Q/DC、独立噪声和ADC；开关紧邻I/Q变频器输入且不改变 `chOut` | Channel §1.2、§4.4、§6.5.2 |
-| `Channel.ApplyCompensatedFeedbackChannelEffects` | P/N/E | `none`执行单次原始FB采样；`phase_pair`对同一个已求值PA输出执行两次0°/90°接收采样、按实测二乘二矩阵估计分离直接/镜像并拟合缓存逆FIR；`filter`只采第一相位状态并应用当前缓存的广义线性逆滤波器 | Channel §1.2、§6.5.2、§7.11；SigProc §14 |
+| `Channel.FeedbackDirectSmallSignalGain` | P/N | 返回普通反馈FIR和I/Q直接FIR各自DC响应、反馈增益及相位组成的零频小信号复增益；不把镜像、DC、噪声和量化当成确定性标量增益 | Channel §1.2.1、§4、§4.6 |
+| `Channel.ApplyFeedbackChannelEffectsAtResponse` | P/N/E | 先执行公共相位和全部I/Q前反馈非理想，再乘有限非零的实测相位开关复响应，随后执行FB实际直接/镜像FIR、DC、独立噪声和ADC；开关紧邻I/Q变频器输入且不改变 `chOut` | Channel §1.2、§4.4、§6.5.2 |
+| `Channel.ApplyCompensatedFeedbackChannelEffects` | P/N/E | `none`执行单次原始FB采样；`phase_pair`对同一个已求值PA输出执行两次0°/90°接收采样、在频选I/Q下分离 $h_d*u$ 与 $h_i*u^*$ 并拟合缓存逆FIR；`filter`只采第一相位状态并应用当前缓存的广义线性逆滤波器 | Channel §1.2、§6.5.2、§7.11；SigProc §14 |
 | `Channel.ApplyForwardChannelEffects`, `Channel.ApplyFeedbackChannelEffects`, `Channel.ApplyChannelEffects` | P/E | 主路从公共PA后节点执行公共相位与测量噪声；原始反馈入口使用单位相位响应执行完整FB模拟链、独立噪声与ADC，兼容入口再按sampleMode选择前向或带补偿反馈；公开Process在forward时复制主路，在fb时执行所选反馈补偿模式 | Channel §1–§4、§6.5.2 |
 | `Channel.ProcessPaOutput` | E/N | 把已有逐PA公开输出解码后先执行PA后耦合，再执行一次forward/fb采样链路并编码；功率闭环因此不包含接收噪声或PA后串扰 | Channel §1、§1.3、§6.2 |
 | `Channel.ProcessBoundPaThermalPeriodFloating`, `Channel.ProcessCoupledPaFloating`, `Channel.ProcessFloating`, `Channel.ProcessOutputPathsFloating`, `Channel.Process` | P/N/E | 内部周期入口先验证三个跨模块热参考面；公共核心只提交一次PA热周期和PA后耦合，并始终生成chOut。forward模式复制chOut为第二项，fb模式才从公共无前向噪声节点生成完整反馈观测；兼容浮点入口按sampleMode选一路，公开Process分别编码并返回二元组 | Channel §1、§1.3–§1.5、§3.4、§6.1–§6.8、§10 |
-| `Channel.SmallSignalGain` | P/N | forward模式返回已提交SISO模拟drive、Tx I/Q直接系数、PA小信号增益与公共相位之积；fb模式再乘反馈直通小信号系数；DC、镜像、噪声和量化不伪装成标量增益 | Channel §2、§4、§6.2、§6.5 |
+| `Channel.SmallSignalGain` | P/N | forward模式返回已提交SISO模拟drive、Tx I/Q直接FIR的DC响应、PA小信号增益与公共相位之积；fb模式再乘反馈零频直通小信号系数；DC、镜像、噪声和量化不伪装成标量增益 | Channel §1.2.1、§2、§4、§6.2、§6.5 |
 
 ### 4.2 `ChannelAnalyse.py`：MIMO通道测量
 

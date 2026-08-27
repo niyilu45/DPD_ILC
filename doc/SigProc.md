@@ -1200,7 +1200,7 @@ measuredPowerDbm = powerCalibration.RmsToDbm(activeVoltageRms)
 
 ## 14. 0°/90°反馈I/Q分离与单采样补偿
 
-`FeedbackIqCalibration` 解决的是板载反馈接收机自身的I/Q镜像，不是Tx I/Q校准，也不改写PA输出。硬件或Channel在反馈I/Q变频器输入之前设置两个已测复响应 $r_0$、$r_1$。Channel旋转的是PA输出的低功率反馈观测支路：开关位于I/Q前反馈放大、非线性和时频偏之后，既不是PA输入预旋转，也不是ADC之后的数字旋转。把开关之前的物理观测记为 $u[n]$；它可以包含Tx I/Q镜像、PA非线性和前级反馈频响。若FB I/Q变频器的直接、共轭系数为 $\alpha$、$\beta$，则定义直接观测 $s[n]=\alpha u[n]$、接收机镜像 $q[n]=\beta u^{*}[n]$。两次采样共有的接收机DC为 $d$，于是：
+`FeedbackIqCalibration` 解决的是板载反馈接收机自身的I/Q镜像，不是Tx I/Q校准，也不改写PA输出。硬件或Channel在反馈I/Q变频器输入之前设置两个已测复响应 $r_0$、$r_1$。Channel旋转的是PA输出的低功率反馈观测支路：开关位于I/Q前反馈放大、非线性和时频偏之后，既不是PA输入预旋转，也不是ADC之后的数字旋转。把开关之前的物理观测记为 $u[n]$；它可以包含Tx I/Q镜像、PA非线性和前级反馈频响。若FB I/Q变频器的直接、共轭因果FIR为 $h_d[n]$、$h_i[n]$，则定义直接观测 $s[n]=(h_d*u)[n]$、接收机镜像 $q[n]=(h_i*u^*)[n]$。平坦模型只是 $h_d=(\alpha)$、$h_i=(\beta)$ 的一抽头特例。两次采样共有的接收机DC为 $d$，于是：
 
 ```math
 z_0[n]-d
@@ -1246,7 +1246,7 @@ q[n]
 \frac{z_0[n]-d+j\left(z_1[n]-d\right)}{2}.
 ```
 
-因此该方法不会错误地假设PA输出“没有镜像”。Tx端或PA已经产生的频谱内容包含在 $u[n]$ 中，会随 $r_k$ 旋转并通过直接观测 $s[n]$ 保留下来；只有I/Q变频器内部产生的共轭响应随 $r_k^{*}$ 旋转并落入 $q[n]$。
+因此该方法不会错误地假设PA输出“没有镜像”。Tx端或PA已经产生的频谱内容包含在 $u[n]$ 中，会随 $r_k$ 旋转并通过直接观测 $s[n]=(h_d*u)[n]$ 保留下来；只有I/Q变频器内部产生的频率选择性共轭响应随 $r_k^{*}$ 旋转并落入 $q[n]$。`phase_pair` 分离的是两条接收机支路，不会顺便把 $h_d$ 均衡成理想 $u[n]$。
 
 ### 14.1 从相位对标定到单状态FIR
 
@@ -1260,7 +1260,7 @@ q[n]
 \sum_{l=0}^{L-1}b_lv_0^{*}[n-l].
 ```
 
-直接抽头 $a_l$ 恢复普通频响，共轭抽头 $b_l$ 抵消镜像频响。把所有样点写入矩阵 $A$，系数向量记为 $c$，求解尺度归一化岭回归：
+直接抽头 $a_l$ 恢复普通频响，共轭抽头 $b_l$ 抵消镜像频响。这里的目标仍是相位对给出的 $s=h_d*u$，不是未知的I/Q前波形 $u$。把所有样点写入矩阵 $A$，系数向量记为 $c$，求解尺度归一化岭回归：
 
 ```math
 c
@@ -1301,7 +1301,7 @@ FeedbackIqCalibration(
 | `regularization` | `1e-6` | 有限正实数 | 尺度归一化岭系数；增大可降低病态拟合和噪声放大，但会增加偏差 |
 | `width` | `16` | 整数0至53 | 公开I/Q边界；0为归一化浮点，正值为有符号整数码 |
 
-建议先用 `filterLength=1`、`regularization=1e-6` 验证平坦I/Q失配。只有实测镜像随频率明显变化时才逐步增加抽头数；抽头过多而训练样本不足会使条件数升高。`phaseResponses` 应填开关的实测复响应而不是只写标称角度；两响应越接近共线，`phaseMatrixConditionNumber` 越大，噪声增强越明显。
+`filterLength=1` 只适合平坦I/Q失配。建议先用它和 `regularization=1e-6` 验证参考面；对Channel中的3-tap直接/镜像响应可从 `filterLength=7` 开始，再用未参与拟合的数据比较 `fitNmseDb` 与带边残余IRR。抽头过多而训练样本不足会使条件数和噪声增强升高；直接响应含深陷波或非最小相位时，有限长因果逆只能近似，增加长度不能保证完全恢复。`phaseResponses` 应填开关的实测复响应而不是只写标称角度；两响应越接近共线，`phaseMatrixConditionNumber` 越大，噪声增强越明显。
 
 所有默认值都位于构造函数内部并通过ChainMap解析。未知键会发出警告并忽略，已识别但类型或范围非法的值会报错。`UpdateParameters(...)` 是事务更新：验证失败会恢复旧配置，成功写入任何已识别项都会使已有FIR失效。
 
@@ -1365,6 +1365,6 @@ print(metrics["imageToDirectDb"], metrics["fitNmseDb"])
 
 相位对的两个数组必须形状相同，且应来自同一PA输出波形和相同时间参考。两次采样之间的随机噪声与ADC量化可以独立，但强削顶、严重接收机非线性、快速漂移或错误的开关响应都会降低分离精度。`filter`只能重建已经标定过的确定性I/Q逆响应；它不能凭一组旧抽头补偿后来改变的反馈FIR、CFO、ADC满量程或公开位宽。
 
-Channel集成提供三种模式：`none`保留单路原始反馈；`phase_pair`对同一个已经计算完成的PA输出做两次接收采样、返回直接项并缓存FIR；`filter`只采第一状态并应用缓存。正确顺序是先显式设置 `sampleMode="fb"` 和 `fbIqCompensationMode="phase_pair"` 完成一次标定，再只把补偿模式切到 `"filter"`。Channel会把PA身份、公共相位、确定性反馈链、I/Q参数、相位响应、滤波控制、ADC和公开位宽纳入签名；敏感配置改变后必须重新执行相位对标定。
+Channel集成提供三种模式：`none`保留单路原始反馈；`phase_pair`对同一个已经计算完成的PA输出做两次接收采样、返回 $h_d*u$ 并缓存FIR；`filter`只采第一状态并应用缓存。正确顺序是先显式设置 `sampleMode="fb"` 和 `fbIqCompensationMode="phase_pair"` 完成一次标定，再只把补偿模式切到 `"filter"`。Channel会把PA身份、公共相位、确定性反馈链、FB I/Q标量、`fbIqDirectFirTaps`、`fbIqImageFirTaps`、DC、相位响应、补偿滤波控制、ADC和公开位宽纳入签名；任一敏感配置改变后必须重新执行相位对标定。
 
 这套反馈I/Q标定与PA输出功率标定位于不同参考面。`PowerCalibration` 始终观察PA后耦合前、相位开关和所有接收非理想之前的干净PA物理输出；0°/90°采样不会改变 `outputPowerDbm` 目标，也不会用补偿后的 `fbOut` 反推PA功率。DPD训练使用补偿后的 `fbOut`，最终EVM、SNR、ACLR、IRR和输出功率仍使用同一轮的 `chOut`。
