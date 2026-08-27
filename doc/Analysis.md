@@ -1522,13 +1522,15 @@ A_{i,\mathrm{target}}
 10^{(p_i-p_{\max})/20}.
 ```
 
-浮点模式把每轮试探输入直接送入方法求值器。定点模式先将试探输入编码为原位宽整数I/Q码，PA输出再按相同位宽解码后测功率；量化和削顶由此真实影响闭环与EVM。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
+浮点模式把每轮试探输入直接送入方法求值器。定点模式先生成保留数字余量的合法整数I/Q码，再把闭环剩余功率差保存在解码后的隐藏post-DAC模拟驱动中；PA输出按相同位宽解码后测功率，量化和削顶由此真实影响闭环与EVM。多个目标功率点的公开码可以完全相同，物理工作点由不同的 `analogDriveDbPerChain` 区分。收敛驱动会提交到plant；ILC的 `NormalizedPaAdapter` 对Channel先使用 `ProcessNormalizedOutputPaths` 保持稳态热公共校准语义，对普通PA则调用 `ProcessOutputPathsFloating` 应用该驱动。raw `ProcessFloating` 不应用隐藏驱动，避免已经管理物理输入标尺的Channel重复增益。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
 
 `outputPowerDbmValues` 必须有限且严格递增，每一点都不得超过 `maximumOutputPowerDbm`。结果对象保留的 `driveScaleValues` 只是由额定极限计算的名义初始试探比例，不是闭环最终隐藏预设；`targetOutputRmsValues` 用于审计50 Ω物理输出标定。
 
 ### 8.3 公平比较原则
 
 对每个输出功率点和每种方法，分析器都独立闭环到相同的PA实测输出功率。不同方法最终需要的输入预设可以不同，这正是非线性增益和DPD行为的一部分。闭环结束后直接把PA实测波形交给相同的 `CalculateEvm`，不做后级幅度重标定。这样曲线差异来自补偿方法在同一实际输出功率下的失真，而不是占空比、输入帧、随机种子或指标定义不同。
+
+主程序的逐点ILC求值还多一层候选选择。`EvaluateIlcPowerPoint` 为当前功率参考建立独立 `Analysis`，运行SISO或MIMO频域ILC，对每轮前向 `chOut` 只调用功率曲线所需的 `CalculateEvm`，以严格Wi-Fi EVM最小值选择对应输入，然后把该输入重放到PA。反馈域 `linearCompensatedNmseDb` 仍用于学习和算法内部诊断，但不能决定最终功率-EVM报告样点；FB链非理想会使LC-NMSE最佳轮与主路EVM最佳轮不同。
 
 这条曲线接口只消费EVM，因此每个方法/功率点不再附带运行输出功率报告、SNR、IRR和ACLR计算。功率闭环自己的有效区功率测量仍必须保留，EVM的同步和星座定义也没有简化；省略的只是曲线结果不使用的指标。
 
@@ -1578,6 +1580,58 @@ EVM(dB)
 - **Baseline**：表示无补偿 PA 的基准。
 
 直接学习的 ILC 可能利用整段已知目标，结果通常比固定部署模型更理想。工程的详细 ILC 原理见 [DPD-ILC.md](./DPD-ILC.md)。
+
+### 8.6 为什么低功率初始EVM更好，DPD后排序却可能反转
+
+低功率PA更接近线性，所以baseline EVM通常更好。DPD主要降低可重复的PA失真；它不能消除与信号不相关的接收噪声，也不能恢复已被固定满量程量化丢失的信息。若噪声与失真近似不相关，总误差能量可写为
+
+```math
+\mathrm{EVM}_{\mathrm{total}}^2
+\approx
+\mathrm{EVM}_{\mathrm{distortion}}^2
++
+\frac{P_{\mathrm{noise}}}{P_{\mathrm{signal}}}.
+```
+
+当 `noiseAmpMv` 或 `noisePwrDbm` 固定时，$P_{\mathrm{noise}}$ 不随发送功率下降；固定满量程、固定位宽量化的误差也近似形成绝对地板。信号每回退1 dB，$P_{\mathrm{noise}}/P_{\mathrm{signal}}$ 就增加1 dB，所以噪声主导区的EVM地板恶化1 dB。DPD前，高功率点由PA非线性主导；DPD后，中功率失真可能降到低于低功率绝对噪声地板，于是最终排序反转。对于真实传导链，这一反转是正确的系统结果，不能通过强制曲线单调或PA后缩放消除。
+
+两类实验必须分开：
+
+| 目标 | 推荐设置 | 应怎样解释排序 |
+|---|---|---|
+| PA/DPD本征能力 | `width=0`；`noiseAmpMv=None`；`noisePwrDbm=None`；关闭噪声，或用固定相对 `noiseSnrDb` 做受控SNR测试 | 主要观察PA失真随功率和DPD迭代的变化 |
+| 真实传导系统EVM | 保留实际绝对接收噪声、ADC/DAC位宽、满量程和削顶 | 低功率地板及排序反转都属于系统性能 |
+
+推荐按下表定位：
+
+| 现象 | 最可能原因 | 核对方法 |
+|---|---|---|
+| 无噪声浮点曲线正常，固定毫伏噪声后反转 | 绝对噪声地板 | 改用固定相对 `noiseSnrDb`；检查反转是否消失 |
+| 只有定点模式反转 | 满量程量化或削顶 | 与 `width=0` 对照，并检查码峰值和削顶计数 |
+| 不同功率的公开码相同，但实测输出功率不同 | 预期的固定数字余量设计 | 检查 `analogDriveDbPerChain` 是否随目标功率变化 |
+| ILC历史在多个目标点都落到近似同一功率 | 已提交模拟驱动未进入浮点ILC plant | 普通PA检查 `ProcessOutputPathsFloating`；Channel检查 `ProcessNormalizedOutputPaths` |
+| FB LC-NMSE改善，但曲线选中的主路EVM不佳 | 错把反馈最佳轮当成报告最佳轮 | 使用 `EvaluateIlcPowerPoint`，并核对每轮 `chOut` 严格EVM |
+| 确定性无噪声重放仍比历史最佳轮差很多 | 工作点、输入或plant状态发生变化 | 对比同一 `bestInputSignal`、已提交drive、热状态和PA记忆状态 |
+
+本征对照的最小Channel噪声配置可以写成：
+
+```python
+intrinsicChannelParameters = {
+    "width": 0,
+    "noiseAmpMv": None,
+    "noisePwrDbm": None,
+    "noiseSnrDb": None,
+}
+
+relativeSnrChannelParameters = {
+    "width": 0,
+    "noiseAmpMv": None,
+    "noisePwrDbm": None,
+    "noiseSnrDb": 45.0,
+}
+```
+
+若还设置了 `ILCConfig.feedbackSnrDb`，它只影响训练用 `fbOut`，不等于Channel主路的传导噪声；做本征对照时也应设为 `None`，除非实验目的就是测试带噪反馈收敛。
 
 ---
 

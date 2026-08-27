@@ -2,6 +2,7 @@
 
 import argparse
 from pathlib import Path
+from typing import Mapping, Union
 
 import numpy as np
 
@@ -17,6 +18,7 @@ from inc.utils.Draw import Draw
 from inc.lib.PaModel import MimoPaModel, PaModel
 from inc.utils.FixedPoint import FixedPoint
 from inc.utils.SigProc import PowerCalibration
+from inc.utils.WifiMetadata import WifiWaveform
 from inc.lib.WaveGenWifi import (
     NormalizeFrameFormat,
     WaveGenWifi,
@@ -123,6 +125,105 @@ def ParseOptionalDbmSequence(rawValue: str) -> tuple:
     if not values:
         raise argparse.ArgumentTypeError("per-chain dBm list cannot be empty")
     return tuple(values)
+
+
+def EvaluateIlcPowerPoint(
+    pointReference: np.ndarray,
+    paModel: Union[PaModel, MimoPaModel],
+    waveform: WifiWaveform,
+    ilcConfig: ILCConfig,
+    analysisParameters: Mapping[str, object],
+) -> np.ndarray:
+    """Evaluate one power point using its strict main-path EVM-best ILC round.
+
+    Processing details:
+        Algorithm: Run SISO or per-chain MIMO frequency-domain ILC at the
+        current calibrated reference, analyze every stored forward ``chOut``
+        with an Analysis instance tied to that same power point, select the
+        minimum strict Wi-Fi EVM candidate, and replay its input through the
+        physical PA. Feedback-domain normalized MSE remains the learning
+        signal but cannot silently choose the reported power-EVM sample.
+
+    Args:
+        pointReference: Public waveform calibrated for the requested PA power.
+        paModel: SISO or MIMO PA plant used by the power sweep.
+        waveform: Wi-Fi metadata describing the reference waveform.
+        ilcConfig: Frequency-domain ILC learning configuration.
+        analysisParameters: Analysis overrides including width and power scale.
+
+    Returns:
+        result: Forward PA output of the strict-EVM-best measured ILC input.
+    """
+
+    pointAnalysis = Analysis(
+        pointReference,
+        waveform,
+        parameters=analysisParameters,
+    )
+    if waveform.numTransmitAntennas == 1:
+        pointIlcResult = RunFrequencyDomainIlc(
+            pointReference,
+            paModel,
+            waveform.sampleRateHz,
+            waveform.bandwidthHz,
+            ilcConfig,
+        )
+        selectedIterationIndex = int(
+            np.argmin(
+                np.asarray(
+                    [
+                        pointAnalysis.CalculateEvm(
+                            iterationRecord.outputSignal
+                        )[0]
+                        for iterationRecord in pointIlcResult.history
+                    ],
+                    dtype=float,
+                )
+            )
+        )
+        selectedInput = pointIlcResult.history[
+            selectedIterationIndex
+        ].inputSignal
+    else:
+        if not isinstance(paModel, MimoPaModel):
+            raise TypeError("MIMO Wi-Fi requires a MimoPaModel")
+        pointIlcResult = RunMimoFrequencyDomainIlc(
+            pointReference,
+            paModel,
+            waveform.sampleRateHz,
+            waveform.bandwidthHz,
+            ilcConfig,
+        )
+        iterationCount = len(pointIlcResult.chainResults[0].history)
+        selectedIterationIndex = int(
+            np.argmin(
+                np.asarray(
+                    [
+                        pointAnalysis.CalculateEvm(
+                            np.column_stack(
+                                [
+                                    chainResult.history[
+                                        iterationIndex
+                                    ].outputSignal
+                                    for chainResult in (
+                                        pointIlcResult.chainResults
+                                    )
+                                ]
+                            )
+                        )[0]
+                        for iterationIndex in range(iterationCount)
+                    ],
+                    dtype=float,
+                )
+            )
+        )
+        selectedInput = np.column_stack(
+            [
+                chainResult.history[selectedIterationIndex].inputSignal
+                for chainResult in pointIlcResult.chainResults
+            ]
+        )
+    return paModel.Process(selectedInput)
 
 
 def Main() -> int:
@@ -857,23 +958,23 @@ def Main() -> int:
         }
         if waveform.numTransmitAntennas == 1:
             methodEvaluators["Frequency-domain ILC"] = (
-                lambda pointReference, _: RunFrequencyDomainIlc(
+                lambda pointReference, _: EvaluateIlcPowerPoint(
                     pointReference,
                     paModel,
-                    waveform.sampleRateHz,
-                    waveform.bandwidthHz,
+                    waveform,
                     ilcConfig,
-                ).outputSignal
+                    analysisOverrides,
+                )
             )
         else:
             methodEvaluators["Frequency-domain ILC"] = (
-                lambda pointReference, _: RunMimoFrequencyDomainIlc(
+                lambda pointReference, _: EvaluateIlcPowerPoint(
                     pointReference,
                     paModel,
-                    waveform.sampleRateHz,
-                    waveform.bandwidthHz,
+                    waveform,
                     ilcConfig,
-                ).outputSignal
+                    analysisOverrides,
+                )
             )
         resultAnalysis.AnalyzePowerEvmCurve(
             outputPowerDbmValues, methodEvaluators

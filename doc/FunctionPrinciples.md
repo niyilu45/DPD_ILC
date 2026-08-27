@@ -50,6 +50,7 @@ flowchart LR
 | `main.ParseFloatSequence` | E | 把每 PA 的 dB 配置解析为有限实数序列；不改变功率定义 | [PaModel.md：多路输出功率](./PaModel.md) |
 | `main.ParseOptionalFloatSequence` | E | 兼容旧接口：把 RMS 电压目标解析为正数或 `None`；新调用应使用 dBm 目标 | [PaModel.md：多路输出功率](./PaModel.md) |
 | `main.ParseOptionalDbmSequence` | E | 把每PA的绝对dBm目标解析为有限实数或 `None`；允许负dBm | [PaModel.md：多路输出功率](./PaModel.md) |
+| `main.EvaluateIlcPowerPoint` | P/E | 在当前功率参考上运行SISO或MIMO频域ILC，以每轮前向chOut的严格Wi-Fi EVM选择最佳输入并重放PA；反馈LC-NMSE只用于学习和诊断，不决定功率曲线报告样点 | DpdIlc §15、Analysis §8.3–§8.6 |
 | `main.Main` | E | 按“波形→PA→ILC→部署 DPD→同步→指标→绘图”编排；物理计算由被调用模块完成 | [README 工作流](../README.md)、图 1 |
 
 ### 2.1 `ConfigUtils.py`：未知配置容错
@@ -169,7 +170,7 @@ flowchart LR
 | `DohertyPA.SmallSignalGain` | P/N | 在零包络极限关闭峰值支路，只返回载波支路与载波合路系数构成的复增益 | PaModel §4.8 |
 | `PaModel.__init__`, `PaModel.ResolveConfiguration`, `PaModel.SynchronizeModel` | E | ChainMap 覆盖解析、未知键警告后忽略，并构造选定Rapp、Wiener、GMP或Doherty内核 | PaModel §12 |
 | `PaModel.ModelName`, `PaModel.Width`, `PaModel.GetParameters`, `PaModel.UpdateParameters` | E | 查询或更新配置；更新后重建模型以保持状态一致 | PaModel §12、FixedPoint §6 |
-| `PaModel.Process`, `PaModel.SmallSignalGain` | E/P | 公开Process在定点解码后应用已提交的模拟驱动，再统一分派到选定物理PA；浮点物理内核与小信号PA增益定义保持独立 | PaModel §9、§12 |
+| `PaModel.Process`, `PaModel.ProcessFloating`, `PaModel.ProcessOutputPathsFloating`, `PaModel.SmallSignalGain` | E/P | 公开Process完成编解码并应用已提交模拟驱动；双输出浮点协议在解码后应用同一post-DAC drive并复制裸PA的chOut/fbOut，供ILC保持校准工作点；raw ProcessFloating保持drive-free以避免Channel重复增益 | PaModel §9–§10.3、§12 |
 | `PaModel.ResolveCalibrationDriveDb`, `PaModel.SetCalibrationDriveDb`, `PaModel.ProcessCalibrationDrive` | P/N/E | 校验单路PA的解码后模拟驱动；校准试探以显式驱动运行且不改状态，只有闭环收敛后才原子提交供后续公开Process复现 | PaModel §9、SigProc §13.2 |
 | `ThermalConfig.Recommended` | P/E | 为静态、单RC和三支Foster生成完整可运行的25 dBm级仿真起始配置，应用调用方实测覆盖后执行全部字段校验；推荐值不是器件规格 | PaModel §13.7.1–§13.7.6、PaThermalMeasurement §1–§12 |
 | `ThermalConfig.Validate` | P/E | 校验静态、单RC或Foster热网络、耗散功率效率模型、参考功率和温度漂移系数 | PaModel §13 |
@@ -183,12 +184,13 @@ flowchart LR
 | `MimoPaModel.__init__`, `MimoPaModel.ResolveNumericSequence`, `MimoPaModel.ResolvePaParametersPerChain`, `MimoPaModel.ValidateParameters`, `MimoPaModel.ResolveThermalCouplingMatrix`, `MimoPaModel.UpdateMutualHeating`, `MimoPaModel.SynchronizeModels` | E | 警告并忽略未知键，把已识别标量/序列配置扩展到每条物理链并构造独立PA；可把逐链耗散功率通过非对角热阻矩阵映射为相邻链温升 | PaModel §10、§13.8 |
 | `MimoPaModel.NumTransmitChains`, `MimoPaModel.Width`, `MimoPaModel.GetParameters`, `MimoPaModel.UpdateParameters` | E | 返回或更新多路配置，不改变功率定义 | PaModel §10、§12、FixedPoint §6 |
 | `MimoPaModel.SetOutputPowerDb`, `MimoPaModel.SetTargetOutputRms`, `MimoPaModel.SetTargetOutputPowerDbm` | P/E | 设置相对幅度比例、旧RMS目标或基于端口阻抗的绝对dBm目标；dB幅度比例为 $10^{P_{dB}/20}$ | PaModel §10 |
-| `MimoPaModel.Process`, `MimoPaModel.ProcessFloating`, `MimoPaModel.ProcessChain` | P/N | 公开矩阵入口先应用已提交的逐链模拟驱动再通过独立PA；裸浮点入口供Channel避免重复增益和公开接口量化 | PaModel §10、§10.2 |
+| `MimoPaModel.Process`, `MimoPaModel.ProcessFloating`, `MimoPaModel.ProcessOutputPathsFloating`, `MimoPaModel.ProcessChain` | P/N | 公开矩阵入口完成编解码并应用逐链drive；双输出浮点协议对每列应用已提交post-DAC drive并复制裸PA bank输出；raw浮点入口保持drive-free，供Channel避免重复增益和公开接口量化 | PaModel §10、§10.2–§10.3 |
 | `MimoPaModel.ProcessThermalPeriodFloating`, `MimoPaModel.CalculateActualDutyCycle` | P/N/E | 以公共周期调度处理各物理PA的内部空闲、外部空闲和实际占空比；稳态且存在互热时再用外层固定点使每链自热与互热同时收敛；整个MIMO周期采用全链事务，任一路失败即恢复全部热状态、累计时间和旧metrics；互热矩阵动态改为全零时在下个成功周期清除旧offset | PaModel §13.8、Channel §10 |
 | `MimoPaModel.ResolveCalibrationDriveDbPerChain`, `MimoPaModel.SetCalibrationDriveDb`, `MimoPaModel.ProcessCalibrationDrive` | P/N/E | 校验、试探并在收敛后提交逐PA解码后模拟驱动，使MIMO定点码满量程与PA额定输出功率解耦 | PaModel §10、SigProc §13.2–§13.3 |
 | `MimoPaModel.GetOutputRmsPerChain`, `MimoPaModel.GetOutputPowerDbmPerChain` | E/P | 返回最近一次实际链输出RMS，并可通过端口阻抗换算为dBm | PaModel §10 |
 | `MimoPaModel.SuspendThermalModel`, `MimoPaModel.RestoreThermalModel`, `MimoPaModel.ResetThermalState`, `MimoPaModel.AdvanceIdle`, `MimoPaModel.GetThermalMetrics` | P/E | 按物理PA链保存、恢复、复位和推进独立热状态；为MIMO无热校准和逐链温度诊断提供一致接口 | PaModel §13.8 |
-| `IQImbalancePA.__init__`, `IQImbalancePA.Process`, `IQImbalancePA.SmallSignalGain` | P/N | 广义线性模型 $y=\alpha v+\beta v^*$ 及其直接支路小信号增益 | PaModel §7 |
+| `IQImbalancePA.__init__`, `IQImbalancePA.Process`, `IQImbalancePA.ProcessFloating`, `IQImbalancePA.ProcessOutputPathsFloating`, `IQImbalancePA.SmallSignalGain` | P/N | 广义线性模型 $y=\alpha v+\beta v^*$；双输出协议优先透传内部plant的committed drive与chOut/fbOut再分别加I/Q变换，raw浮点入口保持drive-free | PaModel §7、§10.3 |
+| `IQImbalancePA.SetCalibrationDriveDb`, `IQImbalancePA.ProcessCalibrationDrive` | P/N/E | 要求内部plant的试探/提交drive协议成对存在并透明代理；第三方plant无协议时由包装器校验、保存并在raw处理前施加后备drive，I/Q输出映射不回灌PA功率检测参考面 | PaModel §7、§10.3、SigProc §13.2–§13.3 |
 | `IQImbalancePA.ProcessThermalPeriodFloating`, `IQImbalancePA.SuspendThermalModel`, `IQImbalancePA.RestoreThermalModel`, `IQImbalancePA.GetThermalMetrics`, `IQImbalancePA.CalculateActualDutyCycle`, `IQImbalancePA.ResetThermalState`, `IQImbalancePA.AdvanceIdle` | P/N/E | 在输出端施加广义线性I/Q包装，同时透明代理物理PA的周期热处理、状态事务、诊断、占空比、复位和额外空闲；包装器不建立第二份热状态或修改PA输入活动参考面 | PaModel §7、§13.5–§13.8、Channel §10 |
 | `PaModel.AsComplexVector` | N | 把输入约束为有限一维复包络；不改变样值 | PaModel §2 |
 | `PaModel.DelaySignal` | N | 因果整数延迟并对历史补零 | PaModel §4 |
@@ -238,7 +240,7 @@ flowchart LR
 | `Channel.ApplyCompensatedFeedbackChannelEffects` | P/N/E | `none`执行单次原始FB采样；`phase_pair`对同一个已求值PA输出执行两次0°/90°接收采样、在频选I/Q下分离 $h_d*u$ 与 $h_i*u^*$ 并拟合缓存逆FIR；`filter`只采第一相位状态并应用当前缓存的广义线性逆滤波器 | Channel §1.2、§6.5.2、§7.11；SigProc §14 |
 | `Channel.ApplyForwardChannelEffects`, `Channel.ApplyFeedbackChannelEffects`, `Channel.ApplyChannelEffects` | P/E | 主路从公共PA后节点执行公共相位与测量噪声；原始反馈入口使用单位相位响应执行完整FB模拟链、独立噪声与ADC，兼容入口再按sampleMode选择前向或带补偿反馈；公开Process在forward时复制主路，在fb时执行所选反馈补偿模式 | Channel §1–§4、§6.5.2 |
 | `Channel.ProcessPaOutput` | E/N | 把已有逐PA公开输出解码后先执行PA后耦合，再执行一次forward/fb采样链路并编码；功率闭环因此不包含接收噪声或PA后串扰 | Channel §1、§1.3、§6.2 |
-| `Channel.ProcessBoundPaThermalPeriodFloating`, `Channel.ProcessCoupledPaFloating`, `Channel.ProcessFloating`, `Channel.ProcessOutputPathsFloating`, `Channel.Process` | P/N/E | 内部周期入口先验证三个跨模块热参考面；公共核心只提交一次PA热周期和PA后耦合，并始终生成chOut。forward模式复制chOut为第二项，fb模式才从公共无前向噪声节点生成完整反馈观测；兼容浮点入口按sampleMode选一路，公开Process分别编码并返回二元组 | Channel §1、§1.3–§1.5、§3.4、§6.1–§6.8、§10 |
+| `Channel.ProcessBoundPaThermalPeriodFloating`, `Channel.ProcessCoupledPaFloating`, `Channel.ProcessFloating`, `Channel.ProcessOutputPathsFloating`, `Channel.ProcessNormalizedOutputPaths`, `Channel.Process` | P/N/E | 内部周期入口先验证三个跨模块热参考面；公共核心只提交一次PA热周期和PA后耦合，并始终生成chOut。归一化公共语义入口在非稳态模式走浮点双输出快路径，稳态热模式则跨过定点边界调用Process，为每个ILC候选复校缓存目标功率；forward复制chOut，fb生成完整反馈观测 | Channel §1、§1.3–§1.5、§3.4、§6.1–§6.8、§10 |
 | `Channel.SmallSignalGain` | P/N | forward模式返回已提交SISO模拟drive、Tx I/Q直接FIR的DC响应、PA小信号增益与公共相位之积；fb模式再乘反馈零频直通小信号系数；DC、镜像、噪声和量化不伪装成标量增益 | Channel §1.2.1、§2、§4、§6.2、§6.5 |
 
 ### 4.2 `ChannelAnalyse.py`：MIMO通道测量
@@ -434,7 +436,7 @@ flowchart LR
 | `Analysis.CalculateIntermodulationOrder`, `Analysis.CalculateIm3`, `Analysis.CalculateIm5`, `Analysis.CalculateIm7` | P/E | 选择3、5或7阶互调，接受元数据或原始NumPy/list输入，返回上下侧物理频率、同侧基波归一化dBc、绝对互调dBFS及同一次分析的 `outputPowerDbm`；非法阶次或缺失原始样值物理频率直接拒绝 | TwoToneAnalysis §4–§5、§8.1–§8.2 |
 | `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO对齐输出，复制反馈同步估计，并在Analysis中按严格EVM在线维护最佳实测轮；直接复用该轮已算指标且只保留最佳输入/输出副本，不做第二次最佳轮分析 | DpdIlc §7、Analysis §5.10，Performance §4.3 |
 | `Analysis.AnalyzeMimoIlcHistory` | P/E | 按轮组合各PA链输出，以完整MIMO空间解映射统一计算性能并在Analysis中选择最佳轮 | Analysis §9 |
-| `Analysis.AnalyzePowerEvmCurve` | P/E | 把每个方法求值器视为完整“DPD+PA”被测对象，在共同目标dBm点反复更新输入并重新运行方法，直到PA实测有效突发输出进入容限；不对方法输出做后级缩放，只调用EVM路径而不附带计算SNR/IRR/ACLR，因此EVM仍对应真实压缩工作点 | Analysis §8，Performance §4.3 |
+| `Analysis.AnalyzePowerEvmCurve` | P/E | 把每个方法求值器视为完整“DPD+PA”被测对象，在共同目标dBm点反复更新输入并重新运行方法，直到PA实测有效突发输出进入容限；不对方法输出做后级缩放，只调用EVM路径而不附带计算SNR/IRR/ACLR。主程序ILC求值器另按每点chOut严格EVM选轮；绝对噪声和满量程量化地板仍如实进入传导曲线 | Analysis §8，Performance §4.3 |
 | `Analysis.SavePowerEvmCurveData`, `Analysis.Print`, `Analysis.PrintMimo`, `Analysis.Save`, `Analysis.SaveConvergence`, `Analysis.PrintConvergence` | E | 展示/序列化既有结果，不改变物理指标 | Analysis §10–§11 |
 
 ## 9. `Draw.py`：图形函数
@@ -528,11 +530,11 @@ flowchart LR
 | `FixedPoint.QuantizeCodes` | N/E | Round and saturate public I/Q integer codes independently; `complex128` is only the common storage container. | [FixedPoint.md](./FixedPoint.md) |
 | `FixedPoint.EncodeComplex` | N | Multiply normalized physical components by $2^{W-1}$ and map them to signed integer codes. | [FixedPoint.md](./FixedPoint.md) |
 | `FixedPoint.DecodeComplex` | N | Divide public integer codes by $2^{W-1}$ only at an internal floating-processing boundary. | [FixedPoint.md](./FixedPoint.md) |
-| `PaModel.ProcessFloating` | P/E | Evaluate the Rapp, Wiener, GMP, or Doherty PA after code decoding without applying a second interface conversion. | [PaModel.md](./PaModel.md) |
-| `MimoPaModel.ProcessChainFloating` | P/E | Apply one chain's input gain, nonlinear PA, output gain, and optional power calibration in normalized floating units. | [PaModel.md](./PaModel.md) |
-| `IQImbalancePA.Width`, `IQImbalancePA.ProcessFloating` | P/E | Inherit the wrapped PA width and evaluate direct plus conjugate image paths in floating units. | [PaModel.md](./PaModel.md) |
+| `PaModel.ProcessFloating`, `PaModel.ProcessOutputPathsFloating` | P/E | Keep the raw floating PA kernel drive-free, while the dual-output boundary applies the committed post-DAC drive and returns independent chOut/fbOut copies for calibrated ILC. | [PaModel.md](./PaModel.md) |
+| `MimoPaModel.ProcessChainFloating`, `MimoPaModel.ProcessOutputPathsFloating` | P/E | Keep raw chain processing drive-free, while the dual-output matrix boundary applies each committed analog drive and preserves vector/matrix orientation. | [PaModel.md](./PaModel.md) |
+| `IQImbalancePA.Width`, `IQImbalancePA.ProcessFloating`, `IQImbalancePA.ProcessOutputPathsFloating` | P/E | Inherit the wrapped PA width; preserve raw drive-free processing, or propagate the wrapped plant's committed-drive dual outputs before applying direct and conjugate image paths. | [PaModel.md](./PaModel.md) |
 | `DpdIlc.ResolvePaWidth` | E | Read the PA interface width and preserve width zero for third-party floating PA models. | [DpdIlc.md](./DpdIlc.md) |
-| `NormalizedPaAdapter.__init__`, `NormalizedPaAdapter.Process`, `NormalizedPaAdapter.ProcessOutputs` | E/P | Hide integer-code transport from ILC, map legacy PA output to both paths, retain Channel chOut for final analysis, and return fbOut to every learning update. A nested adapter delegates to the existing two-path adapter instead of collapsing fbOut into both positions. | [DpdIlc.md](./DpdIlc.md) |
+| `NormalizedPaAdapter.__init__`, `NormalizedPaAdapter.Process`, `NormalizedPaAdapter.ProcessOutputs` | E/P | Hide integer-code transport from ILC; first honor Channel's normalized public-semantics protocol for steady-state candidate recalibration, then prefer committed-drive `ProcessOutputPathsFloating`, raw floating, or public Process fallbacks. Preserve chOut/fbOut roles and nested adapters. | [DpdIlc.md](./DpdIlc.md) |
 | `DpdIlc.EncodeIlcResult` | E/N | Encode selected and per-iteration waveform fields as public integer codes without altering normalized-domain MSE values. | [DpdIlc.md](./DpdIlc.md) |
 | `MimoPaChain.Width` | E | Expose the parent MIMO PA width to the per-chain SISO ILC adapter. | [DpdIlc.md](./DpdIlc.md) |
 

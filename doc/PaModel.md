@@ -1381,7 +1381,7 @@ flowchart LR
 
 **图 6 说明**：当 $\beta=0$ 时没有镜像；$\lvert\beta\rvert$ 越大，镜像越强。`IQImbalancePA` 把任意基础 PA 的输出包装成这一形式，可测试普通复多项式 DPD 对非解析共轭失真的处理边界；它是归因仿真用的代数包装器，并不声明镜像位于Tx调制器还是FB接收机。需要真实参考面时，应使用Channel的 `txIq...` 参数把误差放在PA前，或使用 `fbIq...` 参数把误差只放在反馈采样支路。
 
-当被包装对象启用电热模型时，`IQImbalancePA` 保持包装器透明：`ProcessThermalPeriodFloating` 先让物理PA按完整周期求温度相关输出，再在输出参考面叠加直接项和共轭项；`SuspendThermalModel`、`RestoreThermalModel`、`GetThermalMetrics`、`CalculateActualDutyCycle`、`ResetThermalState` 和 `AdvanceIdle` 都代理到被包装PA。这样功率校准试探仍能暂停并恢复同一份热状态，Channel也能透过包装器识别热模型、读取metrics和调度占空比。共轭包装器没有独立热容，且输出镜像不会反向改变已经在物理PA输出参考面计算的耗散功率。
+当被包装对象启用电热模型时，`IQImbalancePA` 保持包装器透明：`ProcessThermalPeriodFloating` 先让物理PA按完整周期求温度相关输出，再在输出参考面叠加直接项和共轭项；`SuspendThermalModel`、`RestoreThermalModel`、`GetThermalMetrics`、`CalculateActualDutyCycle`、`ResetThermalState` 和 `AdvanceIdle` 都代理到被包装PA。这样功率校准试探仍能暂停并恢复同一份热状态，Channel也能透过包装器识别热模型、读取metrics和调度占空比。共轭包装器没有独立热容，且输出镜像不会反向改变已经在物理PA输出参考面计算的耗散功率。包装器还实现成对的 `ProcessCalibrationDrive` 与 `SetCalibrationDriveDb`：内部plant支持时分别代理未提交试探和最终提交，否则由包装器保存并施加后备drive；二者必须同时存在，避免试探与正式处理参考面不一致。`ProcessOutputPathsFloating` 再优先调用内部plant同名协议以保留已提交的post-DAC模拟驱动和两条观测路径，然后分别对 `chOut` 与 `fbOut` 应用广义线性I/Q变换；`ProcessFloating` 仍保持不额外应用隐藏驱动的raw语义。
 
 ---
 
@@ -1567,7 +1567,17 @@ g_m=d_m-20\log_{10}(r_{q,m}).
 u_m[n]=10^{g_m/20}x_{q,m}[n].
 ```
 
-因此其有效RMS仍为 $10^{d_m/20}$。公开码保持在合法范围并保留默认6 dB数字余量，模拟驱动承担其余幅度；定点量化误差仍在每轮闭环中真实存在。直接用 `PowerCalibration(paModel=paModel, ...)` 时，公开 `Calibrate` 会自动暂停并恢复PA热状态，收敛驱动会提交到该PA对象的公开 `Process` 路径；`ProcessFloating` 仍表示不含这一级隐藏驱动的裸PA内核，避免Channel内部重复乘增益。
+因此其有效RMS仍为 $10^{d_m/20}$。公开码保持在合法范围并保留默认6 dB数字余量，模拟驱动承担其余幅度；定点量化误差仍在每轮闭环中真实存在。直接用 `PowerCalibration(paModel=paModel, ...)` 时，公开 `Calibrate` 会自动暂停并恢复PA热状态，收敛驱动会提交到该PA对象。
+
+三个处理入口的参考面必须明确区分：
+
+| 入口 | 输入/输出边界 | 是否应用已提交模拟驱动 | 典型调用方 |
+|---|---|---:|---|
+| `Process` | 公开浮点或定点码，输出仍为公开格式 | 是 | 普通用户、最终重放 |
+| `ProcessOutputPathsFloating` | 已解码归一化浮点，返回 `(chOut, fbOut)` | 是 | `NormalizedPaAdapter` 的浮点ILC内部plant |
+| `ProcessFloating` | raw归一化浮点物理内核 | 否 | 已经管理真实输入标尺的Channel或模型内部调用 |
+
+定点闭环可能对10、15和20 dBm产生完全相同的公开码；这不是功率点丢失，因为不同的 `analogDriveDbPerChain` 已保存在解码后的post-DAC模拟级。`PaModel.ProcessOutputPathsFloating` 应用单路已提交驱动后只运行一次裸内核，并返回数值相同但存储独立的两份观测；裸PA没有独立反馈接收机。`MimoPaModel.ProcessOutputPathsFloating` 对每列应用各自驱动，再调用一次矩阵raw内核并保持输入的一维/二维形状。`ProcessFloating` 刻意不读取这些驱动，避免Channel在已经显式乘过驱动后重复放大。
 
 ---
 
@@ -1604,6 +1614,8 @@ classDiagram
         +modelName
         +width
         +Process(inputSignal)
+        +ProcessFloating(inputSignal)
+        +ProcessOutputPathsFloating(inputSignal)
         +ProcessThermalPeriodFloating(inputSignal, thermalRunMode, thermalDutyCycle, steadyStateToleranceC, maximumSteadyStateIterations)
         +CalculateActualDutyCycle(inputSignal, thermalDutyCycle)
         +SuspendThermalModel()
@@ -1663,6 +1675,10 @@ classDiagram
     }
     class IQImbalancePA {
         +Process(inputSignal)
+        +ProcessFloating(inputSignal)
+        +ProcessOutputPathsFloating(inputSignal)
+        +ProcessCalibrationDrive(inputSignal, driveDbPerChain)
+        +SetCalibrationDriveDb(driveDbPerChain)
         +ProcessThermalPeriodFloating(inputSignal, thermalRunMode, thermalDutyCycle, steadyStateToleranceC, maximumSteadyStateIterations)
         +SuspendThermalModel()
         +RestoreThermalModel(snapshot)
@@ -1675,6 +1691,7 @@ classDiagram
         +width
         +Process(inputMatrix)
         +ProcessFloating(inputMatrix)
+        +ProcessOutputPathsFloating(inputMatrix)
         +ProcessThermalPeriodFloating(inputMatrix, thermalRunMode, thermalDutyCycle, steadyStateToleranceC, maximumSteadyStateIterations)
         +CalculateActualDutyCycle(inputMatrix, thermalDutyCycle)
         +SuspendThermalModel()

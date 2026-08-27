@@ -3320,3 +3320,56 @@ x-S(fbOut_k),
 这里还必须区分另一种容易混淆的“校准”。`PowerCalibration.outputPowerDbm` 是PA功率设定闭环的目标，它仍定义在PA后耦合前、接收非理想之前的干净物理PA输出面；它不是raw `fbOut` 的表观功率。比如在 `sampleMode="fb"` 下配置 `fbGainDb=-6 dB` 时，20 dBm物理PA输出的反馈样值功率可以显得约低6 dB，但功率控制器不能因此把PA错误推到26 dBm。DPD/ILC所谓“校准或训练”才使用二元组第二项。
 
 如果在fb模式下只用 `fbOut` 同时训练和验收，反馈接收机自己的FIR、I/Q镜像、非线性、限幅和ADC误差可能被误判为PA失真；如果使用forward副本训练，则明确绕过了真实板载反馈链。双输出接口与 `sampleMode` 的组合正是为了在“理想前向训练”和“实际反馈训练”之间显式选择，同时始终保留 `chOut` 作为最终性能参考。
+
+## Q9：为什么低功率初始EVM更好，DPD迭代后最终EVM反而更差？
+
+先区分“本征PA/DPD曲线”和“含接收链地板的传导曲线”。低功率时PA接近线性，baseline EVM更好是正常现象；DPD压低可重复的PA失真后，剩余EVM可能由固定绝对噪声或固定满程量化主导。近似不相关时：
+
+```math
+\mathrm{EVM}_{\mathrm{total}}^2
+\approx
+\mathrm{EVM}_{\mathrm{distortion}}^2
++
+\frac{P_{\mathrm{noise}}}{P_{\mathrm{signal}}}.
+```
+
+固定 `noiseAmpMv`、固定 `noisePwrDbm` 或固定满量程定点量化意味着绝对误差地板基本不随发送功率回退。信号功率每降低1 dB，$P_{\mathrm{noise}}/P_{\mathrm{signal}}$ 增加1 dB，噪声主导的EVM地板也恶化1 dB。于是DPD前由PA非线性决定的排序可以是“低功率更好”，DPD后却由噪声地板决定为“中功率更好”。对于真实传导链，这种反转是正确结果，不应强制改成单调曲线。
+
+但工程中还存在两个会制造假反转的软件参考面问题，本轮已明确处理：
+
+1. 定点 `PowerCalibration` 为了保留数字余量，可以让不同功率点使用相同公开DAC码，实际功率差保存在解码后的隐藏post-DAC `analogDriveDbPerChain`。`NormalizedPaAdapter` 对普通PA必须通过 `ProcessOutputPathsFloating` 在浮点ILC内部继续应用该已提交驱动；对稳态热Channel则先调用 `ProcessNormalizedOutputPaths`，按公共语义为每个候选复校目标功率。raw `ProcessFloating` 本来就是drive-free，不能单独拿来代表校准后的plant。
+2. `ILCResult.learnedInput` 由训练用 `fbOut` 的LC-NMSE选择，不保证是前向主路EVM最佳轮。主程序的 `EvaluateIlcPowerPoint` 现在为每个功率点对全部历史 `chOut` 调用 `CalculateEvm`，按严格Wi-Fi EVM最小值选择对应输入，再重放到PA生成曲线样点。
+
+诊断顺序如下：
+
+| 对照结果 | 结论 | 下一步 |
+|---|---|---|
+| `width=0`、无噪声时低功率仍更好 | PA/DPD本征趋势正常 | 再逐项恢复噪声和定点边界 |
+| 加固定相对 `noiseSnrDb` 后仍正常 | 学习算法的功率归一化通常没有问题 | 比较固定绝对噪声结果 |
+| 只加固定毫伏/dBm噪声后反转 | 真实绝对噪声地板 | 传导报告保留反转；本征报告关闭该噪声 |
+| 只在定点模式反转 | 量化地板、削顶或数字余量问题 | 检查位宽、码峰值、削顶和 `analogDriveDbPerChain` |
+| 多个目标点的ILC历史功率几乎相同 | committed drive或Channel公共校准语义被绕过 | 普通PA检查 `ProcessOutputPathsFloating`；Channel检查 `ProcessNormalizedOutputPaths` |
+| FB LC-NMSE最佳轮与主路EVM最佳轮不同 | 正常的参考面差异 | 报告采用 `chOut` 严格EVM最佳轮 |
+
+做PA/DPD本征扫功率时推荐：
+
+```python
+channelParameters = {
+    "width": 0,
+    "noiseAmpMv": None,
+    "noisePwrDbm": None,
+    "noiseSnrDb": None,
+}
+
+# 若要保持各功率点相同的相对接收SNR：
+relativeNoiseParameters = {
+    **channelParameters,
+    "noiseSnrDb": 45.0,
+}
+
+ilcConfig = ILCConfig(
+    feedbackSnrDb=None,
+)
+```
+
+做真实系统传导EVM时，则应保留实际DAC/ADC位宽、满量程、固定噪声功率、削顶和反馈链非理想，并同时报告每点输出功率、噪声配置、位宽及是否发生削顶。这样“最终排序反转”表达的是系统动态范围，而不是被误判为DPD一定训练失败。

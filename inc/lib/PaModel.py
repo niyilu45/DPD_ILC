@@ -1798,9 +1798,40 @@ class PaModel:
         self.SynchronizeThermalModel()
         interfaceFormat = FixedPoint(self.width)
         floatingInput = interfaceFormat.DecodeComplex(inputSignal)
-        driveScale = np.power(10.0, self._calibrationDriveDb / 20.0)
-        floatingOutput = self.ProcessFloating(driveScale * floatingInput)
+        floatingOutput, _ = self.ProcessOutputPathsFloating(floatingInput)
         return interfaceFormat.EncodeComplex(floatingOutput)
+
+    def ProcessOutputPathsFloating(
+        self, inputSignal: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Process normalized samples at the committed calibrated drive.
+
+        Processing details:
+            Algorithm: Preserve ``ProcessFloating`` as the raw normalized PA
+            kernel, but apply the hidden post-DAC analog drive committed by
+            ``PowerCalibration`` before evaluating it. Return independent
+            channel and feedback copies because a bare PA has no separate
+            receiver path. This protocol lets fixed-point ILC retain the
+            calibrated physical operating point after decoding public codes.
+
+        Args:
+            inputSignal: Normalized complex samples after the public decoder.
+
+        Returns:
+            result: Identical ``(chOut, fbOut)`` floating PA observations.
+        """
+
+        self.SynchronizeModel()
+        self.SynchronizeThermalModel()
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        if complexInput.size == 0 or not np.all(np.isfinite(complexInput)):
+            raise ValueError("inputSignal must contain finite samples")
+        driveScale = np.power(10.0, self._calibrationDriveDb / 20.0)
+        floatingOutput = np.asarray(
+            self.ProcessFloating(driveScale * complexInput),
+            dtype=np.complex128,
+        )
+        return floatingOutput, floatingOutput.copy()
 
     def ResolveCalibrationDriveDb(
         self, driveDbPerChain: Sequence[float]
@@ -1896,9 +1927,9 @@ class PaModel:
         Processing details:
             Algorithm: Validate finite normalized complex samples and pass
             them to the active Rapp, Wiener, GMP, or Doherty calculation without
-            applying the public fixed-point encoding. This method is used by
-            internal algorithms such as ILC after they have crossed the public
-            boundary.
+            applying either public fixed-point encoding or the committed
+            post-DAC drive. Callers that start from decoded public samples,
+            including ILC, use ``ProcessOutputPathsFloating`` instead.
 
         Args:
             inputSignal: Normalized physical complex samples of any shape.
@@ -3429,43 +3460,65 @@ class MimoPaModel:
             )
         if complexInput.shape[0] == 0 or not np.all(np.isfinite(complexInput)):
             raise ValueError("inputSignal must contain finite samples")
+        floatingOutput, _ = self.ProcessOutputPathsFloating(complexInput)
+        outputMatrix = interfaceFormat.EncodeComplex(floatingOutput)
+        if inputWasVector and self.numTransmitChains == 1:
+            return outputMatrix[:, 0]
+        return outputMatrix
+
+    def ProcessOutputPathsFloating(
+        self, inputSignal: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Process every normalized PA input at its committed analog drive.
+
+        Processing details:
+            Algorithm: Resolve one hidden post-DAC drive per chain, apply the
+            gains to the decoded floating matrix, run the raw PA bank once,
+            and duplicate the clean conducted output for channel and feedback
+            roles. The raw ``ProcessFloating`` method intentionally remains a
+            drive-free kernel for callers that already own the physical scale.
+
+        Args:
+            inputSignal: Normalized vector or samples-by-chains matrix after
+                public fixed-point decoding.
+
+        Returns:
+            result: Identical floating ``(chOut, fbOut)`` observations with the
+                same vector or matrix orientation as the input.
+        """
+
+        self.SynchronizeModels()
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        inputWasVector = complexInput.ndim == 1
+        inputMatrix = (
+            complexInput.reshape(-1, 1)
+            if inputWasVector
+            else complexInput
+        )
+        if (
+            inputMatrix.ndim != 2
+            or inputMatrix.shape[1] != self.numTransmitChains
+            or inputMatrix.shape[0] == 0
+            or not np.all(np.isfinite(inputMatrix))
+        ):
+            raise ValueError(
+                "inputSignal must have one finite column per transmit chain"
+            )
         driveDbPerChain = self.ResolveCalibrationDriveDbPerChain(
             self._calibrationDriveDbPerChain
         )
         driveScalePerChain = np.power(
             10.0, np.asarray(driveDbPerChain, dtype=float) / 20.0
         )
-        drivenInput = complexInput * driveScalePerChain.reshape(1, -1)
-        outputColumns = []
-        outputRmsValues = []
-        for chainIndex in range(self.numTransmitChains):
-            floatingChainOutput = self.ProcessChainFloating(
-                drivenInput[:, chainIndex], chainIndex
-            )
-            outputColumns.append(
-                interfaceFormat.EncodeComplex(floatingChainOutput)
-            )
-            outputRmsValues.append(
-                float(
-                    np.sqrt(
-                        np.mean(np.abs(floatingChainOutput) ** 2)
-                    )
-                )
-            )
-        outputMatrix = np.column_stack(outputColumns)
-        self.lastOutputRmsPerChain = tuple(outputRmsValues)
-        self.lastDissipatedPowerWPerChain = tuple(
-            float(
-                paModel.GetThermalMetrics().get(
-                    "averageDissipatedPowerW", 0.0
-                )
-            )
-            for paModel in self.paModels
+        floatingOutput = np.asarray(
+            self.ProcessFloating(
+                inputMatrix * driveScalePerChain.reshape(1, -1)
+            ),
+            dtype=np.complex128,
         )
-        self.UpdateMutualHeating()
         if inputWasVector and self.numTransmitChains == 1:
-            return outputMatrix[:, 0]
-        return outputMatrix
+            floatingOutput = floatingOutput[:, 0]
+        return floatingOutput, floatingOutput.copy()
 
     def ResolveCalibrationDriveDbPerChain(
         self, driveDbPerChain: Sequence[float]
@@ -3593,9 +3646,11 @@ class MimoPaModel:
 
         Processing details:
             Algorithm: Validate a normalized samples-by-chains matrix, call
-            each independently configured PA's floating processing path,
-            update the most recent per-chain RMS diagnostics, and preserve a
-            SISO vector only when the configured PA bank has one chain.
+            each independently configured PA's drive-free floating processing
+            path, update the most recent per-chain RMS diagnostics, and preserve
+            a SISO vector only when the configured PA bank has one chain.
+            Decoded public samples use ``ProcessOutputPathsFloating`` so the
+            committed per-chain post-DAC drives are not lost.
 
         Args:
             inputSignal: Normalized vector or samples-by-chains matrix.
@@ -4292,6 +4347,7 @@ class IQImbalancePA:
         self.paModel = paModel
         self.directCoefficient = complex(directCoefficient)
         self.imageCoefficient = complex(imageCoefficient)
+        self._calibrationDriveDbPerChain: Tuple[float, ...] = tuple()
 
     @property
     def Width(self) -> int:
@@ -4324,16 +4380,218 @@ class IQImbalancePA:
 
         interfaceFormat = FixedPoint(self.width)
         floatingInput = interfaceFormat.DecodeComplex(inputSignal)
-        floatingOutput = self.ProcessFloating(floatingInput)
+        floatingOutput, _ = self.ProcessOutputPathsFloating(floatingInput)
         return interfaceFormat.EncodeComplex(floatingOutput)
+
+    def SetCalibrationDriveDb(
+        self, driveDbPerChain: Sequence[float]
+    ) -> None:
+        """Commit calibrated post-DAC drive on the wrapped physical PA.
+
+        Processing details:
+            Algorithm: Validate and retain the complete chain-ordered sequence,
+            then forward it when the wrapped plant exposes the paired analog-
+            drive protocol. Otherwise the facade applies this fallback drive
+            before the wrapped raw or public processor. A delegated drive is
+            never applied a second time by the facade.
+
+        Args:
+            driveDbPerChain: One finite analog-drive value per wrapped PA chain.
+
+        Returns:
+            result: None. The wrapped plant or fallback facade owns the drive.
+        """
+
+        if isinstance(driveDbPerChain, (str, bytes)):
+            raise TypeError("driveDbPerChain must be a numeric sequence")
+        driveArray = np.asarray(driveDbPerChain, dtype=object)
+        if driveArray.ndim != 1 or driveArray.size == 0:
+            raise ValueError("driveDbPerChain must be a nonempty sequence")
+        resolvedDriveValues = []
+        for driveValue in driveArray:
+            if (
+                not isinstance(
+                    driveValue,
+                    (int, float, np.integer, np.floating),
+                )
+                or isinstance(driveValue, (bool, np.bool_))
+                or not np.isfinite(driveValue)
+            ):
+                raise ValueError(
+                    "every driveDbPerChain entry must be a finite real dB "
+                    "value"
+                )
+            resolvedDriveValues.append(float(driveValue))
+        resolvedDriveDb = tuple(resolvedDriveValues)
+        trialMethod = getattr(self.paModel, "ProcessCalibrationDrive", None)
+        commitMethod = getattr(self.paModel, "SetCalibrationDriveDb", None)
+        if callable(trialMethod) != callable(commitMethod):
+            raise TypeError(
+                "wrapped PA must expose both ProcessCalibrationDrive and "
+                "SetCalibrationDriveDb, or neither"
+            )
+        self._calibrationDriveDbPerChain = resolvedDriveDb
+        if callable(commitMethod):
+            commitMethod(resolvedDriveDb)
+
+    def ProcessCalibrationDrive(
+        self,
+        inputSignal: np.ndarray,
+        driveDbPerChain: Sequence[float],
+    ) -> np.ndarray:
+        """Evaluate one wrapped-PA calibration trial before output IQ mapping.
+
+        Processing details:
+            Algorithm: Delegate public-code decoding, explicit trial drive, PA
+            evaluation, and encoding when the wrapped calibration protocol is
+            available. Otherwise decode locally and apply the trial drive before
+            the wrapped raw processor. In both cases apply the output direct/
+            image mapping and encode the measurement without committing state.
+
+        Args:
+            inputSignal: Public floating samples or fixed-point I/Q codes.
+            driveDbPerChain: Trial analog-drive values in physical chain order.
+
+        Returns:
+            result: Public IQ-imbalanced output of the uncommitted trial.
+        """
+
+        interfaceFormat = FixedPoint(self.width)
+        trialMethod = getattr(self.paModel, "ProcessCalibrationDrive", None)
+        commitMethod = getattr(self.paModel, "SetCalibrationDriveDb", None)
+        if callable(trialMethod) != callable(commitMethod):
+            raise TypeError(
+                "wrapped PA must expose both ProcessCalibrationDrive and "
+                "SetCalibrationDriveDb, or neither"
+            )
+        if callable(trialMethod):
+            rawPaOutput = trialMethod(inputSignal, driveDbPerChain)
+            floatingPaOutput = interfaceFormat.DecodeComplex(rawPaOutput)
+            floatingOutput = np.asarray(
+                self.directCoefficient * floatingPaOutput
+                + self.imageCoefficient * np.conj(floatingPaOutput),
+                dtype=np.complex128,
+            )
+        else:
+            floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+            driveArray = np.asarray(driveDbPerChain, dtype=float).reshape(-1)
+            inputMatrix = (
+                floatingInput.reshape(-1, 1)
+                if floatingInput.ndim == 1
+                else floatingInput
+            )
+            if (
+                inputMatrix.ndim != 2
+                or driveArray.size != inputMatrix.shape[1]
+                or not np.all(np.isfinite(driveArray))
+            ):
+                raise ValueError(
+                    "driveDbPerChain must contain one finite value per chain"
+                )
+            drivenInput = inputMatrix * np.power(
+                10.0, driveArray.reshape(1, -1) / 20.0
+            )
+            if floatingInput.ndim == 1:
+                drivenInput = drivenInput[:, 0]
+            floatingOutput = self.ProcessFloating(drivenInput)
+        return interfaceFormat.EncodeComplex(floatingOutput)
+
+    def ProcessOutputPathsFloating(
+        self, inputSignal: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Preserve committed drive and both observations through the wrapper.
+
+        Processing details:
+            Algorithm: Prefer the wrapped plant's committed-drive floating
+            dual-output protocol. When absent, apply this facade's validated
+            fallback drive before the raw or public wrapped processor. Then
+            apply the same output IQ transformation independently to channel
+            and feedback observations; a single output is duplicated.
+
+        Args:
+            inputSignal: Normalized complex samples after public decoding.
+
+        Returns:
+            result: IQ-imbalanced floating ``(chOut, fbOut)`` observations.
+        """
+
+        complexInput = np.asarray(inputSignal, dtype=np.complex128)
+        outputPathsProcessor = getattr(
+            self.paModel, "ProcessOutputPathsFloating", None
+        )
+        if callable(outputPathsProcessor):
+            paChannelOutput, paFeedbackOutput = outputPathsProcessor(
+                complexInput
+            )
+        else:
+            drivenInput = complexInput
+            if self._calibrationDriveDbPerChain:
+                inputMatrix = (
+                    complexInput.reshape(-1, 1)
+                    if complexInput.ndim == 1
+                    else complexInput
+                )
+                if (
+                    inputMatrix.ndim != 2
+                    or inputMatrix.shape[1]
+                    != len(self._calibrationDriveDbPerChain)
+                ):
+                    raise ValueError(
+                        "committed calibration drive must contain one value "
+                        "per input chain"
+                    )
+                drivenMatrix = inputMatrix * np.power(
+                    10.0,
+                    np.asarray(
+                        self._calibrationDriveDbPerChain, dtype=float
+                    ).reshape(1, -1)
+                    / 20.0,
+                )
+                drivenInput = (
+                    drivenMatrix[:, 0]
+                    if complexInput.ndim == 1
+                    else drivenMatrix
+                )
+            floatingProcessor = getattr(self.paModel, "ProcessFloating", None)
+            if callable(floatingProcessor):
+                paChannelOutput = floatingProcessor(drivenInput)
+            else:
+                interfaceFormat = FixedPoint(self.width)
+                publicOutput = self.paModel.Process(
+                    interfaceFormat.EncodeComplex(drivenInput)
+                )
+                paChannelOutput = interfaceFormat.DecodeComplex(publicOutput)
+            paFeedbackOutput = np.asarray(
+                paChannelOutput, dtype=np.complex128
+            ).copy()
+
+        complexChannelOutput = np.asarray(
+            paChannelOutput, dtype=np.complex128
+        )
+        complexFeedbackOutput = np.asarray(
+            paFeedbackOutput, dtype=np.complex128
+        )
+        return (
+            np.asarray(
+                self.directCoefficient * complexChannelOutput
+                + self.imageCoefficient * np.conj(complexChannelOutput),
+                dtype=np.complex128,
+            ),
+            np.asarray(
+                self.directCoefficient * complexFeedbackOutput
+                + self.imageCoefficient * np.conj(complexFeedbackOutput),
+                dtype=np.complex128,
+            ),
+        )
 
     def ProcessFloating(self, inputSignal: np.ndarray) -> np.ndarray:
         """Apply PA nonlinearity and IQ imbalance in floating-point units.
 
         Processing details:
-            Algorithm: Evaluate the wrapped PA without its public code
-            conversion when supported, then combine direct and conjugated
-            image paths before the outer interface performs one encoding.
+            Algorithm: Evaluate the wrapped PA's raw drive-free kernel without
+            public code conversion when supported, then combine direct and
+            conjugated image paths. Decoded public samples and ILC use
+            ``ProcessOutputPathsFloating`` to preserve committed analog drive.
 
         Args:
             inputSignal: Normalized floating complex samples.

@@ -3918,6 +3918,44 @@ class Channel:
         )
         return channelOutput, feedbackOutput
 
+    def ProcessNormalizedOutputPaths(
+        self, inputSignal: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply public Channel scheduling semantics to normalized ILC samples.
+
+        Processing details:
+            Algorithm: Validate the current configuration and keep the ordinary
+            normalized dual-output fast path for non-steady thermal operation.
+            When periodic steady-state thermal scheduling is active, cross the
+            configured public fixed-point boundary, call ``Process`` so its
+            cached output-power target is recalibrated for this candidate, then
+            decode both outputs. This prevents an ILC amplitude update from
+            silently changing the conducted power used for EVM comparison.
+
+        Args:
+            inputSignal: Normalized floating SISO or samples-by-chains input.
+
+        Returns:
+            result: Normalized ``(chOut, fbOut)`` from one committed live period.
+        """
+
+        self.ValidateParameters()
+        normalizedInput = self.ValidateSignal(inputSignal, "inputSignal")
+        usesSteadyStateThermalMode = (
+            self.IsThermalModelEnabled()
+            and str(self.parameters["thermalRunMode"]).strip().lower()
+            == "steady_state"
+        )
+        if not usesSteadyStateThermalMode:
+            return self.ProcessOutputPathsFloating(normalizedInput)
+        interfaceFormat = FixedPoint(self.width)
+        publicInput = interfaceFormat.EncodeComplex(normalizedInput)
+        publicChannelOutput, publicFeedbackOutput = self.Process(publicInput)
+        return (
+            interfaceFormat.DecodeComplex(publicChannelOutput),
+            interfaceFormat.DecodeComplex(publicFeedbackOutput),
+        )
+
     def Process(
         self,
         inputSignal: np.ndarray,

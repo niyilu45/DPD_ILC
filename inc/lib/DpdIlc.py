@@ -197,11 +197,14 @@ class NormalizedPaAdapter:
         """Return normalized channel and feedback observations together.
 
         Processing details:
-            Algorithm: Prefer Channel's one-PA-evaluation floating dual-output
-            protocol. Otherwise use a conventional floating PA output for both
-            roles. At a fixed public boundary, encode once, accept either the
-            new two-array Channel return or a legacy single PA array, and
-            decode every returned branch exactly once.
+            Algorithm: First honor a plant's normalized public-semantics
+            protocol so steady-state thermal Channel candidates repeat their
+            required power calibration. Otherwise prefer the committed-drive
+            floating dual-output protocol implemented by Channel and the
+            built-in PA facades. This preserves a fixed-point operating point
+            stored after the DAC rather than in public codes. A conventional
+            raw floating PA is used only as a fallback; a public-only plant is
+            encoded once and every returned branch is decoded exactly once.
 
         Args:
             inputSignal: Normalized physical complex samples.
@@ -217,6 +220,17 @@ class NormalizedPaAdapter:
         # method and accidentally duplicating fbOut into the chOut position.
         if isinstance(self.paModel, NormalizedPaAdapter):
             return self.paModel.ProcessOutputs(complexInput)
+        normalizedOutputPathsProcessor = getattr(
+            self.paModel, "ProcessNormalizedOutputPaths", None
+        )
+        if callable(normalizedOutputPathsProcessor):
+            rawChannelOutput, rawFeedbackOutput = (
+                normalizedOutputPathsProcessor(complexInput)
+            )
+            return (
+                np.asarray(rawChannelOutput, dtype=np.complex128),
+                np.asarray(rawFeedbackOutput, dtype=np.complex128),
+            )
         outputPathsProcessor = getattr(
             self.paModel, "ProcessOutputPathsFloating", None
         )

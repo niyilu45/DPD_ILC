@@ -184,7 +184,7 @@ resultAnalysis = Analysis(
 python SmallestSISO.py
 ```
 
-浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序固定运行4轮ILC，使这个确定性最小场景中的两种模式都在局部稳定区同时改善EVM与ACLR，最后打印最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本直接调用 `chOut, fbOut = Channel.Process(waveform.samples, outputPowerDbm=20.0)`；Channel内部按有效Wi-Fi突发区间把干净PA物理输出闭环标定到20 dBm，再执行一次带0度公共移相和10 mV复包络总RMS白噪声的前向主路。这个最小示例显式选择 `sampleMode="forward"`，所以 `fbOut` 是 `chOut` 的数值相同副本，完全绕过FB专用链；ILC同步、MSE和更新使用这个副本，最终EVM/SNR/ACLR/IRR/功率使用 `chOut`。需要研究板载反馈非理想时应改为 `sampleMode="fb"`，此时第二项才经过完整反馈链。接收噪声不进入PA功率设定闭环，前后补零或长占空比静默不进入功率RMS。
+浮点结果保存在 `results/smallest_siso/floating`，16位定点结果保存在 `results/smallest_siso/fixed_16`；程序固定运行4轮ILC，使这个确定性最小场景中的两种模式都在局部稳定区同时改善EVM与ACLR，最后打印最佳ILC EVM及定点减浮点的EVM差值。PA的原始输入不要求预先归一化，脚本直接调用 `chOut, fbOut = Channel.Process(waveform.samples, outputPowerDbm=20.0)`；Channel内部按有效Wi-Fi突发区间把干净PA物理输出闭环标定到20 dBm，再执行一次带0度公共移相和10 mV复包络总RMS白噪声的前向主路。这个最小示例显式选择 `sampleMode="forward"`，所以 `fbOut` 是 `chOut` 的数值相同副本，完全绕过FB专用链；ILC同步、MSE和更新使用这个副本，最终EVM/SNR/ACLR/IRR/功率使用 `chOut`。需要研究板载反馈非理想时应改为 `sampleMode="fb"`，此时第二项才经过完整反馈链。接收噪声不进入PA功率设定闭环，前后补零或长占空比静默不进入功率RMS。注意10 mV是固定绝对噪声：它适合展示传导噪声地板，却不适合据此要求多功率EVM始终保持“功率越低越好”；本征PA/DPD扫功率应关闭它或改用固定相对 `noiseSnrDb`。
 脚本还打印两种波形的峰值以及 `waveformMinimumI/MaximumI/MinimumQ/MaximumQ`。定点版本的 I/Q 字段是公开码值，因此16位分量会位于 `-32768…32767`，并不是小于1的归一化数；复数幅度 `waveformPeakAmplitude` 最多可接近 $\sqrt{2}\,32768$。
 
 ## 工程工作流程图
@@ -618,6 +618,7 @@ flowchart TD
 - `IQImbalancePA` 在被包装PA的输出上增加平坦共轭镜像，只是用于增广ILC归因测试的参考面无关代数包装器；真实Tx与FB两处I/Q误差应分别使用Channel的 `txIq...` 与 `fbIq...` 参数。Channel还可用独立的直接/镜像FIR描述IRR随频率变化，不能用这个平坦包装器替代。它透明代理内部PA的周期热处理、暂停/恢复、metrics、实际占空比、复位和额外空闲接口，因此包装热PA后Channel仍能执行相同热调度与校准事务。`AddAwgn` 模拟反馈接收链噪声。
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
 - `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。`maximumOutputPowerDbm=25.0` 定义每路PA输出参考面的额定上限，20 dBm目标对应的归一化输出RMS是 $10^{(20-25)/20}\approx0.5623$，这个数不是已经求得的PA输入驱动。公开 `Calibrate` 统一执行“热暂停→内部纯电校准→`finally` 恢复”，因此直接绑定热PA也不会让trial发热；`CalibrateElectricalOnly` 只是内部数值内核，事务外直接调用会被 `RuntimeError` 拒绝。闭环反复改变PA前驱动并测量真实输出，不在PA输出端追加常数增益。
+- 定点校准把公开DAC码固定在合法范围和数字余量内，功率点之间剩余的差值保存在解码后的隐藏模拟驱动中；因此10、15和20 dBm完全可以使用相同公开码而由不同 `analogDriveDbPerChain` 得到不同物理输出。`NormalizedPaAdapter` 对Channel先使用 `ProcessNormalizedOutputPaths`，使稳态热模式按公共语义为每个ILC候选复校功率；普通PA、MIMO和I/Q包装器则由 `ProcessOutputPathsFloating` 应用已提交驱动并返回浮点 `(chOut, fbOut)`。`ProcessFloating` 始终是raw、drive-free物理内核，供已经拥有输入物理标尺的Channel等调用方使用。
 - `MimoPaModel` 不在链间引入隐含电信号耦合：每一列进入独立 `PaModel`，可另配互热矩阵。周期热处理以全部PA为一个原子事务；任何后续链失败或互热不收敛都会恢复全部链的热状态、累计时间和旧metrics。运行中把 `thermalCouplingCPerW` 改为全零矩阵时，下一个成功周期清除旧互热offset，失败则仍回滚。`ProcessChain` 是单路 ILC 看到的真实 plant；相对 dB 与绝对 dBm 功率设置均在该路径中生效。
 
 ### `inc/lib/Channel.py`
@@ -1036,6 +1037,8 @@ flowchart TD
 - `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、模拟输出功率、公共复增益幅相和输入峰值。
 - MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA 输出功率/SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
 - 当前版本的功率-EVM扫描采用闭环输入功率校准：每个求值器作为完整“DPD+PA”被反复运行，输入驱动由 `PowerCalibration` 隐式调整，直到实测PA输出落入横轴目标容限；不对方法输出做PA后重标定。因此曲线EVM对应真实压缩工作点。
+- 主程序的逐点ILC求值由 `EvaluateIlcPowerPoint` 完成：每个功率点都用对应参考构造独立 `Analysis`，在全部历史的前向 `chOut` 中按严格Wi-Fi EVM选择最佳轮，再把该轮输入重放到PA。反馈域LC-NMSE仍用于学习和算法内部候选诊断，但不再替代主路EVM决定功率曲线的报告样点。
+- 固定 `noiseAmpMv`、固定 `noisePwrDbm` 或固定满量程定点量化会形成绝对噪声地板。DPD压低PA失真后，低功率点可能先被该地板限制，最终EVM排序因而真实反转；这不是PA或DPD模型必然出错。研究PA/DPD本征曲线时使用 `width=0` 并关闭绝对噪声，或用固定相对 `noiseSnrDb`；评估传导系统时则应保留实际噪声和量化地板。
 
 ### `inc/utils/Draw.py`
 
@@ -1235,7 +1238,7 @@ A_{\mathrm{target}}
 10^{(P_{\mathrm{target}}-P_{\max})/20}.
 ```
 
-例如 `maximumOutputPowerDbm=25.0`、`outputPowerDbm=20.0` 时，$A_{\mathrm{target}}\approx0.5623$。它是功率检测器期望看到的PA输出RMS，并不是应该直接乘到发送波形上的PA输入驱动。PA增益、压缩和记忆都会改变输入输出关系，所以实际输入只能由闭环测量反求。请求目标不得超过额定上限；内置PA与Channel的解码后模拟驱动路径保证低于该上限的目标不会仅因公开定点码满量程而被误判为不可达。
+例如 `maximumOutputPowerDbm=25.0`、`outputPowerDbm=20.0` 时，$A_{\mathrm{target}}\approx0.5623$。它是功率检测器期望看到的PA输出RMS，并不是应该直接乘到发送波形上的PA输入驱动。PA增益、压缩和记忆都会改变输入输出关系，所以实际输入只能由闭环测量反求。请求目标不得超过额定上限；内置PA与Channel的解码后模拟驱动路径保证低于该上限的目标不会仅因公开定点码满量程而被误判为不可达。定点模式可在多个功率点复用同一组保留余量的公开码，实际功率差由收敛后提交的post-DAC `analogDriveDbPerChain` 保存；ILC内部通过plant的 `ProcessOutputPathsFloating` 继续应用该驱动，而raw `ProcessFloating` 不会隐式应用它。
 
 物理电压模式约定复包络的RMS幅度等于电阻端口上的RF RMS电压，因此
 
@@ -2976,7 +2979,7 @@ print([item.ToDict() for item in result.improvements])
 - 每轮 MSE：Raw MSE 保留绝对增益、相位及整帧误差；LC-MSE 删除最优公共复增益，是一般复基带的 EVM 代理；EVM-MSE 使用完整 Wi-Fi 接收链，并严格满足 `EVM-MSE = EVM_rms²` 与 `EVM(dB) = 10·log10(EVM-MSE)`。详细推导见 [结果计算物理原理与推导](doc/Analysis.md#55-为什么原始-mse-不能总是反映-evm)。
 - ACLR：主信道功率与上下相邻同带宽信道功率之比，输出上下邻道和较差值。为完整覆盖两个邻道，命令行采样倍率限制为 4 或 8。
 - Wi-Fi相对发射频谱Mask：对当前VHT/HE/EHT数据字段做逐链Welch频谱估计，以FFT bin频率区间和居中100 kHz矩形RBW窗口的重叠比例作为权重，在线性功率域合成在浮点容差内等于100 kHz的等效RBW，再相对每链带内峰值归一化为dBr；`marginDb = maskLimitDb - measuredPsdDb`，最小Margin不小于0才通过relative预检。分数边缘权重避免对平坦噪声少计1至2 dB。结果以 `assessmentType="relativeDbrPrecheck"` 和 `certificationResult=None` 明确它不是Combined绝对dBm/MHz、仪表VBW、多包统计或认证结论。
-- 功率-EVM：横轴为每路PA绝对输出功率dBm，默认扫描10至25 dBm。`PowerCalibration` 把相对25 dBm额定上限的输出回退换成目标输出RMS，再通过PA实测闭环反求输入驱动；`Analysis` 只分析各工作点的实测波形。定点PA码直接用于EVM，物理电压标定不回灌分析接口。纵轴为RMS EVM dB，数值越低表示性能越好。
+- 功率-EVM：横轴为每路PA绝对输出功率dBm，默认扫描10至25 dBm。`PowerCalibration` 把相对25 dBm额定上限的输出回退换成目标输出RMS，再通过PA实测闭环反求输入驱动；`Analysis` 只分析各工作点的实测波形。主程序逐功率点在 `chOut` 上选择严格Wi-Fi EVM最佳ILC轮并重放其输入，不能用FB域LC-NMSE最佳轮替代。定点PA码直接用于EVM，物理电压标定不回灌分析接口。纵轴为RMS EVM dB，数值越低表示性能越好。若噪声和失真近似不相关，则 $\mathrm{EVM}_{\mathrm{total}}^2\approx\mathrm{EVM}_{\mathrm{distortion}}^2+P_{\mathrm{noise}}/P_{\mathrm{signal}}$；固定绝对噪声或固定满量程量化下，信号每回退1 dB，噪声EVM地板恶化1 dB，所以DPD后低功率排序可能真实反转。
 - 双音IMD：IM3、IM5、IM7分别在解析频率位置做Hann窗精确复投影，并相对同侧基波以dBc表示；越负越好。各方法最终在闭环相同PA输出功率下比较。
 
 ## 验证

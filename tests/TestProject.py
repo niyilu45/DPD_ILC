@@ -46,6 +46,9 @@ from inc.lib.DpdIlc import (
     CalculateIterationMetrics,
     FitMimoGmpPredistorter,
     ILCConfig,
+    ILCResult,
+    MimoIlcResult,
+    NormalizedPaAdapter,
     RunAugmentedIqIlc,
     RunComplexGainIlc,
     RunDirectionalGaussNewtonIlc,
@@ -95,6 +98,7 @@ from inc.lib.WaveGenWifi import (
 )
 from inc.lib.WaveGenTwoTone import WaveGenTwoTone
 from inc.lib.TwoToneAnalysis import TwoToneAnalysis
+from main import EvaluateIlcPowerPoint
 
 
 def CheckMcsTables() -> None:
@@ -2927,6 +2931,709 @@ def CheckPowerEvmCurve() -> None:
     )
     assert "matplotlib" not in analysisSource
     assert ".plot(" not in analysisSource
+
+
+def CheckIlcPowerOperatingPoints() -> None:
+    """Verify that fixed-point ILC preserves calibrated power semantics.
+
+    Processing details:
+        Algorithm: Calibrate one common legal 16-bit Wi-Fi waveform to three
+        conducted powers through hidden post-DAC drive, run a short clean ILC
+        at every operating point, require every stored chOut to remain at its
+        own power, and select the strict chOut-EVM best round. Repeat the
+        three-power sweep without quantization to check intrinsic EVM order,
+        then check two independently calibrated MIMO chains, an IQ wrapper,
+        and steady-state thermal Channel recalibration and period accounting.
+
+    Returns:
+        result: None. Assertions enforce power, reference-plane, and EVM
+        ordering contracts across calibrated ILC operating points.
+    """
+
+    waveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=5,
+        numDataSymbols=2,
+        sampleRateHz=80.0e6,
+        seed=91,
+        width=16,
+    ).Generate()
+    targetPowerDbmValues = (10.0, 15.0, 20.0)
+    publicReferences = []
+    analogDriveDbValues = []
+
+    for targetPowerDbm in targetPowerDbmValues:
+        paModel = PaModel(modelName="gmp", width=16)
+        powerCalibration = PowerCalibration(
+            paModel=paModel,
+            parameters={
+                "outputPowerDbm": targetPowerDbm,
+                "maximumOutputPowerDbm": 25.0,
+                "calibrationToleranceDb": 0.05,
+                "maximumCalibrationIterations": 60,
+                "width": 16,
+            },
+        )
+        referenceSignal = powerCalibration.Calibrate(waveform.samples)
+        publicReferences.append(referenceSignal.copy())
+        calibrationMetrics = powerCalibration.GetLastCalibrationMetrics()
+        analogDriveDbValues.append(
+            float(calibrationMetrics["analogDriveDbPerChain"][0])
+        )
+        assert abs(
+            calibrationMetrics["measuredOutputPowerDbmPerChain"][0]
+            - targetPowerDbm
+        ) <= 0.05
+
+        resultAnalysis = Analysis(
+            referenceSignal,
+            waveform,
+            parameters={
+                "maximumOutputPowerDbm": 25.0,
+                "width": 16,
+            },
+        )
+        baselineMetrics = resultAnalysis.Analyze(
+            powerCalibration.GetLastPaOutput()
+        )
+        assert abs(
+            baselineMetrics["outputPowerDbm"] - targetPowerDbm
+        ) <= 0.10
+
+        ilcResult = RunFrequencyDomainIlc(
+            referenceSignal,
+            paModel,
+            waveform.sampleRateHz,
+            waveform.bandwidthHz,
+            ILCConfig(
+                numIterations=3,
+                learningRate=0.15,
+                regularization=1.0e-3,
+                maxAmplitude=2.0,
+                randomSeed=1091,
+            ),
+        )
+        analyzedHistory = resultAnalysis.AnalyzeIlcHistory(
+            ilcResult.history
+        )
+        assert len(analyzedHistory.history) == 3
+        iterationPowerDbm = np.asarray(
+            [
+                iterationRecord.outputPowerDbm
+                for iterationRecord in analyzedHistory.history
+            ],
+            dtype=float,
+        )
+        assert np.all(
+            np.abs(iterationPowerDbm - targetPowerDbm) <= 0.35
+        )
+        iterationEvmDb = np.asarray(
+            [
+                iterationRecord.evmDb
+                for iterationRecord in analyzedHistory.history
+            ],
+            dtype=float,
+        )
+        expectedBestIndex = int(np.argmin(iterationEvmDb))
+        assert analyzedHistory.bestIteration == expectedBestIndex + 1
+        assert np.array_equal(
+            analyzedHistory.bestInputSignal,
+            ilcResult.history[expectedBestIndex].inputSignal,
+        )
+        assert np.array_equal(
+            analyzedHistory.bestOutputSignal,
+            ilcResult.history[expectedBestIndex].outputSignal,
+        )
+
+        powerCalibration.Calibrate(analyzedHistory.bestInputSignal)
+        selectedOutput = powerCalibration.GetLastPaOutput()
+        selectedMetrics = resultAnalysis.Analyze(selectedOutput)
+        assert abs(
+            selectedMetrics["outputPowerDbm"] - targetPowerDbm
+        ) <= 0.10
+        assert selectedMetrics["evmDb"] <= baselineMetrics["evmDb"] + 0.15
+
+    # With fixed-point digital headroom, all three conducted powers use the
+    # same legal DAC codes. Their distinct physical operating points reside in
+    # the committed post-decode analog drive and must survive ILC adaptation.
+    assert all(
+        np.array_equal(publicReferences[0], publicReference)
+        for publicReference in publicReferences[1:]
+    )
+    assert np.all(np.diff(np.asarray(analogDriveDbValues)) > 3.0)
+
+    # Power ordering is an intrinsic floating-point PA expectation. Do not
+    # impose it on the fixed-point checks above: a quantization floor can
+    # legitimately dominate a sufficiently backed-off waveform.
+    floatingWaveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=5,
+        numDataSymbols=2,
+        sampleRateHz=80.0e6,
+        seed=91,
+        width=0,
+    ).Generate()
+    floatingBaselineEvmDbValues = []
+    floatingFinalEvmDbValues = []
+    floatingIterationEvmDbRows = []
+    for targetPowerDbm in targetPowerDbmValues:
+        floatingPaModel = PaModel(modelName="gmp", width=0)
+        floatingPowerCalibration = PowerCalibration(
+            paModel=floatingPaModel,
+            parameters={
+                "outputPowerDbm": targetPowerDbm,
+                "maximumOutputPowerDbm": 25.0,
+                "calibrationToleranceDb": 0.05,
+                "width": 0,
+            },
+        )
+        floatingReference = floatingPowerCalibration.Calibrate(
+            floatingWaveform.samples
+        )
+        floatingAnalysis = Analysis(
+            floatingReference,
+            floatingWaveform,
+            parameters={
+                "maximumOutputPowerDbm": 25.0,
+                "width": 0,
+            },
+        )
+        floatingBaselineMetrics = floatingAnalysis.Analyze(
+            floatingPowerCalibration.GetLastPaOutput()
+        )
+        floatingBaselineEvmDbValues.append(
+            float(floatingBaselineMetrics["evmDb"])
+        )
+        floatingIlcResult = RunFrequencyDomainIlc(
+            floatingReference,
+            floatingPaModel,
+            floatingWaveform.sampleRateHz,
+            floatingWaveform.bandwidthHz,
+            ILCConfig(
+                numIterations=3,
+                learningRate=0.15,
+                regularization=1.0e-3,
+                maxAmplitude=2.0,
+                randomSeed=1391,
+            ),
+        )
+        floatingHistory = floatingAnalysis.AnalyzeIlcHistory(
+            floatingIlcResult.history
+        )
+        floatingIterationEvmDbRows.append(
+            np.asarray(
+                [
+                    iterationRecord.evmDb
+                    for iterationRecord in floatingHistory.history
+                ],
+                dtype=float,
+            )
+        )
+        assert np.all(
+            np.abs(
+                np.asarray(
+                    [
+                        iterationRecord.outputPowerDbm
+                        for iterationRecord in floatingHistory.history
+                    ],
+                    dtype=float,
+                )
+                - targetPowerDbm
+            )
+            <= 0.35
+        )
+        floatingPowerCalibration.Calibrate(
+            floatingHistory.bestInputSignal
+        )
+        floatingFinalMetrics = floatingAnalysis.Analyze(
+            floatingPowerCalibration.GetLastPaOutput()
+        )
+        floatingFinalEvmDbValues.append(
+            float(floatingFinalMetrics["evmDb"])
+        )
+        assert abs(
+            floatingFinalMetrics["outputPowerDbm"] - targetPowerDbm
+        ) <= 0.10
+        assert (
+            floatingFinalMetrics["evmDb"]
+            <= floatingBaselineMetrics["evmDb"] + 0.15
+        )
+
+    floatingBaselineEvmDb = np.asarray(
+        floatingBaselineEvmDbValues, dtype=float
+    )
+    floatingIterationEvmDbMatrix = np.vstack(
+        floatingIterationEvmDbRows
+    )
+    floatingFinalEvmDb = np.asarray(
+        floatingFinalEvmDbValues, dtype=float
+    )
+    # No receiver/feedback noise, thermal drift, or fixed-point quantization
+    # is present here. At every measured round and after equal-power replay,
+    # lower output power must therefore remain no worse for the default
+    # monotonic GMP plant. More negative EVM dB is better.
+    assert np.all(np.diff(floatingBaselineEvmDb) >= -0.25)
+    assert np.all(
+        np.diff(floatingIterationEvmDbMatrix, axis=0) >= -0.25
+    )
+    assert np.all(np.diff(floatingFinalEvmDb) >= -0.25)
+
+    mimoInput = np.column_stack((waveform.samples, waveform.samples))
+    mimoPaModel = MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "paParametersPerChain": (
+                {"modelName": "gmp"},
+                {"modelName": "gmp"},
+            ),
+            "width": 16,
+        }
+    )
+    mimoTargetPowerDbm = (10.0, 20.0)
+    mimoPowerCalibration = PowerCalibration(
+        paModel=mimoPaModel,
+        parameters={
+            "outputPowerDbm": mimoTargetPowerDbm[0],
+            "outputPowerDbmPerChain": mimoTargetPowerDbm,
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "maximumCalibrationIterations": 60,
+            "width": 16,
+        },
+    )
+    mimoReference = mimoPowerCalibration.Calibrate(mimoInput)
+    mimoIlcResult = RunMimoFrequencyDomainIlc(
+        mimoReference,
+        mimoPaModel,
+        waveform.sampleRateHz,
+        waveform.bandwidthHz,
+        ILCConfig(
+            numIterations=1,
+            learningRate=0.15,
+            regularization=1.0e-3,
+            maxAmplitude=2.0,
+            randomSeed=1191,
+        ),
+    )
+    for chainIndex, targetPowerDbm in enumerate(mimoTargetPowerDbm):
+        chainAnalysis = Analysis(
+            mimoReference[:, chainIndex],
+            waveform,
+            parameters={
+                "maximumOutputPowerDbm": 25.0,
+                "width": 16,
+            },
+        )
+        chainMetrics = chainAnalysis.Analyze(
+            mimoIlcResult.chainResults[chainIndex]
+            .history[0]
+            .outputSignal
+        )
+        assert abs(
+            chainMetrics["outputPowerDbm"] - targetPowerDbm
+        ) <= 0.35
+
+
+    wrappedPaModel = PaModel(modelName="gmp", width=16)
+    iqWrappedPaModel = IQImbalancePA(
+        wrappedPaModel,
+        directCoefficient=0.99 + 0.01j,
+        imageCoefficient=0.02 - 0.01j,
+    )
+    originalWrappedDriveCommit = wrappedPaModel.SetCalibrationDriveDb
+    with patch.object(
+        wrappedPaModel,
+        "SetCalibrationDriveDb",
+        wraps=originalWrappedDriveCommit,
+    ) as wrappedDriveCommit:
+        wrappedPowerCalibration = PowerCalibration(
+            paModel=iqWrappedPaModel,
+            parameters={
+                "outputPowerDbm": 10.0,
+                "maximumOutputPowerDbm": 25.0,
+                "calibrationToleranceDb": 0.05,
+                "width": 16,
+            },
+        )
+        wrappedReference = wrappedPowerCalibration.Calibrate(
+            waveform.samples
+        )
+    wrappedDriveCommit.assert_called_once()
+    committedWrappedDriveDb = float(
+        wrappedDriveCommit.call_args.args[0][0]
+    )
+    assert abs(committedWrappedDriveDb) > 1.0
+    fixedFormatInfo = FixedPoint(16).GetFormatInfo()
+    digitalHeadroomLimit = (
+        float(fixedFormatInfo["maximumCode"])
+        * 10.0 ** (-6.0 / 20.0)
+        + 1.0
+    )
+    assert np.max(np.abs(wrappedReference.real)) <= digitalHeadroomLimit
+    assert np.max(np.abs(wrappedReference.imag)) <= digitalHeadroomLimit
+    wrappedIlcResult = RunFrequencyDomainIlc(
+        wrappedReference,
+        iqWrappedPaModel,
+        waveform.sampleRateHz,
+        waveform.bandwidthHz,
+        ILCConfig(
+            numIterations=1,
+            learningRate=0.15,
+            regularization=1.0e-3,
+            maxAmplitude=2.0,
+            randomSeed=1291,
+        ),
+    )
+    wrappedAnalysis = Analysis(
+        wrappedReference,
+        waveform,
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "width": 16,
+        },
+    )
+    wrappedMetrics = wrappedAnalysis.Analyze(
+        wrappedIlcResult.history[0].outputSignal
+    )
+    assert abs(wrappedMetrics["outputPowerDbm"] - 10.0) <= 0.35
+
+    thermalSampleRateHz = 100.0e3
+    thermalConfig = ThermalConfig(
+        enabled=True,
+        modelName="single_rc",
+        sampleRateHz=thermalSampleRateHz,
+        thermalResistancesCPerW=(8.0,),
+        thermalTimeConstantsSec=(0.01,),
+        thermalUpdateIntervalSamples=20,
+        idleDissipatedPowerW=0.0,
+        referenceOutputPowerDbm=25.0,
+        gainTemperatureCoefficientDbPerC=-0.01,
+        maximumJunctionTemperatureC=200.0,
+    )
+    thermalPaModel = PaModel(
+        parameters={
+            "modelName": "wiener",
+            "thermalConfig": thermalConfig,
+            "width": 16,
+        }
+    )
+    thermalChannel = Channel(
+        paModel=thermalPaModel,
+        parameters={
+            "sampleMode": "forward",
+            "sampleRateHz": thermalSampleRateHz,
+            "thermalRunMode": "steady_state",
+            "thermalDutyCycle": 0.5,
+            "thermalSteadyStateToleranceC": 1.0e-5,
+            "maximumThermalSteadyStateIterations": 100,
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "width": 16,
+        },
+    )
+    thermalPublicInput = FixedPoint(16).EncodeComplex(
+        np.full(200, 0.25 + 0.05j, dtype=np.complex128)
+    )
+    thermalChannelOutput, thermalFeedbackOutput = thermalChannel.Process(
+        thermalPublicInput,
+        outputPowerDbm=20.0,
+    )
+    assert np.array_equal(thermalFeedbackOutput, thermalChannelOutput)
+    thermalReference = thermalChannel.GetLastPaInput()
+    thermalMetrics = thermalChannel.GetThermalMetrics()
+    thermalPeriodDurationSec = float(
+        thermalMetrics["periodDurationSec"]
+    )
+    assert np.isclose(
+        thermalMetrics["elapsedTimeSec"],
+        thermalPeriodDurationSec,
+        rtol=0.0,
+        atol=1.0e-15,
+    )
+    normalizedThermalReference = FixedPoint(16).DecodeComplex(
+        thermalReference
+    )
+    normalizedThermalAdapter = NormalizedPaAdapter(thermalChannel)
+    thermalPowerMeasurement = PowerCalibration(
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "width": 0,
+        }
+    )
+    for candidateScale in (0.8, 1.1):
+        elapsedTimeBeforeSec = float(
+            thermalChannel.GetThermalMetrics()["elapsedTimeSec"]
+        )
+        candidateChannelOutput, candidateFeedbackOutput = (
+            normalizedThermalAdapter.ProcessOutputs(
+                candidateScale * normalizedThermalReference
+            )
+        )
+        elapsedTimeAfterSec = float(
+            thermalChannel.GetThermalMetrics()["elapsedTimeSec"]
+        )
+        assert np.array_equal(
+            candidateFeedbackOutput, candidateChannelOutput
+        )
+        candidateOutputRms = (
+            thermalPowerMeasurement.CalculateActiveRmsPerChain(
+                candidateChannelOutput
+            )[0]
+        )
+        candidateOutputPowerDbm = (
+            thermalPowerMeasurement.NormalizedRmsToOutputPowerDbm(
+                candidateOutputRms
+            )
+        )
+        assert abs(candidateOutputPowerDbm - 20.0) <= 0.10
+        assert np.isclose(
+            elapsedTimeAfterSec - elapsedTimeBeforeSec,
+            thermalPeriodDurationSec,
+            rtol=0.0,
+            atol=1.0e-15,
+        )
+
+    elapsedTimeBeforeIlcSec = float(
+        thermalChannel.GetThermalMetrics()["elapsedTimeSec"]
+    )
+    thermalIlcResult = RunFrequencyDomainIlc(
+        thermalReference,
+        thermalChannel,
+        thermalSampleRateHz,
+        20.0e3,
+        ILCConfig(
+            numIterations=2,
+            learningRate=0.15,
+            regularization=1.0e-3,
+            maxAmplitude=2.0,
+            randomSeed=1591,
+        ),
+    )
+    elapsedTimeAfterIlcSec = float(
+        thermalChannel.GetThermalMetrics()["elapsedTimeSec"]
+    )
+    # One low-power-response probe, two measured candidates, and one final
+    # replay each submit exactly one live thermal period. Their calibration
+    # trials are transactional and must not advance physical time.
+    assert np.isclose(
+        elapsedTimeAfterIlcSec - elapsedTimeBeforeIlcSec,
+        4.0 * thermalPeriodDurationSec,
+        rtol=0.0,
+        atol=1.0e-15,
+    )
+    for iterationRecord in thermalIlcResult.history:
+        normalizedIterationOutput = FixedPoint(16).DecodeComplex(
+            iterationRecord.outputSignal
+        )
+        iterationOutputRms = (
+            thermalPowerMeasurement.CalculateActiveRmsPerChain(
+                normalizedIterationOutput
+            )[0]
+        )
+        iterationOutputPowerDbm = (
+            thermalPowerMeasurement.NormalizedRmsToOutputPowerDbm(
+                iterationOutputRms
+            )
+        )
+        assert abs(iterationOutputPowerDbm - 20.0) <= 0.10
+
+
+def CheckMainIlcPowerPointSelection() -> None:
+    """Verify that the main power sweep replays the chOut-EVM best round.
+
+    Processing details:
+        Algorithm: Inject an ILC history whose feedback-domain LC-NMSE best
+        round deliberately differs from its forward strict-EVM best round,
+        call the main power-point helper, and require the PA replay input to
+        equal the strict main-path candidate rather than ``ILCResult``'s
+        native feedback-selected input.
+
+    Returns:
+        result: None. Assertions enforce strict-EVM candidate selection at the
+        power-curve reporting boundary.
+    """
+
+    waveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=5,
+        numDataSymbols=2,
+        sampleRateHz=80.0e6,
+        seed=491,
+        width=0,
+    ).Generate()
+    pointReference = 0.20 * waveform.samples
+    inputCandidates = (
+        0.90 * pointReference,
+        1.05 * pointReference,
+        1.20 * pointReference,
+    )
+    channelOutputs = (
+        pointReference
+        + 0.08 * pointReference * np.abs(pointReference) ** 2,
+        pointReference.copy(),
+        pointReference + 0.12 * np.conj(pointReference),
+    )
+    feedbackOutputs = (
+        pointReference + 0.14 * np.conj(pointReference),
+        pointReference + 0.07 * np.conj(pointReference),
+        pointReference.copy(),
+    )
+    history = [
+        CalculateIterationMetrics(
+            iterationIndex + 1,
+            pointReference,
+            feedbackOutputs[iterationIndex],
+            inputCandidates[iterationIndex],
+            channelOutputSignal=channelOutputs[iterationIndex],
+            feedbackOutputSignal=feedbackOutputs[iterationIndex],
+        )
+        for iterationIndex in range(3)
+    ]
+    nativeBestIndex = int(
+        np.argmin(
+            np.asarray(
+                [
+                    iterationRecord.linearCompensatedNmseDb
+                    for iterationRecord in history
+                ],
+                dtype=float,
+            )
+        )
+    )
+    assert nativeBestIndex == 2
+    fakeIlcResult = ILCResult(
+        learnedInput=inputCandidates[nativeBestIndex],
+        outputSignal=channelOutputs[nativeBestIndex],
+        history=history,
+        feedbackOutputSignal=feedbackOutputs[nativeBestIndex],
+    )
+    paModel = PaModel(modelName="gmp", width=0)
+    with patch(
+        "main.RunFrequencyDomainIlc",
+        return_value=fakeIlcResult,
+    ), patch.object(
+        paModel,
+        "Process",
+        return_value=channelOutputs[1],
+    ) as replayMethod:
+        selectedOutput = EvaluateIlcPowerPoint(
+            pointReference,
+            paModel,
+            waveform,
+            ILCConfig(numIterations=3),
+            {
+                "maximumOutputPowerDbm": 25.0,
+                "width": 0,
+            },
+        )
+
+    assert np.array_equal(selectedOutput, channelOutputs[1])
+    replayMethod.assert_called_once()
+    replayInput = np.asarray(
+        replayMethod.call_args.args[0], dtype=np.complex128
+    )
+    assert np.array_equal(replayInput, inputCandidates[1])
+    assert not np.array_equal(replayInput, fakeIlcResult.learnedInput)
+
+    mimoWaveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=5,
+        numDataSymbols=2,
+        sampleRateHz=80.0e6,
+        seed=492,
+        numTransmitAntennas=2,
+        numSpatialStreams=2,
+        spatialMapping="direct",
+        width=0,
+    ).Generate()
+    mimoReference = 0.20 * mimoWaveform.samples
+    mimoInputCandidates = (
+        0.90 * mimoReference,
+        1.05 * mimoReference,
+        1.20 * mimoReference,
+    )
+    mimoChannelOutputs = (
+        mimoReference
+        + 0.08 * mimoReference * np.abs(mimoReference) ** 2,
+        mimoReference.copy(),
+        mimoReference + 0.12 * np.conj(mimoReference),
+    )
+    mimoFeedbackOutputs = (
+        mimoReference + 0.14 * np.conj(mimoReference),
+        mimoReference + 0.07 * np.conj(mimoReference),
+        mimoReference.copy(),
+    )
+    fakeChainResults = []
+    for chainIndex in range(2):
+        chainHistory = [
+            CalculateIterationMetrics(
+                iterationIndex + 1,
+                mimoReference[:, chainIndex],
+                mimoFeedbackOutputs[iterationIndex][:, chainIndex],
+                mimoInputCandidates[iterationIndex][:, chainIndex],
+                channelOutputSignal=(
+                    mimoChannelOutputs[iterationIndex][:, chainIndex]
+                ),
+                feedbackOutputSignal=(
+                    mimoFeedbackOutputs[iterationIndex][:, chainIndex]
+                ),
+            )
+            for iterationIndex in range(3)
+        ]
+        fakeChainResults.append(
+            ILCResult(
+                learnedInput=mimoInputCandidates[2][:, chainIndex],
+                outputSignal=mimoChannelOutputs[2][:, chainIndex],
+                history=chainHistory,
+                feedbackOutputSignal=(
+                    mimoFeedbackOutputs[2][:, chainIndex]
+                ),
+            )
+        )
+    fakeMimoIlcResult = MimoIlcResult(
+        learnedInput=mimoInputCandidates[2],
+        outputSignal=mimoChannelOutputs[2],
+        chainResults=tuple(fakeChainResults),
+        feedbackOutputSignal=mimoFeedbackOutputs[2],
+    )
+    mimoPaModel = MimoPaModel(
+        parameters={
+            "numTransmitChains": 2,
+            "width": 0,
+        }
+    )
+    with patch(
+        "main.RunMimoFrequencyDomainIlc",
+        return_value=fakeMimoIlcResult,
+    ), patch.object(
+        mimoPaModel,
+        "Process",
+        return_value=mimoChannelOutputs[1],
+    ) as mimoReplayMethod:
+        selectedMimoOutput = EvaluateIlcPowerPoint(
+            mimoReference,
+            mimoPaModel,
+            mimoWaveform,
+            ILCConfig(numIterations=3),
+            {
+                "maximumOutputPowerDbm": 25.0,
+                "width": 0,
+            },
+        )
+
+    assert np.array_equal(selectedMimoOutput, mimoChannelOutputs[1])
+    mimoReplayMethod.assert_called_once()
+    mimoReplayInput = np.asarray(
+        mimoReplayMethod.call_args.args[0], dtype=np.complex128
+    )
+    assert np.array_equal(mimoReplayInput, mimoInputCandidates[1])
+    assert not np.array_equal(
+        mimoReplayInput, fakeMimoIlcResult.learnedInput
+    )
 
 
 def CheckGuardIntervals() -> None:
@@ -11339,6 +12046,8 @@ def RunTests() -> None:
     CheckIdealMetrics()
     CheckSignalProcessingCompensation()
     CheckPowerEvmCurve()
+    CheckIlcPowerOperatingPoints()
+    CheckMainIlcPowerPointSelection()
     CheckGuardIntervals()
     CheckRappPaModel()
     CheckGmpPaModel()

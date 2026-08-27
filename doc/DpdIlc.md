@@ -246,6 +246,14 @@ Channel或新的双输出plant推荐提供：
 chOut, fbOut = plant.Process(inputSignal)
 ```
 
+内置PA还提供归一化浮点双输出协议：
+
+```python
+chOut, fbOut = plant.ProcessOutputPathsFloating(inputSignal)
+```
+
+`NormalizedPaAdapter` 对普通PA优先调用这个协议。它接收已经解码的归一化样值，但会在PA求值前应用 `PowerCalibration` 已提交的post-DAC模拟驱动，因此定点ILC不会因为离开公开整数码边界而丢失10、15或20 dBm工作点。Channel还提供优先级更高的 `ProcessNormalizedOutputPaths`：非稳态热模式走普通浮点双输出快路径，稳态热模式则穿过公共定点边界并调用 `Process`，为当前ILC候选重复所需功率校准。`PaModel.ProcessFloating` 与 `MimoPaModel.ProcessFloating` 刻意保持raw、drive-free：它们只适合已经拥有物理输入标尺、需要避免重复增益的调用方。`IQImbalancePA.ProcessOutputPathsFloating` 会先透传被包装plant的已提交驱动和双分支，再分别添加相同输出I/Q变换。
+
 `Process` 必须满足：
 
 - 输入必须是一维复数组；每个输出允许比输入更长或更短，ILC会先同步反馈并提取到参考网格；
@@ -290,7 +298,7 @@ print(fixedResult["selectedIlcMetrics"])
 python SmallestSISO.py
 ```
 
-脚本的 `RunSisoMode(width=...)` 会把该值分别写入 `WaveGenWifi.parameters`、`PaModel.parameters`、`Channel.parameters` 和 `Analysis.parameters`。`width=0` 为浮点旁路；`width=16` 的公开 I/Q 分量是 `-32768…32767` 的整数码，`numpy.complex128` 只是统一容器。ILC在入口解码整数码，内部FFT、GMP、移相、加噪、同步、学习更新和指标算法仍使用归一化浮点；返回的最佳输入、输出和逐轮波形再编码为公开整数码。两个结果目录分别是 `results/smallest_siso/floating` 和 `results/smallest_siso/fixed_16`，每个目录都包含逐轮MSE/EVM收敛数据和图片。定点公式见 [FixedPoint.md](./FixedPoint.md)，Channel的噪声单位和流程见 [Channel.md](./Channel.md)。
+脚本的 `RunSisoMode(width=...)` 会把该值分别写入 `WaveGenWifi.parameters`、`PaModel.parameters`、`Channel.parameters` 和 `Analysis.parameters`。`width=0` 为浮点旁路；`width=16` 的公开 I/Q 分量是 `-32768…32767` 的整数码，`numpy.complex128` 只是统一容器。ILC在入口解码整数码，内部FFT、GMP、移相、加噪、同步、学习更新和指标算法仍使用归一化浮点；`NormalizedPaAdapter` 通过 `ProcessOutputPathsFloating` 在每轮重新应用功率闭环已提交的隐藏模拟驱动，返回的最佳输入、输出和逐轮波形再编码为公开整数码。两个结果目录分别是 `results/smallest_siso/floating` 和 `results/smallest_siso/fixed_16`，每个目录都包含逐轮MSE/EVM收敛数据和图片。定点公式见 [FixedPoint.md](./FixedPoint.md)，Channel的噪声单位和流程见 [Channel.md](./Channel.md)。
 
 这个示例中，`paOutputPowerDbm` 是工作点，`maximumOutputPowerDbm` 是额定极限。输出回退和归一化驱动关系为：
 
@@ -1380,6 +1388,10 @@ powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
 - `Fixed GMP deployment`：只用标称功率标签拟合一次，表示模型外推能力。
 - 两者训练预算不同，不能只按曲线最低点给出复杂度结论。
 
+工程主程序用 `EvaluateIlcPowerPoint` 实现上面的 `RunPointIlc` 语义。每个功率点先运行ILC，再由当前点的 `Analysis.CalculateEvm` 逐轮计算前向 `chOut` 的严格Wi-Fi EVM，以最小值对应的输入作为最佳候选并重放到PA。功率曲线不需要的SNR、IRR和ACLR不会在这个内层重复计算。`ILCResult.learnedInput` 是反馈域LC-NMSE最佳候选；当FB链具有I/Q不平衡、频响、噪声或量化时，它与主路EVM最佳轮可以不同，不能直接作为功率-EVM曲线的最终样点。
+
+如果曲线保留固定 `noiseAmpMv`、固定 `noisePwrDbm` 或固定满量程定点量化，DPD把PA失真压低后，低功率点可能先碰到绝对噪声/量化地板并出现最终排序反转。这是传导系统的真实限制。要检查PA/DPD本征趋势，应使用 `width=0`，关闭绝对噪声，或明确改用固定相对 `noiseSnrDb`；不要通过输出后缩放或强制单调来掩盖地板。
+
 ---
 
 ## 16. 结果保存和绘图
@@ -1713,6 +1725,17 @@ referenceSignal.shape[1] == mimoPaModel.numTransmitChains
 - 是否需要按链使用不同学习率或峰值限制。
 
 当前 `RunMimoFrequencyDomainIlc` 对所有链共享一份除随机种子外的 `ILCConfig`。若各链差异很大，应分别调用 `RunFrequencyDomainIlc` 和 `MimoPaChain`，为每路提供独立配置。
+
+### 19.10 低功率初始EVM更好，但迭代后最终EVM排序反转
+
+先做三组对照：`width=0`且无噪声、`width=0`且固定相对 `noiseSnrDb`、原定点与固定绝对噪声配置。若前两组仍保持低功率更好，只有最后一组反转，原因是DPD消除PA失真后暴露了固定绝对噪声或满量程量化地板，不是PA逆模型错误。固定噪声功率下，信号每回退1 dB，噪声EVM地板就恶化1 dB。
+
+若无噪声浮点对照也异常，再检查：
+
+1. 每个功率点的 `analogDriveDbPerChain` 是否不同，且每轮 `chOut` 功率是否仍停留在本点；
+2. 普通PA是否实现 `ProcessOutputPathsFloating`，稳态热Channel是否实现 `ProcessNormalizedOutputPaths`，避免ILC内部调用raw `ProcessFloating` 绕过已提交驱动或公共复校语义；
+3. 功率曲线是否用 `EvaluateIlcPowerPoint` 或等价逻辑按 `chOut` 严格EVM最佳轮选点，而不是直接使用反馈LC-NMSE最佳的 `ILCResult.learnedInput`；
+4. 最佳输入重放是否在同一确定性条件下进行；含随机噪声时，重放值可因新噪声样本轻微波动。
 
 ---
 
