@@ -6,6 +6,7 @@ import inspect
 import json
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -6968,6 +6969,189 @@ def CheckFrequencySelectiveIqImbalance() -> None:
         )
         assert max(toneIrrDb) < 0.0
         assert abs(toneIrrDb[1] - toneIrrDb[0]) > 5.0
+
+    # Keep the four documented recommendation profiles, their plotted data,
+    # and the Channel FIR convention tied to one numeric contract. Loading the
+    # plotting module does not execute its __main__ block or regenerate PNGs.
+    iqFigureDirectory = (
+        GetProjectRoot() / "doc" / "images" / "channel_iq"
+    )
+    iqFigureNamespace = runpy.run_path(
+        str(iqFigureDirectory / "GenerateIqIrrFigures.py")
+    )
+    buildRecommendedProfiles = iqFigureNamespace[
+        "BuildRecommendedIqProfiles"
+    ]
+    calculateIqFrequencyResponses = iqFigureNamespace[
+        "CalculateIqFrequencyResponses"
+    ]
+    calculateIrrDbCurve = iqFigureNamespace["CalculateIrrDbCurve"]
+    recommendedProfiles = buildRecommendedProfiles()
+    expectedProfileNames = (
+        "flat_reference",
+        "mild_frequency_selective",
+        "moderate_edge_degradation",
+        "severe_asymmetric_stress",
+    )
+    assert tuple(recommendedProfiles) == expectedProfileNames
+    expectedProfileTaps = {
+        "flat_reference": (
+            (1.0 + 0.0j,),
+            (0.010 + 0.0j,),
+        ),
+        "mild_frequency_selective": (
+            (0.999 + 0.0j, 0.004 - 0.003j, -0.001 + 0.001j),
+            (0.004 + 0.002j, -0.0015 + 0.001j, 0.0005 - 0.0005j),
+        ),
+        "moderate_edge_degradation": (
+            (0.997 + 0.0j, 0.003 + 0.0j),
+            (0.019 + 0.0j, -0.009 + 0.0j),
+        ),
+        "severe_asymmetric_stress": (
+            (0.985 + 0.0j, 0.025 - 0.018j, -0.008 + 0.006j),
+            (0.050 + 0.028j, -0.024 + 0.017j, 0.010 - 0.008j),
+        ),
+    }
+    profileFrequencyMhz = np.asarray(
+        (-40.0, -20.0, 0.0, 20.0, 40.0), dtype=float
+    )
+    profileFrequencyHz = profileFrequencyMhz * 1.0e6
+    profileSampleRateHz = 80.0e6
+    expectedProfileIrrDb = {
+        "flat_reference": (
+            -40.0,
+            -40.0,
+            -40.0,
+            -40.0,
+            -40.0,
+        ),
+        "mild_frequency_selective": (
+            -44.35471790683431,
+            -44.432977404199924,
+            -48.18467329626209,
+            -51.37063232715508,
+            -44.35471790683431,
+        ),
+        "moderate_edge_degradation": (
+            -31.004567061101884,
+            -33.51971979464614,
+            -40.0,
+            -33.51971979464614,
+            -31.004567061101884,
+        ),
+        "severe_asymmetric_stress": (
+            -21.084376580467698,
+            -21.740285051203543,
+            -25.761005142336046,
+            -31.504329797260844,
+            -21.084376580467705,
+        ),
+    }
+    calculatedProfileCsvValues = {}
+    denseFrequencyHz = np.linspace(-40.0e6, 40.0e6, 2001)
+    worstIrrDbByProfile = {}
+    for profileName, profile in recommendedProfiles.items():
+        directFirTaps = profile["directFirTaps"]
+        imageFirTaps = profile["imageFirTaps"]
+        assert (
+            tuple(directFirTaps),
+            tuple(imageFirTaps),
+        ) == expectedProfileTaps[profileName]
+        profileChannel = Channel(
+            parameters={
+                "txIqGainImbalanceDb": 0.0,
+                "txIqPhaseImbalanceDegrees": 0.0,
+                "txIqDirectFirTaps": directFirTaps,
+                "txIqImageFirTaps": imageFirTaps,
+                "width": 0,
+            }
+        )
+        effectiveDirectTaps, effectiveImageTaps = (
+            profileChannel.TransmitterIqFilterTaps()
+        )
+        assert np.array_equal(effectiveDirectTaps, directFirTaps)
+        assert np.array_equal(effectiveImageTaps, imageFirTaps)
+        keyPointIrrDb = np.asarray(
+            calculateIrrDbCurve(
+                profileFrequencyHz,
+                profileSampleRateHz,
+                effectiveDirectTaps,
+                effectiveImageTaps,
+            ),
+            dtype=float,
+        )
+        assert np.allclose(
+            keyPointIrrDb,
+            expectedProfileIrrDb[profileName],
+            rtol=0.0,
+            atol=1.0e-10,
+        )
+        directResponse, imageAtMirrorResponse = (
+            calculateIqFrequencyResponses(
+                profileFrequencyHz,
+                profileSampleRateHz,
+                effectiveDirectTaps,
+                effectiveImageTaps,
+            )
+        )
+        calculatedProfileCsvValues[profileName] = np.column_stack(
+            (
+                keyPointIrrDb,
+                20.0 * np.log10(np.abs(directResponse)),
+                20.0 * np.log10(np.abs(imageAtMirrorResponse)),
+            )
+        )
+        denseIrrDb = np.asarray(
+            calculateIrrDbCurve(
+                denseFrequencyHz,
+                profileSampleRateHz,
+                effectiveDirectTaps,
+                effectiveImageTaps,
+            ),
+            dtype=float,
+        )
+        worstIrrDbByProfile[profileName] = float(np.max(denseIrrDb))
+
+    assert (
+        worstIrrDbByProfile["mild_frequency_selective"]
+        < worstIrrDbByProfile["moderate_edge_degradation"]
+        < worstIrrDbByProfile["severe_asymmetric_stress"]
+    )
+
+    iqCsvPath = iqFigureDirectory / "iq_irr_frequency_profiles.csv"
+    iqCsvLines = iqCsvPath.read_text(encoding="utf-8").splitlines()
+    expectedCsvHeaders = ["frequency_mhz"]
+    for profileName in expectedProfileNames:
+        expectedCsvHeaders.extend(
+            (
+                f"{profileName}_irr_db",
+                f"{profileName}_direct_gain_db",
+                f"{profileName}_image_gain_db",
+            )
+        )
+    assert iqCsvLines[0].split(",") == expectedCsvHeaders
+    iqCsvData = np.loadtxt(iqCsvPath, delimiter=",", skiprows=1)
+    assert iqCsvData.shape == (2001, len(expectedCsvHeaders))
+    assert np.allclose(
+        iqCsvData[:, 0],
+        np.linspace(-40.0, 40.0, 2001),
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+    for frequencyIndex, frequencyMhz in enumerate(profileFrequencyMhz):
+        csvRowIndex = int(round((frequencyMhz + 40.0) / 0.04))
+        assert abs(iqCsvData[csvRowIndex, 0] - frequencyMhz) < 1.0e-12
+        for profileIndex, profileName in enumerate(expectedProfileNames):
+            irrColumnIndex = 1 + 3 * profileIndex
+            assert np.allclose(
+                iqCsvData[
+                    csvRowIndex,
+                    irrColumnIndex : irrColumnIndex + 3,
+                ],
+                calculatedProfileCsvValues[profileName][frequencyIndex],
+                rtol=0.0,
+                atol=5.0e-10,
+            )
 
     # Returned tap arrays are defensive. Disabling either I/Q stage bypasses
     # its scalar settings, both FIRs, and DC as one atomic identity operation.

@@ -1621,15 +1621,29 @@ j\frac{\phi}{2},
 - `fbIq...` 在PA之后，只污染fb观测；数值增大时，forward不变而fb的 `irrDb` 上升、趋近0，EVM变差。
 - disabled开关并不清除已保存的非零数值，只在处理、有效FIR查询与标量系数查询时使该级采用 $a=(1)$、$b=(0)$ 且 $d=0$。重新置True会恢复这些参数的物理作用。
 
-频率选择性仿真的推荐起点如下；数值只是可观察功能的合成例，不是器件规格：
+下面给出一组可复现的推荐配置。它们在 `sampleRateHz=80e6` 下定义，横轴 $f_0$ 是输入单边复音相对载频的频偏，范围为复基带Nyquist区间 `-40...+40 MHz`。显式FIR是对应支路的完整有效响应；为了避免阅读歧义，使用这些配置时应把旧增益/相位参数置零并把DC置零。
 
-| 场景 | 直接FIR | 镜像FIR | 建议 |
+| 配置名 | 直接FIR $a$ | 镜像FIR $b$ | 适用场景 |
 |---|---|---|---|
-| 平坦兼容基线 | `None` | `None` | 用上面的增益/相位表控制单一IRR |
-| 轻度频选功能验证 | 3 taps，首抽头接近1、其余抽头总幅约0.01至0.03 | 3 taps，总幅约0.01至0.03 | 用不同频率的单边复音确认IRR曲线不平坦 |
-| 实测模型 | 由扫频或宽带系统辨识得到的完整有效响应 | 同一次参考面测量得到的完整共轭响应 | 用独立数据验证带边IRR、NMSE和噪声增强后再定阶 |
+| `flat_reference` | `(1+0j,)` | `(0.010+0j,)` | 平坦 `-40 dBc` 参考线，用于验证逐频计算和测量地板 |
+| `mild_frequency_selective` | `(0.999+0j, 0.004-0.003j, -0.001+0.001j)` | `(0.004+0.002j, -0.0015+0.001j, 0.0005-0.0005j)` | 校准后的轻度频选残差；全带最差约 `-43.23 dBc` |
+| `moderate_edge_degradation` | `(0.997+0j, 0.003+0j)` | `(0.019+0j, -0.009+0j)` | 中心约 `-40 dBc`、带边退化到约 `-31.00 dBc` 的典型带边压力场景 |
+| `severe_asymmetric_stress` | `(0.985+0j, 0.025-0.018j, -0.008+0.006j)` | `(0.050+0.028j, -0.024+0.017j, 0.010-0.008j)` | 未校准宽带链路的非对称压力测试；全带最差约 `-20.10 dBc` |
 
-两支路均显式配置时，建议把旧增益/相位参数置零以减少阅读歧义；这不是运行要求，因为被显式FIR覆盖的支路本来就不会再乘旧系数。直接FIR存在深陷波或响应非最小相位时，有限长因果补偿器一般只能近似其逆，不能只靠增大 `fbIqCompensationFilterLength` 保证完全恢复。
+对应的解析值如下。每个数值都按 $20\log_{10}|B(-f_0)/A(f_0)|$ 计算；最差值是全带内最大的、最接近0的 `irrDb`，不是绝对值最大的数。
+
+| 配置 | `-40 MHz` | `-20 MHz` | `0 MHz` | `+20 MHz` | `+40 MHz` | 全带最好...最差 | 直接支路增益范围 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 平坦参考 | -40.00 | -40.00 | -40.00 | -40.00 | -40.00 | -40.00...-40.00 dBc | 0.000...0.000 dB |
+| 轻度频选 | -44.35 | -44.43 | -48.18 | -51.37 | -44.35 | -51.40...-43.23 dBc | -0.064...+0.029 dB |
+| 中度带边退化 | -31.00 | -33.52 | -40.00 | -33.52 | -31.00 | -40.00...-31.00 dBc | -0.052...0.000 dB |
+| 重度非对称 | -21.08 | -21.74 | -25.76 | -31.50 | -21.08 | -31.63...-20.10 dBc | -0.491...+0.111 dB |
+
+![推荐频率选择性I/Q不平衡配置的IRR曲线](./images/channel_iq/iq_irr_frequency_profiles.png)
+
+上图上半部分是镜像相对期望信号的电平，越负越好；下半部分是同一直接FIR产生的增益纹波。曲线只表示无噪声、线性I/Q级、DC已经排除且PA旁路或工作在小信号区时的解析预期。实际 `MeasureIrr()` 还会受到PA非线性、同步残差、量化和噪声地板影响。相同抽头在其他采样率下保持相对于 $f_0/f_s$ 的形状，例如把采样率从80 MHz改为160 MHz会把横轴物理频率整体放大两倍。
+
+这些合成配置可同时用于Tx和FB，只需把参数名前缀从 `tx` 换成 `fb`；两者的解析曲线相同，但Tx失配会进入PA，而FB失配只污染反馈观测。真实器件应由扫频或宽带系统辨识得到完整有效响应，并用独立数据验证带边IRR、NMSE和噪声增强后再定阶。直接FIR存在深陷波或响应非最小相位时，有限长因果补偿器一般只能近似其逆，不能只靠增大 `fbIqCompensationFilterLength` 保证完全恢复。图和精确CSV由 [`GenerateIqIrrFigures.py`](./images/channel_iq/GenerateIqIrrFigures.py) 共同生成，避免参数、表格和曲线分离维护。
 
 直流参数的影响由它相对有效信号RMS的比例决定：
 
@@ -2669,7 +2683,7 @@ print("FB disabled coefficients:", channel.FeedbackIqCoefficients())
 
 同一次处理时两个开关都为True，因此 `chOut` 包含Tx I/Q、PA和forward公共效应，但不包含任何FB I/Q；`fbOut` 同时包含Tx与FB两处镜像。这个例子的四个FIR均为 `None`，所以 `...IqCoefficients()` 就是实际一抽头响应。后续两组 `UpdateParameters` 展示硬开关的独立性：关闭的一侧系数查询固定返回 `(1+0j, 0+0j)`，另一侧仍根据原有非零参数计算。实际DPD训练使用 `fbOut`；若已完成独立接收机校准，可先去嵌入FB镜像，再把剩余Tx镜像交给增广GMP。最终EVM和IRR必须用 `chOut` 评价。
 
-下面的独立Tx例子用三抽头完整有效响应制造带边变化。`5 MHz` 与 `30 MHz` 都选择为记录内整周期，丢弃卷积启动样点后分别投影到 $x$ 和 $x^*$：
+下面的独立Tx例子直接使用6.9.1节的四组推荐配置。代码先从实际生效的Channel抽头计算整条解析曲线，再用 `+20 MHz` 单边复音验证Channel时域实现；FB建模只需把四个 `txIq...` 参数名替换为 `fbIq...`：
 
 ```python
 import numpy as np
@@ -2677,67 +2691,127 @@ import numpy as np
 from inc.lib.Channel import Channel
 
 
-sampleRateHz = 160.0e6
-measurementSamples = 32768
-txDirectFirTaps = (
-    0.998 + 0.0j,
-    0.018 - 0.012j,
-    -0.007 + 0.004j,
-)
-txImageFirTaps = (
-    0.018 + 0.010j,
-    -0.009 + 0.006j,
-    0.004 - 0.003j,
-)
+recommendedIqProfiles = {
+    "flat_reference": {
+        "directFirTaps": (1.0 + 0.0j,),
+        "imageFirTaps": (0.010 + 0.0j,),
+    },
+    "mild_frequency_selective": {
+        "directFirTaps": (
+            0.999 + 0.0j,
+            0.004 - 0.003j,
+            -0.001 + 0.001j,
+        ),
+        "imageFirTaps": (
+            0.004 + 0.002j,
+            -0.0015 + 0.001j,
+            0.0005 - 0.0005j,
+        ),
+    },
+    "moderate_edge_degradation": {
+        "directFirTaps": (0.997 + 0.0j, 0.003 + 0.0j),
+        "imageFirTaps": (0.019 + 0.0j, -0.009 + 0.0j),
+    },
+    "severe_asymmetric_stress": {
+        "directFirTaps": (
+            0.985 + 0.0j,
+            0.025 - 0.018j,
+            -0.008 + 0.006j,
+        ),
+        "imageFirTaps": (
+            0.050 + 0.028j,
+            -0.024 + 0.017j,
+            0.010 - 0.008j,
+        ),
+    },
+}
+
+sampleRateHz = 80.0e6
+selectedProfile = recommendedIqProfiles[
+    "moderate_edge_degradation"
+]
 frequencySelectiveChannel = Channel(
     parameters={
         "sampleRateHz": sampleRateHz,
         "txIqImbalanceEnabled": True,
         "txIqGainImbalanceDb": 0.0,
         "txIqPhaseImbalanceDegrees": 0.0,
-        "txIqDirectFirTaps": txDirectFirTaps,
-        "txIqImageFirTaps": txImageFirTaps,
+        "txIqDirectFirTaps": selectedProfile["directFirTaps"],
+        "txIqImageFirTaps": selectedProfile["imageFirTaps"],
         "txDcOffset": 0.0 + 0.0j,
         "width": 0,
     }
 )
 
-startupSamples = max(
-    len(txDirectFirTaps), len(txImageFirTaps)
-) - 1
-for toneFrequencyHz in (5.0e6, 30.0e6):
-    sampleIndices = np.arange(
-        measurementSamples + startupSamples,
-        dtype=float,
-    )
-    tone = np.exp(
-        1j
-        * 2.0
-        * np.pi
-        * toneFrequencyHz
-        * sampleIndices
-        / sampleRateHz
-    )
-    iqOutput = frequencySelectiveChannel.ApplyTransmitterIqImbalance(
-        tone
-    )[startupSamples:]
-    tone = tone[startupSamples:]
-    directCoefficient = np.vdot(tone, iqOutput) / np.vdot(tone, tone)
-    imageBasis = np.conj(tone)
-    imageCoefficient = (
-        np.vdot(imageBasis, iqOutput)
-        / np.vdot(imageBasis, imageBasis)
-    )
-    irrDb = 20.0 * np.log10(
-        abs(imageCoefficient / directCoefficient)
-    )
-    print(toneFrequencyHz / 1.0e6, irrDb)
-
 actualDirectTaps, actualImageTaps = (
     frequencySelectiveChannel.TransmitterIqFilterTaps()
 )
-assert np.array_equal(actualDirectTaps, txDirectFirTaps)
-assert np.array_equal(actualImageTaps, txImageFirTaps)
+frequencyMhz = np.array([-40.0, -20.0, 0.0, 20.0, 40.0])
+frequencyHz = frequencyMhz * 1.0e6
+directDelays = np.arange(actualDirectTaps.size, dtype=float)
+imageDelays = np.arange(actualImageTaps.size, dtype=float)
+directResponse = np.sum(
+    actualDirectTaps.reshape(1, -1)
+    * np.exp(
+        -1j
+        * 2.0
+        * np.pi
+        * frequencyHz.reshape(-1, 1)
+        * directDelays.reshape(1, -1)
+        / sampleRateHz
+    ),
+    axis=1,
+)
+imageAtMirrorResponse = np.sum(
+    actualImageTaps.reshape(1, -1)
+    * np.exp(
+        +1j
+        * 2.0
+        * np.pi
+        * frequencyHz.reshape(-1, 1)
+        * imageDelays.reshape(1, -1)
+        / sampleRateHz
+    ),
+    axis=1,
+)
+expectedIrrDb = 20.0 * np.log10(
+    np.abs(imageAtMirrorResponse / directResponse)
+)
+for toneFrequencyMhz, irrDb in zip(frequencyMhz, expectedIrrDb):
+    print(f"{toneFrequencyMhz:+.0f} MHz: {irrDb:.2f} dBc")
+
+# Verify one interior frequency against the actual causal convolution.
+measurementSamples = 4096
+startupSamples = max(
+    actualDirectTaps.size, actualImageTaps.size
+) - 1
+toneFrequencyHz = 20.0e6
+sampleIndices = np.arange(
+    measurementSamples + startupSamples,
+    dtype=float,
+)
+tone = np.exp(
+    1j
+    * 2.0
+    * np.pi
+    * toneFrequencyHz
+    * sampleIndices
+    / sampleRateHz
+)
+iqOutput = frequencySelectiveChannel.ApplyTransmitterIqImbalance(
+    tone
+)[startupSamples:]
+tone = tone[startupSamples:]
+directCoefficient = np.vdot(tone, iqOutput) / np.vdot(tone, tone)
+imageBasis = np.conj(tone)
+imageCoefficient = (
+    np.vdot(imageBasis, iqOutput)
+    / np.vdot(imageBasis, imageBasis)
+)
+measuredIrrDb = 20.0 * np.log10(
+    abs(imageCoefficient / directCoefficient)
+)
+assert abs(measuredIrrDb - expectedIrrDb[3]) < 1.0e-10
 
 frequencySelectiveChannel.UpdateParameters(
     txIqImbalanceEnabled=False
@@ -2751,7 +2825,7 @@ assert np.array_equal(
 )
 ```
 
-前两行约为 `-34.87 dBc` 和 `-38.29 dBc`，说明镜像相对电平随频率变化；越负越好。显式双FIR启用时，旧 `TransmitterIqCoefficients()` 仍只返回增益/相位换算的标量，必须使用 `TransmitterIqFilterTaps()` 得到上述实际响应。最后的断言证明disabled会把标量、FIR和DC一起旁路。
+中度配置会依次打印约 `-31.00`、`-33.52`、`-40.00`、`-33.52`、`-31.00 dBc`。解析扫频允许包含DC和Nyquist端点；实际复音投影应选择内点，因为在DC或Nyquist处 $x$ 与 $x^*$ 不是独立基函数。显式双FIR启用时，旧 `TransmitterIqCoefficients()` 仍只返回增益/相位换算的标量，必须使用 `TransmitterIqFilterTaps()` 得到实际响应。最后的断言证明disabled会把标量、FIR和DC一起旁路。运行 `python doc/images/channel_iq/GenerateIqIrrFigures.py` 可用完全相同的四组参数重绘6.9.1节的PNG和CSV。
 
 完成一次功率校准后，可以分别检查三个发送参考面：
 

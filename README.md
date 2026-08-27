@@ -1529,6 +1529,50 @@ D_{\mathrm{cfg}}D_{\mathrm{wave}}.
 | `fbIqImageFirTaps` | `None` | FB共轭镜像支路的完整有效因果FIR；`None`回退到增益/相位换算的镜像系数。 |
 | `fbDcOffset` | `0+0j` | fb接收机复直流偏置。 |
 
+#### Channel频率选择性I/Q推荐剖面
+
+显式FIR启用后，输入单边复音位于 $f_0$ 时，期望分量使用直接支路响应 $A(f_0)$，镜像分量使用共轭支路在镜像频率处的响应 $B(-f_0)$。因此预期镜像相对电平为
+
+```math
+\mathit{irrDb}(f_0)
+=
+20\log_{10}
+\frac{|B(-f_0)|}{|A(f_0)|}.
+```
+
+下表给出仓库效果图使用的四组完整有效FIR。采样率固定为80 MHz，扫频范围为复基带Nyquist区间 -40 至 +40 MHz；数值是关闭PA非线性、噪声和DC后的解析预期，不是器件合格限值。`irrDb` 越负越好，“最好”是全带最负点，“最差”是最接近0 dBc的点。
+
+| 剖面 | 直接FIR $a[k]$ | 镜像FIR $b[k]$ | `irrDb`：-40 / 0 / +40 MHz | 全带最好 / 最差 |
+| --- | --- | --- | ---: | ---: |
+| 平坦参考 | `(1+0j,)` | `(0.010+0j,)` | `-40.00 / -40.00 / -40.00 dBc` | `-40.00 / -40.00 dBc` |
+| 轻度/校准残差 | `(0.999+0j, 0.004-0.003j, -0.001+0.001j)` | `(0.004+0.002j, -0.0015+0.001j, 0.0005-0.0005j)` | `-44.35 / -48.18 / -44.35 dBc` | `-51.40 / -43.23 dBc` |
+| 中度/带边恶化，推荐功能起点 | `(0.997+0j, 0.003+0j)` | `(0.019+0j, -0.009+0j)` | `-31.00 / -40.00 / -31.00 dBc` | `-40.00 / -31.00 dBc` |
+| 重度/非对称压力测试 | `(0.985+0j, 0.025-0.018j, -0.008+0.006j)` | `(0.050+0.028j, -0.024+0.017j, 0.010-0.008j)` | `-21.08 / -25.76 / -21.08 dBc` | `-31.63 / -20.10 dBc` |
+
+![频率选择性I/Q不平衡推荐配置的预期IRR曲线](doc/images/channel_iq/iq_irr_frequency_profiles.png)
+
+图的上半部分给出逐频点 `irrDb`，下半部分给出同一配置的直接支路增益纹波。平坦参考始终为 -40 dBc；中度配置在中心为 -40 dBc、到两侧带边恶化为约 -31 dBc，适合作为能清楚观察频选效应但又不至于接近0 dBc的推荐起点。轻度配置的最好点位于约 +20.76 MHz、最差点位于约 -30.56 MHz；重度配置的最好点位于约 +21.04 MHz、最差点位于约 -31.92 MHz，说明复杂抽头会造成明显的不对称曲线。验收时应看实际占用带宽内的最差值，同时结合下半图区分“镜像支路增强”和“直接支路衰落”。精确曲线数据见 [`iq_irr_frequency_profiles.csv`](doc/images/channel_iq/iq_irr_frequency_profiles.csv)，可复现脚本及完整代码示例见[Channel文档](doc/Channel.md#691-tx与fb-iq参数如何影响irr)和[FAQ](doc/FAQ.md#31-四组推荐配置的预期irrf曲线)。
+
+推荐的中度Tx配置如下。显式FIR是支路的完整响应，会替代旧增益/相位换算系数，所以把旧参数置零更便于审阅；要模拟FB接收机，只需把四个 `txIq...` 键替换为对应的 `fbIq...` 键，并显式选择 `sampleMode="fb"`。
+
+```python
+from inc.lib.Channel import Channel
+
+channel = Channel(
+    parameters={
+        "sampleMode": "forward",
+        "sampleRateHz": 80.0e6,
+        "txIqImbalanceEnabled": True,
+        "txIqGainImbalanceDb": 0.0,
+        "txIqPhaseImbalanceDegrees": 0.0,
+        "txIqDirectFirTaps": (0.997 + 0.0j, 0.003 + 0.0j),
+        "txIqImageFirTaps": (0.019 + 0.0j, -0.009 + 0.0j),
+        "txDcOffset": 0.0 + 0.0j,
+        "width": 0,
+    }
+)
+```
+
 #### Channel 0°/90°反馈I/Q补偿参数
 
 | 参数 | 默认值 | 说明 |
@@ -1597,7 +1641,7 @@ channel = Channel(
 | --- | --- | --- |
 | Tx I/Q | `txIqImbalanceEnabled=True`，双FIR均 `None`，`0.3 dB`、`2 degree` | 平坦回退时增益和相位误差变成共轭镜像系数并在PA前注入；约对应 `-35 dBc` 量级的单项 `irrDb`，forward与fb都会变差。False时标量、FIR和DC整级旁路。 |
 | FB I/Q | `fbIqImbalanceEnabled=True`，双FIR均 `None`，`0.3 dB`、`2 degree` | 平坦回退时使用相同镜像公式，但只污染fb观测；forward结果不变。False时标量、FIR和DC整级旁路。 |
-| Tx/FB频选I/Q | 平坦基线用四个 `...FirTaps=None`；合成频选从3 taps开始 | 非None直接/镜像序列是各自完整有效FIR；真实工程应由扫频或宽带辨识得到，并用独立验证数据选择阶数。 |
+| Tx/FB频选I/Q | 80 MHz采样率下，中度起点使用直接FIR `(0.997+0j, 0.003+0j)`、镜像FIR `(0.019+0j, -0.009+0j)` | 中心约 -40 dBc、两侧带边约 -31 dBc；非None序列是完整有效响应，真实工程应由扫频或宽带辨识得到，并按占用带宽最差IRR选择阶数。 |
 | FB I/Q补偿 | 先 `phase_pair`，再 `filter`；平坦误差从 `L=1`、`1e-6` 开始，3-tap频选误差可从 `L=7` 开始 | 相位对分离 $h_d*u$ 与 $h_i*u^*$ 并拟合广义线性逆FIR；实时filter只需单状态。深陷波或非最小相位只能用有限长因果FIR近似，必须用验证NMSE和带边IRR定阶。 |
 | 通道耦合 | `-30 dB` | 电压泄漏为 `10^(-30/20)=3.16%`；PA前耦合还会进入非线性。 |
 | FB CFO | `500 Hz`功能验证、`5 kHz`压力测试 | 累计相位为 `2π·CFO·观测时间`；帧越长旋转越明显。 |
