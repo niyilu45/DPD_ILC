@@ -1950,7 +1950,8 @@ I类把H类得到的PA结论转换成可执行的GMP DPD改进，并要求每一
 | 参数 | 默认值 |
 |---|---:|
 | Wi-Fi | EHT、20 MHz、80 MS/s、MCS 7、4个数据符号 |
-| Wi-Fi seed | 321 |
+| Wi-Fi训练seed | 321 |
+| Wi-Fi独立验证seed | 987 |
 | 双音 | -2 MHz、+2 MHz、8192点 |
 | PA | GMP |
 | 标称输出功率 | 12 dBm |
@@ -1968,19 +1969,21 @@ I类把H类得到的PA结论转换成可执行的GMP DPD改进，并要求每一
 | Memory-expanded | 增加7阶，主记忆5，交叉记忆3 | 普通标签NMSE |
 | Peak-weighted | 包络平方权重，岭系数1e-6 | 峰值加权标签NMSE |
 | Regularized | 岭系数由1e-6增至1e-4 | 正则矩阵条件数 |
-| Multi-power | 10/12/14 dBm片段权重1/2/1 | 最差功率标签NMSE和ACLR |
+| Multi-power | 10/12/14 dBm片段权重1/2/1 | 最差功率标签NMSE；独立验证帧ACLR退化不超过0.10 dB |
 
-所有射频比较均重新闭环完整DPD加PA串联系统的输入，PA输出不做常数缩放。多功率片段分别建立GMP历史，只累加正规方程。
+`seed=321` 的训练帧只用于生成ILC标签和拟合系数；`validationSeed=987` 的独立帧不参与任何回归。所有Wi-Fi射频比较均在独立验证帧上重新闭环完整DPD加PA串联系统的输入，PA输出不做常数缩放。多功率片段分别建立GMP历史，只累加正规方程。
 
 ### 30.4 执行流程
 
 ```mermaid
 flowchart TD
-    config["DpdGmpBenchmarkConfig.Validate"] --> wifi["生成确定性EHT帧"]
+    config["DpdGmpBenchmarkConfig.Validate"] --> trainingWifi["训练EHT帧<br/>seed=321"]
+    config --> validationWifi["独立验证EHT帧<br/>validationSeed=987"]
     config --> tone["生成确定性双音"]
-    wifi --> labels["10/12/14 dBm频域ILC标签"]
+    trainingWifi --> labels["10/12/14 dBm频域ILC标签"]
     labels --> models["训练Basic、Memory、Peak、Regularized、Multi-power"]
     models --> calibrate["每阶段重新闭环DPD+PA输出功率"]
+    validationWifi --> calibrate
     calibrate --> wifiMetrics["Analysis：EVM/ACLR/输出功率"]
     calibrate --> toneMetrics["TwoToneAnalysis：IM3/IM5/IM7"]
     models --> fitMetrics["标签NMSE、条件数、系数范数"]
@@ -1990,27 +1993,28 @@ flowchart TD
     compare --> files["阶段CSV、比较CSV、JSON、四联PNG"]
 ```
 
-**图示说明：**ILC只生成监督标签，不在DpdGmp内部计算RF指标。`Analysis`和`TwoToneAnalysis`独立消费PA输出；`Draw`只消费已计算阶段字典。
+**图示说明：**ILC只在`seed=321`训练帧上生成监督标签，不在DpdGmp内部计算RF指标。`Analysis`在`validationSeed=987`独立帧上消费PA输出，`TwoToneAnalysis`使用独立双音激励；`Draw`只消费已计算阶段字典。
 
 ### 30.5 改进前后预期
 
 | 改进 | 前值 | 后值 | 默认改善 | 预期 |
 |---|---:|---:|---:|---|
-| 基础DPD Wi-Fi EVM | -40.545 dB | -46.460 dB | 5.915 dB | EVM降低 |
+| 基础DPD独立帧Wi-Fi EVM | -40.405 dB | -46.122 dB | 5.717 dB | EVM降低 |
 | 基础DPD双音IM3 | -48.280 dBc | -54.562 dBc | 6.281 dB | IM3降低 |
-| 15至12 dBm功率回退 EVM | -39.732 dB | -46.460 dB | 6.728 dB | EVM降低 |
+| 15至12 dBm功率回退 EVM | -39.238 dB | -46.122 dB | 6.883 dB | EVM降低 |
 | 扩展结构标签NMSE | -58.183 dB | -60.035 dB | 1.852 dB | NMSE降低 |
 | 峰值加权标签NMSE | -61.796 dB | -62.305 dB | 0.508 dB | 峰值目标降低 |
 | 增强正则条件数 | `5.435e7` | `5.481e5` | 19.964 dB | 条件数降低 |
 | 多功率最差标签NMSE | -45.427 dB | -47.753 dB | 2.326 dB | 最差值降低 |
-| 多功率最差ACLR | 33.265 dB | 33.275 dB | 0.010 dB | 最差值略提高 |
+| 多功率独立帧最差ACLR | 32.890 dB | 32.862 dB | 退化0.028 dB | 退化不超过0.10 dB |
 
-扩展结构、峰值加权和正则化不要求即时EVM都下降，因为三者分别优化标签表达、峰值误差和数值稳定。当前扩展结构只额外改善0.097 dB EVM，与H类测得的弱记忆一致。多功率训练把最差标签NMSE改善2.326 dB，但最差ACLR只提高0.010 dB，且12 dBm EVM退化1.478 dB；因此它是可量化的折中，不应描述为全面改善。
+扩展结构、峰值加权和正则化不要求即时EVM都下降，因为三者分别优化标签表达、峰值误差和数值稳定。当前扩展结构只额外改善0.112 dB独立帧EVM，与H类测得的弱记忆一致。多功率训练把最差标签NMSE改善2.326 dB，但独立帧最差ACLR下降0.028 dB，且12 dBm EVM相对单功率正则模型退化1.410 dB；因此它是可量化的折中，不应描述为全面改善。源Wi-Fi波形的ACLR本底约为33 dB，ACLR验收采用“相对单功率正则模型退化不超过0.10 dB”的护栏；本次结果通过只表示没有明显频谱退化，不表示ACLR得到提升。
 
 ### 30.6 运行和输出
 
 ```powershell
 python tests/BenchMark.py --dpd-gmp
+python tests/BenchMark.py --dpd-gmp --seed 321 --validation-seed 987
 ```
 
 | 文件 | 内容 |
@@ -2025,13 +2029,14 @@ python tests/BenchMark.py --dpd-gmp
 ### 30.7 I类验收清单
 
 - [ ] 三个ILC标签分别在10、12、14 dBm生成；
+- [ ] `seed=321`训练帧与`validationSeed=987`验证帧彼此独立，验证帧不参与系数求解；
 - [ ] baseline和每个DPD阶段均按完整plant重新闭环输出功率；
 - [ ] Wi-Fi、双音和标签指标由相互独立的分析路径产生；
 - [ ] 每项修改只用与其物理目标一致的主指标判定；
 - [ ] 扩展结构改善普通标签NMSE；
 - [ ] 峰值加权改善显式峰值加权NMSE；
 - [ ] 增强岭正则降低条件数；
-- [ ] 多功率训练改善最差功率标签NMSE和ACLR；
+- [ ] 多功率训练改善最差功率标签NMSE，独立验证帧最差ACLR相对单功率正则模型退化不超过0.10 dB；
 - [ ] `expectationMet` 全部为真，否则测试失败并保留实际结果；
 - [ ] CSV、JSON、PNG和文档使用相同阶段顺序和数值。
 

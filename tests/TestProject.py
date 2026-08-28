@@ -3240,7 +3240,8 @@ def CheckIlcPowerOperatingPoints() -> None:
     floatingBaselineEvmDbValues = []
     floatingFinalEvmDbValues = []
     floatingIterationEvmDbRows = []
-    for targetPowerDbm in targetPowerDbmValues:
+    intrinsicPowerDbmValues = (1.0, 10.0, 16.0, 20.0)
+    for targetPowerDbm in intrinsicPowerDbmValues:
         floatingPaModel = PaModel(modelName="gmp", width=0)
         floatingPowerCalibration = PowerCalibration(
             paModel=floatingPaModel,
@@ -3341,6 +3342,54 @@ def CheckIlcPowerOperatingPoints() -> None:
         np.diff(floatingIterationEvmDbMatrix, axis=0) >= -0.25
     )
     assert np.all(np.diff(floatingFinalEvmDb) >= -0.25)
+    # The noiseless default plant must expose a materially different
+    # nonlinear operating point at every requested power. This catches a
+    # coefficient or calibration regression that would collapse the curve to
+    # an indistinguishable numerical floor below 16 dBm.
+    assert np.all(np.diff(floatingBaselineEvmDb) > 2.0)
+    assert floatingBaselineEvmDb[-1] - floatingBaselineEvmDb[0] > 12.0
+    assert np.all(np.diff(floatingFinalEvmDb) > 2.0)
+    assert floatingFinalEvmDb[-1] - floatingFinalEvmDb[0] > 12.0
+
+    # Doherty is intentionally branch-aware and may outperform the ordinary
+    # GMP at some powers, but its default must not collapse into a much worse
+    # plant. Compare equal-power, identical-frame baselines and retain wide
+    # margins around the expected power trend instead of pinning exact EVMs.
+    dohertyBaselineEvmDbValues = []
+    for targetPowerDbm in intrinsicPowerDbmValues:
+        dohertyPaModel = PaModel(modelName="doherty", width=0)
+        dohertyPowerCalibration = PowerCalibration(
+            paModel=dohertyPaModel,
+            parameters={
+                "outputPowerDbm": targetPowerDbm,
+                "maximumOutputPowerDbm": 25.0,
+                "calibrationToleranceDb": 0.05,
+                "width": 0,
+            },
+        )
+        dohertyReference = dohertyPowerCalibration.Calibrate(
+            floatingWaveform.samples
+        )
+        dohertyMetrics = Analysis(
+            dohertyReference,
+            floatingWaveform,
+            parameters={
+                "maximumOutputPowerDbm": 25.0,
+                "width": 0,
+            },
+        ).Analyze(dohertyPowerCalibration.GetLastPaOutput())
+        assert abs(
+            dohertyMetrics["outputPowerDbm"] - targetPowerDbm
+        ) <= 0.10
+        dohertyBaselineEvmDbValues.append(
+            float(dohertyMetrics["evmDb"])
+        )
+    dohertyBaselineEvmDb = np.asarray(
+        dohertyBaselineEvmDbValues, dtype=float
+    )
+    assert np.all(np.diff(dohertyBaselineEvmDb) > 2.0)
+    assert dohertyBaselineEvmDb[-1] - dohertyBaselineEvmDb[0] > 12.0
+    assert np.max(dohertyBaselineEvmDb - floatingBaselineEvmDb) < 4.0
 
     mimoInput = np.column_stack((waveform.samples, waveform.samples))
     mimoPaModel = MimoPaModel(
@@ -11251,6 +11300,27 @@ def CheckPaCharacterizationBenchmark() -> None:
                 )
                 <= 0.25
             )
+        gmpPowerPoints = tuple(
+            powerPoint
+            for powerPoint in result.powerSweep
+            if powerPoint.modelName == "gmp"
+        )
+        dohertyPowerPoints = tuple(
+            powerPoint
+            for powerPoint in result.powerSweep
+            if powerPoint.modelName == "doherty"
+        )
+        gmpIm3Dbc = np.asarray(
+            [powerPoint.im3WorstDbc for powerPoint in gmpPowerPoints],
+            dtype=float,
+        )
+        dohertyIm3Dbc = np.asarray(
+            [powerPoint.im3WorstDbc for powerPoint in dohertyPowerPoints],
+            dtype=float,
+        )
+        assert np.all(np.diff(gmpIm3Dbc) > 4.0)
+        assert np.all(np.diff(dohertyIm3Dbc) > 4.0)
+        assert np.max(dohertyIm3Dbc - gmpIm3Dbc) < 4.0
         rappSummary = next(
             summary
             for summary in result.summaries
@@ -11325,6 +11395,10 @@ def CheckPaCharacterizationBenchmark() -> None:
             (
                 dpdGmpDirectory / "dpd_gmp_benchmark.json"
             ).read_text(encoding="utf-8")
+        )
+        assert (
+            dpdGmpDocument["configuration"]["seed"]
+            != dpdGmpDocument["configuration"]["validationSeed"]
         )
         assert len(dpdGmpDocument["stages"]) == 8
         assert all(
@@ -11600,6 +11674,35 @@ def CheckDpdGmpModelAndBenchmark() -> None:
     Returns:
         result: None. Assertions identify GMP model or benchmark regressions.
     """
+
+    from tests.BenchMark import (
+        DpdGmpBenchmarkConfig,
+        ParseBenchmarkArguments,
+    )
+
+    try:
+        DpdGmpBenchmarkConfig(seed=701, validationSeed=701).Validate()
+    except ValueError as error:
+        assert "distinct integers" in str(error)
+    else:
+        raise AssertionError("DPD-GMP benchmark accepted its training seed")
+
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "BenchMark.py",
+            "--dpd-gmp",
+            "--seed",
+            "701",
+            "--validation-seed",
+            "809",
+        ],
+    ):
+        parsedDpdGmpConfig = ParseBenchmarkArguments()
+    assert isinstance(parsedDpdGmpConfig, DpdGmpBenchmarkConfig)
+    assert parsedDpdGmpConfig.seed == 701
+    assert parsedDpdGmpConfig.validationSeed == 809
 
     randomGenerator = np.random.default_rng(701)
     referenceSignal = (

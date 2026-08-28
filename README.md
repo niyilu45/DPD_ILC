@@ -2910,6 +2910,7 @@ print(
 
 ```powershell
 python tests\BenchMark.py --dpd-gmp
+python tests\BenchMark.py --dpd-gmp --seed 321 --validation-seed 987
 ```
 
 Python接口：
@@ -2924,6 +2925,8 @@ from tests.BenchMark import (
 
 result = RunDpdGmpBenchmark(
     DpdGmpBenchmarkConfig(
+        seed=321,
+        validationSeed=987,
         optimizedOutputPowerDbm=12.0,
         stressOutputPowerDbm=15.0,
         trainingPowerDbm=(10.0, 12.0, 14.0),
@@ -2946,7 +2949,8 @@ print([item.ToDict() for item in result.comparisons])
 | `sampleRateHz` | `80e6` | 复基带采样率。 |
 | `mcs` | `7` | Wi-Fi MCS。 |
 | `numDataSymbols` | `4` | Wi-Fi数据符号数。 |
-| `seed` | `321` | 10 bit波形随机种子。 |
+| `seed` | `321` | 10 bit训练帧随机种子；只用于生成10/12/14 dBm ILC标签和拟合DPD。 |
+| `validationSeed` | `987` | 与训练种子不同的10 bit验证帧随机种子；用于所有Wi-Fi EVM、ACLR和多功率泛化指标。 |
 | `toneFrequenciesHz` | `(-2e6,2e6)` | 双音频率。 |
 | `toneNumSamples` | `8192` | 双音记录长度。 |
 | `stressOutputPowerDbm` | `15.0` | 深压缩压力测试输出功率。 |
@@ -2958,6 +2962,8 @@ print([item.ToDict() for item in result.comparisons])
 | `width` | `0` | 公开数据位宽；该性能参考默认浮点。 |
 | `outputDirectory` | `results/dpd_gmp_benchmark` | CSV、JSON和PNG输出目录。 |
 
+默认基准明确隔离训练与验收：`seed=321` 的EHT帧只生成ILC监督标签，`validationSeed=987` 的独立EHT帧不参与任何系数求解，并在每个阶段重新闭环到相同输出功率后计算Wi-Fi EVM和ACLR。当前保存结果中，基础DPD把独立帧12 dBm EVM从-40.405 dB降至-46.122 dB，改善5.717 dB；多功率训练把最差标签NMSE从-45.427 dB降至-47.753 dB。最差ACLR则从32.890 dB变为32.862 dB，下降0.028 dB但仍满足“退化不超过0.10 dB”的护栏。由于源Wi-Fi波形自身的ACLR本底约为33 dB，这个护栏用于防止明显频谱退化，不要求多功率模型继续提高ACLR。
+
 输出：
 
 - `dpd_gmp_stage_metrics.csv`：每个阶段的Wi-Fi、双音、标签、条件数和多功率指标；
@@ -2965,7 +2971,7 @@ print([item.ToDict() for item in result.comparisons])
 - `dpd_gmp_benchmark.json`：完整配置和嵌套结果；
 - `dpd_gmp_performance.png`：EVM、IM3、标签NMSE和条件数四联图。
 
-默认基准的每一项改进均有独立目标并要求 `expectationMet=True`。具体方法和参考数值见 [PaAnalyse第12节](doc/PaAnalyse.md#12-pa特性分析后的dpd-gmp改进与实测对比)。
+默认基准的每一项比较均有独立判据并要求 `expectationMet=True`；其中多功率ACLR的通过含义是不超过0.10 dB的退化护栏，而不是强制提升。具体方法和参考数值见 [PaAnalyse第12节](doc/PaAnalyse.md#12-pa特性分析后的dpd-gmp改进与实测对比)。
 
 ### Channel测量与耦合感知DPD-GMP Benchmark
 

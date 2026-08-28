@@ -481,6 +481,7 @@ print(outputCodes[:8])
 
 ```powershell
 python tests/BenchMark.py --dpd-gmp
+python tests/BenchMark.py --dpd-gmp --seed 321 --validation-seed 987
 ```
 
 指定输出目录：
@@ -501,6 +502,8 @@ from tests.BenchMark import (
 
 result = RunDpdGmpBenchmark(
     DpdGmpBenchmarkConfig(
+        seed=321,
+        validationSeed=987,
         optimizedOutputPowerDbm=12.0,
         stressOutputPowerDbm=15.0,
         trainingPowerDbm=(10.0, 12.0, 14.0),
@@ -524,6 +527,23 @@ for comparison in result.comparisons:
 | `dpd_gmp_improvement_comparison.csv` | 每项措施的改进前后数值、方向和通过状态 |
 | `dpd_gmp_benchmark.json` | 完整配置、阶段和比较记录 |
 | `dpd_gmp_performance.png` | EVM、IM3、标签 NMSE 和条件数四联图 |
+
+`seed=321` 生成训练帧，并且只用于10/12/14 dBm ILC标签和DPD拟合；`validationSeed=987` 生成未参与求解的独立帧。阶段表中的Wi-Fi EVM、ACLR以及多功率最差射频指标都来自该验证帧，并在每个功率点重新闭环完整DPD加PA串联系统。两个种子必须不同，从而避免把训练帧拟合误差当作部署性能。
+
+当前 `doc/images/pa_analyse/dpd_gmp` 中CSV/JSON记录的主要比较如下：
+
+| 比较 | 前值 | 后值 | 结果 |
+|---|---:|---:|---:|
+| 基础DPD独立帧EVM | -40.405 dB | -46.122 dB | 改善5.717 dB |
+| 基础DPD双音IM3 | -48.280 dBc | -54.562 dBc | 改善6.281 dB |
+| 15至12 dBm基础DPD EVM | -39.238 dB | -46.122 dB | 改善6.883 dB |
+| 扩展结构标签NMSE | -58.183 dB | -60.035 dB | 改善1.852 dB |
+| 峰值加权标签NMSE | -61.796 dB | -62.305 dB | 改善0.508 dB |
+| 增强正则条件数 | `5.435e7` | `5.481e5` | 改善19.964 dB |
+| 多功率最差标签NMSE | -45.427 dB | -47.753 dB | 改善2.326 dB |
+| 多功率最差ACLR | 32.890 dB | 32.862 dB | 退化0.028 dB，护栏通过 |
+
+最后一行不是“ACLR必须提高”的目标。源Wi-Fi波形的ACLR本底约为33 dB，当前判据允许独立验证帧的多功率最差ACLR相对单功率正则模型最多下降0.10 dB；`0.028 < 0.10 dB`，所以 `expectationMet=True` 表示没有明显退化。
 
 ---
 

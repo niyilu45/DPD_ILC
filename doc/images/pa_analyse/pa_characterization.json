@@ -682,68 +682,68 @@
     {
       "modelName": "doherty",
       "toneSpacingHz": 500000.0,
-      "outputPowerDbm": 20.209249152056948,
-      "im3LowerDbc": -15.572559369293051,
-      "im3UpperDbc": -15.572664173191143,
-      "im3WorstDbc": -15.572559369293051,
-      "im5WorstDbc": -23.057791315691965,
-      "im7WorstDbc": -54.7416716527725,
-      "im3AsymmetryDb": -0.00010480389809153223
+      "outputPowerDbm": 20.105891671050006,
+      "im3LowerDbc": -31.925922170019337,
+      "im3UpperDbc": -31.925719648075432,
+      "im3WorstDbc": -31.925719648075432,
+      "im5WorstDbc": -46.05580778988945,
+      "im7WorstDbc": -52.11425322597688,
+      "im3AsymmetryDb": 0.00020252194390479872
     },
     {
       "modelName": "doherty",
       "toneSpacingHz": 1000000.0,
-      "outputPowerDbm": 20.160174722245543,
-      "im3LowerDbc": -15.572501796756018,
-      "im3UpperDbc": -15.572719671015836,
-      "im3WorstDbc": -15.572501796756018,
-      "im5WorstDbc": -23.056683798018497,
-      "im7WorstDbc": -54.748182640748205,
-      "im3AsymmetryDb": -0.00021787425981756314
+      "outputPowerDbm": 20.060713085853223,
+      "im3LowerDbc": -31.925254872317215,
+      "im3UpperDbc": -31.924528474656956,
+      "im3WorstDbc": -31.924528474656956,
+      "im5WorstDbc": -46.05486861818625,
+      "im7WorstDbc": -52.11504144643365,
+      "im3AsymmetryDb": 0.0007263976602587263
     },
     {
       "modelName": "doherty",
       "toneSpacingHz": 2000000.0,
-      "outputPowerDbm": 20.182804947995855,
-      "im3LowerDbc": -15.572902182051507,
-      "im3UpperDbc": -15.57344476600803,
-      "im3WorstDbc": -15.572902182051507,
-      "im5WorstDbc": -23.051875806291005,
-      "im7WorstDbc": -54.77256421165174,
-      "im3AsymmetryDb": -0.0005425839565234014
+      "outputPowerDbm": 20.081599928312222,
+      "im3LowerDbc": -31.926590966165843,
+      "im3UpperDbc": -31.925416423855793,
+      "im3WorstDbc": -31.925416423855793,
+      "im5WorstDbc": -46.04835958108791,
+      "im7WorstDbc": -52.11622048622904,
+      "im3AsymmetryDb": 0.0011745423100499863
     },
     {
       "modelName": "doherty",
       "toneSpacingHz": 4000000.0,
-      "outputPowerDbm": 20.16936587967584,
-      "im3LowerDbc": -15.573189248203647,
-      "im3UpperDbc": -15.575104515896477,
-      "im3WorstDbc": -15.573189248203647,
-      "im5WorstDbc": -23.03323838120845,
-      "im7WorstDbc": -54.83217956125041,
-      "im3AsymmetryDb": -0.0019152676928300139
+      "outputPowerDbm": 20.071705263802528,
+      "im3LowerDbc": -31.930210207929413,
+      "im3UpperDbc": -31.929308347637683,
+      "im3WorstDbc": -31.929308347637683,
+      "im5WorstDbc": -46.02749166811247,
+      "im7WorstDbc": -52.126412359255426,
+      "im3AsymmetryDb": 0.0009018602917301166
     },
     {
       "modelName": "doherty",
       "toneSpacingHz": 8000000.0,
-      "outputPowerDbm": 20.167766649499605,
-      "im3LowerDbc": -15.577183888083006,
-      "im3UpperDbc": -15.587287567241887,
-      "im3WorstDbc": -15.577183888083006,
-      "im5WorstDbc": -23.01196191353327,
-      "im7WorstDbc": -54.83776807753202,
-      "im3AsymmetryDb": -0.010103679158881107
+      "outputPowerDbm": 20.071040591801403,
+      "im3LowerDbc": -31.927724023419252,
+      "im3UpperDbc": -31.93720701385328,
+      "im3WorstDbc": -31.927724023419252,
+      "im5WorstDbc": -45.96919504420414,
+      "im7WorstDbc": -52.06551803082004,
+      "im3AsymmetryDb": -0.009482990434026561
     },
     {
       "modelName": "doherty",
       "toneSpacingHz": 12000000.0,
-      "outputPowerDbm": 20.169179281723405,
-      "im3LowerDbc": -15.555193745305312,
-      "im3UpperDbc": -15.584597804228332,
-      "im3WorstDbc": -15.555193745305312,
-      "im5WorstDbc": -22.968979219440712,
-      "im7WorstDbc": -54.68580112461494,
-      "im3AsymmetryDb": -0.02940405892302067
+      "outputPowerDbm": 20.072502778805458,
+      "im3LowerDbc": -31.917788988128684,
+      "im3UpperDbc": -31.957911941377137,
+      "im3WorstDbc": -31.917788988128684,
+      "im5WorstDbc": -45.94822573572937,
+      "im7WorstDbc": -52.10246863940115,
+      "im3AsymmetryDb": -0.04012295324845283
     }
   ],
   "powerSweep": [
@@ -920,32 +920,32 @@
     {
       "modelName": "doherty",
       "targetOutputPowerDbm": 20.0,
-      "measuredOutputPowerDbm": 20.16895860149269,
-      "im3WorstDbc": -15.573527358639776,
-      "im5WorstDbc": -23.032332941068454,
-      "im7WorstDbc": -54.83869028775227,
-      "dynamicGainHysteresisDb": 0.06270117327920961,
-      "dynamicPhaseHysteresisDegrees": 0.01838190543817647
+      "measuredOutputPowerDbm": 20.071410400119994,
+      "im3WorstDbc": -31.929768219538243,
+      "im5WorstDbc": -46.02625973956374,
+      "im7WorstDbc": -52.12889663667433,
+      "dynamicGainHysteresisDb": 0.06152159974459859,
+      "dynamicPhaseHysteresisDegrees": 0.012354239036556046
     },
     {
       "modelName": "doherty",
       "targetOutputPowerDbm": 23.0,
-      "measuredOutputPowerDbm": 23.213072155462203,
-      "im3WorstDbc": -18.756965589955424,
-      "im5WorstDbc": -26.559068999897896,
-      "im7WorstDbc": -28.381191923182357,
-      "dynamicGainHysteresisDb": 0.06596267837222997,
-      "dynamicPhaseHysteresisDegrees": 0.031395130197268105
+      "measuredOutputPowerDbm": 23.15320358186035,
+      "im3WorstDbc": -30.411317683532225,
+      "im5WorstDbc": -30.920558609722455,
+      "im7WorstDbc": -51.242851349283676,
+      "dynamicGainHysteresisDb": 0.061631097234202695,
+      "dynamicPhaseHysteresisDegrees": 0.010304854706669777
     },
     {
       "modelName": "doherty",
       "targetOutputPowerDbm": 25.0,
-      "measuredOutputPowerDbm": 25.109446340474932,
-      "im3WorstDbc": -27.536763098693502,
-      "im5WorstDbc": -22.932000927483422,
-      "im7WorstDbc": -36.415252281657445,
-      "dynamicGainHysteresisDb": 0.06813984360018303,
-      "dynamicPhaseHysteresisDegrees": 0.057446831143102395
+      "measuredOutputPowerDbm": 24.75668330610386,
+      "im3WorstDbc": -15.9768708036049,
+      "im5WorstDbc": -39.65626399115136,
+      "im7WorstDbc": -32.12757281209052,
+      "dynamicGainHysteresisDb": 0.0598974627507429,
+      "dynamicPhaseHysteresisDegrees": 0.011315642669970944
     }
   ],
   "summaries": [
@@ -997,13 +997,13 @@
       "gainRippleDb": 0.28508509623890266,
       "groupDelayNs": 0.14757853028715215,
       "phaseNonlinearityDegrees": 0.6292374536246248,
-      "im3SpacingVariationDb": 0.021990142777694288,
-      "maximumIm3AsymmetryDb": 0.02940405892302067,
-      "dynamicGainHysteresisDb": 0.06270131708525303,
-      "dynamicPhaseHysteresisDegrees": 0.01838313361963471,
-      "nominalIm3Dbc": -15.573189248203647,
-      "nominalIm5Dbc": -23.03323838120845,
-      "nominalIm7Dbc": -54.83217956125041
+      "im3SpacingVariationDb": 0.011519359508998406,
+      "maximumIm3AsymmetryDb": 0.04012295324845283,
+      "dynamicGainHysteresisDb": 0.06152162250945483,
+      "dynamicPhaseHysteresisDegrees": 0.012354094687471928,
+      "nominalIm3Dbc": -31.929308347637683,
+      "nominalIm5Dbc": -46.02749166811247,
+      "nominalIm7Dbc": -52.126412359255426
     }
   ],
   "recommendations": [
@@ -1154,7 +1154,7 @@
     {
       "modelName": "doherty",
       "testName": "memory_effect",
-      "measuredEvidence": "Memory severity=weak; IM3 spacing variation=0.022 dB and maximum sideband asymmetry=0.029 dB.",
+      "measuredEvidence": "Memory severity=weak; IM3 spacing variation=0.012 dB and maximum sideband asymmetry=0.040 dB.",
       "dpdArchitecture": "Shallow branch-aware memory polynomial with separate carrier-only and carrier-plus-peaking regions.",
       "dpdConfiguration": "Use odd orders (1,3,5,7), depth 3 per region, and a smooth gate around the peaking turn-on amplitude.",
       "trainingStrategy": "Train with at least the minimum, nominal, and maximum tested tone spacings using equal output-power weighting; select memory depth on a held-out spacing.",
@@ -1163,7 +1163,7 @@
     {
       "modelName": "doherty",
       "testName": "dynamic_hysteresis",
-      "measuredEvidence": "Dynamic AM-AM RMS=0.063 dB and dynamic AM-PM RMS=0.018 deg.",
+      "measuredEvidence": "Dynamic AM-AM RMS=0.062 dB and dynamic AM-PM RMS=0.012 deg.",
       "dpdArchitecture": "Use a smooth mixture-of-experts DPD whose state includes envelope direction near peaking activation.",
       "dpdConfiguration": "Use two smoothly blended coefficient sets and constrain their boundary value and first derivative to be continuous.",
       "trainingStrategy": "Balance rising and falling envelope samples in every amplitude bin; do not let dense low-amplitude samples dominate the regression.",
@@ -1172,7 +1172,7 @@
     {
       "modelName": "doherty",
       "testName": "nominal_nonlinearity",
-      "measuredEvidence": "Nonlinearity severity=severe at 20.0 dBm: IM3=-15.57, IM5=-23.03, IM7=-54.83 dBc.",
+      "measuredEvidence": "Nonlinearity severity=moderate at 20.0 dBm: IM3=-31.93, IM5=-46.03, IM7=-52.13 dBc.",
       "dpdArchitecture": "Piecewise carrier/peaking DPD, such as a smooth LUT plus GMP residual corrector, rather than one global polynomial.",
       "dpdConfiguration": "Use orders (1,3,5,7) per operating region, a continuous transition gate, and separate carrier/peaking gain anchors.",
       "trainingStrategy": "Collect balanced samples below, inside, and above peaking turn-on; fit regional inverses jointly and penalize boundary discontinuity while monitoring every odd-order product.",
@@ -1181,7 +1181,7 @@
     {
       "modelName": "doherty",
       "testName": "output_power",
-      "measuredEvidence": "First strong-distortion point=20.17 dBm (IM3=-15.57 dBc); IM3 power trend=nonmonotonic.",
+      "measuredEvidence": "First strong-distortion point=24.76 dBm (IM3=-15.98 dBc); IM3 power trend=monotonic.",
       "dpdArchitecture": "Carrier-only/carrier-plus-peaking mixture-of-experts DPD with a physically aligned smooth transition gate.",
       "dpdConfiguration": "Retain the measured anchors (10, 15, 20, 23, 25 dBm), add dense anchors at the detected knee +/-1 dB when present, and constrain regional outputs and slopes to join continuously.",
       "trainingStrategy": "Train and validate every configured output-power point, up-weight the detected knee and maximum-power point, and interpolate coefficients only inside the measured range.",
