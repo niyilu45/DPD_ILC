@@ -4679,9 +4679,10 @@ def CheckGmpPaModel() -> None:
     Processing details:
         Algorithm: Sum every same-order default basis to confirm the 13.5%
         nonlinear strength and that memory depth cannot move the settled
-        AM-AM curve, excite the default PA with a continuous high-envelope
-        plateau to bound startup droop, and prove that explicitly supplied
-        measured coefficients retain their exact behavior.
+        AM-AM curve, verify the normalized long cubic envelope-memory branch
+        has zero settled coefficient sum, excite the default PA with a
+        continuous high-envelope plateau to bound startup droop, and prove
+        that explicitly supplied measured coefficients retain exact behavior.
 
     Returns:
         result: None. Assertions enforce the default GMP coefficient contract.
@@ -4738,6 +4739,86 @@ def CheckGmpPaModel() -> None:
                     atol=1e-12,
                 )
 
+    longMemoryCoefficient = 0.008 - 0.0036j
+    (
+        longMainCoefficients,
+        longLaggingCoefficients,
+        longLeadingCoefficients,
+    ) = DefaultGmpCoefficients(
+        tuple(expectedSteadyCoefficients),
+        3,
+        2,
+        longEnvelopeMemoryDepth=12,
+        longEnvelopeMemoryDecay=0.82,
+        longEnvelopeMemoryCoefficient=longMemoryCoefficient,
+    )
+    assert max(
+        crossIndex
+        for order, _memoryIndex, crossIndex in longLaggingCoefficients
+        if order == 3
+    ) == 12
+    ordinaryMain, ordinaryLagging, _ = DefaultGmpCoefficients(
+        tuple(expectedSteadyCoefficients),
+        3,
+        2,
+    )
+    addedLongLaggingCoefficient = sum(
+        coefficient
+        - ordinaryLagging.get(coefficientKey, 0.0 + 0.0j)
+        for coefficientKey, coefficient in longLaggingCoefficients.items()
+        if coefficientKey[0] == 3
+    )
+    assert np.isclose(
+        addedLongLaggingCoefficient,
+        longMemoryCoefficient,
+        rtol=0.0,
+        atol=1.0e-15,
+    )
+    assert np.isclose(
+        longMainCoefficients[(3, 0)]
+        - ordinaryMain[(3, 0)],
+        -longMemoryCoefficient,
+        rtol=0.0,
+        atol=1.0e-15,
+    )
+    longSteadyCubicCoefficient = sum(
+        coefficient
+        for (order, _), coefficient in longMainCoefficients.items()
+        if order == 3
+    ) + sum(
+        coefficient
+        for (order, _, _), coefficient in longLaggingCoefficients.items()
+        if order == 3
+    ) + sum(
+        coefficient
+        for (order, _, _), coefficient in longLeadingCoefficients.items()
+        if order == 3
+    )
+    assert np.isclose(
+        longSteadyCubicCoefficient,
+        expectedSteadyCoefficients[3],
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+    defaultGeneratedGmp = GMPPA()
+    assert max(
+        crossIndex
+        for order, _memoryIndex, crossIndex in (
+            defaultGeneratedGmp.laggingCoefficients
+        )
+        if order == 3
+    ) == 12
+    disabledLongMemoryGmp = GMPPA(
+        GMPConfig(longEnvelopeMemoryDepth=0)
+    )
+    assert max(
+        crossIndex
+        for order, _memoryIndex, crossIndex in (
+            disabledLongMemoryGmp.laggingCoefficients
+        )
+        if order == 3
+    ) == 2
+
     # The full fitted reference remains available explicitly for stress
     # plants such as the built-in piecewise GMP model, while the ordinary
     # GMP default is intentionally gentler at 20 dBm.
@@ -4787,6 +4868,23 @@ def CheckGmpPaModel() -> None:
             assert "nonlinearScale" in str(error)
         else:
             raise AssertionError("invalid GMP nonlinearScale accepted")
+    invalidLongMemoryConfigurations = (
+        {"longEnvelopeMemoryDepth": -1},
+        {"longEnvelopeMemoryDepth": 1.5},
+        {"longEnvelopeMemoryDecay": 0.0},
+        {"longEnvelopeMemoryDecay": 1.01},
+        {"longEnvelopeMemoryCoefficient": complex(float("nan"), 0.0)},
+    )
+    for invalidOverrides in invalidLongMemoryConfigurations:
+        try:
+            GMPConfig(**invalidOverrides).Validate()
+        except ValueError as error:
+            assert "longEnvelopeMemory" in str(error)
+        else:
+            raise AssertionError(
+                "invalid GMP long-memory configuration accepted: "
+                f"{invalidOverrides!r}"
+            )
 
     # The fitted default static curve must remain nondecreasing throughout its
     # documented normalized input interval instead of folding back and forcing
@@ -4863,7 +4961,7 @@ def CheckGmpPaModel() -> None:
     # same compressed level instead of dropping several decibels after sample
     # zero as the former 34-percent delayed terms did.
     plateauPhaseRadians = 0.37
-    plateauLength = 16
+    plateauLength = 40
     for plateauAmplitude in (0.25, 0.5, 0.9, 1.2, 1.5, 1.7, 2.0):
         plateauInput = np.concatenate(
             (
@@ -4878,15 +4976,15 @@ def CheckGmpPaModel() -> None:
         )
         plateauOutput = GMPPA().Process(plateauInput)
         plateauMagnitude = np.abs(plateauOutput[8:8 + plateauLength])
-        settledMagnitude = float(np.mean(plateauMagnitude[6:]))
+        settledMagnitude = float(np.mean(plateauMagnitude[-8:]))
         onsetToSettledDb = 20.0 * np.log10(
             plateauMagnitude[0] / settledMagnitude
         )
         plateauRippleDb = 20.0 * np.log10(
             np.max(plateauMagnitude) / np.min(plateauMagnitude)
         )
-        assert abs(onsetToSettledDb) <= 0.25
-        assert plateauRippleDb <= 0.40
+        assert abs(onsetToSettledDb) <= 0.45
+        assert plateauRippleDb <= 0.45
 
     # Default stabilization must never override coefficients extracted from a
     # measured PA.  This deliberately strong two-tap model retains its exact
@@ -4906,6 +5004,31 @@ def CheckGmpPaModel() -> None:
         measuredGmp.Process(measuredInput),
         np.asarray((1.0, 0.5, 0.5, 0.5), dtype=np.complex128),
     )
+    measuredNonlinearGmp = GMPPA(
+        GMPConfig(
+            nonlinearOrders=(1, 3),
+            memoryDepth=1,
+            crossMemoryDepth=0,
+            mainCoefficients={
+                (1, 0): 1.0 + 0.0j,
+                (3, 0): 0.1 - 0.02j,
+            },
+        )
+    )
+    nonlinearMeasuredInput = np.asarray(
+        (0.2 + 0.1j, 0.7 - 0.3j, -0.4 + 0.8j),
+        dtype=np.complex128,
+    )
+    assert np.allclose(
+        measuredNonlinearGmp.Process(nonlinearMeasuredInput),
+        nonlinearMeasuredInput
+        + (0.1 - 0.02j)
+        * nonlinearMeasuredInput
+        * np.abs(nonlinearMeasuredInput) ** 2,
+        rtol=0.0,
+        atol=1.0e-14,
+    )
+    assert measuredNonlinearGmp.laggingCoefficients == {}
 
 
 def CheckPiecewiseGmpModels() -> None:
@@ -4961,13 +5084,41 @@ def CheckPiecewiseGmpModels() -> None:
     )
     assert customPiecewisePa.SmallSignalGain() == 1.10 + 0.00j
 
+    generatedRegionalPa = PiecewiseGMPPA(
+        PiecewiseGMPConfig(
+            regionConfigs=(GMPConfig(), GMPConfig(), GMPConfig()),
+        )
+    )
+    assert all(
+        max(
+            crossIndex
+            for order, _memoryIndex, crossIndex in (
+                regionModel.laggingCoefficients
+            )
+            if order == 3
+        )
+        == 12
+        for regionModel in generatedRegionalPa.regionModels
+    )
+
     defaultPiecewisePa = PiecewiseGMPPA()
+    assert all(
+        max(
+            crossIndex
+            for order, _memoryIndex, crossIndex in (
+                regionModel.laggingCoefficients
+            )
+            if order == 3
+        )
+        == 12
+        for regionModel in defaultPiecewisePa.regionModels
+    )
     amplitudeGrid = np.linspace(0.0, 2.0, 401)
     settledMagnitudes = np.asarray(
         tuple(
             abs(
                 defaultPiecewisePa.Process(
-                    np.full(12, amplitudeValue, dtype=np.complex128)
+                    np.full(32, amplitudeValue, dtype=np.complex128)
                 )[-1]
             )
             for amplitudeValue in amplitudeGrid
@@ -12606,6 +12757,8 @@ def CheckDpdGmpModelAndBenchmark() -> None:
 
     from tests.BenchMark import (
         DpdGmpBenchmarkConfig,
+        EvaluateDpdGmpWifiStage,
+        GenerateDpdGmpIlcLabel,
         ParseBenchmarkArguments,
     )
 
@@ -12789,6 +12942,111 @@ def CheckDpdGmpModelAndBenchmark() -> None:
         "unknownGmpOption" in str(warningRecord.message)
         for warningRecord in warningRecords
     )
+
+    # The deployable ordinary and piecewise GMP DPDs must not collapse every
+    # noiseless operating point onto the power-independent first-order memory
+    # floor. Train each point on one frame, validate on another, and require
+    # the PA-only long cubic envelope-memory tail to leave a visible residual
+    # that grows with conducted output power.
+    powerValidationConfig = DpdGmpBenchmarkConfig(
+        mcs=5,
+        numDataSymbols=2,
+        seed=91,
+        validationSeed=809,
+        trainingPowerDbm=(1.0, 16.0, 20.0),
+        optimizedOutputPowerDbm=16.0,
+        stressOutputPowerDbm=20.0,
+        numIterations=8,
+        width=0,
+    )
+
+    (
+        powerTrainingWaveform,
+        powerValidationWaveform,
+    ) = tuple(
+        WaveGenWifi(
+            parameters={
+                "frameFormat": "EHT",
+                "bandwidthMhz": 20,
+                "sampleRateHz": 80.0e6,
+                "mcs": 5,
+                "numDataSymbols": 2,
+                "seed": seed,
+                "width": 0,
+            }
+        ).Generate()
+        for seed in (91, 809)
+    )
+    dpdPowerEvmRows = []
+    baselinePowerEvmDb = None
+    for dpdType in (DpdGmp, PiecewiseDpdGmp):
+        correctedEvmDbValues = []
+        currentBaselineEvmDbValues = []
+        for outputPowerDbm in (1.0, 16.0, 20.0):
+            powerPaModel = PaModel(
+                parameters={"modelName": "gmp", "width": 0}
+            )
+            powerReference, learnedInput = GenerateDpdGmpIlcLabel(
+                powerValidationConfig,
+                powerTrainingWaveform,
+                powerPaModel,
+                outputPowerDbm,
+            )
+            powerDpd = dpdType(parameters={"width": 0})
+            powerDpd.FitFromIlc(powerReference, learnedInput)
+            baselineMetrics = EvaluateDpdGmpWifiStage(
+                powerValidationConfig,
+                powerValidationWaveform,
+                powerPaModel,
+                outputPowerDbm,
+            )
+            correctedMetrics = EvaluateDpdGmpWifiStage(
+                powerValidationConfig,
+                powerValidationWaveform,
+                powerPaModel,
+                outputPowerDbm,
+                powerDpd,
+            )
+            currentBaselineEvmDbValues.append(
+                float(baselineMetrics["evmDb"])
+            )
+            correctedEvmDbValues.append(
+                float(correctedMetrics["evmDb"])
+            )
+            assert abs(
+                float(correctedMetrics["outputPowerDbm"])
+                - outputPowerDbm
+            ) <= 0.15
+            assert (
+                float(correctedMetrics["evmDb"])
+                < float(baselineMetrics["evmDb"]) - 4.0
+            )
+        currentBaselineEvmDb = np.asarray(
+            currentBaselineEvmDbValues,
+            dtype=float,
+        )
+        correctedEvmDb = np.asarray(correctedEvmDbValues, dtype=float)
+        if baselinePowerEvmDb is None:
+            baselinePowerEvmDb = currentBaselineEvmDb
+        else:
+            assert np.allclose(
+                currentBaselineEvmDb,
+                baselinePowerEvmDb,
+                rtol=0.0,
+                atol=1.0e-10,
+            )
+        assert np.all(np.diff(correctedEvmDb) > 3.0)
+        assert correctedEvmDb[-1] - correctedEvmDb[0] > 8.0
+        dpdPowerEvmRows.append(correctedEvmDb)
+    assert baselinePowerEvmDb is not None
+    assert np.all(
+        np.abs(
+            baselinePowerEvmDb
+            - np.asarray((-52.0, -48.0, -42.0), dtype=float)
+        )
+        <= 1.5
+    )
+    assert np.all(np.isfinite(np.vstack(dpdPowerEvmRows)))
 
     for documentName, requiredText in (
         ("DPD-GMP.md", "加权岭回归"),

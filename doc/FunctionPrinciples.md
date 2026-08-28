@@ -164,7 +164,7 @@ flowchart LR
 | `RappPA.SmallSignalGain` | P/N | 取零幅度极限，返回正实数 `linearGain` | PaModel §2.2.4 |
 | `WienerPA.Process` | P/N | FIR 线性记忆→Rapp AM-AM→幅度相关 AM-PM | PaModel §3.1–§3.4 |
 | `WienerPA.SmallSignalGain` | P/N | 取零幅度极限，返回线性 FIR 直流复增益 | PaModel §3.5 |
-| `GMPPA.Process` | P/N | 计算主、滞后包络和超前包络GMP支路；每次调用只构造一次实际系数需要的唯一延迟波形及delay/order包络幂，并保持原支路与系数累加顺序 | PaModel §4.2–§4.6，Performance §5 |
+| `GMPPA.Process` | P/N | 计算主、滞后包络和超前包络GMP支路；默认系数还包含归一化长包络三阶差分支路，使长包络动态产生确定性残差而不改变恒包络稳态；每次调用只构造一次实际系数需要的唯一延迟波形及delay/order包络幂，并保持原支路与系数累加顺序 | PaModel §4.2–§4.6，Performance §5 |
 | `GMPPA.SmallSignalGain` | P/N | 只保留一阶主支路得到小信号增益 | PaModel §4.7 |
 | `PiecewiseGMPPA.Process` | P/N | 用两个五次smootherstep形成low/middle/high单位分解；共享所有区域需要的延迟与包络幂，并按首区系数及相邻差分输出连续分段GMP响应 | PaModel §4.10、Performance §5.1 |
 | `PiecewiseGMPPA.SmallSignalGain` | P/N | 原点位于第一过渡区以下，直接返回low区域GMP的一阶直流复增益 | PaModel §4.10 |
@@ -202,8 +202,32 @@ flowchart LR
 | `IQImbalancePA.ProcessThermalPeriodFloating`, `IQImbalancePA.SuspendThermalModel`, `IQImbalancePA.RestoreThermalModel`, `IQImbalancePA.GetThermalMetrics`, `IQImbalancePA.CalculateActualDutyCycle`, `IQImbalancePA.ResetThermalState`, `IQImbalancePA.AdvanceIdle` | P/N/E | 在输出端施加广义线性I/Q包装，同时透明代理物理PA的周期热处理、状态事务、诊断、占空比、复位和额外空闲；包装器不建立第二份热状态或修改PA输入活动参考面 | PaModel §7、§13.5–§13.8、Channel §10 |
 | `PaModel.AsComplexVector` | N | 把输入约束为有限一维复包络；不改变样值 | PaModel §2 |
 | `PaModel.DelaySignal` | N | 因果整数延迟并对历史补零 | PaModel §4 |
-| `PaModel.DefaultGmpCoefficients` | E/N | 用 $0\leq|x|\leq2$ 内单调的有界Rapp型拟合确定参考稳态复系数，默认以0.135缩放三阶及以上项；非线性主记忆和lag/lead交叉项按各阶有效 $C_p$ 比例衰减，再回调零延迟主项保持每阶总和；含一阶的非默认阶次集合必要时进一步共同缩小非线性项，未知高阶为0，无一阶集合只启用最低阶后备项；不代表实测器件 | PaModel §4.9.4、§11 |
+| `PaModel.DefaultGmpCoefficients` | E/N | 用 $0\leq|x|\leq2$ 内单调的有界Rapp型拟合确定参考稳态复系数，默认以0.135缩放三阶及以上项；非线性主记忆和lag/lead交叉项按各阶有效 $C_p$ 比例衰减，再回调零延迟主项保持每阶总和；可选长包络三阶支路以归一化几何权重形成“滞后包络减当前包络”，并从零延迟三阶主项扣除同一总系数；含一阶的非默认阶次集合必要时进一步共同缩小非线性项，未知高阶为0，无一阶集合只启用最低阶后备项；不代表实测器件 | PaModel §4.9.4、§11 |
 | `PaModel.AddAwgn` | P/N | 按目标复基带 SNR 设置圆对称复高斯噪声方差 | PaModel §8 |
+
+### GMP 默认长包络三阶支路与兼容规则
+
+默认 `GMPConfig` 在常规短记忆 main/lagging/leading 项之外启用一条长包络三阶差分支路。令 $L=12$、$\rho=0.82$、$c=0.008-0.0036j$，并定义归一化几何权重
+
+```math
+w_\ell=\frac{\rho^{\ell-1}}{\sum_{q=0}^{L-1}\rho^q},\qquad
+\ell=1,\ldots,L.
+```
+
+该支路加入的输出为
+
+```math
+y_{\mathrm{long},3}[n]
+=c\,x[n]\left(\sum_{\ell=1}^{L}w_\ell|x[n-\ell]|^2-|x[n]|^2\right).
+```
+
+实现上，第一项写入三阶、零载波延迟的 lagging-envelope 系数 `(3, 0, ℓ)`，第二项从零延迟三阶 main 系数 `(3, 0)` 中扣除同一个总系数 $c$。因此它表达的是“归一化滞后平方包络减当前平方包络”，不会额外叠加一条静态三阶压缩曲线。经过起始零填充瞬态后，若输入为恒包络，则 $\sum_\ell w_\ell=1$，括号严格为零；包络上升、下降或长突发内的慢变化才激活该支路。
+
+兼容行为按入口区分：
+
+- 内置 `GMPConfig` 默认值为 `longEnvelopeMemoryDepth=12`、`longEnvelopeMemoryDecay=0.82`、`longEnvelopeMemoryCoefficient=0.008-0.0036j`，所以未提供系数字典的内置 GMP 默认启用该支路；内置分段 GMP 的默认区域种子也显式使用同一组参数。
+- 直接调用 `DefaultGmpCoefficients(...)` 时仍以 `longEnvelopeMemoryDepth=0`、`longEnvelopeMemoryCoefficient=0` 为默认，即默认关闭，以保持既有 helper 调用的系数集合和数值结果不变；需要该支路时必须显式传入长记忆参数。
+- 只要 `mainCoefficients`、`laggingCoefficients`、`leadingCoefficients` 三个映射中任意一个由用户显式提供，`GMPPA` 就把整组系数视为用户定义并禁用隐式长包络支路。即使配置对象仍保留上述长记忆默认值，也不会在用户系数之外静默注入额外项；若需要它，应由用户在显式系数字典中完整给出对应 lagging 项及 main 抵消项。
 
 ### 4.1 `Channel.py`：PA到接收端链路
 

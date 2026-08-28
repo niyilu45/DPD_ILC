@@ -1046,7 +1046,36 @@ C_p.
 支路的第一条延迟尾项约为对应 $C_p$ 的 6%，后续继续快速衰减；它足以形成
 可测的电记忆，又不会把同一份压缩逐个延迟抽头重复累加。
 
-对完整默认阶次 `(1, 3, 5, 7)`，先放置8个零样点，再发送16个恒幅样点，
+**稀疏三阶长包络记忆。** 内置普通GMP在上述浅记忆之外增加
+
+```math
+y_{\mathrm{long}}[n]
+=c\,x[n]
+\left(
+\sum_{\ell=1}^{L}h_\ell|x[n-\ell]|^2-|x[n]|^2
+\right),
+```
+
+```math
+h_\ell
+=\frac{\rho^{\ell-1}}
+{\displaystyle\sum_{k=1}^{L}\rho^{k-1}},
+\qquad
+\sum_{\ell=1}^{L}h_\ell=1.
+```
+
+默认 $L=12$、$\rho=0.82$、$c=0.008-j0.0036$。在GMP基函数中，前一部分
+是 $L$ 个 `lagging` 项 $c h_\ell x[n]|x[n-\ell]|^2$，后一部分是
+同时刻三阶 `main` 项 $-c x[n]|x[n]|^2$，因此它不是额外状态机或
+经验噪声，而是严格、稀疏、因果的三阶GMP展开。
+
+稳定恒包络下 $|x[n-\ell]|=|x[n]|$，归一化权使括号严格为0。
+所以该分支不改变稳态AM-AM/AM-PM，也不会重现旧式“连续几个高幅点后
+输出平台快速塌落”。它表示偏置/陷阱等比浅交叉记忆更长的包络电记忆；
+$L=12$ 明显超过默认普通和分段GMP DPD的 `crossMemoryDepth=2`，因此在无噪声
+仿真中提供确定性的物理模型失配，让DPD后残差仍随输出功率变化。
+
+对完整默认阶次 `(1, 3, 5, 7)`，先放置8个零样点，再发送40个恒幅样点，
 并采用默认三阶主记忆和二阶交叉记忆。在0.25至2.0的输入幅度扫描中定义平台
 纹波：
 
@@ -1060,7 +1089,7 @@ R_{\mathrm{plateau}}
 ```
 
 七个验证幅度0.25、0.50、0.90、1.20、1.50、1.70和2.00的最大平台纹波约为
-0.3084 dB；首点相对第7个样点以后稳态均值的最大绝对偏差约为0.1704 dB。
+0.3930 dB；首点相对最后8个稳态样点均值的最大绝对偏差约为0.3930 dB。
 这个测试限制的是默认演示系数的短时动态，不是对任意实测
 自定义字典强加物理限制。
 
@@ -1101,12 +1130,15 @@ R_{\mathrm{plateau}}
 | `memoryDepth` | 增加主项延迟抽头；默认一阶尾抽头改变小信号频响，高阶尾抽头改变动态压缩，零延迟项会自动回调以保持稳态 $C_p$ 不变 | 自定义字典是最终执行项；只改深度不会自动创建或删除调用方给出的键 |
 | `crossMemoryDepth` | 增加滞后/超前包络项并回调默认零延迟主项；增强动态 AM-AM、AM-PM 和迟滞，但不改变默认稳态曲线 | 自定义 `laggingCoefficients`、`leadingCoefficients` 的实际内容决定执行项 |
 | `nonlinearScale` | 默认0.135；在默认系数生成时统一缩放三阶及以上参考项，一阶不变；1.0恢复全强度压力参考 | 显式系数字典是最终值，不重复乘该比例 |
+| `longEnvelopeMemoryDepth` | 默认12；设定长包络滞后抽头数，0关闭 | 只要三张系数表有任何一张显式给出，内置长记忆整体关闭 |
+| `longEnvelopeMemoryDecay` | 默认0.82；限制在 $(0,1]$，决定归一化指数权 $h_\ell$ 的衰减 | 显式系数语义下不自动生成长记忆 |
+| `longEnvelopeMemoryCoefficient` | 默认 $0.008-j0.0036$；是长延迟项的总复系数，0关闭 | 显式系数语义下不自动生成长记忆 |
 | `mainCoefficients[(1,m)]` | 直接决定小信号 FIR 增益和频率响应 | 实部、虚部共同决定幅度与相位，不能把虚部简单理解成“只影响相位” |
 | `mainCoefficients[(p,m)]`, $p>1$ | 决定静态曲率和对应阶次的记忆 | 负实方向的三阶项常产生压缩，正实方向常产生扩张，但最终结果取决于所有复向量之和 |
 | `laggingCoefficients` | 对恒包络稳态并入 $C_p$，对调制包络形成历史依赖 | 增大后通常加宽同一输入幅度对应的增益散点或迟滞环 |
 | `leadingCoefficients` | 对恒包络稳态并入 $C_p$，对调制包络补充另一类动态相关性 | 影响动态轨迹；代码仍是因果延迟，并不读取未来样本 |
 
-三个系数字典分别判断是否为 `None`。因此，同阶动态项严格零和、恒包络稳态系数保持为 $C_p$ 的保证适用于三个字典全部采用默认值的完整组合；只覆盖其中一部分时，自定义项与其余默认项会共同求和，稳态曲线可能随之移动。例如只自定义 `mainCoefficients`，却让 `laggingCoefficients=None` 和 `leadingCoefficients=None`，只要 `crossMemoryDepth>0`，代码仍会生成默认交叉项。若需要严格的无记忆自定义曲线，`mainCoefficients` 中应只保留 `memoryIndex=0` 的键，并采用下面两种方式之一关闭交叉项：把 `crossMemoryDepth=0`；或者把 `laggingCoefficients={}` 与 `leadingCoefficients={}` 显式传入。两种方式不要求同时使用。把 `memoryDepth=1` 写入配置可以表达并校验调用方意图，但它不会主动删除自定义字典中已经存在的延迟键。
+三个系数字典分别判断是否为 `None`。因此，同阶短记忆动态项严格零和、恒包络稳态系数保持为 $C_p$ 的保证适用于三个字典全部采用默认值的完整组合；只覆盖其中一部分时，自定义项与其余默认项会共同求和，稳态曲线可能随之移动。长包络分支采用更严格的整体开关：只有 `mainCoefficients`、`laggingCoefficients`和 `leadingCoefficients` 三者全部为 `None` 时内置普通GMP才自动启用；任何一张显式映射（包括空字典）都会关闭它，以免在实测系数上静默叠加内置物理假设。直接调用 `DefaultGmpCoefficients(...)` 的默认 `longEnvelopeMemoryDepth=0`、`longEnvelopeMemoryCoefficient=0`，所以所有旧调用保持原来结果。例如只自定义 `mainCoefficients`，却让 `laggingCoefficients=None` 和 `leadingCoefficients=None`，只要 `crossMemoryDepth>0`，代码仍会生成默认的短交叉项，但不会生成长包络项。若需要严格的无记忆自定义曲线，`mainCoefficients` 中应只保留 `memoryIndex=0` 的键，并采用下面两种方式之一关闭交叉项：把 `crossMemoryDepth=0`；或者把 `laggingCoefficients={}` 与 `leadingCoefficients={}` 显式传入。两种方式不要求同时使用。把 `memoryDepth=1` 写入配置可以表达并校验调用方意图，但它不会主动删除自定义字典中已经存在的延迟键。
 
 GMP 最重要的使用边界是：**具有记忆时不存在一条能完整描述宽带 PA 的唯一增益曲线**。静态扫幅只给出恒包络稳态截面。对 Wi-Fi 波形，同一个当前幅度 $|x[n]|$ 会因为过去包络不同而得到不同增益，所以 AM-AM 图会形成一条有宽度的轨迹带。此时应同时查看：
 
@@ -1392,6 +1424,15 @@ w_L(r[n])F_L(x)[n]
 交叉记忆深度 1。低区稍接近线性，中区保持基准压缩，高区增加 AM-PM 和动态
 记忆强度；默认恒包络 AM-AM 在 $0\leq r\leq2$ 内保持不折返。默认值用于构造
 比纯全局 GMP 更难、但仍可逆的无噪行为 plant，不代表某一颗器件的实测系数。
+内置分段模型在生成区域基础系数时显式启用
+`longEnvelopeMemoryDepth=12`、`longEnvelopeMemoryDecay=0.82` 和
+`longEnvelopeMemoryCoefficient=0.008-j0.0036`，然后再对low/middle/high的
+增益、相位、非线性和记忆强度做区域化。这保留了与普通GMP PA
+相同的长包络物理失配，同时不重复叠加该分支。
+
+显式传入 `regionConfigs` 只表示区域配置由调用方负责，并不单独关闭长支路。
+每个区域仍独立遵守普通 `GMPConfig` 规则：三张系数表都为 `None` 时按该区域的
+`longEnvelopeMemory*` 参数自动生成；任意一张系数表显式给出时不再隐式注入。
 
 调用方也可以给每个区域提供独立 `GMPConfig`：
 
@@ -1760,23 +1801,23 @@ $\lambda>0$ 可以缓和高阶基函数相关造成的病态问题，但过大�
 
 ### 11.1 无噪声功率区分与独立帧验证
 
-下面是默认普通GMP的确定性无噪声回归点，不是某颗真实器件的规格。测试固定为EHT 20 MHz、80 Msps、MCS 5、2个数据symbol、`seed=91`、`maximumOutputPowerDbm=25`；每个功率点都新建波形对应格式、PA、功率校准器和Analysis，先从PA输入闭环到目标功率，再直接分析 `GetLastPaOutput()`，不在PA后补乘常数。EVM dB越负越好。
+下面是内置普通GMP PA的确定性无噪声独立帧验证，不是某颗真实器件的规格。测试固定为EHT 20 MHz、80 Msps、MCS 5、2个数据symbol、`width=0`、`maximumOutputPowerDbm=25`；训练帧使用 `seed=91`，验证帧使用 `seed=809`。每个功率点都新建PA和功率校准器，独立运行8轮ILC，分别用 `DpdGmp.FitFromIlc` 和 `PiecewiseDpdGmp.FitFromIlc` 拟合；表中全部EVM都在不同随机载荷的验证帧上测量。EVM dB越负越好。
 
-| 每路目标输出功率 | 浮点本征 `width=0` | 16位固定输出，$F_{out}=2$ |
-|---:|---:|---:|
-| 1 dBm | 约 -51.5 dB | 约 -51.5 dB |
-| 16 dBm | 约 -47.6 dB | 约 -47.6 dB |
-| 20 dBm | 约 -42.1 dB | 约 -42.1 dB |
+| 每路目标输出功率 | PA baseline | `DpdGmp` | `PiecewiseDpdGmp` |
+|---:|---:|---:|---:|
+| 1 dBm | -51.63 dB | -57.42 dB | -57.43 dB |
+| 16 dBm | -47.18 dB | -53.25 dB | -53.38 dB |
+| 20 dBm | -41.23 dB | -47.25 dB | -47.21 dB |
 
-推荐把精确回归断言写成以 `(-52, -48, -42)` dB为中心的正负1.5 dB窗口，并额外要求相邻功率点至少恶化2 dB、1至20 dBm总变化超过8 dB。功率闭环容差设为0.05 dB时，每点Analysis报告功率可要求距目标不超过0.10 dB。这样既能捕获模型强度或参考面回归，又不会把FFT、同步和平台差异钉死到最后一位小数。
+回归应同时检查三类性质：基线从1至20 dBm有明显功率恶化；两种DPD在每点至少改善4 dB；DPD后相邻功率点仍恶化超过3 dB且1至20 dBm总差超过8 dB。这些趋势同时防止PA过强、DPD无效和“所有功率点被补到同一约 -52 dB数值底”三类回归。功率闭环容差设为0.05 dB时，每点Analysis报告功率可要求距目标不超过0.15 dB。
 
 16位结果必须用两个不同标尺：发送参考和DAC输入使用 `FixedPoint(16, 1.0)`，PA输出使用 `FixedPoint(16, paModel.outputFullScaleAmplitude)`。直接PA输出携带FixedPointArray元数据，Analysis会自动读取；显式配置同一个 `outputFullScaleAmplitude` 可固定参考面，并在元数据被剥离后是必需的。默认输出标尺2.0时，20 dBm高PAPR输出不会碰到每分量正负满码，固定点结果因此与浮点本征结果接近。
 
-若沿用旧输出标尺1.0，20 dBm原始输出分量峰值可达约1.60，输出编码会把超出正负1的样点夹到码轨；此时测得约 -24 dB EVM是**输出观测削顶**，不是GMP本征非线性，也不是 `nonlinearScale=0.135` 太强。增加位宽仍不改变正负1范围，继续减小GMP系数则会错误地掩盖参考面问题。正确修复是恢复默认输出标尺2.0，并让PowerCalibration和Analysis按该标尺解码；接近25 dBm的更高PAPR实验若峰值接近2，可按需把PA/Channel输出标尺与分析标尺一起设为4。
+若沿用旧输出标尺1.0，20 dBm原始输出分量峰值约1.57，输出编码会把超出正负1的样点夹到码轨；此时测得约 -24 dB EVM是**输出观测削顶**，不是GMP本征非线性，也不是 `nonlinearScale=0.135` 太强。增加位宽仍不改变正负1范围，继续减小GMP系数则会错误地掩盖参考面问题。正确修复是恢复默认输出标尺2.0，并让PowerCalibration和Analysis按该标尺解码；接近25 dBm的更高PAPR实验若峰值可能超过2，可按需把PA/Channel输出标尺与分析标尺一起设为4。
 
-量程边界复测进一步说明了这个取舍：默认输出标尺2.0在20 dBm无rail并保持上述约 -42.1 dB；接近额定上限时会出现少量rail。显式把plant和Analysis标尺同时设为4.0后，25 dBm测试实测25.095 dBm、EVM约 -35.72 dB，I/Q rail计数为0。因而2.0是默认20 dBm精度与余量的折中，4.0是近25 dBm高PAPR场景的按需设置，不应把默认值无条件扩大。
+量程边界复测进一步说明了这个取舍：默认输出标尺2.0在20 dBm无rail并保留上述本征功率趋势；接近额定上限时会出现少量rail。显式把plant和Analysis标尺同时设为4.0后，25 dBm测试实测25.098 dBm、EVM约 -33.82 dB，I/Q rail计数为0。因而2.0是默认20 dBm精度与余量的折中，4.0是近25 dBm高PAPR场景的按需设置，不应把默认值无条件扩大。
 
-同一默认GMP的当前双音特性产物在20 dBm给出IM3/IM5/IM7约 `-50.16/-87.23/-129.55 dBc`；扫功率没有旧的strong-distortion阈值，最高实测25.10 dBm点IM3约 `-40.98 dBc`。这些数值应以 `doc/images/pa_analyse` 下重新生成的CSV/JSON为准。
+同一默认GMP的当前双音特性产物在20 dBm给出IM3/IM5/IM7约 `-49.51/-87.22/-129.54 dBc`；扫功率没有越过strong-distortion阈值，最高实测25.10 dBm点IM3约 `-40.17 dBc`。这些数值应以 `doc/images/pa_analyse` 下重新生成的CSV/JSON为准。
 
 低功率无噪声EVM接近线性是高阶项按 $|x|^{p-1}$ 快速衰减的正常结果。普通GMP默认模型承担稳定、单调、连续平台、功率可达且适合算法回归的基线职责；需要更复杂的plant时，应使用实测系数、自定义 `GMPConfig`、`PiecewiseGMPPA`，或显式增加温度、频率选择性I/Q和反馈链失配，同时保留这组普通GMP回归点作为参考。
 

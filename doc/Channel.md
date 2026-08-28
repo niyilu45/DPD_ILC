@@ -736,7 +736,7 @@ r_y
 
 所以 `20 dBm <= 25 dBm` 对默认GMP等内置drive-aware plant必须可达，不能因为公开定点码已经饱和而误报不可达。真正的不可达情况包括目标高于额定上限、第三方plant没有模拟drive接口且数字码已到满量程，以及用户自定义PA参数使响应不覆盖目标或出现无法求解的非单调区。
 
-功率校准器会自动读取Channel的输出标尺并按 `FixedPoint(width, channel.outputFullScaleAmplitude)` 解码干净PA输出。默认GMP在20 dBm时的高PAPR分量峰值可超过1；若错误沿用输出标尺1.0，会先发生输出观测削顶，并可能把本征约 -42 dB的EVM误测成约 -24 dB。默认标尺2.0修复的是这个观测边界，不是通过减小GMP系数来掩盖失真；它在20 dBm无rail，是量化精度与峰值余量的默认折中。接近25 dBm且峰值接近2时，可按需把Channel与后续Analysis的输出标尺一起配置成4；边界复测实测25.095 dBm、EVM约 -35.72 dB且I/Q rail计数为0。
+功率校准器会自动读取Channel的输出标尺并按 `FixedPoint(width, channel.outputFullScaleAmplitude)` 解码干净PA输出。默认GMP在20 dBm时的高PAPR分量峰值可超过1；若错误沿用输出标尺1.0，会先发生输出观测削顶，并可能把本征约 -41 dB的EVM误测成约 -24 dB。默认标尺2.0修复的是这个观测边界，不是通过减小GMP系数来掩盖失真；它在20 dBm无rail，是量化精度与峰值余量的默认折中。接近25 dBm且峰值可能超过2时，可按需把Channel与后续Analysis的输出标尺一起配置成4；当前边界复测实测25.098 dBm、EVM约 -33.82 dB且I/Q rail计数为0。
 
 一次 `Channel.Process(rawSignal, outputPowerDbm=target)` 的完整顺序为：
 

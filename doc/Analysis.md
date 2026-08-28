@@ -455,7 +455,7 @@ P_{\mathrm{max,dBm}}+20\log_{10}(a_m).
 
 输出scaled full-scale标尺与dBm锚点是两个独立量。默认输出标尺2.0表示正满码附近代表I或Q分量幅度2，提供6.02 dB观测余量；`maximumOutputPowerDbm=25` 仍表示**解码后有效区RMS等于1**对应25 dBm。扩大输出标尺不会改变PA工作点，只会扩大观测范围并同比增大量化步长。
 
-默认2.0是面向20 dBm高PAPR基线的精度/余量折中：该点无rail并保持约 -42.1 dB EVM。接近25 dBm时若2.0出现rail，应让plant与Analysis同时使用4.0；边界复测实测25.095 dBm、EVM约 -35.72 dB且I/Q rail计数为0。TwoToneAnalysis分析同一固定点PA输出时也必须使用同一输出标尺。
+默认2.0是面向20 dBm高PAPR基线的精度/余量折中：该点无rail并保持约 -40.9 dB EVM。接近25 dBm时若2.0出现rail，应让plant与Analysis同时使用4.0；当前边界复测实测25.098 dBm、EVM约 -33.82 dB且I/Q rail计数为0。TwoToneAnalysis分析同一固定点PA输出时也必须使用同一输出标尺。
 
 MIMO 的每路 PA 是独立传导端口，不能把复电压直接相加。总输出功率应先在线性功率域相加：
 
@@ -1614,7 +1614,7 @@ EVM(dB)
 |---|---|---|
 | 无噪声浮点曲线正常，固定毫伏噪声后反转 | 绝对噪声地板 | 改用固定相对 `noiseSnrDb`；检查反转是否消失 |
 | 只有定点模式反转 | 满量程量化或削顶 | 与 `width=0` 对照，并检查码峰值和削顶计数 |
-| 默认GMP浮点20 dBm约 -42 dB，16位却约 -24 dB | PA输出被旧标尺1.0削顶 | 保持输入DAC标尺1.0；把PA/Channel输出和Analysis的 `outputFullScaleAmplitude` 同时设为2.0 |
+| 默认GMP浮点20 dBm约 -41 dB，16位却约 -24 dB | PA输出被旧标尺1.0削顶 | 保持输入DAC标尺1.0；把PA/Channel输出和Analysis的 `outputFullScaleAmplitude` 同时设为2.0 |
 | 不同功率的公开码相同，但实测输出功率不同 | 预期的固定数字余量设计 | 检查 `analogDriveDbPerChain` 是否随目标功率变化 |
 | ILC历史在多个目标点都落到近似同一功率 | 已提交模拟驱动未进入浮点ILC plant | 普通PA检查 `ProcessOutputPathsFloating`；Channel检查 `ProcessNormalizedOutputPaths` |
 | FB LC-NMSE改善，但曲线选中的主路EVM不佳 | 错把反馈最佳轮当成报告最佳轮 | 使用 `EvaluateIlcPowerPoint`，并核对每轮 `chOut` 严格EVM |
@@ -1640,7 +1640,7 @@ relativeSnrChannelParameters = {
 
 若还设置了 `ILCConfig.feedbackSnrDb`，它只影响训练用 `fbOut`，不等于Channel主路的传导噪声；做本征对照时也应设为 `None`，除非实验目的就是测试带噪反馈收敛。
 
-上述约 -24 dB现象不是“固定点一定比浮点差18 dB”。默认EHT MCS5、`seed=91`、无噪声20 dBm工作点的原始输出分量峰值可达约1.60；若仍按 `fullScaleAmplitude=1` 编码，超范围峰值会不可逆夹到码轨。内置PA/Channel默认输出标尺2.0后，16位结果应回到约 -42.1 dB并接近浮点本征；增加位宽但保留标尺1.0不会修复范围问题。
+上述约 -24 dB现象不是“固定点一定比浮点差18 dB”。默认EHT MCS5、`seed=91`、无噪声20 dBm工作点的原始输出分量峰值约1.57；若仍按 `fullScaleAmplitude=1` 编码，超范围峰值会不可逆夹到码轨。内置PA/Channel默认输出标尺2.0后，16位结果应回到约 -40.9 dB并接近浮点本征；增加位宽但保留标尺1.0不会修复范围问题。
 
 ---
 

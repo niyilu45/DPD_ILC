@@ -1002,8 +1002,14 @@ class GMPConfig:
     generator creates a mildly compressive Rapp-like static curve that is
     monotonic for normalized constant-envelope amplitudes from zero through
     two, then adds small zero-sum dynamic memory residuals around that curve.
-    Custom dictionaries remain unconstrained behavioral fits and may therefore
-    contain stronger droop, hysteresis, or polynomial foldback.
+    The generated plant also includes a normalized long cubic envelope-memory
+    branch controlled by ``longEnvelopeMemory*``. Its coefficients sum to zero
+    at a settled constant envelope, while its depth intentionally exceeds the
+    shallow default DPD model so noiseless validation retains a deterministic
+    power-dependent residual. Supplying any explicit coefficient dictionary
+    disables automatic insertion of that branch; custom dictionaries remain
+    unconstrained behavioral fits and may therefore contain stronger droop,
+    hysteresis, or polynomial foldback.
     """
 
     nonlinearOrders: Tuple[int, ...] = (1, 3, 5, 7)
@@ -1013,6 +1019,9 @@ class GMPConfig:
     mainCoefficients: Optional[Mapping[Tuple[int, int], complex]] = None
     laggingCoefficients: Optional[Mapping[Tuple[int, int, int], complex]] = None
     leadingCoefficients: Optional[Mapping[Tuple[int, int, int], complex]] = None
+    longEnvelopeMemoryDepth: int = 12
+    longEnvelopeMemoryDecay: float = 0.82
+    longEnvelopeMemoryCoefficient: complex = 0.008 - 0.0036j
 
     def Validate(self) -> None:
         """Validate order and memory dimensions used by the GMP expansion.
@@ -1033,6 +1042,39 @@ class GMPConfig:
         if self.crossMemoryDepth < 0:
             raise ValueError("crossMemoryDepth cannot be negative")
         if (
+            not isinstance(self.longEnvelopeMemoryDepth, int)
+            or isinstance(self.longEnvelopeMemoryDepth, bool)
+            or self.longEnvelopeMemoryDepth < 0
+        ):
+            raise ValueError(
+                "longEnvelopeMemoryDepth must be a nonnegative integer"
+            )
+        if (
+            not isinstance(self.longEnvelopeMemoryDecay, (int, float))
+            or isinstance(self.longEnvelopeMemoryDecay, bool)
+            or not np.isfinite(self.longEnvelopeMemoryDecay)
+            or not 0.0 < float(self.longEnvelopeMemoryDecay) <= 1.0
+        ):
+            raise ValueError(
+                "longEnvelopeMemoryDecay must be finite and in (0, 1]"
+            )
+        if (
+            not isinstance(
+                self.longEnvelopeMemoryCoefficient,
+                (int, float, complex),
+            )
+            or isinstance(self.longEnvelopeMemoryCoefficient, bool)
+            or not np.isfinite(
+                complex(self.longEnvelopeMemoryCoefficient).real
+            )
+            or not np.isfinite(
+                complex(self.longEnvelopeMemoryCoefficient).imag
+            )
+        ):
+            raise ValueError(
+                "longEnvelopeMemoryCoefficient must be a finite number"
+            )
+        if (
             not isinstance(self.nonlinearScale, (int, float))
             or isinstance(self.nonlinearScale, bool)
             or not np.isfinite(self.nonlinearScale)
@@ -1050,7 +1092,12 @@ class GMPPA:
         """Initialize GMP coefficients from validated order and memory settings.
 
         Processing details:
-            Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+            Algorithm: Validate the requested basis dimensions, generate the
+            complete default coefficient set, and enable its long cubic
+            envelope-memory tail only when all three coefficient dictionaries
+            are omitted. If the caller supplies any dictionary, preserve the
+            explicit/custom coefficient contract without injecting hidden
+            long-memory terms.
 
         Args:
             config: Validated configuration object controlling this operation.
@@ -1060,11 +1107,30 @@ class GMPPA:
         """
         config.Validate()
         self.config = config
+        usesCompleteGeneratedCoefficientSet = all(
+            coefficientMapping is None
+            for coefficientMapping in (
+                config.mainCoefficients,
+                config.laggingCoefficients,
+                config.leadingCoefficients,
+            )
+        )
         defaultMain, defaultLagging, defaultLeading = DefaultGmpCoefficients(
             config.nonlinearOrders,
             config.memoryDepth,
             config.crossMemoryDepth,
             config.nonlinearScale,
+            longEnvelopeMemoryDepth=(
+                config.longEnvelopeMemoryDepth
+                if usesCompleteGeneratedCoefficientSet
+                else 0
+            ),
+            longEnvelopeMemoryDecay=config.longEnvelopeMemoryDecay,
+            longEnvelopeMemoryCoefficient=(
+                config.longEnvelopeMemoryCoefficient
+                if usesCompleteGeneratedCoefficientSet
+                else 0.0 + 0.0j
+            ),
         )
         self.mainCoefficients = dict(
             defaultMain
@@ -1086,7 +1152,11 @@ class GMPPA:
         """Evaluate the main, lagging, and leading GMP basis expansions.
 
         Processing details:
-            Algorithm: Execute the configured signal-processing path, preserve sample alignment, and return the complete downstream result.
+            Algorithm: Cache every required causal delay and envelope power,
+            then accumulate main, lagging-envelope, and leading-envelope basis
+            terms in coefficient order. Long-envelope defaults are ordinary
+            lagging cubic GMP terms, so this path needs no separate state or
+            noise source and remains deterministic across calls.
 
         Args:
             inputSignal: One-dimensional complex baseband samples supplied to the operation.
@@ -1300,7 +1370,14 @@ class PiecewiseGMPConfig:
 
 
 class PiecewiseGMPPA:
-    """Blend adjacent sparse GMP models over smooth envelope regions."""
+    """Blend adjacent sparse GMP models over smooth envelope regions.
+
+    The deterministic built-in profiles share the normalized long cubic
+    envelope-memory branch used by the ordinary generated GMP plant. Explicit
+    ``regionConfigs`` remain caller-owned; each regional ``GMPConfig`` follows
+    the ordinary rule that generated coefficient maps include the configured
+    long branch while any explicit coefficient map prevents hidden insertion.
+    """
 
     def __init__(
         self,
@@ -1335,6 +1412,9 @@ class PiecewiseGMPPA:
                 memoryDepth,
                 crossMemoryDepth,
                 nonlinearScale=1.0,
+                longEnvelopeMemoryDepth=12,
+                longEnvelopeMemoryDecay=0.82,
+                longEnvelopeMemoryCoefficient=0.008 - 0.0036j,
             )
             regionProfiles = (
                 (1.025, -0.004, 0.78, 0.72),
@@ -6093,6 +6173,9 @@ def DefaultGmpCoefficients(
     memoryDepth: int,
     crossMemoryDepth: int,
     nonlinearScale: float = 0.135,
+    longEnvelopeMemoryDepth: int = 0,
+    longEnvelopeMemoryDecay: float = 0.82,
+    longEnvelopeMemoryCoefficient: complex = 0.0 + 0.0j,
 ) -> Tuple[
     Dict[Tuple[int, int], complex],
     Dict[Tuple[int, int, int], complex],
@@ -6108,7 +6191,11 @@ def DefaultGmpCoefficients(
         main coefficient so every same-order coefficient still sums to its
         static target. Memory depth therefore changes transient and frequency
         behavior without duplicating compression in a constant-envelope
-        plateau.
+        plateau. Optionally add one normalized, long cubic lagging-envelope
+        tail and subtract the same total coefficient from the zero-delay
+        cubic main term. This branch is also zero on a settled constant
+        envelope, but its longer memory cannot be represented by a shallow
+        DPD and therefore leaves a power-dependent deterministic residual.
 
     Args:
         nonlinearOrders: Positive odd polynomial orders included in the model.
@@ -6116,6 +6203,12 @@ def DefaultGmpCoefficients(
         crossMemoryDepth: Number of envelope cross-delays included in the GMP model.
         nonlinearScale: Strength applied to orders above one. Zero selects the
             linear-memory floor and one selects the full reference fit.
+        longEnvelopeMemoryDepth: Number of delayed envelope-power samples in
+            the optional normalized cubic long-memory tail. Zero disables it.
+        longEnvelopeMemoryDecay: Geometric tap decay in the interval (0, 1].
+        longEnvelopeMemoryCoefficient: Total complex coefficient distributed
+            over the normalized delayed-envelope taps and subtracted from the
+            same-sample cubic main term.
 
     Returns:
         result: Tuple[Dict[Tuple[int, int], complex], Dict[Tuple[int, int, int], complex], Dict[Tuple[int, int, int], complex]]. The computed value described by the summary, with documented units, shape, and normalization.
@@ -6129,6 +6222,35 @@ def DefaultGmpCoefficients(
     ):
         raise ValueError(
             "nonlinearScale must be finite and between zero and one"
+        )
+    if (
+        not isinstance(longEnvelopeMemoryDepth, int)
+        or isinstance(longEnvelopeMemoryDepth, bool)
+        or longEnvelopeMemoryDepth < 0
+    ):
+        raise ValueError(
+            "longEnvelopeMemoryDepth must be a nonnegative integer"
+        )
+    if (
+        not isinstance(longEnvelopeMemoryDecay, (int, float))
+        or isinstance(longEnvelopeMemoryDecay, bool)
+        or not np.isfinite(longEnvelopeMemoryDecay)
+        or not 0.0 < float(longEnvelopeMemoryDecay) <= 1.0
+    ):
+        raise ValueError(
+            "longEnvelopeMemoryDecay must be finite and in (0, 1]"
+        )
+    if (
+        not isinstance(
+            longEnvelopeMemoryCoefficient,
+            (int, float, complex),
+        )
+        or isinstance(longEnvelopeMemoryCoefficient, bool)
+        or not np.isfinite(complex(longEnvelopeMemoryCoefficient).real)
+        or not np.isfinite(complex(longEnvelopeMemoryCoefficient).imag)
+    ):
+        raise ValueError(
+            "longEnvelopeMemoryCoefficient must be a finite number"
         )
 
     # These reference coefficients were fitted over 0 <= |x| <= 2 to a
@@ -6300,6 +6422,33 @@ def DefaultGmpCoefficients(
             - delayedMainSum
             - laggingSum
             - leadingSum
+        )
+
+    resolvedLongMemoryCoefficient = complex(
+        longEnvelopeMemoryCoefficient
+    )
+    if (
+        3 in selectedOrders
+        and longEnvelopeMemoryDepth > 0
+        and resolvedLongMemoryCoefficient != 0.0 + 0.0j
+    ):
+        longMemoryWeights = (
+            float(longEnvelopeMemoryDecay)
+            ** np.arange(longEnvelopeMemoryDepth, dtype=float)
+        )
+        longMemoryWeights /= float(np.sum(longMemoryWeights))
+        for crossIndex, tapWeight in enumerate(
+            longMemoryWeights,
+            start=1,
+        ):
+            coefficientKey = (3, 0, crossIndex)
+            laggingCoefficients[coefficientKey] = (
+                laggingCoefficients.get(coefficientKey, 0.0 + 0.0j)
+                + resolvedLongMemoryCoefficient * float(tapWeight)
+            )
+        mainCoefficients[(3, 0)] = (
+            mainCoefficients.get((3, 0), 0.0 + 0.0j)
+            - resolvedLongMemoryCoefficient
         )
 
     return mainCoefficients, laggingCoefficients, leadingCoefficients
