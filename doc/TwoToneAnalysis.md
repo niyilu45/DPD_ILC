@@ -199,28 +199,24 @@ P_{\mathrm{out,dBm}}
 
 当 `width=W>0` 时，公开NumPy数组的实部和虚部虽然存储在
 `complex128` 中，但数值是有符号整数码，不是归一化小数，也不是伏特。
-分析器必须先执行
+设PA输出每个I/Q分量的物理码轨为 $F_{\mathrm{out}}$，分析器必须先执行
 
 ```math
 y[n]
 =
+F_{\mathrm{out}}
 \frac{c_I[n]+j c_Q[n]}{2^{W-1}},
 ```
 
-再计算活动区RMS和dBm。若把码值 $c[n]$ 直接当作浮点复包络，功率会额外
+再计算活动区RMS和dBm。频谱中的dBFS使用 $y/F_{\mathrm{out}}$，所以扩大观测量程不会改变同一整数码相对于码轨的电平。若把码值 $c[n]$ 直接当作浮点复包络，功率会额外
 增加
 
 ```math
 \Delta P_{\mathrm{dB}}
-=20\log_{10}\left(2^{W-1}\right)
-=6.0206(W-1)\ \mathrm{dB}.
+=20\log_{10}\left(\frac{2^{W-1}}{F_{\mathrm{out}}}\right).
 ```
 
-16位接口的纯缩放误差就是
-$6.0206\times15\approx90.31\ \mathrm{dB}$。因此本应约为20 dBm的波形
-可能被错误报告成约110 dBm；若真实工作点略高、还混入峰值或参考面增益，
-就很容易看到112 dBm附近的异常值。这不是PA产生了如此大的功率，而是把
-整数码误当成模拟幅度造成的单位错误。
+16位旧FS1接口的纯缩放误差为约90.31 dB，因而本应约为20 dBm的波形曾可能被错误报告成110至112 dBm。当前PA/Channel定点输出默认FS2，误差项为约84.29 dB；无论具体量程为何，这都不是PA产生了超高功率，而是把整数码误当成模拟幅度或使用了错误输出标尺。
 
 原始NumPy/list模式可以对明显超出归一化范围的整数码自动识别工程默认
 16位。这个启发式不用于带 `TwoToneWaveform` 的元数据模式：该模式在省略
@@ -228,7 +224,7 @@ $6.0206\times15\approx90.31\ \mathrm{dB}$。因此本应约为20 dBm的波形
 必须显式传入 `width=16`；否则接收码会按发送端的 `width=0` 解释，正好
 产生上述约90.31 dB偏差。
 
-例如 `maximumOutputPowerDbm=25.0`、目标输出为20 dBm时，正确的归一化
+例如 `maximumOutputPowerDbm=25.0`、目标输出为20 dBm时，正确的物理
 活动区RMS应接近
 
 ```math
@@ -237,10 +233,10 @@ y_{\mathrm{rms,target}}
 \approx0.5623.
 ```
 
-在16位公开接口中，这相当于约
-$0.5623\times32768\approx18427$ 的复包络码RMS。分析器使用 `width=16`
-先除以32768，仍得到约20 dBm；使用 `width=0` 错把18427当作归一化RMS，
-则会多出约90.31 dB。
+在默认FS2的16位PA输出接口中，这相当于约
+$0.5623/2\times32768\approx9213$ 的复包络码RMS。分析器使用 `width=16, outputFullScaleAmplitude=2.0` 解码后仍得到约20 dBm；若错误沿用FS1，会得到约14 dBm；若使用 `width=0` 又把9213直接当成物理RMS，则会多出约84.29 dB。
+
+工程的标尺约定是：WaveGen/DPD/DAC输入默认FS1，`PaModel` 和 `Channel` 输出默认FS2，接近25 dBm且高PAPR峰值可能越过FS2时可把PA、Channel和分析器统一改为FS4。`TwoToneAnalysis` 与普通 `Analysis` 必须匹配实际输出标尺；只修改其中一端会造成6.02 dB（FS1与FS2）或更大的幅度/功率错误。
 
 最终方法对比前，Benchmark会把每种ILC选择出的输入重新交给闭环 `PowerCalibration`。校准器只调整PA输入，直到实际输出功率进入容限，不在PA输出端做常数缩放。因此各方法的IM3、IM5和IM7是在相同真实输出dBm下比较。
 
@@ -261,7 +257,7 @@ $0.5623\times32768\approx18427$ 的复包络码RMS。分析器使用 `width=16`
 构造函数为：
 
 ```python
-TwoToneAnalysis(waveform, parameters=None, width=None, **parameterOverrides)
+TwoToneAnalysis(waveform, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)
 ```
 
 | 参数 | 默认值 | 含义 |
@@ -274,6 +270,7 @@ TwoToneAnalysis(waveform, parameters=None, width=None, **parameterOverrides)
 | `activePowerThresholdDb` | `-60.0` | 相对活动段峰值的功率检测门限，低于门限的长补零或空闲不进入模拟功率RMS |
 | `activeGapToleranceSamples` | `16` | 活动区内允许闭合的短过零间隙样点数 |
 | `width` | 省略时自动识别或继承元数据 | 描述 `measuredSignal` 的边界；典型16位整数码可从浮点发送元数据中自动识别，0为浮点，大于0为公开整数I/Q码 |
+| `outputFullScaleAmplitude` | `1.0` | 接收/PA输出整数码轨表示的物理I/Q分量幅度；兼容旧FS1采集，当前PA/Channel默认输出应显式设为2.0 |
 
 ## 8. PA输出分析示例
 
@@ -316,6 +313,7 @@ toneAnalysis = TwoToneAnalysis(
     parameters={
         "maximumOutputPowerDbm": 25.0,
         "width": 0,
+        "outputFullScaleAmplitude": paModel.outputFullScaleAmplitude,
     },
 )
 metrics = toneAnalysis.Analyze(paOutput)
@@ -334,14 +332,25 @@ assert abs(metrics["outputPowerDbm"] - 20.0) <= 0.25
 ```python
 from inc.lib.Analysis import Analysis
 
+toneParameters = {
+    "maximumOutputPowerDbm": 25.0,
+    "width": 0,
+    "outputFullScaleAmplitude": paModel.outputFullScaleAmplitude,
+}
 allMetrics = Analysis.AnalyzeTwoTone(
     paOutput,
     toneWaveform,
-    parameters={"maximumOutputPowerDbm": 25.0, "width": 0},
+    parameters=toneParameters,
 )
-im3Metrics = Analysis.CalculateIm3(paOutput, toneWaveform)
-im5Metrics = Analysis.CalculateIm5(paOutput, toneWaveform)
-im7Metrics = Analysis.CalculateIm7(paOutput, toneWaveform)
+im3Metrics = Analysis.CalculateIm3(
+    paOutput, toneWaveform, parameters=toneParameters
+)
+im5Metrics = Analysis.CalculateIm5(
+    paOutput, toneWaveform, parameters=toneParameters
+)
+im7Metrics = Analysis.CalculateIm7(
+    paOutput, toneWaveform, parameters=toneParameters
+)
 
 print(allMetrics["worstIntermodulationDbc"])
 print(allMetrics["outputPowerDbm"])
@@ -429,6 +438,7 @@ fixedMetrics = Analysis.AnalyzeTwoTone(
         "activePowerThresholdDb": -60.0,
         "activeGapToleranceSamples": 16,
         "width": 16,
+        "outputFullScaleAmplitude": 2.0,
     },
 )
 

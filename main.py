@@ -661,6 +661,10 @@ def Main() -> int:
     waveform = wifiGenerator.Generate()
     interfaceFormat = FixedPoint(wifiGenerator.width)
     powerCalibration.SetPaModel(paModel)
+    outputInterfaceFormat = FixedPoint(
+        wifiGenerator.width,
+        powerCalibration.outputFullScaleAmplitude,
+    )
     # Closed-loop calibration regenerates the PA input, measures the actual
     # active-burst output power, and hides every preset correction from the
     # caller. The converged input becomes the ILC operating-point reference.
@@ -669,6 +673,9 @@ def Main() -> int:
         "loadResistanceOhm": powerCalibration.loadResistanceOhm,
         "maximumOutputPowerDbm": (
             powerCalibration.maximumOutputPowerDbm
+        ),
+        "outputFullScaleAmplitude": (
+            powerCalibration.outputFullScaleAmplitude
         ),
     }
     if arguments.width is not None:
@@ -687,7 +694,7 @@ def Main() -> int:
     baselineCalibrationMetrics = (
         powerCalibration.GetLastCalibrationMetrics()
     )
-    floatingBaselineOutput = interfaceFormat.DecodeComplex(
+    floatingBaselineOutput = outputInterfaceFormat.DecodeComplex(
         baselineOutput
     )
     baselineOutputMatrix = (

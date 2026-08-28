@@ -368,6 +368,7 @@ class Analysis:
         sampleRateHz: Optional[float] = None,
         channelBandwidthHz: Optional[float] = None,
         width: Optional[int] = None,
+        outputFullScaleAmplitude: Optional[float] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize one of the three independent analysis contexts.
@@ -408,6 +409,11 @@ class Analysis:
             width: Optional external I/Q width. None selects the internal
                 16-bit default, zero selects floating point, and a positive
                 value selects signed integer I/Q codes in complex128.
+            outputFullScaleAmplitude: Optional physical component magnitude
+                represented by measured PA/channel output code rails. The
+                reference waveform always retains the normalized DAC scale
+                of one. The compatibility default is 1.0; pass the bound
+                PA or Channel's output scale when analyzing its fixed output.
             parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
 
         Returns:
@@ -430,6 +436,7 @@ class Analysis:
                 "assistedReferenceSearchSamples": 32768,
                 "assistedMinimumCorrelation": 0.12,
                 "width": 16,
+                "outputFullScaleAmplitude": 1.0,
             }
         )
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -464,6 +471,10 @@ class Analysis:
             )
         if width is not None:
             recognizedOverrides["width"] = width
+        if outputFullScaleAmplitude is not None:
+            recognizedOverrides["outputFullScaleAmplitude"] = (
+                outputFullScaleAmplitude
+            )
         self.parameters: ChainMap[str, object] = ChainMap(
             recognizedOverrides,
             externalParameters,
@@ -471,6 +482,10 @@ class Analysis:
         )
         self.interfaceFormat = FixedPoint(
             cast(int, self.parameters["width"])
+        )
+        self.outputInterfaceFormat = FixedPoint(
+            cast(int, self.parameters["width"]),
+            self.parameters["outputFullScaleAmplitude"],
         )
 
         self.parsedWifiFrame: Optional[ParsedWifiFrame] = None
@@ -538,7 +553,7 @@ class Analysis:
             measuredArray = self.interfaceFormat.QuantizeCodes(
                 measuredInput
             )
-            floatingMeasuredArray = self.interfaceFormat.DecodeComplex(
+            floatingMeasuredArray = self.outputInterfaceFormat.DecodeComplex(
                 measuredArray
             )
             if isinstance(transmittedSignal, WifiWaveform):
@@ -755,6 +770,24 @@ class Analysis:
 
     width = Width
 
+    @property
+    def OutputFullScaleAmplitude(self) -> float:
+        """Return the physical component magnitude represented by measured codes.
+
+        Processing details:
+            Algorithm: Read the validated measured-output scale independently
+            of the normalized reference/DAC convention.
+
+        Returns:
+            result: Positive physical I/Q component full-scale amplitude.
+        """
+
+        return float(
+            cast(float, self.parameters["outputFullScaleAmplitude"])
+        )
+
+    outputFullScaleAmplitude = OutputFullScaleAmplitude
+
     def GetSignalOverlapResult(
         self,
     ) -> Optional[SignalOverlapResult]:
@@ -820,6 +853,10 @@ class Analysis:
         """
 
         self.interfaceFormat = FixedPoint(self.width)
+        self.outputInterfaceFormat = FixedPoint(
+            self.width,
+            self.parameters["outputFullScaleAmplitude"],
+        )
         maxSegmentLength = self.parameters["maxSegmentLength"]
         if (
             not isinstance(maxSegmentLength, int)
@@ -1009,7 +1046,7 @@ class Analysis:
         signalProcessingParameters = self.parameters[
             "signalProcessingParameters"
         ]
-        measuredArray = self.interfaceFormat.DecodeComplex(
+        measuredArray = self.outputInterfaceFormat.DecodeComplex(
             measuredSignal
         )
         referenceMatrix = (
@@ -2484,7 +2521,9 @@ class Analysis:
                 )
             selectedSignal = self.defaultMeasuredSignal
         self.ValidateParameters()
-        decodedSignal = self.interfaceFormat.DecodeComplex(selectedSignal)
+        decodedSignal = self.outputInterfaceFormat.DecodeComplex(
+            selectedSignal
+        )
         referenceMatrix = (
             self.referenceSignal.reshape(-1, 1)
             if self.referenceSignal.ndim == 1
@@ -2727,6 +2766,7 @@ class Analysis:
         toneFrequenciesHz: Optional[Sequence[float]] = None,
         ilcBandwidthHz: Optional[float] = None,
         width: Optional[int] = None,
+        outputFullScaleAmplitude: float = 1.0,
     ) -> TwoToneWaveform:
         """Resolve metadata-rich or raw two-tone inputs into one waveform.
 
@@ -2755,6 +2795,9 @@ class Analysis:
                 range as 16-bit samples and otherwise selects floating point.
                 Metadata-rich mode inherits its width only when no measured-
                 signal override is supplied.
+            outputFullScaleAmplitude: Physical component magnitude represented
+                by a measured fixed-point output code rail. The compatibility
+                default is one.
 
         Returns:
             result: Existing or newly constructed immutable two-tone metadata.
@@ -2788,7 +2831,7 @@ class Analysis:
             # floating transmit reference and fixed-point instrument capture
             # are therefore a valid and common combination.
             if width is not None:
-                FixedPoint(width)
+                FixedPoint(width, outputFullScaleAmplitude)
             return waveform
 
         rawMetadataSignal = measuredSignal if waveform is None else waveform
@@ -2877,7 +2920,9 @@ class Analysis:
             resolvedInputWidth = (
                 16 if integerCodeShape and exceedsNormalizedRange else 0
             )
-        interfaceFormat = FixedPoint(resolvedInputWidth)
+        interfaceFormat = FixedPoint(
+            resolvedInputWidth, outputFullScaleAmplitude
+        )
         resolvedWidth = interfaceFormat.width
         decodedSamples = interfaceFormat.DecodeComplex(rawSamples).reshape(-1)
         sortedFrequenciesHz = tuple(
@@ -2995,6 +3040,18 @@ class Analysis:
         metadataWidth = width
         if metadataWidth is None and parameters is not None:
             metadataWidth = parameters.get("width")
+        metadataOutputFullScaleAmplitude = parameterOverrides.get(
+            "outputFullScaleAmplitude"
+        )
+        if (
+            metadataOutputFullScaleAmplitude is None
+            and parameters is not None
+        ):
+            metadataOutputFullScaleAmplitude = parameters.get(
+                "outputFullScaleAmplitude"
+            )
+        if metadataOutputFullScaleAmplitude is None:
+            metadataOutputFullScaleAmplitude = 1.0
         resolvedWaveform = Analysis.BuildTwoToneWaveform(
             measuredSignal,
             waveform=waveform,
@@ -3002,6 +3059,7 @@ class Analysis:
             toneFrequenciesHz=toneFrequenciesHz,
             ilcBandwidthHz=ilcBandwidthHz,
             width=metadataWidth,
+            outputFullScaleAmplitude=metadataOutputFullScaleAmplitude,
         )
         toneAnalysis = TwoToneAnalysis(
             resolvedWaveform,
@@ -3064,6 +3122,18 @@ class Analysis:
         metadataWidth = width
         if metadataWidth is None and parameters is not None:
             metadataWidth = parameters.get("width")
+        metadataOutputFullScaleAmplitude = parameterOverrides.get(
+            "outputFullScaleAmplitude"
+        )
+        if (
+            metadataOutputFullScaleAmplitude is None
+            and parameters is not None
+        ):
+            metadataOutputFullScaleAmplitude = parameters.get(
+                "outputFullScaleAmplitude"
+            )
+        if metadataOutputFullScaleAmplitude is None:
+            metadataOutputFullScaleAmplitude = 1.0
         resolvedWaveform = Analysis.BuildTwoToneWaveform(
             measuredSignal,
             waveform=waveform,
@@ -3071,6 +3141,7 @@ class Analysis:
             toneFrequenciesHz=toneFrequenciesHz,
             ilcBandwidthHz=ilcBandwidthHz,
             width=metadataWidth,
+            outputFullScaleAmplitude=metadataOutputFullScaleAmplitude,
         )
         completeMetrics: Mapping[str, float] = Analysis.AnalyzeTwoTone(
             measuredSignal,
@@ -3369,11 +3440,14 @@ class Analysis:
             currentOutputPowerDbm = [float(powerDbmArray[0])]
             # The mutable one-element list lets one bound callable retain the
             # calibrator's hidden preset while the requested sweep dBm changes.
-            powerCalibration.SetPaModel(
-                lambda trialInput: methodEvaluator(
-                    trialInput, currentOutputPowerDbm[0]
-                )
+            calibrationEvaluator = lambda trialInput: methodEvaluator(
+                trialInput, currentOutputPowerDbm[0]
             )
+            calibrationEvaluator.width = self.width
+            calibrationEvaluator.outputFullScaleAmplitude = (
+                self.outputFullScaleAmplitude
+            )
+            powerCalibration.SetPaModel(calibrationEvaluator)
             for outputPowerDbm in powerDbmArray:
                 currentOutputPowerDbm[0] = float(outputPowerDbm)
                 powerCalibration.UpdateParameters(

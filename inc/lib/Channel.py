@@ -57,6 +57,7 @@ class Channel:
         paModel: Optional[Any] = None,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
+        outputFullScaleAmplitude: Optional[float] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize a live ChainMap-backed PA-to-receiver channel.
@@ -75,6 +76,9 @@ class Channel:
             width: Optional public I/Q component width. None selects the
                 internal 16-bit default, zero selects floating point, and a
                 positive value selects signed integer I/Q codes.
+            outputFullScaleAmplitude: Optional physical component magnitude
+                represented by the channel/feedback output code rail. The
+                default 2.0 supplies 6.02 dB of PA observation headroom.
             parameterOverrides: Highest-priority local configuration values.
                 Unsupported names raise ``TypeError`` because Channel uses a
                 strict, case-sensitive public configuration vocabulary.
@@ -138,11 +142,16 @@ class Channel:
                 "activeGapToleranceSamples": 16,
                 "randomSeed": 1701,
                 "width": 16,
+                "outputFullScaleAmplitude": 2.0,
             }
         )
         directOverrides = dict(parameterOverrides)
         if width is not None:
             directOverrides["width"] = width
+        if outputFullScaleAmplitude is not None:
+            directOverrides["outputFullScaleAmplitude"] = (
+                outputFullScaleAmplitude
+            )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
         externalParameters: Mapping[object, object] = (
@@ -222,6 +231,24 @@ class Channel:
         return cast(int, self.parameters["width"])
 
     width = Width
+
+    @property
+    def OutputFullScaleAmplitude(self) -> float:
+        """Return the physical magnitude represented by public output rails.
+
+        Processing details:
+            Algorithm: Resolve the live Channel output-observation scale from
+            the layered configuration without changing the input DAC scale.
+
+        Returns:
+            result: Positive physical I/Q component full-scale amplitude.
+        """
+
+        return float(
+            cast(float, self.parameters["outputFullScaleAmplitude"])
+        )
+
+    outputFullScaleAmplitude = OutputFullScaleAmplitude
 
     @property
     def SampleMode(self) -> str:
@@ -376,6 +403,7 @@ class Channel:
             "fbAdcWidth",
             "fbAdcFullScale",
             "width",
+            "outputFullScaleAmplitude",
         }
         if any(
             parameterName in calibrationSensitiveNames
@@ -1032,6 +1060,10 @@ class Channel:
                 "[0, 53] bits, where 0 selects floating-point mode."
             )
         FixedPoint(width)
+        FixedPoint(
+            width,
+            self.parameters["outputFullScaleAmplitude"],
+        )
 
     def SetPaModel(self, paModel: Any) -> None:
         """Bind the PA evaluated before the channel impairments.
@@ -1908,7 +1940,9 @@ class Channel:
                 "GetLastFeedbackPhasePair"
             )
         self.RequireCurrentFeedbackIqCalibration()
-        interfaceFormat = FixedPoint(self.width)
+        interfaceFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
         return tuple(
             interfaceFormat.EncodeComplex(phaseSignal).copy()
             for phaseSignal in self._lastFeedbackPhasePair
@@ -3580,10 +3614,12 @@ class Channel:
         """Apply channel effects to an already evaluated public PA output.
 
         Processing details:
-            Algorithm: Decode public integer I/Q codes once, apply configured
-            post-PA inter-chain coupling, execute the selected forward or
-            feedback sampling path in normalized floating units, and encode
-            the receiver signal back to the same public interface convention.
+            Algorithm: Decode public integer I/Q codes with the bound PA's
+            output scale, apply configured post-PA inter-chain coupling,
+            execute the selected forward or feedback sampling path in
+            normalized floating units, and encode the receiver signal with
+            the Channel output scale. Equal defaults preserve the ordinary
+            same-format path while allowing an explicitly wider PA capture.
 
         Args:
             paOutputSignal: Public PA output vector or matrix.
@@ -3598,8 +3634,18 @@ class Channel:
         )
         self._trustedProcessingDepth += 1
         try:
-            interfaceFormat = FixedPoint(self.width)
-            normalizedPaOutput = interfaceFormat.DecodeComplex(
+            paOutputFormat = FixedPoint(
+                int(getattr(self.paModel, "width", self.width)),
+                getattr(
+                    self.paModel,
+                    "outputFullScaleAmplitude",
+                    self.outputFullScaleAmplitude,
+                ),
+            )
+            channelOutputFormat = FixedPoint(
+                self.width, self.outputFullScaleAmplitude
+            )
+            normalizedPaOutput = paOutputFormat.DecodeComplex(
                 preparedPaOutput
             )
             coupledPaOutput = self.ApplyPostPaCoupling(
@@ -3608,7 +3654,7 @@ class Channel:
             normalizedReceiverSignal = self.ApplyChannelEffects(
                 coupledPaOutput
             )
-            return interfaceFormat.EncodeComplex(
+            return channelOutputFormat.EncodeComplex(
                 normalizedReceiverSignal
             )
         finally:
@@ -3647,12 +3693,20 @@ class Channel:
             normalizedPaOutput = floatingProcessor(normalizedInput)
         else:
             paWidthValue = getattr(self.paModel, "width", 0)
-            paInterfaceFormat = FixedPoint(int(paWidthValue))
-            publicPaInput = paInterfaceFormat.EncodeComplex(
+            paInputFormat = FixedPoint(int(paWidthValue))
+            paOutputFormat = FixedPoint(
+                int(paWidthValue),
+                getattr(
+                    self.paModel,
+                    "outputFullScaleAmplitude",
+                    1.0,
+                ),
+            )
+            publicPaInput = paInputFormat.EncodeComplex(
                 normalizedInput
             )
             publicPaOutput = self._paProcessMethod(publicPaInput)
-            normalizedPaOutput = paInterfaceFormat.DecodeComplex(
+            normalizedPaOutput = paOutputFormat.DecodeComplex(
                 publicPaOutput
             )
         normalizedOutput = self.PrepareSignal(
@@ -3896,8 +3950,11 @@ class Channel:
             result: Public clean PA output before post-PA coupling and sampling.
         """
 
-        interfaceFormat = FixedPoint(self.width)
-        normalizedInput = interfaceFormat.DecodeComplex(
+        inputFormat = FixedPoint(self.width)
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
+        normalizedInput = inputFormat.DecodeComplex(
             self.PrepareSignal(inputSignal, "inputSignal")
         )
         drivenInput = self.ApplyCalibrationDrive(
@@ -3915,7 +3972,7 @@ class Channel:
             else np.array(actualPaInput, dtype=np.complex128, copy=True)
         )
         normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
-        return interfaceFormat.EncodeComplex(normalizedPaOutput)
+        return outputFormat.EncodeComplex(normalizedPaOutput)
 
     def ProcessPaBankForCalibration(
         self, inputSignal: np.ndarray
@@ -3936,8 +3993,11 @@ class Channel:
             result: Public clean PA outputs before post-PA coupling.
         """
 
-        interfaceFormat = FixedPoint(self.width)
-        normalizedInput = interfaceFormat.DecodeComplex(
+        inputFormat = FixedPoint(self.width)
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
+        normalizedInput = inputFormat.DecodeComplex(
             self.PrepareSignal(inputSignal, "inputSignal")
         )
         drivenInput = self.ApplyCalibrationDrive(normalizedInput)
@@ -3955,7 +4015,7 @@ class Channel:
             else np.array(actualPaInput, dtype=np.complex128, copy=True)
         )
         normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
-        return interfaceFormat.EncodeComplex(normalizedPaOutput)
+        return outputFormat.EncodeComplex(normalizedPaOutput)
 
     def ProcessCoupledPaFloating(
         self, inputSignal: np.ndarray
@@ -4154,15 +4214,18 @@ class Channel:
                     self.ProcessOutputPathsFloating(normalizedInput)
                 )
             else:
-                interfaceFormat = FixedPoint(self.width)
-                publicInput = interfaceFormat.EncodeComplex(normalizedInput)
+                inputFormat = FixedPoint(self.width)
+                outputFormat = FixedPoint(
+                    self.width, self.outputFullScaleAmplitude
+                )
+                publicInput = inputFormat.EncodeComplex(normalizedInput)
                 publicChannelOutput, publicFeedbackOutput = self.Process(
                     publicInput
                 )
-                channelOutput = interfaceFormat.DecodeComplex(
+                channelOutput = outputFormat.DecodeComplex(
                     publicChannelOutput
                 )
-                feedbackOutput = interfaceFormat.DecodeComplex(
+                feedbackOutput = outputFormat.DecodeComplex(
                     publicFeedbackOutput
                 )
             channelOutput = self.PrepareSignal(
@@ -4263,18 +4326,21 @@ class Channel:
                 # CalibratePaInput has already restored the PA's original
                 # thermal state. Re-evaluate the accepted drive once so this
                 # public call represents one real temperature-aware period.
-            interfaceFormat = FixedPoint(self.width)
-            normalizedInput = interfaceFormat.DecodeComplex(processingInput)
+            inputFormat = FixedPoint(self.width)
+            outputFormat = FixedPoint(
+                self.width, self.outputFullScaleAmplitude
+            )
+            normalizedInput = inputFormat.DecodeComplex(processingInput)
             normalizedChannelOutput, normalizedFeedbackOutput = (
                 self.ProcessOutputPathsFloating(normalizedInput)
             )
-            publicChannelOutput = interfaceFormat.EncodeComplex(
+            publicChannelOutput = outputFormat.EncodeComplex(
                 normalizedChannelOutput
             )
             if self.sampleMode == "forward":
                 publicFeedbackOutput = publicChannelOutput.copy()
             else:
-                publicFeedbackOutput = interfaceFormat.EncodeComplex(
+                publicFeedbackOutput = outputFormat.EncodeComplex(
                     normalizedFeedbackOutput
                 )
             return publicChannelOutput, publicFeedbackOutput

@@ -254,6 +254,8 @@ chOut, fbOut = plant.ProcessOutputPathsFloating(inputSignal)
 
 `NormalizedPaAdapter` 对普通PA优先调用这个协议。它接收已经解码的归一化样值，但会在PA求值前应用 `PowerCalibration` 已提交的post-DAC模拟驱动，因此定点ILC不会因为离开公开整数码边界而丢失10、15或20 dBm工作点。Channel还提供优先级更高的 `ProcessNormalizedOutputPaths`：非稳态热模式走普通浮点双输出快路径，稳态热模式则穿过公共定点边界并调用 `Process`，为当前ILC候选重复所需功率校准。`PaModel.ProcessFloating` 与 `MimoPaModel.ProcessFloating` 刻意保持raw、drive-free：它们只适合已经拥有物理输入标尺、需要避免重复增益的调用方。`IQImbalancePA.ProcessOutputPathsFloating` 会先透传被包装plant的已提交驱动和双分支，再分别添加相同输出I/Q变换。
 
+定点适配器分别维护输入和观测量程：WaveGen/DPD/DAC输入按FS1（`fullScaleAmplitude=1.0`）解码，PA/Channel输出从plant的 `outputFullScaleAmplitude` 读取，默认FS2。所有ILC入口返回时，`learnedInput` 与每轮 `inputSignal` 仍按输入FS1编码；`outputSignal`、`feedbackOutputSignal` 以及历史中每轮的 `chOut`/`fbOut` 则按plant输出量程编码。近25 dBm高PAPR场景若显式把plant改成FS4，ILC历史会自动随之使用FS4；后续 `Analysis` 或 `TwoToneAnalysis` 也必须配置相同输出量程。
+
 `Process` 必须满足：
 
 - 输入必须是一维复数组；每个输出允许比输入更长或更短，ILC会先同步反馈并提取到参考网格；
@@ -298,7 +300,7 @@ print(fixedResult["selectedIlcMetrics"])
 python SmallestSISO.py
 ```
 
-脚本的 `RunSisoMode(width=...)` 会把该值分别写入 `WaveGenWifi.parameters`、`PaModel.parameters`、`Channel.parameters` 和 `Analysis.parameters`。`width=0` 为浮点旁路；`width=16` 的公开 I/Q 分量是 `-32768…32767` 的整数码，`numpy.complex128` 只是统一容器。ILC在入口解码整数码，内部FFT、GMP、移相、加噪、同步、学习更新和指标算法仍使用归一化浮点；`NormalizedPaAdapter` 通过 `ProcessOutputPathsFloating` 在每轮重新应用功率闭环已提交的隐藏模拟驱动，返回的最佳输入、输出和逐轮波形再编码为公开整数码。两个结果目录分别是 `results/smallest_siso/floating` 和 `results/smallest_siso/fixed_16`，每个目录都包含逐轮MSE/EVM收敛数据和图片。定点公式见 [FixedPoint.md](./FixedPoint.md)，Channel的噪声单位和流程见 [Channel.md](./Channel.md)。
+脚本的 `RunSisoMode(width=...)` 会把该值分别写入 `WaveGenWifi.parameters`、`PaModel.parameters`、`Channel.parameters` 和 `Analysis.parameters`。`width=0` 为浮点旁路；`width=16` 的公开 I/Q 分量是 `-32768…32767` 的整数码，`numpy.complex128` 只是统一容器。数字输入使用FS1，PA/Channel输出默认FS2；`Analysis.outputFullScaleAmplitude` 必须与plant保持2.0。ILC在入口解码整数码，内部FFT、GMP、移相、加噪、同步、学习更新和指标算法仍使用浮点；`NormalizedPaAdapter` 通过 `ProcessOutputPathsFloating` 在每轮重新应用功率闭环已提交的隐藏模拟驱动，并用输入FS1编码最佳/历史输入、用plant输出FS2编码最佳/历史 `chOut` 与 `fbOut`。两个结果目录分别是 `results/smallest_siso/floating` 和 `results/smallest_siso/fixed_16`，每个目录都包含逐轮MSE/EVM收敛数据和图片。定点公式见 [FixedPoint.md](./FixedPoint.md)，Channel的噪声单位和流程见 [Channel.md](./Channel.md)。
 
 这个示例中，`paOutputPowerDbm` 是工作点，`maximumOutputPowerDbm` 是额定极限。输出回退和归一化驱动关系为：
 
@@ -467,10 +469,10 @@ ILCResult(
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `learnedInput` | 一维复数数组 | `DpdIlc` 按LC-NMSE选择的算法原生候选 |
-| `outputSignal` | 一维复数数组 | 最佳输入重新求值时的 `chOut`，用于最终RF指标 |
-| `feedbackOutputSignal` | 一维复数数组或 `None` | 与最终 `outputSignal` 同次求值得到的raw `fbOut`；普通单输出PA兼容时与前者相同 |
-| `history` | `List[ILCIteration]` | 每个已测轮的反馈域原生诊断、输入、`chOut`和`fbOut` |
+| `learnedInput` | 一维复数数组 | `DpdIlc` 按LC-NMSE选择的算法原生候选；定点时按输入FS1编码 |
+| `outputSignal` | 一维复数数组 | 最佳输入重新求值时的 `chOut`，用于最终RF指标；定点时按plant输出量程编码 |
+| `feedbackOutputSignal` | 一维复数数组或 `None` | 与最终 `outputSignal` 同次求值得到的raw `fbOut`；普通单输出PA兼容时与前者相同，定点时按plant输出量程编码 |
+| `history` | `List[ILCIteration]` | 每个已测轮的反馈域原生诊断、输入、`chOut`和`fbOut`；输入历史用FS1，两个输出历史用plant scale |
 
 ### 7.1 `numIterations` 的准确含义
 

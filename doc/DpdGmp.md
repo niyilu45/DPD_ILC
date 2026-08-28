@@ -125,7 +125,7 @@ print(dpd.GetParameters()["ridgeFactor"])
 | `FitSegments(references, targets, segmentWeights=None, sampleWeights=None)` | 多个独立片段 | `DpdGmpTrainingResult` | 先重置，再联合多帧/多功率训练 |
 | `UpdateCoefficientSegments(...)` | 多个独立片段 | `DpdGmpTrainingResult` | 用多个片段增量更新当前系数 |
 | `FitFromIlc(reference, learnedInput, weights=None)` | 理想波形和 ILC 标签 | `DpdGmpTrainingResult` | 把波形专用 ILC 结果压缩成可部署 GMP |
-| `FitIndirect(paInput, paOutput, sampleRateHz, signalProcessingParameters=None, sampleWeights=None)` | PA 输入/输出采集 | `DpdGmpTrainingResult` | 通过同步后的后置逆执行间接学习 |
+| `FitIndirect(paInput, paOutput, sampleRateHz, signalProcessingParameters=None, sampleWeights=None, paOutputFullScaleAmplitude=1.0)` | PA 输入/输出采集 | `DpdGmpTrainingResult` | 通过同步后的后置逆执行间接学习；末尾参数声明反馈输出码轨的物理量程 |
 | `GetLastTrainingResult()` | 无 | 结果或 `None` | 读取最近一次训练诊断 |
 
 ---
@@ -297,6 +297,8 @@ trainingResult = dpd.FitSegments(
 )
 ```
 
+这里普通 `PaModel(modelName="gmp")` 使用 `nonlinearScale=0.135`：三阶及以上默认稳态系数为 full-reference 拟合的13.5%，一阶小信号和记忆底不缩放。`nonlinearScale=1.0` 只应由显式GMP配置选作强非线性压力plant，不能把它的结果当作普通GMP默认曲线。
+
 每个片段独立建立记忆历史，12 dBm 的正规方程贡献为其他单个片段的两倍。`segmentWeights` 不会因为片段内权重归一化而被抵消。
 
 若每个功率还需要独立的逐样点权重：
@@ -370,10 +372,13 @@ trainingResult = dpd.FitIndirect(
         "enableSamplingFrequencyOffsetCompensation": True,
         "enableComplexGainCompensation": True,
     },
+    paOutputFullScaleAmplitude=2.0,
 )
 ```
 
 `FitIndirect` 要求 PA 输入和输出数组长度相同。它调用 `SigProc` 对输出执行整数/分数时延、载波频偏、采样频偏和公共复增益补偿，然后拟合“校正后 PA 输出到真实 PA 输入”的后置逆。
+
+`paOutputFullScaleAmplitude` 是末尾兼容参数，默认1.0可继续读取旧Q1/FS1反馈码。当前 `PaModel` 与 `Channel` 的定点输出默认FS2，所以直接把其PA输出或 `fbOut` 送入 `FitIndirect` 时必须传 `paOutputFullScaleAmplitude=2.0`；若高功率链路统一改为FS4则传4.0。PA输入/DAC标签仍按FS1解码。即使公共复增益补偿通常能吸收一个常数尺度，也应声明真实量程；尤其把 `enableComplexGainCompensation=False` 时，漏传FS2会把反馈幅度缩小一半并直接污染后置逆标签。
 
 真实仪表中应先确认反馈链本身不会产生明显非线性；否则间接学习会把反馈链失真一起写入DPD系数。把Channel作为plant时，每次 `Process` 返回 `(chOut, fbOut)`：GMP标签、同步、训练NMSE和系数更新使用第二项，最终EVM、SNR、ACLR、IRR和功率使用同次第一项。需要板载反馈链训练时必须显式设置 `sampleMode="fb"`；默认forward模式让第二项成为第一项的数值相同副本。两项来自同一次PA记忆/热状态，不能用两次PA调用替代。
 
@@ -444,7 +449,7 @@ assert restoredDpd.GetFeatureSpecs() == featureSpecs
 
 ## 11. 定点接口示例
 
-`width=16` 时，输入和输出的容器仍为 `numpy.complex128`，但实部和虚部数值是整数码：
+`width=16` 时，输入和输出的容器仍为 `numpy.complex128`，但实部和虚部数值是整数码。`DpdGmp` 自身是数字预失真器，输入和预失真输出都使用FS1；PA/Channel观测则独立使用其 `outputFullScaleAmplitude`（默认FS2）：
 
 ```python
 from inc.lib.DpdGmp import DpdGmp
@@ -534,16 +539,16 @@ for comparison in result.comparisons:
 
 | 比较 | 前值 | 后值 | 结果 |
 |---|---:|---:|---:|
-| 基础DPD独立帧EVM | -40.405 dB | -46.122 dB | 改善5.717 dB |
-| 基础DPD双音IM3 | -48.280 dBc | -54.562 dBc | 改善6.281 dB |
-| 15至12 dBm基础DPD EVM | -39.238 dB | -46.122 dB | 改善6.883 dB |
-| 扩展结构标签NMSE | -58.183 dB | -60.035 dB | 改善1.852 dB |
-| 峰值加权标签NMSE | -61.796 dB | -62.305 dB | 改善0.508 dB |
+| 基础DPD独立帧EVM | -50.524 dB | -56.273 dB | 改善5.749 dB |
+| 基础DPD双音IM3 | -65.947 dBc | -71.152 dBc | 改善5.205 dB |
+| 15至12 dBm基础DPD EVM | -54.038 dB | -56.273 dB | 改善2.235 dB |
+| 扩展结构标签NMSE | -68.094 dB | -71.317 dB | 改善3.223 dB |
+| 峰值加权标签NMSE | -72.992 dB | -73.868 dB | 改善0.876 dB |
 | 增强正则条件数 | `5.435e7` | `5.481e5` | 改善19.964 dB |
-| 多功率最差标签NMSE | -45.427 dB | -47.753 dB | 改善2.326 dB |
-| 多功率最差ACLR | 32.890 dB | 32.862 dB | 退化0.028 dB，护栏通过 |
+| 多功率最差标签NMSE | -62.510 dB | -64.806 dB | 改善2.296 dB |
+| 多功率最差ACLR | 33.062199 dB | 33.062091 dB | 退化0.000108 dB，护栏通过 |
 
-最后一行不是“ACLR必须提高”的目标。源Wi-Fi波形的ACLR本底约为33 dB，当前判据允许独立验证帧的多功率最差ACLR相对单功率正则模型最多下降0.10 dB；`0.028 < 0.10 dB`，所以 `expectationMet=True` 表示没有明显退化。
+最后一行不是“ACLR必须提高”的目标。源Wi-Fi波形的ACLR本底约为33 dB，当前判据允许独立验证帧的多功率最差ACLR相对单功率正则模型最多下降0.10 dB；`0.000108 < 0.10 dB`，所以 `expectationMet=True` 表示没有明显退化。
 
 ---
 

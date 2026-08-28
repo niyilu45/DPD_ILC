@@ -369,7 +369,7 @@ flowchart TD
 | `couplingDetectionThresholdDb` | 右图非对角路径检测线 | 数值提高时，较弱耦合更容易被判为未检测；数值降低时可检出更弱路径，但更容易把噪声当作耦合 |
 | `magnitudeFloorDb` | 左图数值地板 | 数值提高时，对极小幅值采用更高的数值下限，避免对数和相位计算失稳；它不抬高真实信号 |
 | `groupDelayMagnitudeRangeDb` | 右图相位拟合有效点 | 数值增大时，会把距离路径峰值更远的低幅频点也纳入相位斜率拟合；覆盖更宽但更容易受噪声影响 |
-| `width` | 测量类公开边界 | `0` 使用浮点物理幅值；正整数使用对应满量程整数 I/Q 码，内部分析仍在浮点域进行 |
+| `width` | 测量类探针边界 | `0` 使用浮点物理幅值；正整数先按FS1生成整数I/Q探针；`Measure` 随后根据被绑定处理器自动转换到真实输入量程并按真实输出量程解码 |
 
 右图两侧的橙色区域只是强调：当 `channelBandwidthHz` 扩大时，带边频点会逐渐进入指标统计。它们不是额外的配置参数，也不表示实现中存在隐藏的“带边裁剪点数”。
 
@@ -1572,6 +1572,10 @@ u_j(n-m)|u_k(n-r)|^{p-1},
 | `ProtectMagnitude(inputSignal)` | 对复响应施加安全幅度下限 |
 | `MeasurePath(...)` | 计算一条有向路径的增益、相位、平坦度和群时延 |
 
+`Measure` 不再假定处理器输入和输出共用同一Q1标尺。它先检查可调用对象及其绑定owner的协议属性：普通处理器可暴露 `inputWidth`、`inputFullScaleAmplitude`、`outputWidth` 和 `outputFullScaleAmplitude`；对绑定的 `channel.ProcessPaOutput`，输入宽度和量程会自动从 `channel.paModel.width` 与 `channel.paModel.outputFullScaleAmplitude` 解析，输出宽度和量程则从Channel解析。这样默认定点链路会把分析器生成的FS1冲激转换为PA输出参考面的FS2码，再把Channel返回的FS2码解回物理复包络后估计冲激响应。
+
+工程默认WaveGen/DPD/DAC输入为FS1，`PaModel` 与 `Channel` 输出为FS2。接近25 dBm且高PAPR峰值需要额外余量时，可以把PA和Channel统一改为FS4；绑定方法的自动解析会随owner配置更新。`ChannelAnalyse.width` 仍定义探针的初始位宽，不替代真实接口协议。对匿名lambda或没有这些属性的自定义函数，输入回退到FS1、输出回退到owner量程或FS1，因此生产仪表适配器应显式暴露上述属性，而不是依赖猜测。
+
 ### 9.3 `CouplingAwareDpdGmp` 参数
 
 | 参数 | 默认值 | 含义 |
@@ -1657,7 +1661,7 @@ print(coupling01.ToDict())
 print(preMeasurement.ToDict())
 ```
 
-这里调用的是 `Channel` 的内部浮点线性网络，所以 `ChannelAnalyse.width` 也配置为 0。测量公开定点硬件接口时，应把分析器 `width` 配置为对应位宽。
+这里调用的是 `Channel` 的内部浮点线性网络，所以 `ChannelAnalyse.width` 也配置为 0。测量公开定点硬件接口时，应把分析器 `width` 配置为对应位宽。若测量的是绑定的 `channel.ProcessPaOutput`，无需手工把FS2 PA输出探针伪装成FS1；`Measure` 会自动读取绑定PA的输入量程和Channel的输出量程。
 
 ### 10.2 分析仪表已经恢复的冲激响应
 

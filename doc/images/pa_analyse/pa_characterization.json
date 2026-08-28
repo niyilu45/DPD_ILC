@@ -266,110 +266,110 @@
     {
       "modelName": "gmp",
       "frequencyHz": -41000000.0,
-      "gainDb": 2.148940931833853,
-      "phaseDegrees": 1.9834870483636171
+      "gainDb": 2.155053575409102,
+      "phaseDegrees": 1.9785731663118757
     },
     {
       "modelName": "gmp",
       "frequencyHz": -39000000.0,
-      "gainDb": 2.1473896823243157,
-      "phaseDegrees": 1.828843348621365
+      "gainDb": 2.1535338470159986,
+      "phaseDegrees": 1.8240514094116098
     },
     {
       "modelName": "gmp",
       "frequencyHz": -31000000.0,
-      "gainDb": 2.1246417207107613,
-      "phaseDegrees": 1.3008563604362042
+      "gainDb": 2.1309299074731456,
+      "phaseDegrees": 1.2958151164235494
     },
     {
       "modelName": "gmp",
       "frequencyHz": -29000000.0,
-      "gainDb": 2.115963235394072,
-      "phaseDegrees": 1.1948832118591928
+      "gainDb": 2.122284993990973,
+      "phaseDegrees": 1.1898762423503826
     },
     {
       "modelName": "gmp",
       "frequencyHz": -21000000.0,
-      "gainDb": 2.0765041487118228,
-      "phaseDegrees": 0.8836053939886214
+      "gainDb": 2.082949485845914,
+      "phaseDegrees": 0.8778103125906048
     },
     {
       "modelName": "gmp",
       "frequencyHz": -19000000.0,
-      "gainDb": 2.0666188429353234,
-      "phaseDegrees": 0.8320951092509418
+      "gainDb": 2.0730914006068675,
+      "phaseDegrees": 0.8262454880578564
     },
     {
       "modelName": "gmp",
       "frequencyHz": -11000000.0,
-      "gainDb": 2.032973472635988,
-      "phaseDegrees": 0.7105115174253256
+      "gainDb": 2.039499510855744,
+      "phaseDegrees": 0.7034625765062236
     },
     {
       "modelName": "gmp",
       "frequencyHz": -9000000.0,
-      "gainDb": 2.0267343230071138,
-      "phaseDegrees": 0.6950328860319087
+      "gainDb": 2.0332736297900307,
+      "phaseDegrees": 0.6878795728318728
     },
     {
       "modelName": "gmp",
       "frequencyHz": -1000000.0,
-      "gainDb": 2.012665663694714,
-      "phaseDegrees": 0.6538793742715309
+      "gainDb": 2.0191594675253604,
+      "phaseDegrees": 0.6454608369630058
     },
     {
       "modelName": "gmp",
       "frequencyHz": 1000000.0,
-      "gainDb": 2.011778187819526,
-      "phaseDegrees": 0.6411508593538185
+      "gainDb": 2.01826942335883,
+      "phaseDegrees": 0.6326451850930509
     },
     {
       "modelName": "gmp",
       "frequencyHz": 9000000.0,
-      "gainDb": 2.0162762086842507,
-      "phaseDegrees": 0.5438116920851995
+      "gainDb": 2.02263644833713,
+      "phaseDegrees": 0.5343780894988165
     },
     {
       "modelName": "gmp",
       "frequencyHz": 11000000.0,
-      "gainDb": 2.018578507207495,
-      "phaseDegrees": 0.5025125121514902
+      "gainDb": 2.024925848562194,
+      "phaseDegrees": 0.49306663716202975
     },
     {
       "modelName": "gmp",
       "frequencyHz": 19000000.0,
-      "gainDb": 2.026723527620619,
-      "phaseDegrees": 0.25421959915005315
+      "gainDb": 2.0329037453900476,
+      "phaseDegrees": 0.24441929922997757
     },
     {
       "modelName": "gmp",
       "frequencyHz": 21000000.0,
-      "gainDb": 2.027311677109079,
-      "phaseDegrees": 0.17080857864463203
+      "gainDb": 2.0334779355245445,
+      "phaseDegrees": 0.16108771532333246
     },
     {
       "modelName": "gmp",
       "frequencyHz": 29000000.0,
-      "gainDb": 2.0175632665822274,
-      "phaseDegrees": -0.23348568530662944
+      "gainDb": 2.0235816874383454,
+      "phaseDegrees": -0.24301783247126513
     },
     {
       "modelName": "gmp",
       "frequencyHz": 31000000.0,
-      "gainDb": 2.0110809511015026,
-      "phaseDegrees": -0.34765262679057335
+      "gainDb": 2.017091989375931,
+      "phaseDegrees": -0.357037451922056
     },
     {
       "modelName": "gmp",
       "frequencyHz": 39000000.0,
-      "gainDb": 1.9649106061387984,
-      "phaseDegrees": -0.8157236931952102
+      "gainDb": 1.970827923269829,
+      "phaseDegrees": -0.8245953243983216
     },
     {
       "modelName": "gmp",
       "frequencyHz": 41000000.0,
-      "gainDb": 1.947868286446315,
-      "phaseDegrees": -0.9273723971997038
+      "gainDb": 1.953788021914821,
+      "phaseDegrees": -0.9360710528499951
     },
     {
       "modelName": "doherty",
@@ -616,68 +616,68 @@
     {
       "modelName": "gmp",
       "toneSpacingHz": 500000.0,
-      "outputPowerDbm": 20.160695906051767,
-      "im3LowerDbc": -30.86551798312589,
-      "im3UpperDbc": -30.86639050537272,
-      "im3WorstDbc": -30.86551798312589,
-      "im5WorstDbc": -66.52401958684446,
-      "im7WorstDbc": -107.3630422349605,
-      "im3AsymmetryDb": -0.0008725222468299876
+      "outputPowerDbm": 20.12210562081973,
+      "im3LowerDbc": -50.14826036361519,
+      "im3UpperDbc": -50.1493641141333,
+      "im3WorstDbc": -50.14826036361519,
+      "im5WorstDbc": -87.12106611431473,
+      "im7WorstDbc": -128.3272173628614,
+      "im3AsymmetryDb": -0.0011037505181121787
     },
     {
       "modelName": "gmp",
       "toneSpacingHz": 1000000.0,
-      "outputPowerDbm": 20.117678798229296,
-      "im3LowerDbc": -30.866922971427172,
-      "im3UpperDbc": -30.868565799008763,
-      "im3WorstDbc": -30.866922971427172,
-      "im5WorstDbc": -66.53318209952427,
-      "im7WorstDbc": -107.4500572257972,
-      "im3AsymmetryDb": -0.0016428275815911775
+      "outputPowerDbm": 20.077845432775465,
+      "im3LowerDbc": -50.16033815048615,
+      "im3UpperDbc": -50.16163387150493,
+      "im3WorstDbc": -50.16033815048615,
+      "im5WorstDbc": -87.23006604868239,
+      "im7WorstDbc": -129.42179729007083,
+      "im3AsymmetryDb": -0.0012957210187849455
     },
     {
       "modelName": "gmp",
       "toneSpacingHz": 2000000.0,
-      "outputPowerDbm": 20.13755402772242,
-      "im3LowerDbc": -30.867789795500688,
-      "im3UpperDbc": -30.87112199852102,
-      "im3WorstDbc": -30.867789795500688,
-      "im5WorstDbc": -66.53191182233004,
-      "im7WorstDbc": -107.4607116098407,
-      "im3AsymmetryDb": -0.003332203020331548
+      "outputPowerDbm": 20.098319198772646,
+      "im3LowerDbc": -50.15984080747356,
+      "im3UpperDbc": -50.16269861004495,
+      "im3WorstDbc": -50.15984080747356,
+      "im5WorstDbc": -87.2234800326301,
+      "im7WorstDbc": -129.5269987397315,
+      "im3AsymmetryDb": -0.0028578025713912325
     },
     {
       "modelName": "gmp",
       "toneSpacingHz": 4000000.0,
-      "outputPowerDbm": 20.128972015163995,
-      "im3LowerDbc": -30.87278267265985,
-      "im3UpperDbc": -30.879586078288916,
-      "im3WorstDbc": -30.87278267265985,
-      "im5WorstDbc": -66.53489146083609,
-      "im7WorstDbc": -107.4541882773196,
-      "im3AsymmetryDb": -0.0068034056290677825
+      "outputPowerDbm": 20.089139343208295,
+      "im3LowerDbc": -50.1649460467054,
+      "im3UpperDbc": -50.17076069776442,
+      "im3WorstDbc": -50.1649460467054,
+      "im5WorstDbc": -87.225812266363,
+      "im7WorstDbc": -129.5464439361359,
+      "im3AsymmetryDb": -0.005814651059019127
     },
     {
       "modelName": "gmp",
       "toneSpacingHz": 8000000.0,
-      "outputPowerDbm": 20.129737602272925,
-      "im3LowerDbc": -30.887206717232495,
-      "im3UpperDbc": -30.90191460678853,
-      "im3WorstDbc": -30.887206717232495,
-      "im5WorstDbc": -66.55221252064082,
-      "im7WorstDbc": -107.48840132529219,
-      "im3AsymmetryDb": -0.014707889556035525
+      "outputPowerDbm": 20.089517442925278,
+      "im3LowerDbc": -50.17926396483474,
+      "im3UpperDbc": -50.19205039439808,
+      "im3WorstDbc": -50.17926396483474,
+      "im5WorstDbc": -87.24239256104573,
+      "im7WorstDbc": -129.57698468633586,
+      "im3AsymmetryDb": -0.012786429563341528
     },
     {
       "modelName": "gmp",
       "toneSpacingHz": 12000000.0,
-      "outputPowerDbm": 20.132241484316737,
-      "im3LowerDbc": -30.903227141585276,
-      "im3UpperDbc": -30.92770483228763,
-      "im3WorstDbc": -30.903227141585276,
-      "im5WorstDbc": -66.58885328573376,
-      "im7WorstDbc": -107.56335828633212,
-      "im3AsymmetryDb": -0.02447769070235495
+      "outputPowerDbm": 20.091933460747494,
+      "im3LowerDbc": -50.195481936790074,
+      "im3UpperDbc": -50.217154367916294,
+      "im3WorstDbc": -50.195481936790074,
+      "im5WorstDbc": -87.28085172665166,
+      "im7WorstDbc": -129.65369364002177,
+      "im3AsymmetryDb": -0.02167243112621975
     },
     {
       "modelName": "doherty",
@@ -850,52 +850,52 @@
     {
       "modelName": "gmp",
       "targetOutputPowerDbm": 10.0,
-      "measuredOutputPowerDbm": 10.087206865680884,
-      "im3WorstDbc": -52.3422723343119,
-      "im5WorstDbc": -109.68351838114755,
-      "im7WorstDbc": -171.9889841004403,
-      "dynamicGainHysteresisDb": 0.011615481240186267,
-      "dynamicPhaseHysteresisDegrees": 0.03397092710692344
+      "measuredOutputPowerDbm": 10.081371092490459,
+      "im3WorstDbc": -69.90707106014267,
+      "im5WorstDbc": -127.3535515919818,
+      "im7WorstDbc": -186.81673846838032,
+      "dynamicGainHysteresisDb": 0.011988733305208206,
+      "dynamicPhaseHysteresisDegrees": 0.034278340822068466
     },
     {
       "modelName": "gmp",
       "targetOutputPowerDbm": 15.0,
-      "measuredOutputPowerDbm": 15.101109811993185,
-      "im3WorstDbc": -42.01640136391295,
-      "im5WorstDbc": -88.99348009187703,
-      "im7WorstDbc": -141.24382868261353,
-      "dynamicGainHysteresisDb": 0.010662072769991808,
-      "dynamicPhaseHysteresisDegrees": 0.03318789098512152
+      "measuredOutputPowerDbm": 15.083272637112042,
+      "im3WorstDbc": -59.96535941889023,
+      "im5WorstDbc": -107.33174898991955,
+      "im7WorstDbc": -159.923936181066,
+      "dynamicGainHysteresisDb": 0.011863714345985479,
+      "dynamicPhaseHysteresisDegrees": 0.03417586294471937
     },
     {
       "modelName": "gmp",
       "targetOutputPowerDbm": 20.0,
-      "measuredOutputPowerDbm": 20.128521825495458,
-      "im3WorstDbc": -30.873866915720246,
-      "im5WorstDbc": -66.53709268719575,
-      "im7WorstDbc": -107.45750542724022,
-      "dynamicGainHysteresisDb": 0.007701829134223551,
-      "dynamicPhaseHysteresisDegrees": 0.030658188013819778
+      "measuredOutputPowerDbm": 20.088678494943046,
+      "im3WorstDbc": -50.16583320425155,
+      "im5WorstDbc": -87.22766800206932,
+      "im7WorstDbc": -129.5492689797312,
+      "dynamicGainHysteresisDb": 0.011466957200487037,
+      "dynamicPhaseHysteresisDegrees": 0.033854687141445315
     },
     {
       "modelName": "gmp",
       "targetOutputPowerDbm": 23.0,
-      "measuredOutputPowerDbm": 23.18498802096934,
-      "im3WorstDbc": -22.479440284637562,
-      "im5WorstDbc": -49.202922459580776,
-      "im7WorstDbc": -81.27407281090042,
-      "dynamicGainHysteresisDb": 0.00930465888245857,
-      "dynamicPhaseHysteresisDegrees": 0.028429269950046913
+      "measuredOutputPowerDbm": 23.09475975344421,
+      "im3WorstDbc": -44.50489378609399,
+      "im5WorstDbc": -75.09577253672668,
+      "im7WorstDbc": -110.96662972464912,
+      "dynamicGainHysteresisDb": 0.010887421031597544,
+      "dynamicPhaseHysteresisDegrees": 0.03339526065272925
     },
     {
       "modelName": "gmp",
       "targetOutputPowerDbm": 25.0,
-      "measuredOutputPowerDbm": 24.75348869325586,
-      "im3WorstDbc": -15.700156091216543,
-      "im5WorstDbc": -33.17714281610058,
-      "im7WorstDbc": -57.00480428883896,
-      "dynamicGainHysteresisDb": 0.03051772829813971,
-      "dynamicPhaseHysteresisDegrees": 0.04485778680329209
+      "measuredOutputPowerDbm": 25.098995805767085,
+      "im3WorstDbc": -40.98425252446911,
+      "im5WorstDbc": -66.97425189216446,
+      "im7WorstDbc": -98.3378500505758,
+      "dynamicGainHysteresisDb": 0.010209398874820223,
+      "dynamicPhaseHysteresisDegrees": 0.03286922904720449
     },
     {
       "modelName": "doherty",
@@ -979,17 +979,17 @@
     },
     {
       "modelName": "gmp",
-      "averageGainDb": 2.044140179997654,
-      "gainRippleDb": 0.20107264538753777,
-      "groupDelayNs": 0.07965364560875644,
-      "phaseNonlinearityDegrees": 0.5696255367766244,
-      "im3SpacingVariationDb": 0.037709158459385606,
-      "maximumIm3AsymmetryDb": 0.02447769070235495,
-      "dynamicGainHysteresisDb": 0.007701443579251168,
-      "dynamicPhaseHysteresisDegrees": 0.030657815377806527,
-      "nominalIm3Dbc": -30.87278267265985,
-      "nominalIm5Dbc": -66.53489146083609,
-      "nominalIm7Dbc": -107.4541882773196
+      "averageGainDb": 2.0504043800936005,
+      "gainRippleDb": 0.20126555349428088,
+      "groupDelayNs": 0.07983500440491155,
+      "phaseNonlinearityDegrees": 0.5669196424389802,
+      "im3SpacingVariationDb": 0.04722157317488751,
+      "maximumIm3AsymmetryDb": 0.02167243112621975,
+      "dynamicGainHysteresisDb": 0.011466895595663067,
+      "dynamicPhaseHysteresisDegrees": 0.033854637722683954,
+      "nominalIm3Dbc": -50.1649460467054,
+      "nominalIm5Dbc": -87.225812266363,
+      "nominalIm7Dbc": -129.5464439361359
     },
     {
       "modelName": "doherty",
@@ -1100,7 +1100,7 @@
     {
       "modelName": "gmp",
       "testName": "frequency_response",
-      "measuredEvidence": "Gain ripple=0.201 dB, group delay=0.080 ns, residual phase=0.570 deg.",
+      "measuredEvidence": "Gain ripple=0.201 dB, group delay=0.080 ns, residual phase=0.567 deg.",
       "dpdArchitecture": "Complex FIR or frequency-domain pre-equalizer followed by GMP so linear and nonlinear memory remain jointly modeled.",
       "dpdConfiguration": "Start with 7 complex FIR taps; normalize the center tap and regularize the remaining tap energy.",
       "trainingStrategy": "Jointly fit FIR and GMP on multitone or wideband data with ridge regularization; retain edge-frequency validation.",
@@ -1109,7 +1109,7 @@
     {
       "modelName": "gmp",
       "testName": "memory_effect",
-      "measuredEvidence": "Memory severity=weak; IM3 spacing variation=0.038 dB and maximum sideband asymmetry=0.024 dB.",
+      "measuredEvidence": "Memory severity=weak; IM3 spacing variation=0.047 dB and maximum sideband asymmetry=0.022 dB.",
       "dpdArchitecture": "Full lagging-and-leading GMP or frequency-selective ILC with explicit envelope cross-memory branches.",
       "dpdConfiguration": "Use odd orders (1,3,5,7,9), main memory depth 5-7, and lagging/leading envelope cross-memory depth 3-5.",
       "trainingStrategy": "Train with at least the minimum, nominal, and maximum tested tone spacings using equal output-power weighting; select memory depth on a held-out spacing.",
@@ -1118,7 +1118,7 @@
     {
       "modelName": "gmp",
       "testName": "dynamic_hysteresis",
-      "measuredEvidence": "Dynamic AM-AM RMS=0.008 dB and dynamic AM-PM RMS=0.031 deg.",
+      "measuredEvidence": "Dynamic AM-AM RMS=0.011 dB and dynamic AM-PM RMS=0.034 deg.",
       "dpdArchitecture": "Use bidirectional envelope GMP terms or a compact recurrent envelope-state branch in addition to the main polynomial.",
       "dpdConfiguration": "Retain at least 3 lagging and 3 leading envelope delays; weight AM-PM residuals explicitly in coefficient fitting.",
       "trainingStrategy": "Balance rising and falling envelope samples in every amplitude bin; do not let dense low-amplitude samples dominate the regression.",
@@ -1127,7 +1127,7 @@
     {
       "modelName": "gmp",
       "testName": "nominal_nonlinearity",
-      "measuredEvidence": "Nonlinearity severity=moderate at 20.0 dBm: IM3=-30.87, IM5=-66.53, IM7=-107.45 dBc.",
+      "measuredEvidence": "Nonlinearity severity=mild at 20.0 dBm: IM3=-50.16, IM5=-87.23, IM7=-129.55 dBc.",
       "dpdArchitecture": "Regularized high-order GMP trained with peak-aware weighting and explicit input-amplitude projection.",
       "dpdConfiguration": "Start with orders (1,3,5,7,9), depth 5, cross-depth 3, coefficient normalization, and ridge-factor search.",
       "trainingStrategy": "Begin about 5 dB below the 20.0 dBm severe-distortion point, fit a stable regularized inverse, and increase power in small steps only while held-out error continues to improve.",
@@ -1136,7 +1136,7 @@
     {
       "modelName": "gmp",
       "testName": "output_power",
-      "measuredEvidence": "First strong-distortion point=23.18 dBm (IM3=-22.48 dBc); IM3 power trend=monotonic.",
+      "measuredEvidence": "No strong-distortion threshold crossed; highest tested point=25.10 dBm (IM3=-40.98 dBc); IM3 power trend=monotonic.",
       "dpdArchitecture": "Multi-operating-point GMP or coefficient bank indexed by measured output power and envelope RMS.",
       "dpdConfiguration": "Use all measured anchors (10, 15, 20, 23, 25 dBm), normalize each power block, and regularize coefficient changes between adjacent blocks.",
       "trainingStrategy": "Train and validate every configured output-power point, up-weight the detected knee and maximum-power point, and interpolate coefficients only inside the measured range.",

@@ -201,7 +201,7 @@ A_{\mathrm{probe}}=0.05.
 \approx-21.0\ {\mathrm{dB}}.
 ```
 
-这里的0.25只是“小信号探针最多取目标RMS四分之一”的保护系数，不是PA非线性系数缩放。当前 `SmallestSISO.py` 直接使用默认GMP系数，不再把三阶、五阶、七阶或交叉记忆系数统一乘以25%。探针主要测量GMP的一阶线性项和线性记忆：
+这里的0.25只是“小信号探针最多取目标RMS四分之一”的保护系数，不是PA非线性系数缩放。当前 `SmallestSISO.py` 不在脚本中二次修改系数，而是使用 `GMPConfig` 自身的默认 `nonlinearScale=0.135`：一阶项不变，三阶及以上内置参考项使用13.5%的强度。探针主要测量GMP的一阶线性项和线性记忆：
 
 ```math
 Y_{\mathrm{probe}}(f)
@@ -395,17 +395,18 @@ C_p
 残差。真实PA可能因偏置网络、陷阱效应或电热记忆产生突发内增益下垂，但如果
 没有实测依据，不能默认用数dB、仅持续两三个采样点的下降代表这种物理效应。
 
-当前默认生成器使用三组相关约束修复这个问题。第一，完整默认结构的稳态每阶
-系数改为：
+当前默认生成器使用三组相关约束修复这个问题。第一，完整结构先保存全强度
+参考拟合，再由普通默认 `nonlinearScale=0.135` 缩放三阶及以上项：
 
-| 阶次 | 当前 $C_p$ |
-|---:|---:|
-| 1 | $1.261692+j0.014052$ |
-| 3 | $-0.291144+j0.054204$ |
-| 5 | $0.031812-j0.022452$ |
-| 7 | $-0.000168+j0.002784$ |
+| 阶次 | 全强度参考 $C_p^{ref}$ | 默认有效 $C_p$ |
+|---:|---:|---:|
+| 1 | $1.261692+j0.014052$ | $1.261692+j0.014052$ |
+| 3 | $-0.291144+j0.054204$ | $-0.03930444+j0.00731754$ |
+| 5 | $0.031812-j0.022452$ | $0.00429462-j0.00303102$ |
+| 7 | $-0.000168+j0.002784$ | $-0.00002268+j0.00037584$ |
 
-这些系数由 $0\leq A\leq2$ 内的有界Rapp型响应拟合得到。令
+全强度参考由 $0\leq A\leq2$ 内的有界Rapp型响应拟合得到；默认有效系数用于
+普通稳定基线，`nonlinearScale=1.0` 才恢复压力参考。令
 
 ```math
 P(A)
@@ -471,13 +472,13 @@ C_p-T_p.
 
 | 输入幅度 | 平台纹波 |
 |---:|---:|
-| 0.25 | 0.3065 dB |
-| 0.50 | 0.2997 dB |
-| 0.90 | 0.2780 dB |
-| 1.20 | 0.2513 dB |
-| 1.50 | 0.2148 dB |
-| 1.70 | 0.2320 dB |
-| 2.00 | 0.2615 dB |
+| 0.25 | 0.3084 dB |
+| 0.50 | 0.3075 dB |
+| 0.90 | 0.3052 dB |
+| 1.20 | 0.3029 dB |
+| 1.50 | 0.3006 dB |
+| 1.70 | 0.2992 dB |
+| 2.00 | 0.2977 dB |
 
 这里的平台纹波定义为：
 
@@ -490,12 +491,13 @@ R_{\mathrm{plateau}}
 \right).
 ```
 
-因此0.25至2.0验证扫描的最大值为0.3065 dB，不超过0.307 dB；首点相对稳态
-均值的最大绝对偏差为0.1673 dB。
+因此0.25至2.0验证扫描的最大值约为0.3084 dB；首点相对稳态均值的最大绝对
+偏差约为0.1704 dB。
 
 第三，非默认 `nonlinearOrders` 不能简单从四阶拟合中删列，因为被删除的高阶
-项可能正用于阻止低阶多项式折返。若集合包含一阶项，生成器保留 $C_1$，并在
-必要时用同一个 $0\leq\gamma\leq1$ 缩小所有非线性稳态系数：
+项可能正用于阻止低阶多项式折返。生成器先应用 `nonlinearScale`；若集合包含
+一阶项，再保留 $C_1$，并在必要时用同一个 $0\leq\gamma\leq1$ 进一步缩小所有
+非线性稳态系数：
 
 ```math
 \widetilde C_1=C_1,
@@ -634,8 +636,9 @@ z(u)\approx u
 
 输出功率dBm不能直接代替归一化输入幅度。Channel闭环会调整隐藏模拟驱动，使PA
 输出达到目标功率；判断是否超出GMP拟合区间时，应检查实际送入裸PA内核的浮点
-包络峰值。`SmallestSISO.py` 当前直接使用默认GMP，不再用统一25%系数缩放掩盖
-工作区问题。
+包络峰值。`SmallestSISO.py` 当前直接使用 `GMPConfig` 默认0.135强度，不在
+脚本外再乘一层临时比例；改变强度时应显式配置 `nonlinearScale` 并重新验证
+AM-AM、连续平台和功率可达性。
 
 ### 10. 更合适的局部逆测量
 
@@ -3593,3 +3596,72 @@ AM-PM 一般只要求相位解缠后连续、斜率有界，不应默认强制�
 单调且同号”。共同基函数和全局归一化让系数可比，$C^2$ 软门控保证边界平滑，
 相邻段差分正则提高插值稳定性，AM-AM/AM-PM 或 DPD 静态映射上的形状约束
 负责物理合理性；所有强度最终由独立帧和相邻工作点决定。
+
+## Q11：为什么默认GMP在16位20 dBm时会测到约 -24 dB，而浮点本征应约 -42 dB？
+
+这是固定点**输出观测边界削顶**，不是默认GMP在20 dBm突然变得更非线性。
+
+默认普通GMP使用 `nonlinearScale=0.135`。在EHT 20 MHz、80 Msps、MCS 5、2个数据symbol、`seed=91`、无噪声、25 dBm额定上限，并且每个功率点都新建PA和校准器的条件下，确定性基线为：
+
+| 每路目标输出功率 | 浮点本征 | 16位固定输出，标尺2.0 |
+|---:|---:|---:|
+| 1 dBm | 约 -51.5 dB | 约 -51.5 dB |
+| 16 dBm | 约 -47.6 dB | 约 -47.6 dB |
+| 20 dBm | 约 -42.1 dB | 约 -42.1 dB |
+
+20 dBm时，PA原始高PAPR输出的某个I或Q分量峰值可达约1.60。若固定点输出仍用旧 `fullScaleAmplitude=1.0`，编码器只能表示每分量约 `[-1,1)`，于是把这些峰值夹到码轨。EVM约 -24 dB反映的是不可逆削顶。把位宽从16增加到更多位只会减小量化步长，不会扩大正负1的范围；继续减小GMP非线性系数虽然可能让曲线“看起来变好”，却会掩盖错误参考面。
+
+当前参考面约定是：
+
+1. `WaveGenWifi` 和PA输入DAC固定使用 `fullScaleAmplitude=1.0`；
+2. `PaModel`、`MimoPaModel` 和 `Channel` 固定点输出默认 `outputFullScaleAmplitude=2.0`，提供6.02 dB分量观测余量；
+3. `PowerCalibration` 自动读取绑定plant的输出标尺，第三方plant没有该属性时兼容回退到1.0；
+4. `Analysis` 与 `TwoToneAnalysis` 为兼容外部仪表和旧数组仍默认1.0，因此分析内置固定点plant输出时必须显式传plant标尺；
+5. 接近25 dBm的高PAPR实验若输出分量峰值接近2，可以把plant与分析端标尺一起设为4。标尺增大也会增大量化步长，不应无条件使用更大值。
+
+量程边界复测表明，默认标尺2.0在20 dBm没有rail并保持约 -42.1 dB EVM，是该工作点量化精度与峰值余量的折中；接近额定上限时它可能出现少量rail。把plant及Analysis标尺同时显式设为4.0后，25 dBm测试实测25.095 dBm、EVM约 -35.72 dB，I/Q rail计数为0。
+
+这里应称为scaled full-scale格式，不把任意可配标尺笼统称为Q2.14。`maximumOutputPowerDbm=25` 的功率锚点仍是**解码后输出有效区RMS等于1**；把输出码标尺从1改为2不会修改PA方程、模拟drive或目标dBm，只扩大观测范围。
+
+最小固定点验证代码如下：
+
+```python
+from inc.lib.Analysis import Analysis
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.utils.SigProc import PowerCalibration
+
+waveform = WaveGenWifi(
+    frameFormat="EHT",
+    bandwidthMhz=20,
+    mcs=5,
+    numDataSymbols=2,
+    sampleRateHz=80.0e6,
+    seed=91,
+    width=16,
+).Generate()
+paModel = PaModel(modelName="gmp", width=16)
+calibration = PowerCalibration(
+    paModel=paModel,
+    parameters={
+        "outputPowerDbm": 20.0,
+        "maximumOutputPowerDbm": 25.0,
+        "calibrationToleranceDb": 0.05,
+        "width": 16,
+    },
+)
+referenceCodes = calibration.Calibrate(waveform.samples)
+paOutputCodes = calibration.GetLastPaOutput()
+
+metrics = Analysis(
+    referenceCodes,
+    waveform,
+    width=16,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
+).Analyze(paOutputCodes)
+
+assert abs(metrics["outputPowerDbm"] - 20.0) <= 0.10
+assert abs(metrics["evmDb"] - (-42.0)) <= 1.5
+```
+
+排查时先做三项对照：同一帧 `width=0`；固定点输出按plant标尺解码；统计I/Q是否碰到最大/最小码。只有浮点本征也明显恶化时，才继续检查GMP系数、实际PA输入峰值、温度或功率校准，而不是先改输出量化格式。

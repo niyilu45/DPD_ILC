@@ -77,6 +77,7 @@ from inc.lib.DpdIlc import (
     RunScalarPIlc,
 )
 from inc.lib.PaModel import (
+    GMPConfig,
     IQImbalancePA,
     MimoPaModel,
     PaModel,
@@ -1140,8 +1141,34 @@ class DpdGmpBenchmarkResult:
         }
 
 
+def ResolveBenchmarkOutputFullScaleAmplitude(plant: Any) -> float:
+    """Resolve a benchmark plant's physical output-code full scale.
+
+    Processing details:
+        Algorithm: Inspect an object or bound callback through the common
+        ``outputFullScaleAmplitude`` protocol, preserve the historical unit
+        full scale for third-party plants that do not expose it, and validate
+        the result through ``FixedPoint``.
+
+    Args:
+        plant: PA, PA cascade, calibrator, or third-party plant adapter.
+
+    Returns:
+        result: Positive physical I/Q component full-scale amplitude.
+    """
+
+    protocolOwner = getattr(plant, "__self__", None)
+    if protocolOwner is None:
+        protocolOwner = plant
+    width = int(getattr(protocolOwner, "width", 0))
+    return FixedPoint(
+        width,
+        getattr(protocolOwner, "outputFullScaleAmplitude", 1.0),
+    ).fullScaleAmplitude
+
+
 class DpdGmpPaCascade:
-    """Expose a DpdGmp followed by one PA as a calibration-compatible plant."""
+    """Expose DpdGmp plus PA as one output-format-aware calibration plant."""
 
     def __init__(self, predistorter: DpdGmp, paModel: PaModel) -> None:
         """Store equal-width DPD and PA objects.
@@ -1165,6 +1192,23 @@ class DpdGmpPaCascade:
         self.predistorter = predistorter
         self.paModel = paModel
         self.width = predistorter.width
+
+    @property
+    def OutputFullScaleAmplitude(self) -> float:
+        """Forward the physical PA-output code full scale.
+
+        Processing details:
+            Algorithm: Resolve the live value from the final PA stage so a
+            calibrator or analyzer does not mistake an expanded PA output
+            range for the normalized DPD input range.
+
+        Returns:
+            result: Positive physical I/Q component full-scale amplitude.
+        """
+
+        return ResolveBenchmarkOutputFullScaleAmplitude(self.paModel)
+
+    outputFullScaleAmplitude = OutputFullScaleAmplitude
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
         """Apply DPD followed by the physical PA model.
@@ -1287,11 +1331,13 @@ def CalculateDynamicHysteresis(
     outputSignal: np.ndarray,
     width: int,
     settlingSamples: int,
+    outputFullScaleAmplitude: float = 1.0,
 ) -> Tuple[float, float]:
     """Measure rising/falling envelope gain and phase loop separation.
 
     Processing details:
-        Algorithm: Decode both public waveforms, remove settling edges,
+        Algorithm: Decode the source and PA-output waveforms with their
+        respective physical full scales, remove settling edges,
         calculate the instantaneous complex gain away from envelope nulls,
         classify samples by positive or negative envelope slope, compare
         median gain and circular-mean phase in common amplitude bins, and
@@ -1304,15 +1350,23 @@ def CalculateDynamicHysteresis(
         outputSignal: Matching public PA output waveform.
         width: Shared public I/Q component width.
         settlingSamples: Equal number of edge samples discarded at both ends.
+        outputFullScaleAmplitude: Physical component magnitude represented by
+            the PA output's nominal full-scale code. The default preserves
+            third-party plants that use the historical unit output range.
 
     Returns:
         result: RMS gain-loop separation in dB and phase-loop separation in
             degrees.
     """
 
-    interfaceFormat = FixedPoint(width)
-    decodedInput = interfaceFormat.DecodeComplex(inputSignal).reshape(-1)
-    decodedOutput = interfaceFormat.DecodeComplex(outputSignal).reshape(-1)
+    inputInterfaceFormat = FixedPoint(width)
+    outputInterfaceFormat = FixedPoint(
+        width, outputFullScaleAmplitude
+    )
+    decodedInput = inputInterfaceFormat.DecodeComplex(inputSignal).reshape(-1)
+    decodedOutput = outputInterfaceFormat.DecodeComplex(
+        outputSignal
+    ).reshape(-1)
     if (
         decodedInput.size != decodedOutput.size
         or decodedInput.size == 0
@@ -1430,6 +1484,9 @@ def MeasurePaFrequencyResponse(
             "width": config.width,
         }
     )
+    outputFullScaleAmplitude = ResolveBenchmarkOutputFullScaleAmplitude(
+        paModel
+    )
     rawPoints = []
     halfSpacingHz = 0.5 * config.frequencyToneSpacingHz
     for centerFrequencyHz in config.frequencyCentersHz:
@@ -1451,13 +1508,17 @@ def MeasurePaFrequencyResponse(
             parameters={
                 "settlingSamples": config.settlingSamples,
                 "width": config.width,
+                "outputFullScaleAmplitude": outputFullScaleAmplitude,
             },
         )
-        interfaceFormat = FixedPoint(config.width)
-        decodedInput = interfaceFormat.DecodeComplex(
+        inputInterfaceFormat = FixedPoint(config.width)
+        outputInterfaceFormat = FixedPoint(
+            config.width, outputFullScaleAmplitude
+        )
+        decodedInput = inputInterfaceFormat.DecodeComplex(
             waveform.samples
         )
-        decodedOutput = interfaceFormat.DecodeComplex(paOutput)
+        decodedOutput = outputInterfaceFormat.DecodeComplex(paOutput)
         steadyInput = (
             decodedInput
             if config.settlingSamples == 0
@@ -1591,6 +1652,9 @@ def MeasurePaMemoryEffect(
                     config.maximumOutputPowerDbm
                 ),
                 "width": config.width,
+                "outputFullScaleAmplitude": (
+                    powerCalibration.outputFullScaleAmplitude
+                ),
             },
         )
         metrics = resultAnalysis.Analyze(paOutput)
@@ -1621,6 +1685,7 @@ def MeasurePaMemoryEffect(
                 paOutput,
                 config.width,
                 config.settlingSamples,
+                powerCalibration.outputFullScaleAmplitude,
             )
     if (
         dynamicGainHysteresisDb is None
@@ -1692,6 +1757,9 @@ def MeasurePaPowerSweep(
             "loadResistanceOhm": config.loadResistanceOhm,
             "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
             "width": config.width,
+            "outputFullScaleAmplitude": (
+                powerCalibration.outputFullScaleAmplitude
+            ),
         },
     )
     powerPoints = []
@@ -1710,6 +1778,7 @@ def MeasurePaPowerSweep(
             paOutput,
             config.width,
             config.settlingSamples,
+            powerCalibration.outputFullScaleAmplitude,
         )
         powerPoints.append(
             PaPowerSweepPoint(
@@ -2746,6 +2815,9 @@ def EvaluateDpdGmpWifiStage(
             "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
             "loadResistanceOhm": config.loadResistanceOhm,
             "width": config.width,
+            "outputFullScaleAmplitude": (
+                powerCalibration.outputFullScaleAmplitude
+            ),
         },
     )
     return resultAnalysis.Analyze(paOutput)
@@ -2798,6 +2870,9 @@ def EvaluateDpdGmpTwoToneStage(
             "loadResistanceOhm": config.loadResistanceOhm,
             "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
             "width": config.width,
+            "outputFullScaleAmplitude": (
+                powerCalibration.outputFullScaleAmplitude
+            ),
         },
     )
     return resultAnalysis.Analyze(paOutput)
@@ -3908,10 +3983,11 @@ def BuildChannelAnalysisPaBank(width: int) -> MimoPaModel:
     """Construct two different nonlinear PA branches for channel testing.
 
     Processing details:
-        Algorithm: Bind a memory-polynomial PA to chain zero and a Wiener PA
-        to chain one so the compensation test cannot benefit from an
-        accidental common inverse model, while preserving the selected
-        public I/Q convention at the MIMO boundary.
+        Algorithm: Bind a full-reference-strength GMP PA to chain zero and a
+        Wiener PA to chain one so this explicit stress benchmark remains
+        stable when the ordinary user-facing GMP default is retuned, cannot
+        benefit from an accidental common inverse model, and preserves the
+        selected public I/Q convention at the MIMO boundary.
 
     Args:
         width: Public floating or fixed-point component width.
@@ -3924,7 +4000,10 @@ def BuildChannelAnalysisPaBank(width: int) -> MimoPaModel:
         parameters={
             "numTransmitChains": 2,
             "paParametersPerChain": (
-                {"modelName": "gmp"},
+                {
+                    "modelName": "gmp",
+                    "gmpConfig": GMPConfig(nonlinearScale=1.0),
+                },
                 {"modelName": "wiener"},
             ),
             "width": width,
@@ -4301,7 +4380,8 @@ def BuildChannelDpdImprovements(
         values, and require those three coupling objectives to improve.  Keep
         the signed ACLR delta visible while applying a one-decibel regression
         guard because uncanceled same-channel leakage raises the independent
-        stage's wanted-band denominator and is not an ACLR benefit.
+        stage's wanted-band denominator and is not an ACLR benefit. The three
+        direct coupling objectives must still improve.
 
     Args:
         stages: Ordered benchmark stage results.
@@ -5114,6 +5194,9 @@ def RunIlcCurvePoint(
         parameters={
             "maximumOutputPowerDbm": maximumOutputPowerDbm,
             "width": width,
+            "outputFullScaleAmplitude": (
+                ResolveBenchmarkOutputFullScaleAmplitude(paModel)
+            ),
         },
     )
     if methodName == "Frequency-domain ILC":
@@ -5201,6 +5284,9 @@ def RunTwoToneIlcBenchmark(
             "loadResistanceOhm": config.loadResistanceOhm,
             "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
             "width": config.width,
+            "outputFullScaleAmplitude": (
+                powerCalibration.outputFullScaleAmplitude
+            ),
         },
     )
     baselineMetrics = resultAnalysis.Analyze(baselineOutput)
@@ -5562,6 +5648,9 @@ def RunAllIlcBenchmark(
             "loadResistanceOhm": config.loadResistanceOhm,
             "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
             "width": config.width,
+            "outputFullScaleAmplitude": (
+                powerCalibration.outputFullScaleAmplitude
+            ),
         },
     )
     validationAnalysis = Analysis(
@@ -5571,6 +5660,9 @@ def RunAllIlcBenchmark(
             "loadResistanceOhm": config.loadResistanceOhm,
             "maximumOutputPowerDbm": config.maximumOutputPowerDbm,
             "width": config.width,
+            "outputFullScaleAmplitude": (
+                powerCalibration.outputFullScaleAmplitude
+            ),
         },
     )
     maxAmplitude = max(

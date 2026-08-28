@@ -151,6 +151,27 @@ def ResolvePaWidth(paModel: Any) -> int:
     return int(resolvedWidth)
 
 
+def ResolvePaOutputFullScaleAmplitude(paModel: Any) -> float:
+    """Return the physical magnitude represented by PA output codes.
+
+    Processing details:
+        Algorithm: Read the optional plant protocol attribute, fall back to
+        the historical normalized scale of one, and validate it through the
+        common fixed-point convention.
+
+    Args:
+        paModel: PA, Channel, wrapper, or third-party plant object.
+
+    Returns:
+        result: Positive physical I/Q component full-scale amplitude.
+    """
+
+    resolvedFullScale = getattr(
+        paModel, "outputFullScaleAmplitude", 1.0
+    )
+    return FixedPoint(0, resolvedFullScale).fullScaleAmplitude
+
+
 class NormalizedPaAdapter:
     """Expose any public PA through a normalized floating-point ILC boundary."""
 
@@ -170,6 +191,10 @@ class NormalizedPaAdapter:
 
         self.paModel = paModel
         self.interfaceFormat = FixedPoint(ResolvePaWidth(paModel))
+        self.outputInterfaceFormat = FixedPoint(
+            ResolvePaWidth(paModel),
+            ResolvePaOutputFullScaleAmplitude(paModel),
+        )
         self.width = 0
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
@@ -261,13 +286,15 @@ class NormalizedPaAdapter:
             publicChannelOutput = rawPublicOutput
             publicFeedbackOutput = rawPublicOutput
         return (
-            self.interfaceFormat.DecodeComplex(publicChannelOutput),
-            self.interfaceFormat.DecodeComplex(publicFeedbackOutput),
+            self.outputInterfaceFormat.DecodeComplex(publicChannelOutput),
+            self.outputInterfaceFormat.DecodeComplex(publicFeedbackOutput),
         )
 
 
 def EncodeIlcResult(
-    result: ILCResult, interfaceFormat: FixedPoint
+    result: ILCResult,
+    interfaceFormat: FixedPoint,
+    outputInterfaceFormat: Optional[FixedPoint] = None,
 ) -> ILCResult:
     """Encode all signal-valued ILC result fields for the public interface.
 
@@ -278,7 +305,9 @@ def EncodeIlcResult(
 
     Args:
         result: Normalized floating-point ILC result.
-        interfaceFormat: Public fixed-point conversion convention.
+        interfaceFormat: Public input fixed-point conversion convention.
+        outputInterfaceFormat: Optional PA/channel observation convention.
+            None preserves the historical same-scale behavior.
 
     Returns:
         result: ILC result whose waveform arrays contain public I/Q codes.
@@ -286,19 +315,28 @@ def EncodeIlcResult(
 
     if interfaceFormat.IsFloatingPoint():
         return result
+    selectedOutputFormat = (
+        interfaceFormat
+        if outputInterfaceFormat is None
+        else outputInterfaceFormat
+    )
+    if selectedOutputFormat.width != interfaceFormat.width:
+        raise ValueError(
+            "input and output ILC formats must use the same width"
+        )
     publicHistory = [
         replace(
             iterationRecord,
             inputSignal=interfaceFormat.EncodeComplex(
                 iterationRecord.inputSignal
             ),
-            outputSignal=interfaceFormat.EncodeComplex(
+            outputSignal=selectedOutputFormat.EncodeComplex(
                 iterationRecord.outputSignal
             ),
             feedbackOutputSignal=(
                 None
                 if iterationRecord.feedbackOutputSignal is None
-                else interfaceFormat.EncodeComplex(
+                else selectedOutputFormat.EncodeComplex(
                     iterationRecord.feedbackOutputSignal
                 )
             ),
@@ -307,12 +345,14 @@ def EncodeIlcResult(
     ]
     return ILCResult(
         learnedInput=interfaceFormat.EncodeComplex(result.learnedInput),
-        outputSignal=interfaceFormat.EncodeComplex(result.outputSignal),
+        outputSignal=selectedOutputFormat.EncodeComplex(result.outputSignal),
         history=publicHistory,
         feedbackOutputSignal=(
             None
             if result.feedbackOutputSignal is None
-            else interfaceFormat.EncodeComplex(result.feedbackOutputSignal)
+            else selectedOutputFormat.EncodeComplex(
+                result.feedbackOutputSignal
+            )
         ),
     )
 
@@ -818,6 +858,10 @@ def RunFrequencyDomainIlc(
             feedbackOutputSignal=finalFeedbackOutput,
         ),
         interfaceFormat,
+        FixedPoint(
+            interfaceFormat.width,
+            ResolvePaOutputFullScaleAmplitude(paModel),
+        ),
     )
 
 
@@ -1591,6 +1635,10 @@ def RunWaveformUpdate(
             feedbackOutputSignal=finalFeedbackOutput,
         ),
         interfaceFormat,
+        FixedPoint(
+            interfaceFormat.width,
+            ResolvePaOutputFullScaleAmplitude(paModel),
+        ),
     )
 
 def EstimateComplexGain(
@@ -1908,6 +1956,10 @@ def RunFirIlc(
             sampleRateHz,
         ),
         interfaceFormat,
+        FixedPoint(
+            interfaceFormat.width,
+            ResolvePaOutputFullScaleAmplitude(paModel),
+        ),
     )
 
 def RunDirectionalGaussNewtonIlc(
@@ -2001,6 +2053,10 @@ def RunDirectionalGaussNewtonIlc(
             sampleRateHz,
         ),
         interfaceFormat,
+        FixedPoint(
+            interfaceFormat.width,
+            ResolvePaOutputFullScaleAmplitude(paModel),
+        ),
     )
 
 def MemoryPolynomialBasis(
@@ -2140,6 +2196,10 @@ def RunParameterDomainIlc(
             feedbackOutputSignal=finalFeedbackOutput,
         ),
         interfaceFormat,
+        FixedPoint(
+            interfaceFormat.width,
+            ResolvePaOutputFullScaleAmplitude(paModel),
+        ),
     )
 
 def RunAugmentedIqIlc(
@@ -2232,6 +2292,10 @@ def RunAugmentedIqIlc(
             sampleRateHz,
         ),
         interfaceFormat,
+        FixedPoint(
+            interfaceFormat.width,
+            ResolvePaOutputFullScaleAmplitude(paModel),
+        ),
     )
 
 
@@ -2277,6 +2341,22 @@ class MimoPaChain:
         return self.mimoPaModel.width
 
     width = Width
+
+    @property
+    def OutputFullScaleAmplitude(self) -> float:
+        """Return the parent MIMO PA output-code physical full scale.
+
+        Processing details:
+            Algorithm: Forward the live parent property so a per-chain ILC
+            result uses the same observation scale as the matrix PA facade.
+
+        Returns:
+            result: Positive physical I/Q component full-scale amplitude.
+        """
+
+        return self.mimoPaModel.outputFullScaleAmplitude
+
+    outputFullScaleAmplitude = OutputFullScaleAmplitude
 
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
         """Process one vector through the selected physical PA path.

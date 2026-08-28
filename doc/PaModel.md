@@ -932,18 +932,30 @@ G_v(r)
 \right).
 ```
 
-默认 `(1, 3, 5, 7)`、`memoryDepth=3`、`crossMemoryDepth=2` 在恒包络稳态下合并后的系数为：
+`DefaultGmpCoefficients` 先保存一组全强度参考拟合 $C_p^{ref}$。普通
+`GMPConfig` 默认 `nonlinearScale=0.135`，只缩放 $p>1$ 的参考项：
 
-| 阶次 | 合并系数 $C_p$ | 对默认曲线的主要作用 |
-|---:|---:|---|
-| 1 | $1.261692+j0.014052$ | 小信号复增益 |
-| 3 | $-0.291144+j0.054204$ | 主要软压缩和轻度 AM-PM |
-| 5 | $0.031812-j0.022452$ | 修正压缩膝点及中高幅度相位 |
-| 7 | $-0.000168+j0.002784$ | 保持拟合区间高幅度端平滑 |
+```math
+C_1=C_1^{ref},
+\qquad
+C_p=0.135C_p^{ref},\quad p>1.
+```
 
-这些数值来自 `DefaultGmpCoefficients`，不是器件测量值。它们是在
-$0\leq r\leq2$ 的归一化输入幅度范围内，对有界 Rapp 型 AM-AM 曲线和
-轻度 AM-PM 曲线进行拟合得到的。该区间内的默认输出幅度保持单调：
+默认 `(1, 3, 5, 7)`、`memoryDepth=3`、`crossMemoryDepth=2` 在恒包络稳态下的
+参考系数和实际有效系数为：
+
+| 阶次 | 全强度参考 $C_p^{ref}$ | 默认有效 $C_p$ | 对默认曲线的主要作用 |
+|---:|---:|---:|---|
+| 1 | $1.261692+j0.014052$ | $1.261692+j0.014052$ | 小信号复增益 |
+| 3 | $-0.291144+j0.054204$ | $-0.03930444+j0.00731754$ | 主要软压缩和轻度 AM-PM |
+| 5 | $0.031812-j0.022452$ | $0.00429462-j0.00303102$ | 修正压缩膝点及中高幅度相位 |
+| 7 | $-0.000168+j0.002784$ | $-0.00002268+j0.00037584$ | 保持拟合区间高幅度端平滑 |
+
+这些数值不是器件测量值。全强度参考是在 $0\leq r\leq2$ 的归一化输入幅度
+范围内对有界Rapp型AM-AM和轻度AM-PM曲线拟合得到的；默认0.135强度保留可测
+功率趋势，同时避免20 dBm基线过度失真。`nonlinearScale=1.0` 可恢复全强度
+压力参考，但不应再把它称为普通默认。显式提供三个系数字典时，调用方数值是
+最终执行值，不会再乘 `nonlinearScale`。该区间内的默认输出幅度保持单调：
 
 ```math
 \frac{d}{dr}
@@ -958,14 +970,14 @@ $0\leq r\leq2$ 的归一化输入幅度范围内，对有界 Rapp 型 AM-AM 曲�
 
 | 输入幅度 $r$ | 输出幅度 | 局部幅度斜率 | 输出相位 |
 |---:|---:|---:|---:|
-| 0.55 | 0.6473 | 1.0130 | 1.39度 |
-| 0.80 | 0.8713 | 0.7699 | 2.12度 |
-| 1.00 | 1.0034 | 0.5496 | 2.78度 |
-| 1.30 | 1.1199 | 0.2377 | 3.66度 |
-| 1.70 | 1.1624 | 0.0387 | 4.23度 |
-| 2.00 | 1.1949 | 0.2465 | 4.78度 |
+| 0.55 | 0.6877 | 1.2281 | 0.73度 |
+| 0.80 | 0.9907 | 1.1952 | 0.81度 |
+| 1.00 | 1.2268 | 1.1653 | 0.87度 |
+| 1.30 | 1.5699 | 1.1232 | 0.93度 |
+| 1.70 | 2.0121 | 1.0965 | 0.92度 |
+| 2.00 | 2.3438 | 1.1237 | 0.92度 |
 
-输出斜率在膝点附近很小，表示深压缩，但没有出现“输入继续增大、输出反而
+输出斜率始终为正，曲线呈温和压缩而没有出现“输入继续增大、输出反而
 减小”的多项式折返。幅度超过 2 属于拟合区间之外的外推，代码不会声称该
 区域仍满足单调性、器件精度或稳定可逆性。
 
@@ -1047,15 +1059,16 @@ R_{\mathrm{plateau}}
 \right).
 ```
 
-七个验证幅度0.25、0.50、0.90、1.20、1.50、1.70和2.00的最大平台纹波为
-0.3065 dB，即不超过0.307 dB；首点相对第7个样点以后稳态均值的最大绝对
-偏差为0.1673 dB。这个测试限制的是默认演示系数的短时动态，不是对任意实测
+七个验证幅度0.25、0.50、0.90、1.20、1.50、1.70和2.00的最大平台纹波约为
+0.3084 dB；首点相对第7个样点以后稳态均值的最大绝对偏差约为0.1704 dB。
+这个测试限制的是默认演示系数的短时动态，不是对任意实测
 自定义字典强加物理限制。
 
-**非默认阶次集合。**完整四阶拟合中的高阶项可能负责抵消低阶项的折返，直接
-删除某一阶不能保证剩余多项式仍单调。因此 `DefaultGmpCoefficients` 对包含
-一阶项的非默认集合保留 $C_1$，并用同一个系数 $\gamma$ 缩小所有选中的非线性
-稳态项：
+**非默认阶次集合。**生成器先把调用方的 `nonlinearScale` 作用于三阶及以上
+参考项。完整四阶拟合中的高阶项可能负责抵消低阶项的折返，直接删除某一阶
+不能保证剩余多项式仍单调。因此 `DefaultGmpCoefficients` 对包含一阶项的
+非默认集合保留 $C_1$，必要时再用同一个安全系数 $\gamma$ 缩小所有已经过
+`nonlinearScale` 处理的非线性稳态项：
 
 ```math
 \widetilde C_1=C_1,
@@ -1065,8 +1078,8 @@ R_{\mathrm{plateau}}
 ```
 
 其中 $0\leq\gamma\leq1$，由0至2幅度网格上的单调性搜索确定；需要缩放时再
-保留2%的数值余量。完整 `(1, 3, 5, 7)` 已经单调，所以 $\gamma=1$，上述默认
-系数完全不变。参考表没有定义的9阶及更高阶默认稳态系数为0，不再使用可能在
+保留2%的数值余量。完整 `(1, 3, 5, 7)` 已经单调，所以 $\gamma=1$，但这不
+撤销前一级默认0.135强度。参考表没有定义的9阶及更高阶默认稳态系数为0，不再使用可能在
 大幅度处失控的经验外推系数。
 
 如果请求的默认阶次集合不含一阶项，模型没有有意义的小信号增益。生成器只把
@@ -1087,6 +1100,7 @@ R_{\mathrm{plateau}}
 | `nonlinearOrders` | 决定生成哪些奇数阶；含一阶的非默认子集会共同缩小非线性 $C_p$ 以保持0至2内单调，未知高阶默认值为0；不含一阶时只启用最低阶后备项 | 数值曲线由三个系数字典中的实际键和值决定，默认单调化不会改写显式字典 |
 | `memoryDepth` | 增加主项延迟抽头；默认一阶尾抽头改变小信号频响，高阶尾抽头改变动态压缩，零延迟项会自动回调以保持稳态 $C_p$ 不变 | 自定义字典是最终执行项；只改深度不会自动创建或删除调用方给出的键 |
 | `crossMemoryDepth` | 增加滞后/超前包络项并回调默认零延迟主项；增强动态 AM-AM、AM-PM 和迟滞，但不改变默认稳态曲线 | 自定义 `laggingCoefficients`、`leadingCoefficients` 的实际内容决定执行项 |
+| `nonlinearScale` | 默认0.135；在默认系数生成时统一缩放三阶及以上参考项，一阶不变；1.0恢复全强度压力参考 | 显式系数字典是最终值，不重复乘该比例 |
 | `mainCoefficients[(1,m)]` | 直接决定小信号 FIR 增益和频率响应 | 实部、虚部共同决定幅度与相位，不能把虚部简单理解成“只影响相位” |
 | `mainCoefficients[(p,m)]`, $p>1$ | 决定静态曲率和对应阶次的记忆 | 负实方向的三阶项常产生压缩，正实方向常产生扩张，但最终结果取决于所有复向量之和 |
 | `laggingCoefficients` | 对恒包络稳态并入 $C_p$，对调制包络形成历史依赖 | 增大后通常加宽同一输入幅度对应的增益散点或迟滞环 |
@@ -1677,6 +1691,8 @@ U_m^{(i+1)}[k]
 
 `maximumOutputPowerDbm=25.0` 表示PA输出参考面的额定上限，不表示16位DAC正码 `32767` 本身就是25 dBm。数字码经过DAC后，工程链路通常还有可调衰减器、VGA或射频驱动级。若闭环只在定点编码前不断放大OFDM波形，高峰均比会先使I/Q码削顶，PA驱动不再随预设增长；这会把本来低于额定上限的20 dBm错误判断为不可达。
 
+还要把输入DAC标尺与PA输出观测标尺分开。`PaModel` 和 `MimoPaModel` 的固定点输入仍使用 `FixedPoint(width, 1.0)`；固定点输出默认使用 `FixedPoint(width, outputFullScaleAmplitude=2.0)`，比单位幅度多6.02 dB分量观测余量。这个scaled full-scale只防止PA高PAPR输出在软件观测边界削顶，不改变PA方程、输入drive或“解码后RMS等于1对应25 dBm”的功率锚点。接近25 dBm且输出峰值仍接近2时，可按需把输出标尺配置成4，但量化步长也会随之增大。
+
 本工程因此为 `PaModel` 与 `MimoPaModel` 提供配套的内部校准协议：
 
 - `ProcessCalibrationDrive(inputSignal, driveDbPerChain)` 使用本轮显式模拟驱动进行一次试探，但不修改已提交状态；
@@ -1718,7 +1734,7 @@ u_m[n]=10^{g_m/20}x_{q,m}[n].
 
 ## 11. 默认参数不是器件测量结果
 
-`GMPConfig` 在未给系数字典时生成一组压缩型、带轻微记忆的复系数。稳态系数来自 $0\leq|x|\leq2$ 内的有界 Rapp 型曲线拟合，并在这个声明的归一化范围内验证 AM-AM 单调。默认非线性主记忆尾项和交叉项都按各阶稳态 $C_p$ 比例生成，再调整每阶零延迟主系数，使记忆项总和不会改变稳态曲线；一阶线性尾项仍使用独立的小信号FIR系数。非默认阶次子集会在需要时共同缩小非线性项，未知高阶默认值为0；无一阶集合只保留最低阶的单调数值后备项。其作用是让工程开箱即用，并为所有 ILC 方法提供一致、可解释的非线性对象；它们不代表某个具体 PA 的工作频率、工艺、输出功率或温度，也不保证幅度超过 2 后的多项式外推仍符合真实器件。
+`GMPConfig` 在未给系数字典时生成一组压缩型、带轻微记忆的复系数。全强度稳态参考来自 $0\leq|x|\leq2$ 内的有界 Rapp 型曲线拟合；普通默认 `nonlinearScale=0.135` 只把三阶及以上参考项缩到13.5%，一阶小信号项保持不变，并在这个声明的归一化范围内验证 AM-AM 单调。默认非线性主记忆尾项和交叉项都按各阶有效稳态 $C_p$ 比例生成，再调整每阶零延迟主系数，使记忆项总和不会改变稳态曲线；一阶线性尾项仍使用独立的小信号FIR系数。非默认阶次子集会在需要时进一步共同缩小非线性项，未知高阶默认值为0；无一阶集合只保留最低阶的单调数值后备项。其作用是让工程开箱即用，并为所有 ILC 方法提供一致、可解释的非线性对象；它们不代表某个具体 PA 的工作频率、工艺、输出功率或温度，也不保证幅度超过 2 后的多项式外推仍符合真实器件。
 
 若要拟合真实器件，通常需要：
 
@@ -1741,33 +1757,25 @@ $\lambda>0$ 可以缓和高阶基函数相关造成的病态问题，但过大�
 
 ### 11.1 无噪声功率区分与独立帧验证
 
-下面的结果用于检查默认普通 GMP 与默认 Doherty 是否能在没有噪声的条件下表现出随输出功率变化的失真，而不是把默认系数当作某一颗真实器件的指标。测试采用 EHT 20 MHz、80 Msps、MCS 7、4 个数据 symbol 和浮点接口；功率标定上限为 25 dBm。每个功率点都先在 PA 输入端闭环校准，使 PA 原生输出达到目标功率，校准后不再缩放 PA 输出。训练帧使用 `seed=321`，验证帧使用未参与 ILC 或 GMP 回归的 `seed=987`。单功率 DPD 在相应功率点生成 8 轮 ILC 标签，再使用阶次 `(1, 3, 5, 7)`、主记忆深度 5、交叉记忆深度 3、岭系数 $10^{-4}$ 和峰值权重指数 2 的 `DpdGmp` 拟合。
+下面是默认普通GMP的确定性无噪声回归点，不是某颗真实器件的规格。测试固定为EHT 20 MHz、80 Msps、MCS 5、2个数据symbol、`seed=91`、`maximumOutputPowerDbm=25`；每个功率点都新建波形对应格式、PA、功率校准器和Analysis，先从PA输入闭环到目标功率，再直接分析 `GetLastPaOutput()`，不在PA后补乘常数。EVM dB越负越好。
 
-表中 ACLR 使用正数抑制度表示，因此越大越好；EVM dB 越负越好。全部闭环实测功率与目标值之差小于 0.13 dB。
+| 每路目标输出功率 | 浮点本征 `width=0` | 16位固定输出，$F_{out}=2$ |
+|---:|---:|---:|
+| 1 dBm | 约 -51.5 dB | 约 -51.5 dB |
+| 16 dBm | 约 -47.6 dB | 约 -47.6 dB |
+| 20 dBm | 约 -42.1 dB | 约 -42.1 dB |
 
-| GMP 目标功率 | Baseline实测功率 | Baseline EVM | Baseline最差ACLR | 单功率DPD实测功率 | 单功率DPD EVM | 单功率DPD最差ACLR |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 dBm | 1.08 dBm | -51.03 dB | 33.04 dB | 1.08 dBm | -57.01 dB | 33.06 dB |
-| 10 dBm | 10.09 dBm | -43.92 dB | 32.98 dB | 10.08 dBm | -49.91 dB | 33.04 dB |
-| 16 dBm | 16.11 dBm | -32.48 dB | 32.06 dB | 16.09 dBm | -37.31 dB | 32.56 dB |
-| 20 dBm | 20.12 dBm | -23.87 dB | 28.37 dB | 20.09 dBm | -26.56 dB | 29.35 dB |
+推荐把精确回归断言写成以 `(-52, -48, -42)` dB为中心的正负1.5 dB窗口，并额外要求相邻功率点至少恶化2 dB、1至20 dBm总变化超过8 dB。功率闭环容差设为0.05 dB时，每点Analysis报告功率可要求距目标不超过0.10 dB。这样既能捕获模型强度或参考面回归，又不会把FFT、同步和平台差异钉死到最后一位小数。
 
-| Doherty目标功率 | Baseline实测功率 | Baseline EVM | Baseline最差ACLR | 单功率DPD实测功率 | 单功率DPD EVM | 单功率DPD最差ACLR |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 dBm | 1.06 dBm | -51.19 dB | 33.07 dB | 1.06 dBm | -56.99 dB | 33.10 dB |
-| 10 dBm | 10.06 dBm | -44.02 dB | 32.99 dB | 10.06 dBm | -50.17 dB | 33.06 dB |
-| 16 dBm | 16.07 dBm | -33.83 dB | 32.11 dB | 16.08 dBm | -40.44 dB | 32.56 dB |
-| 20 dBm | 20.12 dBm | -26.73 dB | 29.46 dB | 20.11 dBm | -28.15 dB | 29.92 dB |
+16位结果必须用两个不同标尺：发送参考和DAC输入使用 `FixedPoint(16, 1.0)`，PA输出使用 `FixedPoint(16, paModel.outputFullScaleAmplitude)`，Analysis显式配置同一个 `outputFullScaleAmplitude`。默认输出标尺2.0时，20 dBm高PAPR输出不会碰到每分量正负满码，固定点结果因此与浮点本征结果接近。
 
-这组数据表明两种模型都已经具有清楚的功率趋势：从 1 dBm 提高到 20 dBm 时，普通 GMP 的 Baseline EVM 恶化约 27.16 dB，Doherty 恶化约 24.46 dB。当前默认 Doherty 也没有比普通 GMP 过度恶化；在 16 dBm 和 20 dBm，它的 Baseline EVM 分别比普通 GMP 好约 1.35 dB 和 2.87 dB。单功率 DPD 在独立帧上仍能改善 EVM，说明改善不是简单地记住训练帧。
+若沿用旧输出标尺1.0，20 dBm原始输出分量峰值可达约1.60，输出编码会把超出正负1的样点夹到码轨；此时测得约 -24 dB EVM是**输出观测削顶**，不是GMP本征非线性，也不是 `nonlinearScale=0.135` 太强。增加位宽仍不改变正负1范围，继续减小GMP系数则会错误地掩盖参考面问题。正确修复是恢复默认输出标尺2.0，并让PowerCalibration和Analysis按该标尺解码；接近25 dBm的更高PAPR实验若峰值接近2，可按需把PA/Channel输出标尺与分析标尺一起设为4。
 
-低功率 ACLR 不能按同样方式解读。用完全线性的理想直通模型测量同一个 `seed=987` 波形时，1、10、16 和 20 dBm 的最差 ACLR 均为 33.1156 dB；功率只改变整体幅度，不改变该比值。因此表中约 33 dB 的低功率结果已经碰到当前 Wi-Fi 源波形的窗化、帧边界和带外谱本底。此时 PA 失真即使继续减小，报告的 ACLR 也不会明显提高。若需要用 ACLR 比较更弱的非线性，应先提高源波形本身的带外抑制，或同时报告相对于线性直通参考扣除后的净失真谱；不能把约 33 dB 的平台误判成 PA 已经产生了同等强度的邻道再生。
+量程边界复测进一步说明了这个取舍：默认输出标尺2.0在20 dBm无rail并保持上述约 -42.1 dB；接近额定上限时会出现少量rail。显式把plant和Analysis标尺同时设为4.0后，25 dBm测试实测25.095 dBm、EVM约 -35.72 dB，I/Q rail计数为0。因而2.0是默认20 dBm精度与余量的折中，4.0是近25 dBm高PAPR场景的按需设置，不应把默认值无条件扩大。
 
-训练和验证还必须使用不同帧。若 ILC 标签、DPD 回归和最终 EVM 都使用同一个 seed，回归器可能拟合该帧特有的 OFDM 样点轨迹、前后补零和边界瞬态，使结果比未见数据更好。这里固定训练 seed 为 321、验证 seed 为 987，正是为了隔离这种同帧泄漏。修改模型后应继续保留独立帧，并最好再增加多个验证 seed 报告均值与最差值。
+同一默认GMP的当前双音特性产物在20 dBm给出IM3/IM5/IM7约 `-50.16/-87.23/-129.55 dBc`；扫功率没有旧的strong-distortion阈值，最高实测25.10 dBm点IM3约 `-40.98 dBc`。这些数值应以 `doc/images/pa_analyse` 下重新生成的CSV/JSON为准。
 
-不应为了让 1 dBm 和 10 dBm 的曲线看起来差异更大而刻意“调坏”普通 GMP 默认值。大输出回退时，高阶基函数按 $|x|^{p-1}$ 自然快速减小，无噪声模型接近线性是预期结果。普通 GMP 默认模型承担的是稳定、单调、容易校准且适合算法回归测试的基线职责；任意放大高阶或记忆系数可能造成非物理折返、功率校准多解或失败，也会把“被测 PA 更复杂”和“DPD 使用相同 GMP 基函数所以容易求逆”混为一谈。需要更真实且更难的 plant 时，应优先使用实测系数、自定义 `GMPConfig`、`PiecewiseGMPPA`，或显式增加温度、频率选择性 I/Q、反馈链和其他已知失配，同时保留普通 GMP 作为可解释基线。
-
-最后，单功率结果不等于一套系数可以无代价覆盖全部功率。把 1、10、16 和 20 dBm 的四组标签联合拟合到同一个普通 `DpdGmp` 后，独立帧 EVM 分别为：GMP `-49.32/-44.20/-33.81/-25.38 dB`，Doherty `-49.10/-43.39/-36.95/-27.76 dB`。它在中高功率取得一定改善，却会牺牲部分低功率性能，因为一套固定复系数需要在相差 19 dB 的包络分布之间折中。工程上可以按工作功率保存独立系数，在相邻功率锚点之间插值，或使用 `PiecewiseDpdGmp` 的平滑区域模型；无论采用哪种方案，都应在未参与训练的功率点和 Wi-Fi 帧上验证插值，而不是只比较训练锚点。
+低功率无噪声EVM接近线性是高阶项按 $|x|^{p-1}$ 快速衰减的正常结果。普通GMP默认模型承担稳定、单调、连续平台、功率可达且适合算法回归的基线职责；需要更复杂的plant时，应使用实测系数、自定义 `GMPConfig`、`PiecewiseGMPPA`，或显式增加温度、频率选择性I/Q和反馈链失配，同时保留这组普通GMP回归点作为参考。
 
 ---
 
@@ -1778,6 +1786,7 @@ classDiagram
     class PaModel {
         +modelName
         +width
+        +outputFullScaleAmplitude
         +Process(inputSignal)
         +ProcessFloating(inputSignal)
         +ProcessOutputPathsFloating(inputSignal)
@@ -1859,6 +1868,7 @@ classDiagram
     }
     class MimoPaModel {
         +width
+        +outputFullScaleAmplitude
         +Process(inputMatrix)
         +ProcessFloating(inputMatrix)
         +ProcessOutputPathsFloating(inputMatrix)
@@ -1956,7 +1966,7 @@ dohertyOutput = paModel.Process(inputSignal)
 ```
 
 `PaModel` 的公开构造签名为
-`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, piecewiseGmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收I/Q整数码，解码后先应用最近一次成功功率校准提交的模拟驱动，再使用选定电模型计算，最后把结果编码回整数码。未运行功率校准时该驱动为0 dB，所以原有直接调用行为不变。公开返回容器始终是 `numpy.complex128`：
+`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, piecewiseGmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。定点输入DAC标尺固定为1.0，固定点输出 `outputFullScaleAmplitude` 默认2.0。`Process` 在定点模式下接收I/Q整数码，按输入标尺解码后先应用最近一次成功功率校准提交的模拟驱动，再使用选定电模型计算，最后按输出标尺把结果编码回整数码。未运行功率校准时该驱动为0 dB，所以原有直接调用行为不变。公开返回容器始终是 `numpy.complex128`：
 
 ```python
 from inc.lib.PaModel import PaModel
@@ -1969,12 +1979,16 @@ fixedPa = PaModel(
     parameters={"modelName": "gmp", "width": 16}
 )
 
-fixedFormat = FixedPoint(width=16)
-fixedInputCodes = fixedFormat.EncodeComplex(inputSignal)
+inputFormat = FixedPoint(width=16, fullScaleAmplitude=1.0)
+outputFormat = FixedPoint(
+    width=16,
+    fullScaleAmplitude=fixedPa.outputFullScaleAmplitude,
+)
+fixedInputCodes = inputFormat.EncodeComplex(inputSignal)
 
 floatingOutput = floatingPa.Process(inputSignal)
 fixedOutputCodes = fixedPa.Process(fixedInputCodes)
-fixedOutputForInspection = fixedFormat.DecodeComplex(fixedOutputCodes)
+fixedOutputForInspection = outputFormat.DecodeComplex(fixedOutputCodes)
 
 assert fixedOutputCodes.real.max() <= 32767
 assert fixedOutputCodes.real.min() >= -32768
@@ -1983,6 +1997,9 @@ assert fixedOutputForInspection.dtype == floatingOutput.dtype
 ```
 
 这种边界模型包含“输入码值舍入误差经过非线性放大”和“PA输出再次编码量化”两部分，但PA内部幂次、记忆抽头与包络交叉项仍使用归一化浮点。公开16位最大正码是 `32767`；完整码值推导见 [FixedPoint.md](./FixedPoint.md)。
+
+`MimoPaModel` 的公开构造签名为
+`MimoPaModel(parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`；默认同样使用输入标尺1.0和所有输出列共享的标尺2.0。
 
 多路调用只传需要修改的覆盖值，默认值仍在类内部：
 

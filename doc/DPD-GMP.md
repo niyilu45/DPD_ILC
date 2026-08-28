@@ -238,7 +238,9 @@ ILC 可以产生高自由度、波形专用的逆响应；GMP 再把这些标签
 u[n].
 ```
 
-辨识完成后把后置逆系数复制到前置 DPD。对应接口为 `FitIndirect`。该方法不需要显式 ILC 标签，但依赖 PA 在训练工作点附近可逆，而且反馈链的噪声、频响和非线性会进入系数。
+辨识完成后把后置逆系数复制到前置 DPD。对应接口为 `FitIndirect(paInputSignal, paOutputSignal, sampleRateHz, signalProcessingParameters=None, sampleWeights=None, paOutputFullScaleAmplitude=1.0)`。该方法不需要显式 ILC 标签，但依赖 PA 在训练工作点附近可逆，而且反馈链的噪声、频响和非线性会进入系数。
+
+定点间接学习中，PA输入/DAC标签按FS1解码，PA或反馈输出则由末尾的 `paOutputFullScaleAmplitude` 单独声明。当前 `PaModel` 与 `Channel` 默认输出FS2，因此其输出码应传2.0；旧Q1采集可沿用默认1.0，统一扩大量程的高PAPR链路可传4.0。公共复增益补偿开启时纯常数尺度可能被对齐吸收，但关闭 `enableComplexGainCompensation` 后，漏传FS2会直接把反馈幅度减半并改变后置逆目标。
 
 ---
 
@@ -558,7 +560,7 @@ J
 
 ## 12. 本工程默认基准的实测验证
 
-`tests/BenchMark.py --dpd-gmp` 对默认 GMP PA 执行以下阶段。基准使用 `seed=321` 的EHT帧生成10/12/14 dBm ILC标签并拟合系数，再用 `validationSeed=987` 的独立EHT帧重新闭环各阶段、各功率点并计算Wi-Fi EVM和ACLR；验证帧从不参与回归。当前默认 PA 的静态系数拟合为单调 Rapp 型曲线，记忆项是零和的小动态残差；因此下文的 `stress` 表示相对于 12 dBm 标称点的较高功率压力点，不再表示模型已经发生多项式折返或不可逆深压缩：
+`tests/BenchMark.py --dpd-gmp` 对默认 GMP PA 执行以下阶段。基准使用 `seed=321` 的EHT帧生成10/12/14 dBm ILC标签并拟合系数，再用 `validationSeed=987` 的独立EHT帧重新闭环各阶段、各功率点并计算Wi-Fi EVM和ACLR；验证帧从不参与回归。普通GMP默认 `nonlinearScale=0.135`，即三阶及以上只采用 full-reference 稳态拟合的13.5%，一阶小信号和记忆底不缩放；`nonlinearScale=1.0` 只用于显式压力plant。当前默认 PA 的静态曲线单调，记忆项是零和的小动态残差；因此下文的 `stress` 表示相对于 12 dBm 标称点的较高功率压力点，不再表示模型已经发生多项式折返或不可逆深压缩：
 
 1. 12 dBm 和 15 dBm 无 DPD 基线；
 2. 基础 1/3/5 阶 DPD-GMP；
@@ -583,16 +585,16 @@ J
 
 | 改进 | 改进前 | 改进后 | 目标变化 |
 |---|---:|---:|---:|
-| 基础 DPD-GMP：独立帧 Wi-Fi EVM | -40.405 dB | -46.122 dB | 改善 5.717 dB |
-| 基础 DPD-GMP：双音 IM3 | -48.28 dBc | -54.56 dBc | 改善 6.28 dB |
-| 15 dBm 压力点回到 12 dBm：基础 DPD EVM | -39.238 dB | -46.122 dB | 改善 6.883 dB |
-| 扩展阶数与记忆：标签 NMSE | -58.18 dB | -60.04 dB | 改善 1.85 dB |
-| 峰值加权：峰值标签 NMSE | -61.80 dB | -62.30 dB | 改善 0.51 dB |
+| 基础 DPD-GMP：独立帧 Wi-Fi EVM | -50.524 dB | -56.273 dB | 改善 5.749 dB |
+| 基础 DPD-GMP：双音 IM3 | -65.947 dBc | -71.152 dBc | 改善 5.205 dB |
+| 15 dBm 压力点回到 12 dBm：基础 DPD EVM | -54.038 dB | -56.273 dB | 改善 2.235 dB |
+| 扩展阶数与记忆：标签 NMSE | -68.094 dB | -71.317 dB | 改善 3.223 dB |
+| 峰值加权：峰值标签 NMSE | -72.992 dB | -73.868 dB | 改善 0.876 dB |
 | 增强岭正则：条件数 | 约 `5.44e7` | 约 `5.48e5` | 改善约 19.96 dB |
-| 多功率联合训练：最差标签 NMSE | -45.43 dB | -47.75 dB | 改善 2.33 dB |
-| 多功率联合训练：独立帧最差 ACLR | 32.890 dB | 32.862 dB | 退化 0.028 dB，0.10 dB护栏内通过 |
+| 多功率联合训练：最差标签 NMSE | -62.510 dB | -64.806 dB | 改善 2.296 dB |
+| 多功率联合训练：独立帧最差 ACLR | 33.062199 dB | 33.062091 dB | 退化 0.000108 dB，0.10 dB护栏内通过 |
 
-扩展结构在当前弱记忆默认模型上只把独立验证帧的12 dBm Wi-Fi EVM从-46.122 dB改善到-46.234 dB，约改善0.112 dB，说明标签拟合收益并不等于同量级的射频收益。多功率ACLR也不是强制改善项：源Wi-Fi波形的ACLR本底约为33 dB，因此基准只要求多功率最差ACLR相对单功率正则模型的下降不超过0.10 dB。本次从32.890 dB变为32.862 dB，退化0.028 dB并通过护栏，不能据此宣称ACLR得到提升。精确机器可读数据位于 `doc/images/pa_analyse/dpd_gmp` 中的CSV和JSON。参考数值只描述当前默认行为模型、`seed=321`训练帧和`validationSeed=987`独立验证帧，真实PA必须重新采集和验收。
+扩展结构在当前弱记忆默认模型上把独立验证帧的12 dBm Wi-Fi EVM从-56.273 dB改善到-56.678 dB，约改善0.405 dB，说明标签拟合收益并不等于同量级的射频收益。多功率ACLR也不是强制改善项：源Wi-Fi波形的ACLR本底约为33 dB，因此基准只要求多功率最差ACLR相对单功率正则模型的下降不超过0.10 dB。本次从33.062199 dB变为33.062091 dB，退化0.000108 dB并通过护栏，不能据此宣称ACLR得到提升。精确机器可读数据位于 `doc/images/pa_analyse/dpd_gmp` 中的CSV和JSON。参考数值只描述当前默认行为模型、`seed=321`训练帧和`validationSeed=987`独立验证帧，真实PA必须重新采集和验收。
 
 ---
 
@@ -620,7 +622,7 @@ A_{\max}\frac{u[n]}{|u[n]|},
 
 限幅是安全约束，不是理想线性化方法。若大量样点触发限幅，应降低工作点、改善训练覆盖或重新选择模型，而不是继续增大高阶系数。
 
-`width=0` 时公开接口使用归一化浮点复数。`width>0` 时公开输入输出使用有符号整数 I/Q 码，GMP 内部仍解码为浮点完成基函数与回归，最后再编码。定点模式需要重新测量 EVM 和 ACLR，因为量化、舍入和饱和都可能改变最佳系数。
+`width=0` 时公开接口使用浮点复数。`width>0` 时公开输入输出使用有符号整数 I/Q 码，GMP 内部仍解码为浮点完成基函数与回归，最后再编码。数字参考、DPD输出和DAC输入默认FS1；PA/Channel观测默认FS2，并由 `Analysis.outputFullScaleAmplitude` 或 `TwoToneAnalysis.outputFullScaleAmplitude` 使用同一标尺解码。接近25 dBm的高PAPR输出若仍触及FS2，可把PA、Channel和分析器统一改为FS4，但不能改变DPD/DAC的FS1输入约定。定点模式需要重新测量 EVM 和 ACLR，因为量化、舍入和饱和都可能改变最佳系数。
 
 ---
 

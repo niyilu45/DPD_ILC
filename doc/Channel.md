@@ -4,6 +4,9 @@
 
 `inc/lib/Channel.py` 描述PA前多通道耦合、独立非线性PA、PA后耦合、外部仪表采样和板载反馈接收机。公开入口 `Channel.Process(...)` 固定返回二元组 `chOut, fbOut`：`chOut` 始终是前向主路测量；`sampleMode="forward"` 时 `fbOut` 是 `chOut` 的数值相同副本，`sampleMode="fb"` 时 `fbOut` 才是经过完整反馈接收链的DPD/ILC训练观测。两种模式都只运行一次PA、使用同一段记忆状态和同一个热周期，不能通过分别调用PA来伪造。
 
+公开构造签名为
+`Channel(paModel=None, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。固定点输入DAC标尺保持1.0；固定点 `chOut`/`fbOut` 的 `outputFullScaleAmplitude` 默认2.0，提供6.02 dB分量观测余量。两者位宽相同但幅度标尺可以不同。
+
 `sampleMode` 不改变公开 `Process` 的二元组顺序，但会决定第二项怎样产生：默认 `"forward"` 复制第一项并完全绕过FB专用链；`"fb"` 才执行完整反馈接收机。`ProcessFloating`、`ApplyChannelEffects`、`ProcessPaOutput`、`SmallSignalGain` 等兼容单输出接口仍按它选择旧行为。需要反馈链训练的新代码应显式选择fb模式并解包两路：
 
 ```python
@@ -632,6 +635,8 @@ p_m(\mathbf d+\Delta d\mathbf e_n)-p_m(\mathbf d)
 
 浮点模式没有有限数字满量程，闭环可以把完整的候选drive直接乘到公开浮点波形。定点模式不同：公开接口中的复数容器仍为 `numpy.complex128`，但I和Q必须是位宽允许范围内的整数码。若闭环继续放大这些码，数字输入会先饱和成相同的码序列；再增加迭代次数也不会改变实际PA激励。
 
+本节前半部分的 $Q_W$、$D_W$ 和 $A_{\mathrm{FS}}$ 描述**输入DAC**，其 `fullScaleAmplitude=1.0`。PA输出在进入功率检测或返回调用方时使用另一套相同位宽的scaled full-scale格式：默认 `outputFullScaleAmplitude=2.0`。输出标尺只扩大观测范围，不参与下面输入drive拆分。
+
 Channel因此把正位宽校准分成两个物理阶段：
 
 ```mermaid
@@ -730,6 +735,8 @@ r_y
 ```
 
 所以 `20 dBm <= 25 dBm` 对默认GMP等内置drive-aware plant必须可达，不能因为公开定点码已经饱和而误报不可达。真正的不可达情况包括目标高于额定上限、第三方plant没有模拟drive接口且数字码已到满量程，以及用户自定义PA参数使响应不覆盖目标或出现无法求解的非单调区。
+
+功率校准器会自动读取Channel的输出标尺并按 `FixedPoint(width, channel.outputFullScaleAmplitude)` 解码干净PA输出。默认GMP在20 dBm时的高PAPR分量峰值可超过1；若错误沿用输出标尺1.0，会先发生输出观测削顶，并可能把本征约 -42 dB的EVM误测成约 -24 dB。默认标尺2.0修复的是这个观测边界，不是通过减小GMP系数来掩盖失真；它在20 dBm无rail，是量化精度与峰值余量的默认折中。接近25 dBm且峰值接近2时，可按需把Channel与后续Analysis的输出标尺一起配置成4；边界复测实测25.095 dBm、EVM约 -35.72 dB且I/Q rail计数为0。
 
 一次 `Channel.Process(rawSignal, outputPowerDbm=target)` 的完整顺序为：
 
@@ -1333,6 +1340,7 @@ flowchart TB
 | `calibrationProbeStepDb` | 增大时 Jacobian 探测更明显，但局部线性近似变粗 | 不是实际输出功率步进 |
 | `calibrationRegularization` | 增大时联合求解更稳定、更新更保守 | 过大可能留下功率偏差 |
 | `width` | `0` 为物理浮点幅值；正整数使用对应满量程整数 I/Q 码 | 内部 PA 和信道计算仍是浮点 |
+| `outputFullScaleAmplitude` | 增大时固定点 `chOut`/`fbOut` 的物理分量范围扩大 | 不改变输入DAC范围、PA非线性或dBm锚点；同位宽下会增大量化步长 |
 
 调用 `Process(inputSignal, outputPowerDbm=...)` 时，`outputPowerDbm` 才是本次运行希望每路 PA 达到的实际输出功率；它不是构造参数。图中 G 区把它作为闭环目标单独画出，是为了避免与 `maximumOutputPowerDbm` 混淆。
 
@@ -1345,6 +1353,7 @@ Channel(
     paModel=None,
     parameters=None,
     width=None,
+    outputFullScaleAmplitude=None,
     **parameterOverrides,
 )
 ```
@@ -1359,6 +1368,7 @@ Channel(
 | `sampleRateHz` | `1.0` | sample/s | CFO、SFO、分数时延和热时间换算使用的真实采样率 |
 | `phaseDegrees` | `0` | degree | PA输出后的公共移相，仅允许 `-90`、`0`、`90` |
 | `width` | `16` | bit/I或Q | `0`为浮点；正整数为公开边界有符号I/Q码位宽 |
+| `outputFullScaleAmplitude` | `2.0` | normalized component | 固定点 `chOut`/`fbOut` 正满码代表的I或Q分量幅度；默认相对单位幅度提供6.02 dB观测余量，输入DAC标尺仍为1.0 |
 
 #### 6.1.1 周期热运行参数
 
@@ -2026,6 +2036,7 @@ stressFeedbackParameters = {
 
 | 方法 | 参数 | 返回值或作用 |
 |---|---|---|
+| `OutputFullScaleAmplitude` / `outputFullScaleAmplitude` | 无 | 返回固定点 `chOut`/`fbOut` 的scaled full-scale分量标尺；默认2.0，供PowerCalibration自动发现及Analysis显式接线 |
 | `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 返回 `(chOut, fbOut)`；默认稳态热模式每次都校准后只提交一个稳态周期。`forward` 复制第一项，`fb` 执行完整反馈链；首次必须给目标，后续 `None` 复用最近成功目标 |
 | `ProcessOutputPathsFloating(inputSignal)` | 内部归一化浮点波形 | 从一次PA/热周期返回浮点 `(chOut, fbOut)`；`sampleMode` 决定第二项是前向副本还是反馈观测，供ILC适配器使用 |
 | `ProcessFloating(inputSignal)` | 内部归一化浮点波形 | 兼容单输出入口，按 `sampleMode` 返回一路；新代码不应用它代替双输出接口 |
@@ -2177,20 +2188,20 @@ chOut, fbOut = channel.Process(paInputSignal)
 
 ```mermaid
 flowchart LR
-    publicInput["公开PA输入"] --> decode["解码到内部浮点"]
+    publicInput["公开PA输入<br/>输入标尺1"] --> decode["解码到内部浮点"]
     decode --> pa["PA.ProcessFloating"]
     pa --> forward["前向仪表采样<br/>跳过全部fb参数"]
     forward --> noise["AddNoise"]
-    noise --> encodeCh["编码chOut"]
+    noise --> encodeCh["按输出标尺编码chOut<br/>默认2"]
     pa --> sampleMode{"sampleMode：选择fbOut来源"}
     sampleMode -->|forward| copy["数值相同副本"]
     sampleMode -->|fb| feedback["完整FB链 + 独立噪声<br/>含FB ADC"]
     noise -. "forward副本来源" .-> copy
-    copy --> encodeFb["编码fbOut"]
+    copy --> encodeFb["按输出标尺编码fbOut<br/>默认2"]
     feedback --> encodeFb
 ```
 
-图示说明：`width=0` 时解码和编码是等值复制；`width>0` 时两路公开I/Q都是整数码，但PA、移相和噪声仍在内部归一化浮点域计算。默认 `sampleMode="forward"` 时只生成一次前向波形并让两项逐样点相同；选择 `"fb"` 才构造第二条反馈链。最终Analysis使用 `chOut`，而DPD/ILC使用 `fbOut`。
+图示说明：`width=0` 时解码和编码是等值复制；`width>0` 时两路公开I/Q都是整数码，但PA、移相和噪声仍在内部归一化浮点域计算。输入使用标尺1，两个输出共用Channel的 `outputFullScaleAmplitude`，默认2。默认 `sampleMode="forward"` 时只生成一次前向波形并让两项逐样点相同；选择 `"fb"` 才构造第二条反馈链。最终Analysis使用 `chOut`，而DPD/ILC使用 `fbOut`，两者都必须按Channel输出标尺解码。
 
 ### 7.3 前向仪表与板载反馈同时输出
 
@@ -2421,6 +2432,7 @@ resultAnalysis = Analysis(
         "maximumOutputPowerDbm": 25.0,
         "loadResistanceOhm": 50.0,
         "width": 0,
+        "outputFullScaleAmplitude": channel.outputFullScaleAmplitude,
     },
 )
 metrics = resultAnalysis.Analyze(chOut)
@@ -2431,7 +2443,7 @@ print(metrics["evmDb"], metrics["evmPercent"])
 print(metrics["aclrWorstDb"])
 ```
 
-固定移相会由Analysis的公共复增益步骤补偿；随机噪声、PA非线性和记忆失真仍会进入SNR和EVM残差。`Analysis` 的独立使用方式见 [Analysis.md §11](./Analysis.md)。
+固定移相会由Analysis的公共复增益步骤补偿；随机噪声、PA非线性和记忆失真仍会进入SNR和EVM残差。浮点模式下输出标尺不改变样值，但保留这项显式接线可让同一示例切换到固定点后仍正确。`Analysis` 的独立使用方式见 [Analysis.md §11](./Analysis.md)。
 
 ### 7.7 16位定点接口
 
@@ -2445,12 +2457,12 @@ from inc.lib.PaModel import PaModel
 from inc.utils.FixedPoint import FixedPoint
 
 
-fixedPoint = FixedPoint(16)
+inputFormat = FixedPoint(16, fullScaleAmplitude=1.0)
 floatingInput = np.array(
     [0.10 + 0.20j, -0.25 + 0.15j],
     dtype=np.complex128,
 )
-fixedInput = fixedPoint.EncodeComplex(floatingInput)
+fixedInput = inputFormat.EncodeComplex(floatingInput)
 paModel = PaModel(
     parameters={"modelName": "wiener", "width": 16}
 )
@@ -2468,16 +2480,21 @@ channel = Channel(
 fixedChOut, fixedFbOut = channel.Process(
     fixedInput, outputPowerDbm=20.0
 )
+outputFormat = FixedPoint(
+    16,
+    fullScaleAmplitude=channel.outputFullScaleAmplitude,
+)
+decodedChOut = outputFormat.DecodeComplex(fixedChOut)
 calibratedPublicInput = channel.GetLastPaInput()
 actualPaInput = channel.GetLastActualPaInput()
 calibrationMetrics = channel.GetLastCalibrationMetrics()
 
-assert fixedOutput.dtype == np.complex128
+assert fixedChOut.dtype == np.complex128
 assert np.array_equal(
-    fixedOutput.real, np.rint(fixedOutput.real)
+    fixedChOut.real, np.rint(fixedChOut.real)
 )
 assert np.array_equal(
-    fixedOutput.imag, np.rint(fixedOutput.imag)
+    fixedChOut.imag, np.rint(fixedChOut.imag)
 )
 assert np.array_equal(
     calibratedPublicInput.real,
@@ -2492,9 +2509,10 @@ assert abs(
     calibrationMetrics["measuredOutputPowerDbmPerChain"][0]
     - 20.0
 ) <= 0.25
+assert np.all(np.isfinite(decodedChOut))
 ```
 
-10 mV不会被直接当成整数码10。Channel先把物理电压转换为内部归一化RMS，生成浮点噪声，最后统一编码为16位整数码。`calibratedPublicInput`也是整数码，并默认保留6 dB分量峰值余量；`actualPaInput`是公开码解码后再经过隐藏模拟drive、Tx I/Q和PA前耦合的浮点物理参考面，因此不应对它做整数码断言。默认25 dBm额定上限下，20 dBm由内置Wiener、GMP等drive-aware plant正常覆盖。
+10 mV不会被直接当成整数码10。Channel先把物理电压转换为内部归一化RMS，生成浮点噪声，最后按输出标尺编码为16位整数码。`calibratedPublicInput`也是整数码，并默认保留6 dB分量峰值余量；`actualPaInput`是公开码按输入标尺1解码后再经过隐藏模拟drive、Tx I/Q和PA前耦合的浮点物理参考面，因此不应对它做整数码断言。`decodedChOut` 必须用Channel的输出标尺解码。默认25 dBm额定上限下，20 dBm由内置Wiener、GMP等drive-aware plant正常覆盖。
 
 ### 7.8 运行时更新参数和复现噪声
 

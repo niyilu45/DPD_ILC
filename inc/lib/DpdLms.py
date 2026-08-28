@@ -1059,6 +1059,7 @@ class DpdLms(DpdGmp):
             Mapping[str, object]
         ] = None,
         sampleWeights: Optional[np.ndarray] = None,
+        paOutputFullScaleAmplitude: float = 1.0,
     ) -> DpdLmsTrainingResult:
         """Adapt an indirect-learning postinverse sample by sample.
 
@@ -1076,6 +1077,9 @@ class DpdLms(DpdGmp):
             sampleRateHz: Positive complex sample rate used by synchronization.
             signalProcessingParameters: Optional SigProc overrides.
             sampleWeights: Optional per-aligned-sample importance.
+            paOutputFullScaleAmplitude: Physical component magnitude
+                represented by the feedback output code rail. The default
+                preserves historical Q1 captures.
 
         Returns:
             result: Indirect sample-update and fixed-model diagnostics.
@@ -1095,6 +1099,7 @@ class DpdLms(DpdGmp):
         floatingOutput = self.PreparePublicSignal(
             paOutputSignal,
             "paOutputSignal",
+            paOutputFullScaleAmplitude,
         )
         signalProcessor = SigProc(
             floatingInput,

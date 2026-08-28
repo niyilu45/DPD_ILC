@@ -449,7 +449,11 @@ P_{m,\mathrm{dBm}}
 P_{\mathrm{max,dBm}}+20\log_{10}(a_m).
 ```
 
-默认值是 $R=50\ \Omega$、$P_{\mathrm{max,dBm}}=25\ \mathrm{dBm}$、`activePowerThresholdDb=-60.0`、`activeGapToleranceSamples=16`。定点模式先把公开整数 I/Q 码按位宽解码成归一化复包络，再使用同一公式，所以浮点和定点入口具有相同的功率定义。若外部系统使用不同的满量程功率，必须通过 `maximumOutputPowerDbm` 传入实际标定值；它不是由EVM或复增益自动猜测出来的。完整有效区检测与任意幅度重标定推导见 [SigProc.md](./SigProc.md#131-有效信号区间与占空比)。
+默认值是 $R=50\ \Omega$、$P_{\mathrm{max,dBm}}=25\ \mathrm{dBm}$、`activePowerThresholdDb=-60.0`、`activeGapToleranceSamples=16`。定点Reference/DAC码始终按 `FixedPoint(width, 1.0)` 解码；定点待测输出则按 `FixedPoint(width, outputFullScaleAmplitude)` 解码，再使用同一功率公式。`Analysis` 为兼容外部仪表和旧数组默认 `outputFullScaleAmplitude=1.0`，无法只从裸整数码推断plant标尺；分析内置 `PaModel`、`MimoPaModel` 或 `Channel` 输出时必须显式传 `plant.outputFullScaleAmplitude`，其默认值为2.0。若外部系统使用不同的额定功率锚点，还必须通过 `maximumOutputPowerDbm` 传入实际标定值；它不是由EVM或复增益自动猜测出来的。完整有效区检测与任意幅度重标定推导见 [SigProc.md](./SigProc.md#131-有效信号区间与占空比)。
+
+输出scaled full-scale标尺与dBm锚点是两个独立量。默认输出标尺2.0表示正满码附近代表I或Q分量幅度2，提供6.02 dB观测余量；`maximumOutputPowerDbm=25` 仍表示**解码后有效区RMS等于1**对应25 dBm。扩大输出标尺不会改变PA工作点，只会扩大观测范围并同比增大量化步长。
+
+默认2.0是面向20 dBm高PAPR基线的精度/余量折中：该点无rail并保持约 -42.1 dB EVM。接近25 dBm时若2.0出现rail，应让plant与Analysis同时使用4.0；边界复测实测25.095 dBm、EVM约 -35.72 dB且I/Q rail计数为0。TwoToneAnalysis分析同一固定点PA输出时也必须使用同一输出标尺。
 
 MIMO 的每路 PA 是独立传导端口，不能把复电压直接相加。总输出功率应先在线性功率域相加：
 
@@ -1522,7 +1526,7 @@ A_{i,\mathrm{target}}
 10^{(p_i-p_{\max})/20}.
 ```
 
-浮点模式把每轮试探输入直接送入方法求值器。定点模式先生成保留数字余量的合法整数I/Q码，再把闭环剩余功率差保存在解码后的隐藏post-DAC模拟驱动中；PA输出按相同位宽解码后测功率，量化和削顶由此真实影响闭环与EVM。多个目标功率点的公开码可以完全相同，物理工作点由不同的 `analogDriveDbPerChain` 区分。收敛驱动会提交到plant；ILC的 `NormalizedPaAdapter` 对Channel先使用 `ProcessNormalizedOutputPaths` 保持稳态热公共校准语义，对普通PA则调用 `ProcessOutputPathsFloating` 应用该驱动。raw `ProcessFloating` 不应用隐藏驱动，避免已经管理物理输入标尺的Channel重复增益。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
+浮点模式把每轮试探输入直接送入方法求值器。定点模式先按输入DAC标尺1.0生成保留数字余量的合法整数I/Q码，再把闭环剩余功率差保存在解码后的隐藏post-DAC模拟驱动中；PA输出使用相同位宽但独立的plant `outputFullScaleAmplitude` 解码后测功率，量化和削顶由此真实影响闭环与EVM。多个目标功率点的公开码可以完全相同，物理工作点由不同的 `analogDriveDbPerChain` 区分。收敛驱动会提交到plant；ILC的 `NormalizedPaAdapter` 对Channel先使用 `ProcessNormalizedOutputPaths` 保持稳态热公共校准语义，对普通PA则调用 `ProcessOutputPathsFloating` 应用该驱动。raw `ProcessFloating` 不应用隐藏驱动，避免已经管理物理输入标尺的Channel重复增益。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
 
 `outputPowerDbmValues` 必须有限且严格递增，每一点都不得超过 `maximumOutputPowerDbm`。结果对象保留的 `driveScaleValues` 只是由额定极限计算的名义初始试探比例，不是闭环最终隐藏预设；`targetOutputRmsValues` 用于审计50 Ω物理输出标定。
 
@@ -1608,6 +1612,7 @@ EVM(dB)
 |---|---|---|
 | 无噪声浮点曲线正常，固定毫伏噪声后反转 | 绝对噪声地板 | 改用固定相对 `noiseSnrDb`；检查反转是否消失 |
 | 只有定点模式反转 | 满量程量化或削顶 | 与 `width=0` 对照，并检查码峰值和削顶计数 |
+| 默认GMP浮点20 dBm约 -42 dB，16位却约 -24 dB | PA输出被旧标尺1.0削顶 | 保持输入DAC标尺1.0；把PA/Channel输出和Analysis的 `outputFullScaleAmplitude` 同时设为2.0 |
 | 不同功率的公开码相同，但实测输出功率不同 | 预期的固定数字余量设计 | 检查 `analogDriveDbPerChain` 是否随目标功率变化 |
 | ILC历史在多个目标点都落到近似同一功率 | 已提交模拟驱动未进入浮点ILC plant | 普通PA检查 `ProcessOutputPathsFloating`；Channel检查 `ProcessNormalizedOutputPaths` |
 | FB LC-NMSE改善，但曲线选中的主路EVM不佳 | 错把反馈最佳轮当成报告最佳轮 | 使用 `EvaluateIlcPowerPoint`，并核对每轮 `chOut` 严格EVM |
@@ -1632,6 +1637,8 @@ relativeSnrChannelParameters = {
 ```
 
 若还设置了 `ILCConfig.feedbackSnrDb`，它只影响训练用 `fbOut`，不等于Channel主路的传导噪声；做本征对照时也应设为 `None`，除非实验目的就是测试带噪反馈收敛。
+
+上述约 -24 dB现象不是“固定点一定比浮点差18 dB”。默认EHT MCS5、`seed=91`、无噪声20 dBm工作点的原始输出分量峰值可达约1.60；若仍按 `fullScaleAmplitude=1` 编码，超范围峰值会不可逆夹到码轨。内置PA/Channel默认输出标尺2.0后，16位结果应回到约 -42.1 dB并接近浮点本征；增加位宽但保留标尺1.0不会修复范围问题。
 
 ---
 
@@ -1798,6 +1805,9 @@ ILC 每轮收敛结果另外输出：
 ## 11. 代码入口和典型调用
 
 `Analysis` 是独立的测量与结果统计类，不要求使用任何ILC算法。只要能够得到参考波形和待测波形，或者接收波形包含本工程可解析的Wi-Fi描述字段，就可以直接计算指标。下面所有示例都不导入 `DpdIlc`；表中的逐轮历史接口只是兼容迭代算法输出的可选扩展，不是使用Analysis的前提。
+
+公开构造签名为
+`Analysis(referenceSignal=None, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。其中 `outputFullScaleAmplitude` 只描述待测输出码，默认1.0；Reference/DAC码仍使用标尺1.0。
 
 | 计算步骤 | 方法 |
 |---|---|
@@ -1993,6 +2003,7 @@ resultAnalysis = Analysis(
         "maximumOutputPowerDbm": 25.0,
         "loadResistanceOhm": 50.0,
         "width": 0,
+        "outputFullScaleAmplitude": channel.outputFullScaleAmplitude,
     },
 )
 metrics = resultAnalysis.Analyze(chOut)
@@ -2016,14 +2027,20 @@ forwardMetrics = Analysis(
     transmittedSignal=referenceSignal,
     sampleRateHz=wifiWaveform.sampleRateHz,
     channelBandwidthHz=wifiWaveform.bandwidthHz,
-    parameters={"width": 0},
+    parameters={
+        "width": 0,
+        "outputFullScaleAmplitude": channel.outputFullScaleAmplitude,
+    },
 ).Analyze()
 feedbackMetrics = Analysis(
     fbOut,
     transmittedSignal=referenceSignal,
     sampleRateHz=wifiWaveform.sampleRateHz,
     channelBandwidthHz=wifiWaveform.bandwidthHz,
-    parameters={"width": 0},
+    parameters={
+        "width": 0,
+        "outputFullScaleAmplitude": channel.outputFullScaleAmplitude,
+    },
 ).Analyze()
 ```
 
@@ -2067,7 +2084,10 @@ resultAnalysis = Analysis(
     transmittedSignal=transmittedSignal,
     sampleRateHz=twoToneWaveform.sampleRateHz,
     channelBandwidthHz=twoToneWaveform.ilcBandwidthHz,
-    parameters={"width": 0},
+    parameters={
+        "width": 0,
+        "outputFullScaleAmplitude": paModel.outputFullScaleAmplitude,
+    },
 )
 metrics = resultAnalysis.Analyze()
 
@@ -2082,6 +2102,7 @@ twoToneAnalysisParameters = {
     "activePowerThresholdDb": -60.0,
     "activeGapToleranceSamples": 16,
     "width": 0,
+    "outputFullScaleAmplitude": paModel.outputFullScaleAmplitude,
 }
 allImMetrics = Analysis.AnalyzeTwoTone(
     receivedSignal,
@@ -2139,8 +2160,8 @@ rawImMetrics = Analysis.AnalyzeTwoTone(
 原始NumPy/list模式省略 `width` 时会自动检查码形态：若I/Q分量均为整数
 且至少一个分量的绝对值大于1，则识别为工程默认16位；其他记录按浮点
 `width=0` 处理。显式配置始终优先，生产测试中的浮点数组仍建议像上例
-一样写明 `width=0`，8、12、24位等非默认格式也必须显式给出。16位码必须先除以
-$2^{15}=32768$ 才是归一化复包络；若把码值直接当作浮点或伏特，功率将
+一样写明 `width=0`，8、12、24位等非默认格式也必须显式给出。16位码按
+$Fq/2^{15}$ 解码；兼容默认 $F=1$ 时即为除以32768。若把码值直接当作浮点或伏特，功率将
 虚增 $20\log_{10}(32768)\approx90.31$ dB，本来约20 dBm的波形可能显示
 为110 dBm以上。完整推导、有效活动样点门限以及定点调用示例见
 [TwoToneAnalysis.md第5节](./TwoToneAnalysis.md#5-模拟输出功率参考面和定点换算)。
@@ -2151,6 +2172,9 @@ $2^{15}=32768$ 才是归一化复包络；若把码值直接当作浮点或伏�
 分析器会自动切换到16位接收解码。因此“浮点发送参考 + 16位仪表采集”不再
 静默产生约90.31 dB误差；低幅码或非默认位宽仍应显式配置。频率、采样率和
 样点数继续来自发送元数据，不会因为接收量化格式不同而改变。
+
+`Analysis.AnalyzeTwoTone` 的 `parameters` 和底层
+`TwoToneAnalysis(waveform, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)` 都接受相同输出标尺。它们为兼容旧仪表码默认1.0；分析固定点PA输出时应显式使用 `paModel.outputFullScaleAmplitude`。
 
 ### 11.5 多个测试阶段的横向比较与保存
 
@@ -2271,24 +2295,30 @@ fixedWaveform = WaveGenWifi(
         "width": 16,
     }
 ).Generate()
-fixedPoint = FixedPoint(16)
-fixedReference = fixedPoint.QuantizeCodes(
+inputFormat = FixedPoint(16, fullScaleAmplitude=1.0)
+fixedReference = inputFormat.QuantizeCodes(
     0.20 * fixedWaveform.samples
 )
-fixedReceived = PaModel(
+fixedPa = PaModel(
     parameters={"modelName": "wiener", "width": 16}
-).Process(fixedReference)
+)
+fixedReceived = fixedPa.Process(fixedReference)
 fixedMetrics = Analysis(
     fixedReference,
     fixedWaveform,
-    parameters={"width": 16},
+    parameters={
+        "width": 16,
+        "outputFullScaleAmplitude": (
+            fixedPa.outputFullScaleAmplitude
+        ),
+    },
 ).Analyze(fixedReceived)
 
 print(floatingMetrics)
 print(fixedMetrics)
 ```
 
-不要把小于1的浮点归一化样值直接送给 `width=16` 的Analysis；它会被解释为接近零的公开整数码。反过来也不能把32767量级的整数码送给 `width=0` 的Analysis。
+不要把小于1的浮点归一化样值直接送给 `width=16` 的Analysis；它会被解释为接近零的公开整数码。反过来也不能把32767量级的整数码送给 `width=0` 的Analysis。固定点Reference按输入标尺1.0解码，固定点待测输出按 `outputFullScaleAmplitude` 解码；只匹配位宽而遗漏输出标尺仍会造成幅度、功率和削顶判断错误。
 
 ### 11.8 MIMO波形的逐链和逐空间流结果
 
@@ -2452,7 +2482,7 @@ Analysis(
 
 `signalProcessingParameters` 是显式构造参数，其映射内容直接传给 `SigProc`。为兼容旧程序，`parameters={"signalProcessingParameters": {...}}` 仍然有效；新代码应优先使用显式参数，避免把同步配置误认为普通Analysis指标配置。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。任何层出现未知键时，代码会发出 `UserWarning`、忽略该键并继续；已识别键的类型、单位和物理范围仍严格校验。
 
-`width` 配置参考和测量波形的统一I/Q接口。`width=0` 使用浮点旁路；默认 `width=16` 要求公开输入的 I、Q 分量是 `-32768…32767` 的整数码。`Analysis` 在入口先按 $2^{width-1}$ 解码成归一化 `numpy.complex128`，然后完成时延、CFO、SFO、复增益、OFDM解调和指标计算。显式参考、发送辅助和盲分析三条路径都只解码一次，盲模式还会把位宽传给Parser重建参考。完整且数据互不混用的浮点/定点示例见11.7节。
+`width` 配置参考和测量波形的统一I/Q码宽。`width=0` 使用浮点旁路；默认 `width=16` 要求公开输入的 I、Q 分量是 `-32768…32767` 的整数码。Analysis在入口把Reference按 $q/2^{width-1}$ 解码，把待测输出按 $F_{out}q/2^{width-1}$ 解码，再完成时延、CFO、SFO、复增益、OFDM解调和指标计算。显式参考、发送辅助和盲分析三条路径都只解码一次，盲模式还会把位宽传给Parser重建参考。完整且数据互不混用的浮点/定点示例见11.7节。
 
 两种结果都是普通字典。定点调用中的 `referenceSignal` 和 `receivedSignal` 必须来自相同位宽的模块公开接口，不能把已解码的小于1浮点值或已经换算成伏特的功率标定副本冒充整数码。`width=` 直接参数仍可作为最高优先级便捷写法；放入 `parameters` 时则与其他Analysis配置共同进入 `ChainMap`。可以通过 `resultAnalysis.GetParameters()["width"]` 或 `resultAnalysis.width` 读取最终解析值。定点码值、舍入、饱和和EVM近似推导见 [FixedPoint.md](./FixedPoint.md)。
 

@@ -500,6 +500,9 @@ processingResult = resultAnalysis.GetLastSignalProcessingResult()
 
 `PowerCalibration` 与同步类放在同一个 `SigProc.py` 中，但职责彼此独立。它负责dBm/RMS换算、根据额定输出功率产生第一次输入驱动预设，并闭环调整PA输入；PA非线性仍由绑定的PA模型或仪表实现。它不会在PA输出端乘常数增益来伪造目标功率。若绑定对象同时提供 `SuspendThermalModel` 与 `RestoreThermalModel`，公开入口 `Calibrate` 还会统一包围一个“暂停热效应—纯电闭环—恢复热状态”的事务。因此通过Channel使用和直接绑定热PA使用都在参考温度电模型上校准。普通业务代码仍推荐调用 `chOut, fbOut = Channel.Process(rawSignal, outputPowerDbm=...)`，由Channel在内部组合本工具。
 
+公开构造签名为
+`PowerCalibration(loadResistanceOhm=None, maximumOutputPowerDbm=None, paModel=None, parameters=None, width=None, **parameterOverrides)`。它没有要求调用方重复传输出标尺：`SetPaModel` 会从绑定对象或绑定方法所有者自动读取 `outputFullScaleAmplitude`；没有该属性的第三方plant兼容回退到1.0。输入DAC仍使用 `fullScaleAmplitude=1.0`。
+
 这里的 `outputPowerDbm` 只表示PA后耦合前、接收链非理想之前的干净物理PA输出功率。`PowerCalibration` 不读取raw `fbOut` 的表观RMS，也不会把 `fbGainDb`、反馈FIR、反馈非线性、噪声或ADC量化误当成发射功率误差。用户口中的“DPD校准”是后续学习过程：它把 `fbOut` 交给本文件的同步工具计算训练误差；最终EVM、SNR、ACLR、IRR和功率则对 `chOut` 计算。
 
 工程约定复包络 RMS 幅度等于纯电阻端口上的 RF RMS 电压。设端口电阻为 $R$，RMS 电压为 $V_{\mathrm{RMS}}$，则端口平均功率为
@@ -601,7 +604,7 @@ P_{m,\mathrm{target}}-P_{\max},
 
 `CalibrateElectricalOnly` 只是为了让热事务边界和闭环数值实现分离的内部内核。它不会自行暂停或恢复温度，并且会硬性拒绝事务外直接调用，提示用户改用 `Calibrate`。Channel内部构造 `PowerCalibration`、把自己的热代理接口交给校准器，并将 `Channel.Process` 的目标功率写入该工具；直接使用 `PowerCalibration(paModel=thermalPa)` 也会经过同一个公开热事务。普通用户只传原始波形与目标dBm，不需要感知该内核或读写每轮驱动预设。
 
-浮点模式下，闭环返回最终PA输入波形；定点模式下，闭环返回带数字余量的公开整数码，并由同一个Channel保存与其配对的隐藏模拟增益。`GetLastPaOutput()` 返回收敛判定所使用的最后一次PA实测输出。代码不会在PA后把输出乘常数来伪造目标dBm，因此AM-AM压缩、AM-PM、EVM和ACLR均对应真实驱动工作点。`outputPowerDbmPerChain` 不为 `None` 时逐列独立闭环，否则所有链使用共同的 `outputPowerDbm`。
+浮点模式下，闭环返回最终PA输入波形；定点模式下，闭环返回带数字余量的公开整数码，并由同一个Channel保存与其配对的隐藏模拟增益。`GetLastPaOutput()` 返回收敛判定所使用的最后一次PA实测输出；定点时该数组是plant输出标尺下的整数码，校准器已按自动发现的标尺解码后才测功率。代码不会在PA后把输出乘常数来伪造目标dBm，因此AM-AM压缩、AM-PM、EVM和ACLR均对应真实驱动工作点。`outputPowerDbmPerChain` 不为 `None` 时逐列独立闭环，否则所有链使用共同的 `outputPowerDbm`。
 
 `PowerCalibration` 的完整配置如下。所有默认值都定义在构造函数内部，并通过 `ChainMap` 允许调用方只覆盖需要修改的项目。直接构造参数和 `UpdateParameters(...)` 位于高优先级覆盖层；它们会覆盖 `parameters` 传入的低层活动映射，而不是与同名键合并。
 
@@ -622,6 +625,8 @@ P_{m,\mathrm{target}}-P_{\max},
 | `activePowerThresholdDb` | `-60.0` | 相对峰值的有效突发功率门限 |
 | `activeGapToleranceSamples` | `16` | 仍并入有效突发的最大内部低功率空洞长度 |
 | `width` | `16` | 公开I/Q位宽；0为浮点，闭环定点校准要求至少2 bit |
+
+只读属性 `OutputFullScaleAmplitude` / `outputFullScaleAmplitude` 返回当前plant输出码标尺；它不是独立配置层。重新 `SetPaModel` 时会重新发现该属性，避免旧plant标尺泄漏到新对象。
 
 ### 13.1 有效信号区间与占空比
 
@@ -763,6 +768,11 @@ y_m^{(k)}[n]
 u_m^{(k)}[n]
 \right\}.
 ```
+
+若 $y_m^{(k)}$ 是固定点公开码，`EvaluateDrivePreset` 先用
+`FixedPoint(width, outputFullScaleAmplitude)` 解码；该标尺由绑定plant自动
+提供，内置PA、MIMO PA和Channel默认2.0，第三方兼容默认1.0。以下公式中的
+$y_m^{(k)}$ 均指正确解码后的浮点PA输出，而不是整数码本身。
 
 仅在输出有效集合上计算RMS，并映射为实测功率：
 
@@ -933,7 +943,7 @@ flowchart LR
 
 ### 13.3 定点接口
 
-`width=0` 时输入输出均为浮点复包络。`width>0` 时输入和输出均为公开整数I/Q码，容器类型仍为 `numpy.complex128`。模块内部仍使用浮点运算，但固定字长边界上的数值是诸如8191、-16384一类原始码，而不是小于1的归一化浮点数。
+`width=0` 时输入输出均为浮点复包络。`width>0` 时输入和输出均为公开整数I/Q码，容器类型仍为 `numpy.complex128`。模块内部仍使用浮点运算，但固定字长边界上的数值是诸如8191、-16384一类原始码，而不是小于1的归一化浮点数。输入和输出共享位宽，却不强制共享幅度标尺：输入DAC固定为1.0；内置PA/Channel输出默认 `outputFullScaleAmplitude=2.0`。这种可配格式统一称为scaled full-scale，不把任意比例称为Q2.14。
 
 #### 13.3.1 为什么不能在定点编码之前不断放大
 
@@ -947,7 +957,7 @@ q_I,q_Q
 2^{w-1}-1.
 ```
 
-解码后的正向满量程为
+输入DAC解码后的正向满量程为
 
 ```math
 r_w
@@ -1087,12 +1097,14 @@ flowchart LR
     decode --> analog
     analog --> tx["Tx I/Q + PA前耦合"]
     tx --> pa["PA模型或仪表"]
-    pa --> measure["解码PA输出并测量有效突发功率"]
+    pa --> measure["按plant输出标尺解码<br/>并测量有效突发功率"]
     measure --> update["更新下一轮总drive"]
     update --> drive
 ```
 
 **图 6 说明：**数字基波形只负责提供合法、带余量的公开码；隐藏模拟增益负责改变真实PA驱动。闭环调节的是两者合成后的总有效drive。PA输出仍跨越公开定点边界，输出量化和输出采集削顶都会进入实测反馈。图中的trial在收敛前不会改变Channel已提交的模拟增益。
+
+PA输出边界使用plant自己的scaled full-scale。默认 $F_{out}=2$ 相对单位幅度提供6.02 dB分量观测余量，但 `maximumOutputPowerDbm` 的功率锚点仍是解码后输出有效区RMS等于1。默认GMP 20 dBm高PAPR输出的原始分量峰值可达约1.60：错误使用 $F_{out}=1$ 时会削顶并把本征约 -42 dB EVM测成约 -24 dB；使用默认2.0后不会碰轨，因此2.0是20 dBm精度与余量的默认折中。接近25 dBm且峰值接近2时可按需把plant输出标尺配置为4，同时让Analysis或TwoToneAnalysis使用同一个值；边界复测实测25.095 dBm、EVM约 -35.72 dB且I/Q rail计数为0。
 
 收敛后，`GetLastPaInput()` 返回的是公开数字部分 $q_m[n]$。要复现同一功率，必须继续通过完成本次校准的同一个Channel处理，因为该Channel同时保存了已提交的隐藏模拟增益。`GetLastActualPaInput()` 返回经过隐藏增益、Tx I/Q和PA前耦合后的真实PA输入，更适合检查物理工作点。把 `GetLastPaInput()` 单独复制给另一个未校准的裸PA对象，不能保证复现相同输出功率。
 
@@ -1162,7 +1174,10 @@ powerCalibration = PowerCalibration(
 paInput = powerCalibration.Calibrate(waveform.samples)
 paOutput = powerCalibration.GetLastPaOutput()
 calibrationMetrics = powerCalibration.GetLastCalibrationMetrics()
-decodedOutput = FixedPoint(16).DecodeComplex(paOutput)
+decodedOutput = FixedPoint(
+    16,
+    powerCalibration.outputFullScaleAmplitude,
+).DecodeComplex(paOutput)
 measuredRms = powerCalibration.CalculateActiveRmsPerChain(
     decodedOutput
 )[0]
@@ -1170,6 +1185,8 @@ measuredPowerDbm = (
     powerCalibration.NormalizedRmsToOutputPowerDbm(measuredRms)
 )
 ```
+
+`powerCalibration.outputFullScaleAmplitude` 从当前绑定plant读取；因此这个示例既适用于内置默认2.0，也适用于显式配置4.0或兼容第三方1.0。独立Analysis/TwoToneAnalysis不会持有plant，调用时需要显式传入同一个值。
 
 若这里的 `paModel` 启用了 `ThermalConfig`，上述 `Calibrate` 会在参考温度电模型上运行全部trial，并在返回或抛出异常之前恢复原来的结温、累计时间和互热状态。把示例中的调用替换为 `CalibrateElectricalOnly` 会因缺少外层事务而直接得到 `RuntimeError`。
 

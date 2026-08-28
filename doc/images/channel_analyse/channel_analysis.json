@@ -216,7 +216,8 @@
         "beforeNmseDb": -15.842610157837766,
         "afterNmseDb": -18.97597209478306,
         "regularizedConditionNumber": 1585798.6674236967,
-        "normalizedCoefficientUpdateNorm": 1.7737236232829774
+        "normalizedCoefficientUpdateNorm": 1.7737236232829774,
+        "regionSmoothnessPenalty": 0.0
       },
       {
         "sampleCount": 8640,
@@ -225,7 +226,8 @@
         "beforeNmseDb": -11.159891389008136,
         "afterNmseDb": -12.12055527650862,
         "regularizedConditionNumber": 1605063.769844134,
-        "normalizedCoefficientUpdateNorm": 2.316637867022587
+        "normalizedCoefficientUpdateNorm": 2.316637867022587,
+        "regionSmoothnessPenalty": 0.0
       }
     ]
   },

@@ -1008,6 +1008,7 @@ class GMPConfig:
     nonlinearOrders: Tuple[int, ...] = (1, 3, 5, 7)
     memoryDepth: int = 3
     crossMemoryDepth: int = 2
+    nonlinearScale: float = 0.135
     mainCoefficients: Optional[Mapping[Tuple[int, int], complex]] = None
     laggingCoefficients: Optional[Mapping[Tuple[int, int, int], complex]] = None
     leadingCoefficients: Optional[Mapping[Tuple[int, int, int], complex]] = None
@@ -1030,6 +1031,15 @@ class GMPConfig:
             raise ValueError("memoryDepth must be positive")
         if self.crossMemoryDepth < 0:
             raise ValueError("crossMemoryDepth cannot be negative")
+        if (
+            not isinstance(self.nonlinearScale, (int, float))
+            or isinstance(self.nonlinearScale, bool)
+            or not np.isfinite(self.nonlinearScale)
+            or not 0.0 <= float(self.nonlinearScale) <= 1.0
+        ):
+            raise ValueError(
+                "nonlinearScale must be finite and between zero and one"
+            )
 
 
 class GMPPA:
@@ -1053,6 +1063,7 @@ class GMPPA:
             config.nonlinearOrders,
             config.memoryDepth,
             config.crossMemoryDepth,
+            config.nonlinearScale,
         )
         self.mainCoefficients = dict(
             defaultMain
@@ -1322,6 +1333,7 @@ class PiecewiseGMPPA:
                 nonlinearOrders,
                 memoryDepth,
                 crossMemoryDepth,
+                nonlinearScale=1.0,
             )
             regionProfiles = (
                 (1.025, -0.004, 0.78, 0.72),
@@ -2025,6 +2037,7 @@ class PaModel:
         thermalConfig: Optional[ThermalConfig] = None,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
+        outputFullScaleAmplitude: Optional[float] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize the PA facade and select its active model family.
@@ -2046,6 +2059,10 @@ class PaModel:
             width: Optional external I/Q width. None selects the internal
                 16-bit default, zero selects floating point, and a positive
                 value selects signed integer I/Q codes in complex128.
+            outputFullScaleAmplitude: Optional physical magnitude represented
+                by the PA output code rail. The 2.0 default gives the
+                observation path 6.02 dB of component headroom while the
+                input DAC remains normalized to one.
             parameterOverrides: Additional keyword settings. Unsupported names
                 produce a warning and are ignored.
 
@@ -2062,6 +2079,7 @@ class PaModel:
                 "dohertyConfig": None,
                 "thermalConfig": None,
                 "width": 16,
+                "outputFullScaleAmplitude": 2.0,
             }
         )
         directOverrides = dict(parameterOverrides)
@@ -2081,6 +2099,10 @@ class PaModel:
             directOverrides["thermalConfig"] = thermalConfig
         if width is not None:
             directOverrides["width"] = width
+        if outputFullScaleAmplitude is not None:
+            directOverrides["outputFullScaleAmplitude"] = (
+                outputFullScaleAmplitude
+            )
         if parameters is not None and not isinstance(parameters, Mapping):
             raise TypeError("parameters must be a mapping or None")
         externalParameters: Mapping[str, object] = (
@@ -2153,6 +2175,24 @@ class PaModel:
         return cast(int, self.parameters["width"])
 
     width = Width
+
+    @property
+    def OutputFullScaleAmplitude(self) -> float:
+        """Return the physical magnitude represented by a PA output code rail.
+
+        Processing details:
+            Algorithm: Resolve the live observation scale independently of
+            the normalized input DAC convention.
+
+        Returns:
+            result: Positive physical I/Q component full-scale amplitude.
+        """
+
+        return float(
+            cast(float, self.parameters["outputFullScaleAmplitude"])
+        )
+
+    outputFullScaleAmplitude = OutputFullScaleAmplitude
 
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened snapshot of all resolved PA parameters.
@@ -2430,6 +2470,10 @@ class PaModel:
                 "dohertyConfig must be a DohertyConfig or None"
             )
         FixedPoint(self.width)
+        FixedPoint(
+            self.width,
+            self.parameters["outputFullScaleAmplitude"],
+        )
         self.ResolveThermalConfig()
         return (
             normalizedName,
@@ -2507,10 +2551,13 @@ class PaModel:
 
         self.SynchronizeModel()
         self.SynchronizeThermalModel()
-        interfaceFormat = FixedPoint(self.width)
-        floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+        inputFormat = FixedPoint(self.width)
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
+        floatingInput = inputFormat.DecodeComplex(inputSignal)
         floatingOutput, _ = self.ProcessOutputPathsFloating(floatingInput)
-        return interfaceFormat.EncodeComplex(floatingOutput)
+        return outputFormat.EncodeComplex(floatingOutput)
 
     def ProcessOutputPathsFloating(
         self, inputSignal: np.ndarray
@@ -2626,11 +2673,14 @@ class PaModel:
         """
 
         trialDriveDb = self.ResolveCalibrationDriveDb(driveDbPerChain)
-        interfaceFormat = FixedPoint(self.width)
-        floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+        inputFormat = FixedPoint(self.width)
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
+        floatingInput = inputFormat.DecodeComplex(inputSignal)
         driveScale = np.power(10.0, trialDriveDb / 20.0)
         floatingOutput = self.ProcessFloating(driveScale * floatingInput)
-        return interfaceFormat.EncodeComplex(floatingOutput)
+        return outputFormat.EncodeComplex(floatingOutput)
 
     def ProcessFloating(self, inputSignal: np.ndarray) -> np.ndarray:
         """Evaluate the PA directly in its normalized floating-point domain.
@@ -3821,6 +3871,7 @@ class MimoPaModel:
         self,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
+        outputFullScaleAmplitude: Optional[float] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize all chain models with internal default parameters.
@@ -3834,6 +3885,8 @@ class MimoPaModel:
             parameters: Optional caller-owned mapping containing overrides.
             width: Optional matrix-interface I/Q width. None selects the
                 internal 16-bit default and zero selects floating point.
+            outputFullScaleAmplitude: Optional physical magnitude represented
+                by each PA-output code rail. The default is 2.0.
             parameterOverrides: Highest-priority MIMO PA settings.
 
         Returns:
@@ -3852,6 +3905,7 @@ class MimoPaModel:
                 "maximumOutputPowerDbm": 25.0,
                 "thermalCouplingCPerW": None,
                 "width": 16,
+                "outputFullScaleAmplitude": 2.0,
             }
         )
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -3872,6 +3926,10 @@ class MimoPaModel:
         )
         if width is not None:
             recognizedOverrides["width"] = width
+        if outputFullScaleAmplitude is not None:
+            recognizedOverrides["outputFullScaleAmplitude"] = (
+                outputFullScaleAmplitude
+            )
         self.parameters: ChainMap[str, object] = ChainMap(
             recognizedOverrides,
             externalParameters,
@@ -3915,6 +3973,24 @@ class MimoPaModel:
         return cast(int, self.parameters["width"])
 
     width = Width
+
+    @property
+    def OutputFullScaleAmplitude(self) -> float:
+        """Return the physical magnitude represented by each PA output rail.
+
+        Processing details:
+            Algorithm: Resolve the common live MIMO observation scale without
+            changing any independently configured PA coefficients.
+
+        Returns:
+            result: Positive physical I/Q component full-scale amplitude.
+        """
+
+        return float(
+            cast(float, self.parameters["outputFullScaleAmplitude"])
+        )
+
+    outputFullScaleAmplitude = OutputFullScaleAmplitude
 
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened snapshot of effective MIMO PA parameters.
@@ -4106,6 +4182,10 @@ class MimoPaModel:
                     targetPowerDbm
                 )
         FixedPoint(self.width)
+        FixedPoint(
+            self.width,
+            self.parameters["outputFullScaleAmplitude"],
+        )
         self.ResolveThermalCouplingMatrix()
 
     def ResolveThermalCouplingMatrix(self) -> np.ndarray:
@@ -4331,8 +4411,11 @@ class MimoPaModel:
         """
 
         self.SynchronizeModels()
-        interfaceFormat = FixedPoint(self.width)
-        complexInput = interfaceFormat.DecodeComplex(inputSignal)
+        inputFormat = FixedPoint(self.width)
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
+        complexInput = inputFormat.DecodeComplex(inputSignal)
         inputWasVector = complexInput.ndim == 1
         if inputWasVector:
             complexInput = complexInput.reshape(-1, 1)
@@ -4346,7 +4429,7 @@ class MimoPaModel:
         if complexInput.shape[0] == 0 or not np.all(np.isfinite(complexInput)):
             raise ValueError("inputSignal must contain finite samples")
         floatingOutput, _ = self.ProcessOutputPathsFloating(complexInput)
-        outputMatrix = interfaceFormat.EncodeComplex(floatingOutput)
+        outputMatrix = outputFormat.EncodeComplex(floatingOutput)
         if inputWasVector and self.numTransmitChains == 1:
             return outputMatrix[:, 0]
         return outputMatrix
@@ -4493,8 +4576,11 @@ class MimoPaModel:
         """
 
         self.SynchronizeModels()
-        interfaceFormat = FixedPoint(self.width)
-        floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+        inputFormat = FixedPoint(self.width)
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
+        floatingInput = inputFormat.DecodeComplex(inputSignal)
         inputWasVector = floatingInput.ndim == 1
         inputMatrix = (
             floatingInput.reshape(-1, 1)
@@ -4519,7 +4605,7 @@ class MimoPaModel:
         floatingOutput = self.ProcessFloating(
             inputMatrix * driveScalePerChain.reshape(1, -1)
         )
-        publicOutput = interfaceFormat.EncodeComplex(floatingOutput)
+        publicOutput = outputFormat.EncodeComplex(floatingOutput)
         if inputWasVector and self.numTransmitChains == 1:
             return np.asarray(publicOutput)[:, 0]
         return np.asarray(publicOutput, dtype=np.complex128)
@@ -4940,8 +5026,11 @@ class MimoPaModel:
             raise TypeError("chainIndex must be an integer")
         if chainIndex < 0 or chainIndex >= self.numTransmitChains:
             raise IndexError("chainIndex is outside the configured chain range")
-        interfaceFormat = FixedPoint(self.width)
-        complexInput = interfaceFormat.DecodeComplex(inputSignal)
+        inputFormat = FixedPoint(self.width)
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
+        complexInput = inputFormat.DecodeComplex(inputSignal)
         if complexInput.ndim != 1 or complexInput.size == 0:
             raise ValueError("inputSignal must be a nonempty vector")
         if not np.all(np.isfinite(complexInput)):
@@ -4955,7 +5044,7 @@ class MimoPaModel:
         chainOutput = self.ProcessChainFloating(
             driveScale * complexInput, chainIndex
         )
-        return interfaceFormat.EncodeComplex(chainOutput)
+        return outputFormat.EncodeComplex(chainOutput)
 
     def ProcessChainFloating(
         self, inputSignal: np.ndarray, chainIndex: int
@@ -5250,6 +5339,27 @@ class IQImbalancePA:
 
     width = Width
 
+    @property
+    def OutputFullScaleAmplitude(self) -> float:
+        """Forward the wrapped PA output-code physical full scale.
+
+        Processing details:
+            Algorithm: Read the wrapped protocol attribute and retain a scale
+            of one for third-party normalized-output PA objects.
+
+        Returns:
+            result: Positive physical I/Q component full-scale amplitude.
+        """
+
+        rawFullScaleAmplitude = getattr(
+            self.paModel, "outputFullScaleAmplitude", 1.0
+        )
+        return FixedPoint(
+            self.width, rawFullScaleAmplitude
+        ).fullScaleAmplitude
+
+    outputFullScaleAmplitude = OutputFullScaleAmplitude
+
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
         """Apply the base PA and then add its conjugate image component.
 
@@ -5263,10 +5373,13 @@ class IQImbalancePA:
             result: np.ndarray. The computed value described by the summary, with documented units, shape, and normalization.
         """
 
-        interfaceFormat = FixedPoint(self.width)
-        floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+        inputFormat = FixedPoint(self.width)
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
+        floatingInput = inputFormat.DecodeComplex(inputSignal)
         floatingOutput, _ = self.ProcessOutputPathsFloating(floatingInput)
-        return interfaceFormat.EncodeComplex(floatingOutput)
+        return outputFormat.EncodeComplex(floatingOutput)
 
     def SetCalibrationDriveDb(
         self, driveDbPerChain: Sequence[float]
@@ -5341,7 +5454,10 @@ class IQImbalancePA:
             result: Public IQ-imbalanced output of the uncommitted trial.
         """
 
-        interfaceFormat = FixedPoint(self.width)
+        inputFormat = FixedPoint(self.width)
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
         trialMethod = getattr(self.paModel, "ProcessCalibrationDrive", None)
         commitMethod = getattr(self.paModel, "SetCalibrationDriveDb", None)
         if callable(trialMethod) != callable(commitMethod):
@@ -5351,14 +5467,14 @@ class IQImbalancePA:
             )
         if callable(trialMethod):
             rawPaOutput = trialMethod(inputSignal, driveDbPerChain)
-            floatingPaOutput = interfaceFormat.DecodeComplex(rawPaOutput)
+            floatingPaOutput = outputFormat.DecodeComplex(rawPaOutput)
             floatingOutput = np.asarray(
                 self.directCoefficient * floatingPaOutput
                 + self.imageCoefficient * np.conj(floatingPaOutput),
                 dtype=np.complex128,
             )
         else:
-            floatingInput = interfaceFormat.DecodeComplex(inputSignal)
+            floatingInput = inputFormat.DecodeComplex(inputSignal)
             driveArray = np.asarray(driveDbPerChain, dtype=float).reshape(-1)
             inputMatrix = (
                 floatingInput.reshape(-1, 1)
@@ -5379,7 +5495,7 @@ class IQImbalancePA:
             if floatingInput.ndim == 1:
                 drivenInput = drivenInput[:, 0]
             floatingOutput = self.ProcessFloating(drivenInput)
-        return interfaceFormat.EncodeComplex(floatingOutput)
+        return outputFormat.EncodeComplex(floatingOutput)
 
     def ProcessOutputPathsFloating(
         self, inputSignal: np.ndarray
@@ -5441,11 +5557,14 @@ class IQImbalancePA:
             if callable(floatingProcessor):
                 paChannelOutput = floatingProcessor(drivenInput)
             else:
-                interfaceFormat = FixedPoint(self.width)
-                publicOutput = self.paModel.Process(
-                    interfaceFormat.EncodeComplex(drivenInput)
+                inputFormat = FixedPoint(self.width)
+                outputFormat = FixedPoint(
+                    self.width, self.outputFullScaleAmplitude
                 )
-                paChannelOutput = interfaceFormat.DecodeComplex(publicOutput)
+                publicOutput = self.paModel.Process(
+                    inputFormat.EncodeComplex(drivenInput)
+                )
+                paChannelOutput = outputFormat.DecodeComplex(publicOutput)
             paFeedbackOutput = np.asarray(
                 paChannelOutput, dtype=np.complex128
             ).copy()
@@ -5490,7 +5609,14 @@ class IQImbalancePA:
         if callable(floatingProcessor):
             paOutput = floatingProcessor(complexInput)
         else:
-            paOutput = self.paModel.Process(complexInput)
+            inputFormat = FixedPoint(self.width)
+            outputFormat = FixedPoint(
+                self.width, self.outputFullScaleAmplitude
+            )
+            publicOutput = self.paModel.Process(
+                inputFormat.EncodeComplex(complexInput)
+            )
+            paOutput = outputFormat.DecodeComplex(publicOutput)
         return np.asarray(
             self.directCoefficient * paOutput
             + self.imageCoefficient * np.conj(paOutput),
@@ -5742,6 +5868,7 @@ def DefaultGmpCoefficients(
     nonlinearOrders: Sequence[int],
     memoryDepth: int,
     crossMemoryDepth: int,
+    nonlinearScale: float = 0.135,
 ) -> Tuple[
     Dict[Tuple[int, int], complex],
     Dict[Tuple[int, int, int], complex],
@@ -5751,26 +5878,41 @@ def DefaultGmpCoefficients(
 
     Processing details:
         Algorithm: Select a Rapp-like per-order steady-state target fitted over
-        normalized amplitudes from zero through two, generate small causal main
-        and envelope-cross memory tails, and solve the zero-delay main
-        coefficient so every same-order coefficient still sums to its static
-        target. Memory depth therefore changes transient and frequency behavior
-        without duplicating compression in a constant-envelope plateau.
+        normalized amplitudes from zero through two, scale every nonlinear
+        steady-state order by the configured default strength, generate small
+        causal main and envelope-cross memory tails, and solve the zero-delay
+        main coefficient so every same-order coefficient still sums to its
+        static target. Memory depth therefore changes transient and frequency
+        behavior without duplicating compression in a constant-envelope
+        plateau.
 
     Args:
         nonlinearOrders: Positive odd polynomial orders included in the model.
         memoryDepth: Number of causal sample delays included in the model.
         crossMemoryDepth: Number of envelope cross-delays included in the GMP model.
+        nonlinearScale: Strength applied to orders above one. Zero selects the
+            linear-memory floor and one selects the full reference fit.
 
     Returns:
         result: Tuple[Dict[Tuple[int, int], complex], Dict[Tuple[int, int, int], complex], Dict[Tuple[int, int, int], complex]]. The computed value described by the summary, with documented units, shape, and normalization.
     """
 
-    # These coefficients were fitted over 0 <= |x| <= 2 to a bounded Rapp-like
-    # AM-AM curve with mild AM-PM conversion.  The resulting constant-envelope
-    # response is monotonic throughout that declared fitting interval.  This
-    # prevents a power-control loop from reaching an ordinary operating point
-    # through a nonphysical polynomial foldback branch.
+    if (
+        not isinstance(nonlinearScale, (int, float))
+        or isinstance(nonlinearScale, bool)
+        or not np.isfinite(nonlinearScale)
+        or not 0.0 <= float(nonlinearScale) <= 1.0
+    ):
+        raise ValueError(
+            "nonlinearScale must be finite and between zero and one"
+        )
+
+    # These reference coefficients were fitted over 0 <= |x| <= 2 to a
+    # bounded Rapp-like AM-AM curve with mild AM-PM conversion.  The public
+    # default uses 13.5 percent of the nonlinear orders so a 20 dBm Wi-Fi
+    # operating point remains moderately distorted instead of entering deep
+    # compression.  Scaling toward zero preserves the reference curve's
+    # monotonicity and the first-order electrical-memory floor.
     referenceSteadyStateCoefficient = {
         1: 1.261692 + 0.014052j,
         3: -0.291144 + 0.054204j,
@@ -5779,9 +5921,16 @@ def DefaultGmpCoefficients(
     }
     selectedOrders = tuple(dict.fromkeys(int(order) for order in nonlinearOrders))
     steadyStateCoefficients = {
-        nonlinearOrder: referenceSteadyStateCoefficient.get(
-            nonlinearOrder,
-            0.0 + 0.0j,
+        nonlinearOrder: (
+            referenceSteadyStateCoefficient.get(
+                nonlinearOrder,
+                0.0 + 0.0j,
+            )
+            * (
+                1.0
+                if nonlinearOrder == 1
+                else float(nonlinearScale)
+            )
         )
         for nonlinearOrder in selectedOrders
     }

@@ -412,10 +412,12 @@ class ChannelAnalyse:
         """Measure a square MIMO channel through sequential orthogonal probes.
 
         Processing details:
-            Algorithm: Excite one input at a time, decode each complete
-            output capture, extract the causal response relative to the probe
-            position, assemble ``h[delay, destination, source]``, and derive
-            all frequency-domain summaries from that measured tensor.
+        Algorithm: Excite one input at a time, resolve distinct input/output
+            code scales from the processor or its bound owner, convert each
+            probe and capture at the correct boundary, extract the causal
+            response relative to the probe position, assemble
+            ``h[delay, destination, source]``, and derive all frequency-domain
+            summaries from that measured tensor.
 
         Args:
             channelProcessor: Callable accepting and returning waveform arrays.
@@ -445,12 +447,73 @@ class ChannelAnalyse:
             (impulseLength, chainCount, chainCount),
             dtype=np.complex128,
         )
-        interfaceFormat = FixedPoint(self.width)
+        protocolOwner = getattr(channelProcessor, "__self__", None)
+        if protocolOwner is None:
+            protocolOwner = channelProcessor
+        inputFullScaleAmplitude = getattr(
+            channelProcessor,
+            "inputFullScaleAmplitude",
+            None,
+        )
+        inputWidth = getattr(
+            channelProcessor,
+            "inputWidth",
+            None,
+        )
+        if (
+            getattr(channelProcessor, "__name__", "")
+            == "ProcessPaOutput"
+        ):
+            boundPaModel = getattr(protocolOwner, "paModel", None)
+            if inputFullScaleAmplitude is None:
+                inputFullScaleAmplitude = getattr(
+                    boundPaModel,
+                    "outputFullScaleAmplitude",
+                    getattr(
+                        protocolOwner,
+                        "outputFullScaleAmplitude",
+                        1.0,
+                    ),
+                )
+            if inputWidth is None:
+                inputWidth = getattr(
+                    boundPaModel,
+                    "width",
+                    self.width,
+                )
+        if inputFullScaleAmplitude is None:
+            inputFullScaleAmplitude = 1.0
+        if inputWidth is None:
+            inputWidth = self.width
+        inputInterfaceFormat = FixedPoint(
+            inputWidth, inputFullScaleAmplitude
+        )
+        outputInterfaceFormat = FixedPoint(
+            getattr(
+                channelProcessor,
+                "outputWidth",
+                getattr(protocolOwner, "width", self.width),
+            ),
+            getattr(
+                protocolOwner,
+                "outputFullScaleAmplitude",
+                1.0,
+            ),
+        )
         for sourceChain in range(chainCount):
             probeSignal = self.BuildImpulseProbe(
                 chainCount, sourceChain
             )
-            outputSignal = interfaceFormat.DecodeComplex(
+            if not np.isclose(
+                inputInterfaceFormat.fullScaleAmplitude,
+                1.0,
+                rtol=0.0,
+                atol=0.0,
+            ) or inputInterfaceFormat.width != self.width:
+                probeSignal = inputInterfaceFormat.EncodeComplex(
+                    FixedPoint(self.width).DecodeComplex(probeSignal)
+                )
+            outputSignal = outputInterfaceFormat.DecodeComplex(
                 channelProcessor(probeSignal)
             )
             outputMatrix = np.asarray(

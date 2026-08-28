@@ -120,7 +120,7 @@ parameters外部活动映射
 | `UpdateSample(referenceSample, targetSample, sampleWeight=1)` | 公开浮点或定点样点 | 同公开格式预测 | 对外逐样点入口 |
 | `CommitCoefficients()` | 无 | `None` | 一次性把影子系数复制为活动系数 |
 | `UpdateFromLabels(referenceSignal, targetSignal, sampleWeights=None)` | 完整有序标签对 | `DpdLmsTrainingResult` | 软件中按时间顺序逐点回放 |
-| `UpdateIndirect(paInputSignal, paOutputSignal, sampleRateHz, ...)` | PA输入和任意长度反馈采集 | `DpdLmsTrainingResult` | 同步后逐点训练后置逆 |
+| `UpdateIndirect(paInputSignal, paOutputSignal, sampleRateHz, signalProcessingParameters=None, sampleWeights=None, paOutputFullScaleAmplitude=1.0)` | PA输入和任意长度反馈采集 | `DpdLmsTrainingResult` | 同步后逐点训练后置逆；末尾参数声明反馈输出码轨的物理量程 |
 | `Process(inputSignal)` | 新DPD参考波形 | 预失真波形 | 使用活动系数部署 |
 | `CalculateNmse(referenceSignal, targetSignal, sampleWeights=None)` | 标签对 | dB标量 | 评估活动固定模型 |
 | `GetLastLmsTrainingResult()` | 无 | 结果或`None` | 获取最近一次完整逐点训练摘要 |
@@ -379,6 +379,7 @@ trainingResult = dpdLms.UpdateIndirect(
         "enableSamplingFrequencyOffsetCompensation": True,
         "enableComplexGainCompensation": True,
     },
+    paOutputFullScaleAmplitude=2.0,
 )
 
 nextPaInput = dpdLms.Process(nextReferenceSignal)
@@ -400,6 +401,8 @@ feedbackCapture -> SigProc --------+-> aligned output/input pair
 ```
 
 `SigProc`按整帧估计同步量，输出长度与PA输入参考一致；之后才开始逐样点更新。发送/反馈原始数组不做长度相等检查。
+
+`paOutputFullScaleAmplitude` 位于签名末尾，默认1.0用于兼容旧Q1/FS1采集。当前 `PaModel` 与 `Channel` 的定点PA/FB输出默认FS2，因此直接训练其输出时应传2.0；近25 dBm链路若把PA、Channel和接收分析统一扩到FS4，则传4.0。PA输入与DPD输出仍是FS1。公共复增益补偿开启时，一个纯常数标尺误差可能被同步吸收，但仍应传真实量程；尤其设置 `enableComplexGainCompensation=False` 时，FS2输出若沿用默认1.0会被解码成一半幅度并使逐点误差和更新方向失真。
 
 ---
 
@@ -440,7 +443,7 @@ deploymentParameters = {"coefficientCommitMode": "frame"}
 
 ## 9. 定点逐样点接口
 
-默认 `width=16`，因此 `UpdateSample`应接收整数I/Q码，而不是小于1的归一化浮点：
+默认 `width=16`，因此 `UpdateSample`应接收整数I/Q码，而不是小于1的归一化浮点。该逐样点数字接口的参考、目标和DPD预测均为FS1；只有 `UpdateIndirect` 的PA/FB观测通过独立的 `paOutputFullScaleAmplitude` 解码：
 
 ```python
 from inc.lib.DpdLms import DpdLms

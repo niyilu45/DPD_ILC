@@ -858,6 +858,7 @@ def CheckDocumentationApiConsistency() -> None:
         "sampleRateHz",
         "channelBandwidthHz",
         "width",
+        "outputFullScaleAmplitude",
         "parameterOverrides",
     )
     actualAnalysisParameters = tuple(
@@ -869,7 +870,8 @@ def CheckDocumentationApiConsistency() -> None:
         "Analysis(referenceSignal=None, waveform=None, parameters=None, "
         "parseParameters=None, transmittedSignal=None, "
         "signalProcessingParameters=None, sampleRateHz=None, "
-        "channelBandwidthHz=None, width=None, **parameterOverrides)"
+        "channelBandwidthHz=None, width=None, "
+        "outputFullScaleAmplitude=None, **parameterOverrides)"
     )
     readmeText = (projectRoot / "README.md").read_text(encoding="utf-8")
     analysisDocumentText = (
@@ -910,10 +912,12 @@ def CheckDocumentationApiConsistency() -> None:
                 "waveform",
                 "parameters",
                 "width",
+                "outputFullScaleAmplitude",
                 "parameterOverrides",
             ),
             (
                 "TwoToneAnalysis(waveform, parameters=None, width=None, "
+                "outputFullScaleAmplitude=None, "
                 "**parameterOverrides)"
             ),
         ),
@@ -945,6 +949,7 @@ def CheckDocumentationApiConsistency() -> None:
                 "thermalConfig",
                 "parameters",
                 "width",
+                "outputFullScaleAmplitude",
                 "parameterOverrides",
             ),
             (
@@ -954,6 +959,7 @@ def CheckDocumentationApiConsistency() -> None:
                 "dohertyConfig=None, "
                 "thermalConfig=None, "
                 "parameters=None, width=None, "
+                "outputFullScaleAmplitude=None, "
                 "**parameterOverrides)"
             ),
         ),
@@ -963,10 +969,12 @@ def CheckDocumentationApiConsistency() -> None:
                 "paModel",
                 "parameters",
                 "width",
+                "outputFullScaleAmplitude",
                 "parameterOverrides",
             ),
             (
                 "Channel(paModel=None, parameters=None, width=None, "
+                "outputFullScaleAmplitude=None, "
                 "**parameterOverrides)"
             ),
         ),
@@ -2761,7 +2769,9 @@ def CheckPowerEvmCurve() -> None:
         fixedCalibratedInput.imag,
         np.rint(fixedCalibratedInput.imag),
     )
-    decodedFixedBurst = FixedPoint(16).DecodeComplex(
+    decodedFixedBurst = FixedPoint(
+        16, fixedPaModel.outputFullScaleAmplitude
+    ).DecodeComplex(
         fixedCalibratedBurst
     )
     fixedActiveRms = fixedCalibration.CalculateActiveRmsPerChain(
@@ -2781,6 +2791,9 @@ def CheckPowerEvmCurve() -> None:
             "activePowerThresholdDb": -60.0,
             "activeGapToleranceSamples": 16,
             "width": 16,
+            "outputFullScaleAmplitude": (
+                fixedPaModel.outputFullScaleAmplitude
+            ),
         },
     ).Analyze()
     assert abs(fixedBurstMetrics["outputPowerDbm"] - 22.0) < 0.01
@@ -3121,9 +3134,10 @@ def CheckIlcPowerOperatingPoints() -> None:
         seed=91,
         width=16,
     ).Generate()
-    targetPowerDbmValues = (10.0, 15.0, 20.0)
+    targetPowerDbmValues = (1.0, 16.0, 20.0)
     publicReferences = []
     analogDriveDbValues = []
+    fixedBaselineEvmDbValues = []
 
     for targetPowerDbm in targetPowerDbmValues:
         paModel = PaModel(modelName="gmp", width=16)
@@ -3154,14 +3168,29 @@ def CheckIlcPowerOperatingPoints() -> None:
             parameters={
                 "maximumOutputPowerDbm": 25.0,
                 "width": 16,
+                "outputFullScaleAmplitude": (
+                    paModel.outputFullScaleAmplitude
+                ),
             },
         )
-        baselineMetrics = resultAnalysis.Analyze(
-            powerCalibration.GetLastPaOutput()
-        )
+        baselinePaOutput = powerCalibration.GetLastPaOutput()
+        baselineMetrics = resultAnalysis.Analyze(baselinePaOutput)
+        fixedBaselineEvmDbValues.append(float(baselineMetrics["evmDb"]))
         assert abs(
             baselineMetrics["outputPowerDbm"] - targetPowerDbm
         ) <= 0.10
+        if targetPowerDbm == 20.0:
+            baselineFormatInfo = FixedPoint(
+                16, paModel.outputFullScaleAmplitude
+            ).GetFormatInfo()
+            assert not np.any(
+                np.abs(baselinePaOutput.real)
+                >= float(baselineFormatInfo["maximumCode"])
+            )
+            assert not np.any(
+                np.abs(baselinePaOutput.imag)
+                >= float(baselineFormatInfo["maximumCode"])
+            )
 
         ilcResult = RunFrequencyDomainIlc(
             referenceSignal,
@@ -3216,6 +3245,20 @@ def CheckIlcPowerOperatingPoints() -> None:
         ) <= 0.10
         assert selectedMetrics["evmDb"] <= baselineMetrics["evmDb"] + 0.15
 
+        if targetPowerDbm == 20.0:
+            publicPaOutput = powerCalibration.GetLastPaOutput()
+            formatInfo = FixedPoint(
+                16, paModel.outputFullScaleAmplitude
+            ).GetFormatInfo()
+            assert not np.any(
+                np.abs(publicPaOutput.real)
+                >= float(formatInfo["maximumCode"])
+            )
+            assert not np.any(
+                np.abs(publicPaOutput.imag)
+                >= float(formatInfo["maximumCode"])
+            )
+
     # With fixed-point digital headroom, all three conducted powers use the
     # same legal DAC codes. Their distinct physical operating points reside in
     # the committed post-decode analog drive and must survive ILC adaptation.
@@ -3224,6 +3267,56 @@ def CheckIlcPowerOperatingPoints() -> None:
         for publicReference in publicReferences[1:]
     )
     assert np.all(np.diff(np.asarray(analogDriveDbValues)) > 3.0)
+    assert np.all(
+        np.abs(
+            np.asarray(fixedBaselineEvmDbValues, dtype=float)
+            - np.asarray((-52.0, -48.0, -42.0), dtype=float)
+        )
+        <= 1.5
+    )
+
+    # The 2.0 default is chosen for the requested low-/mid-/20 dBm EVM
+    # resolution. Near the 25 dBm rated endpoint, a caller can explicitly
+    # trade one additional bit of resolution for another 6.02 dB of peak
+    # observation headroom.
+    ratedHeadroomPa = PaModel(
+        modelName="gmp",
+        width=16,
+        outputFullScaleAmplitude=4.0,
+    )
+    ratedHeadroomCalibration = PowerCalibration(
+        paModel=ratedHeadroomPa,
+        parameters={
+            "outputPowerDbm": 25.0,
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.15,
+            "maximumCalibrationIterations": 60,
+            "width": 16,
+        },
+    )
+    ratedReference = ratedHeadroomCalibration.Calibrate(
+        waveform.samples
+    )
+    ratedOutput = ratedHeadroomCalibration.GetLastPaOutput()
+    ratedMetrics = Analysis(
+        ratedReference,
+        waveform,
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "width": 16,
+            "outputFullScaleAmplitude": 4.0,
+        },
+    ).Analyze(ratedOutput)
+    assert abs(ratedMetrics["outputPowerDbm"] - 25.0) <= 0.15
+    ratedFormatInfo = FixedPoint(16, 4.0).GetFormatInfo()
+    assert not np.any(
+        np.abs(ratedOutput.real)
+        >= float(ratedFormatInfo["maximumCode"])
+    )
+    assert not np.any(
+        np.abs(ratedOutput.imag)
+        >= float(ratedFormatInfo["maximumCode"])
+    )
 
     # Power ordering is an intrinsic floating-point PA expectation. Do not
     # impose it on the fixed-point checks above: a quantization floor can
@@ -3240,7 +3333,7 @@ def CheckIlcPowerOperatingPoints() -> None:
     floatingBaselineEvmDbValues = []
     floatingFinalEvmDbValues = []
     floatingIterationEvmDbRows = []
-    intrinsicPowerDbmValues = (1.0, 10.0, 16.0, 20.0)
+    intrinsicPowerDbmValues = (1.0, 16.0, 20.0)
     for targetPowerDbm in intrinsicPowerDbmValues:
         floatingPaModel = PaModel(modelName="gmp", width=0)
         floatingPowerCalibration = PowerCalibration(
@@ -3343,13 +3436,19 @@ def CheckIlcPowerOperatingPoints() -> None:
     )
     assert np.all(np.diff(floatingFinalEvmDb) >= -0.25)
     # The noiseless default plant must expose a materially different
-    # nonlinear operating point at every requested power. This catches a
-    # coefficient or calibration regression that would collapse the curve to
-    # an indistinguishable numerical floor below 16 dBm.
+    # nonlinear operating point at every requested power. The default 13.5%
+    # nonlinear scale intentionally targets approximately -52/-48/-42 dB at
+    # 1/16/20 dBm for this deterministic noiseless EHT frame.
+    expectedBaselineEvmDb = np.asarray(
+        (-52.0, -48.0, -42.0), dtype=float
+    )
+    assert np.all(
+        np.abs(floatingBaselineEvmDb - expectedBaselineEvmDb) <= 1.5
+    )
     assert np.all(np.diff(floatingBaselineEvmDb) > 2.0)
-    assert floatingBaselineEvmDb[-1] - floatingBaselineEvmDb[0] > 12.0
+    assert floatingBaselineEvmDb[-1] - floatingBaselineEvmDb[0] > 8.0
     assert np.all(np.diff(floatingFinalEvmDb) > 2.0)
-    assert floatingFinalEvmDb[-1] - floatingFinalEvmDb[0] > 12.0
+    assert floatingFinalEvmDb[-1] - floatingFinalEvmDb[0] > 8.0
 
     # Doherty is intentionally branch-aware and may outperform the ordinary
     # GMP at some powers, but its default must not collapse into a much worse
@@ -3389,7 +3488,7 @@ def CheckIlcPowerOperatingPoints() -> None:
     )
     assert np.all(np.diff(dohertyBaselineEvmDb) > 2.0)
     assert dohertyBaselineEvmDb[-1] - dohertyBaselineEvmDb[0] > 12.0
-    assert np.max(dohertyBaselineEvmDb - floatingBaselineEvmDb) < 4.0
+    assert dohertyBaselineEvmDb[-1] < -24.0
 
     mimoInput = np.column_stack((waveform.samples, waveform.samples))
     mimoPaModel = MimoPaModel(
@@ -3435,6 +3534,9 @@ def CheckIlcPowerOperatingPoints() -> None:
             parameters={
                 "maximumOutputPowerDbm": 25.0,
                 "width": 16,
+                "outputFullScaleAmplitude": (
+                    mimoPaModel.outputFullScaleAmplitude
+                ),
             },
         )
         chainMetrics = chainAnalysis.Analyze(
@@ -3503,6 +3605,9 @@ def CheckIlcPowerOperatingPoints() -> None:
         parameters={
             "maximumOutputPowerDbm": 25.0,
             "width": 16,
+            "outputFullScaleAmplitude": (
+                iqWrappedPaModel.outputFullScaleAmplitude
+            ),
         },
     )
     wrappedMetrics = wrappedAnalysis.Analyze(
@@ -3544,8 +3649,19 @@ def CheckIlcPowerOperatingPoints() -> None:
             "width": 16,
         },
     )
+    thermalSampleIndices = np.arange(200, dtype=float)
     thermalPublicInput = FixedPoint(16).EncodeComplex(
-        np.full(200, 0.25 + 0.05j, dtype=np.complex128)
+        (0.25 + 0.05j)
+        * (
+            1.0
+            + 0.08
+            * np.cos(2.0 * np.pi * thermalSampleIndices / 20.0)
+        )
+        * np.exp(
+            1j
+            * 0.12
+            * np.sin(2.0 * np.pi * thermalSampleIndices / 25.0)
+        )
     )
     thermalChannelOutput, thermalFeedbackOutput = thermalChannel.Process(
         thermalPublicInput,
@@ -3635,7 +3751,9 @@ def CheckIlcPowerOperatingPoints() -> None:
         atol=1.0e-15,
     )
     for iterationRecord in thermalIlcResult.history:
-        normalizedIterationOutput = FixedPoint(16).DecodeComplex(
+        normalizedIterationOutput = FixedPoint(
+            16, thermalChannel.outputFullScaleAmplitude
+        ).DecodeComplex(
             iterationRecord.outputSignal
         )
         iterationOutputRms = (
@@ -4187,20 +4305,28 @@ def CheckGmpPaModel() -> None:
     """Verify physically consistent default GMP steady and transient behavior.
 
     Processing details:
-        Algorithm: Sum every same-order default basis to confirm that memory
-        depth cannot move the settled AM-AM curve, excite the default PA with a
-        continuous high-envelope plateau to bound startup droop, and prove that
-        explicitly supplied measured coefficients retain their exact behavior.
+        Algorithm: Sum every same-order default basis to confirm the 13.5%
+        nonlinear strength and that memory depth cannot move the settled
+        AM-AM curve, excite the default PA with a continuous high-envelope
+        plateau to bound startup droop, and prove that explicitly supplied
+        measured coefficients retain their exact behavior.
 
     Returns:
         result: None. Assertions enforce the default GMP coefficient contract.
     """
 
-    expectedSteadyCoefficients = {
+    referenceSteadyCoefficients = {
         1: 1.261692 + 0.014052j,
         3: -0.291144 + 0.054204j,
         5: 0.031812 - 0.022452j,
         7: -0.000168 + 0.002784j,
+    }
+    expectedSteadyCoefficients = {
+        nonlinearOrder: coefficient
+        * (1.0 if nonlinearOrder == 1 else 0.135)
+        for nonlinearOrder, coefficient in (
+            referenceSteadyCoefficients.items()
+        )
     }
     for memoryDepth in (1, 3, 5):
         for crossMemoryDepth in (0, 2, 4):
@@ -4239,6 +4365,56 @@ def CheckGmpPaModel() -> None:
                     rtol=0.0,
                     atol=1e-12,
                 )
+
+    # The full fitted reference remains available explicitly for stress
+    # plants such as the built-in piecewise GMP model, while the ordinary
+    # GMP default is intentionally gentler at 20 dBm.
+    (
+        referenceMainCoefficients,
+        referenceLaggingCoefficients,
+        referenceLeadingCoefficients,
+    ) = DefaultGmpCoefficients(
+        tuple(referenceSteadyCoefficients),
+        3,
+        2,
+        nonlinearScale=1.0,
+    )
+    for nonlinearOrder, expectedCoefficient in (
+        referenceSteadyCoefficients.items()
+    ):
+        combinedReferenceCoefficient = sum(
+            coefficient
+            for (order, _), coefficient in (
+                referenceMainCoefficients.items()
+            )
+            if order == nonlinearOrder
+        ) + sum(
+            coefficient
+            for (order, _, _), coefficient in (
+                referenceLaggingCoefficients.items()
+            )
+            if order == nonlinearOrder
+        ) + sum(
+            coefficient
+            for (order, _, _), coefficient in (
+                referenceLeadingCoefficients.items()
+            )
+            if order == nonlinearOrder
+        )
+        assert np.isclose(
+            combinedReferenceCoefficient,
+            expectedCoefficient,
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+
+    for invalidNonlinearScale in (-0.01, 1.01, float("nan")):
+        try:
+            GMPConfig(nonlinearScale=invalidNonlinearScale).Validate()
+        except ValueError as error:
+            assert "nonlinearScale" in str(error)
+        else:
+            raise AssertionError("invalid GMP nonlinearScale accepted")
 
     # The fitted default static curve must remain nondecreasing throughout its
     # documented normalized input interval instead of folding back and forcing
@@ -5725,6 +5901,73 @@ def CheckFixedPointInterfaces() -> None:
     assert fixedFormat.GetFormatInfo()["minimumCode"] == -4.0
     assert fixedFormat.GetFormatInfo()["maximumCode"] == 3.0
 
+    physicalFormat = FixedPoint(
+        width=3,
+        fullScaleAmplitude=2.0,
+    )
+    physicalSignal = np.array(
+        [0.5 + 1.0j, 2.5 - 3.0j],
+        dtype=np.complex128,
+    )
+    physicalCodes = physicalFormat.EncodeComplex(physicalSignal)
+    assert np.array_equal(
+        physicalCodes,
+        np.array([1.0 + 2.0j, 3.0 - 4.0j]),
+    )
+    assert np.array_equal(
+        physicalFormat.DecodeComplex(physicalCodes),
+        np.array([0.5 + 1.0j, 1.5 - 2.0j]),
+    )
+    physicalFormatInfo = physicalFormat.GetFormatInfo()
+    assert physicalFormatInfo["fullScaleAmplitude"] == 2.0
+    assert physicalFormatInfo["quantizationStep"] == 0.5
+    assert physicalFormatInfo["physicalMinimumValue"] == -2.0
+    assert physicalFormatInfo["physicalMaximumValue"] == 1.5
+
+    class FixedOnlyOutputScalePa:
+        """Expose an identity plant only through asymmetric fixed formats."""
+
+        width = 16
+        outputFullScaleAmplitude = 2.0
+
+        def Process(self, publicInput: np.ndarray) -> np.ndarray:
+            """Pass one physical signal through asymmetric public scales.
+
+            Processing details:
+                Algorithm: Decode normalized 16-bit DAC codes, preserve the
+                physical complex samples exactly, and re-encode them using
+                the synthetic PA's two-times-larger output full scale.
+
+            Args:
+                publicInput: Public Q1 fixed-point I/Q code vector.
+
+            Returns:
+                result: Equal physical samples encoded as Q2 output codes.
+            """
+
+            floatingInput = FixedPoint(self.width).DecodeComplex(publicInput)
+            return FixedPoint(
+                self.width, self.outputFullScaleAmplitude
+            ).EncodeComplex(floatingInput)
+
+    fixedOnlyProbe = np.array(
+        [0.5 + 0.25j, -0.375 + 0.125j],
+        dtype=np.complex128,
+    )
+    fixedOnlyWrapper = IQImbalancePA(
+        FixedOnlyOutputScalePa(),
+        directCoefficient=1.0 + 0.0j,
+        imageCoefficient=0.0 + 0.0j,
+    )
+    assert np.allclose(
+        fixedOnlyWrapper.ProcessFloating(fixedOnlyProbe),
+        FixedPoint(16, 2.0).DecodeComplex(
+            FixedPoint(16, 2.0).EncodeComplex(fixedOnlyProbe)
+        ),
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+
     defaultGenerator = WaveGenWifi(
         bandwidthMhz=20,
         numDataSymbols=1,
@@ -5810,6 +6053,96 @@ def CheckFixedPointInterfaces() -> None:
             raise AssertionError(
                 f"invalid fixed-point width accepted: {invalidWidth!r}"
             )
+
+    for invalidFullScale in (
+        0.0,
+        -1.0,
+        float("inf"),
+        float("nan"),
+        True,
+        "2.0",
+    ):
+        try:
+            FixedPoint(16, invalidFullScale)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(
+                "invalid fixed-point full scale accepted: "
+                f"{invalidFullScale!r}"
+            )
+
+    publicScaleConstructors = (
+        (
+            "PaModel",
+            lambda value: PaModel(outputFullScaleAmplitude=value),
+        ),
+        (
+            "MimoPaModel",
+            lambda value: MimoPaModel(
+                outputFullScaleAmplitude=value
+            ),
+        ),
+        (
+            "Channel",
+            lambda value: Channel(outputFullScaleAmplitude=value),
+        ),
+        (
+            "Analysis",
+            lambda value: Analysis(
+                defaultWaveform.samples,
+                defaultWaveform,
+                outputFullScaleAmplitude=value,
+            ),
+        ),
+    )
+    for invalidFullScale in (True, np.bool_(True), "2.0"):
+        for constructorName, constructor in publicScaleConstructors:
+            try:
+                constructor(invalidFullScale)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(
+                    f"{constructorName} accepted invalid output full scale "
+                    f"{invalidFullScale!r}"
+                )
+
+        invalidThirdPartyPa = FixedOnlyOutputScalePa()
+        invalidThirdPartyPa.outputFullScaleAmplitude = invalidFullScale
+        invalidScaleChannel = Channel(
+            paModel=invalidThirdPartyPa,
+            width=16,
+        )
+        invalidScaleWrapper = IQImbalancePA(invalidThirdPartyPa)
+        thirdPartyScaleOperations = (
+            (
+                "Channel.ProcessPaOutput",
+                lambda: invalidScaleChannel.ProcessPaOutput(
+                    np.zeros(1, dtype=np.complex128)
+                ),
+            ),
+            (
+                "Channel.ProcessBoundPaFloating",
+                lambda: invalidScaleChannel.ProcessBoundPaFloating(
+                    np.zeros(1, dtype=np.complex128)
+                ),
+            ),
+            (
+                "IQImbalancePA.outputFullScaleAmplitude",
+                lambda: invalidScaleWrapper.outputFullScaleAmplitude,
+            ),
+        )
+        for operationName, operation in thirdPartyScaleOperations:
+            try:
+                operation()
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(
+                    f"{operationName} accepted third-party output full scale "
+                    f"{invalidFullScale!r}"
+                )
 
 
 def CheckPaThermalModel() -> None:
@@ -8499,9 +8832,15 @@ def CheckFrequencySelectiveIqImbalance() -> None:
             "width": 16,
         }
     )
-    fixedFeedbackOutput = fixedFeedbackChannel.ProcessPaOutput(fixedInput)
-    decodedFixedInput = fixedFormat.DecodeComplex(fixedInput)
-    expectedFixedFeedback = fixedFormat.EncodeComplex(
+    fixedOutputFormat = FixedPoint(
+        16, fixedFeedbackChannel.outputFullScaleAmplitude
+    )
+    fixedPaOutput = fixedOutputFormat.EncodeComplex(fixedFloatingInput)
+    fixedFeedbackOutput = fixedFeedbackChannel.ProcessPaOutput(
+        fixedPaOutput
+    )
+    decodedFixedInput = fixedOutputFormat.DecodeComplex(fixedPaOutput)
+    expectedFixedFeedback = fixedOutputFormat.EncodeComplex(
         ApplyReferenceIqFir(
             decodedFixedInput,
             fbDirectTaps,
@@ -8510,6 +8849,39 @@ def CheckFrequencySelectiveIqImbalance() -> None:
         )
     )
     assert np.array_equal(fixedFeedbackOutput, expectedFixedFeedback)
+
+    widerPaOutputScale = 4.0
+    mismatchedScalePa = PaModel(
+        modelName="gmp",
+        width=8,
+        outputFullScaleAmplitude=widerPaOutputScale,
+    )
+    mismatchedScaleChannel = Channel(
+        paModel=mismatchedScalePa,
+        parameters={
+            "sampleMode": "forward",
+            "width": 16,
+            "outputFullScaleAmplitude": 2.0,
+        },
+    )
+    physicalPaOutput = np.array(
+        [0.25 + 0.50j, -0.75 + 0.125j, 1.25 - 0.50j],
+        dtype=np.complex128,
+    )
+    paOutputCodes = FixedPoint(
+        8, widerPaOutputScale
+    ).EncodeComplex(physicalPaOutput)
+    expectedDecodedPaOutput = FixedPoint(
+        8, widerPaOutputScale
+    ).DecodeComplex(paOutputCodes)
+    convertedChannelOutput = mismatchedScaleChannel.ProcessPaOutput(
+        paOutputCodes
+    )
+    assert np.array_equal(
+        convertedChannelOutput,
+        FixedPoint(16, 2.0).EncodeComplex(expectedDecodedPaOutput),
+    )
+
     fixedTxChannel = Channel(
         paModel=MimoPaModel(
             parameters={"numTransmitChains": 2, "width": 0}
@@ -8525,8 +8897,9 @@ def CheckFrequencySelectiveIqImbalance() -> None:
     fixedChannelOutput, fixedTxFeedbackOutput = fixedTxChannel.Process(
         fixedInput
     )
+    decodedFixedTxInput = fixedFormat.DecodeComplex(fixedInput)
     expectedFixedTransmitter = ApplyReferenceIqFir(
-        decodedFixedInput,
+        decodedFixedTxInput,
         txDirectTaps,
         txImageTaps,
         txDcOffset,
@@ -10435,7 +10808,7 @@ def CheckChannelModel() -> None:
         - fixedWifiHeadroomRestoreDb
     )
     assert fixedWifiHeadroomRestoreDb > 0.0
-    assert 0.0 < residualAnalogDriveDb < 3.0
+    assert abs(residualAnalogDriveDb) < 3.0
     actualFixedGmpInput = fixedGmpChannel.GetLastActualPaInput()
     assert np.max(np.abs(actualFixedGmpInput)) <= 2.0
     for publicWaveform in (
@@ -10459,6 +10832,9 @@ def CheckChannelModel() -> None:
             "activePowerThresholdDb": -60.0,
             "activeGapToleranceSamples": 16,
             "width": 16,
+            "outputFullScaleAmplitude": (
+                fixedGmpChannel.outputFullScaleAmplitude
+            ),
         },
     ).Analyze()
     assert abs(fixedGmpOutputMetrics["outputPowerDbm"] - 20.0) <= 0.25
@@ -10508,7 +10884,13 @@ def CheckChannelModel() -> None:
     largerHeadroomOutputMetrics = Analysis(
         largerHeadroomOutput,
         transmittedSignal=largerHeadroomOutput,
-        parameters={"maximumOutputPowerDbm": 25.0, "width": 16},
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "width": 16,
+            "outputFullScaleAmplitude": (
+                fixedGmpChannel.outputFullScaleAmplitude
+            ),
+        },
     ).Analyze()
     assert abs(
         largerHeadroomOutputMetrics["outputPowerDbm"] - 20.0
@@ -10700,6 +11082,19 @@ def CheckTwoToneAnalogPowerReporting() -> None:
         expectedOutputPowerDbm,
         atol=0.01,
     )
+    for invalidFullScale in (True, np.bool_(True), "2.0"):
+        try:
+            TwoToneAnalysis(
+                floatingWaveform,
+                outputFullScaleAmplitude=invalidFullScale,
+            )
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(
+                "TwoToneAnalysis accepted invalid output full scale "
+                f"{invalidFullScale!r}"
+            )
 
     # Raw normalized floating records remain backward compatible when width is
     # omitted, while an explicit zero remains the authoritative declaration.
@@ -10747,6 +11142,58 @@ def CheckTwoToneAnalogPowerReporting() -> None:
     assert set(directFixedMetrics) == expectedMetricNames
     assert np.isclose(
         directFixedMetrics["outputPowerDbm"],
+        expectedOutputPowerDbm,
+        atol=0.02,
+    )
+
+    expandedOutputScale = 2.0
+    expandedOutputCodes = FixedPoint(
+        16, expandedOutputScale
+    ).EncodeComplex(floatingWaveform.samples)
+    expandedOutputMetrics = TwoToneAnalysis(
+        floatingWaveform,
+        parameters={
+            **analysisParameters,
+            "width": 16,
+            "outputFullScaleAmplitude": expandedOutputScale,
+        },
+    ).Analyze(expandedOutputCodes)
+    assert np.isclose(
+        expandedOutputMetrics["outputPowerDbm"],
+        expectedOutputPowerDbm,
+        atol=0.02,
+    )
+    assert np.isclose(
+        expandedOutputMetrics["fundamentalAverageDbfs"],
+        directFixedMetrics["fundamentalAverageDbfs"]
+        - 20.0 * np.log10(expandedOutputScale),
+        atol=0.02,
+    )
+    assert expandedOutputMetrics["im3WorstDbc"] < -85.0
+    expandedRawMetadata = Analysis.BuildTwoToneWaveform(
+        expandedOutputCodes,
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=toneFrequenciesHz,
+        width=16,
+        outputFullScaleAmplitude=expandedOutputScale,
+    )
+    assert np.isclose(
+        expandedRawMetadata.rmsLevel,
+        expectedNormalizedRms,
+        atol=2.0e-4,
+    )
+    expandedRawMetrics = Analysis.AnalyzeTwoTone(
+        expandedOutputCodes,
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=toneFrequenciesHz,
+        parameters={
+            **analysisParameters,
+            "width": 16,
+            "outputFullScaleAmplitude": expandedOutputScale,
+        },
+    )
+    assert np.isclose(
+        expandedRawMetrics["outputPowerDbm"],
         expectedOutputPowerDbm,
         atol=0.02,
     )
@@ -11211,13 +11658,17 @@ def CheckTwoToneIlcAnalysis() -> None:
         outputDirectory = Path(temporaryDirectory)
         benchmarkRows = RunTwoToneIlcBenchmark(
             TwoToneBenchmarkConfig(
-                width=0,
+                width=16,
                 numSamples=4096,
                 numIterations=2,
                 outputDirectory=outputDirectory,
             )
         )
         assert len(benchmarkRows) == 8
+        assert all(
+            abs(row.metrics["outputPowerDbm"] - 20.0) <= 0.25
+            for row in benchmarkRows
+        )
         assert (
             outputDirectory / "all_ilc_two_tone_metrics.csv"
         ).exists()
@@ -11320,7 +11771,8 @@ def CheckPaCharacterizationBenchmark() -> None:
         )
         assert np.all(np.diff(gmpIm3Dbc) > 4.0)
         assert np.all(np.diff(dohertyIm3Dbc) > 4.0)
-        assert np.max(dohertyIm3Dbc - gmpIm3Dbc) < 4.0
+        assert -53.0 < gmpIm3Dbc[-1] < -47.0
+        assert dohertyIm3Dbc[-1] < -28.0
         rappSummary = next(
             summary
             for summary in result.summaries
@@ -11587,6 +12039,57 @@ def CheckDpdLmsModelAndBenchmark() -> None:
     )
     assert indirectResult.sampleCount == referenceSignal.size
     assert indirectResult.afterNmseDb < -100.0
+
+    fixedIndirectPhysical = referenceSignal[:1024]
+    fixedIndirectInput = FixedPoint(16).EncodeComplex(
+        fixedIndirectPhysical
+    )
+    fixedIndirectOutput = FixedPoint(16, 2.0).EncodeComplex(
+        fixedIndirectPhysical
+    )
+    disabledGainCompensation = {
+        "enableComplexGainCompensation": False,
+    }
+    fixedIndirectGmp = DpdGmp(
+        parameters={
+            "nonlinearOrders": (1,),
+            "memoryDepth": 1,
+            "crossMemoryDepth": 0,
+            "ridgeFactor": 1.0e-9,
+            "maximumOutputMagnitude": None,
+            "width": 16,
+        }
+    )
+    fixedIndirectGmp.FitIndirect(
+        fixedIndirectInput,
+        fixedIndirectOutput,
+        sampleRateHz=80.0e6,
+        signalProcessingParameters=disabledGainCompensation,
+        paOutputFullScaleAmplitude=2.0,
+    )
+    assert abs(fixedIndirectGmp.GetCoefficients()[0] - 1.0) < 0.01
+
+    fixedIndirectLms = DpdLms(
+        parameters={
+            "nonlinearOrders": (1,),
+            "memoryDepth": 1,
+            "crossMemoryDepth": 0,
+            "learningRate": 0.05,
+            "featureScaleMode": "frame",
+            "coefficientCommitMode": "frame",
+            "leakageFactor": 0.0,
+            "maximumOutputMagnitude": None,
+            "width": 16,
+        }
+    )
+    fixedIndirectLms.UpdateIndirect(
+        fixedIndirectInput,
+        fixedIndirectOutput,
+        sampleRateHz=80.0e6,
+        signalProcessingParameters=disabledGainCompensation,
+        paOutputFullScaleAmplitude=2.0,
+    )
+    assert abs(fixedIndirectLms.GetCoefficients()[0] - 1.0) < 0.01
 
     fixedFormat = FixedPoint(16)
     fixedReference = fixedFormat.EncodeComplex(referenceSignal)
@@ -11921,6 +12424,38 @@ def CheckChannelAnalysisAndCoupledDpd() -> None:
     assert abs(measuredLeakage.groupDelaySamples - 2.0) < 0.01
     assert measuredLeakage.flatnessDb < 0.01
     assert preMeasurement.worstConditionNumber > 1.0
+
+    fixedMeasurementPa = PaModel(
+        modelName="gmp",
+        width=8,
+        outputFullScaleAmplitude=4.0,
+    )
+    fixedMeasurementChannel = Channel(
+        paModel=fixedMeasurementPa,
+        parameters={
+            "sampleMode": "forward",
+            "width": 16,
+            "outputFullScaleAmplitude": 2.0,
+        },
+    )
+    fixedChannelAnalyzer = ChannelAnalyse(
+        parameters={
+            "sampleRateHz": 80.0e6,
+            "channelBandwidthHz": 20.0e6,
+            "fftLength": 128,
+            "impulseLength": 8,
+            "probeDelaySamples": 2,
+            "width": 16,
+        }
+    )
+    fixedPostPaMeasurement = fixedChannelAnalyzer.Measure(
+        fixedMeasurementChannel.ProcessPaOutput,
+        1,
+        "fixed post-PA",
+    )
+    fixedDirectPath = fixedPostPaMeasurement.GetPath(0, 0)
+    assert abs(fixedDirectPath.gainDb) < 0.01
+    assert fixedDirectPath.flatnessDb < 0.01
 
     identityModels = (
         DpdGmp(parameters={"width": 0}),

@@ -130,31 +130,63 @@ def PlotWienerPanel(axis: plt.Axes, inputAmplitude: np.ndarray) -> None:
 
 
 def PlotGmpPanel(axis: plt.Axes, inputAmplitude: np.ndarray) -> None:
-    """Draw the actual default GMP steady curve and its mild memory band."""
+    """Draw the default GMP curve beside its full-strength stress reference."""
 
-    steadyStateCoefficients = {
+    referenceSteadyStateCoefficients = {
         1: 1.261692 + 0.014052j,
         3: -0.291144 + 0.054204j,
         5: 0.031812 - 0.022452j,
         7: -0.000168 + 0.002784j,
     }
-    steadyOutput = sum(
+    nonlinearScale = 0.135
+    defaultSteadyStateCoefficients = {
+        nonlinearOrder: coefficient
+        * (1.0 if nonlinearOrder == 1 else nonlinearScale)
+        for nonlinearOrder, coefficient in (
+            referenceSteadyStateCoefficients.items()
+        )
+    }
+    defaultSteadyOutput = sum(
         coefficient * inputAmplitude**nonlinearOrder
-        for nonlinearOrder, coefficient in steadyStateCoefficients.items()
+        for nonlinearOrder, coefficient in (
+            defaultSteadyStateCoefficients.items()
+        )
     )
-    nominalGain = np.abs(steadyOutput) / inputAmplitude
-    nominalGainDb = 20.0 * np.log10(np.maximum(nominalGain, 1.0e-6))
-    dynamicHalfWidthDb = 0.15 * np.minimum(inputAmplitude, 1.5)
+    referenceSteadyOutput = sum(
+        coefficient * inputAmplitude**nonlinearOrder
+        for nonlinearOrder, coefficient in (
+            referenceSteadyStateCoefficients.items()
+        )
+    )
+    defaultGainDb = 20.0 * np.log10(
+        np.maximum(np.abs(defaultSteadyOutput) / inputAmplitude, 1.0e-6)
+    )
+    referenceGainDb = 20.0 * np.log10(
+        np.maximum(
+            np.abs(referenceSteadyOutput) / inputAmplitude,
+            1.0e-6,
+        )
+    )
+    dynamicHalfWidthDb = 0.025 * np.minimum(inputAmplitude, 1.5)
     axis.plot(
         inputAmplitude,
-        nominalGainDb,
+        defaultGainDb,
         linewidth=2.5,
         color="#2563eb",
+        label="default nonlinearScale=0.135",
+    )
+    axis.plot(
+        inputAmplitude,
+        referenceGainDb,
+        linewidth=1.8,
+        linestyle="--",
+        color="#64748b",
+        label="nonlinearScale=1.0 stress reference",
     )
     axis.fill_between(
         inputAmplitude,
-        nominalGainDb - dynamicHalfWidthDb,
-        nominalGainDb + dynamicHalfWidthDb,
+        defaultGainDb - dynamicHalfWidthDb,
+        defaultGainDb + dynamicHalfWidthDb,
         color="#60a5fa",
         alpha=0.22,
         label="mild default memory trajectory",
@@ -162,20 +194,23 @@ def PlotGmpPanel(axis: plt.Axes, inputAmplitude: np.ndarray) -> None:
     annotationAmplitude = 1.05
     annotationOutput = sum(
         coefficient * annotationAmplitude**nonlinearOrder
-        for nonlinearOrder, coefficient in steadyStateCoefficients.items()
+        for nonlinearOrder, coefficient in (
+            defaultSteadyStateCoefficients.items()
+        )
     )
     annotationGainDb = 20.0 * np.log10(
         abs(annotationOutput) / annotationAmplitude
     )
     axis.annotate(
-        "same-order sums set a monotonic center curve",
+        "nonlinearScale adjusts orders 3 and above",
         xy=(annotationAmplitude, annotationGainDb),
-        xytext=(0.12, -3.5),
+        xytext=(0.10, -2.4),
         arrowprops={"arrowstyle": "->", "color": "#444444"},
     )
     axis.text(
         0.03,
         0.08,
+        "order 1 preserves the small-signal gain\n"
         "memoryDepth -> zero-sum main residual\n"
         "crossMemoryDepth -> zero-sum envelope-history residual",
         transform=axis.transAxes,
@@ -183,7 +218,7 @@ def PlotGmpPanel(axis: plt.Axes, inputAmplitude: np.ndarray) -> None:
         fontweight="bold",
     )
     axis.set_ylim(-5.0, 3.0)
-    axis.legend(loc="lower left", frameon=False, fontsize=9)
+    axis.legend(loc="lower right", frameon=False, fontsize=9)
     ConfigureAxes(axis, "C. GMP: polynomial order and delayed-envelope memory")
 
 

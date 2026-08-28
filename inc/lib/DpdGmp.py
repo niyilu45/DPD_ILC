@@ -445,7 +445,10 @@ class DpdGmp:
         self.lastTrainingResult = None
 
     def PreparePublicSignal(
-        self, inputSignal: np.ndarray, signalName: str
+        self,
+        inputSignal: np.ndarray,
+        signalName: str,
+        fullScaleAmplitude: float = 1.0,
     ) -> np.ndarray:
         """Decode and validate one public signal as a floating-point vector.
 
@@ -456,14 +459,17 @@ class DpdGmp:
         Args:
             inputSignal: Floating samples or public fixed-point complex codes.
             signalName: Name included in validation errors.
+            fullScaleAmplitude: Physical component magnitude represented by
+                the fixed-point code rail. The default is the normalized DPD
+                input scale of one.
 
         Returns:
             result: Normalized finite complex training/inference vector.
         """
 
-        decodedSignal = FixedPoint(self.width).DecodeComplex(
-            inputSignal
-        ).reshape(-1)
+        decodedSignal = FixedPoint(
+            self.width, fullScaleAmplitude
+        ).DecodeComplex(inputSignal).reshape(-1)
         if decodedSignal.size == 0:
             raise ValueError(f"{signalName} cannot be empty")
         if not np.all(np.isfinite(decodedSignal)):
@@ -1224,6 +1230,7 @@ class DpdGmp:
             Mapping[str, object]
         ] = None,
         sampleWeights: Optional[np.ndarray] = None,
+        paOutputFullScaleAmplitude: float = 1.0,
     ) -> DpdGmpTrainingResult:
         """Fit an indirect-learning postinverse and copy it into the DPD.
 
@@ -1239,6 +1246,9 @@ class DpdGmp:
             sampleRateHz: Complex sample rate used for synchronization.
             signalProcessingParameters: Optional SigProc overrides.
             sampleWeights: Optional per-sample regression importance.
+            paOutputFullScaleAmplitude: Physical component magnitude
+                represented by the PA/feedback output code rail. The default
+                preserves historical Q1 captures.
 
         Returns:
             result: Indirect-learning coefficient-fit diagnostics.
@@ -1248,7 +1258,9 @@ class DpdGmp:
             paInputSignal, "paInputSignal"
         )
         floatingOutput = self.PreparePublicSignal(
-            paOutputSignal, "paOutputSignal"
+            paOutputSignal,
+            "paOutputSignal",
+            paOutputFullScaleAmplitude,
         )
         if floatingInput.size != floatingOutput.size:
             raise ValueError(

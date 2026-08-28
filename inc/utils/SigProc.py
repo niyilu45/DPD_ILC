@@ -197,6 +197,31 @@ class PowerCalibration:
 
     width = Width
 
+    @property
+    def OutputFullScaleAmplitude(self) -> float:
+        """Return the bound plant's physical PA-output code full scale.
+
+        Processing details:
+            Algorithm: Resolve the protocol owner behind an object or bound
+            callback, fall back to one for legacy plants, and validate the
+            result through ``FixedPoint``.
+
+        Returns:
+            result: Positive physical I/Q component full-scale amplitude.
+        """
+
+        protocolOwner = getattr(self._paProcessMethod, "__self__", None)
+        if protocolOwner is None:
+            protocolOwner = self.paModel
+        fullScaleAmplitude = getattr(
+            protocolOwner, "outputFullScaleAmplitude", 1.0
+        )
+        return FixedPoint(
+            self.width, fullScaleAmplitude
+        ).fullScaleAmplitude
+
+    outputFullScaleAmplitude = OutputFullScaleAmplitude
+
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened calibration parameter snapshot.
 
@@ -502,6 +527,10 @@ class PowerCalibration:
             raise ValueError(
                 "PowerCalibration and paModel must use the same width"
             )
+        FixedPoint(
+            int(paWidth),
+            getattr(protocolOwner, "outputFullScaleAmplitude", 1.0),
+        )
         calibrationProcessMethod = getattr(
             protocolOwner, "ProcessCalibrationDrive", None
         )
@@ -1235,7 +1264,10 @@ class PowerCalibration:
                 tuple(float(value) for value in analogDriveDb),
             )
         publicPaOutput = np.asarray(rawPaOutput, dtype=np.complex128)
-        floatingPaOutput = interfaceFormat.DecodeComplex(
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
+        floatingPaOutput = outputFormat.DecodeComplex(
             publicPaOutput
         )
         if floatingPaOutput.ndim == 1:

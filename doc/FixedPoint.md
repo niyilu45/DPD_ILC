@@ -2,31 +2,33 @@
 
 ## 1. 最重要的接口约定
 
-本工程的浮点模式和定点模式都返回 `numpy.complex128`，但二者的数值含义不同：
+本工程的浮点模式和定点模式都返回 `numpy.complex128`，但二者的数值含义不同。统一转换器的公开构造签名为
+`FixedPoint(width: int = 16, fullScaleAmplitude: float = 1.0)`；下文把 `fullScaleAmplitude` 记为 $F$：
 
 | 模式 | `width` | `complex128` 中保存的数值 |
 |---|---:|---|
 | 浮点 | 0 | 归一化物理复包络，通常在单位幅度附近 |
-| 定点 | 大于0 | I、Q 两个分量的有符号整数码 |
+| 定点 | 大于0 | I、Q 两个分量的有符号整数码；$F$ 决定这些码代表的物理分量幅度 |
 
 `complex128` 只是统一的复数数组容器，并不表示定点模式仍返回归一化小数。例如：
 
 - 14 位定点的 I/Q 码范围是 `-8192` 至 `8191`；
 - 16 位定点的 I/Q 码范围是 `-32768` 至 `32767`；
 - 14 位正满量程附近应看到 `8191`，而不是 `0.9998779`；
-- 只有模块内部计算时，`8191` 才会被解码为约 `0.9998779`。
+- $F=1$ 时，只有模块内部计算时，`8191` 才会被解码为约 `0.9998779`；
+- $F=2$ 时，同一个 `8191` 代表约 `1.9997559`。码范围没有变化，变化的是码与物理幅度之间的标尺。
 
 ```mermaid
 flowchart LR
-    physicalInput["内部归一化浮点 x"] --> encode["EncodeComplex<br/>乘 2^(W-1)、舍入、饱和"]
+    physicalInput["内部物理浮点 x"] --> encode["EncodeComplex<br/>乘 2^(W-1)/F、舍入、饱和"]
     encode --> publicInput["公开 complex128<br/>I/Q 为整数码"]
-    publicInput --> decode["DecodeComplex<br/>除以 2^(W-1)"]
+    publicInput --> decode["DecodeComplex<br/>乘 F/2^(W-1)"]
     decode --> algorithm["内部浮点算法<br/>Wi-Fi / PA / 同步 / EVM / ILC"]
     algorithm --> outputEncode["EncodeComplex"]
     outputEncode --> publicOutput["公开 complex128<br/>I/Q 为整数码"]
 ```
 
-**图 1 说明**：定点码只存在于模块公开边界。模块内部仍采用浮点计算，但这不改变公开输入输出必须是整数码的约定。
+**图 1 说明**：定点码只存在于模块公开边界。模块内部仍采用浮点计算，但这不改变公开输入输出必须是整数码的约定。发送DAC输入默认使用 $F=1$；`PaModel`、`MimoPaModel` 和 `Channel` 的固定点输出默认使用 $F_{out}=2$，提供6.02 dB分量观测余量。它是 **scaled full-scale** 标尺，不应在 $F$ 任意可配时笼统称为Q1.15或Q2.14。
 
 ## 2. 位宽和码值范围
 
@@ -42,6 +44,14 @@ flowchart LR
 S_W=2^{W-1}
 ```
 
+代码范围只由 $W$ 决定；解码后物理可表示范围还由 $F$ 决定：
+
+```math
+-F\leq x\leq F-\Delta,
+\qquad
+\Delta=\frac{F}{S_W}.
+```
+
 常见位宽如下：
 
 | 位宽 | 缩放因子 | 最小码 | 最大码 |
@@ -55,7 +65,7 @@ S_W=2^{W-1}
 
 ## 3. 从物理浮点量编码为整数码
 
-对归一化实分量 $x_{\mathrm{I}}$，编码公式为：
+对物理实分量 $x_{\mathrm{I}}$，编码公式为：
 
 ```math
 q_{\mathrm{I}}=
@@ -63,7 +73,7 @@ q_{\mathrm{I}}=
 2^{W-1}-1,
 \max\left(
 -2^{W-1},
-\mathrm{round}\left(S_W x_{\mathrm{I}}\right)
+\mathrm{round}\left(\frac{S_W x_{\mathrm{I}}}{F}\right)
 \right)
 \right)
 ```
@@ -74,7 +84,7 @@ Q 分量独立使用同一公式。复数公开样值为：
 q=q_{\mathrm{I}}+j q_{\mathrm{Q}}
 ```
 
-工程使用 NumPy 的最近整数舍入规则，并在超出范围时饱和。例如 14 位模式下：
+工程使用 NumPy 的最近整数舍入规则，并在超出范围时饱和。例如14位、默认 $F=1$ 时：
 
 ```math
 x_{\mathrm{I}}=1
@@ -91,9 +101,9 @@ q_{\mathrm{I}}=8191
 模块拿到公开码后，先舍入和饱和，再执行：
 
 ```math
-\hat x_{\mathrm{I}}=\frac{q_{\mathrm{I}}}{S_W},
+\hat x_{\mathrm{I}}=F\frac{q_{\mathrm{I}}}{S_W},
 \qquad
-\hat x_{\mathrm{Q}}=\frac{q_{\mathrm{Q}}}{S_W}
+\hat x_{\mathrm{Q}}=F\frac{q_{\mathrm{Q}}}{S_W}
 ```
 
 对应的复包络为：
@@ -102,7 +112,7 @@ q_{\mathrm{I}}=8191
 \hat x=\hat x_{\mathrm{I}}+j\hat x_{\mathrm{Q}}
 ```
 
-14 位最大正码解码结果为：
+14位最大正码在默认 $F=1$ 时的解码结果为：
 
 ```math
 \frac{8191}{8192}=0.9998779296875
@@ -114,10 +124,10 @@ q_{\mathrm{I}}=8191
 
 | 函数 | 输入含义 | 输出含义 | 典型位置 |
 |---|---|---|---|
-| `EncodeComplex` | 归一化物理浮点量 | 公开整数码 | 模块输出边界 |
+| `EncodeComplex` | 当前 $F$ 标尺下的物理浮点量 | 公开整数码 | 模块输出边界 |
 | `QuantizeCodes` | 可能含小数或越界的码值 | 舍入并饱和后的整数码 | 模块输入校验 |
-| `DecodeComplex` | 公开整数码 | 归一化物理浮点量 | 模块输入边界 |
-| `QuantizeComplex` | 归一化物理浮点量 | 公开整数码 | `EncodeComplex` 的兼容别名 |
+| `DecodeComplex` | 公开整数码 | 当前 $F$ 标尺下的物理浮点量 | 模块输入边界 |
+| `QuantizeComplex` | 当前 $F$ 标尺下的物理浮点量 | 公开整数码 | `EncodeComplex` 的兼容别名 |
 
 如果调用者对公开定点波形乘一个驱动比例，例如：
 
@@ -162,6 +172,23 @@ print(decodedSignal)
 3. 正满量程为 `8191`；
 4. 解码后的内部浮点量才小于或等于 1。
 
+同一位宽也可以承载更宽的输出观测范围。下面的16位scaled full-scale格式把分量幅度2映射到正满码附近：
+
+```python
+from inc.utils.FixedPoint import FixedPoint
+
+inputDacFormat = FixedPoint(width=16, fullScaleAmplitude=1.0)
+paOutputFormat = FixedPoint(width=16, fullScaleAmplitude=2.0)
+
+outputCodes = paOutputFormat.EncodeComplex([1.60 + 0.25j])
+decodedOutput = paOutputFormat.DecodeComplex(outputCodes)
+
+assert outputCodes.real[0] < 32767
+assert abs(decodedOutput[0].real - 1.60) < 2.0 / 32768
+```
+
+这里输入DAC标尺仍为1；只扩大PA输出观测标尺。若把同一个1.60分量错误地按 $F=1$ 编码，它会削顶到32767，增加位宽也不会扩大这个物理范围。
+
 ## 7. WaveGenWifi、PaModel、Channel 和 Analysis 的边界
 
 ### 7.1 WaveGenWifi
@@ -188,14 +215,17 @@ assert waveform.samples.real.min() >= -8192
 
 ### 7.2 PaModel
 
+公开构造签名为
+`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, piecewiseGmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。输入DAC格式固定使用 `FixedPoint(width, 1.0)`；固定点输出格式使用 `FixedPoint(width, paModel.outputFullScaleAmplitude)`，内置默认值为2.0。
+
 `PaModel.Process` 的流程为：
 
 ```mermaid
 flowchart LR
-    inputCodes["输入整数码"] --> decode["解码为归一化浮点"]
+    inputCodes["输入整数码<br/>输入F=1"] --> decode["解码为归一化浮点"]
     decode --> analogDrive["已提交的隐藏模拟驱动<br/>首次校准前为0 dB"]
     analogDrive --> pa["Rapp/Wiener/GMP/Doherty浮点PA"]
-    pa --> encode["编码、舍入、饱和"]
+    pa --> encode["按输出F编码、舍入、饱和<br/>默认Fout=2"]
     encode --> outputCodes["输出整数码"]
 ```
 
@@ -203,7 +233,8 @@ flowchart LR
 
 ### 7.3 Channel
 
-`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码。提供目标功率时，Channel先保存并暂停PA热状态。内部 `PowerCalibration` 把原始有效区归一化波形缩放成合法公开码，并用 `calibrationDigitalHeadroomDb=6.0` 默认保留6 dB每分量峰值余量；码值解码以后，闭环才调整隐藏的逐链模拟驱动，然后执行Tx I/Q、PA前耦合和参考温度各路PA。PA输出经过公开边界量化再解码，功率检测器只统计有效突发，因此输入和输出量化误差都进入闭环，但驱动增加不再要求生成越界整数码。该功率检测器观察的是接收分叉前的干净物理PA输出，不是raw `fbOut` 定点码的表观功率。
+公开构造签名为
+`Channel(paModel=None, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。`Channel.Process(inputSignal, outputPowerDbm=...)` 在定点公开边界保留整数I/Q码：输入DAC仍用 $F=1$，`chOut` 与 `fbOut` 默认用 `outputFullScaleAmplitude=2.0`。提供目标功率时，Channel先保存并暂停PA热状态。内部 `PowerCalibration` 把原始有效区归一化波形缩放成合法公开码，并用 `calibrationDigitalHeadroomDb=6.0` 默认保留6 dB每分量峰值余量；码值解码以后，闭环才调整隐藏的逐链模拟驱动，然后执行Tx I/Q、PA前耦合和参考温度各路PA。PA输出经过scaled full-scale公开边界量化再解码，功率检测器只统计有效突发，因此输入和输出量化误差都进入闭环，但驱动增加不再要求生成越界整数码。该功率检测器观察的是接收分叉前的干净物理PA输出，不是raw `fbOut` 定点码的表观功率。
 
 成功后，Channel提交模拟驱动，恢复原热状态，并用同一公开码和已提交驱动通过真实温度PA/热周期一次；PA后耦合节点随后生成 `chOut`。`sampleMode="forward"` 把同一浮点结果复制为第二项，`"fb"` 才执行完整反馈链；两项再分别编码成相同公开定点格式并以二元组返回，因此forward模式的两个公开数组仍逐样点相同。校准试探不发热，两项都对应同一次温漂。目标为 `None` 时，`Channel.Process` 解码公开输入，应用最近一次已经提交的模拟驱动，再执行单次耦合PA并返回两项；从未校准时该驱动为0 dB。`Channel.ProcessPaOutput` 是按 `sampleMode` 选一路的兼容入口，用于已有逐PA输出。
 
@@ -222,9 +253,9 @@ flowchart LR
     sampleMode -->|fb| fb["反馈模拟非理想<br/>可选内部ADC"]
     forwardNoise -. "forward副本来源" .-> copy
     fb --> feedbackNoise["独立浮点噪声"]
-    forwardNoise --> encodeCh["FixedPoint.EncodeComplex"]
+    forwardNoise --> encodeCh["FixedPoint.EncodeComplex<br/>默认输出F=2"]
     copy --> encodeFb
-    feedbackNoise --> encodeFb["FixedPoint.EncodeComplex"]
+    feedbackNoise --> encodeFb["FixedPoint.EncodeComplex<br/>默认输出F=2"]
     encodeCh --> chOut["chOut公开整数码"]
     encodeFb --> fbOut["fbOut公开整数码"]
 ```
@@ -247,14 +278,26 @@ flowchart LR
 
 ### 7.4 Analysis
 
-`Analysis` 接收公开整数码后先解码，再执行：
+`Analysis` 的公开构造签名为
+`Analysis(referenceSignal=None, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。它接收公开整数码后先解码，再执行：
 
 - 整数和分数时延估计；
 - CFO、SFO 与复增益补偿；
 - OFDM 解调；
 - SNR、EVM 和 ACLR 计算。
 
-显式参考、发送辅助和盲解析三条路径都只解码一次。`ParseWifi` 的公开结果仍是整数码，交给 `Analysis` 后再统一解码。
+显式参考、发送辅助和盲解析三条路径都只解码一次。`ParseWifi` 的公开结果仍是输入DAC整数码，交给 `Analysis` 后再统一解码。为兼容外部仪表和旧数组，Analysis默认 `outputFullScaleAmplitude=1.0`，无法仅从裸整数数组推断plant标尺；分析固定点PA输出时必须显式传入：
+
+```python
+fixedPa = PaModel(modelName="gmp", width=16)
+paOutput = fixedPa.Process(fixedInputCodes)
+metrics = Analysis(
+    fixedReferenceCodes,
+    wifiWaveform,
+    width=16,
+    outputFullScaleAmplitude=fixedPa.outputFullScaleAmplitude,
+).Analyze(paOutput)
+```
 
 ## 8. ILC 为什么也要隐藏码值
 
@@ -279,7 +322,7 @@ flowchart LR
 忽略饱和时，一个分量的物理量化步长为：
 
 ```math
-\Delta=\frac{1}{2^{W-1}}
+\Delta=\frac{F}{2^{W-1}}
 ```
 
 在误差近似均匀且与信号不相关时，每个实分量的量化噪声方差近似为：
@@ -297,16 +340,16 @@ P_q\approx\frac{\Delta^2}{6}
 饱和误差不同于小量化噪声。当内部物理分量超过范围时：
 
 ```math
-x_{\mathrm{I}}>1-\Delta
+x_{\mathrm{I}}>F-\Delta
 \quad\Longrightarrow\quad
 q_{\mathrm{I}}=2^{W-1}-1
 ```
 
-OFDM 具有较高 PAPR，即使整包 RMS 已归一化，瞬时 I 或 Q 仍可能超过范围。增加位宽会减小 $\Delta$，但不会把归一化可表示范围扩展到远大于 1；需要更大动态范围时，应另行定义整数位和小数位分配，而不能只增加当前接口的总位宽。
+OFDM 具有较高 PAPR，即使整包 RMS 已归一化，瞬时 I 或 Q 仍可能超过当前 $F$。增加位宽会减小 $\Delta$，但不会扩大由 $F$ 定义的物理范围；需要更大观测动态范围时，应显式增大输出 `fullScaleAmplitude`，而不能只增加总位宽。扩大 $F$ 会按同比例增大量化步长，因此仍应选择能覆盖峰值的最小合理值。
 
 ## 10. dBm 与整数码的关系
 
-定点码不是伏特，也不是dBm。`maximumOutputPowerDbm` 定义每路PA输出参考面的额定功率上限，同时规定归一化输出有效区RMS等于1时的dBm映射。它不表示16位码 `32767` 本身等于25 dBm，也不表示校准器会在PA输出端追加增益。
+定点码不是伏特，也不是dBm。`maximumOutputPowerDbm` 定义每路PA输出参考面的额定功率上限，同时规定**解码后归一化输出有效区RMS等于1**时的dBm映射。它不表示16位码 `32767` 本身等于25 dBm，也不表示校准器会在PA输出端追加增益。默认输出 $F=2$ 时，满码附近代表分量幅度2，而功率标定的单位RMS锚点仍是1；两者必须分开。
 
 设额定上限为 $P_{\max}$，目标输出功率为 $P_{\mathrm{target}}$，则功率检测器期望的归一化**输出**RMS为：
 
@@ -420,7 +463,7 @@ $u_m^{(k)}[n]$ 才是隐藏模拟驱动之后、Tx I/Q之前的信号。它随�
 4. 依次运行Tx I/Q、PA前耦合和真实非线性PA，测量PA自身的有效突发输出功率。
 5. 根据功率误差更新模拟驱动；MIMO PA前耦合场景使用Jacobian联合更新。
 6. 收敛后提交模拟驱动，后续正常 `Process` 自动复用；PA输出不做后级常数缩放。
-7. Analysis直接分析实际返回波形，并使用相同的 $P_{\max}$ 映射报告dBm。
+7. Analysis直接分析实际返回波形，使用plant的输出 $F$ 解码，并使用相同的 $P_{\max}$ 映射报告dBm。`PowerCalibration` 会自动读取绑定plant的输出标尺；独立Analysis必须由调用方显式传入。
 
 闭环异常会报告目标功率、最佳实测输出、最佳误差、迭代次数和失败原因。只要至少有一次有效测量，`GetLastCalibrationMetrics()` 还会返回 `converged=False`、`failureReason`，以及可用时的 `analogDriveDbPerChain`。内置 `PaModel`、`MimoPaModel` 和 `Channel` 提供解码后模拟驱动接口；只实现传统 `Process` 的第三方定点plant仍走兼容的全数字路径，如果公开码连续停在同一个满量程值，错误信息会明确指出缺少模拟驱动接口。
 
@@ -437,7 +480,7 @@ python SmallestSISO.py
 脚本分别执行：
 
 - `width=0`：公开数值和内部数值均为浮点物理量；
-- `width=16`：公开数值为 `-32768` 至 `32767` 的整数码，内部仍为归一化浮点。
+- `width=16`：公开数值为 `-32768` 至 `32767` 的整数码；输入按 $F=1$ 解码，PA/Channel输出默认按 $F=2$ 解码。
 
 输出目录为：
 
@@ -448,13 +491,15 @@ python SmallestSISO.py
 
 ## 12. 使用检查表
 
-1. 同一条信号链的 `WaveGenWifi`、`PaModel`、`Channel`、`ParseWifi` 和 `Analysis` 必须使用相同 `width`。
+1. 同一条信号链的 `WaveGenWifi`、`PaModel`、`Channel`、`ParseWifi` 和 `Analysis` 必须使用相同 `width`；输入DAC保持 $F=1$，PA/Channel输出与Analysis之间还必须使用相同的 `outputFullScaleAmplitude`。
 2. `width=0` 表示浮点模式；正值表示公开整数码模式。
 3. 不要通过 `dtype` 判断模式，应读取 `width` 或 `GetFormatInfo()`。
 4. 定点公开数据的实部和虚部都应等于各自的最近整数。
 5. 14 位最大正码是 `8191`，16 位最大正码是 `32767`。
-6. 只有内部算法或显式调用 `DecodeComplex` 后，样值才恢复到单位幅度附近。
+6. 只有内部算法或显式调用匹配 $F$ 的 `DecodeComplex` 后，码值才恢复成正确物理幅度。
 7. 物理电压标定数据不能伪装成定点码重新送入定点接口。
 8. `maximumOutputPowerDbm` 是PA输出参考面的额定上限，不是公开整数码的功率标签。
 9. 定点闭环默认保留6 dB数字峰值余量，并在解码后调整隐藏模拟驱动；不要通过制造越界码代替该驱动级。
 10. `GetLastPaInput()` 是模拟驱动前的公开数字参考，真正的PA激励应查看 `GetLastActualPaInput()`。
+11. 内置PA、MIMO PA和Channel固定输出默认 `outputFullScaleAmplitude=2.0`；Analysis和TwoToneAnalysis为兼容旧数据默认1.0，分析plant输出时应显式传入plant标尺。
+12. 约25 dBm的高PAPR输出若分量峰值仍接近2，可按需把输出标尺设为4；这增加观测余量，也会把量化步长扩大一倍。

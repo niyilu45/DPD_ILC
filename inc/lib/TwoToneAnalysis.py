@@ -104,6 +104,7 @@ class TwoToneAnalysis:
         waveform: TwoToneWaveform,
         parameters: Optional[Mapping[str, object]] = None,
         width: Optional[int] = None,
+        outputFullScaleAmplitude: Optional[float] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize a metadata-aware two-tone analysis context.
@@ -117,6 +118,10 @@ class TwoToneAnalysis:
             waveform: Generated two-tone metadata defining exact frequencies.
             parameters: Optional caller-owned mapping layered ahead of defaults.
             width: Optional public I/Q width; None inherits waveform metadata.
+            outputFullScaleAmplitude: Optional physical component magnitude
+                represented by measured PA-output code rails. The default is
+                1.0 for compatibility and is independent of the transmit
+                waveform's DAC scale.
             parameterOverrides: Highest-priority recognized analysis values.
 
         Returns:
@@ -136,6 +141,7 @@ class TwoToneAnalysis:
                 "activePowerThresholdDb": -60.0,
                 "activeGapToleranceSamples": 16,
                 "width": waveform.width,
+                "outputFullScaleAmplitude": 1.0,
             }
         )
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -143,6 +149,10 @@ class TwoToneAnalysis:
         directOverrides = dict(parameterOverrides)
         if width is not None:
             directOverrides["width"] = width
+        if outputFullScaleAmplitude is not None:
+            directOverrides["outputFullScaleAmplitude"] = (
+                outputFullScaleAmplitude
+            )
         externalParameters: Mapping[str, object] = (
             {}
             if parameters is None
@@ -180,6 +190,24 @@ class TwoToneAnalysis:
         return cast(int, self.parameters["width"])
 
     width = Width
+
+    @property
+    def OutputFullScaleAmplitude(self) -> float:
+        """Return the physical magnitude represented by measured PA codes.
+
+        Processing details:
+            Algorithm: Read the validated measured-output scale separately
+            from the source waveform's DAC convention.
+
+        Returns:
+            result: Positive physical I/Q component full-scale amplitude.
+        """
+
+        return float(
+            cast(float, self.parameters["outputFullScaleAmplitude"])
+        )
+
+    outputFullScaleAmplitude = OutputFullScaleAmplitude
 
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened snapshot of all resolved analysis parameters.
@@ -298,7 +326,10 @@ class TwoToneAnalysis:
             raise ValueError(
                 "activeGapToleranceSamples must be a nonnegative integer"
             )
-        FixedPoint(self.width)
+        FixedPoint(
+            self.width,
+            self.parameters["outputFullScaleAmplitude"],
+        )
 
     def BuildAnalysisWindow(self, sampleCount: int) -> np.ndarray:
         """Construct the configured deterministic spectral analysis window.
@@ -428,7 +459,9 @@ class TwoToneAnalysis:
                 # the measurement boundary instead of treating DAC codes as
                 # normalized amplitudes and adding about 90.31 dB to power.
                 resolvedWidth = 16
-        decodedSignal = FixedPoint(resolvedWidth).DecodeComplex(
+        decodedSignal = FixedPoint(
+            resolvedWidth, self.outputFullScaleAmplitude
+        ).DecodeComplex(
             publicSignal
         ).reshape(-1)
         settlingSamples = cast(int, self.parameters["settlingSamples"])
@@ -506,9 +539,12 @@ class TwoToneAnalysis:
             )
             if integerCodeShape and exceedsNormalizedRange:
                 resolvedWidth = 16
-        decodedSignal = FixedPoint(resolvedWidth).DecodeComplex(
+        decodedSignal = FixedPoint(
+            resolvedWidth, self.outputFullScaleAmplitude
+        ).DecodeComplex(
             publicSignal
         ).reshape(-1)
+        decodedSignal = decodedSignal / self.outputFullScaleAmplitude
         if (
             decodedSignal.size != self.waveform.numSamples
             or not np.all(np.isfinite(decodedSignal))
