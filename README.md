@@ -195,7 +195,7 @@ resultAnalysis = Analysis(
 )
 ```
 
-顶层 [SmallestSISO.py](./SmallestSISO.py) 会用完全相同的 EHT、默认GMP PA、Channel和ILC设置依次运行浮点与16位定点版本。普通GMP默认 `nonlinearScale=0.135`：一阶小信号项保持不变，三阶及以上内置参考系数统一使用13.5%的强度；显式传入的系数字典仍按调用方数值执行。默认稳态系数由 $0\leq|x|\leq2$ 内的有界Rapp型曲线拟合得到，并在该归一化范围内保持AM-AM单调；非线性延迟主项和交叉记忆项都按各阶稳态系数比例生成，零延迟项抵消它们对恒包络稳态的贡献。内置普通GMP还启用12抽头的稀疏三阶长包络记忆：它在恒包络稳态时严格为零，不改变AM-AM截面，但会保留浅记忆DPD无法完全拟合的确定性动态残差。完整强度参考模型（`nonlinearScale=1.0`）在0.25至2.0幅度扫描中的最大平台纹波约0.35 dB。非默认阶次集合若含一阶项，会在必要时进一步共同缩小全部非线性稳态项以保持同一区间单调；未知高阶默认值为0。定点闭环的功率可达性由解码后的隐藏模拟驱动保证，不再依赖把公开整数码推到满量程：
+顶层 [SmallestSISO.py](./SmallestSISO.py) 会用完全相同的 EHT、默认GMP PA、Channel和ILC设置依次运行浮点与16位定点版本。普通GMP默认 `nonlinearScale=0.135`：一阶小信号项保持不变，三阶及以上内置参考系数统一使用13.5%的强度；显式传入的系数字典仍按调用方数值执行。默认稳态系数由 $0\leq|x|\leq2$ 内的有界Rapp型曲线拟合得到，并在该归一化范围内保持AM-AM单调；非线性延迟主项和交叉记忆项都按各阶稳态系数比例生成，零延迟项抵消它们对恒包络稳态的贡献。内置普通GMP还启用12抽头的稀疏三阶长包络记忆：它在恒包络稳态时严格为零，不改变AM-AM截面，但会保留浅记忆DPD无法完全拟合的确定性动态残差。默认复系数 `0.0215-j0.1282` 以相位分量为主，使模型失配主要表现为动态AM-PM而不是持续幅度下陷；0.25至2.0的零到高平台扫描最大幅度纹波约0.311 dB，并受回归阈值0.45 dB约束。非默认阶次集合若含一阶项，会在必要时进一步共同缩小全部非线性稳态项以保持同一区间单调；未知高阶默认值为0。定点闭环的功率可达性由解码后的隐藏模拟驱动保证，不再依赖把公开整数码推到满量程：
 
 ```powershell
 python SmallestSISO.py
@@ -1392,7 +1392,7 @@ MIMO独立功率直接调用 `chOut, fbOut = channel.Process(inputWaveform, outp
 | 参数 | 默认值 | 约束或含义 |
 | --- | --- | --- |
 | `linearGain` | `1.0` | 有限正数；小信号电压增益。 |
-| `saturationAmplitude` | `1.0` | 有限正数；输入压缩膝点幅度标尺。 |
+| `saturationAmplitude` | `1.44` | 有限正数；输入压缩膝点幅度标尺。默认相对旧值1.0把约1 dB压缩位置右移约3.17 dB，避免20 dBm高PAPR峰值进入过深且难以求逆的压缩。 |
 | `rappSmoothness` | `3.0` | 有限正数；软压缩过渡平滑度，常用起点为2至3。 |
 
 `WienerConfig` 支持：
@@ -1401,7 +1401,7 @@ MIMO独立功率直接调用 `chOut, fbOut = channel.Process(inputWaveform, outp
 | --- | --- | --- |
 | `linearTaps` | `(1+0j, 0.055-0.025j, -0.018+0.012j)` | 非空复数 FIR 系数元组。 |
 | `linearGain` | `1.0` | 正数；线性增益。 |
-| `saturationAmplitude` | `1.0` | 正数；Rapp 饱和幅度。 |
+| `saturationAmplitude` | `1.55` | 正数；FIR输出进入Rapp压缩的幅度标尺。默认比无记忆Rapp略高，用于容纳前置FIR抬高的局部OFDM峰值。 |
 | `rappSmoothness` | `3.0` | 正数；Rapp 平滑度。 |
 | `ampmCoefficient` | `0.18` | AM-PM 相位旋转强度。 |
 
@@ -1415,7 +1415,7 @@ MIMO独立功率直接调用 `chOut, fbOut = channel.Process(inputWaveform, outp
 | `nonlinearScale` | `0.135` | 0至1的有限实数；只缩放默认三阶及以上参考系数，一阶小信号项不变。1.0恢复全强度压力参考；显式系数字典不被重复缩放。 |
 | `longEnvelopeMemoryDepth` | `12` | 非负整数；内置稀疏三阶长包络记忆的延迟抽头数，0关闭。 |
 | `longEnvelopeMemoryDecay` | `0.82` | $(0,1]$ 内的有限实数；归一化指数权的递减因子。 |
-| `longEnvelopeMemoryCoefficient` | `0.008-j0.0036` | 有限复数；分配到长包络抽头并从同时刻三阶主项扣除的总系数。0关闭。 |
+| `longEnvelopeMemoryCoefficient` | `0.0215-j0.1282` | 有限复数；分配到长包络抽头并从同时刻三阶主项扣除的总系数。0关闭。该相位主导默认只属于普通 `GMPConfig`，用于保留动态失配而避免连续高幅平台发生数dB幅度塌落。 |
 | `mainCoefficients` | `None` | 主项系数字典，键为 `(order, memoryIndex)`；`None` 使用内置Rapp型拟合系数，并自动抵消默认记忆项对稳态曲线的重复贡献。 |
 | `laggingCoefficients` | `None` | 滞后交叉项字典，键为 `(order, memoryIndex, crossIndex)`；`None` 生成 $C_p(-0.060+j0.025)(0.22)^m(0.42)^l$。 |
 | `leadingCoefficients` | `None` | 超前交叉项字典，键为 `(order, memoryIndex, crossIndex)`；`None` 生成 $C_p(0.040-j0.018)(0.22)^m(0.42)^l$。 |
@@ -1432,17 +1432,28 @@ y_{\mathrm{long}}[n]
 h_\ell=\frac{\rho^{\ell-1}}{\sum_{k=1}^{L}\rho^{k-1}}.
 ```
 
-因为 $\sum_\ell h_\ell=1$，稳定恒包络时该项严格为0：它不改变稳态AM-AM/AM-PM，也不会重现连续高幅点的平台快速塌落。$L=12$ 比默认普通/分段DPD的 `crossMemoryDepth=2` 更长，因此形成可重复、无噪声的物理模型失配，避免各功率点在DPD后全部落到同一数值底。只有 `mainCoefficients`/`laggingCoefficients`/`leadingCoefficients` 全部为 `None` 时，内置普通GMP才自动启用该分支；任何一张显式系数表（包括空字典）都会关闭自动长记忆，保证实测系数的精确语义。直接调用 `DefaultGmpCoefficients(...)` 仍默认 `longEnvelopeMemoryDepth=0`，所以旧调用保持不变；内置 `PiecewiseGMPPA` 则显式传入上述 $L$/$\rho$/$c$ 后再构造三个区域。
+因为 $\sum_\ell h_\ell=1$，稳定恒包络时该项严格为0：它不改变稳态AM-AM/AM-PM，也不会重现连续高幅点的平台快速塌落。最终复系数以虚部为主，使暂态更偏向相位旋转而不是幅度压低；在0.25至2.0输入幅度的零到高平台扫描中，最大幅度纹波约0.311 dB，低于0.45 dB回归上限。$L=12$ 比默认普通/分段DPD的 `crossMemoryDepth=2` 更长，因此形成可重复、无噪声的物理模型失配，避免各功率点在DPD后全部落到同一数值底。只有 `mainCoefficients`/`laggingCoefficients`/`leadingCoefficients` 全部为 `None` 时，内置普通GMP才自动启用该分支；任何一张显式系数表（包括空字典）都会关闭自动长记忆，保证实测系数的精确语义。直接调用 `DefaultGmpCoefficients(...)` 仍默认 `longEnvelopeMemoryDepth=0`，所以旧调用保持不变。内置 `PiecewiseGMPPA` 是另一种、更强且本来就较难的PA plant；它的区域种子继续显式使用较温和的 `0.008-j0.0036`，没有随普通 `GMPConfig` 一起改为 `0.0215-j0.1282`。
 
 下表是无噪声独立帧验证，而不是某颗器件指标：EHT 20 MHz、80 Msps、MCS 5、2个数据symbol、`width=0`、25 dBm额定功率，训练帧 `seed=91`、验证帧 `seed=809`；每个功率点都新建PA和校准器、独立运行8轮ILC并拟合DPD。EVM越负越好：
 
 | 每路目标输出功率 | PA baseline | `DpdGmp` | `PiecewiseDpdGmp` |
 |---:|---:|---:|---:|
-| 1 dBm | -51.63 dB | -57.42 dB | -57.43 dB |
-| 16 dBm | -47.18 dB | -53.25 dB | -53.38 dB |
-| 20 dBm | -41.23 dB | -47.25 dB | -47.21 dB |
+| 1 dBm | -51.48 dB | -57.30 dB | -57.32 dB |
+| 16 dBm | -40.11 dB | -45.97 dB | -45.99 dB |
+| 20 dBm | -32.52 dB | -38.10 dB | -38.02 dB |
 
-若16位20 dBm结果反而约为 -24 dB，先检查输出观测标尺：该工作点的高PAPR分量峰值可超过1，按旧 `fullScaleAmplitude=1` 编码会削顶；这不是默认GMP本征突然变差。内置PA/Channel默认2.0已覆盖该场景，并在20 dBm兼顾量化精度与峰值余量。接近25 dBm且峰值更高时可按需显式配置4.0，同时把同一个值传给Analysis或TwoToneAnalysis；当前量程边界复测在4.0标尺下得到25.098 dBm、EVM约 -33.82 dB且I/Q rail计数为0。
+这里的 `PiecewiseDpdGmp` 是作用于同一个普通 `PaModel(modelName="gmp")` 的分段DPD算法，不是 `PaModel(modelName="piecewise_gmp")` PA。后者本身就是更强、更难的分段plant，不能用来替换本表PA后再声称比较的只是两种DPD结构。
+
+若16位20 dBm结果比上述浮点独立帧结果再差很多，先检查输出观测标尺：该工作点的高PAPR分量峰值可超过1，按旧 `fullScaleAmplitude=1` 编码会削顶。内置PA/Channel默认2.0已覆盖常规20 dBm场景；但当前普通GMP的约 -32.52 dB baseline主要来自确定性长包络失配，不应再解释成量程错误。接近25 dBm且峰值更高时可按需显式配置4.0，同时把同一个值传给Analysis或TwoToneAnalysis。
+
+标准 `main.py` 默认帧和完整“8轮ILC标签→GMP拟合→重新功率闭环→最终部署”路径在20 dBm的复测如下。旧值只用于说明默认参数调整的幅度，不是器件规格：
+
+| PA模型 | 旧默认最终EVM | 新默认最终EVM | 变化 |
+|---|---:|---:|---:|
+| Rapp | -24.22 dB | -39.00 dB | 改善14.78 dB |
+| Wiener | -24.14 dB | -39.18 dB | 改善15.04 dB |
+| GMP | 约 -51.03 dB | -41.04 dB | 变差9.99 dB，用于显式暴露长记忆结构失配 |
+| Doherty | -29.31 dB | -44.82 dB | 改善15.51 dB |
 
 `PiecewiseGMPConfig` 支持：
 
@@ -1469,9 +1480,12 @@ h_\ell=\frac{\rho^{\ell-1}}{\sum_{k=1}^{L}\rho^{k-1}}.
 | `peakingTurnOnAmplitude` | `0.45` | Peaking开始导通的归一化包络。 |
 | `peakingTransitionWidth` | `0.50` | 从关闭到完全导通的平滑包络宽度。 |
 | `carrierCombineCoefficient` | `1+0j` | Carrier复功率合成系数，不能为零。 |
-| `peakingCombineCoefficient` | `0.15+0j` | Peaking复功率合成系数。 |
+| `peakingCombineCoefficient` | `0.045+0j` | Peaking复功率合成系数。默认只保留较弱峰值支路贡献。 |
 | `peakingDelaySamples` | `0` | Peaking支路非负整数时延。 |
-| `loadModulationStrength` | `0.02` | Carrier包络相关简化负载调制强度。 |
+| `loadModulationStrength` | `0.0035` | Carrier包络相关简化负载调制强度。 |
+| `defaultWienerSaturationAmplitude` | `2.0` | 位于配置字段末尾；只在对应Wiener支路配置为 `None` 时使用的Doherty专用压缩膝点。显式 `carrierWienerConfig` 或 `peakingWienerConfig` 优先。 |
+
+这个Doherty默认应理解为**弱Peaking、高压缩余量的非对称行为模型**：两条缺省Wiener支路使用2.0的饱和幅度，但Peaking合成权重和简化负载调制都较小。它适合生成可逆、双工作区仍可见的DPD仿真plant，不冒充典型对称Doherty器件；对称器件应由实测支路增益、开启点、负载调制和合路相位重新配置。
 
 `PaModel.Process(inputSignal)` 返回 PA 复基带输出；`SmallSignalGain()` 返回当前模型的 DC 小信号复增益。
 Rapp、Wiener、GMP、分段GMP、Doherty 的静态增益曲线定义、1 dB 压缩点推导、每一个配置值对曲线的移动或变形方式、外部 dBm 工作点与模型曲线的区别，以及恒包络扫幅示例，见
@@ -2964,7 +2978,7 @@ print(
 )
 ```
 
-输出包括频响、双音间隔记忆、20 dBm标称互调和随实测输出功率变化的四张PNG，以及每个原始点的CSV/JSON。当前随默认长包络支路重生成的GMP 20 dBm标称IM3/IM5/IM7为 `-49.51/-87.22/-129.54 dBc`；扫功率中没有越过strong-distortion阈值，最高实测25.10 dBm点的IM3约 `-40.17 dBc`。`pa_dpd_recommendations.csv`进一步按“PA模型×测试类别”保存实测依据、DPD结构、初始配置、训练策略和验收条件；默认四种PA、五类测试共20条建议。默认还在`dpd_gmp`子目录保存基础补偿、结构扩展、峰值加权、正则化和多功率训练的改进前后数据及四联图；当前stress/nominal PA baseline EVM为 `-48.30/-50.29 dB`，基础DPD-GMP后为 `-53.45/-56.02 dB`。完整公式、流程、参考数值、逐测试优化建议和图表见[PA双音特性分析](doc/PaAnalyse.md)，数值更新时以生成的CSV/JSON为准。
+输出包括频响、双音间隔记忆、20 dBm标称互调和随实测输出功率变化的四张PNG，以及每个原始点的CSV/JSON。当前随默认长包络支路重生成的GMP 20 dBm标称IM3/IM5/IM7为 `-41.22/-87.18/-129.50 dBc`；扫功率在23.10 dBm首次进入strong-distortion分类（IM3约 `-35.13 dBc`），最高实测25.10 dBm点的IM3约 `-31.05 dBc`。`pa_dpd_recommendations.csv`进一步按“PA模型×测试类别”保存实测依据、DPD结构、初始配置、训练策略和验收条件；默认四种PA、五类测试共20条建议。默认还在`dpd_gmp`子目录保存基础补偿、结构扩展、峰值加权、正则化和多功率训练的改进前后数据及四联图；当前stress/nominal PA baseline EVM为 `-42.12/-46.55 dB`，基础DPD-GMP后为 `-46.64/-51.70 dB`。完整公式、流程、参考数值、逐测试优化建议和图表见[PA双音特性分析](doc/PaAnalyse.md)，数值更新时以生成的CSV/JSON为准。
 
 ### DPD-GMP分阶段性能Benchmark
 
@@ -3024,7 +3038,7 @@ print([item.ToDict() for item in result.comparisons])
 | `width` | `0` | 公开数据位宽；该性能参考默认浮点。 |
 | `outputDirectory` | `results/dpd_gmp_benchmark` | CSV、JSON和PNG输出目录。 |
 
-默认基准明确隔离训练与验收：`seed=321` 的EHT帧只生成ILC监督标签，`validationSeed=987` 的独立EHT帧不参与任何系数求解，并在每个阶段重新闭环到相同输出功率后计算Wi-Fi EVM和ACLR。当前保存结果中，基础DPD把独立帧12 dBm EVM从-50.289 dB降至-56.024 dB，改善5.735 dB；多功率训练把最差标签NMSE从-61.790 dB降至-64.010 dB，改善2.220 dB。最差ACLR由33.062276 dB变为33.061390 dB，下降约0.0009 dB，仍满足“退化不超过0.10 dB”的护栏。由于源Wi-Fi波形自身的ACLR本底约为33 dB，这个护栏用于防止明显频谱退化，不要求多功率模型继续提高ACLR。
+默认基准明确隔离训练与验收：`seed=321` 的EHT帧只生成ILC监督标签，`validationSeed=987` 的独立EHT帧不参与任何系数求解，并在每个阶段重新闭环到相同输出功率后计算Wi-Fi EVM和ACLR。当前保存结果中，基础DPD把独立帧12 dBm EVM从-46.548 dB降至-51.700 dB，改善5.152 dB；多功率训练把最差标签NMSE从-55.362 dB降至-57.121 dB，改善1.759 dB。最差ACLR由33.026863 dB变为33.019261 dB，下降约0.0076 dB，仍满足“退化不超过0.10 dB”的护栏。由于源Wi-Fi波形自身的ACLR本底约为33 dB，这个护栏用于防止明显频谱退化，不要求多功率模型继续提高ACLR。
 
 输出：
 

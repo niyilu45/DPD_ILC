@@ -1104,7 +1104,7 @@ flowchart LR
 
 **图 6 说明：**数字基波形只负责提供合法、带余量的公开码；隐藏模拟增益负责改变真实PA驱动。闭环调节的是两者合成后的总有效drive。PA输出仍跨越公开定点边界，输出量化和输出采集削顶都会进入实测反馈。图中的trial在收敛前不会改变Channel已提交的模拟增益。
 
-PA输出边界使用plant自己的scaled full-scale。默认 $F_{out}=2$ 相对单位幅度提供6.02 dB分量观测余量，但 `maximumOutputPowerDbm` 的功率锚点仍是解码后输出有效区RMS等于1。默认GMP 20 dBm高PAPR输出的原始分量峰值约1.57：错误使用 $F_{out}=1$ 时会削顶并把本征约 -41 dB EVM测成约 -24 dB；使用默认2.0后不会碰轨，因此2.0是20 dBm精度与余量的默认折中。接近25 dBm且峰值较高时可按需把plant输出标尺配置为4，同时让Analysis或TwoToneAnalysis使用同一个值；当前边界复测实测25.098 dBm、EVM约 -33.82 dB且I/Q rail计数为0。
+PA输出边界使用plant自己的scaled full-scale。默认 $F_{out}=2$ 相对单位幅度提供6.02 dB分量观测余量，但 `maximumOutputPowerDbm` 的功率锚点仍是解码后输出有效区RMS等于1。默认GMP 20 dBm高PAPR输出的原始分量峰值约1.58：错误使用 $F_{out}=1$ 时会削顶并把当前本征约 -32.15 dB EVM测成约 -23.72 dB；使用默认2.0后不会碰轨，因此2.0是20 dBm精度与余量的默认折中。接近25 dBm且峰值较高时可按需把plant输出标尺配置为4，同时让Analysis或TwoToneAnalysis使用同一个值；当前边界复测实测25.088 dBm、EVM约 -22.09 dB且I/Q rail计数为0。扩大标尺只恢复观测范围，不会改善PA本征失真。
 
 收敛后，`GetLastPaInput()` 返回的是公开数字部分 $q_m[n]$。要复现同一功率，必须继续通过完成本次校准的同一个Channel处理，因为该Channel同时保存了已提交的隐藏模拟增益。`GetLastActualPaInput()` 返回经过隐藏增益、Tx I/Q和PA前耦合后的真实PA输入，更适合检查物理工作点。把 `GetLastPaInput()` 单独复制给另一个未校准的裸PA对象，不能保证复现相同输出功率。
 

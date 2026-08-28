@@ -771,10 +771,14 @@ class ThermalNetwork:
 
 @dataclass(frozen=True)
 class RappConfig:
-    """Configure the classic memoryless Rapp solid-state PA model."""
+    """Configure the classic memoryless Rapp solid-state PA model.
+
+    The built-in knee leaves enough headroom for a 20 dBm Wi-Fi operating
+    point to remain moderately nonlinear instead of entering deep clipping.
+    """
 
     linearGain: float = 1.0
-    saturationAmplitude: float = 1.0
+    saturationAmplitude: float = 1.44
     rappSmoothness: float = 3.0
 
     def Validate(self) -> None:
@@ -889,7 +893,11 @@ class RappPA:
 
 @dataclass(frozen=True)
 class WienerConfig:
-    """Configure the linear-memory and memoryless-nonlinearity cascade."""
+    """Configure the linear-memory and memoryless-nonlinearity cascade.
+
+    Its default compression knee is slightly farther right than the Rapp
+    reference because the causal FIR can raise individual OFDM peaks.
+    """
 
     linearTaps: Tuple[complex, ...] = (
         1.0 + 0.0j,
@@ -897,7 +905,7 @@ class WienerConfig:
         -0.018 + 0.012j,
     )
     linearGain: float = 1.0
-    saturationAmplitude: float = 1.0
+    saturationAmplitude: float = 1.55
     rappSmoothness: float = 3.0
     ampmCoefficient: float = 0.18
 
@@ -1006,10 +1014,15 @@ class GMPConfig:
     branch controlled by ``longEnvelopeMemory*``. Its coefficients sum to zero
     at a settled constant envelope, while its depth intentionally exceeds the
     shallow default DPD model so noiseless validation retains a deterministic
-    power-dependent residual. Supplying any explicit coefficient dictionary
-    disables automatic insertion of that branch; custom dictionaries remain
-    unconstrained behavioral fits and may therefore contain stronger droop,
-    hysteresis, or polynomial foldback.
+    power-dependent residual. The default branch strength places the 20 dBm
+    independent-frame DPD result near -38 dB rather than a common numerical
+    floor near -50 dB. Its phase-dominant complex direction keeps the gain
+    ripple of a zero-to-constant high-envelope run below about 0.45 dB, so the
+    added model mismatch does not recreate a multi-decibel plateau collapse.
+    Supplying any explicit coefficient dictionary disables automatic
+    insertion of that branch; custom dictionaries remain unconstrained
+    behavioral fits and may therefore contain stronger droop, hysteresis, or
+    polynomial foldback.
     """
 
     nonlinearOrders: Tuple[int, ...] = (1, 3, 5, 7)
@@ -1021,7 +1034,7 @@ class GMPConfig:
     leadingCoefficients: Optional[Mapping[Tuple[int, int, int], complex]] = None
     longEnvelopeMemoryDepth: int = 12
     longEnvelopeMemoryDecay: float = 0.82
-    longEnvelopeMemoryCoefficient: complex = 0.008 - 0.0036j
+    longEnvelopeMemoryCoefficient: complex = 0.0215 - 0.1282j
 
     def Validate(self) -> None:
         """Validate order and memory dimensions used by the GMP expansion.
@@ -1372,11 +1385,13 @@ class PiecewiseGMPConfig:
 class PiecewiseGMPPA:
     """Blend adjacent sparse GMP models over smooth envelope regions.
 
-    The deterministic built-in profiles share the normalized long cubic
-    envelope-memory branch used by the ordinary generated GMP plant. Explicit
-    ``regionConfigs`` remain caller-owned; each regional ``GMPConfig`` follows
-    the ordinary rule that generated coefficient maps include the configured
-    long branch while any explicit coefficient map prevents hidden insertion.
+    The deterministic built-in profiles use the same normalized long cubic
+    envelope-memory topology as the ordinary generated GMP plant, but retain
+    a lower-strength regional seed because their amplitude-dependent static
+    response is already a difficult plant. Explicit ``regionConfigs`` remain
+    caller-owned; each regional ``GMPConfig`` follows the ordinary rule that
+    generated coefficient maps include the configured long branch while any
+    explicit coefficient map prevents hidden insertion.
     """
 
     def __init__(
@@ -1388,10 +1403,12 @@ class PiecewiseGMPPA:
         Processing details:
             Algorithm: Validate compact transition geometry, use caller-owned
             regional GMP configurations when supplied, or derive three sparse
-            defaults from one common GMP expansion. The built-in profiles
-            preserve each region's settled target while varying gain, AM-PM,
-            nonlinearity, and zero-sum memory residual strength so ordinary
-            GMP predistortion sees controlled structural model mismatch.
+            defaults from one common, lower-strength GMP expansion. The
+            built-in profiles preserve each region's settled target while
+            varying gain, AM-PM, nonlinearity, and zero-sum memory residual
+            strength so ordinary GMP predistortion sees controlled structural
+            model mismatch without inheriting the ordinary GMP plant's much
+            stronger 20 dBm residual.
 
         Args:
             config: Piecewise transition and regional GMP configuration.
@@ -1414,6 +1431,9 @@ class PiecewiseGMPPA:
                 nonlinearScale=1.0,
                 longEnvelopeMemoryDepth=12,
                 longEnvelopeMemoryDecay=0.82,
+                # The regional AM-AM/AM-PM transitions already dominate this
+                # stress plant, so keep its historical lower-strength memory
+                # seed independent of the ordinary GMP calibration target.
                 longEnvelopeMemoryCoefficient=0.008 - 0.0036j,
             )
             regionProfiles = (
@@ -1800,7 +1820,13 @@ class PiecewiseGMPPA:
 
 @dataclass(frozen=True)
 class DohertyConfig:
-    """Configure a behavioral carrier-plus-peaking Doherty architecture."""
+    """Configure a behavioral carrier-plus-peaking Doherty architecture.
+
+    When a Wiener branch configuration is omitted, the Doherty-specific
+    saturation amplitude is used instead of the standalone Wiener default.
+    This keeps both branches out of deep clipping while the nonzero peaking
+    and load-modulation controls retain a smooth two-region response.
+    """
 
     carrierModelName: str = "wiener"
     peakingModelName: str = "wiener"
@@ -1813,9 +1839,10 @@ class DohertyConfig:
     peakingTurnOnAmplitude: float = 0.45
     peakingTransitionWidth: float = 0.50
     carrierCombineCoefficient: complex = 1.0 + 0.0j
-    peakingCombineCoefficient: complex = 0.15 + 0.0j
+    peakingCombineCoefficient: complex = 0.045 + 0.0j
     peakingDelaySamples: int = 0
-    loadModulationStrength: float = 0.02
+    loadModulationStrength: float = 0.0035
+    defaultWienerSaturationAmplitude: float = 2.0
 
     def Validate(self) -> None:
         """Validate both branch families and all Doherty physical controls.
@@ -1864,6 +1891,10 @@ class DohertyConfig:
         for gainName, gainValue in (
             ("carrierInputGain", self.carrierInputGain),
             ("peakingInputGain", self.peakingInputGain),
+            (
+                "defaultWienerSaturationAmplitude",
+                self.defaultWienerSaturationAmplitude,
+            ),
         ):
             if (
                 not isinstance(gainValue, (int, float))
@@ -1965,11 +1996,13 @@ class DohertyPA:
             config.carrierModelName,
             config.carrierWienerConfig,
             config.carrierGmpConfig,
+            config.defaultWienerSaturationAmplitude,
         )
         self.peakingModel = self.BuildBranchModel(
             config.peakingModelName,
             config.peakingWienerConfig,
             config.peakingGmpConfig,
+            config.defaultWienerSaturationAmplitude,
         )
 
     @staticmethod
@@ -1977,6 +2010,7 @@ class DohertyPA:
         modelName: str,
         wienerConfig: Optional[WienerConfig],
         gmpConfig: Optional[GMPConfig],
+        defaultWienerSaturationAmplitude: Optional[float] = None,
     ) -> Any:
         """Construct one validated Wiener or GMP Doherty branch.
 
@@ -1989,15 +2023,28 @@ class DohertyPA:
             modelName: Branch family name, either Wiener or GMP.
             wienerConfig: Optional Wiener settings for this branch.
             gmpConfig: Optional GMP settings for this branch.
+            defaultWienerSaturationAmplitude: Optional Doherty-specific
+                compression knee used when a Wiener branch configuration is
+                omitted. None retains the standalone Wiener default for
+                backward-compatible direct calls to this helper.
 
         Returns:
             result: WienerPA or GMPPA object exposing Process and gain methods.
         """
 
         if modelName.strip().lower() == "wiener":
-            return WienerPA(
-                WienerConfig() if wienerConfig is None else wienerConfig
-            )
+            resolvedWienerConfig = wienerConfig
+            if resolvedWienerConfig is None:
+                resolvedWienerConfig = (
+                    WienerConfig()
+                    if defaultWienerSaturationAmplitude is None
+                    else WienerConfig(
+                        saturationAmplitude=(
+                            defaultWienerSaturationAmplitude
+                        )
+                    )
+                )
+            return WienerPA(resolvedWienerConfig)
         return GMPPA(GMPConfig() if gmpConfig is None else gmpConfig)
 
     def PeakingActivation(

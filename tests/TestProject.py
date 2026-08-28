@@ -1074,6 +1074,15 @@ def CheckInternalDefaultConfiguration() -> None:
         result: None. Completion is communicated through validation, state updates, saved artifacts, printed output, or assertions.
     """
 
+    assert RappConfig().saturationAmplitude == 1.44
+    assert WienerConfig().saturationAmplitude == 1.55
+    defaultGmpConfig = GMPConfig()
+    assert defaultGmpConfig.longEnvelopeMemoryDepth == 12
+    assert defaultGmpConfig.longEnvelopeMemoryDecay == 0.82
+    assert defaultGmpConfig.longEnvelopeMemoryCoefficient == (
+        0.0215 - 0.1282j
+    )
+
     externalWifiParameters = {
         "bandwidthMhz": 20,
         "mcs": 0,
@@ -3361,7 +3370,7 @@ def CheckIlcPowerOperatingPoints() -> None:
     assert np.all(
         np.abs(
             np.asarray(fixedBaselineEvmDbValues, dtype=float)
-            - np.asarray((-52.0, -51.0, -48.0, -42.0), dtype=float)
+            - np.asarray((-51.5, -49.0, -40.4, -32.6), dtype=float)
         )
         <= 1.5
     )
@@ -3538,11 +3547,11 @@ def CheckIlcPowerOperatingPoints() -> None:
     )
     assert np.all(np.diff(floatingFinalEvmDb) >= -0.25)
     # The noiseless default plant must expose a materially different
-    # nonlinear operating point at every requested power. The default 13.5%
-    # nonlinear scale intentionally targets approximately -52/-48/-42 dB at
-    # 1/16/20 dBm for this deterministic noiseless EHT frame.
+    # nonlinear operating point at every requested power. The stronger
+    # deterministic long-envelope residual intentionally targets roughly
+    # -51.5/-40.4/-32.6 dB at 1/16/20 dBm for this noiseless EHT frame.
     expectedBaselineEvmDb = np.asarray(
-        (-52.0, -48.0, -42.0), dtype=float
+        (-51.5, -40.4, -32.6), dtype=float
     )
     assert np.all(
         np.abs(floatingBaselineEvmDb - expectedBaselineEvmDb) <= 1.5
@@ -4539,10 +4548,19 @@ def CheckDohertyPaModel() -> None:
 
     defaultDohertyConfig = DohertyConfig()
     assert defaultDohertyConfig.peakingInputGain == 0.85
+    assert defaultDohertyConfig.defaultWienerSaturationAmplitude == 2.0
     assert defaultDohertyConfig.peakingTransitionWidth == 0.50
-    assert defaultDohertyConfig.peakingCombineCoefficient == 0.15 + 0.0j
-    assert defaultDohertyConfig.loadModulationStrength == 0.02
+    assert defaultDohertyConfig.peakingCombineCoefficient == 0.045 + 0.0j
+    assert defaultDohertyConfig.loadModulationStrength == 0.0035
     defaultDoherty = DohertyPA(defaultDohertyConfig)
+    assert defaultDoherty.carrierModel.config.saturationAmplitude == 2.0
+    assert defaultDoherty.peakingModel.config.saturationAmplitude == 2.0
+    directHelperBranch = DohertyPA.BuildBranchModel(
+        "wiener",
+        None,
+        None,
+    )
+    assert directHelperBranch.config.saturationAmplitude == 1.55
     defaultAmplitudeGrid = np.linspace(0.0, 2.0, 401)
     defaultSettledMagnitude = np.asarray(
         tuple(
@@ -4559,6 +4577,8 @@ def CheckDohertyPaModel() -> None:
     invalidDohertyConfigs = (
         {"carrierModelName": "memoryPolynomial"},
         {"peakingInputGain": 0.0},
+        {"defaultWienerSaturationAmplitude": 0.0},
+        {"defaultWienerSaturationAmplitude": float("nan")},
         {"peakingTurnOnAmplitude": 0.0},
         {"peakingTransitionWidth": 0.0},
         {"carrierCombineCoefficient": 0.0 + 0.0j},
@@ -4739,7 +4759,9 @@ def CheckGmpPaModel() -> None:
                     atol=1e-12,
                 )
 
-    longMemoryCoefficient = 0.008 - 0.0036j
+    # Use a nondefault explicit value to verify exact coefficient accounting;
+    # the configured built-in default is asserted separately above.
+    explicitLongMemoryCoefficient = 0.008 - 0.0036j
     (
         longMainCoefficients,
         longLaggingCoefficients,
@@ -4750,7 +4772,7 @@ def CheckGmpPaModel() -> None:
         2,
         longEnvelopeMemoryDepth=12,
         longEnvelopeMemoryDecay=0.82,
-        longEnvelopeMemoryCoefficient=longMemoryCoefficient,
+        longEnvelopeMemoryCoefficient=explicitLongMemoryCoefficient,
     )
     assert max(
         crossIndex
@@ -4770,14 +4792,14 @@ def CheckGmpPaModel() -> None:
     )
     assert np.isclose(
         addedLongLaggingCoefficient,
-        longMemoryCoefficient,
+        explicitLongMemoryCoefficient,
         rtol=0.0,
         atol=1.0e-15,
     )
     assert np.isclose(
         longMainCoefficients[(3, 0)]
         - ordinaryMain[(3, 0)],
-        -longMemoryCoefficient,
+        -explicitLongMemoryCoefficient,
         rtol=0.0,
         atol=1.0e-15,
     )
@@ -4957,9 +4979,9 @@ def CheckGmpPaModel() -> None:
             assert np.isclose(orderSteadyCoefficients[9], 0.0 + 0.0j)
 
     # A high-level run preceded by zeros exposes excessive repeated nonlinear
-    # memory coefficients.  All plateau samples should remain at nearly the
-    # same compressed level instead of dropping several decibels after sample
-    # zero as the former 34-percent delayed terms did.
+    # memory coefficients. The phase-dominant long-memory residual must keep
+    # every plateau amplitude within a small ripple while still settling
+    # exactly instead of producing an ongoing high-level collapse.
     plateauPhaseRadians = 0.37
     plateauLength = 40
     for plateauAmplitude in (0.25, 0.5, 0.9, 1.2, 1.5, 1.7, 2.0):
@@ -4985,6 +5007,12 @@ def CheckGmpPaModel() -> None:
         )
         assert abs(onsetToSettledDb) <= 0.45
         assert plateauRippleDb <= 0.45
+        assert np.allclose(
+            plateauMagnitude[-8:],
+            settledMagnitude,
+            rtol=0.0,
+            atol=1.0e-12,
+        )
 
     # Default stabilization must never override coefficients extracted from a
     # measured PA.  This deliberately strong two-tap model retains its exact
@@ -12007,7 +12035,7 @@ def CheckTwoToneIlcAnalysis() -> None:
     )
     baselineOutput = powerCalibration.GetLastPaOutput()
     baselineMetrics = resultAnalysis.Analyze(baselineOutput)
-    assert -40.0 < baselineMetrics["im3WorstDbc"] < -20.0
+    assert -42.5 < baselineMetrics["im3WorstDbc"] < -39.5
 
     facadeMetrics = Analysis.AnalyzeTwoTone(
         baselineOutput,
@@ -12348,7 +12376,7 @@ def CheckPaCharacterizationBenchmark() -> None:
         )
         assert np.all(np.diff(gmpIm3Dbc) > 4.0)
         assert np.all(np.diff(dohertyIm3Dbc) > 4.0)
-        assert -53.0 < gmpIm3Dbc[-1] < -47.0
+        assert -42.5 < gmpIm3Dbc[-1] < -40.0
         assert dohertyIm3Dbc[-1] < -28.0
         rappSummary = next(
             summary
@@ -13042,11 +13070,28 @@ def CheckDpdGmpModelAndBenchmark() -> None:
     assert np.all(
         np.abs(
             baselinePowerEvmDb
-            - np.asarray((-52.0, -48.0, -42.0), dtype=float)
+            - np.asarray((-51.6, -40.7, -33.0), dtype=float)
         )
-        <= 1.5
+        <= 1.0
     )
-    assert np.all(np.isfinite(np.vstack(dpdPowerEvmRows)))
+    correctedPowerEvmDb = np.vstack(dpdPowerEvmRows)
+    assert np.all(np.isfinite(correctedPowerEvmDb))
+    expectedCorrectedPowerEvmDb = np.asarray(
+        (
+            (-57.4, -46.5, -38.0),
+            (-57.4, -46.5, -38.0),
+        ),
+        dtype=float,
+    )
+    correctedPowerTolerancesDb = np.asarray(
+        (1.0, 1.0, 0.75), dtype=float
+    )
+    assert np.all(
+        np.abs(
+            correctedPowerEvmDb - expectedCorrectedPowerEvmDb
+        )
+        <= correctedPowerTolerancesDb
+    )
 
     for documentName, requiredText in (
         ("DPD-GMP.md", "加权岭回归"),

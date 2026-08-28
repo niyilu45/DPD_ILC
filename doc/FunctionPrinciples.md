@@ -159,7 +159,7 @@ flowchart LR
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
 | `RappConfig.Validate`, `WienerConfig.Validate`, `GMPConfig.Validate`, `PiecewiseGMPConfig.Validate`, `DohertyConfig.Validate` | E | 检查无记忆Rapp增益/饱和/平滑度，以及Wiener、GMP阶次/记忆/0至1非线性强度、分段边界/区域、Doherty分支开启、合路和系数合法性 | PaModel §2.2、§3.6、§4、§4.8、§4.10 |
-| `RappPA.__init__`, `WienerPA.__init__`, `GMPPA.__init__`, `PiecewiseGMPPA.__init__`, `DohertyPA.__init__`, `DohertyPA.BuildBranchModel` | E | 保存已验证模型参数；分段GMP解析显式区域或构造三套默认稀疏GMP并预计算区域系数差；Doherty按配置为载波与峰值支路构造Wiener或GMP内核 | PaModel §2.2、§3、§4、§4.8、§4.10 |
+| `RappPA.__init__`, `WienerPA.__init__`, `GMPPA.__init__`, `PiecewiseGMPPA.__init__`, `DohertyPA.__init__`, `DohertyPA.BuildBranchModel` | E | 保存已验证模型参数；独立Rapp/Wiener默认饱和幅度分别为1.44/1.55；分段GMP解析显式区域或构造三套默认稀疏GMP并预计算区域系数差；Doherty按配置为载波与峰值支路构造Wiener或GMP内核，省略Wiener支路配置时使用末尾字段 `defaultWienerSaturationAmplitude=2.0` | PaModel §2.2、§3、§4、§4.8、§4.10 |
 | `RappPA.Process` | P/N | 对每个复样点独立执行经典Rapp SSPA AM-AM软压缩并原样保留相位；无FIR、时延、历史包络或状态 | PaModel §2.2.2–§2.2.3 |
 | `RappPA.SmallSignalGain` | P/N | 取零幅度极限，返回正实数 `linearGain` | PaModel §2.2.4 |
 | `WienerPA.Process` | P/N | FIR 线性记忆→Rapp AM-AM→幅度相关 AM-PM | PaModel §3.1–§3.4 |
@@ -207,7 +207,7 @@ flowchart LR
 
 ### GMP 默认长包络三阶支路与兼容规则
 
-默认 `GMPConfig` 在常规短记忆 main/lagging/leading 项之外启用一条长包络三阶差分支路。令 $L=12$、$\rho=0.82$、$c=0.008-0.0036j$，并定义归一化几何权重
+默认 `GMPConfig` 在常规短记忆 main/lagging/leading 项之外启用一条长包络三阶差分支路。令 $L=12$、$\rho=0.82$、$c=0.0215-0.1282j$，并定义归一化几何权重
 
 ```math
 w_\ell=\frac{\rho^{\ell-1}}{\sum_{q=0}^{L-1}\rho^q},\qquad
@@ -221,13 +221,24 @@ y_{\mathrm{long},3}[n]
 =c\,x[n]\left(\sum_{\ell=1}^{L}w_\ell|x[n-\ell]|^2-|x[n]|^2\right).
 ```
 
-实现上，第一项写入三阶、零载波延迟的 lagging-envelope 系数 `(3, 0, ℓ)`，第二项从零延迟三阶 main 系数 `(3, 0)` 中扣除同一个总系数 $c$。因此它表达的是“归一化滞后平方包络减当前平方包络”，不会额外叠加一条静态三阶压缩曲线。经过起始零填充瞬态后，若输入为恒包络，则 $\sum_\ell w_\ell=1$，括号严格为零；包络上升、下降或长突发内的慢变化才激活该支路。
+实现上，第一项写入三阶、零载波延迟的 lagging-envelope 系数 `(3, 0, ℓ)`，第二项从零延迟三阶 main 系数 `(3, 0)` 中扣除同一个总系数 $c$。因此它表达的是“归一化滞后平方包络减当前平方包络”，不会额外叠加一条静态三阶压缩曲线。经过起始零填充瞬态后，若输入为恒包络，则 $\sum_\ell w_\ell=1$，括号严格为零；包络上升、下降或长突发内的慢变化才激活该支路。复系数以虚部为主，使残差偏向动态AM-PM而不是幅度下陷；0.25至2.0的零到高平台最大幅度纹波约0.311 dB，受0.45 dB测试上限约束，避免重新引入连续高幅平台约3 dB的塌落。
 
 兼容行为按入口区分：
 
-- 内置 `GMPConfig` 默认值为 `longEnvelopeMemoryDepth=12`、`longEnvelopeMemoryDecay=0.82`、`longEnvelopeMemoryCoefficient=0.008-0.0036j`，所以未提供系数字典的内置 GMP 默认启用该支路；内置分段 GMP 的默认区域种子也显式使用同一组参数。
+- 内置普通 `GMPConfig` 默认值为 `longEnvelopeMemoryDepth=12`、`longEnvelopeMemoryDecay=0.82`、`longEnvelopeMemoryCoefficient=0.0215-0.1282j`，所以未提供系数字典的普通GMP默认启用该支路。
+- `piecewise_gmp` PA 是另一种、本来已更强且更难的plant；其low/middle/high默认区域种子仍显式使用较温和的 `0.008-0.0036j`，不会跟随普通 `GMPConfig` 的新系数变化。下文验证表中的“分段GMP”专指 `PiecewiseDpdGmp` 算法，不是这个PA模型。
 - 直接调用 `DefaultGmpCoefficients(...)` 时仍以 `longEnvelopeMemoryDepth=0`、`longEnvelopeMemoryCoefficient=0` 为默认，即默认关闭，以保持既有 helper 调用的系数集合和数值结果不变；需要该支路时必须显式传入长记忆参数。
 - 只要 `mainCoefficients`、`laggingCoefficients`、`leadingCoefficients` 三个映射中任意一个由用户显式提供，`GMPPA` 就把整组系数视为用户定义并禁用隐式长包络支路。即使配置对象仍保留上述长记忆默认值，也不会在用户系数之外静默注入额外项；若需要它，应由用户在显式系数字典中完整给出对应 lagging 项及 main 抵消项。
+
+独立帧验证使用同一个普通GMP PA：EHT20、80 Msps、MCS 5、2 symbols、`width=0`，训练帧seed 91、验证帧seed 809。结果如下；这里比较的是两种DPD算法，不是更难的 `piecewise_gmp` PA。
+
+| 目标功率 | 未启用DPD | `DpdGmp` | `PiecewiseDpdGmp` |
+|---:|---:|---:|---:|
+| 1 dBm | -51.48 dB | -57.30 dB | -57.32 dB |
+| 16 dBm | -40.11 dB | -45.97 dB | -45.99 dB |
+| 20 dBm | -32.52 dB | -38.10 dB | -38.02 dB |
+
+标准 `main.py` 20 dBm最终部署EVM为：Rapp `-39.00 dB`、独立Wiener `-39.18 dB`、普通GMP `-41.04 dB`、Doherty `-44.82 dB`；相对旧默认分别改善 `14.78 dB`、改善 `15.04 dB`、变差 `9.99 dB`、改善 `15.51 dB`。GMP的回退是有意增强可见的长记忆结构失配，不通过噪声、分析标尺或目标功率制造差异。Doherty默认同时采用 `peakingCombineCoefficient=0.045`、`loadModulationStrength=0.0035`，配合两条省略配置时饱和幅度2.0的Wiener支路，表达的是“弱peaking、高余量”的行为模型起点，不冒充典型对称Doherty器件；器件级结论应覆盖为实测支路和合路参数。
 
 ### 4.1 `Channel.py`：PA到接收端链路
 

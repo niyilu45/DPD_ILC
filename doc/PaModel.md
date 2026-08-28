@@ -230,7 +230,7 @@ C_{\mathrm{dB}}(A_{\mathrm{sat}})
 | 参数 | 代码约束 | 建议起点 | 增大后发生什么 |
 |---|---|---:|---|
 | `linearGain` | 有限且大于0 | `1.0` | 小信号增益提高，渐近饱和输出也同比提高；膝点在输入幅度轴上的位置不变 |
-| `saturationAmplitude` | 有限且大于0 | `1.0` | 压缩膝点右移，渐近饱和输出同比提高；小信号斜率不变 |
+| `saturationAmplitude` | 有限且大于0 | `1.44` | 压缩膝点右移，渐近饱和输出同比提高；小信号斜率不变。相对旧默认1.0约右移3.17 dB |
 | `rappSmoothness` | 有限且大于0 | `2`至`3` | 线性增益保持更久、膝点更陡；过大时更接近硬限幅并增加高阶谱再生 |
 
 经验上，`rappSmoothness=2`至`3`适合作为常见SSPA软压缩起点；更小值模拟更早、更圆滑的压缩，更大值适合研究接近硬限幅的边界。模型参数必须根据实测AM-AM曲线拟合，默认值不代表某一具体器件。
@@ -249,7 +249,7 @@ rappPa = PaModel(
         "modelName": "rapp",
         "rappConfig": RappConfig(
             linearGain=1.0,
-            saturationAmplitude=1.0,
+            saturationAmplitude=1.44,
             rappSmoothness=3.0,
         ),
         "width": 0,
@@ -302,6 +302,9 @@ H(e^{j\omega})=\sum_{m=0}^{M-1}h[m]e^{-j\omega m}.
 ```
 
 这是一个温和且稳定的仿真记忆响应，不对应某个特定实测器件。
+独立Wiener模型的默认 `saturationAmplitude=1.55`、`rappSmoothness=3.0`、
+`ampmCoefficient=0.18`。1.55比Rapp的1.44略高，用于容纳前置FIR可能抬高的
+局部OFDM峰值；它只移动压缩膝点，不删除FIR记忆或AM-PM。
 
 ### 3.3 第二步：Rapp AM-AM 压缩
 
@@ -691,6 +694,17 @@ c_c g_c G_{c,\mathrm{small}}.
 
 该模型能够研究支路开启拐点、支路幅相失配、记忆差异和负载调制对EVM/ACLR的影响，但不直接输出漏极效率，也没有求解晶体管阻抗、反射波或电磁合成网络。
 
+内置 `DohertyConfig()` 使用Wiener/Wiener双支路；当相应支路配置为 `None` 时，
+末尾字段 `defaultWienerSaturationAmplitude=2.0` 为该支路提供Doherty专用压缩
+膝点。其余关键默认值为 `peakingCombineCoefficient=0.045+0j`、
+`loadModulationStrength=0.0035`。显式 `carrierWienerConfig` 或
+`peakingWienerConfig` 始终优先，不会被2.0覆盖。
+
+这组值代表**弱Peaking、高余量的非对称行为默认**：保留平滑开启的第二支路，
+但不让峰值支路或简化负载调制主导20 dBm波形。它适合可逆性和DPD算法回归，
+不冒充典型对称Doherty器件；后者必须用实测的支路功率比、开启点、负载调制和
+合路幅相替换默认值。
+
 ### 4.8.2 典型调用
 
 ```python
@@ -839,7 +853,7 @@ C_{\mathrm{dB}}(A_{\mathrm{sat}})
 -\frac{3.0103}{p}\ {\rm dB}.
 ```
 
-默认 `rappSmoothness=3.0` 时，这一点约为 1.003 dB 压缩点。因此默认 `saturationAmplitude=1.0` 可以近似理解为“FIR 输出幅度等于 1 时到达 1 dB 压缩”。
+默认 `rappSmoothness=3.0` 时，这一点约为 1.003 dB 压缩点。因此默认 `saturationAmplitude=1.55` 可以近似理解为“FIR 输出幅度等于 1.55 时到达约 1 dB 压缩”。
 
 更一般地，若希望求正数形式的 $C$ dB 压缩点，则
 
@@ -1064,14 +1078,16 @@ h_\ell
 \sum_{\ell=1}^{L}h_\ell=1.
 ```
 
-默认 $L=12$、$\rho=0.82$、$c=0.008-j0.0036$。在GMP基函数中，前一部分
+普通 `GMPConfig` 默认 $L=12$、$\rho=0.82$、$c=0.0215-j0.1282$。在GMP基函数中，前一部分
 是 $L$ 个 `lagging` 项 $c h_\ell x[n]|x[n-\ell]|^2$，后一部分是
 同时刻三阶 `main` 项 $-c x[n]|x[n]|^2$，因此它不是额外状态机或
 经验噪声，而是严格、稀疏、因果的三阶GMP展开。
 
 稳定恒包络下 $|x[n-\ell]|=|x[n]|$，归一化权使括号严格为0。
 所以该分支不改变稳态AM-AM/AM-PM，也不会重现旧式“连续几个高幅点后
-输出平台快速塌落”。它表示偏置/陷阱等比浅交叉记忆更长的包络电记忆；
+输出平台快速塌落”。最终复系数以虚部为主，让长记忆残差主要表现为动态
+AM-PM，而不是把连续高幅平台再压低数dB。它表示偏置/陷阱等比浅交叉记忆
+更长的包络电记忆；
 $L=12$ 明显超过默认普通和分段GMP DPD的 `crossMemoryDepth=2`，因此在无噪声
 仿真中提供确定性的物理模型失配，让DPD后残差仍随输出功率变化。
 
@@ -1089,9 +1105,9 @@ R_{\mathrm{plateau}}
 ```
 
 七个验证幅度0.25、0.50、0.90、1.20、1.50、1.70和2.00的最大平台纹波约为
-0.3930 dB；首点相对最后8个稳态样点均值的最大绝对偏差约为0.3930 dB。
-这个测试限制的是默认演示系数的短时动态，不是对任意实测
-自定义字典强加物理限制。
+0.311 dB；首点相对最后8个稳态样点均值的最大绝对偏差约为0.247 dB，二者
+均通过0.45 dB回归上限。这个测试限制的是默认演示系数的短时动态，不是对
+任意实测自定义字典强加物理限制。
 
 **非默认阶次集合。**生成器先把调用方的 `nonlinearScale` 作用于三阶及以上
 参考项。完整四阶拟合中的高阶项可能负责抵消低阶项的折返，直接删除某一阶
@@ -1132,7 +1148,7 @@ R_{\mathrm{plateau}}
 | `nonlinearScale` | 默认0.135；在默认系数生成时统一缩放三阶及以上参考项，一阶不变；1.0恢复全强度压力参考 | 显式系数字典是最终值，不重复乘该比例 |
 | `longEnvelopeMemoryDepth` | 默认12；设定长包络滞后抽头数，0关闭 | 只要三张系数表有任何一张显式给出，内置长记忆整体关闭 |
 | `longEnvelopeMemoryDecay` | 默认0.82；限制在 $(0,1]$，决定归一化指数权 $h_\ell$ 的衰减 | 显式系数语义下不自动生成长记忆 |
-| `longEnvelopeMemoryCoefficient` | 默认 $0.008-j0.0036$；是长延迟项的总复系数，0关闭 | 显式系数语义下不自动生成长记忆 |
+| `longEnvelopeMemoryCoefficient` | 普通 `GMPConfig` 默认 $0.0215-j0.1282$；相位主导的长延迟总复系数，0关闭 | 显式系数语义下不自动生成长记忆；默认方向限制平台幅度塌落 |
 | `mainCoefficients[(1,m)]` | 直接决定小信号 FIR 增益和频率响应 | 实部、虚部共同决定幅度与相位，不能把虚部简单理解成“只影响相位” |
 | `mainCoefficients[(p,m)]`, $p>1$ | 决定静态曲率和对应阶次的记忆 | 负实方向的三阶项常产生压缩，正实方向常产生扩张，但最终结果取决于所有复向量之和 |
 | `laggingCoefficients` | 对恒包络稳态并入 $C_p$，对调制包络形成历史依赖 | 增大后通常加宽同一输入幅度对应的增益散点或迟滞环 |
@@ -1427,8 +1443,9 @@ w_L(r[n])F_L(x)[n]
 内置分段模型在生成区域基础系数时显式启用
 `longEnvelopeMemoryDepth=12`、`longEnvelopeMemoryDecay=0.82` 和
 `longEnvelopeMemoryCoefficient=0.008-j0.0036`，然后再对low/middle/high的
-增益、相位、非线性和记忆强度做区域化。这保留了与普通GMP PA
-相同的长包络物理失配，同时不重复叠加该分支。
+增益、相位、非线性和记忆强度做区域化。这个较温和值有意保持不变，**不继承**
+普通 `GMPConfig` 新的 `0.0215-j0.1282`；`piecewise_gmp` PA本来就是更强、更难
+的分段plant，不能把它与下面用于比较两种DPD算法的普通GMP PA混为一谈。
 
 显式传入 `regionConfigs` 只表示区域配置由调用方负责，并不单独关闭长支路。
 每个区域仍独立遵守普通 `GMPConfig` 规则：三张系数表都为 `None` 时按该区域的
@@ -1805,19 +1822,29 @@ $\lambda>0$ 可以缓和高阶基函数相关造成的病态问题，但过大�
 
 | 每路目标输出功率 | PA baseline | `DpdGmp` | `PiecewiseDpdGmp` |
 |---:|---:|---:|---:|
-| 1 dBm | -51.63 dB | -57.42 dB | -57.43 dB |
-| 16 dBm | -47.18 dB | -53.25 dB | -53.38 dB |
-| 20 dBm | -41.23 dB | -47.25 dB | -47.21 dB |
+| 1 dBm | -51.48 dB | -57.30 dB | -57.32 dB |
+| 16 dBm | -40.11 dB | -45.97 dB | -45.99 dB |
+| 20 dBm | -32.52 dB | -38.10 dB | -38.02 dB |
 
-回归应同时检查三类性质：基线从1至20 dBm有明显功率恶化；两种DPD在每点至少改善4 dB；DPD后相邻功率点仍恶化超过3 dB且1至20 dBm总差超过8 dB。这些趋势同时防止PA过强、DPD无效和“所有功率点被补到同一约 -52 dB数值底”三类回归。功率闭环容差设为0.05 dB时，每点Analysis报告功率可要求距目标不超过0.15 dB。
+本表中的 `PiecewiseDpdGmp` 是对**同一个普通GMP PA**训练的分段DPD算法，不是
+`PaModel(modelName="piecewise_gmp")` PA。回归应同时检查三类性质：基线从1至
+20 dBm有明显功率恶化；两种DPD在每点至少改善约5 dB；DPD后相邻功率点仍保持
+明显恶化。这些趋势同时防止PA过强、DPD无效和“所有功率点被补到同一约 -52 dB
+数值底”三类回归。功率闭环容差设为0.05 dB时，每点Analysis报告功率可要求距
+目标不超过0.15 dB。
+
+标准 `main.py` 默认帧的20 dBm最终部署复测为：Rapp `-39.00 dB`、Wiener
+`-39.18 dB`、GMP `-41.04 dB`、Doherty `-44.82 dB`。相对旧默认，Rapp、
+Wiener和Doherty分别改善14.78、15.04和15.51 dB；GMP则故意变差9.99 dB，
+用于暴露有限DPD无法完全覆盖的确定性长包络记忆，而不是依靠噪声制造差异。
 
 16位结果必须用两个不同标尺：发送参考和DAC输入使用 `FixedPoint(16, 1.0)`，PA输出使用 `FixedPoint(16, paModel.outputFullScaleAmplitude)`。直接PA输出携带FixedPointArray元数据，Analysis会自动读取；显式配置同一个 `outputFullScaleAmplitude` 可固定参考面，并在元数据被剥离后是必需的。默认输出标尺2.0时，20 dBm高PAPR输出不会碰到每分量正负满码，固定点结果因此与浮点本征结果接近。
 
 若沿用旧输出标尺1.0，20 dBm原始输出分量峰值约1.57，输出编码会把超出正负1的样点夹到码轨；此时测得约 -24 dB EVM是**输出观测削顶**，不是GMP本征非线性，也不是 `nonlinearScale=0.135` 太强。增加位宽仍不改变正负1范围，继续减小GMP系数则会错误地掩盖参考面问题。正确修复是恢复默认输出标尺2.0，并让PowerCalibration和Analysis按该标尺解码；接近25 dBm的更高PAPR实验若峰值可能超过2，可按需把PA/Channel输出标尺与分析标尺一起设为4。
 
-量程边界复测进一步说明了这个取舍：默认输出标尺2.0在20 dBm无rail并保留上述本征功率趋势；接近额定上限时会出现少量rail。显式把plant和Analysis标尺同时设为4.0后，25 dBm测试实测25.098 dBm、EVM约 -33.82 dB，I/Q rail计数为0。因而2.0是默认20 dBm精度与余量的折中，4.0是近25 dBm高PAPR场景的按需设置，不应把默认值无条件扩大。
+量程边界复测进一步说明了这个取舍：默认输出标尺2.0在20 dBm无rail并保留上述本征功率趋势；接近额定上限时会出现少量rail。显式把plant和Analysis标尺同时设为4.0后，25 dBm测试实测25.088 dBm、EVM约 -22.09 dB，I/Q rail计数为0。因而2.0是默认20 dBm精度与余量的折中，4.0是近25 dBm高PAPR场景的按需设置，不应把默认值无条件扩大；标尺只避免观测削顶，不会改善PA在25 dBm处的本征失真。
 
-同一默认GMP的当前双音特性产物在20 dBm给出IM3/IM5/IM7约 `-49.51/-87.22/-129.54 dBc`；扫功率没有越过strong-distortion阈值，最高实测25.10 dBm点IM3约 `-40.17 dBc`。这些数值应以 `doc/images/pa_analyse` 下重新生成的CSV/JSON为准。
+同一默认GMP的当前双音特性产物在20 dBm给出IM3/IM5/IM7约 `-41.22/-87.18/-129.50 dBc`；扫功率在23.10 dBm首次进入strong-distortion分类（IM3约 `-35.13 dBc`），最高实测25.10 dBm点IM3约 `-31.05 dBc`。这些数值应以 `doc/images/pa_analyse` 下重新生成的CSV/JSON为准。
 
 低功率无噪声EVM接近线性是高阶项按 $|x|^{p-1}$ 快速衰减的正常结果。普通GMP默认模型承担稳定、单调、连续平台、功率可达且适合算法回归的基线职责；需要更复杂的plant时，应使用实测系数、自定义 `GMPConfig`、`PiecewiseGMPPA`，或显式增加温度、频率选择性I/Q和反馈链失配，同时保留这组普通GMP回归点作为参考。
 
@@ -1892,7 +1919,7 @@ classDiagram
     }
     class DohertyConfig
     class DohertyPA {
-        +BuildBranchModel(modelName, wienerConfig, gmpConfig)
+        +BuildBranchModel(modelName, wienerConfig, gmpConfig, defaultWienerSaturationAmplitude=None)
         +PeakingActivation(inputMagnitude)
         +Process(inputSignal)
         +SmallSignalGain()
@@ -1969,7 +1996,7 @@ paOverrides = {
     "modelName": "rapp",
     "width": 16,
     "rappConfig": RappConfig(
-        saturationAmplitude=1.0,
+        saturationAmplitude=1.44,
         rappSmoothness=3.0,
     ),
 }
@@ -1979,7 +2006,7 @@ rappOutput = paModel.Process(inputSignal)
 paOverrides.update({
     "modelName": "wiener",
     "wienerConfig": WienerConfig(
-        saturationAmplitude=1.0,
+        saturationAmplitude=1.55,
         rappSmoothness=3.0,
         ampmCoefficient=0.18,
     ),

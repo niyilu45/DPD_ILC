@@ -323,7 +323,7 @@ trainingResult = dpd.FitSegments(
 一阶线性记忆残差。因此普通GMP DPD和分段GMP DPD在1、16、20 dBm都收敛到
 约 -52 dB，并不一定是EVM计算错误；它也不表示一套系数可以跨功率部署。
 
-新的内置普通GMP PA和内置分段GMP PA在自动生成默认系数时增加：
+新的内置普通GMP PA在自动生成默认系数时使用：
 
 ```math
 h_l=\frac{\rho^{l-1}}{\sum_{q=0}^{L-1}\rho^q},\qquad
@@ -331,18 +331,40 @@ y_{\mathrm{long}}[n]
 =c\,x[n]\left(\sum_{l=1}^{L}h_l|x[n-l]|^2-|x[n]|^2\right),
 ```
 
-默认 $L=12$、$\rho=0.82$、$c=0.008-0.0036j$。归一化权重满足
+默认 $L=12$、$\rho=0.82$、$c=0.0215-0.1282j$。归一化权重满足
 $\sum_l h_l=1$，所以恒包络稳态下该支路为零，不改变已有静态压缩曲线；只有
 包络变化时才产生确定性的三阶长记忆动态。它不是噪声，也不依靠早停制造性能
-差异。`DpdGmp` 和 `PiecewiseDpdGmp` 仍默认使用较短的
+差异。该复系数以虚部为主，让模型失配更偏向动态AM-PM；0.25至2.0输入幅度的
+零到高平台最大幅度纹波约0.311 dB，并受0.45 dB回归上限约束，因而不会重新
+引入连续高幅平台的数dB幅度塌落。`DpdGmp` 和 `PiecewiseDpdGmp` 仍默认使用较短的
 `memoryDepth=3`、`crossMemoryDepth=2`，从而形成有限DPD与真实plant之间的
 结构失配。
 
-该默认支路只属于“自动生成的PA系数”。普通GMP或分段PA的任一区域只要显式
-传入 `mainCoefficients`、`laggingCoefficients`、`leadingCoefficients` 中的
-任意一张表，就不会再自动叠加这条支路，调用者给出的系数仍具有完全可重复的
-原始语义。仅传入 `regionConfigs` 不等于提供系数表；其中仍使用自动生成系数的
-区域会按各自 `GMPConfig.longEnvelopeMemory*` 设置决定是否启用。
+该默认支路只属于“自动生成的PA系数”。普通GMP只要显式传入
+`mainCoefficients`、`laggingCoefficients`、`leadingCoefficients` 中的任意一张
+表，就不会再自动叠加这条支路，调用者给出的系数仍具有完全可重复的原始语义。
+
+必须区分三个名称：本节独立帧比较中的plant始终是普通
+`PaModel(modelName="gmp")`；`DpdGmp` 与 `PiecewiseDpdGmp` 是作用在该plant前的
+两种DPD算法；`PaModel(modelName="piecewise_gmp")` 则是另一种、本来已经更强且
+更难的分段PA plant。内置 `piecewise_gmp` PA的区域种子继续显式使用
+`L=12`、`rho=0.82`、`c=0.008-0.0036j`，没有随普通 `GMPConfig` 一起改为
+`0.0215-0.1282j`。若调用者显式传入该PA的 `regionConfigs`，每个区域再独立
+遵守自己的 `GMPConfig.longEnvelopeMemory*` 和显式系数规则。
+
+无噪声独立帧验证固定EHT 20 MHz、80 Msps、MCS 5、2个数据symbol、`width=0`，
+训练帧为 `seed=91`、验证帧为 `seed=809`；每个功率点独立生成8轮ILC标签并在
+验证帧重新闭环到相同输出dBm：
+
+| 目标输出功率 | 普通GMP PA baseline | `DpdGmp` | `PiecewiseDpdGmp` |
+|---:|---:|---:|---:|
+| 1 dBm | -51.48 dB | -57.30 dB | -57.32 dB |
+| 16 dBm | -40.11 dB | -45.97 dB | -45.99 dB |
+| 20 dBm | -32.52 dB | -38.10 dB | -38.02 dB |
+
+标准 `main.py` 默认帧的20 dBm最终部署GMP EVM为 `-41.04 dB`，相对旧默认约
+`-51.03 dB` 变差9.99 dB。这是有意增强可观测的长记忆结构失配，不是分析
+标尺、噪声或功率目标变化。
 
 ### 6.2 多功率联合训练与多功率鲁棒性
 
@@ -586,16 +608,16 @@ oracle，但最终结论必须来自独立验证帧上的有限记忆DPD；否�
 
 | 比较 | 前值 | 后值 | 结果 |
 |---|---:|---:|---:|
-| 基础DPD独立帧EVM | -50.289 dB | -56.024 dB | 改善5.735 dB |
-| 基础DPD双音IM3 | -64.355 dBc | -69.190 dBc | 改善4.835 dB |
-| 15至12 dBm基础DPD EVM | -53.447 dB | -56.024 dB | 改善2.577 dB |
-| 扩展结构标签NMSE | -67.632 dB | -70.877 dB | 改善3.245 dB |
-| 峰值加权标签NMSE | -72.442 dB | -73.290 dB | 改善0.848 dB |
+| 基础DPD独立帧EVM | -46.548 dB | -51.700 dB | 改善5.152 dB |
+| 基础DPD双音IM3 | -53.638 dBc | -57.743 dBc | 改善4.105 dB |
+| 15至12 dBm基础DPD EVM | -46.644 dB | -51.700 dB | 改善5.056 dB |
+| 扩展结构标签NMSE | -60.226 dB | -63.971 dB | 改善3.745 dB |
+| 峰值加权标签NMSE | -65.168 dB | -65.778 dB | 改善0.610 dB |
 | 增强正则条件数 | `5.435e7` | `5.481e5` | 改善19.964 dB |
-| 多功率最差标签NMSE | -61.790 dB | -64.010 dB | 改善2.220 dB |
-| 多功率最差ACLR | 33.062276 dB | 33.061390 dB | 退化0.000886 dB，护栏通过 |
+| 多功率最差标签NMSE | -55.362 dB | -57.121 dB | 改善1.759 dB |
+| 多功率最差ACLR | 33.026863 dB | 33.019261 dB | 退化0.007601 dB，护栏通过 |
 
-最后一行不是“ACLR必须提高”的目标。源Wi-Fi波形的ACLR本底约为33 dB，当前判据允许独立验证帧的多功率最差ACLR相对单功率正则模型最多下降0.10 dB；`0.000886 < 0.10 dB`，所以 `expectationMet=True` 表示没有明显退化。
+最后一行不是“ACLR必须提高”的目标。源Wi-Fi波形的ACLR本底约为33 dB，当前判据允许独立验证帧的多功率最差ACLR相对单功率正则模型最多下降0.10 dB；`0.007601 < 0.10 dB`，所以 `expectationMet=True` 表示没有明显退化。
 
 ---
 
@@ -635,7 +657,7 @@ flowchart TD
 | 系数范数很大且随采集跳变 | 设计矩阵病态或反馈噪声过大 | 增大 `ridgeFactor`，减少冗余项，增加平均 |
 | 普通 NMSE 不变，峰值 EVM 改善 | 低幅度样点仍主导普通 NMSE | 同时报告峰值加权 NMSE |
 | 多功率训练最佳单点略退化 | 一个系数集在多个工作点之间折中 | 检查最差功率指标；必要时使用分功率系数库 |
-| 无噪声时普通/分段GMP DPD都约 -52 dB | 旧PA/DPD结构过匹配，非线性消除后剩下功率无关的一阶线性记忆EVM；或每个功率都重新训练了局部逆 | 使用带确定性长包络支路的内置PA；独立帧、等实测功率并冻结同一组系数跨功率验证 |
+| 无噪声时 `DpdGmp`/`PiecewiseDpdGmp` 都约 -52 dB | 旧普通GMP PA与DPD结构过匹配，非线性消除后剩下功率无关的一阶线性记忆EVM；或每个功率都重新训练了局部逆 | 使用带确定性长包络支路的普通GMP PA；独立帧、等实测功率并冻结同一组系数跨功率验证。这里“分段”指DPD算法，不是换用 `piecewise_gmp` PA |
 | 定点输出仍是 `complex128` | 容器类型固定，但 I/Q 数值是整数码 | 检查实部/虚部是否为整数码，不要只看 dtype |
 
 ---
@@ -860,11 +882,13 @@ python tests/BenchMark.py --channel-analyse
 三组不是硬切换：相邻区域通过 $C^2$ smootherstep 权重共同作用，所以训练
 和部署映射在两个包络边界处连续。
 
-内置 `PiecewiseGMPPA` 的默认三个区域还包含第6.1节的12样点长包络三阶
-支路，而 `PiecewiseDpdGmp` 默认仍是短记忆。两者使用相同的平滑瞬时包络门控
-并不等于plant与逆模型结构相同。若调用者显式传入PA的 `regionConfigs`，每个
-区域独立遵守普通 `GMPConfig` 的规则：任意显式系数表关闭自动长支路，三张表
-都为 `None` 时则按该区域的 `longEnvelopeMemory*` 参数生成。
+`PiecewiseDpdGmp` 是DPD算法，不要求plant也是 `PiecewiseGMPPA`。第6.1节的
+独立帧数字明确使用普通 `PaModel(modelName="gmp")` 作为共同plant，因而比较只
+反映普通与分段DPD结构。若另行选择内置 `PiecewiseGMPPA`，其默认三个区域使用
+12样点长包络三阶支路，但总系数保持 `0.008-0.0036j`；这个PA本来已更强、更难，
+不能与普通GMP plant的 `0.0215-0.1282j` 默认或第6.1节数字混用。调用者显式
+传入PA的 `regionConfigs` 时，每个区域独立遵守普通 `GMPConfig` 规则：任意显式
+系数表关闭自动长支路，三张表都为 `None` 时按该区域参数生成。
 
 ### 18.1 新增参数
 
