@@ -70,8 +70,9 @@ class Channel:
 
         Args:
             paModel: Optional object exposing ``Process`` and preferably
-                ``ProcessFloating``. It is required by ``Process`` but not by
-                ``ProcessPaOutput``.
+                drive-free ``ProcessRawFloating``. Third-party objects may use
+                the legacy ``ProcessFloating`` fallback. A PA is required by
+                ``Process`` but not by ``ProcessPaOutput``.
             parameters: Optional caller-owned live mapping of channel values.
             width: Optional public I/Q component width. None selects the
                 internal 16-bit default, zero selects floating point, and a
@@ -1069,10 +1070,11 @@ class Channel:
         """Bind the PA evaluated before the channel impairments.
 
         Processing details:
-            Algorithm: Require a callable public ``Process`` entry, retain
-            the PA object and bound method, and allow ``ProcessFloating`` to
-            be selected dynamically when the PA provides that efficient
-            normalized-domain path.
+            Algorithm: Require a callable public ``Process`` entry, retain the
+            PA object and bound method, and dynamically prefer an explicit
+            drive-free ``ProcessRawFloating`` path after Channel applies its
+            own analog drive. Preserve ``ProcessFloating`` as the normalized-
+            domain fallback for third-party PA objects.
 
         Args:
             paModel: PA-like object exposing a callable ``Process`` method.
@@ -3666,11 +3668,12 @@ class Channel:
         """Evaluate only the bound PA bank in normalized floating units.
 
         Processing details:
-            Algorithm: Prefer the PA's direct ``ProcessFloating`` entry. For
-            a fixed-only third-party PA, encode and decode around its public
-            width exactly once. No pre/post coupling or sampling impairment is
-            applied here, which keeps one unambiguous PA-bank calculation
-            reusable by normal processing and closed-loop power calibration.
+            Algorithm: Prefer the PA's explicit drive-free
+            ``ProcessRawFloating`` entry because Channel has already applied
+            its own trial or committed post-DAC drive. Fall back to the legacy
+            ``ProcessFloating`` protocol, or encode and decode around a
+            fixed-only third-party PA exactly once. No pre/post coupling or
+            sampling impairment is applied here.
 
         Args:
             inputSignal: Normalized floating PA input vector or matrix.
@@ -3687,8 +3690,12 @@ class Channel:
             inputSignal, "inputSignal"
         )
         floatingProcessor = getattr(
-            self.paModel, "ProcessFloating", None
+            self.paModel, "ProcessRawFloating", None
         )
+        if not callable(floatingProcessor):
+            floatingProcessor = getattr(
+                self.paModel, "ProcessFloating", None
+            )
         if callable(floatingProcessor):
             normalizedPaOutput = floatingProcessor(normalizedInput)
         else:

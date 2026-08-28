@@ -1960,7 +1960,7 @@ I类把H类得到的PA结论转换成可执行的GMP DPD改进，并要求每一
 | 每个标签ILC轮数 | 8 |
 | 公开位宽 | 0 |
 
-定点运行时，Wi-Fi/DPD/DAC输入为FS1，PA/Channel输出默认FS2；`Analysis` 和 `TwoToneAnalysis` 必须使用同一个 `outputFullScaleAmplitude=2.0`。近25 dBm的高PAPR输出若触及FS2，可把PA、Channel和两个分析器统一改为FS4。不能只扩大分析器或把输入DAC量程一并改掉，否则基准不再处于同一物理参考面。
+定点运行时，Wi-Fi/DPD/DAC输入为FS1，PA/Channel输出默认FS2；`Analysis` 和 `TwoToneAnalysis` 必须使用同一输出标尺。直接工程FixedPointArray会自动传递FS2/FS4，显式配置优先；若元数据被剥离则必须手工指定。近25 dBm的高PAPR输出若触及FS2，可把PA、Channel和两个分析器统一改为FS4。不能只扩大分析器或把输入DAC量程一并改掉，否则基准不再处于同一物理参考面。
 
 ### 30.3 阶段与控制变量
 

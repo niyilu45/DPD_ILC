@@ -252,9 +252,9 @@ chOut, fbOut = plant.Process(inputSignal)
 chOut, fbOut = plant.ProcessOutputPathsFloating(inputSignal)
 ```
 
-`NormalizedPaAdapter` 对普通PA优先调用这个协议。它接收已经解码的归一化样值，但会在PA求值前应用 `PowerCalibration` 已提交的post-DAC模拟驱动，因此定点ILC不会因为离开公开整数码边界而丢失10、15或20 dBm工作点。Channel还提供优先级更高的 `ProcessNormalizedOutputPaths`：非稳态热模式走普通浮点双输出快路径，稳态热模式则穿过公共定点边界并调用 `Process`，为当前ILC候选重复所需功率校准。`PaModel.ProcessFloating` 与 `MimoPaModel.ProcessFloating` 刻意保持raw、drive-free：它们只适合已经拥有物理输入标尺、需要避免重复增益的调用方。`IQImbalancePA.ProcessOutputPathsFloating` 会先透传被包装plant的已提交驱动和双分支，再分别添加相同输出I/Q变换。
+`NormalizedPaAdapter` 对普通PA优先调用这个协议。它接收已经解码的归一化样值，但会在PA求值前应用 `PowerCalibration` 已提交的post-DAC模拟驱动，因此定点ILC不会因为离开公开整数码边界而丢失10、15或20 dBm工作点。Channel还提供优先级更高的 `ProcessNormalizedOutputPaths`：非稳态热模式走普通浮点双输出快路径，稳态热模式则穿过公共定点边界并调用 `Process`，为当前ILC候选重复所需功率校准。`PaModel.ProcessFloating`、`MimoPaModel.ProcessFloating` 和 `IQImbalancePA.ProcessFloating` 是保留当前committed drive的单输出浮点重放入口；功率扫描应在每个目标校准后立即重放，或为不同目标使用独立plant，因为一个对象只保存最近一次成功校准的drive。只有显式的 `ProcessRawFloating`/`ProcessChainRawFloating` 是drive-free参考面；Channel已经拥有物理输入标尺时优先调用它们，避免重复增益。`IQImbalancePA.ProcessOutputPathsFloating` 会先透传被包装plant的已提交驱动和双分支，再分别添加相同输出I/Q变换。
 
-定点适配器分别维护输入和观测量程：WaveGen/DPD/DAC输入按FS1（`fullScaleAmplitude=1.0`）解码，PA/Channel输出从plant的 `outputFullScaleAmplitude` 读取，默认FS2。所有ILC入口返回时，`learnedInput` 与每轮 `inputSignal` 仍按输入FS1编码；`outputSignal`、`feedbackOutputSignal` 以及历史中每轮的 `chOut`/`fbOut` 则按plant输出量程编码。近25 dBm高PAPR场景若显式把plant改成FS4，ILC历史会自动随之使用FS4；后续 `Analysis` 或 `TwoToneAnalysis` 也必须配置相同输出量程。
+定点适配器分别维护输入和观测量程：WaveGen/DPD/DAC输入按FS1（`fullScaleAmplitude=1.0`）解码，PA/Channel输出从plant的 `outputFullScaleAmplitude` 读取，默认FS2。所有ILC入口返回时，`learnedInput` 与每轮 `inputSignal` 仍按输入FS1编码；`outputSignal`、`feedbackOutputSignal` 以及历史中每轮的 `chOut`/`fbOut` 则按plant输出量程编码并携带格式元数据。近25 dBm高PAPR场景若显式把plant改成FS4，ILC历史会自动随之使用FS4；Analysis和TwoToneAnalysis对直接工程输出自动读取该标尺，若先转成裸ndarray/list或经不保留子类的拼接，则必须显式配置相同输出量程。
 
 `Process` 必须满足：
 
@@ -764,7 +764,11 @@ noiseAwareAnalysis = resultAnalysis.AnalyzeIlcHistory(
 ### 11.1 推荐写法
 
 ```python
-resultAnalysis = Analysis(referenceSignal, waveform)
+resultAnalysis = Analysis(
+    referenceSignal,
+    waveform,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
+)
 ilcConfig = ILCConfig(numIterations=8, learningRate=0.15)
 ilcResult = RunFrequencyDomainIlc(
     referenceSignal,
@@ -797,7 +801,11 @@ print(ilcMetrics["aclrWorstDb"])
 
 ```python
 pointReference = 0.30 * waveform.samples
-pointAnalysis = Analysis(pointReference, waveform)
+pointAnalysis = Analysis(
+    pointReference,
+    waveform,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
+)
 pointResult = RunFrequencyDomainIlc(
     pointReference,
     paModel,
@@ -973,7 +981,11 @@ trainingReference = 0.24 * trainingWaveform.samples
 validationReference = 0.24 * validationWaveform.samples
 paModel = PaModel(parameters={"modelName": "wiener"})
 
-trainingAnalysis = Analysis(trainingReference, trainingWaveform)
+trainingAnalysis = Analysis(
+    trainingReference,
+    trainingWaveform,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
+)
 trainingConfig = ILCConfig(
     numIterations=10,
     learningRate=0.15,
@@ -1010,6 +1022,7 @@ deployedOutput = paModel.Process(deployedInput)
 validationAnalysis = Analysis(
     validationReference,
     validationWaveform,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
 )
 validationAnalysis.AnalyzeStages(
     {
@@ -1221,7 +1234,11 @@ mimoResult = RunMimoFrequencyDomainIlc(
     waveform.bandwidthHz,
     mimoConfig,
 )
-resultAnalysis = Analysis(referenceSignal, waveform)
+resultAnalysis = Analysis(
+    referenceSignal,
+    waveform,
+    outputFullScaleAmplitude=mimoPaModel.outputFullScaleAmplitude,
+)
 mimoIlcAnalysis = resultAnalysis.AnalyzeMimoIlcHistory(
     tuple(
         chainResult.history
@@ -1247,7 +1264,11 @@ deployedChOut, deployedFbOut = channel.Process(
     rawDeployedInput,
     outputPowerDbm=targetOutputPowerDbmPerChain,
 )
-physicalAnalysis = Analysis(referenceSignal, waveform)
+physicalAnalysis = Analysis(
+    referenceSignal,
+    waveform,
+    outputFullScaleAmplitude=channel.outputFullScaleAmplitude,
+)
 physicalAnalysis.AnalyzeStages(
     {
         "MIMO PA baseline": baselineChOut,
@@ -1353,7 +1374,11 @@ def RunPointIlc(
     """Run point-specific ILC with a matching EVM objective."""
 
     del outputPowerDbm
-    pointAnalysis = Analysis(pointReference, waveform)
+    pointAnalysis = Analysis(
+        pointReference,
+        waveform,
+        outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
+    )
     pointResult = RunFrequencyDomainIlc(
         pointReference,
         paModel,
@@ -1735,7 +1760,7 @@ referenceSignal.shape[1] == mimoPaModel.numTransmitChains
 若无噪声浮点对照也异常，再检查：
 
 1. 每个功率点的 `analogDriveDbPerChain` 是否不同，且每轮 `chOut` 功率是否仍停留在本点；
-2. 普通PA是否实现 `ProcessOutputPathsFloating`，稳态热Channel是否实现 `ProcessNormalizedOutputPaths`，避免ILC内部调用raw `ProcessFloating` 绕过已提交驱动或公共复校语义；
+2. 普通PA是否实现 `ProcessOutputPathsFloating`，稳态热Channel是否实现 `ProcessNormalizedOutputPaths`，并确认自定义适配器没有误用drive-free的 `ProcessRawFloating` 绕过已提交驱动或公共复校语义；
 3. 功率曲线是否用 `EvaluateIlcPowerPoint` 或等价逻辑按 `chOut` 严格EVM最佳轮选点，而不是直接使用反馈LC-NMSE最佳的 `ILCResult.learnedInput`；
 4. 最佳输入重放是否在同一确定性条件下进行；含随机噪声时，重放值可因新噪声样本轻微波动。
 

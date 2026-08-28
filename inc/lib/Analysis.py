@@ -32,7 +32,7 @@ if __package__ and "." in __package__:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
-    from ..utils.FixedPoint import FixedPoint
+    from ..utils.FixedPoint import FixedPoint, GetFixedPointFormat
     from ..utils.FrameProcess import FrameProcess
     from ..utils.SigProc import (
         PowerCalibration,
@@ -46,7 +46,7 @@ else:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
-    from utils.FixedPoint import FixedPoint
+    from utils.FixedPoint import FixedPoint, GetFixedPointFormat
     from utils.FrameProcess import FrameProcess
     from utils.SigProc import (
         PowerCalibration,
@@ -412,8 +412,9 @@ class Analysis:
             outputFullScaleAmplitude: Optional physical component magnitude
                 represented by measured PA/channel output code rails. The
                 reference waveform always retains the normalized DAC scale
-                of one. The compatibility default is 1.0; pass the bound
-                PA or Channel's output scale when analyzing its fixed output.
+                of one. Project ``FixedPointArray`` inputs supply this scale
+                automatically unless explicitly overridden. Plain ndarrays
+                retain the 1.0 compatibility default.
             parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
 
         Returns:
@@ -550,10 +551,13 @@ class Analysis:
                 if isinstance(referenceSignal, WifiWaveform)
                 else referenceSignal
             )
-            measuredArray = self.interfaceFormat.QuantizeCodes(
+            measuredOutputFormat = self.ResolveMeasuredOutputFormat(
                 measuredInput
             )
-            floatingMeasuredArray = self.outputInterfaceFormat.DecodeComplex(
+            measuredArray = measuredOutputFormat.QuantizeCodes(
+                measuredInput
+            )
+            floatingMeasuredArray = measuredOutputFormat.DecodeComplex(
                 measuredArray
             )
             if isinstance(transmittedSignal, WifiWaveform):
@@ -648,6 +652,14 @@ class Analysis:
                 else dict(parseParameters)
             )
             parseConfiguration["width"] = self.interfaceFormat.width
+            blindMeasuredInput = (
+                referenceSignal.samples
+                if isinstance(referenceSignal, WifiWaveform)
+                else referenceSignal
+            )
+            blindOutputFormat = self.ResolveMeasuredOutputFormat(
+                blindMeasuredInput
+            )
             parseInput: Union[np.ndarray, WifiWaveform] = (
                 replace(
                     referenceSignal,
@@ -667,8 +679,8 @@ class Analysis:
             )
             selectedReference = self.parsedWifiFrame.referenceSignal
             selectedWaveform = self.parsedWifiFrame.waveform
-            self.defaultMeasuredSignal = (
-                self.parsedWifiFrame.receivedSignal.copy()
+            self.defaultMeasuredSignal = blindOutputFormat.QuantizeCodes(
+                self.parsedWifiFrame.receivedSignal
             )
         if isinstance(selectedReference, WifiWaveform):
             selectedReference = selectedReference.samples
@@ -787,6 +799,40 @@ class Analysis:
         )
 
     outputFullScaleAmplitude = OutputFullScaleAmplitude
+
+    def ResolveMeasuredOutputFormat(
+        self, measuredSignal: object
+    ) -> FixedPoint:
+        """Resolve one measured signal's fixed-point output convention.
+
+        Processing details:
+            Algorithm: Honor any explicit ``outputFullScaleAmplitude`` layer
+            first. Otherwise read validated metadata attached by ``FixedPoint``
+            producers when its width matches this Analysis interface, and fall
+            back to the historical FS1 configuration for plain ndarrays.
+            Metadata is never written into the live ChainMap, so one analyzer
+            can process successive signals with different explicit formats.
+
+        Args:
+            measuredSignal: Candidate PA, Channel, or external capture array.
+
+        Returns:
+            result: Fixed-point decoder for this measured reference plane.
+        """
+
+        outputScaleWasExplicitlyConfigured = any(
+            "outputFullScaleAmplitude" in parameterLayer
+            for parameterLayer in self.parameters.maps[:-1]
+        )
+        if outputScaleWasExplicitlyConfigured:
+            return self.outputInterfaceFormat
+        formatMetadata = GetFixedPointFormat(measuredSignal)
+        if formatMetadata is None:
+            return self.outputInterfaceFormat
+        metadataWidth, metadataFullScaleAmplitude = formatMetadata
+        if metadataWidth != self.width:
+            return self.outputInterfaceFormat
+        return FixedPoint(self.width, metadataFullScaleAmplitude)
 
     def GetSignalOverlapResult(
         self,
@@ -1046,9 +1092,9 @@ class Analysis:
         signalProcessingParameters = self.parameters[
             "signalProcessingParameters"
         ]
-        measuredArray = self.outputInterfaceFormat.DecodeComplex(
+        measuredArray = self.ResolveMeasuredOutputFormat(
             measuredSignal
-        )
+        ).DecodeComplex(measuredSignal)
         referenceMatrix = (
             self.referenceSignal.reshape(-1, 1)
             if self.referenceSignal.ndim == 1
@@ -2521,9 +2567,9 @@ class Analysis:
                 )
             selectedSignal = self.defaultMeasuredSignal
         self.ValidateParameters()
-        decodedSignal = self.outputInterfaceFormat.DecodeComplex(
+        decodedSignal = self.ResolveMeasuredOutputFormat(
             selectedSignal
-        )
+        ).DecodeComplex(selectedSignal)
         referenceMatrix = (
             self.referenceSignal.reshape(-1, 1)
             if self.referenceSignal.ndim == 1
@@ -2766,7 +2812,7 @@ class Analysis:
         toneFrequenciesHz: Optional[Sequence[float]] = None,
         ilcBandwidthHz: Optional[float] = None,
         width: Optional[int] = None,
-        outputFullScaleAmplitude: float = 1.0,
+        outputFullScaleAmplitude: Optional[float] = None,
     ) -> TwoToneWaveform:
         """Resolve metadata-rich or raw two-tone inputs into one waveform.
 
@@ -2796,13 +2842,25 @@ class Analysis:
                 Metadata-rich mode inherits its width only when no measured-
                 signal override is supplied.
             outputFullScaleAmplitude: Physical component magnitude represented
-                by a measured fixed-point output code rail. The compatibility
-                default is one.
+                by a measured fixed-point output code rail. None reads project
+                signal metadata and otherwise falls back to one.
 
         Returns:
             result: Existing or newly constructed immutable two-tone metadata.
         """
 
+        formatMetadata = GetFixedPointFormat(measuredSignal)
+        resolvedOutputFullScaleAmplitude = (
+            FixedPoint(
+                0, outputFullScaleAmplitude
+            ).fullScaleAmplitude
+            if outputFullScaleAmplitude is not None
+            else (
+                1.0
+                if formatMetadata is None or formatMetadata[0] == 0
+                else float(formatMetadata[1])
+            )
+        )
         if isinstance(waveform, TwoToneWaveform):
             if sampleRateHz is not None and not np.isclose(
                 float(sampleRateHz), waveform.sampleRateHz
@@ -2831,7 +2889,7 @@ class Analysis:
             # floating transmit reference and fixed-point instrument capture
             # are therefore a valid and common combination.
             if width is not None:
-                FixedPoint(width, outputFullScaleAmplitude)
+                FixedPoint(width, resolvedOutputFullScaleAmplitude)
             return waveform
 
         rawMetadataSignal = measuredSignal if waveform is None else waveform
@@ -2921,7 +2979,7 @@ class Analysis:
                 16 if integerCodeShape and exceedsNormalizedRange else 0
             )
         interfaceFormat = FixedPoint(
-            resolvedInputWidth, outputFullScaleAmplitude
+            resolvedInputWidth, resolvedOutputFullScaleAmplitude
         )
         resolvedWidth = interfaceFormat.width
         decodedSamples = interfaceFormat.DecodeComplex(rawSamples).reshape(-1)
@@ -3051,7 +3109,12 @@ class Analysis:
                 "outputFullScaleAmplitude"
             )
         if metadataOutputFullScaleAmplitude is None:
-            metadataOutputFullScaleAmplitude = 1.0
+            formatMetadata = GetFixedPointFormat(measuredSignal)
+            metadataOutputFullScaleAmplitude = (
+                1.0
+                if formatMetadata is None or formatMetadata[0] == 0
+                else float(formatMetadata[1])
+            )
         resolvedWaveform = Analysis.BuildTwoToneWaveform(
             measuredSignal,
             waveform=waveform,
@@ -3133,7 +3196,12 @@ class Analysis:
                 "outputFullScaleAmplitude"
             )
         if metadataOutputFullScaleAmplitude is None:
-            metadataOutputFullScaleAmplitude = 1.0
+            formatMetadata = GetFixedPointFormat(measuredSignal)
+            metadataOutputFullScaleAmplitude = (
+                1.0
+                if formatMetadata is None or formatMetadata[0] == 0
+                else float(formatMetadata[1])
+            )
         resolvedWaveform = Analysis.BuildTwoToneWaveform(
             measuredSignal,
             waveform=waveform,

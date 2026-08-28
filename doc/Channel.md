@@ -1959,7 +1959,7 @@ except RuntimeError as error:
 
 1. 先确认 `outputPowerDbm <= maximumOutputPowerDbm`。超过额定上限属于配置错误，不应开始闭环。
 2. 若使用内置Rapp、Wiener、GMP、Doherty或内置MIMO plant，正位宽路径会自动使用解码后的模拟drive。默认上限25 dBm时，20 dBm属于必须覆盖的正常目标；出现不可达提示应视为实现或自定义参数问题，而不是通过增大 `maximumOutputPowerDbm` 绕过。
-3. 第三方PA通过Channel使用时，应提供 `ProcessFloating(inputSignal)`，让Channel在公开码解码并施加模拟drive后直接送入物理PA模型；若只有定点 `Process`，中间再次编码可能重新削顶。第三方对象若直接绑定 `PowerCalibration`，则应提供配对的 `ProcessCalibrationDrive(inputSignal, driveDbPerChain)` 与 `SetCalibrationDriveDb(driveDbPerChain)`。缺少drive-aware接口时只能沿用全数字调节；连续多轮产生相同满量程公开码后会报告数字饱和或在迭代上限给出最佳实测值。
+3. 第三方PA通过Channel使用时，推荐提供明确drive-free的 `ProcessRawFloating(inputSignal)`，让Channel在公开码解码并施加模拟drive后直接送入物理PA模型；为兼容旧对象，缺少该方法时仍回退到传统 `ProcessFloating(inputSignal)`。内置PA的公开 `ProcessFloating` 现在会自行应用committed drive，所以Channel内部总是优先选择 `ProcessRawFloating`，避免重复增益。若第三方PA只有定点 `Process`，中间再次编码可能重新削顶。第三方对象若直接绑定 `PowerCalibration`，则应提供配对的 `ProcessCalibrationDrive(inputSignal, driveDbPerChain)` 与 `SetCalibrationDriveDb(driveDbPerChain)`。缺少drive-aware接口时只能沿用全数字调节；连续多轮产生相同满量程公开码后会报告数字饱和或在迭代上限给出最佳实测值。
 4. 若数字码仍在变化但最佳功率不再接近目标，检查自定义PA的AM/AM曲线、目标附近是否单调、PA前耦合Jacobian是否病态，以及每路目标是否都落在真实覆盖范围内。单纯增加 `maximumCalibrationIterations` 通常不能修复这些物理或接口问题。
 
 失败metrics用于诊断，不代表接受了该试探工作点。`GetLastPaInput()` 与 `GetLastPaOutput()`仍只返回成功收敛的公开输入和干净PA输出；一次新的失败校准不会把历史成功波形伪装成本次结果。
@@ -2036,7 +2036,7 @@ stressFeedbackParameters = {
 
 | 方法 | 参数 | 返回值或作用 |
 |---|---|---|
-| `OutputFullScaleAmplitude` / `outputFullScaleAmplitude` | 无 | 返回固定点 `chOut`/`fbOut` 的scaled full-scale分量标尺；默认2.0，供PowerCalibration自动发现及Analysis显式接线 |
+| `OutputFullScaleAmplitude` / `outputFullScaleAmplitude` | 无 | 返回固定点 `chOut`/`fbOut` 的scaled full-scale分量标尺；默认2.0，供PowerCalibration发现，并随FixedPointArray自动传给Analysis或用于显式接线 |
 | `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 返回 `(chOut, fbOut)`；默认稳态热模式每次都校准后只提交一个稳态周期。`forward` 复制第一项，`fb` 执行完整反馈链；首次必须给目标，后续 `None` 复用最近成功目标 |
 | `ProcessOutputPathsFloating(inputSignal)` | 内部归一化浮点波形 | 从一次PA/热周期返回浮点 `(chOut, fbOut)`；`sampleMode` 决定第二项是前向副本还是反馈观测，供ILC适配器使用 |
 | `ProcessFloating(inputSignal)` | 内部归一化浮点波形 | 兼容单输出入口，按 `sampleMode` 返回一路；新代码不应用它代替双输出接口 |
@@ -2189,7 +2189,7 @@ chOut, fbOut = channel.Process(paInputSignal)
 ```mermaid
 flowchart LR
     publicInput["公开PA输入<br/>输入标尺1"] --> decode["解码到内部浮点"]
-    decode --> pa["PA.ProcessFloating"]
+    decode --> pa["PA.ProcessRawFloating<br/>legacy fallback: ProcessFloating"]
     pa --> forward["前向仪表采样<br/>跳过全部fb参数"]
     forward --> noise["AddNoise"]
     noise --> encodeCh["按输出标尺编码chOut<br/>默认2"]
@@ -2201,7 +2201,7 @@ flowchart LR
     feedback --> encodeFb
 ```
 
-图示说明：`width=0` 时解码和编码是等值复制；`width>0` 时两路公开I/Q都是整数码，但PA、移相和噪声仍在内部归一化浮点域计算。输入使用标尺1，两个输出共用Channel的 `outputFullScaleAmplitude`，默认2。默认 `sampleMode="forward"` 时只生成一次前向波形并让两项逐样点相同；选择 `"fb"` 才构造第二条反馈链。最终Analysis使用 `chOut`，而DPD/ILC使用 `fbOut`，两者都必须按Channel输出标尺解码。
+图示说明：`width=0` 时解码和编码是等值复制；`width>0` 时两路公开I/Q都是整数码，但PA、移相和噪声仍在内部归一化浮点域计算。输入使用标尺1，两个输出共用Channel的 `outputFullScaleAmplitude`，默认2。默认 `sampleMode="forward"` 时只生成一次前向波形并让两项逐样点相同；选择 `"fb"` 才构造第二条反馈链。最终Analysis使用 `chOut`，而DPD/ILC使用 `fbOut`，两者都必须按Channel输出标尺解码；直接FixedPointArray自动携带该值，裸数组需显式配置。
 
 ### 7.3 前向仪表与板载反馈同时输出
 

@@ -229,7 +229,7 @@ flowchart LR
     encode --> outputCodes["输出整数码"]
 ```
 
-**图 2 说明**：PA 内部幂次、记忆抽头和包络交叉项不直接对 `8191` 做运算，而是对解码后的约 `0.9999` 做运算；否则高阶项会产生完全错误的数量级。直接使用 `PaModel` 做过一次成功的闭环校准后，`SetCalibrationDriveDb` 会提交模拟驱动，后续公开 `Process` 自动复用该驱动；底层 `ProcessFloating` 仍以调用者提供的实际浮点PA输入为准，不重复施加驱动。
+**图 2 说明**：PA 内部幂次、记忆抽头和包络交叉项不直接对 `8191` 做运算，而是对解码后的约 `0.9999` 做运算；否则高阶项会产生完全错误的数量级。直接使用 `PaModel` 做过一次成功的闭环校准后，`SetCalibrationDriveDb` 会提交模拟驱动，后续公开 `Process` 与 `ProcessFloating` 都自动复用该驱动；前者保留公开码边界，后者直接返回浮点结果。只有 `ProcessRawFloating` 把输入视为已经带有实际模拟驱动的物理PA输入，不再重复施加驱动，供Channel和模型内部使用。
 
 ### 7.3 Channel
 
@@ -286,7 +286,9 @@ flowchart LR
 - OFDM 解调；
 - SNR、EVM 和 ACLR 计算。
 
-显式参考、发送辅助和盲解析三条路径都只解码一次。`ParseWifi` 的公开结果仍是输入DAC整数码，交给 `Analysis` 后再统一解码。为兼容外部仪表和旧数组，Analysis默认 `outputFullScaleAmplitude=1.0`，无法仅从裸整数数组推断plant标尺；分析固定点PA输出时必须显式传入：
+`FixedPoint.QuantizeCodes`、`EncodeComplex` 和 `QuantizeComplex` 返回 `FixedPointArray`。它仍是 `numpy.ndarray` 的 `complex128` 子类，但额外携带只读 `fixedPointWidth` 与 `fullScaleAmplitude`；切片、`.copy()` 和普通标量运算保留元数据。`DecodeComplex` 明确返回普通ndarray，因为解码后的物理浮点量不能继续冒充公开整数码。`np.asarray`、`.tolist()`、部分拼接以及保存后按普通ndarray重载会剥离元数据，这时无法仅从整数码值判断FS1还是FS2。
+
+显式参考、发送辅助和盲解析三条路径都只解码一次。`ParseWifi` 的公开结果仍是输入DAC整数码，交给 `Analysis` 后再统一解码。对直接工程输出，Analysis会在任何 `np.asarray` 之前读取 `FixedPointArray` 元数据；显式 `outputFullScaleAmplitude` 具有最高优先级。外部仪表和旧裸数组兼容回退1.0，分析已丢元数据的PA输出时仍应显式传入：
 
 ```python
 fixedPa = PaModel(modelName="gmp", width=16)
@@ -491,7 +493,7 @@ python SmallestSISO.py
 
 ## 12. 使用检查表
 
-1. 同一条信号链的 `WaveGenWifi`、`PaModel`、`Channel`、`ParseWifi` 和 `Analysis` 必须使用相同 `width`；输入DAC保持 $F=1$，PA/Channel输出与Analysis之间还必须使用相同的 `outputFullScaleAmplitude`。
+1. 同一条信号链的 `WaveGenWifi`、`PaModel`、`Channel`、`ParseWifi` 和 `Analysis` 必须使用相同 `width`；输入DAC保持 $F=1$，PA/Channel输出与Analysis之间还必须使用相同的 `outputFullScaleAmplitude`，直接FixedPointArray会自动传递该值。
 2. `width=0` 表示浮点模式；正值表示公开整数码模式。
 3. 不要通过 `dtype` 判断模式，应读取 `width` 或 `GetFormatInfo()`。
 4. 定点公开数据的实部和虚部都应等于各自的最近整数。
@@ -501,5 +503,5 @@ python SmallestSISO.py
 8. `maximumOutputPowerDbm` 是PA输出参考面的额定上限，不是公开整数码的功率标签。
 9. 定点闭环默认保留6 dB数字峰值余量，并在解码后调整隐藏模拟驱动；不要通过制造越界码代替该驱动级。
 10. `GetLastPaInput()` 是模拟驱动前的公开数字参考，真正的PA激励应查看 `GetLastActualPaInput()`。
-11. 内置PA、MIMO PA和Channel固定输出默认 `outputFullScaleAmplitude=2.0`；Analysis和TwoToneAnalysis为兼容旧数据默认1.0，分析plant输出时应显式传入plant标尺。
+11. 内置PA、MIMO PA和Channel固定输出默认 `outputFullScaleAmplitude=2.0`；Analysis和TwoToneAnalysis自动读取直接工程输出的格式元数据，裸旧数组回退1.0，元数据被剥离后必须显式传plant标尺。
 12. 约25 dBm的高PAPR输出若分量峰值仍接近2，可按需把输出标尺设为4；这增加观测余量，也会把量化步长扩大一倍。

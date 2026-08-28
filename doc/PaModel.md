@@ -1528,7 +1528,7 @@ flowchart LR
 
 **图 6 说明**：当 $\beta=0$ 时没有镜像；$\lvert\beta\rvert$ 越大，镜像越强。`IQImbalancePA` 把任意基础 PA 的输出包装成这一形式，可测试普通复多项式 DPD 对非解析共轭失真的处理边界；它是归因仿真用的代数包装器，并不声明镜像位于Tx调制器还是FB接收机。需要真实参考面时，应使用Channel的 `txIq...` 参数把误差放在PA前，或使用 `fbIq...` 参数把误差只放在反馈采样支路。
 
-当被包装对象启用电热模型时，`IQImbalancePA` 保持包装器透明：`ProcessThermalPeriodFloating` 先让物理PA按完整周期求温度相关输出，再在输出参考面叠加直接项和共轭项；`SuspendThermalModel`、`RestoreThermalModel`、`GetThermalMetrics`、`CalculateActualDutyCycle`、`ResetThermalState` 和 `AdvanceIdle` 都代理到被包装PA。这样功率校准试探仍能暂停并恢复同一份热状态，Channel也能透过包装器识别热模型、读取metrics和调度占空比。共轭包装器没有独立热容，且输出镜像不会反向改变已经在物理PA输出参考面计算的耗散功率。包装器还实现成对的 `ProcessCalibrationDrive` 与 `SetCalibrationDriveDb`：内部plant支持时分别代理未提交试探和最终提交，否则由包装器保存并施加后备drive；二者必须同时存在，避免试探与正式处理参考面不一致。`ProcessOutputPathsFloating` 再优先调用内部plant同名协议以保留已提交的post-DAC模拟驱动和两条观测路径，然后分别对 `chOut` 与 `fbOut` 应用广义线性I/Q变换；`ProcessFloating` 仍保持不额外应用隐藏驱动的raw语义。
+当被包装对象启用电热模型时，`IQImbalancePA` 保持包装器透明：`ProcessThermalPeriodFloating` 先让物理PA按完整周期求温度相关输出，再在输出参考面叠加直接项和共轭项；`SuspendThermalModel`、`RestoreThermalModel`、`GetThermalMetrics`、`CalculateActualDutyCycle`、`ResetThermalState` 和 `AdvanceIdle` 都代理到被包装PA。这样功率校准试探仍能暂停并恢复同一份热状态，Channel也能透过包装器识别热模型、读取metrics和调度占空比。共轭包装器没有独立热容，且输出镜像不会反向改变已经在物理PA输出参考面计算的耗散功率。包装器还实现成对的 `ProcessCalibrationDrive` 与 `SetCalibrationDriveDb`：内部plant支持时分别代理未提交试探和最终提交，否则由包装器保存并施加后备drive；二者必须同时存在，避免试探与正式处理参考面不一致。`ProcessOutputPathsFloating` 优先调用内部plant同名协议以保留已提交的post-DAC模拟驱动和两条观测路径，然后分别对 `chOut` 与 `fbOut` 应用广义线性I/Q变换；单输出 `ProcessFloating` 也保留该committed drive。只有 `ProcessRawFloating` 绕过包装器和内层PA保存的drive，用于调用方已经施加物理drive的内部参考面。
 
 ---
 
@@ -1726,9 +1726,10 @@ u_m[n]=10^{g_m/20}x_{q,m}[n].
 |---|---|---:|---|
 | `Process` | 公开浮点或定点码，输出仍为公开格式 | 是 | 普通用户、最终重放 |
 | `ProcessOutputPathsFloating` | 已解码归一化浮点，返回 `(chOut, fbOut)` | 是 | `NormalizedPaAdapter` 的浮点ILC内部plant |
-| `ProcessFloating` | raw归一化浮点物理内核 | 否 | 已经管理真实输入标尺的Channel或模型内部调用 |
+| `ProcessFloating` | 已解码归一化浮点，返回单路输出 | 是 | 校准后的单输出浮点重放、自定义DPD评估 |
+| `ProcessRawFloating` | 已带物理drive的浮点PA输入 | 否 | 已经管理真实输入标尺的Channel或模型内部调用 |
 
-定点闭环可能对10、15和20 dBm产生完全相同的公开码；这不是功率点丢失，因为不同的 `analogDriveDbPerChain` 已保存在解码后的post-DAC模拟级。`PaModel.ProcessOutputPathsFloating` 应用单路已提交驱动后只运行一次裸内核，并返回数值相同但存储独立的两份观测；裸PA没有独立反馈接收机。`MimoPaModel.ProcessOutputPathsFloating` 对每列应用各自驱动，再调用一次矩阵raw内核并保持输入的一维/二维形状。`ProcessFloating` 刻意不读取这些驱动，避免Channel在已经显式乘过驱动后重复放大。
+定点闭环可能对1、10和20 dBm产生完全相同的公开码；这不是功率点丢失，因为不同功率点在各自校准时得到不同的 `analogDriveDbPerChain`。一个PA对象只保存最近一次成功提交的drive，因此功率扫描必须在每点校准后立即调用 `ProcessFloating` 重放，或为每个功率点使用独立PA对象；公开码本身不携带功率状态。`PaModel.ProcessOutputPathsFloating` 同样应用单路当前已提交驱动后只运行一次裸内核，并返回数值相同但存储独立的两份观测；裸PA没有独立反馈接收机。`MimoPaModel.ProcessOutputPathsFloating` 对每列应用各自驱动，再调用一次矩阵raw内核并保持输入的一维/二维形状。Channel在自己的公开码解码级已经显式乘过试探或committed drive，因此内部优先调用 `ProcessRawFloating`/`ProcessChainRawFloating`，不会再经过 `ProcessFloating` 重复放大。
 
 ---
 
@@ -1767,7 +1768,7 @@ $\lambda>0$ 可以缓和高阶基函数相关造成的病态问题，但过大�
 
 推荐把精确回归断言写成以 `(-52, -48, -42)` dB为中心的正负1.5 dB窗口，并额外要求相邻功率点至少恶化2 dB、1至20 dBm总变化超过8 dB。功率闭环容差设为0.05 dB时，每点Analysis报告功率可要求距目标不超过0.10 dB。这样既能捕获模型强度或参考面回归，又不会把FFT、同步和平台差异钉死到最后一位小数。
 
-16位结果必须用两个不同标尺：发送参考和DAC输入使用 `FixedPoint(16, 1.0)`，PA输出使用 `FixedPoint(16, paModel.outputFullScaleAmplitude)`，Analysis显式配置同一个 `outputFullScaleAmplitude`。默认输出标尺2.0时，20 dBm高PAPR输出不会碰到每分量正负满码，固定点结果因此与浮点本征结果接近。
+16位结果必须用两个不同标尺：发送参考和DAC输入使用 `FixedPoint(16, 1.0)`，PA输出使用 `FixedPoint(16, paModel.outputFullScaleAmplitude)`。直接PA输出携带FixedPointArray元数据，Analysis会自动读取；显式配置同一个 `outputFullScaleAmplitude` 可固定参考面，并在元数据被剥离后是必需的。默认输出标尺2.0时，20 dBm高PAPR输出不会碰到每分量正负满码，固定点结果因此与浮点本征结果接近。
 
 若沿用旧输出标尺1.0，20 dBm原始输出分量峰值可达约1.60，输出编码会把超出正负1的样点夹到码轨；此时测得约 -24 dB EVM是**输出观测削顶**，不是GMP本征非线性，也不是 `nonlinearScale=0.135` 太强。增加位宽仍不改变正负1范围，继续减小GMP系数则会错误地掩盖参考面问题。正确修复是恢复默认输出标尺2.0，并让PowerCalibration和Analysis按该标尺解码；接近25 dBm的更高PAPR实验若峰值接近2，可按需把PA/Channel输出标尺与分析标尺一起设为4。
 
@@ -1789,6 +1790,7 @@ classDiagram
         +outputFullScaleAmplitude
         +Process(inputSignal)
         +ProcessFloating(inputSignal)
+        +ProcessRawFloating(inputSignal)
         +ProcessOutputPathsFloating(inputSignal)
         +ProcessThermalPeriodFloating(inputSignal, thermalRunMode, thermalDutyCycle, steadyStateToleranceC, maximumSteadyStateIterations)
         +CalculateActualDutyCycle(inputSignal, thermalDutyCycle)
@@ -1855,6 +1857,7 @@ classDiagram
     class IQImbalancePA {
         +Process(inputSignal)
         +ProcessFloating(inputSignal)
+        +ProcessRawFloating(inputSignal)
         +ProcessOutputPathsFloating(inputSignal)
         +ProcessCalibrationDrive(inputSignal, driveDbPerChain)
         +SetCalibrationDriveDb(driveDbPerChain)
@@ -1871,6 +1874,7 @@ classDiagram
         +outputFullScaleAmplitude
         +Process(inputMatrix)
         +ProcessFloating(inputMatrix)
+        +ProcessRawFloating(inputMatrix)
         +ProcessOutputPathsFloating(inputMatrix)
         +ProcessThermalPeriodFloating(inputMatrix, thermalRunMode, thermalDutyCycle, steadyStateToleranceC, maximumSteadyStateIterations)
         +CalculateActualDutyCycle(inputMatrix, thermalDutyCycle)
@@ -1966,7 +1970,7 @@ dohertyOutput = paModel.Process(inputSignal)
 ```
 
 `PaModel` 的公开构造签名为
-`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, piecewiseGmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。定点输入DAC标尺固定为1.0，固定点输出 `outputFullScaleAmplitude` 默认2.0。`Process` 在定点模式下接收I/Q整数码，按输入标尺解码后先应用最近一次成功功率校准提交的模拟驱动，再使用选定电模型计算，最后按输出标尺把结果编码回整数码。未运行功率校准时该驱动为0 dB，所以原有直接调用行为不变。公开返回容器始终是 `numpy.complex128`：
+`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, piecewiseGmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。定点输入DAC标尺固定为1.0，固定点输出 `outputFullScaleAmplitude` 默认2.0。`Process` 在定点模式下接收I/Q整数码，按输入标尺解码后先应用最近一次成功功率校准提交的模拟驱动，再使用选定电模型计算，最后按输出标尺把结果编码回整数码；`ProcessFloating` 对已解码输入应用同一个committed drive并直接返回浮点结果；`ProcessRawFloating` 则要求输入已含物理drive。未运行功率校准时已提交驱动为0 dB，所以原有直接调用行为不变。公开返回容器始终是 `numpy.complex128`：
 
 ```python
 from inc.lib.PaModel import PaModel

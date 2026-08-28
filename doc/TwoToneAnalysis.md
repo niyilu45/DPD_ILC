@@ -270,7 +270,7 @@ TwoToneAnalysis(waveform, parameters=None, width=None, outputFullScaleAmplitude=
 | `activePowerThresholdDb` | `-60.0` | 相对活动段峰值的功率检测门限，低于门限的长补零或空闲不进入模拟功率RMS |
 | `activeGapToleranceSamples` | `16` | 活动区内允许闭合的短过零间隙样点数 |
 | `width` | 省略时自动识别或继承元数据 | 描述 `measuredSignal` 的边界；典型16位整数码可从浮点发送元数据中自动识别，0为浮点，大于0为公开整数I/Q码 |
-| `outputFullScaleAmplitude` | `1.0` | 接收/PA输出整数码轨表示的物理I/Q分量幅度；兼容旧FS1采集，当前PA/Channel默认输出应显式设为2.0 |
+| `outputFullScaleAmplitude` | `1.0` | 接收/PA输出整数码轨表示的物理I/Q分量幅度；工程FixedPointArray自动提供实际FS且显式值优先，裸旧采集兼容回退FS1 |
 
 ## 8. PA输出分析示例
 

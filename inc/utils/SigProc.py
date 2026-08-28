@@ -872,8 +872,12 @@ class PowerCalibration:
                 self._calibrationTargetPowerDbmPerChain = (
                     targetPowers
                 )
-                self._lastCalibratedPaInput = publicTrialInput.copy()
-                self._lastCalibratedPaOutput = publicPaOutput.copy()
+                self._lastCalibratedPaInput = (
+                    interfaceFormat.QuantizeCodes(publicTrialInput)
+                )
+                self._lastCalibratedPaOutput = FixedPoint(
+                    self.width, self.outputFullScaleAmplitude
+                ).QuantizeCodes(publicPaOutput)
                 self._lastMeasuredOutputPowerDbmPerChain = tuple(
                     float(value) for value in measuredPowerArray
                 )
@@ -1143,7 +1147,7 @@ class PowerCalibration:
                     quantizedRmsPerChain
                 )
                 return (
-                    np.asarray(publicTrialInput, dtype=np.complex128),
+                    interfaceFormat.QuantizeCodes(publicTrialInput),
                     np.asarray(analogDriveDb, dtype=float),
                 )
             formatInfo = interfaceFormat.GetFormatInfo()
@@ -1196,7 +1200,7 @@ class PowerCalibration:
                     activeGapToleranceSamples,
                 )
         return (
-            np.asarray(publicTrialInput, dtype=np.complex128),
+            interfaceFormat.QuantizeCodes(publicTrialInput),
             np.asarray(analogDriveDb, dtype=float),
         )
 
@@ -1263,10 +1267,10 @@ class PowerCalibration:
                 publicTrialInput,
                 tuple(float(value) for value in analogDriveDb),
             )
-        publicPaOutput = np.asarray(rawPaOutput, dtype=np.complex128)
         outputFormat = FixedPoint(
             self.width, self.outputFullScaleAmplitude
         )
+        publicPaOutput = outputFormat.QuantizeCodes(rawPaOutput)
         floatingPaOutput = outputFormat.DecodeComplex(
             publicPaOutput
         )
@@ -1298,8 +1302,8 @@ class PowerCalibration:
             dtype=float,
         )
         return (
-            np.asarray(publicTrialInput, dtype=np.complex128),
-            np.asarray(publicPaOutput, dtype=np.complex128),
+            publicTrialInput.copy(),
+            publicPaOutput.copy(),
             measuredPowerArray,
             analogDriveDb,
         )

@@ -1,8 +1,125 @@
 """Represent signed fixed-point I/Q codes in complex NumPy arrays."""
 
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import numpy as np
+
+
+class FixedPointArray(np.ndarray):
+    """Carry public I/Q codes together with their numerical reference plane."""
+
+    def __array_finalize__(self, source: Optional[np.ndarray]) -> None:
+        """Propagate fixed-point metadata to NumPy-derived views.
+
+        Processing details:
+            Algorithm: Copy the private width and full-scale fields from the
+            source view when present. A raw ndarray view without these fields
+            remains unannotated and is ignored by ``GetFixedPointFormat``.
+
+        Args:
+            source: Source array used by NumPy to create the new view.
+
+        Returns:
+            result: None. Metadata is attached to the new array in place.
+        """
+
+        if source is None:
+            return
+        self._fixedPointWidth = getattr(
+            source, "_fixedPointWidth", None
+        )
+        self._fullScaleAmplitude = getattr(
+            source, "_fullScaleAmplitude", None
+        )
+
+    @property
+    def FixedPointWidth(self) -> int:
+        """Return the public I/Q component width carried by this array.
+
+        Returns:
+            result: Zero for floating bypass or the positive code width.
+        """
+
+        return int(self._fixedPointWidth)
+
+    fixedPointWidth = FixedPointWidth
+
+    @property
+    def FullScaleAmplitude(self) -> float:
+        """Return the physical component magnitude represented by code rails.
+
+        Returns:
+            result: Positive full-scale amplitude associated with the codes.
+        """
+
+        return float(self._fullScaleAmplitude)
+
+    fullScaleAmplitude = FullScaleAmplitude
+
+
+def CreateFixedPointArray(
+    inputSignal: np.ndarray,
+    width: int,
+    fullScaleAmplitude: float,
+) -> FixedPointArray:
+    """Create a complex code array with immutable format metadata.
+
+    Processing details:
+        Algorithm: Validate the supplied fixed-point convention, view a
+        complex128 copy as ``FixedPointArray``, and attach the component width
+        and physical code-rail amplitude. NumPy slices and copies retain these
+        fields through ``FixedPointArray.__array_finalize__``.
+
+    Args:
+        inputSignal: Finite public code or floating-bypass samples.
+        width: Nonnegative public I/Q component width.
+        fullScaleAmplitude: Positive physical component code-rail value.
+
+    Returns:
+        result: Metadata-bearing complex128 NumPy array.
+    """
+
+    formatDefinition = FixedPoint(width, fullScaleAmplitude)
+    complexInput = np.asarray(inputSignal, dtype=np.complex128)
+    if not np.all(np.isfinite(complexInput)):
+        raise ValueError("inputSignal contains NaN or infinite values")
+    result = complexInput.copy().view(FixedPointArray)
+    result._fixedPointWidth = formatDefinition.width
+    result._fullScaleAmplitude = formatDefinition.fullScaleAmplitude
+    return result
+
+
+def GetFixedPointFormat(
+    inputSignal: object,
+) -> Optional[Tuple[int, float]]:
+    """Read validated fixed-point metadata from a public signal array.
+
+    Processing details:
+        Algorithm: Recognize only ``FixedPointArray`` instances whose private
+        metadata survived NumPy propagation, revalidate the convention, and
+        return an immutable pair. Plain ndarrays deliberately return ``None``
+        because their physical code scale cannot be inferred from values.
+
+    Args:
+        inputSignal: Candidate public signal object.
+
+    Returns:
+        result: ``(width, fullScaleAmplitude)`` or ``None`` when unannotated.
+    """
+
+    if not isinstance(inputSignal, FixedPointArray):
+        return None
+    rawWidth = getattr(inputSignal, "_fixedPointWidth", None)
+    rawFullScaleAmplitude = getattr(
+        inputSignal, "_fullScaleAmplitude", None
+    )
+    if rawWidth is None or rawFullScaleAmplitude is None:
+        return None
+    formatDefinition = FixedPoint(rawWidth, rawFullScaleAmplitude)
+    return (
+        formatDefinition.width,
+        formatDefinition.fullScaleAmplitude,
+    )
 
 
 class FixedPoint:
@@ -151,7 +268,9 @@ class FixedPoint:
         if not np.all(np.isfinite(complexInput)):
             raise ValueError("inputSignal contains NaN or infinite values")
         if self.IsFloatingPoint():
-            return complexInput.copy()
+            return CreateFixedPointArray(
+                complexInput, self.width, self.fullScaleAmplitude
+            )
         integerScale = float(2 ** (self.width - 1))
         minimumCode = -integerScale
         maximumCode = integerScale - 1.0
@@ -165,8 +284,12 @@ class FixedPoint:
             minimumCode,
             maximumCode,
         )
-        return (realCodes + 1j * imaginaryCodes).astype(
-            np.complex128, copy=False
+        return CreateFixedPointArray(
+            (realCodes + 1j * imaginaryCodes).astype(
+                np.complex128, copy=False
+            ),
+            self.width,
+            self.fullScaleAmplitude,
         )
 
     def EncodeComplex(self, inputSignal: np.ndarray) -> np.ndarray:
@@ -190,7 +313,9 @@ class FixedPoint:
         if not np.all(np.isfinite(complexInput)):
             raise ValueError("inputSignal contains NaN or infinite values")
         if self.IsFloatingPoint():
-            return complexInput.copy()
+            return CreateFixedPointArray(
+                complexInput, self.width, self.fullScaleAmplitude
+            )
         integerScale = float(2 ** (self.width - 1))
         return self.QuantizeCodes(
             complexInput / self.fullScaleAmplitude * integerScale
@@ -214,13 +339,16 @@ class FixedPoint:
 
         quantizedCodes = self.QuantizeCodes(inputSignal)
         if self.IsFloatingPoint():
-            return quantizedCodes
+            return np.asarray(
+                quantizedCodes, dtype=np.complex128
+            ).copy()
         integerScale = float(2 ** (self.width - 1))
-        return (
-            quantizedCodes / integerScale * self.fullScaleAmplitude
-        ).astype(
-            np.complex128, copy=False
+        decodedSignal = (
+            np.asarray(quantizedCodes, dtype=np.complex128)
+            / integerScale
+            * self.fullScaleAmplitude
         )
+        return np.asarray(decodedSignal, dtype=np.complex128)
 
     def QuantizeComplex(self, inputSignal: np.ndarray) -> np.ndarray:
         """Encode physical samples using the historical method name.

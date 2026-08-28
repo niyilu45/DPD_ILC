@@ -466,7 +466,10 @@ CP会使相邻少量采样偏移仍可能得到可判决的FFT结果。Parser找
 ```python
 driveScale = 10.0 ** ((20.0 - 25.0) / 20.0)
 paOutput = paModel.Process(driveScale * transmitWaveform.samples)
-resultAnalysis = Analysis(paOutput)
+resultAnalysis = Analysis(
+    paOutput,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
+)
 metrics = resultAnalysis.Analyze()
 ```
 
@@ -476,6 +479,7 @@ metrics = resultAnalysis.Analyze()
 resultAnalysis = Analysis(
     paOutput,
     transmittedSignal=transmitWaveform,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
 )
 metrics = resultAnalysis.Analyze()
 ```
@@ -723,6 +727,7 @@ receivedSignal = paModel.Process(wifiWaveform.samples)
 resultAnalysis = Analysis(
     receivedSignal,
     transmittedSignal=wifiWaveform,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
 )
 metrics = resultAnalysis.Analyze()
 ```
@@ -735,6 +740,7 @@ metrics = resultAnalysis.Analyze()
 resultAnalysis = Analysis(
     referenceSignal,
     wifiWaveform,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
 )
 metrics = resultAnalysis.Analyze(receivedSignal)
 ```

@@ -1186,7 +1186,7 @@ measuredPowerDbm = (
 )
 ```
 
-`powerCalibration.outputFullScaleAmplitude` 从当前绑定plant读取；因此这个示例既适用于内置默认2.0，也适用于显式配置4.0或兼容第三方1.0。独立Analysis/TwoToneAnalysis不会持有plant，调用时需要显式传入同一个值。
+`powerCalibration.outputFullScaleAmplitude` 从当前绑定plant读取；因此这个示例既适用于内置默认2.0，也适用于显式配置4.0或兼容第三方1.0。直接返回的工程FixedPointArray携带同一标尺，独立Analysis/TwoToneAnalysis可自动读取；若转换成裸ndarray/list或从不保留元数据的外部文件恢复，则需要显式传入同一个值。
 
 若这里的 `paModel` 启用了 `ThermalConfig`，上述 `Calibrate` 会在参考温度电模型上运行全部trial，并在返回或抛出异常之前恢复原来的结温、累计时间和互热状态。把示例中的调用替换为 `CalibrateElectricalOnly` 会因缺少外层事务而直接得到 `RuntimeError`。
 

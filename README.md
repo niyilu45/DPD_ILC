@@ -180,6 +180,7 @@ chOut, fbOut = channel.Process(
     wifiWaveform.samples,
     outputPowerDbm=20.0,
 )
+referenceSignal = channel.GetLastPaInput()
 mimoPaModel = MimoPaModel(
     parameters={"numTransmitChains": 2, "width": 16}
 )
@@ -636,7 +637,7 @@ flowchart TD
 - `IQImbalancePA` 在被包装PA的输出上增加平坦共轭镜像，只是用于增广ILC归因测试的参考面无关代数包装器；真实Tx与FB两处I/Q误差应分别使用Channel的 `txIq...` 与 `fbIq...` 参数。Channel还可用独立的直接/镜像FIR描述IRR随频率变化，不能用这个平坦包装器替代。它透明代理内部PA的周期热处理、暂停/恢复、metrics、实际占空比、复位和额外空闲接口，因此包装热PA后Channel仍能执行相同热调度与校准事务。`AddAwgn` 模拟反馈接收链噪声。
 - `SmallSignalGain` 为复增益归一化和频率响应估计提供线性工作点参考。
 - `PowerCalibration` 使用 $P=V_{\mathrm{RMS}}^2/R$ 在 dBm 与复包络 RMS 电压之间换算；默认端口电阻为 50 Ω。`maximumOutputPowerDbm=25.0` 定义每路PA输出参考面的额定上限，20 dBm目标对应的归一化输出RMS是 $10^{(20-25)/20}\approx0.5623$，这个数不是已经求得的PA输入驱动。绑定plant后，校准器自动读取其 `outputFullScaleAmplitude` 解码固定点输出；第三方或旧plant没有该属性时兼容默认1.0。公开 `Calibrate` 统一执行“热暂停→内部纯电校准→`finally` 恢复”，因此直接绑定热PA也不会让trial发热；`CalibrateElectricalOnly` 只是内部数值内核，事务外直接调用会被 `RuntimeError` 拒绝。闭环反复改变PA前驱动并测量真实输出，不在PA输出端追加常数增益。
-- 定点校准把公开DAC码固定在合法范围和数字余量内，功率点之间剩余的差值保存在解码后的隐藏模拟驱动中；因此10、15和20 dBm完全可以使用相同公开码而由不同 `analogDriveDbPerChain` 得到不同物理输出。`NormalizedPaAdapter` 对Channel先使用 `ProcessNormalizedOutputPaths`，使稳态热模式按公共语义为每个ILC候选复校功率；普通PA、MIMO和I/Q包装器则由 `ProcessOutputPathsFloating` 应用已提交驱动并返回浮点 `(chOut, fbOut)`。`ProcessFloating` 始终是raw、drive-free物理内核，供已经拥有输入物理标尺的Channel等调用方使用。
+- 定点校准把公开DAC码固定在合法范围和数字余量内，功率点之间剩余的差值保存在解码后的隐藏模拟驱动中；因此10、15和20 dBm完全可以使用相同公开码而由不同 `analogDriveDbPerChain` 得到不同物理输出。`NormalizedPaAdapter` 对Channel先使用 `ProcessNormalizedOutputPaths`，使稳态热模式按公共语义为每个ILC候选复校功率；普通PA、MIMO和I/Q包装器则由 `ProcessOutputPathsFloating` 应用已提交驱动并返回浮点 `(chOut, fbOut)`。公开 `ProcessFloating` 同样应用当前已提交驱动，是不经过整数码转换的单输出重放入口；每个目标校准后立即重放，或为各目标使用独立PA对象时，会正确保持相应工作点。一个PA对象只保存最近一次成功校准的drive。只有显式的 `ProcessRawFloating` 是drive-free物理内核，供已经施加实际输入标尺的Channel和模型内部调用，避免模拟驱动重复放大。
 - `MimoPaModel` 不在链间引入隐含电信号耦合：每一列进入独立 `PaModel`，可另配互热矩阵。周期热处理以全部PA为一个原子事务；任何后续链失败或互热不收敛都会恢复全部链的热状态、累计时间和旧metrics。运行中把 `thermalCouplingCPerW` 改为全零矩阵时，下一个成功周期清除旧互热offset，失败则仍回滚。`ProcessChain` 是单路 ILC 看到的真实 plant；相对 dB 与绝对 dBm 功率设置均在该路径中生效。
 
 ### `inc/lib/Channel.py`
@@ -1273,7 +1274,7 @@ A_{\mathrm{target}}
 10^{(P_{\mathrm{target}}-P_{\max})/20}.
 ```
 
-例如 `maximumOutputPowerDbm=25.0`、`outputPowerDbm=20.0` 时，$A_{\mathrm{target}}\approx0.5623$。它是功率检测器期望看到的PA输出RMS，并不是应该直接乘到发送波形上的PA输入驱动。PA增益、压缩和记忆都会改变输入输出关系，所以实际输入只能由闭环测量反求。请求目标不得超过额定上限；内置PA与Channel的解码后模拟驱动路径保证低于该上限的目标不会仅因公开定点码满量程而被误判为不可达。定点模式可在多个功率点复用同一组保留余量的公开码，实际功率差由收敛后提交的post-DAC `analogDriveDbPerChain` 保存；ILC内部通过plant的 `ProcessOutputPathsFloating` 继续应用该驱动，而raw `ProcessFloating` 不会隐式应用它。
+例如 `maximumOutputPowerDbm=25.0`、`outputPowerDbm=20.0` 时，$A_{\mathrm{target}}\approx0.5623$。它是功率检测器期望看到的PA输出RMS，并不是应该直接乘到发送波形上的PA输入驱动。PA增益、压缩和记忆都会改变输入输出关系，所以实际输入只能由闭环测量反求。请求目标不得超过额定上限；内置PA与Channel的解码后模拟驱动路径保证低于该上限的目标不会仅因公开定点码满量程而被误判为不可达。定点模式可在多个功率点复用同一组保留余量的公开码，实际功率差由收敛后提交的post-DAC `analogDriveDbPerChain` 保存；ILC内部通过plant的 `ProcessOutputPathsFloating` 继续应用该驱动，单输出浮点重放可直接使用同样保留驱动的 `ProcessFloating`。只有Channel已经显式施加drive后才调用 `ProcessRawFloating`。
 
 校准器还会从绑定plant读取 `outputFullScaleAmplitude`，并用 `FixedPoint(width, plant.outputFullScaleAmplitude)` 解码每轮固定点PA输出；没有该属性的第三方plant兼容默认1.0。输入DAC格式仍固定为 `fullScaleAmplitude=1.0`。因此内置PA或Channel默认输出标尺2.0不会被误读成单位满量程，功率闭环也不需要调用方重复配置标尺。
 
@@ -1857,7 +1858,7 @@ measurementChOut, filteredFbOut = channel.Process(
 
 发送参考可以包含帧外前后补零，也可以长于实际PA输入或接收捕获。Parser不会把发送长度大于接收长度视为错误，而是在公共有效区间内估计有符号时延。若裁剪删除的只是帧外补零，性能指标保持不变；若裁剪切入OFDM帧内部，缺失样点无法恢复并会反映到EVM中。
 
-当接收数组是 `PaModel.Process(...)` 的输出时，Parser会分别用每个描述OFDM符号的已知导频估计复增益，撤销跨符号交织，再对90 bit短块LDPC码字执行软输入归一化min-sum译码。因此典型20 dBm输出下的Rapp、Wiener、GMP、分段GMP和Doherty输出可以直接使用 `Analysis(paOutput).Analyze()`。Parser仍可读取旧版magic加CRC描述。若PA已进入严重饱和、描述字段相关度低于门限，任何无参考解析都不能可靠恢复随机种子；此时应使用 `Analysis(paOutput, transmittedSignal=transmitSamples)`，其中 `transmitSamples` 可以是原始NumPy发送数组或 `WifiWaveform`。
+当接收数组是 `PaModel.Process(...)` 的直接输出时，Parser会分别用每个描述OFDM符号的已知导频估计复增益，撤销跨符号交织，再对90 bit短块LDPC码字执行软输入归一化min-sum译码。因此典型20 dBm输出下的Rapp、Wiener、GMP、分段GMP和Doherty输出可以直接使用 `Analysis(paOutput).Analyze()`；工程公开固定点数组携带位宽与FS1/FS2/FS4元数据，Analysis会自动按PA输出标尺解码。显式 `outputFullScaleAmplitude=paModel.outputFullScaleAmplitude` 仍可用于固定参考面并具有最高优先级。Parser仍可读取旧版magic加CRC描述。若PA已进入严重饱和、描述字段相关度低于门限，任何无参考解析都不能可靠恢复随机种子；此时应使用 `Analysis(paOutput, transmittedSignal=transmitSamples)`，其中 `transmitSamples` 可以是原始NumPy发送数组或 `WifiWaveform`。`np.asarray`、保存为普通 `.npy` 后重载或 `.tolist()` 会丢失数组元数据；这类裸整数码仍兼容默认FS1，分析内置PA/Channel的FS2输出时必须显式传标尺，否则模拟功率会低6.02 dB。
 
 后一种发送辅助调用不会把 `transmitSamples` 交给Parser。Analysis直接对发送与接收样值做互相关并将公共区间作为Reference，因此Descriptor、seed、MCS、GI和重生成步骤全部被绕过。
 
@@ -1906,7 +1907,7 @@ print(assistedMetrics["evmDb"])
 | --- | --- | --- |
 | `parameters` | `None` | 外部 `Mapping` 覆盖层；未提供的键使用 `Analysis` 构造函数内部默认值。 |
 | `width` | `16` | 参考和接收波形的I/Q接口位宽；`0`为浮点，正数输入整数码，解码后用 `complex128` 浮点值做同步和指标计算。 |
-| `outputFullScaleAmplitude` | `1.0` | 待测固定点接收波形的scaled full-scale分量标尺；兼容外部仪表和旧数组而默认1.0。分析PA、MIMO PA或Channel输出时显式传 `plant.outputFullScaleAmplitude`。 |
+| `outputFullScaleAmplitude` | `1.0` | 待测固定点接收波形的scaled full-scale分量标尺；显式配置优先。工程 `FixedPointArray` 自动携带实际FS，裸外部仪表和旧ndarray兼容回退1.0。 |
 | `maxSegmentLength` | `16384` | Welch PSD 的最大分段长度，必须是不小于 16 的整数。 |
 | `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
 | `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
@@ -2289,6 +2290,7 @@ paModel = PaModel(parameters=paOverrides)
 analysisOverrides = {
     "maxSegmentLength": 8192,
     "powerEvmFileStem": "eht_mcs11_power_evm",
+    "outputFullScaleAmplitude": paModel.outputFullScaleAmplitude,
 }
 resultAnalysis = Analysis(
     0.24 * secondWaveform.samples,
@@ -2429,7 +2431,11 @@ chOut, fbOut = channel.Process(
 )
 referenceSignal = channel.GetLastPaInput()  # Digital target before Tx I/Q.
 
-resultAnalysis = Analysis(referenceSignal, waveform)
+resultAnalysis = Analysis(
+    referenceSignal,
+    waveform,
+    outputFullScaleAmplitude=channel.outputFullScaleAmplitude,
+)
 resultAnalysis.AnalyzeStages({"MIMO PA + Channel": chOut})
 resultAnalysis.Print()
 resultAnalysis.PrintMimo()
@@ -2459,6 +2465,7 @@ paOutput = paModel.Process(referenceSignal)
 resultAnalysis = Analysis(
     referenceSignal,
     waveform,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
     signalProcessingParameters={
         "maxIntegerDelaySamples": 256,
         "maxSamplingFrequencyOffsetPpm": 100.0,
@@ -2540,7 +2547,12 @@ powerCalibration = PowerCalibration(
 )
 referenceSignal = powerCalibration.Calibrate(waveform.samples)
 baselineOutput = powerCalibration.GetLastPaOutput()
-resultAnalysis = Analysis(referenceSignal, waveform)
+resultAnalysis = Analysis(
+    referenceSignal,
+    waveform,
+    width=16,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
+)
 
 ilcConfig = ILCConfig(
     numIterations=10,
@@ -2774,7 +2786,7 @@ TwoToneAnalysis(waveform, parameters=None, width=None, outputFullScaleAmplitude=
 | `activePowerThresholdDb` | `-60.0` | 相对峰值的活动功率门限；排除长补零和占空比空闲 |
 | `activeGapToleranceSamples` | `16` | 活动区中仍并入功率RMS的短过零间隙长度 |
 | `width` | 省略时自动识别或继承元数据 | 描述被测 `measuredSignal`；典型16位整数码可从浮点发送元数据中自动识别，也可显式设为与发送波形不同的接收位宽 |
-| `outputFullScaleAmplitude` | `1.0` | 被测固定点输出码的scaled full-scale分量标尺；兼容旧数组而默认1.0。分析PA输出时显式传 `paModel.outputFullScaleAmplitude`。 |
+| `outputFullScaleAmplitude` | `1.0` | 被测固定点输出码的scaled full-scale分量标尺；显式配置优先，工程固定点输出自动读取数组元数据，裸旧数组兼容回退1.0。 |
 
 `Analyze(measuredSignal)` 返回普通字典，主要键为：
 
@@ -2789,7 +2801,7 @@ TwoToneAnalysis(waveform, parameters=None, width=None, outputFullScaleAmplitude=
 
 上层程序也可以通过 `Analysis.AnalyzeTwoTone(...)` 一次取得全部指标，或通过 `Analysis.CalculateIm3(...)`、`Analysis.CalculateIm5(...)`、`Analysis.CalculateIm7(...)` 分别取得单阶结果。三个单阶结果同样包含 `outputPowerDbm`，并额外包含 `lowerFrequencyHz`、`upperFrequencyHz`、`lowerProductDbfs` 和 `upperProductDbfs`，便于在同一个实际输出功率参考面比较不等功率双音的相对抑制度与绝对干扰电平。
 
-原始NumPy/list调用省略 `width` 时会自动检查I/Q码形态：全部分量均为整数且至少一个分量绝对值大于1时识别为工程默认16位，其他记录按浮点处理；显式配置始终优先，非默认定点位宽必须给出。16位码的分析入口按 $Fq/2^{15}$ 解码，再计算活动样点RMS；兼容默认 $F=1$ 时即为除以32768。若错误地把码值直接当成归一化浮点或伏特，功率会虚增 $20\log_{10}(32768)\approx90.31$ dB，约20 dBm的正常输出可能被错误显示为110 dBm以上；若把默认 $F=2$ 的PA输出误按 $F=1$ 解码，功率还会低报6.02 dB。`outputPowerDbm` 测量传入波形所在参考面，不会复制PA输入功率或闭环目标值；完整参考面与公式见[双音IM分析文档第5节](doc/TwoToneAnalysis.md#5-模拟输出功率参考面和定点换算)。
+原始NumPy/list调用省略 `width` 时会自动检查I/Q码形态：全部分量均为整数且至少一个分量绝对值大于1时识别为工程默认16位，其他记录按浮点处理；显式配置始终优先，非默认定点位宽必须给出。工程 `FixedPointArray` 还会自动提供FS1/FS2/FS4；裸NumPy/list则回退兼容FS1。16位码的分析入口按 $Fq/2^{15}$ 解码，再计算活动样点RMS。若错误地把码值直接当成归一化浮点或伏特，功率会虚增 $20\log_{10}(32768)\approx90.31$ dB，约20 dBm的正常输出可能被错误显示为110 dBm以上；若元数据被剥离后又把默认 $F=2$ 的PA输出误按 $F=1$ 解码，功率还会低报6.02 dB。`outputPowerDbm` 测量传入波形所在参考面，不会复制PA输入功率或闭环目标值；完整参考面与公式见[双音IM分析文档第5节](doc/TwoToneAnalysis.md#5-模拟输出功率参考面和定点换算)。
 
 该自动识别同时适用于raw模式和 `TwoToneWaveform.width=0` 的元数据模式，因此“浮点发送参考 + 典型16位仪表码”省略接收位宽时也不会再产生约90.31 dB的功率尺度错误。若发送元数据已经声明非零位宽，则省略时继承该位宽；低幅整数码、整数值浮点信号以及8、12、24位等非默认格式仍应显式配置，以消除数值形态歧义。
 

@@ -3340,7 +3340,7 @@ x-S(fbOut_k),
 
 但工程中还存在两个会制造假反转的软件参考面问题，本轮已明确处理：
 
-1. 定点 `PowerCalibration` 为了保留数字余量，可以让不同功率点使用相同公开DAC码，实际功率差保存在解码后的隐藏post-DAC `analogDriveDbPerChain`。`NormalizedPaAdapter` 对普通PA必须通过 `ProcessOutputPathsFloating` 在浮点ILC内部继续应用该已提交驱动；对稳态热Channel则先调用 `ProcessNormalizedOutputPaths`，按公共语义为每个候选复校目标功率。raw `ProcessFloating` 本来就是drive-free，不能单独拿来代表校准后的plant。
+1. 定点 `PowerCalibration` 为了保留数字余量，可以让不同功率点使用相同公开DAC码，实际功率差保存在解码后的隐藏post-DAC `analogDriveDbPerChain`。`NormalizedPaAdapter` 对普通PA通过 `ProcessOutputPathsFloating` 在浮点ILC内部继续应用该已提交驱动；对稳态热Channel则先调用 `ProcessNormalizedOutputPaths`，按公共语义为每个候选复校目标功率。校准后的单输出重放也可以直接调用公开 `ProcessFloating`，它会保留当前最近一次成功校准提交的drive；扫描1、10和20 dBm时应在每点校准后立即重放，或为各点使用独立PA对象。只有 `ProcessRawFloating` 是明确的drive-free参考面，供已经施加物理drive的Channel内部使用。
 2. `ILCResult.learnedInput` 由训练用 `fbOut` 的LC-NMSE选择，不保证是前向主路EVM最佳轮。主程序的 `EvaluateIlcPowerPoint` 现在为每个功率点对全部历史 `chOut` 调用 `CalculateEvm`，按严格Wi-Fi EVM最小值选择对应输入，再重放到PA生成曲线样点。
 
 诊断顺序如下：

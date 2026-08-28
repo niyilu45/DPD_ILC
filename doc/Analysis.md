@@ -210,6 +210,8 @@ receivedSignal = np.load(
 resultAnalysis = Analysis(
     receivedSignal,
     parseParameters={"sampleRateHz": 80.0e6},
+    # Match the physical full scale used when this capture was encoded.
+    outputFullScaleAmplitude=2.0,
 )
 metrics = resultAnalysis.Analyze()
 
@@ -449,7 +451,7 @@ P_{m,\mathrm{dBm}}
 P_{\mathrm{max,dBm}}+20\log_{10}(a_m).
 ```
 
-默认值是 $R=50\ \Omega$、$P_{\mathrm{max,dBm}}=25\ \mathrm{dBm}$、`activePowerThresholdDb=-60.0`、`activeGapToleranceSamples=16`。定点Reference/DAC码始终按 `FixedPoint(width, 1.0)` 解码；定点待测输出则按 `FixedPoint(width, outputFullScaleAmplitude)` 解码，再使用同一功率公式。`Analysis` 为兼容外部仪表和旧数组默认 `outputFullScaleAmplitude=1.0`，无法只从裸整数码推断plant标尺；分析内置 `PaModel`、`MimoPaModel` 或 `Channel` 输出时必须显式传 `plant.outputFullScaleAmplitude`，其默认值为2.0。若外部系统使用不同的额定功率锚点，还必须通过 `maximumOutputPowerDbm` 传入实际标定值；它不是由EVM或复增益自动猜测出来的。完整有效区检测与任意幅度重标定推导见 [SigProc.md](./SigProc.md#131-有效信号区间与占空比)。
+默认值是 $R=50\ \Omega$、$P_{\mathrm{max,dBm}}=25\ \mathrm{dBm}$、`activePowerThresholdDb=-60.0`、`activeGapToleranceSamples=16`。定点Reference/DAC码始终按 `FixedPoint(width, 1.0)` 解码；定点待测输出则按 `FixedPoint(width, outputFullScaleAmplitude)` 解码，再使用同一功率公式。内置 `PaModel`、`MimoPaModel`、`Channel`、WaveGen和DPD公开输出是携带位宽与full-scale元数据的 `FixedPointArray`；未显式配置输出标尺时，Analysis会在任何 `np.asarray` 转换前读取该元数据，因此FS2/FS4不会被误按FS1。显式 `outputFullScaleAmplitude` 始终优先。裸整数ndarray无法从码值推断物理标尺，继续兼容回退1.0；分析被剥离元数据的内置输出时必须显式传 `plant.outputFullScaleAmplitude`。若外部系统使用不同的额定功率锚点，还必须通过 `maximumOutputPowerDbm` 传入实际标定值；它不是由EVM或复增益自动猜测出来的。完整有效区检测与任意幅度重标定推导见 [SigProc.md](./SigProc.md#131-有效信号区间与占空比)。
 
 输出scaled full-scale标尺与dBm锚点是两个独立量。默认输出标尺2.0表示正满码附近代表I或Q分量幅度2，提供6.02 dB观测余量；`maximumOutputPowerDbm=25` 仍表示**解码后有效区RMS等于1**对应25 dBm。扩大输出标尺不会改变PA工作点，只会扩大观测范围并同比增大量化步长。
 
@@ -1526,7 +1528,7 @@ A_{i,\mathrm{target}}
 10^{(p_i-p_{\max})/20}.
 ```
 
-浮点模式把每轮试探输入直接送入方法求值器。定点模式先按输入DAC标尺1.0生成保留数字余量的合法整数I/Q码，再把闭环剩余功率差保存在解码后的隐藏post-DAC模拟驱动中；PA输出使用相同位宽但独立的plant `outputFullScaleAmplitude` 解码后测功率，量化和削顶由此真实影响闭环与EVM。多个目标功率点的公开码可以完全相同，物理工作点由不同的 `analogDriveDbPerChain` 区分。收敛驱动会提交到plant；ILC的 `NormalizedPaAdapter` 对Channel先使用 `ProcessNormalizedOutputPaths` 保持稳态热公共校准语义，对普通PA则调用 `ProcessOutputPathsFloating` 应用该驱动。raw `ProcessFloating` 不应用隐藏驱动，避免已经管理物理输入标尺的Channel重复增益。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
+浮点模式把每轮试探输入直接送入方法求值器。定点模式先按输入DAC标尺1.0生成保留数字余量的合法整数I/Q码，再把闭环剩余功率差保存在解码后的隐藏post-DAC模拟驱动中；PA输出使用相同位宽但独立的plant `outputFullScaleAmplitude` 解码后测功率，量化和削顶由此真实影响闭环与EVM。多个目标功率点的公开码可以完全相同，物理工作点由不同的 `analogDriveDbPerChain` 区分。收敛驱动会提交到plant；ILC的 `NormalizedPaAdapter` 对Channel先使用 `ProcessNormalizedOutputPaths` 保持稳态热公共校准语义，对普通PA则调用 `ProcessOutputPathsFloating` 应用该驱动。公开 `ProcessFloating` 也应用隐藏驱动，适合校准后的单输出浮点重放；Channel在自己已经施加drive的内部参考面优先调用 `ProcessRawFloating`，避免重复增益。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
 
 `outputPowerDbmValues` 必须有限且严格递增，每一点都不得超过 `maximumOutputPowerDbm`。结果对象保留的 `driveScaleValues` 只是由额定极限计算的名义初始试探比例，不是闭环最终隐藏预设；`targetOutputRmsValues` 用于审计50 Ω物理输出标定。
 
@@ -1807,7 +1809,7 @@ ILC 每轮收敛结果另外输出：
 `Analysis` 是独立的测量与结果统计类，不要求使用任何ILC算法。只要能够得到参考波形和待测波形，或者接收波形包含本工程可解析的Wi-Fi描述字段，就可以直接计算指标。下面所有示例都不导入 `DpdIlc`；表中的逐轮历史接口只是兼容迭代算法输出的可选扩展，不是使用Analysis的前提。
 
 公开构造签名为
-`Analysis(referenceSignal=None, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。其中 `outputFullScaleAmplitude` 只描述待测输出码，默认1.0；Reference/DAC码仍使用标尺1.0。
+`Analysis(referenceSignal=None, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。其中 `outputFullScaleAmplitude` 只描述待测输出码；工程 `FixedPointArray` 自动提供实际标尺，显式值优先，裸ndarray兼容回退1.0；Reference/DAC码仍使用标尺1.0。
 
 | 计算步骤 | 方法 |
 |---|---|
@@ -2174,7 +2176,7 @@ $Fq/2^{15}$ 解码；兼容默认 $F=1$ 时即为除以32768。若把码值直�
 样点数继续来自发送元数据，不会因为接收量化格式不同而改变。
 
 `Analysis.AnalyzeTwoTone` 的 `parameters` 和底层
-`TwoToneAnalysis(waveform, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)` 都接受相同输出标尺。它们为兼容旧仪表码默认1.0；分析固定点PA输出时应显式使用 `paModel.outputFullScaleAmplitude`。
+`TwoToneAnalysis(waveform, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)` 都接受相同输出标尺。工程固定点输出自动读取数组元数据，显式值优先；旧仪表裸码兼容回退1.0，已丢元数据的PA输出应显式使用 `paModel.outputFullScaleAmplitude`。
 
 ### 11.5 多个测试阶段的横向比较与保存
 
@@ -2413,6 +2415,8 @@ from inc.lib.Analysis import Analysis
 
 analysisOverrides = {
     "maxSegmentLength": 8192,
+    # Match the PA/Channel output code scale used by paOutput.
+    "outputFullScaleAmplitude": 2.0,
 }
 resultAnalysis = Analysis(
     referenceSignal,
@@ -2476,6 +2480,7 @@ Analysis(
     sampleRateHz=None,
     channelBandwidthHz=None,
     width=None,
+    outputFullScaleAmplitude=None,
     **parameterOverrides,
 )
 ```

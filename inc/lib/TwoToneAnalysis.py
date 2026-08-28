@@ -18,14 +18,14 @@ if __package__ and "." in __package__:
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
-    from ..utils.FixedPoint import FixedPoint
+    from ..utils.FixedPoint import FixedPoint, GetFixedPointFormat
     from ..utils.SigProc import PowerCalibration
 else:
     from utils.ConfigUtils import (
         FilterRecognizedParameters,
         RecognizedParameterView,
     )
-    from utils.FixedPoint import FixedPoint
+    from utils.FixedPoint import FixedPoint, GetFixedPointFormat
     from utils.SigProc import PowerCalibration
 
 
@@ -208,6 +208,35 @@ class TwoToneAnalysis:
         )
 
     outputFullScaleAmplitude = OutputFullScaleAmplitude
+
+    def ResolveMeasuredOutputFullScaleAmplitude(
+        self, measuredSignal: object
+    ) -> float:
+        """Resolve the physical code scale for one measured signal.
+
+        Processing details:
+            Algorithm: Preserve an explicitly configured output scale. When
+            the ChainMap contains only the compatibility default, read the
+            validated scale metadata carried by project fixed-point outputs;
+            plain ndarrays continue to use FS1.
+
+        Args:
+            measuredSignal: Candidate PA, Channel, or external two-tone array.
+
+        Returns:
+            result: Positive physical component full-scale amplitude.
+        """
+
+        outputScaleWasExplicitlyConfigured = any(
+            "outputFullScaleAmplitude" in parameterLayer
+            for parameterLayer in self.parameters.maps[:-1]
+        )
+        if outputScaleWasExplicitlyConfigured:
+            return self.outputFullScaleAmplitude
+        formatMetadata = GetFixedPointFormat(measuredSignal)
+        if formatMetadata is None or formatMetadata[0] == 0:
+            return self.outputFullScaleAmplitude
+        return float(formatMetadata[1])
 
     def GetParameters(self) -> Dict[str, object]:
         """Return a flattened snapshot of all resolved analysis parameters.
@@ -424,6 +453,9 @@ class TwoToneAnalysis:
             result: Average steady-state PA output power in dBm.
         """
 
+        resolvedOutputFullScaleAmplitude = (
+            self.ResolveMeasuredOutputFullScaleAmplitude(inputSignal)
+        )
         publicSignal = np.asarray(
             inputSignal, dtype=np.complex128
         ).reshape(-1)
@@ -460,7 +492,7 @@ class TwoToneAnalysis:
                 # normalized amplitudes and adding about 90.31 dB to power.
                 resolvedWidth = 16
         decodedSignal = FixedPoint(
-            resolvedWidth, self.outputFullScaleAmplitude
+            resolvedWidth, resolvedOutputFullScaleAmplitude
         ).DecodeComplex(
             publicSignal
         ).reshape(-1)
@@ -508,6 +540,9 @@ class TwoToneAnalysis:
         """
 
         self.ValidateParameters()
+        resolvedOutputFullScaleAmplitude = (
+            self.ResolveMeasuredOutputFullScaleAmplitude(measuredSignal)
+        )
         publicSignal = np.asarray(
             measuredSignal, dtype=np.complex128
         ).reshape(-1)
@@ -540,11 +575,13 @@ class TwoToneAnalysis:
             if integerCodeShape and exceedsNormalizedRange:
                 resolvedWidth = 16
         decodedSignal = FixedPoint(
-            resolvedWidth, self.outputFullScaleAmplitude
+            resolvedWidth, resolvedOutputFullScaleAmplitude
         ).DecodeComplex(
             publicSignal
         ).reshape(-1)
-        decodedSignal = decodedSignal / self.outputFullScaleAmplitude
+        decodedSignal = (
+            decodedSignal / resolvedOutputFullScaleAmplitude
+        )
         if (
             decodedSignal.size != self.waveform.numSamples
             or not np.all(np.isfinite(decodedSignal))
@@ -685,12 +722,18 @@ class TwoToneAnalysis:
         return TwoToneILCAnalysisResult(
             history=tuple(analyzedHistory),
             bestIteration=int(bestRecord.iteration),
-            bestInputSignal=np.asarray(
-                bestRecord.inputSignal, dtype=np.complex128
-            ).copy(),
-            bestOutputSignal=np.asarray(
-                bestRecord.outputSignal, dtype=np.complex128
-            ).copy(),
+            bestInputSignal=np.array(
+                bestRecord.inputSignal,
+                dtype=np.complex128,
+                copy=True,
+                subok=True,
+            ),
+            bestOutputSignal=np.array(
+                bestRecord.outputSignal,
+                dtype=np.complex128,
+                copy=True,
+                subok=True,
+            ),
             bestMetrics=analyzedHistory[bestIndex].metrics,
         )
 

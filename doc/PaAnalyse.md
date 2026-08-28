@@ -474,7 +474,7 @@ flowchart TD
 
 普通 `GMPPA` 的默认非线性强度为 `nonlinearScale=0.135`：一阶小信号与记忆底保持不变，三阶及以上稳态目标只使用完整参考拟合的13.5%。`nonlinearScale=1.0` 是显式选择的 full-reference 压力模型，只应用于需要强压缩的受控场景；它不是普通GMP的生产默认值，引用其旧曲线时必须同时标明该覆盖参数。
 
-定点测试还要区分数字输入和PA观测量程。WaveGen/DPD/DAC输入默认 `fullScaleAmplitude=1.0`（FS1），`PaModel` 与 `Channel` 的输出默认 `outputFullScaleAmplitude=2.0`（FS2，约6.02 dB观测余量）。`Analysis` 与 `TwoToneAnalysis` 必须使用与被测PA/Channel输出完全相同的 `outputFullScaleAmplitude`，否则功率和波形幅度会被解码到错误标尺。接近25 dBm且高PAPR峰值仍可能触及FS2时，可把PA、Channel和分析器统一设为FS4；不能只扩大分析器量程，也不能把DAC输入一并误改为FS4。
+定点测试还要区分数字输入和PA观测量程。WaveGen/DPD/DAC输入默认 `fullScaleAmplitude=1.0`（FS1），`PaModel` 与 `Channel` 的输出默认 `outputFullScaleAmplitude=2.0`（FS2，约6.02 dB观测余量）。`Analysis` 与 `TwoToneAnalysis` 必须使用与被测PA/Channel输出完全相同的标尺；直接工程FixedPointArray会自动传递，显式值优先，裸数组则需手工配置。否则功率和波形幅度会被解码到错误标尺。接近25 dBm且高PAPR峰值仍可能触及FS2时，可把PA、Channel和分析器统一设为FS4；不能只扩大分析器量程，也不能把DAC输入一并误改为FS4。
 
 ---
 

@@ -10,6 +10,7 @@ import runpy
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from typing import Sequence
 from unittest.mock import patch
 import warnings
 
@@ -65,7 +66,11 @@ from inc.lib.Fec import (
     EncodeDescriptorLdpc,
 )
 from inc.utils.Draw import Draw
-from inc.utils.FixedPoint import FixedPoint
+from inc.utils.FixedPoint import (
+    FixedPoint,
+    FixedPointArray,
+    GetFixedPointFormat,
+)
 from inc.lib.PaModel import (
     DefaultGmpCoefficients,
     DohertyConfig,
@@ -3112,7 +3117,7 @@ def CheckIlcPowerOperatingPoints() -> None:
     """Verify that fixed-point ILC preserves calibrated power semantics.
 
     Processing details:
-        Algorithm: Calibrate one common legal 16-bit Wi-Fi waveform to three
+        Algorithm: Calibrate one common legal 16-bit Wi-Fi waveform to four
         conducted powers through hidden post-DAC drive, run a short clean ILC
         at every operating point, require every stored chOut to remain at its
         own power, and select the strict chOut-EVM best round. Repeat the
@@ -3134,10 +3139,11 @@ def CheckIlcPowerOperatingPoints() -> None:
         seed=91,
         width=16,
     ).Generate()
-    targetPowerDbmValues = (1.0, 16.0, 20.0)
+    targetPowerDbmValues = (1.0, 10.0, 16.0, 20.0)
     publicReferences = []
     analogDriveDbValues = []
     fixedBaselineEvmDbValues = []
+    rawFloatingOutputs = []
 
     for targetPowerDbm in targetPowerDbmValues:
         paModel = PaModel(modelName="gmp", width=16)
@@ -3179,6 +3185,74 @@ def CheckIlcPowerOperatingPoints() -> None:
         assert abs(
             baselineMetrics["outputPowerDbm"] - targetPowerDbm
         ) <= 0.10
+        automaticScaleAnalysis = Analysis(
+            referenceSignal,
+            waveform,
+            parameters={
+                "maximumOutputPowerDbm": 25.0,
+                "width": 16,
+            },
+        )
+        automaticScaleMetrics = automaticScaleAnalysis.Analyze(
+            baselinePaOutput
+        )
+        assert abs(
+            automaticScaleMetrics["outputPowerDbm"] - targetPowerDbm
+        ) <= 0.10
+        if targetPowerDbm == 20.0:
+            blindAutomaticScaleMetrics = Analysis(
+                baselinePaOutput
+            ).Analyze()
+            assert abs(
+                blindAutomaticScaleMetrics["outputPowerDbm"]
+                - targetPowerDbm
+            ) <= 0.10
+            explicitLegacyScaleMetrics = Analysis(
+                referenceSignal,
+                waveform,
+                parameters={
+                    "maximumOutputPowerDbm": 25.0,
+                    "width": 16,
+                    "outputFullScaleAmplitude": 1.0,
+                },
+            ).Analyze(baselinePaOutput)
+            assert np.isclose(
+                explicitLegacyScaleMetrics["outputPowerDbm"],
+                baselineMetrics["outputPowerDbm"]
+                - 20.0 * np.log10(2.0),
+                atol=0.01,
+            )
+
+        # Public floating processing must retain the hidden post-DAC drive just
+        # like public fixed processing. The explicit raw kernel is reserved for
+        # calibration/Channel code that has already applied that drive.
+        inputFormat = FixedPoint(16)
+        outputFormat = FixedPoint(
+            16, paModel.outputFullScaleAmplitude
+        )
+        normalizedReference = inputFormat.DecodeComplex(referenceSignal)
+        floatingPaOutput = paModel.ProcessFloating(normalizedReference)
+        rawFloatingOutputs.append(
+            paModel.ProcessRawFloating(normalizedReference)
+        )
+        encodedFloatingPaOutput = outputFormat.EncodeComplex(
+            floatingPaOutput
+        )
+        assert np.array_equal(encodedFloatingPaOutput, baselinePaOutput)
+        assert np.array_equal(
+            encodedFloatingPaOutput,
+            paModel.Process(referenceSignal),
+        )
+        floatingMetrics = resultAnalysis.Analyze(encodedFloatingPaOutput)
+        assert abs(
+            floatingMetrics["outputPowerDbm"] - targetPowerDbm
+        ) <= 0.10
+        assert np.isclose(
+            floatingMetrics["evmDb"],
+            baselineMetrics["evmDb"],
+            rtol=0.0,
+            atol=1.0e-12,
+        )
         if targetPowerDbm == 20.0:
             baselineFormatInfo = FixedPoint(
                 16, paModel.outputFullScaleAmplitude
@@ -3259,18 +3333,22 @@ def CheckIlcPowerOperatingPoints() -> None:
                 >= float(formatInfo["maximumCode"])
             )
 
-    # With fixed-point digital headroom, all three conducted powers use the
+    # With fixed-point digital headroom, all four conducted powers use the
     # same legal DAC codes. Their distinct physical operating points reside in
     # the committed post-decode analog drive and must survive ILC adaptation.
     assert all(
         np.array_equal(publicReferences[0], publicReference)
         for publicReference in publicReferences[1:]
     )
+    assert all(
+        np.array_equal(rawFloatingOutputs[0], rawFloatingOutput)
+        for rawFloatingOutput in rawFloatingOutputs[1:]
+    )
     assert np.all(np.diff(np.asarray(analogDriveDbValues)) > 3.0)
     assert np.all(
         np.abs(
             np.asarray(fixedBaselineEvmDbValues, dtype=float)
-            - np.asarray((-52.0, -48.0, -42.0), dtype=float)
+            - np.asarray((-52.0, -51.0, -48.0, -42.0), dtype=float)
         )
         <= 1.5
     )
@@ -3308,6 +3386,17 @@ def CheckIlcPowerOperatingPoints() -> None:
         },
     ).Analyze(ratedOutput)
     assert abs(ratedMetrics["outputPowerDbm"] - 25.0) <= 0.15
+    automaticRatedMetrics = Analysis(
+        ratedReference,
+        waveform,
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "width": 16,
+        },
+    ).Analyze(ratedOutput)
+    assert abs(
+        automaticRatedMetrics["outputPowerDbm"] - 25.0
+    ) <= 0.15
     ratedFormatInfo = FixedPoint(16, 4.0).GetFormatInfo()
     assert not np.any(
         np.abs(ratedOutput.real)
@@ -3514,6 +3603,24 @@ def CheckIlcPowerOperatingPoints() -> None:
         },
     )
     mimoReference = mimoPowerCalibration.Calibrate(mimoInput)
+    mimoInputFormat = FixedPoint(16)
+    mimoOutputFormat = FixedPoint(
+        16, mimoPaModel.outputFullScaleAmplitude
+    )
+    mimoFloatingOutput = mimoPaModel.ProcessFloating(
+        mimoInputFormat.DecodeComplex(mimoReference)
+    )
+    encodedMimoFloatingOutput = mimoOutputFormat.EncodeComplex(
+        mimoFloatingOutput
+    )
+    assert np.array_equal(
+        encodedMimoFloatingOutput,
+        mimoPaModel.Process(mimoReference),
+    )
+    assert np.array_equal(
+        encodedMimoFloatingOutput,
+        mimoPowerCalibration.GetLastPaOutput(),
+    )
     mimoIlcResult = RunMimoFrequencyDomainIlc(
         mimoReference,
         mimoPaModel,
@@ -3586,6 +3693,30 @@ def CheckIlcPowerOperatingPoints() -> None:
     )
     assert np.max(np.abs(wrappedReference.real)) <= digitalHeadroomLimit
     assert np.max(np.abs(wrappedReference.imag)) <= digitalHeadroomLimit
+    wrappedInputFormat = FixedPoint(16)
+    wrappedOutputFormat = FixedPoint(
+        16, iqWrappedPaModel.outputFullScaleAmplitude
+    )
+    wrappedFloatingOutput = iqWrappedPaModel.ProcessFloating(
+        wrappedInputFormat.DecodeComplex(wrappedReference)
+    )
+    encodedWrappedFloatingOutput = wrappedOutputFormat.EncodeComplex(
+        wrappedFloatingOutput
+    )
+    assert np.array_equal(
+        encodedWrappedFloatingOutput,
+        iqWrappedPaModel.Process(wrappedReference),
+    )
+    assert np.array_equal(
+        encodedWrappedFloatingOutput,
+        wrappedPowerCalibration.GetLastPaOutput(),
+    )
+    assert not np.allclose(
+        wrappedFloatingOutput,
+        iqWrappedPaModel.ProcessRawFloating(
+            wrappedInputFormat.DecodeComplex(wrappedReference)
+        ),
+    )
     wrappedIlcResult = RunFrequencyDomainIlc(
         wrappedReference,
         iqWrappedPaModel,
@@ -3614,6 +3745,234 @@ def CheckIlcPowerOperatingPoints() -> None:
         wrappedIlcResult.history[0].outputSignal
     )
     assert abs(wrappedMetrics["outputPowerDbm"] - 10.0) <= 0.35
+
+    class PairedDriveOnlyPa:
+        """Model a third-party PA with paired drive methods but no raw path."""
+
+        def __init__(self) -> None:
+            """Initialize one linear chain at the shared fixed-point boundary.
+
+            Processing details:
+                Algorithm: Store the public word width, physical output full
+                scale, and a zero committed post-DAC drive while intentionally
+                omitting raw and dual-output floating protocols.
+
+            Returns:
+                result: None. The synthetic third-party PA is ready.
+            """
+
+            self.width = 16
+            self.outputFullScaleAmplitude = 2.0
+            self.committedDriveDb = 0.0
+
+        def SetCalibrationDriveDb(
+            self, driveDbPerChain: Sequence[float]
+        ) -> None:
+            """Commit exactly one finite post-DAC drive value.
+
+            Processing details:
+                Algorithm: Validate a one-chain drive sequence and retain its
+                scalar dB value for both fixed and floating public processing.
+
+            Args:
+                driveDbPerChain: Sequence containing one finite drive in dB.
+
+            Returns:
+                result: None. Later public calls use the committed drive.
+            """
+
+            driveValues = np.asarray(driveDbPerChain, dtype=float).reshape(-1)
+            if driveValues.size != 1 or not np.all(np.isfinite(driveValues)):
+                raise ValueError("driveDbPerChain must contain one value")
+            self.committedDriveDb = float(driveValues[0])
+
+        def ProcessCalibrationDrive(
+            self,
+            inputSignal: np.ndarray,
+            driveDbPerChain: Sequence[float],
+        ) -> np.ndarray:
+            """Evaluate one uncommitted linear analog-drive trial.
+
+            Processing details:
+                Algorithm: Decode the public samples, apply the supplied
+                single-chain drive once, and encode the identity-plant output
+                at the declared physical output full scale.
+
+            Args:
+                inputSignal: Public fixed-point complex waveform.
+                driveDbPerChain: Sequence containing one trial drive in dB.
+
+            Returns:
+                result: Public fixed-point output for the uncommitted trial.
+            """
+
+            driveValues = np.asarray(driveDbPerChain, dtype=float).reshape(-1)
+            if driveValues.size != 1 or not np.all(np.isfinite(driveValues)):
+                raise ValueError("driveDbPerChain must contain one value")
+            assert GetFixedPointFormat(inputSignal) == (16, 1.0)
+            inputFormat = FixedPoint(self.width)
+            outputFormat = FixedPoint(
+                self.width, self.outputFullScaleAmplitude
+            )
+            floatingInput = inputFormat.DecodeComplex(inputSignal)
+            driveScale = np.power(10.0, float(driveValues[0]) / 20.0)
+            return outputFormat.EncodeComplex(driveScale * floatingInput)
+
+        def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+            """Evaluate fixed public samples at the committed drive.
+
+            Processing details:
+                Algorithm: Reuse the uncommitted trial calculation with the
+                retained drive so the physical analog gain is applied once.
+
+            Args:
+                inputSignal: Public fixed-point complex waveform.
+
+            Returns:
+                result: Public fixed-point output at the committed drive.
+            """
+
+            return self.ProcessCalibrationDrive(
+                inputSignal, (self.committedDriveDb,)
+            )
+
+        def ProcessFloating(self, inputSignal: np.ndarray) -> np.ndarray:
+            """Evaluate floating public samples at the committed drive.
+
+            Processing details:
+                Algorithm: Apply the retained single-chain drive once to the
+                normalized complex input without crossing a public quantizer.
+
+            Args:
+                inputSignal: Normalized complex samples before analog drive.
+
+            Returns:
+                result: Floating linear output at the committed drive.
+            """
+
+            floatingInput = np.asarray(inputSignal, dtype=np.complex128)
+            driveScale = np.power(10.0, self.committedDriveDb / 20.0)
+            return driveScale * floatingInput
+
+    pairedDrivePa = PairedDriveOnlyPa()
+    pairedDriveIqPa = IQImbalancePA(
+        pairedDrivePa,
+        directCoefficient=1.0 + 0.0j,
+        imageCoefficient=0.0 + 0.0j,
+    )
+    pairedDriveCalibration = PowerCalibration(
+        paModel=pairedDriveIqPa,
+        parameters={
+            "outputPowerDbm": 10.0,
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "width": 16,
+        },
+    )
+    pairedDriveReference = pairedDriveCalibration.Calibrate(waveform.samples)
+    pairedInputFormat = FixedPoint(16)
+    pairedOutputFormat = FixedPoint(
+        16, pairedDriveIqPa.outputFullScaleAmplitude
+    )
+    pairedFloatingInput = pairedInputFormat.DecodeComplex(
+        pairedDriveReference
+    )
+    pairedFloatingOutput = pairedDriveIqPa.ProcessFloating(
+        pairedFloatingInput
+    )
+    pairedEncodedFloatingOutput = pairedOutputFormat.EncodeComplex(
+        pairedFloatingOutput
+    )
+    pairedFixedOutput = pairedDriveIqPa.Process(pairedDriveReference)
+    assert np.array_equal(pairedEncodedFloatingOutput, pairedFixedOutput)
+    pairedCalibrationDifference = (
+        pairedEncodedFloatingOutput
+        - pairedDriveCalibration.GetLastPaOutput()
+    )
+    assert np.max(np.abs(pairedCalibrationDifference.real)) <= 1.0
+    assert np.max(np.abs(pairedCalibrationDifference.imag)) <= 1.0
+    pairedRawOutput = pairedDriveIqPa.ProcessRawFloating(
+        pairedFloatingInput
+    )
+    assert np.max(
+        np.abs(pairedRawOutput - pairedFloatingInput)
+    ) <= 2.0 / (2 ** 15)
+    assert not np.allclose(pairedRawOutput, pairedFloatingOutput)
+    pairedAnalysis = Analysis(
+        pairedDriveReference,
+        waveform,
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "width": 16,
+            "outputFullScaleAmplitude": (
+                pairedDriveIqPa.outputFullScaleAmplitude
+            ),
+        },
+    )
+    pairedMetrics = pairedAnalysis.Analyze(pairedFixedOutput)
+    assert abs(pairedMetrics["outputPowerDbm"] - 10.0) <= 0.10
+
+    class RawPairedDrivePa(PairedDriveOnlyPa):
+        """Add an explicit raw path to the paired-drive third-party model."""
+
+        def ProcessRawFloating(
+            self, inputSignal: np.ndarray
+        ) -> np.ndarray:
+            """Evaluate the drive-free identity kernel.
+
+            Processing details:
+                Algorithm: Convert the supplied physical PA-input samples to
+                complex128 without applying the retained committed drive.
+
+            Args:
+                inputSignal: Physical floating samples already carrying drive.
+
+            Returns:
+                result: Drive-free identity output with matching shape.
+            """
+
+            return np.asarray(inputSignal, dtype=np.complex128)
+
+    # Wrapping an already-calibrated raw+paired third-party PA must retain the
+    # inner committed drive even though the new facade has not committed its
+    # own copy yet. In that state the wrapper uses the inner public path.
+    preCalibratedRawPa = RawPairedDrivePa()
+    preWrapperCalibration = PowerCalibration(
+        paModel=preCalibratedRawPa,
+        parameters={
+            "outputPowerDbm": 10.0,
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "width": 16,
+        },
+    )
+    preWrapperReference = preWrapperCalibration.Calibrate(waveform.samples)
+    preWrapperInputFormat = FixedPoint(16)
+    preWrapperOutputFormat = FixedPoint(
+        16, preCalibratedRawPa.outputFullScaleAmplitude
+    )
+    preWrapperFloatingInput = preWrapperInputFormat.DecodeComplex(
+        preWrapperReference
+    )
+    expectedPreWrapperOutput = preCalibratedRawPa.ProcessFloating(
+        preWrapperFloatingInput
+    )
+    preCalibratedIqPa = IQImbalancePA(
+        preCalibratedRawPa,
+        directCoefficient=1.0 + 0.0j,
+        imageCoefficient=0.0 + 0.0j,
+    )
+    actualPreWrapperOutput = preCalibratedIqPa.ProcessFloating(
+        preWrapperFloatingInput
+    )
+    assert np.array_equal(
+        preWrapperOutputFormat.EncodeComplex(actualPreWrapperOutput),
+        preWrapperOutputFormat.EncodeComplex(expectedPreWrapperOutput),
+    )
+    assert np.array_equal(
+        preCalibratedIqPa.Process(preWrapperReference),
+        preCalibratedRawPa.Process(preWrapperReference),
+    )
 
     thermalSampleRateHz = 100.0e3
     thermalConfig = ThermalConfig(
@@ -5856,8 +6215,9 @@ def CheckFixedPointInterfaces() -> None:
 
     Processing details:
         Algorithm: Check exact raw-code encoding, saturation, and decoding,
-        require an unchanged complex128 container type in both modes, exercise
-        14- and 16-bit generators, and pass raw codes through PA and Analysis.
+        require a complex128 metadata-bearing public container in both modes,
+        exercise 14- and 16-bit generators, and pass raw codes through PA and
+        Analysis.
 
     Returns:
         result: None. Assertions identify interface-format regressions.
@@ -5885,13 +6245,19 @@ def CheckFixedPointInterfaces() -> None:
     assert fixedFormat.GetFormatInfo()["fractionalBits"] == 2
     assert floatingSignal.dtype == np.complex128
     assert fixedSignal.dtype == np.complex128
+    assert isinstance(floatingSignal, FixedPointArray)
+    assert isinstance(fixedSignal, FixedPointArray)
+    assert GetFixedPointFormat(floatingSignal) == (0, 1.0)
+    assert GetFixedPointFormat(fixedSignal) == (3, 1.0)
+    assert GetFixedPointFormat(fixedSignal.copy()) == (3, 1.0)
+    assert GetFixedPointFormat(fixedSignal[1:]) == (3, 1.0)
     assert floatingSignal.shape == fixedSignal.shape == inputSignal.shape
     assert np.array_equal(floatingSignal, inputSignal)
     assert np.array_equal(fixedSignal, expectedFixedSignal)
-    assert np.array_equal(
-        fixedFormat.DecodeComplex(fixedSignal),
-        expectedDecodedSignal,
-    )
+    decodedFixedSignal = fixedFormat.DecodeComplex(fixedSignal)
+    assert np.array_equal(decodedFixedSignal, expectedDecodedSignal)
+    assert type(decodedFixedSignal) is np.ndarray
+    assert GetFixedPointFormat(decodedFixedSignal) is None
     assert np.array_equal(
         fixedFormat.QuantizeCodes(
             np.array([1.4 - 5.2j, -9.0 + 2.6j])
@@ -5910,6 +6276,7 @@ def CheckFixedPointInterfaces() -> None:
         dtype=np.complex128,
     )
     physicalCodes = physicalFormat.EncodeComplex(physicalSignal)
+    assert GetFixedPointFormat(physicalCodes) == (3, 2.0)
     assert np.array_equal(
         physicalCodes,
         np.array([1.0 + 2.0j, 3.0 - 4.0j]),
@@ -10792,6 +11159,10 @@ def CheckChannelModel() -> None:
     )
     fixedGmpMetrics = fixedGmpChannel.GetLastCalibrationMetrics()
     assert fixedGmpMetrics["converged"] is True
+    assert np.array_equal(
+        fixedGmpOutput,
+        fixedGmpChannel.GetLastPaOutput(),
+    )
     assert fixedGmpMetrics["targetOutputPowerDbmPerChain"] == (20.0,)
     assert abs(
         fixedGmpMetrics["measuredOutputPowerDbmPerChain"][0] - 20.0
@@ -11163,6 +11534,15 @@ def CheckTwoToneAnalogPowerReporting() -> None:
         expectedOutputPowerDbm,
         atol=0.02,
     )
+    automaticExpandedOutputMetrics = TwoToneAnalysis(
+        floatingWaveform,
+        parameters={**analysisParameters, "width": 16},
+    ).Analyze(expandedOutputCodes)
+    assert np.isclose(
+        automaticExpandedOutputMetrics["outputPowerDbm"],
+        expectedOutputPowerDbm,
+        atol=0.02,
+    )
     assert np.isclose(
         expandedOutputMetrics["fundamentalAverageDbfs"],
         directFixedMetrics["fundamentalAverageDbfs"]
@@ -11182,6 +11562,17 @@ def CheckTwoToneAnalogPowerReporting() -> None:
         expectedNormalizedRms,
         atol=2.0e-4,
     )
+    automaticExpandedRawMetadata = Analysis.BuildTwoToneWaveform(
+        expandedOutputCodes,
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=toneFrequenciesHz,
+        width=16,
+    )
+    assert np.isclose(
+        automaticExpandedRawMetadata.rmsLevel,
+        expectedNormalizedRms,
+        atol=2.0e-4,
+    )
     expandedRawMetrics = Analysis.AnalyzeTwoTone(
         expandedOutputCodes,
         sampleRateHz=sampleRateHz,
@@ -11194,6 +11585,17 @@ def CheckTwoToneAnalogPowerReporting() -> None:
     )
     assert np.isclose(
         expandedRawMetrics["outputPowerDbm"],
+        expectedOutputPowerDbm,
+        atol=0.02,
+    )
+    automaticExpandedRawMetrics = Analysis.AnalyzeTwoTone(
+        expandedOutputCodes,
+        sampleRateHz=sampleRateHz,
+        toneFrequenciesHz=toneFrequenciesHz,
+        parameters={**analysisParameters, "width": 16},
+    )
+    assert np.isclose(
+        automaticExpandedRawMetrics["outputPowerDbm"],
         expectedOutputPowerDbm,
         atol=0.02,
     )

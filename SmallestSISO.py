@@ -111,6 +111,9 @@ def RunSisoMode(
             "loadResistanceOhm": loadResistanceOhm,
             "maximumOutputPowerDbm": maximumOutputPowerDbm,
             "width": width,
+            "outputFullScaleAmplitude": (
+                channel.outputFullScaleAmplitude
+            ),
         },
     )
     baselineMetrics = resultAnalysis.Analyze(baselineOutput)
