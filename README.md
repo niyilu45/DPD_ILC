@@ -626,7 +626,7 @@ flowchart TD
 
 **图示说明：**
 
-- 调用方创建 `PaModel(modelName="rapp"、"wiener"、"gmp"、"piecewise_gmp" 或 "doherty")`；统一类根据名称持有对应实现和配置对象。
+- 调用方创建 `PaModel(parameters={"modelName": "rapp"})`；`modelName` 也可取 `"wiener"`、`"gmp"`、`"piecewise_gmp"` 或 `"doherty"`，统一类根据名称持有对应实现和配置对象。
 - `PaModel.Process` 与 `PaModel.SmallSignalGain` 将调用委托给当前实现，因此主程序和 ILC 无须包含模型类型分支。
 - `RappPA.Process` 使用经典SSPA软压缩曲线逐样点映射，保留输入相位，不持有FIR、时延或包络历史，是严格无记忆对照模型。
 - `WienerPA.Process` 依次执行线性记忆滤波、Rapp AM-AM 压缩和 AM-PM 相位旋转。

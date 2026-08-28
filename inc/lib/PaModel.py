@@ -1,7 +1,8 @@
 """Power-amplifier behavioral models used by the DPD-ILC simulation.
 
-Callers construct ``PaModel`` with ``modelName="rapp"``, ``"wiener"``,
-``"gmp"``, ``"piecewise_gmp"``, or ``"doherty"`` and then call ``Process``.
+Callers construct ``PaModel`` with ``parameters={"modelName": modelName}``,
+where ``modelName`` is ``"rapp"``, ``"wiener"``, ``"gmp"``,
+``"piecewise_gmp"``, or ``"doherty"``, and then call ``Process``.
 Five nonlinear model families are
 provided internally:
 
@@ -2022,7 +2023,7 @@ class PaModel:
     processing interface while retaining the dedicated model implementations.
 
     Example:
-        ``paModel = PaModel(modelName="wiener")``
+        ``paModel = PaModel(parameters={"modelName": "wiener"})``
         ``outputSignal = paModel.Process(inputSignal)``
     """
 

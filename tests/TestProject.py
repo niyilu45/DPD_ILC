@@ -820,8 +820,9 @@ def CheckDocumentationApiConsistency() -> None:
         Algorithm: Compile every fenced Python example, compare the public
         ``Analysis`` constructor parameter order with its documented
         signature, require synchronization examples to use the explicit
-        ``signalProcessingParameters`` argument, and retain one documented
-        compatibility note for the legacy nested mapping form.
+        ``signalProcessingParameters`` argument, require the piecewise-GMP PA
+        example to use the common ``parameters`` mapping, and retain one
+        documented compatibility note for the legacy nested mapping form.
 
     Returns:
         result: None. A stale example or signature fails with its document
@@ -885,7 +886,19 @@ def CheckDocumentationApiConsistency() -> None:
     signalDocumentText = (
         projectRoot / "doc" / "SigProc.md"
     ).read_text(encoding="utf-8")
+    paModelDocumentText = (
+        projectRoot / "doc" / "PaModel.md"
+    ).read_text(encoding="utf-8")
     assert expectedSignatureText in readmeText
+    assert (
+        'piecewisePa = PaModel(\n'
+        '    parameters={\n'
+        '        "modelName": "piecewise_gmp",'
+    ) in paModelDocumentText
+    assert (
+        'piecewisePa = PaModel(\n'
+        '    modelName="piecewise_gmp",'
+    ) not in paModelDocumentText
     documentedParameterExpectations = (
         (
             WaveGenWifi,
@@ -4924,13 +4937,12 @@ def CheckPiecewiseGmpModels() -> None:
             0.80 - 0.03j,
         )
     )
-    customPiecewisePa = PiecewiseGMPPA(
-        PiecewiseGMPConfig(
-            regionBoundaries=(0.30, 0.70),
-            transitionWidths=(0.10, 0.10),
-            regionConfigs=pureGainConfigs,
-        )
+    customPiecewiseConfig = PiecewiseGMPConfig(
+        regionBoundaries=(0.30, 0.70),
+        transitionWidths=(0.10, 0.10),
+        regionConfigs=pureGainConfigs,
     )
+    customPiecewisePa = PiecewiseGMPPA(customPiecewiseConfig)
     regionalInput = np.asarray(
         (0.10 + 0.0j, 0.40 + 0.0j, 0.90 + 0.0j),
         dtype=np.complex128,
@@ -4962,9 +4974,21 @@ def CheckPiecewiseGmpModels() -> None:
         )
     )
     assert np.all(np.diff(settledMagnitudes) >= -1.0e-10)
-    facadePa = PaModel(modelName="piecewise_gmp", width=0)
+    facadePa = PaModel(
+        parameters={
+            "modelName": "piecewise_gmp",
+            "piecewiseGmpConfig": customPiecewiseConfig,
+            "width": 0,
+        }
+    )
     assert isinstance(facadePa.model, PiecewiseGMPPA)
-    assert np.all(np.isfinite(facadePa.Process(regionalInput)))
+    assert facadePa.model.config == customPiecewiseConfig
+    assert np.allclose(
+        facadePa.Process(regionalInput),
+        customPiecewisePa.Process(regionalInput),
+        rtol=0.0,
+        atol=1.0e-14,
+    )
     try:
         PiecewiseGMPConfig(
             regionBoundaries=(0.70, 0.30),

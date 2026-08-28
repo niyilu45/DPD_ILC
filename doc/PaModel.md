@@ -1421,13 +1421,15 @@ regionConfigs = (
 )
 
 piecewisePa = PaModel(
-    modelName="piecewise_gmp",
-    piecewiseGmpConfig=PiecewiseGMPConfig(
-        regionBoundaries=(0.25, 0.60),
-        transitionWidths=(0.12, 0.18),
-        regionConfigs=regionConfigs,
-    ),
-    width=0,
+    parameters={
+        "modelName": "piecewise_gmp",
+        "piecewiseGmpConfig": PiecewiseGMPConfig(
+            regionBoundaries=(0.25, 0.60),
+            transitionWidths=(0.12, 0.18),
+            regionConfigs=regionConfigs,
+        ),
+        "width": 0,
+    }
 )
 
 paOutput = piecewisePa.Process(paInput)
