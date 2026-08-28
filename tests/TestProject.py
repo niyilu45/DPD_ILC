@@ -40,6 +40,7 @@ from inc.lib.DpdGmp import (
     AugmentedDpdGmp,
     CouplingAwareDpdGmp,
     DpdGmp,
+    PiecewiseDpdGmp,
 )
 from inc.lib.DpdLms import DpdLms
 from inc.lib.DpdIlc import (
@@ -75,6 +76,8 @@ from inc.lib.PaModel import (
     IQImbalancePA,
     MimoPaModel,
     PaModel,
+    PiecewiseGMPConfig,
+    PiecewiseGMPPA,
     RappConfig,
     RappPA,
     ThermalConfig,
@@ -937,6 +940,7 @@ def CheckDocumentationApiConsistency() -> None:
                 "rappConfig",
                 "wienerConfig",
                 "gmpConfig",
+                "piecewiseGmpConfig",
                 "dohertyConfig",
                 "thermalConfig",
                 "parameters",
@@ -946,7 +950,8 @@ def CheckDocumentationApiConsistency() -> None:
             (
                 "PaModel(modelName=None, rappConfig=None, "
                 "wienerConfig=None, "
-                "gmpConfig=None, dohertyConfig=None, "
+                "gmpConfig=None, piecewiseGmpConfig=None, "
+                "dohertyConfig=None, "
                 "thermalConfig=None, "
                 "parameters=None, width=None, "
                 "**parameterOverrides)"
@@ -1254,6 +1259,163 @@ def CheckWifiBandwidths() -> None:
             assert waveform.fftLength == baseFftLength
             assert waveform.dataSubcarriers.size == dataToneCount
             assert waveform.pilotSubcarriers.size == pilotToneCount
+
+
+def CheckWifiFixedPointHeadroom() -> None:
+    """Verify fixed Wi-Fi encoding preserves the floating OFDM envelope.
+
+    Processing details:
+        Algorithm: Generate identical floating and 16-bit MIMO packets, derive
+        the expected common component-headroom scale, prove raw rounding never
+        needs saturation, and compare decoded PAPR, normalized correlation,
+        constellation references, and scale metadata with the floating source.
+
+    Returns:
+        result: None. Assertions expose fixed-boundary clipping regressions.
+    """
+
+    generationParameters = {
+        "frameFormat": "EHT",
+        "bandwidthMhz": 20,
+        "mcs": 7,
+        "numDataSymbols": 10,
+        "oversampling": 4,
+        "seed": 101,
+        "numTransmitAntennas": 2,
+        "numSpatialStreams": 2,
+        "spatialMapping": "dft",
+    }
+    floatingWaveform = WaveGenWifi(
+        **generationParameters,
+        width=0,
+    ).Generate()
+    fixedWaveform = WaveGenWifi(
+        **generationParameters,
+        width=16,
+    ).Generate()
+    fixedFormat = FixedPoint(16)
+    formatInfo = fixedFormat.GetFormatInfo()
+    decodedFixedSamples = fixedFormat.DecodeComplex(
+        fixedWaveform.samples
+    )
+
+    floatingPacketRms = float(
+        np.sqrt(
+            np.mean(
+                np.sum(
+                    np.abs(floatingWaveform.samples) ** 2,
+                    axis=1,
+                )
+            )
+        )
+    )
+    assert np.isclose(
+        floatingPacketRms,
+        1.0,
+        rtol=0.0,
+        atol=1.0e-14,
+    )
+    positiveComponentPeak = max(
+        float(np.max(floatingWaveform.samples.real)),
+        float(np.max(floatingWaveform.samples.imag)),
+    )
+    negativeComponentPeak = max(
+        float(-np.min(floatingWaveform.samples.real)),
+        float(-np.min(floatingWaveform.samples.imag)),
+    )
+    exactHeadroomScale = min(
+        1.0,
+        float(formatInfo["physicalMaximumValue"])
+        / positiveComponentPeak,
+        abs(float(formatInfo["physicalMinimumValue"]))
+        / negativeComponentPeak,
+    )
+    expectedHeadroomScale = float(
+        np.nextafter(exactHeadroomScale, 0.0)
+    )
+    metadataHeadroomScale = (
+        fixedWaveform.normalizationScale
+        / floatingWaveform.normalizationScale
+    )
+    assert exactHeadroomScale < 1.0
+    assert metadataHeadroomScale == expectedHeadroomScale
+
+    # Equality with unconstrained rounding proves EncodeComplex did not rely
+    # on its saturation clip for any I/Q component. Reaching an endpoint code
+    # at the unique true packet peak remains a valid, unclipped representation.
+    integerScale = float(2 ** (fixedFormat.width - 1))
+    scaledFloatingSamples = (
+        metadataHeadroomScale * floatingWaveform.samples
+    )
+    unconstrainedCodes = (
+        np.rint(scaledFloatingSamples.real * integerScale)
+        + 1j
+        * np.rint(scaledFloatingSamples.imag * integerScale)
+    )
+    assert np.min(unconstrainedCodes.real) >= float(
+        formatInfo["minimumCode"]
+    )
+    assert np.max(unconstrainedCodes.real) <= float(
+        formatInfo["maximumCode"]
+    )
+    assert np.min(unconstrainedCodes.imag) >= float(
+        formatInfo["minimumCode"]
+    )
+    assert np.max(unconstrainedCodes.imag) <= float(
+        formatInfo["maximumCode"]
+    )
+    assert np.array_equal(fixedWaveform.samples, unconstrainedCodes)
+    assert np.allclose(
+        fixedWaveform.referenceDataSymbols,
+        metadataHeadroomScale
+        * floatingWaveform.referenceDataSymbols,
+        rtol=0.0,
+        atol=2.0e-16,
+    )
+
+    decodedPacketRms = float(
+        np.sqrt(
+            np.mean(
+                np.sum(np.abs(decodedFixedSamples) ** 2, axis=1)
+            )
+        )
+    )
+    assert np.isclose(
+        decodedPacketRms,
+        metadataHeadroomScale,
+        rtol=0.0,
+        atol=5.0e-6,
+    )
+    for transmitIndex in range(
+        floatingWaveform.numTransmitAntennas
+    ):
+        floatingChain = floatingWaveform.samples[:, transmitIndex]
+        fixedChain = decodedFixedSamples[:, transmitIndex]
+        normalizedCorrelation = abs(
+            np.vdot(floatingChain, fixedChain)
+        ) / np.sqrt(
+            float(np.vdot(floatingChain, floatingChain).real)
+            * float(np.vdot(fixedChain, fixedChain).real)
+        )
+        floatingPaprDb = 10.0 * np.log10(
+            np.max(np.abs(floatingChain) ** 2)
+            / np.mean(np.abs(floatingChain) ** 2)
+        )
+        fixedPaprDb = 10.0 * np.log10(
+            np.max(np.abs(fixedChain) ** 2)
+            / np.mean(np.abs(fixedChain) ** 2)
+        )
+        assert normalizedCorrelation > 0.99999999
+        assert abs(fixedPaprDb - floatingPaprDb) < 0.002
+
+    try:
+        WaveGenWifi(width=1)
+    except ValueError as error:
+        assert "at least two bits" in str(error)
+    else:
+        raise AssertionError(
+            "one-bit Wi-Fi I/Q cannot represent a bipolar OFDM waveform"
+        )
 
 
 def CheckWifiSpectralMaskAnalysis() -> None:
@@ -3736,7 +3898,8 @@ def CheckDohertyPaModel() -> None:
         Algorithm: Compare low-envelope output with the continuously active
         carrier branch, require the peaking branch to alter high-envelope
         samples, verify analytic small-signal gain against a numerical probe,
-        exercise mixed Doherty/GMP MIMO configuration, and reject invalid
+        exercise mixed Doherty/GMP MIMO configuration, require the smoother
+        built-in Doherty defaults to remain nonfolding, and reject invalid
         branch, turn-on, transition, delay, and load-modulation settings.
 
     Returns:
@@ -3834,6 +3997,25 @@ def CheckDohertyPaModel() -> None:
     assert not np.allclose(
         mixedOutput[:, 0], mixedOutput[:, 1]
     )
+
+    defaultDohertyConfig = DohertyConfig()
+    assert defaultDohertyConfig.peakingInputGain == 0.85
+    assert defaultDohertyConfig.peakingTransitionWidth == 0.50
+    assert defaultDohertyConfig.peakingCombineCoefficient == 0.15 + 0.0j
+    assert defaultDohertyConfig.loadModulationStrength == 0.02
+    defaultDoherty = DohertyPA(defaultDohertyConfig)
+    defaultAmplitudeGrid = np.linspace(0.0, 2.0, 401)
+    defaultSettledMagnitude = np.asarray(
+        tuple(
+            abs(
+                defaultDoherty.Process(
+                    np.full(16, amplitudeValue, dtype=np.complex128)
+                )[-1]
+            )
+            for amplitudeValue in defaultAmplitudeGrid
+        )
+    )
+    assert np.all(np.diff(defaultSettledMagnitude) >= -1.0e-10)
 
     invalidDohertyConfigs = (
         {"carrierModelName": "memoryPolynomial"},
@@ -4126,6 +4308,266 @@ def CheckGmpPaModel() -> None:
     assert np.allclose(
         measuredGmp.Process(measuredInput),
         np.asarray((1.0, 0.5, 0.5, 0.5), dtype=np.complex128),
+    )
+
+
+def CheckPiecewiseGmpModels() -> None:
+    """Verify smooth piecewise PA and DPD models on independent records.
+
+    Processing details:
+        Algorithm: Check custom and default PA regions, C2 partition weights,
+        identity inference, joint piecewise regression against a global GMP,
+        and noisy-data validation with and without adjacent-region coefficient
+        smoothing. The validation waveform is independent of all fit samples.
+
+    Returns:
+        result: None. Assertions enforce continuity, monotonic PA response,
+            regional model accuracy, and effective smoothness regularization.
+    """
+
+    pureGainConfigs = tuple(
+        GMPConfig(
+            nonlinearOrders=(1,),
+            memoryDepth=1,
+            crossMemoryDepth=0,
+            mainCoefficients={(1, 0): gainValue},
+            laggingCoefficients={},
+            leadingCoefficients={},
+        )
+        for gainValue in (
+            1.10 + 0.00j,
+            0.95 + 0.02j,
+            0.80 - 0.03j,
+        )
+    )
+    customPiecewisePa = PiecewiseGMPPA(
+        PiecewiseGMPConfig(
+            regionBoundaries=(0.30, 0.70),
+            transitionWidths=(0.10, 0.10),
+            regionConfigs=pureGainConfigs,
+        )
+    )
+    regionalInput = np.asarray(
+        (0.10 + 0.0j, 0.40 + 0.0j, 0.90 + 0.0j),
+        dtype=np.complex128,
+    )
+    expectedRegionalOutput = regionalInput * np.asarray(
+        tuple(
+            regionConfig.mainCoefficients[(1, 0)]
+            for regionConfig in pureGainConfigs
+        )
+    )
+    assert np.allclose(
+        customPiecewisePa.Process(regionalInput),
+        expectedRegionalOutput,
+        rtol=0.0,
+        atol=1.0e-14,
+    )
+    assert customPiecewisePa.SmallSignalGain() == 1.10 + 0.00j
+
+    defaultPiecewisePa = PiecewiseGMPPA()
+    amplitudeGrid = np.linspace(0.0, 2.0, 401)
+    settledMagnitudes = np.asarray(
+        tuple(
+            abs(
+                defaultPiecewisePa.Process(
+                    np.full(12, amplitudeValue, dtype=np.complex128)
+                )[-1]
+            )
+            for amplitudeValue in amplitudeGrid
+        )
+    )
+    assert np.all(np.diff(settledMagnitudes) >= -1.0e-10)
+    facadePa = PaModel(modelName="piecewise_gmp", width=0)
+    assert isinstance(facadePa.model, PiecewiseGMPPA)
+    assert np.all(np.isfinite(facadePa.Process(regionalInput)))
+    try:
+        PiecewiseGMPConfig(
+            regionBoundaries=(0.70, 0.30),
+            transitionWidths=(0.10, 0.10),
+            regionConfigs=pureGainConfigs,
+        ).Validate()
+    except ValueError as error:
+        assert "strictly increasing" in str(error)
+    else:
+        raise AssertionError("unordered piecewise-GMP boundaries accepted")
+
+    commonDpdParameters = {
+        "nonlinearOrders": (1, 3),
+        "memoryDepth": 1,
+        "crossMemoryDepth": 0,
+        "ridgeFactor": 1.0e-8,
+        "maximumOutputMagnitude": None,
+        "width": 0,
+    }
+    identityPiecewiseDpd = PiecewiseDpdGmp(
+        parameters=commonDpdParameters
+    )
+    weightProbe = np.asarray(
+        (0.05, 0.25, 0.40, 0.60, 0.90),
+        dtype=np.complex128,
+    )
+    envelopeWeights = identityPiecewiseDpd.CalculateEnvelopeWeights(
+        weightProbe
+    )
+    assert envelopeWeights.shape == (weightProbe.size, 3)
+    assert np.all(envelopeWeights >= 0.0)
+    assert np.all(envelopeWeights <= 1.0)
+    assert np.allclose(
+        np.sum(envelopeWeights, axis=1),
+        1.0,
+        rtol=0.0,
+        atol=2.0e-15,
+    )
+    assert np.allclose(
+        identityPiecewiseDpd.Process(weightProbe),
+        weightProbe,
+        rtol=0.0,
+        atol=2.0e-15,
+    )
+
+    randomGenerator = np.random.default_rng(20260828)
+
+    def BuildEnvelopeRecord(sampleCount: int) -> np.ndarray:
+        """Create one independent full-region complex-envelope record.
+
+        Processing details:
+            Algorithm: Draw amplitudes uniformly across all three regions and
+            phases uniformly around the complex plane using the enclosing
+            test's deterministic random generator.
+
+        Args:
+            sampleCount: Positive number of requested complex samples.
+
+        Returns:
+            result: Complex vector spanning low, middle, and high envelopes.
+        """
+
+        amplitudes = randomGenerator.uniform(0.02, 1.0, sampleCount)
+        phases = randomGenerator.uniform(-np.pi, np.pi, sampleCount)
+        return amplitudes * np.exp(1j * phases)
+
+    trainingReference = BuildEnvelopeRecord(5000)
+    validationReference = BuildEnvelopeRecord(5000)
+    teacherDpd = PiecewiseDpdGmp(
+        parameters={
+            **commonDpdParameters,
+            "regionSmoothnessFactor": 0.0,
+        }
+    )
+    teacherDpd.SetCoefficients(
+        np.asarray(
+            (
+                1.02 + 0.00j,
+                0.06 - 0.01j,
+                1.00 + 0.01j,
+                0.12 - 0.02j,
+                0.96 + 0.03j,
+                0.22 - 0.04j,
+            ),
+            dtype=np.complex128,
+        )
+    )
+    trainingTarget = teacherDpd.Process(trainingReference)
+    validationTarget = teacherDpd.Process(validationReference)
+    globalDpd = DpdGmp(parameters=commonDpdParameters)
+    globalDpd.Fit(trainingReference, trainingTarget)
+    fittedPiecewiseDpd = PiecewiseDpdGmp(
+        parameters={
+            **commonDpdParameters,
+            "regionSmoothnessFactor": 0.0,
+        }
+    )
+    fittedPiecewiseDpd.Fit(trainingReference, trainingTarget)
+    globalValidationNmseDb = globalDpd.CalculateNmse(
+        validationReference,
+        validationTarget,
+    )
+    piecewiseValidationNmseDb = fittedPiecewiseDpd.CalculateNmse(
+        validationReference,
+        validationTarget,
+    )
+    assert piecewiseValidationNmseDb < globalValidationNmseDb - 50.0
+    assert np.allclose(
+        fittedPiecewiseDpd.GetRegionCoefficients("middle"),
+        teacherDpd.GetRegionCoefficients("middle"),
+        rtol=0.0,
+        atol=2.0e-5,
+    )
+
+    noisyDpdParameters = {
+        **commonDpdParameters,
+        "nonlinearOrders": (1, 3, 5),
+    }
+    noisyTeacher = PiecewiseDpdGmp(
+        parameters={
+            **noisyDpdParameters,
+            "regionSmoothnessFactor": 0.0,
+        }
+    )
+    noisyTeacher.SetCoefficients(
+        np.asarray(
+            (
+                1.02 + 0.00j,
+                0.06 - 0.01j,
+                0.005 + 0.000j,
+                1.00 + 0.01j,
+                0.12 - 0.02j,
+                0.008 + 0.000j,
+                0.96 + 0.03j,
+                0.22 - 0.04j,
+                0.012 + 0.000j,
+            ),
+            dtype=np.complex128,
+        )
+    )
+    noisyTrainingReference = BuildEnvelopeRecord(800)
+    noisyValidationReference = BuildEnvelopeRecord(8000)
+    cleanTrainingTarget = noisyTeacher.Process(noisyTrainingReference)
+    noisyTrainingTarget = cleanTrainingTarget + 0.004 * (
+        randomGenerator.normal(size=noisyTrainingReference.size)
+        + 1j
+        * randomGenerator.normal(size=noisyTrainingReference.size)
+    )
+    noisyValidationTarget = noisyTeacher.Process(
+        noisyValidationReference
+    )
+    unsmoothedDpd = PiecewiseDpdGmp(
+        parameters={
+            **noisyDpdParameters,
+            "regionSmoothnessFactor": 0.0,
+        }
+    )
+    smoothedDpd = PiecewiseDpdGmp(
+        parameters={
+            **noisyDpdParameters,
+            "regionSmoothnessFactor": 0.1,
+        }
+    )
+    unsmoothedResult = unsmoothedDpd.Fit(
+        noisyTrainingReference,
+        noisyTrainingTarget,
+    )
+    smoothedResult = smoothedDpd.Fit(
+        noisyTrainingReference,
+        noisyTrainingTarget,
+    )
+    unsmoothedValidationNmseDb = unsmoothedDpd.CalculateNmse(
+        noisyValidationReference,
+        noisyValidationTarget,
+    )
+    smoothedValidationNmseDb = smoothedDpd.CalculateNmse(
+        noisyValidationReference,
+        noisyValidationTarget,
+    )
+    assert (
+        smoothedResult.regionSmoothnessPenalty
+        < 0.01 * unsmoothedResult.regionSmoothnessPenalty
+    )
+    assert smoothedValidationNmseDb < unsmoothedValidationNmseDb - 0.5
+    assert (
+        smoothedResult.afterNmseDb
+        < unsmoothedResult.afterNmseDb + 0.1
     )
 
 
@@ -9933,10 +10375,20 @@ def CheckChannelModel() -> None:
         fixedGmpMetrics["measuredOutputPowerDbmPerChain"][0] - 20.0
     ) <= 0.25
     assert 1 <= fixedGmpMetrics["iterationCount"] <= 60
-    assert fixedGmpMetrics["analogDriveDbPerChain"][0] > 0.0
-    assert fixedGmpMetrics["analogDriveDbPerChain"][0] < 3.0
+    fixedWifiDecoded = FixedPoint(16).DecodeComplex(
+        fixedWifiWaveform.samples
+    )
+    fixedWifiHeadroomRestoreDb = -20.0 * np.log10(
+        np.sqrt(np.mean(np.abs(fixedWifiDecoded) ** 2))
+    )
+    residualAnalogDriveDb = (
+        fixedGmpMetrics["analogDriveDbPerChain"][0]
+        - fixedWifiHeadroomRestoreDb
+    )
+    assert fixedWifiHeadroomRestoreDb > 0.0
+    assert 0.0 < residualAnalogDriveDb < 3.0
     actualFixedGmpInput = fixedGmpChannel.GetLastActualPaInput()
-    assert np.max(np.abs(actualFixedGmpInput)) <= 1.2
+    assert np.max(np.abs(actualFixedGmpInput)) <= 2.0
     for publicWaveform in (
         fixedGmpChannel.GetLastPaInput(),
         fixedGmpChannel.GetLastPaOutput(),
@@ -11745,6 +12197,432 @@ def CheckPerformanceOptimizationEquivalence() -> None:
             BuildNaiveGmpOutput(customGmp, testedInput),
         )
 
+    # Channel validates one live configuration transaction at its public
+    # boundary. Nested ideal stages may share intermediate arrays, while the
+    # public input and both returned arrays retain independent ownership.
+    channelInput = 0.13 * (
+        randomGenerator.normal(size=257)
+        + 1j * randomGenerator.normal(size=257)
+    )
+    acceleratedChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={"sampleMode": "forward", "width": 0},
+    )
+    validationDepths = []
+    finiteProofNames = []
+    originalValidateParameters = acceleratedChannel.ValidateParameters
+    originalPrepareSignal = acceleratedChannel.PrepareSignal
+
+    def RecordChannelValidation() -> None:
+        """Record whether a Channel validation is outer or nested.
+
+        Processing details:
+            Algorithm: Save the trusted-transaction depth immediately before
+            delegating to the real validator without changing its result.
+
+        Returns:
+            result: None. The captured depths are asserted below.
+        """
+
+        validationDepths.append(
+            acceleratedChannel._trustedProcessingDepth
+        )
+        originalValidateParameters()
+
+    def RecordSignalPreparation(
+        inputSignal: np.ndarray,
+        signalName: str,
+        forceValidation: bool = False,
+    ) -> np.ndarray:
+        """Record full finite-value proofs around the optimized Channel.
+
+        Processing details:
+            Algorithm: Count outer-boundary and explicitly forced checks, then
+            delegate shape, type, and finite-value handling to PrepareSignal.
+
+        Args:
+            inputSignal: Candidate complex vector or matrix.
+            signalName: Diagnostic name supplied by the production caller.
+            forceValidation: Whether an external result requires a new proof.
+
+        Returns:
+            result: The production PrepareSignal result.
+        """
+
+        if (
+            forceValidation
+            or acceleratedChannel._trustedProcessingDepth == 0
+        ):
+            finiteProofNames.append(signalName)
+        return originalPrepareSignal(
+            inputSignal,
+            signalName,
+            forceValidation,
+        )
+
+    with patch.object(
+        acceleratedChannel,
+        "ValidateParameters",
+        new=RecordChannelValidation,
+    ), patch.object(
+        acceleratedChannel,
+        "PrepareSignal",
+        new=RecordSignalPreparation,
+    ):
+        channelOutput, feedbackOutput = acceleratedChannel.Process(
+            channelInput
+        )
+    assert validationDepths.count(0) == 1
+    assert finiteProofNames.count("inputSignal") == 1
+    assert finiteProofNames.count("paOutputSignal") == 1
+    assert np.array_equal(channelOutput, feedbackOutput)
+    assert not np.shares_memory(channelOutput, feedbackOutput)
+    assert not np.shares_memory(channelOutput, channelInput)
+    assert acceleratedChannel._trustedProcessingDepth == 0
+
+    # Every standalone identity helper preserves its historical defensive-copy
+    # contract even though the same stages alias intermediates inside Process.
+    identityHelperOutputs = (
+        acceleratedChannel.ApplyMimoCoupling(
+            channelInput, "prePaCouplingPaths"
+        ),
+        acceleratedChannel.ApplyIqImbalanceStage(
+            channelInput,
+            0.0,
+            0.0,
+            0.0 + 0.0j,
+            "testIqStage",
+            None,
+            None,
+        ),
+        acceleratedChannel.ApplyTransmitterIqImbalance(channelInput),
+        acceleratedChannel.ApplyPhaseRotation(channelInput),
+        acceleratedChannel.AddNoise(channelInput),
+        acceleratedChannel.ApplyFeedbackLinearResponse(channelInput),
+        acceleratedChannel.ApplyFeedbackNonlinearity(channelInput),
+        acceleratedChannel.ApplyFeedbackTimingAndFrequency(channelInput),
+        acceleratedChannel.ApplyFeedbackIqImbalance(channelInput),
+        acceleratedChannel.ApplyFeedbackAdc(channelInput),
+        acceleratedChannel.ApplyCalibrationDrive(channelInput),
+    )
+    for identityHelperOutput in identityHelperOutputs:
+        assert np.array_equal(identityHelperOutput, channelInput)
+        assert not np.shares_memory(identityHelperOutput, channelInput)
+
+    # A callback returning nonfinite data and a finite PA result that overflows
+    # during post-coupling must both fail and restore the transaction depth.
+    failingPaModel = PaModel(modelName="wiener", width=0)
+    failingChannel = Channel(
+        paModel=failingPaModel,
+        parameters={"sampleMode": "forward", "width": 0},
+    )
+    protectedChannelInput = channelInput.copy()
+
+    def MutatePaInputAndReturnNan(
+        inputSignal: np.ndarray,
+        **thermalParameters: object,
+    ) -> np.ndarray:
+        """Mutate a received PA buffer and return an invalid waveform.
+
+        Processing details:
+            Algorithm: Overwrite the array supplied across the third-party PA
+            boundary, ignore scheduling keywords, and return NaNs so both
+            caller-input ownership and exception cleanup are exercised.
+
+        Args:
+            inputSignal: Floating waveform supplied to the synthetic PA.
+            thermalParameters: Channel thermal scheduling keyword values.
+
+        Returns:
+            result: Same-shape nonfinite waveform rejected by Channel.
+        """
+
+        inputSignal[...] = 0.0 + 0.0j
+        return np.full(inputSignal.shape, np.nan + 0.0j)
+
+    with patch.object(
+        failingPaModel,
+        "ProcessThermalPeriodFloating",
+        side_effect=MutatePaInputAndReturnNan,
+    ):
+        try:
+            failingChannel.ProcessOutputPathsFloating(channelInput)
+        except ValueError as error:
+            assert "paOutputSignal" in str(error)
+        else:
+            raise AssertionError("Channel accepted a nonfinite PA output")
+        try:
+            failingChannel.Process(channelInput)
+        except ValueError as error:
+            assert "paOutputSignal" in str(error)
+        else:
+            raise AssertionError(
+                "Channel.Process accepted a nonfinite PA output"
+            )
+    assert np.array_equal(channelInput, protectedChannelInput)
+    assert failingChannel._trustedProcessingDepth == 0
+    recoveredOutput, recoveredFeedback = (
+        failingChannel.ProcessOutputPathsFloating(channelInput)
+    )
+    assert np.all(np.isfinite(recoveredOutput))
+    assert np.array_equal(recoveredOutput, recoveredFeedback)
+
+    overflowPaModel = MimoPaModel(
+        parameters={"numTransmitChains": 2, "width": 0}
+    )
+    overflowChannel = Channel(
+        paModel=overflowPaModel,
+        parameters={
+            "sampleMode": "forward",
+            "postPaCouplingPaths": (
+                {
+                    "sourceChain": 0,
+                    "destinationChain": 1,
+                    "gainDb": 20.0 * np.log10(2.0),
+                },
+            ),
+            "width": 0,
+        },
+    )
+    overflowInput = np.column_stack((channelInput, channelInput))
+    finiteHugeOutput = np.full(
+        overflowInput.shape,
+        np.finfo(float).max / 1.5 + 0.0j,
+        dtype=np.complex128,
+    )
+    with patch.object(
+        overflowPaModel,
+        "ProcessThermalPeriodFloating",
+        return_value=finiteHugeOutput,
+    ), np.errstate(over="ignore", invalid="ignore"):
+        try:
+            overflowChannel.ProcessOutputPathsFloating(overflowInput)
+        except ValueError as error:
+            assert "numeric range" in str(error)
+        else:
+            raise AssertionError("Channel accepted post-coupling overflow")
+    assert overflowChannel._trustedProcessingDepth == 0
+
+    # Caller-owned ChainMap values remain live between public calls; no
+    # optimized result or validated configuration crosses that boundary.
+    liveChannelParameters = {"phaseDegrees": 0, "width": 0}
+    liveChannel = Channel(parameters=liveChannelParameters)
+    liveBaseOutput = liveChannel.ProcessPaOutput(channelInput)
+    liveChannelParameters["phaseDegrees"] = 90
+    liveRotatedOutput = liveChannel.ProcessPaOutput(channelInput)
+    assert np.allclose(
+        liveRotatedOutput,
+        1j * liveBaseOutput,
+        rtol=0.0,
+        atol=1.0e-15,
+    )
+    liveChannelParameters["phaseDegrees"] = 45
+    try:
+        liveChannel.ProcessPaOutput(channelInput)
+    except ValueError as error:
+        assert "phaseDegrees" in str(error)
+    else:
+        raise AssertionError("live invalid Channel parameters were cached")
+
+    # A fixed drive-aware calibration encodes its drive-independent DAC preset
+    # once per transaction. Each probe receives a fresh copy, and every exit
+    # clears the strong input reference held by the transaction-local cache.
+    fixedPresetInput = FixedPoint(16).EncodeComplex(
+        np.r_[
+            np.zeros(8, dtype=np.complex128),
+            channelInput,
+            np.zeros(8, dtype=np.complex128),
+        ]
+    )
+    fixedPresetChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "calibrationToleranceDb": 0.05,
+            "maximumCalibrationIterations": 60,
+            "width": 16,
+        },
+    )
+    originalCalibrationDrive = fixedPresetChannel.ProcessCalibrationDrive
+    receivedPresetInputs = []
+    encodeInvocationCount = [0]
+    originalEncodeComplex = FixedPoint.EncodeComplex
+
+    def MutatingCalibrationDrive(
+        inputSignal: np.ndarray,
+        driveDbPerChain: object,
+    ) -> np.ndarray:
+        """Emulate a plant that overwrites each supplied trial buffer.
+
+        Processing details:
+            Algorithm: Capture the untouched public codes, evaluate the real
+            Channel calibration path, then overwrite only the caller-owned
+            trial array to prove the cached source remains isolated.
+
+        Args:
+            inputSignal: Public fixed-point trial codes.
+            driveDbPerChain: Candidate analog drive values for all chains.
+
+        Returns:
+            result: Clean PA output produced before mutating the trial buffer.
+        """
+
+        receivedPresetInputs.append(inputSignal.copy())
+        calibrationOutput = originalCalibrationDrive(
+            inputSignal,
+            driveDbPerChain,
+        )
+        inputSignal[...] = 0.0 + 0.0j
+        return calibrationOutput
+
+    def CountEncodeComplex(
+        self: FixedPoint,
+        inputSignal: np.ndarray,
+    ) -> np.ndarray:
+        """Count fixed-point encodes while retaining production behavior.
+
+        Processing details:
+            Algorithm: Increment a local structural counter and delegate the
+            actual rounding, saturation, and copying to the original method.
+
+        Args:
+            inputSignal: Normalized complex samples to encode.
+
+        Returns:
+            result: Production fixed-point public codes.
+        """
+
+        encodeInvocationCount[0] += 1
+        return originalEncodeComplex(self, inputSignal)
+
+    fixedPresetChannel.ProcessCalibrationDrive = MutatingCalibrationDrive
+    with patch.object(
+        FixedPoint,
+        "EncodeComplex",
+        new=CountEncodeComplex,
+    ):
+        fixedPresetChannel.CalibratePaInput(fixedPresetInput, 20.0)
+    fixedPresetCalibration = fixedPresetChannel._powerCalibration
+    if fixedPresetCalibration is None:
+        raise AssertionError("Channel did not retain its calibrator")
+    fixedPresetMetrics = (
+        fixedPresetCalibration.GetLastCalibrationMetrics()
+    )
+    fixedPresetIterationCount = int(fixedPresetMetrics["iterationCount"])
+    assert fixedPresetIterationCount > 1
+    assert encodeInvocationCount[0] == fixedPresetIterationCount + 1
+    assert len(receivedPresetInputs) == fixedPresetIterationCount
+    for receivedPresetInput in receivedPresetInputs[1:]:
+        assert np.array_equal(
+            receivedPresetInput,
+            receivedPresetInputs[0],
+        )
+    assert fixedPresetCalibration._activeFixedDrivePresetCache is None
+    assert fixedPresetCalibration._electricalCalibrationTransactionActive is False
+
+    secondPresetInput = np.roll(
+        np.conjugate(fixedPresetInput),
+        5,
+    )
+    secondReceivedStart = len(receivedPresetInputs)
+    secondEncodeStart = encodeInvocationCount[0]
+    with patch.object(
+        FixedPoint,
+        "EncodeComplex",
+        new=CountEncodeComplex,
+    ):
+        fixedPresetChannel.CalibratePaInput(secondPresetInput, 20.0)
+    secondPresetMetrics = (
+        fixedPresetCalibration.GetLastCalibrationMetrics()
+    )
+    secondPresetIterationCount = int(
+        secondPresetMetrics["iterationCount"]
+    )
+    assert (
+        encodeInvocationCount[0] - secondEncodeStart
+        == secondPresetIterationCount + 1
+    )
+    assert len(receivedPresetInputs) == (
+        secondReceivedStart + secondPresetIterationCount
+    )
+    assert not np.array_equal(
+        receivedPresetInputs[secondReceivedStart],
+        receivedPresetInputs[0],
+    )
+    assert fixedPresetCalibration._activeFixedDrivePresetCache is None
+    assert fixedPresetCalibration._electricalCalibrationTransactionActive is False
+
+    presetProbeMatrix = FixedPoint(16).DecodeComplex(
+        fixedPresetInput
+    ).reshape(-1, 1)
+    presetProbeDriveDb = np.asarray((-5.0,), dtype=float)
+    originalThresholdDb = float(
+        fixedPresetCalibration.GetParameters()["activePowerThresholdDb"]
+    )
+    originalGapTolerance = int(
+        fixedPresetCalibration.GetParameters()[
+            "activeGapToleranceSamples"
+        ]
+    )
+    cacheKeyEncodeStart = encodeInvocationCount[0]
+    fixedPresetCalibration._electricalCalibrationTransactionActive = True
+    try:
+        with patch.object(
+            FixedPoint,
+            "EncodeComplex",
+            new=CountEncodeComplex,
+        ):
+            fixedPresetCalibration.PrepareDrivePreset(
+                presetProbeMatrix,
+                presetProbeDriveDb,
+                FixedPoint(16),
+            )
+            fixedPresetCalibration.PrepareDrivePreset(
+                presetProbeMatrix,
+                presetProbeDriveDb,
+                FixedPoint(16),
+            )
+            assert encodeInvocationCount[0] == cacheKeyEncodeStart + 1
+            fixedPresetCalibration.UpdateParameters(
+                activePowerThresholdDb=-50.0
+            )
+            fixedPresetCalibration.PrepareDrivePreset(
+                presetProbeMatrix,
+                presetProbeDriveDb,
+                FixedPoint(16),
+            )
+            assert encodeInvocationCount[0] == cacheKeyEncodeStart + 2
+            fixedPresetCalibration.UpdateParameters(
+                activeGapToleranceSamples=0
+            )
+            fixedPresetCalibration.PrepareDrivePreset(
+                presetProbeMatrix,
+                presetProbeDriveDb,
+                FixedPoint(16),
+            )
+            assert encodeInvocationCount[0] == cacheKeyEncodeStart + 3
+    finally:
+        fixedPresetCalibration._activeFixedDrivePresetCache = None
+        fixedPresetCalibration._electricalCalibrationTransactionActive = False
+        fixedPresetCalibration.UpdateParameters(
+            activePowerThresholdDb=originalThresholdDb,
+            activeGapToleranceSamples=originalGapTolerance,
+        )
+
+    with patch.object(
+        fixedPresetCalibration,
+        "_paCalibrationProcessMethod",
+        side_effect=RuntimeError("synthetic calibration failure"),
+    ):
+        try:
+            fixedPresetCalibration.Calibrate(fixedPresetInput)
+        except RuntimeError as error:
+            assert "synthetic calibration failure" in str(error)
+        else:
+            raise AssertionError("synthetic calibration failure was hidden")
+    assert fixedPresetCalibration._activeFixedDrivePresetCache is None
+    assert fixedPresetCalibration._electricalCalibrationTransactionActive is False
+
     # Range-tree energy vectorization must select exactly the lag selected by
     # the old scalar overlap-energy loop under padding, cropping, and gain.
     integerReference = (
@@ -12038,6 +12916,7 @@ def RunTests() -> None:
     CheckChannelModel()
     CheckWifiFormats()
     CheckWifiBandwidths()
+    CheckWifiFixedPointHeadroom()
     CheckWifiSpectralMaskAnalysis()
     CheckSampleRateConfiguration()
     CheckMimoSpatialStructure()
@@ -12051,6 +12930,7 @@ def RunTests() -> None:
     CheckGuardIntervals()
     CheckRappPaModel()
     CheckGmpPaModel()
+    CheckPiecewiseGmpModels()
     CheckDohertyPaModel()
     CheckIlcImprovement()
     CheckIlcFeedbackSynchronization()

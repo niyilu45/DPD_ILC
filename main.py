@@ -272,9 +272,18 @@ def Main() -> int:
     argumentParser.add_argument(
         "--pa",
         dest="paModelName",
-        choices=("rapp", "wiener", "gmp", "doherty"),
+        choices=(
+            "rapp",
+            "wiener",
+            "gmp",
+            "piecewise_gmp",
+            "doherty",
+        ),
         default=None,
-        help="Nonlinear PA model family: Rapp, Wiener, GMP, or Doherty",
+        help=(
+            "Nonlinear PA model family: Rapp, Wiener, GMP, piecewise GMP, "
+            "or Doherty"
+        ),
     )
     argumentParser.add_argument(
         "--tx-antennas",

@@ -37,6 +37,7 @@ class DpdGmpTrainingResult:
     afterNmseDb: float
     regularizedConditionNumber: float
     normalizedCoefficientUpdateNorm: float
+    regionSmoothnessPenalty: float = 0.0
 
     def ToDict(self) -> Dict[str, object]:
         """Return a stable dictionary containing all training diagnostics.
@@ -61,6 +62,7 @@ class DpdGmpTrainingResult:
             "normalizedCoefficientUpdateNorm": (
                 self.normalizedCoefficientUpdateNorm
             ),
+            "regionSmoothnessPenalty": self.regionSmoothnessPenalty,
         }
 
 
@@ -565,6 +567,74 @@ class DpdGmp:
             stopIndex,
         )
 
+    def BuildAdditionalRegularizationMatrix(
+        self,
+        featureScale: np.ndarray,
+        diagonalScale: float,
+    ) -> np.ndarray:
+        """Return an optional normalized-coordinate coefficient penalty.
+
+        Processing details:
+            Algorithm: Validate the supplied feature scales and return a zero
+            Hermitian matrix for the ordinary unconstrained GMP. Subclasses
+            may override this hook to add positive-semidefinite structure to
+            the common joint normal equations without duplicating the solver.
+
+        Args:
+            featureScale: Positive RMS normalization for every basis column.
+            diagonalScale: Positive mean diagonal of the data normal matrix.
+
+        Returns:
+            result: Feature-by-feature complex regularization matrix.
+        """
+
+        resolvedFeatureScale = np.asarray(
+            featureScale, dtype=float
+        ).reshape(-1)
+        if (
+            resolvedFeatureScale.size != len(self.featureSpecs)
+            or not np.all(np.isfinite(resolvedFeatureScale))
+            or np.any(resolvedFeatureScale <= 0.0)
+            or not np.isfinite(diagonalScale)
+            or diagonalScale <= 0.0
+        ):
+            raise ValueError(
+                "featureScale and diagonalScale must be finite and positive"
+            )
+        return np.zeros(
+            (len(self.featureSpecs), len(self.featureSpecs)),
+            dtype=np.complex128,
+        )
+
+    def CalculateRegionSmoothnessPenalty(
+        self, coefficients: np.ndarray
+    ) -> float:
+        """Return the regional coefficient-difference diagnostic.
+
+        Processing details:
+            Algorithm: Validate one coefficient vector and return zero for an
+            ordinary GMP, which has no independent envelope-region blocks.
+            Piecewise subclasses override this metric using adjacent regions.
+
+        Args:
+            coefficients: Complex coefficient vector in active feature order.
+
+        Returns:
+            result: Nonnegative adjacent-region squared-difference sum.
+        """
+
+        complexCoefficients = np.asarray(
+            coefficients, dtype=np.complex128
+        ).reshape(-1)
+        if (
+            complexCoefficients.size != len(self.featureSpecs)
+            or not np.all(np.isfinite(complexCoefficients))
+        ):
+            raise ValueError(
+                "coefficients must contain one finite value per feature"
+            )
+        return 0.0
+
     def Process(self, inputSignal: np.ndarray) -> np.ndarray:
         """Apply DPD while preserving the configured public data convention.
 
@@ -987,8 +1057,23 @@ class DpdGmp:
         ridgeScale = (
             float(self.parameters["ridgeFactor"]) * diagonalScale
         )
+        additionalRegularization = (
+            self.BuildAdditionalRegularizationMatrix(
+                featureScale,
+                diagonalScale,
+            )
+        )
+        if (
+            additionalRegularization.shape
+            != (featureCount, featureCount)
+            or not np.all(np.isfinite(additionalRegularization))
+        ):
+            raise RuntimeError(
+                "additional GMP regularization returned an invalid matrix"
+            )
         regularizedMatrix = normalMatrix + (
             ridgeScale * np.eye(featureCount)
+            + additionalRegularization
         )
         priorNormalizedCoefficients = (
             self.coefficients * featureScale
@@ -1093,6 +1178,11 @@ class DpdGmp:
                 np.linalg.cond(regularizedMatrix)
             ),
             normalizedCoefficientUpdateNorm=updateNorm,
+            regionSmoothnessPenalty=(
+                self.CalculateRegionSmoothnessPenalty(
+                    updatedCoefficients
+                )
+            ),
         )
         self.lastTrainingResult = trainingResult
         return trainingResult
@@ -1194,6 +1284,571 @@ class DpdGmp:
 
         self.SynchronizeStructure()
         return self.lastTrainingResult
+
+
+class PiecewiseDpdGmp(DpdGmp):
+    """Fit one jointly optimized GMP model across smooth envelope regions.
+
+    The low, middle, and high regions each own a complete GMP coefficient
+    vector.  Two C2-continuous envelope transitions blend their basis columns
+    before both regression and inference.  Consequently the ordinary
+    ``DpdGmp`` solver can estimate every region jointly, while the deployed
+    mapping remains continuous through both configured boundaries.
+    """
+
+    regionNames: Tuple[str, ...] = ("low", "middle", "high")
+
+    def __init__(
+        self,
+        parameters: Optional[Mapping[str, object]] = None,
+        width: Optional[int] = None,
+        **parameterOverrides: object,
+    ) -> None:
+        """Initialize a three-region GMP with smooth envelope transitions.
+
+        Processing details:
+            Algorithm: Define the ordinary GMP controls together with two
+            normalized-envelope boundaries and transition widths, layer live
+            caller parameters using the project ChainMap convention, validate
+            the complete configuration, and create an exact identity mapping
+            in all three regions.
+
+        Args:
+            parameters: Optional caller-owned live mapping of configuration
+                values, including ``envelopeBoundaries`` and
+                ``transitionWidths``.
+            width: Optional public I/Q component width. None selects the
+                internal 16-bit default and zero selects floating point.
+            parameterOverrides: Highest-priority recognized configuration
+                values.
+
+        Returns:
+            result: None. A validated identity-initialized piecewise DPD is
+                ready for joint training or inference.
+        """
+
+        self.defaultParameters: Mapping[str, object] = MappingProxyType(
+            {
+                "nonlinearOrders": (1, 3, 5, 7),
+                "memoryDepth": 3,
+                "crossMemoryDepth": 2,
+                "ridgeFactor": 1.0e-6,
+                "coefficientLearningRate": 1.0,
+                "chunkSize": 8192,
+                "peakWeightExponent": 0.0,
+                "maximumOutputMagnitude": 2.0,
+                "envelopeBoundaries": (0.25, 0.60),
+                "transitionWidths": (0.12, 0.18),
+                "regionSmoothnessFactor": 1.0e-4,
+                "width": 16,
+            }
+        )
+        directOverrides = dict(parameterOverrides)
+        if width is not None:
+            directOverrides["width"] = width
+        if parameters is not None and not isinstance(parameters, Mapping):
+            raise TypeError("parameters must be a mapping or None")
+        externalParameters: Mapping[str, object] = (
+            {}
+            if parameters is None
+            else RecognizedParameterView(
+                parameters,
+                self.defaultParameters,
+                "PiecewiseDpdGmp",
+            )
+        )
+        recognizedOverrides = FilterRecognizedParameters(
+            directOverrides,
+            self.defaultParameters,
+            "PiecewiseDpdGmp",
+        )
+        self.parameters: ChainMap[str, object] = ChainMap(
+            recognizedOverrides,
+            externalParameters,
+            self.defaultParameters,
+        )
+        self.featureSpecs: List[Tuple[str, int, int, int]] = []
+        self.baseFeatureSpecs: List[
+            Tuple[str, int, int, int]
+        ] = []
+        self.coefficients = np.zeros(0, dtype=np.complex128)
+        self.lastTrainingResult: Optional[DpdGmpTrainingResult] = None
+        self.activeStructure: Tuple[
+            Tuple[int, ...], int, int
+        ] = (tuple(), 0, 0)
+        self.activeEnvelopeConfiguration: Tuple[
+            Tuple[float, float], Tuple[float, float]
+        ] = ((0.0, 0.0), (0.0, 0.0))
+        self.ValidateParameters()
+        self.RebuildStructure(resetCoefficients=True)
+
+    def ResolveEnvelopeConfiguration(
+        self,
+    ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        """Resolve the two boundaries and widths as immutable float pairs.
+
+        Processing details:
+            Algorithm: Require each configured value to be a non-text
+            two-element sequence, convert finite real scalars to floats,
+            enforce positive increasing boundaries and positive widths, and
+            return tuples suitable for structural change detection.
+
+        Returns:
+            result: ``(envelopeBoundaries, transitionWidths)`` in normalized
+                complex-envelope amplitude units.
+        """
+
+        resolvedPairs = []
+        for parameterName in (
+            "envelopeBoundaries",
+            "transitionWidths",
+        ):
+            rawValues = self.parameters[parameterName]
+            if (
+                isinstance(rawValues, (str, bytes))
+                or not isinstance(rawValues, (Sequence, np.ndarray))
+                or len(rawValues) != 2
+            ):
+                raise ValueError(
+                    f"{parameterName} must contain exactly two values"
+                )
+            numericValues = []
+            for rawValue in rawValues:
+                if (
+                    not isinstance(
+                        rawValue,
+                        (int, float, np.integer, np.floating),
+                    )
+                    or isinstance(rawValue, (bool, np.bool_))
+                    or not np.isfinite(rawValue)
+                    or float(rawValue) <= 0.0
+                ):
+                    raise ValueError(
+                        f"every {parameterName} value must be finite and "
+                        "positive"
+                    )
+                numericValues.append(float(rawValue))
+            resolvedPairs.append(
+                (numericValues[0], numericValues[1])
+            )
+        envelopeBoundaries = resolvedPairs[0]
+        transitionWidths = resolvedPairs[1]
+        if envelopeBoundaries[0] >= envelopeBoundaries[1]:
+            raise ValueError(
+                "envelopeBoundaries must be strictly increasing"
+            )
+        return (envelopeBoundaries, transitionWidths)
+
+    def ValidateParameters(self) -> None:
+        """Validate ordinary GMP and piecewise envelope configuration.
+
+        Processing details:
+            Algorithm: Delegate all common order, memory, solver, clipping,
+            and fixed-point checks to ``DpdGmp``, then validate both envelope
+            boundary and transition-width pairs used by the piecewise basis.
+
+        Returns:
+            result: None. Invalid configuration raises a descriptive error.
+        """
+
+        super().ValidateParameters()
+        self.ResolveEnvelopeConfiguration()
+        regionSmoothnessFactor = self.parameters[
+            "regionSmoothnessFactor"
+        ]
+        if (
+            not isinstance(
+                regionSmoothnessFactor,
+                (int, float, np.integer, np.floating),
+            )
+            or isinstance(regionSmoothnessFactor, (bool, np.bool_))
+            or not np.isfinite(regionSmoothnessFactor)
+            or float(regionSmoothnessFactor) < 0.0
+        ):
+            raise ValueError(
+                "regionSmoothnessFactor must be finite and nonnegative"
+            )
+
+    def UpdateParameters(self, **parameterOverrides: object) -> None:
+        """Apply piecewise or ordinary settings transactionally.
+
+        Processing details:
+            Algorithm: Filter recognized values, validate the updated live
+            configuration, reset coefficients when either GMP dimensions or
+            envelope transition settings change, and restore the prior local
+            layer and model state after any invalid update.
+
+        Args:
+            parameterOverrides: Supported values placed in the highest
+                priority local ChainMap layer.
+
+        Returns:
+            result: None. Valid changes affect subsequent calls.
+        """
+
+        recognizedOverrides = FilterRecognizedParameters(
+            parameterOverrides,
+            self.defaultParameters,
+            "PiecewiseDpdGmp.UpdateParameters",
+        )
+        previousOverrides = dict(self.parameters.maps[0])
+        previousSignature = (
+            self.activeStructure,
+            self.activeEnvelopeConfiguration,
+        )
+        self.parameters.maps[0].update(recognizedOverrides)
+        try:
+            self.ValidateParameters()
+            currentSignature = (
+                self.ResolveStructure(),
+                self.ResolveEnvelopeConfiguration(),
+            )
+            if currentSignature != previousSignature:
+                self.RebuildStructure(resetCoefficients=True)
+        except (TypeError, ValueError):
+            self.parameters.maps[0].clear()
+            self.parameters.maps[0].update(previousOverrides)
+            raise
+
+    def SynchronizeStructure(self) -> None:
+        """Synchronize live GMP and envelope settings with coefficients.
+
+        Processing details:
+            Algorithm: Validate the complete current ChainMap, compare its
+            base structure and smooth-region controls with the signatures that
+            own the coefficient vector, and restore piecewise identity if a
+            caller changed either group between public method calls.
+
+        Returns:
+            result: None. Coefficients always match the active piecewise basis.
+        """
+
+        self.ValidateParameters()
+        if (
+            self.ResolveStructure() != self.activeStructure
+            or self.ResolveEnvelopeConfiguration()
+            != self.activeEnvelopeConfiguration
+        ):
+            self.RebuildStructure(resetCoefficients=True)
+
+    def RebuildStructure(self, resetCoefficients: bool) -> None:
+        """Build low, middle, and high copies of the canonical GMP basis.
+
+        Processing details:
+            Algorithm: Enumerate the ordinary GMP features once, create three
+            region-prefixed copies in low-to-high order, preserve coefficients
+            only when their size remains compatible, and initialize every
+            region's zero-delay first-order term to one so partition-of-unity
+            weighting implements exact identity before training.
+
+        Args:
+            resetCoefficients: Whether to discard coefficients and initialize
+                the piecewise identity mapping.
+
+        Returns:
+            result: None. Feature metadata and coefficient storage agree.
+        """
+
+        baseFeatureSpecs = list(
+            BuildFeatureSpecs(*self.ResolveStructure())
+        )
+        featureSpecs = [
+            (
+                f"{regionName}_{branchName}",
+                nonlinearOrder,
+                signalDelay,
+                envelopeDelay,
+            )
+            for regionName in self.regionNames
+            for (
+                branchName,
+                nonlinearOrder,
+                signalDelay,
+                envelopeDelay,
+            ) in baseFeatureSpecs
+        ]
+        if not resetCoefficients and len(featureSpecs) != len(
+            self.coefficients
+        ):
+            raise ValueError(
+                "coefficient count cannot be preserved across structure change"
+            )
+        self.baseFeatureSpecs = baseFeatureSpecs
+        self.featureSpecs = featureSpecs
+        self.activeStructure = self.ResolveStructure()
+        self.activeEnvelopeConfiguration = (
+            self.ResolveEnvelopeConfiguration()
+        )
+        if resetCoefficients:
+            self.coefficients = np.zeros(
+                len(self.featureSpecs), dtype=np.complex128
+            )
+            for regionName in self.regionNames:
+                identityIndex = self.featureSpecs.index(
+                    (f"{regionName}_main", 1, 0, 0)
+                )
+                self.coefficients[identityIndex] = 1.0 + 0.0j
+            self.lastTrainingResult = None
+
+    def CalculateEnvelopeWeights(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Return smooth low, middle, and high weights for every sample.
+
+        Processing details:
+            Algorithm: Center one finite-width transition on each configured
+            envelope boundary, map its clipped position through the C2
+            smootherstep ``6z^5 - 15z^4 + 10z^3``, then form
+            ``low=1-S1``, ``middle=S1*(1-S2)``, and ``high=S1*S2``. The three
+            nonnegative weights sum to one even when transitions overlap.
+
+        Args:
+            inputSignal: Normalized finite complex waveform whose instantaneous
+                envelope selects the regional mixture.
+
+        Returns:
+            result: Samples-by-three real matrix ordered low, middle, high.
+        """
+
+        self.SynchronizeStructure()
+        complexInput = np.asarray(
+            inputSignal, dtype=np.complex128
+        ).reshape(-1)
+        if complexInput.size == 0 or not np.all(np.isfinite(complexInput)):
+            raise ValueError(
+                "inputSignal must be a finite nonempty complex vector"
+            )
+        envelopeMagnitude = np.abs(complexInput)
+        (
+            envelopeBoundaries,
+            transitionWidths,
+        ) = self.activeEnvelopeConfiguration
+        transitionValues = []
+        for boundaryValue, transitionWidth in zip(
+            envelopeBoundaries, transitionWidths
+        ):
+            transitionStart = boundaryValue - 0.5 * transitionWidth
+            transitionPosition = np.clip(
+                (envelopeMagnitude - transitionStart)
+                / transitionWidth,
+                0.0,
+                1.0,
+            )
+            smootherStep = np.clip(
+                transitionPosition**3
+                * (
+                    transitionPosition
+                    * (6.0 * transitionPosition - 15.0)
+                    + 10.0
+                ),
+                0.0,
+                1.0,
+            )
+            transitionValues.append(smootherStep)
+        lowerTransition, upperTransition = transitionValues
+        lowWeight = 1.0 - lowerTransition
+        middleWeight = lowerTransition * (1.0 - upperTransition)
+        highWeight = lowerTransition * upperTransition
+        return np.column_stack(
+            (lowWeight, middleWeight, highWeight)
+        )
+
+    def BuildBasisChunk(
+        self,
+        inputSignal: np.ndarray,
+        startIndex: int,
+        stopIndex: int,
+    ) -> np.ndarray:
+        """Build the joint smoothly weighted three-region GMP basis.
+
+        Processing details:
+            Algorithm: Evaluate the canonical GMP columns once for the chunk,
+            calculate the same envelope weights used during deployment, and
+            concatenate low-, middle-, and high-weighted copies in the exact
+            region-major order exposed by ``GetFeatureSpecs``.
+
+        Args:
+            inputSignal: Normalized finite desired waveform.
+            startIndex: Inclusive output-sample index of the basis chunk.
+            stopIndex: Exclusive output-sample index of the basis chunk.
+
+        Returns:
+            result: Complex joint-regression matrix with three columns per
+                ordinary GMP feature.
+        """
+
+        baseBasis = BuildGmpBasisChunk(
+            inputSignal,
+            self.baseFeatureSpecs,
+            startIndex,
+            stopIndex,
+        )
+        envelopeWeights = self.CalculateEnvelopeWeights(
+            inputSignal[startIndex:stopIndex]
+        )
+        return np.column_stack(
+            tuple(
+                baseBasis
+                * envelopeWeights[:, regionIndex].reshape(-1, 1)
+                for regionIndex in range(len(self.regionNames))
+            )
+        )
+
+    def BuildAdditionalRegularizationMatrix(
+        self,
+        featureScale: np.ndarray,
+        diagonalScale: float,
+    ) -> np.ndarray:
+        """Penalize differences between adjacent regional coefficients.
+
+        Processing details:
+            Algorithm: Build the block first-difference operator for
+            low-to-middle and middle-to-high raw coefficient vectors, map it
+            into the solver's normalized coefficient coordinates, normalize
+            its mean diagonal so ``regionSmoothnessFactor`` is dimensionless,
+            and return the resulting positive-semidefinite matrix scaled
+            relative to the data normal matrix. A zero factor disables the
+            penalty exactly.
+
+        Args:
+            featureScale: Positive RMS normalization for every joint basis
+                column.
+            diagonalScale: Positive mean diagonal of the data normal matrix.
+
+        Returns:
+            result: Hermitian matrix implementing
+                ``lambda_s*(||c_middle-c_low||^2 +
+                ||c_high-c_middle||^2)`` up to a common unit normalization.
+        """
+
+        baseMatrix = super().BuildAdditionalRegularizationMatrix(
+            featureScale,
+            diagonalScale,
+        )
+        smoothnessFactor = float(
+            self.parameters["regionSmoothnessFactor"]
+        )
+        if smoothnessFactor == 0.0:
+            return baseMatrix
+        featureScaleVector = np.asarray(
+            featureScale, dtype=float
+        ).reshape(-1)
+        baseFeatureCount = len(self.baseFeatureSpecs)
+        differenceMatrix = np.zeros(
+            (
+                2 * baseFeatureCount,
+                len(self.featureSpecs),
+            ),
+            dtype=float,
+        )
+        featureIndices = np.arange(baseFeatureCount)
+        differenceMatrix[
+            featureIndices, featureIndices
+        ] = -1.0
+        differenceMatrix[
+            featureIndices,
+            baseFeatureCount + featureIndices,
+        ] = 1.0
+        secondRows = baseFeatureCount + featureIndices
+        differenceMatrix[
+            secondRows,
+            baseFeatureCount + featureIndices,
+        ] = -1.0
+        differenceMatrix[
+            secondRows,
+            2 * baseFeatureCount + featureIndices,
+        ] = 1.0
+        normalizedDifferenceMatrix = (
+            differenceMatrix / featureScaleVector.reshape(1, -1)
+        )
+        rawPenaltyMatrix = (
+            normalizedDifferenceMatrix.conj().T
+            @ normalizedDifferenceMatrix
+        )
+        penaltyDiagonalMean = max(
+            float(np.mean(np.real(np.diag(rawPenaltyMatrix)))),
+            np.finfo(float).tiny,
+        )
+        return np.asarray(
+            baseMatrix
+            + smoothnessFactor
+            * diagonalScale
+            * rawPenaltyMatrix
+            / penaltyDiagonalMean,
+            dtype=np.complex128,
+        )
+
+    def CalculateRegionSmoothnessPenalty(
+        self, coefficients: np.ndarray
+    ) -> float:
+        """Measure adjacent low/middle/high coefficient disagreement.
+
+        Processing details:
+            Algorithm: Validate the complete piecewise coefficient vector,
+            split it into equal region-major blocks, and sum the squared
+            complex Euclidean distances from low to middle and middle to high
+            without imposing a component-wise monotonic constraint.
+
+        Args:
+            coefficients: Joint piecewise coefficient vector.
+
+        Returns:
+            result: Nonnegative raw coefficient smoothness penalty.
+        """
+
+        complexCoefficients = np.asarray(
+            coefficients, dtype=np.complex128
+        ).reshape(-1)
+        if (
+            complexCoefficients.size != len(self.featureSpecs)
+            or not np.all(np.isfinite(complexCoefficients))
+        ):
+            raise ValueError(
+                "coefficients must contain one finite value per feature"
+            )
+        baseFeatureCount = len(self.baseFeatureSpecs)
+        lowCoefficients = complexCoefficients[:baseFeatureCount]
+        middleCoefficients = complexCoefficients[
+            baseFeatureCount : 2 * baseFeatureCount
+        ]
+        highCoefficients = complexCoefficients[
+            2 * baseFeatureCount : 3 * baseFeatureCount
+        ]
+        return float(
+            np.sum(np.abs(middleCoefficients - lowCoefficients) ** 2)
+            + np.sum(np.abs(highCoefficients - middleCoefficients) ** 2)
+        )
+
+    def GetRegionCoefficients(self, regionName: str) -> np.ndarray:
+        """Return one detached regional GMP coefficient vector.
+
+        Processing details:
+            Algorithm: Normalize the requested low, middle, or high name,
+            synchronize live configuration, locate its deterministic
+            region-major block, and return an owned copy without exposing
+            mutable model state.
+
+        Args:
+            regionName: Case-insensitive ``low``, ``middle``, or ``high``.
+
+        Returns:
+            result: Complex coefficient vector in ordinary GMP feature order.
+        """
+
+        if not isinstance(regionName, str):
+            raise TypeError("regionName must be a string")
+        normalizedRegionName = regionName.strip().lower()
+        if normalizedRegionName not in self.regionNames:
+            raise ValueError(
+                "regionName must be 'low', 'middle', or 'high'"
+            )
+        self.SynchronizeStructure()
+        regionIndex = self.regionNames.index(normalizedRegionName)
+        featureCount = len(self.baseFeatureSpecs)
+        blockStart = regionIndex * featureCount
+        return self.coefficients[
+            blockStart : blockStart + featureCount
+        ].copy()
 
 
 class AugmentedDpdGmp(DpdGmp):

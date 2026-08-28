@@ -5,6 +5,7 @@
 - 构造 main、lagging-envelope、leading-envelope GMP 基函数；
 - 从直接标签、ILC 标签或 PA 输入/输出采集训练系数；
 - 用岭正则、峰值权重、多片段权重和增量学习更新系数；
+- 用 `PiecewiseDpdGmp` 对低、中、高瞬时包络区联合训练并平滑混合；
 - 对新波形执行 DPD；
 - 在浮点或定点公开接口下保持一致的复数数组容器。
 
@@ -53,6 +54,7 @@ parameters 外部映射
 | `afterNmseDb` | 更新后对本批标签的加权 NMSE |
 | `regularizedConditionNumber` | 正则化正规矩阵条件数 |
 | `normalizedCoefficientUpdateNorm` | 归一化系数变化的二范数 |
+| `regionSmoothnessPenalty` | 相邻区域原始复系数差的平方和；普通 GMP 为 0 |
 
 `ToDict()` 返回普通字典，便于保存为 JSON 或 CSV。
 
@@ -777,3 +779,85 @@ python tests/BenchMark.py --channel-analyse
 - `channel_analysis.json` 中的 `iqImbalanceStages`。
 
 曲线同时比较 `IQ-impaired PA`、`Conventional GMP` 和 `Augmented GMP`，所有点都由功率闭环校准到相同目标 PA 输出 dBm。
+
+## 18. `PiecewiseDpdGmp` 使用说明
+
+`PiecewiseDpdGmp` 继承普通 `DpdGmp` 的训练入口、定点边界、输出限幅和
+多片段联合拟合，但把每个普通 GMP 特征扩展为 low、middle、high 三组。
+三组不是硬切换：相邻区域通过 $C^2$ smootherstep 权重共同作用，所以训练
+和部署映射在两个包络边界处连续。
+
+### 18.1 新增参数
+
+| 参数 | 默认值 | 约束与作用 |
+|---|---:|---|
+| `envelopeBoundaries` | `(0.25, 0.60)` | 两个严格递增的正归一化包络幅度；分别位于 low/middle 和 middle/high 之间 |
+| `transitionWidths` | `(0.12, 0.18)` | 两个正过渡区的完整宽度；每个过渡以对应边界为中心 |
+| `regionSmoothnessFactor` | `1e-4` | 非负无量纲系数；惩罚 low 到 middle、middle 到 high 的同位置复系数差；0 完全关闭 |
+
+其余参数和第 2 节相同。三个区域当前必须使用同一组
+`nonlinearOrders`、`memoryDepth` 和 `crossMemoryDepth`，这是相邻系数差具有
+一致含义的前提。这里的区域由每个样点的 $|x[n]|$ 选择，不是 10、15、20 dBm
+三套平均功率模型库。
+
+### 18.2 从 ILC 标签联合训练
+
+```python
+from inc.lib.DpdGmp import PiecewiseDpdGmp
+
+piecewiseDpd = PiecewiseDpdGmp(
+    parameters={
+        "nonlinearOrders": (1, 3, 5, 7),
+        "memoryDepth": 3,
+        "crossMemoryDepth": 2,
+        "envelopeBoundaries": (0.25, 0.60),
+        "transitionWidths": (0.12, 0.18),
+        "ridgeFactor": 1.0e-5,
+        "regionSmoothnessFactor": 1.0e-4,
+        "maximumOutputMagnitude": 2.0,
+        "width": 0,
+    }
+)
+
+# learnedInput is the converged PA-input label from the feedback path.
+trainingResult = piecewiseDpd.FitFromIlc(
+    trainingReference,
+    learnedInput,
+)
+
+# Always evaluate deployment on a different frame and the clean channel path.
+validationPredistorted = piecewiseDpd.Process(validationReference)
+validationChOut, validationFbOut = channel.Process(
+    validationPredistorted
+)
+
+print(trainingResult.ToDict())
+print(piecewiseDpd.GetRegionCoefficients("low"))
+print(piecewiseDpd.GetRegionCoefficients("middle"))
+print(piecewiseDpd.GetRegionCoefficients("high"))
+```
+
+若要把多个平均功率点或多帧标签共同拟合，仍使用 `FitSegments`。每个片段的
+因果历史会独立补零，不会把一个功率点的尾部当作下一个功率点的记忆输入。
+
+### 18.3 新增诊断方法
+
+| 方法 | 返回值与用途 |
+|---|---|
+| `CalculateEnvelopeWeights(inputSignal)` | 样点数乘 3 的实权重矩阵；逐行非负且和为 1 |
+| `GetRegionCoefficients(regionName)` | 指定 `low`、`middle` 或 `high` 区域的普通 GMP 顺序系数副本 |
+| `CalculateRegionSmoothnessPenalty(coefficients)` | 相邻区域系数差平方和，用于比较不同正则强度 |
+| `GetFeatureSpecs()` | low、middle、high 区域优先排列的完整特征索引 |
+
+训练结果里的 `regionSmoothnessPenalty` 是诊断量，不是越小越好。如果它趋近
+于零而独立帧 EVM/ACLR 变差，说明三个区域被过度拉平；如果它很大且验证帧在
+边界附近抖动，则可提高 `regionSmoothnessFactor` 或扩大过渡宽度。
+
+### 18.4 单调性和正负号
+
+不要对 `GetRegionCoefficients` 返回的复数数组逐元素排序，也不要强制三段同号。
+相位参考旋转、相关基函数之间的抵消和列尺度都会改变实部/虚部的方向。工程上
+应检查稳态 AM-AM 不折返、AM-PM 连续且斜率有界、DPD 输出峰值受控，以及独立
+帧 EVM/ACLR 没有边界尖峰。完整推导、论文依据和响应级形状约束见
+[DPD-GMP 原理第 17 节](./DPD-GMP.md#17-分段-gmp平滑包络区域与系数正则)和
+[FAQ Q10](./FAQ.md#q10分段gmp的低中高功率系数能否保持单调系数正负号必须相同吗)。

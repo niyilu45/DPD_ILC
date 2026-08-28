@@ -655,6 +655,10 @@ class WaveGenWifi:
         if not isinstance(self.cyclicShiftEnabled, bool):
             raise TypeError("cyclicShiftEnabled must be boolean")
         FixedPoint(self.width)
+        if self.width == 1:
+            raise ValueError(
+                "WaveGenWifi width must be zero or at least two bits"
+            )
 
     def GetMcsInfo(self) -> MCSInfo:
         """Return the MCS record selected by this generator instance.
@@ -1276,8 +1280,9 @@ def GenerateWifiWaveform(config: WaveGenWifi) -> WifiWaveform:
         config: The constructed Wi-Fi generator and all of its PHY settings.
 
     Returns:
-        A ``WifiWaveform`` containing unit-RMS samples, field boundaries,
-        subcarrier allocations, and the transmitted data constellation.
+        A ``WifiWaveform`` containing unit-RMS floating samples or uniformly
+        headroom-scaled fixed-point codes, field boundaries, subcarrier
+        allocations, and the consistently scaled data constellation.
     """
 
     config.Validate()
@@ -1587,6 +1592,49 @@ def GenerateWifiWaveform(config: WaveGenWifi) -> WifiWaveform:
     normalizationScale = 1.0 / max(packetRms, np.finfo(float).tiny)
     packetSamples *= normalizationScale
 
+    # A unit-RMS OFDM packet normally has component peaks well beyond the
+    # normalized signed-I/Q interval. Encoding it directly would silently
+    # saturate those peaks and collapse PAPR. Floating mode retains the public
+    # unit-RMS convention. Fixed mode instead applies one common headroom scale
+    # to every field, antenna, and component before the only public encode.
+    # Respect the asymmetric two's-complement endpoints independently so the
+    # positive peak fits +((2**(width - 1)) - 1) and the negative peak fits
+    # -(2**(width - 1)) without changing waveform shape.
+    interfaceFormat = FixedPoint(config.width)
+    if not interfaceFormat.IsFloatingPoint():
+        formatInfo = interfaceFormat.GetFormatInfo()
+        positiveComponentLimit = float(
+            formatInfo["physicalMaximumValue"]
+        )
+        negativeComponentLimit = abs(
+            float(formatInfo["physicalMinimumValue"])
+        )
+        positiveComponentPeak = max(
+            0.0,
+            float(np.max(packetSamples.real)),
+            float(np.max(packetSamples.imag)),
+        )
+        negativeComponentPeak = max(
+            0.0,
+            float(-np.min(packetSamples.real)),
+            float(-np.min(packetSamples.imag)),
+        )
+        fixedPointScale = min(
+            1.0,
+            positiveComponentLimit
+            / max(positiveComponentPeak, np.finfo(float).tiny),
+            negativeComponentLimit
+            / max(negativeComponentPeak, np.finfo(float).tiny),
+        )
+        if fixedPointScale < 1.0:
+            # Move one floating-point step inward so roundoff in the multiply
+            # cannot place the selected extreme just outside its endpoint.
+            fixedPointScale = float(
+                np.nextafter(fixedPointScale, 0.0)
+            )
+            packetSamples *= fixedPointScale
+            normalizationScale *= fixedPointScale
+
     codedBitsPerSymbol = (
         dataSubcarriers.size
         * bitsPerSubcarrier
@@ -1604,8 +1652,9 @@ def GenerateWifiWaveform(config: WaveGenWifi) -> WifiWaveform:
     # boundary. Every field, OFDM transform, and normalization calculation
     # above remains floating point in both interface modes.
     # Fixed-mode public samples are raw signed I/Q codes stored in complex128.
-    # The generated OFDM envelope above remains normalized floating point.
-    outputSamples = FixedPoint(config.width).EncodeComplex(outputSamples)
+    # The generated OFDM envelope above remains floating point and fixed mode
+    # has already applied its single common component-headroom scale.
+    outputSamples = interfaceFormat.EncodeComplex(outputSamples)
     outputQamSymbols = (
         qamSymbols[:, :, 0]
         if config.numSpatialStreams == 1

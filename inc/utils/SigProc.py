@@ -116,6 +116,17 @@ class PowerCalibration:
         self._paThermalSuspendMethod: Optional[Any] = None
         self._paThermalRestoreMethod: Optional[Any] = None
         self._electricalCalibrationTransactionActive = False
+        self._activeFixedDrivePresetCache: Optional[
+            Tuple[
+                np.ndarray,
+                np.ndarray,
+                np.ndarray,
+                int,
+                float,
+                float,
+                int,
+            ]
+        ] = None
         self._calibrationDriveDbPerChain: Tuple[float, ...] = tuple()
         self._calibrationTargetPowerDbmPerChain: Tuple[
             float, ...
@@ -653,6 +664,10 @@ class PowerCalibration:
         thermalRestoreMethod = self._paThermalRestoreMethod
         thermalSnapshot = None
         suspensionCompleted = False
+        # Never let a completed or externally interrupted transaction seed a
+        # later calibration.  The finally block performs the matching cleanup
+        # on every success and failure path.
+        self._activeFixedDrivePresetCache = None
         self._electricalCalibrationTransactionActive = True
         try:
             thermalSnapshot = (
@@ -667,6 +682,7 @@ class PowerCalibration:
                 if thermalRestoreMethod is not None and suspensionCompleted:
                     thermalRestoreMethod(thermalSnapshot)
             finally:
+                self._activeFixedDrivePresetCache = None
                 self._electricalCalibrationTransactionActive = False
 
     def CalibrateElectricalOnly(
@@ -1030,8 +1046,12 @@ class PowerCalibration:
             create one drive-independent public waveform below the signed I/Q
             limit by ``calibrationDigitalHeadroomDb``. Measure its quantized
             active RMS and place the complete remaining gain after decoding.
-            A legacy plant without that paired interface retains the historical
-            all-digital behavior so third-party callbacks remain compatible.
+            During one active calibration transaction, reuse that preset only
+            while the input identity, width, headroom, active threshold, and
+            active-gap definition all match; give every plant trial a fresh
+            copy and clear the cache on every transaction exit. A legacy plant
+            without that paired interface retains the historical all-digital
+            behavior so third-party callbacks remain compatible.
 
         Args:
             normalizedInput: Unit-active-RMS samples-by-chain matrix.
@@ -1065,10 +1085,38 @@ class PowerCalibration:
 
         digitalDriveScale = requestedDriveScale.copy()
         analogDriveDb = np.zeros(driveVector.size, dtype=float)
-        if (
+        usesFixedAnalogDrive = (
             not interfaceFormat.IsFloatingPoint()
             and self._paCalibrationProcessMethod is not None
-        ):
+        )
+        headroomDb = float(
+            self.parameters["calibrationDigitalHeadroomDb"]
+        )
+        activePowerThresholdDb = float(
+            self.parameters["activePowerThresholdDb"]
+        )
+        activeGapToleranceSamples = int(
+            self.parameters["activeGapToleranceSamples"]
+        )
+        if usesFixedAnalogDrive:
+            cachedPreset = self._activeFixedDrivePresetCache
+            if (
+                cachedPreset is not None
+                and cachedPreset[0] is inputMatrix
+                and cachedPreset[3] == interfaceFormat.width
+                and cachedPreset[4] == headroomDb
+                and cachedPreset[5] == activePowerThresholdDb
+                and cachedPreset[6] == activeGapToleranceSamples
+            ):
+                publicTrialInput = cachedPreset[1].copy()
+                quantizedRmsPerChain = cachedPreset[2]
+                analogDriveDb = driveVector - 20.0 * np.log10(
+                    quantizedRmsPerChain
+                )
+                return (
+                    np.asarray(publicTrialInput, dtype=np.complex128),
+                    np.asarray(analogDriveDb, dtype=float),
+                )
             formatInfo = interfaceFormat.GetFormatInfo()
             maximumNormalizedComponent = float(
                 cast(float, formatInfo["physicalMaximumValue"])
@@ -1087,10 +1135,7 @@ class PowerCalibration:
                 )
             headroomScale = np.power(
                 10.0,
-                -float(
-                    self.parameters["calibrationDigitalHeadroomDb"]
-                )
-                / 20.0,
+                -headroomDb / 20.0,
             )
             digitalDriveScale = (
                 maximumNormalizedComponent
@@ -1100,10 +1145,7 @@ class PowerCalibration:
 
         floatingTrialInput = inputMatrix * digitalDriveScale.reshape(1, -1)
         publicTrialInput = interfaceFormat.EncodeComplex(floatingTrialInput)
-        if (
-            not interfaceFormat.IsFloatingPoint()
-            and self._paCalibrationProcessMethod is not None
-        ):
+        if usesFixedAnalogDrive:
             quantizedTrialInput = interfaceFormat.DecodeComplex(
                 publicTrialInput
             )
@@ -1114,6 +1156,16 @@ class PowerCalibration:
             analogDriveDb = driveVector - 20.0 * np.log10(
                 quantizedRmsPerChain
             )
+            if self._electricalCalibrationTransactionActive:
+                self._activeFixedDrivePresetCache = (
+                    inputMatrix,
+                    publicTrialInput.copy(),
+                    quantizedRmsPerChain.copy(),
+                    interfaceFormat.width,
+                    headroomDb,
+                    activePowerThresholdDb,
+                    activeGapToleranceSamples,
+                )
         return (
             np.asarray(publicTrialInput, dtype=np.complex128),
             np.asarray(analogDriveDb, dtype=float),

@@ -1,13 +1,14 @@
-# 功率放大器模型：Rapp、Wiener、GMP、Doherty与电热特性的物理原理
+# 功率放大器模型：Rapp、Wiener、GMP、分段GMP、Doherty与电热特性的物理原理
 
-本文解释 `inc/lib/PaModel.py` 中功率放大器（Power Amplifier，PA）模型的物理意义、数学来源、参数作用和适用边界。工程支持四类模型：
+本文解释 `inc/lib/PaModel.py` 中功率放大器（Power Amplifier，PA）模型的物理意义、数学来源、参数作用和适用边界。工程支持五类模型：
 
 - **Rapp 模型**：面向固态功率放大器的经典无记忆AM-AM模型；输出样点只依赖同一时刻输入样点；
 - **Wiener 模型**：线性记忆滤波器后接无记忆非线性，直观、参数少；
 - **GMP 模型**：主记忆多项式加包络超前/滞后交叉项，表达能力更强；
+- **分段 GMP 模型**：低、中、高瞬时包络区使用独立 GMP，并通过平滑权重联合输出；
 - **Doherty 模型**：载波PA和峰值PA并联，通过包络门控、支路时延、复合成与简化负载调制描述Doherty架构。
 
-> Rapp、Wiener、GMP和Doherty是复基带“行为电模型”。可选 `ThermalConfig` 在它们外面增加耗散功率、结温和温度参数漂移；它是可辨识的系统级电热模型，不等同于晶体管级可靠性仿真。
+> Rapp、Wiener、GMP、分段GMP和Doherty是复基带“行为电模型”。可选 `ThermalConfig` 在它们外面增加耗散功率、结温和温度参数漂移；它是可辨识的系统级电热模型，不等同于晶体管级可靠性仿真。
 
 > **性能说明**：`GMPPA.Process()`在每次调用内只构造一次实际系数需要的唯一延迟波形和唯一包络幂，同时严格保留原系数项累加顺序与因果补零。它不缓存PA输出或热状态。实现推导和参考耗时见 [Performance.md](./Performance.md#5-pamodel的gmp路径)。
 
@@ -1301,6 +1302,138 @@ print("AM-PM in degrees:", np.asarray(phaseDegrees))
 
 ---
 
+## 4.10 分段 GMP：幅度相关工作区的平滑组合
+
+### 4.10.1 为什么单一 GMP 有时过于理想
+
+普通 GMP 在整个输入幅度范围内使用同一组复系数。若 PA 的小信号区、压缩
+过渡区和高峰值区由不同工作机制主导，例如 Doherty 峰值支路开启、包络跟踪
+电源变化或偏置状态变化，一个全局多项式往往需要更高阶数才能兼顾所有区域。
+更高阶数会增加基函数相关性，并可能让训练区外的响应振荡。
+
+`PiecewiseGMPPA` 把归一化瞬时输入包络
+
+```math
+r[n]=|x[n]|
+```
+
+划分为 low、middle、high 三个重叠区域，每个区域拥有完整的 GMP 系数集。
+这里的“低、中、高”是一个 OFDM 帧内逐样点变化的包络区，不是把不同平均
+输出功率 dBm 的三次采集直接拼成三个区域。
+
+### 4.10.2 $C^2$ 软门控
+
+默认边界为 $b_1=0.25$、$b_2=0.60$，完整过渡宽度为
+$\Delta_1=0.12$、$\Delta_2=0.18$。对每个边界先计算
+
+```math
+z_i(r)
+=
+\mathrm{clip}
+\left(
+\frac{r-(b_i-\Delta_i/2)}{\Delta_i},
+0,
+1
+\right),
+```
+
+再使用
+
+```math
+S(z)=6z^5-15z^4+10z^3.
+```
+
+三个权重为
+
+```math
+w_L=1-S(z_1),
+```
+
+```math
+w_M=S(z_1)[1-S(z_2)],
+```
+
+```math
+w_H=S(z_1)S(z_2).
+```
+
+它们非负且逐样点和为 1。`smootherstep` 在过渡两端的一阶、二阶导数均为
+零，因此区域系数不同也不会形成硬切换。设第 $q$ 区 GMP 为 $F_q(x)$，输出为
+
+```math
+y[n]
+=
+w_L(r[n])F_L(x)[n]
++w_M(r[n])F_M(x)[n]
++w_H(r[n])F_H(x)[n].
+```
+
+实现没有把三套 `GMPPA.Process` 简单串行运行。它先收集所有区域实际使用的
+延迟和包络幂，只计算一次共同基函数，再把区域系数写成“第一区系数加相邻差分”
+进行累加，所以仍保持因果补零和确定性，同时避免三次重复构造大数组。
+
+### 4.10.3 默认区域与自定义区域
+
+默认 `regionConfigs=None` 时，三个区域共同采用 `(1,3,5)` 阶、主记忆深度 2、
+交叉记忆深度 1。低区稍接近线性，中区保持基准压缩，高区增加 AM-PM 和动态
+记忆强度；默认恒包络 AM-AM 在 $0\leq r\leq2$ 内保持不折返。默认值用于构造
+比纯全局 GMP 更难、但仍可逆的无噪行为 plant，不代表某一颗器件的实测系数。
+
+调用方也可以给每个区域提供独立 `GMPConfig`：
+
+```python
+from inc.lib.PaModel import (
+    GMPConfig,
+    PaModel,
+    PiecewiseGMPConfig,
+)
+
+regionConfigs = (
+    GMPConfig(
+        nonlinearOrders=(1, 3, 5),
+        memoryDepth=2,
+        crossMemoryDepth=1,
+    ),
+    GMPConfig(
+        nonlinearOrders=(1, 3, 5, 7),
+        memoryDepth=3,
+        crossMemoryDepth=2,
+    ),
+    GMPConfig(
+        nonlinearOrders=(1, 3, 5, 7),
+        memoryDepth=4,
+        crossMemoryDepth=2,
+    ),
+)
+
+piecewisePa = PaModel(
+    modelName="piecewise_gmp",
+    piecewiseGmpConfig=PiecewiseGMPConfig(
+        regionBoundaries=(0.25, 0.60),
+        transitionWidths=(0.12, 0.18),
+        regionConfigs=regionConfigs,
+    ),
+    width=0,
+)
+
+paOutput = piecewisePa.Process(paInput)
+```
+
+`regionBoundaries` 必须严格递增，`transitionWidths` 必须逐项为正，且显式
+`regionConfigs` 的数量必须等于边界数加一。允许过渡区重叠，因为层级权重仍
+保持非负和单位和。
+
+### 4.10.4 系数能否单调
+
+不要求同一 GMP 项在 low、middle、high 之间单调，也不要求复系数同号。
+复数没有自然全序；相位参考旋转、相关基函数之间的抵消、列归一化和区域样本
+分布都可能让单个系数变号，而总 AM-AM/AM-PM 仍平滑。应约束和验收的是稳态
+输出幅度不折返、相位连续且斜率有界、过渡区没有异常谱再生，以及独立帧上的
+EVM/ACLR。论文依据、相邻区域差分正则和慢状态插值方案见
+[FAQ Q10](./FAQ.md#q10分段gmp的低中高功率系数能否保持单调系数正负号必须相同吗)。
+
+---
+
 ## 5. 非线性为什么会产生邻道频谱再生
 
 考虑两个复音调
@@ -1415,19 +1548,21 @@ w_I,w_Q\sim\mathcal N\left(0,\frac{P_n}{2}\right).
 
 ---
 
-## 9. 四类模型的选择
+## 9. 五类模型的选择
 
-| 对比项 | Rapp | Wiener | GMP | Doherty |
-|---|---|---|---|---|
-| 结构 | 单样点静态AM-AM | FIR后接静态非线性 | 多阶、多延迟、交叉包络基函数并联 | Carrier与Peaking两条行为PA并联合成 |
-| 参数数量 | 最少，3个 | 少 | 较多 | 取决于两条支路模型 |
-| 物理直觉 | 纯SSPA软压缩 | 很直观 | 需要基函数理解 | 直接对应双支路开启和合成 |
-| 动态非线性表达力 | 无 | 中等、结构受限 | 强 | 两支路可各自使用Wiener或GMP |
-| 系数辨识 | 静态AM-AM拟合 | 非线性参数拟合可能较复杂 | 对系数线性，可最小二乘 | 需要分别辨识支路及开启/合成参数 |
-| 计算量 | 最低 | 较低 | 随阶次/记忆/交叉深度增加 | 约为两条所选支路之和 |
-| 适合用途 | 无记忆基线、静态压缩和算法归因 | 算法原理验证、可解释压缩曲线 | 宽带PA行为拟合、DPD基函数验证 | Doherty架构、支路失配和开启区研究 |
+| 对比项 | Rapp | Wiener | GMP | 分段GMP | Doherty |
+|---|---|---|---|---|---|
+| 结构 | 单样点静态AM-AM | FIR后接静态非线性 | 多阶、多延迟、交叉包络基函数并联 | 多区域GMP经软门控联合 | Carrier与Peaking两条行为PA并联合成 |
+| 参数数量 | 最少，3个 | 少 | 较多 | 约为各区域非零项之和 | 取决于两条支路模型 |
+| 物理直觉 | 纯SSPA软压缩 | 很直观 | 需要基函数理解 | 对应幅度相关工作区 | 直接对应双支路开启和合成 |
+| 动态非线性表达力 | 无 | 中等、结构受限 | 强 | 强，并能表达区域变化 | 两支路可各自使用Wiener或GMP |
+| 系数辨识 | 静态AM-AM拟合 | 非线性参数拟合可能较复杂 | 对系数线性，可最小二乘 | 联合最小二乘并做区域平滑 | 需要分别辨识支路及开启/合成参数 |
+| 计算量 | 最低 | 较低 | 随阶次/记忆/交叉深度增加 | 共享基函数后高于稀疏单一GMP | 约为两条所选支路之和 |
+| 适合用途 | 无记忆基线、静态压缩和算法归因 | 算法原理验证、可解释压缩曲线 | 宽带PA行为拟合、DPD基函数验证 | Doherty、ET等幅度分区行为和模型失配验证 | Doherty架构、支路失配和开启区研究 |
 
-建议：先用Rapp隔离纯静态压缩，再用Wiener观察简单线性记忆和AM-PM，再用GMP检查宽带动态非线性，最后用Doherty研究载波/峰值支路切换、失配和合成对DPD的影响。
+建议：先用Rapp隔离纯静态压缩，再用Wiener观察简单线性记忆和AM-PM；用
+GMP验证基础宽带动态非线性；需要让PA与普通全局GMP DPD存在可控结构失配时
+使用分段GMP；需要研究载波/峰值支路物理开启与合成时再使用Doherty。
 
 ---
 
@@ -1451,7 +1586,7 @@ z_m[n]
 =b_m\,f_m\!\left(a_m x_m[n]\right),
 ```
 
-其中 $f_m(\cdot)$ 可以是该路自己的Rapp、Wiener、GMP或Doherty模型，输入和输出幅度标尺分别为
+其中 $f_m(\cdot)$ 可以是该路自己的Rapp、Wiener、GMP、分段GMP或Doherty模型，输入和输出幅度标尺分别为
 
 ```math
 a_m=10^{G_{\mathrm{in},m}/20},
@@ -1473,7 +1608,7 @@ $r_m$ 是复包络 RMS。比如 `outputPowerDbPerChain=(0,-3,-6)` 会让三路�
 flowchart LR
     matrix["输入矩阵 X"] --> split["按列拆分"]
     split --> in0["输入 dB：aₘ"]
-    in0 --> pa0["独立 fₘ：Rapp/Wiener/GMP/Doherty"]
+    in0 --> pa0["独立 fₘ：Rapp/Wiener/GMP/分段GMP/Doherty"]
     pa0 --> out0["输出 dB：bₘ"]
     out0 --> target{"启用绝对 dBm?"}
     target -->|否| column["zₘ"]
@@ -1666,6 +1801,11 @@ classDiagram
         +Process(inputSignal)
         +SmallSignalGain()
     }
+    class PiecewiseGMPConfig
+    class PiecewiseGMPPA {
+        +Process(inputSignal)
+        +SmallSignalGain()
+    }
     class DohertyConfig
     class DohertyPA {
         +BuildBranchModel(modelName, wienerConfig, gmpConfig)
@@ -1712,17 +1852,20 @@ classDiagram
     PaModel --> RappPA : modelName=rapp
     PaModel --> WienerPA : modelName=wiener
     PaModel --> GMPPA : modelName=gmp
+    PaModel --> PiecewiseGMPPA : modelName=piecewise_gmp
     PaModel --> DohertyPA : modelName=doherty
     RappPA --> RappConfig
     WienerPA --> WienerConfig
     GMPPA --> GMPConfig
+    PiecewiseGMPPA --> PiecewiseGMPConfig
+    PiecewiseGMPPA o-- GMPPA : one model per region
     DohertyPA --> DohertyConfig
     DohertyPA o-- WienerPA : carrier or peaking
     DohertyPA o-- GMPPA : carrier or peaking
     IQImbalancePA o-- PaModel : wraps
 ```
 
-**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Rapp、Wiener、GMP或Doherty。Doherty的Carrier和Peaking又各自选择Wiener或GMP。`ThermalConfig.Recommended` 为static、single_rc和foster返回完整可运行的模型专用起点，`Validate` 继续负责物理边界校验。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口；它把公共周期作为原子热事务，任何一路处理或互热迭代失败都会恢复全部PA的周期前状态和旧metrics。`IQImbalancePA` 不只代理普通 `Process`，还透明代理周期热处理、热状态暂停/恢复、metrics、实际占空比、复位和额外空闲，因此用它包装热PA不会让Channel误判为无热模型。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
+**图 8 说明**：`PaModel` 是统一面向对象入口，内部选择Rapp、Wiener、GMP、分段GMP或Doherty。分段GMP共享基函数并按包络权重混合区域系数；Doherty的Carrier和Peaking又各自选择Wiener或GMP。`ThermalConfig.Recommended` 为static、single_rc和foster返回完整可运行的模型专用起点，`Validate` 继续负责物理边界校验。`MimoPaModel` 按物理链持有多个 `PaModel`，并提供内部浮点矩阵入口；它把公共周期作为原子热事务，任何一路处理或互热迭代失败都会恢复全部PA的周期前状态和旧metrics。`IQImbalancePA` 不只代理普通 `Process`，还透明代理周期热处理、热状态暂停/恢复、metrics、实际占空比、复位和额外空闲，因此用它包装热PA不会让Channel误判为无热模型。`PowerCalibration` 位于 `SigProc.py`，可以绑定任意具有 `Process` 接口的PA或完整耦合plant，通过闭环输入驱动校准设置真实输出dBm；普通用户由Channel间接使用它，`Analysis` 无需因此导入 `PaModel.py`。
 
 需要区分实验室前向仪表与板载反馈接收机时，完整Channel会在同一次PA计算和同一个热周期上公开返回 `(chOut, fbOut)`。前者始终跳过反馈专用非理想，用于最终EVM、SNR、ACLR、IRR和功率评价；默认 `sampleMode="forward"` 时后者只是前者的数值相同副本。显式设置 `sampleMode="fb"` 后，第二项才从公共PA后节点增加反馈FIR、时频偏、I/Q/DC、接收机非线性、限幅、独立噪声和ADC量化，用于板载反馈DPD/ILC同步、MSE和更新。兼容单输出入口仍按该参数选路。反馈链参数属于观察接收机，不属于PA模型系数，不能写入Wiener或GMP来混合拟合。
 
@@ -1783,7 +1926,7 @@ dohertyOutput = paModel.Process(inputSignal)
 ```
 
 `PaModel` 的公开构造签名为
-`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收I/Q整数码，解码后先应用最近一次成功功率校准提交的模拟驱动，再使用Rapp、Wiener、GMP或Doherty模型计算，最后把结果编码回整数码。未运行功率校准时该驱动为0 dB，所以原有直接调用行为不变。公开返回容器始终是 `numpy.complex128`：
+`PaModel(modelName=None, rappConfig=None, wienerConfig=None, gmpConfig=None, piecewiseGmpConfig=None, dohertyConfig=None, thermalConfig=None, parameters=None, width=None, **parameterOverrides)`。`width=0` 旁路码值转换；默认 `width=16`。`Process` 在定点模式下接收I/Q整数码，解码后先应用最近一次成功功率校准提交的模拟驱动，再使用选定电模型计算，最后把结果编码回整数码。未运行功率校准时该驱动为0 dB，所以原有直接调用行为不变。公开返回容器始终是 `numpy.complex128`：
 
 ```python
 from inc.lib.PaModel import PaModel
@@ -1863,7 +2006,7 @@ flowchart LR
 
 | 现象 | 常见时间尺度 | 本工程中的位置 | 能否由短波形直接识别 |
 |---|---:|---|---|
-| 瞬时AM-AM、AM-PM | 亚采样到若干采样 | Rapp/Wiener/GMP/Doherty电模型 | 可以 |
+| 瞬时AM-AM、AM-PM | 亚采样到若干采样 | Rapp/Wiener/GMP/分段GMP/Doherty电模型 | 可以 |
 | 匹配网络与偏置电记忆 | 数ns到数us | FIR或GMP记忆项 | 可以，但需要足够带宽 |
 | 芯片和封装快热 | 数us到数ms | Foster快速支路 | 需要连续突发或功率阶跃 |
 | PCB、底板和散热器慢热 | 数ms到数s以上 | Foster慢速支路 | 需要更长采集和明确空闲时间 |
@@ -1875,7 +2018,7 @@ flowchart LR
 
 ![PA电热参数作用位置](./images/pa_thermal/thermal_parameter_map.png)
 
-图示说明：现有Rapp、Wiener、GMP或Doherty仍先计算基础电响应；归一化输出通过参考dBm和效率模型换成耗散功率，热网络将其积累为结温，结温再调制下一热更新区间的增益、相位、饱和尺度和非线性强度。即使基础Rapp电模型严格无记忆，外接热网络后，结温状态也会让整个电热系统具有慢记忆。
+图示说明：现有Rapp、Wiener、GMP、分段GMP或Doherty仍先计算基础电响应；归一化输出通过参考dBm和效率模型换成耗散功率，热网络将其积累为结温，结温再调制下一热更新区间的增益、相位、饱和尺度和非线性强度。即使基础Rapp电模型严格无记忆，外接热网络后，结温状态也会让整个电热系统具有慢记忆。
 
 本工程在公开功率校准入口中严格分离两个阶段，调用方只看见一次函数调用：
 
@@ -2143,7 +2286,7 @@ T_j-T_{\mathrm{ref}}
 
 它的优点是RF波形拟合精度高，适合给DPD生成温度相关训练数据；缺点是参数数目约随温度基函数数量成倍增加，要求多温度、同参考面、同功率定义的I/Q数据。温度与输入包络高度相关时，普通最小二乘还可能无法区分“电记忆项”和“温度项”，需要多种突发周期与占空比来提高可辨识性。
 
-当前 `ApplyTemperatureDrift` 是温度条件化GMP的低阶近似：它在完整Rapp/Wiener/GMP/Doherty输出外统一施加增益、相位、饱和和附加压缩。若实测表明不同GMP阶次具有明显不同的温度斜率，才建议升级为逐系数温度条件化。
+当前 `ApplyTemperatureDrift` 是温度条件化GMP的低阶近似：它在完整Rapp/Wiener/GMP/分段GMP/Doherty输出外统一施加增益、相位、饱和和附加压缩。若实测表明不同GMP阶次具有明显不同的温度斜率，才建议升级为逐系数温度条件化。
 
 #### 13.2.7 神经网络电热模型
 
@@ -2766,7 +2909,7 @@ measuredSingleRcConfig = ThermalConfig.Recommended(
 |---|---|---|
 | `ambientTemperatureC` | `25.0` | 使用实际冷板、壳体或环境传感器值；温箱扫描逐点修改 |
 | `initialJunctionTemperatureC` | 动态冷启动等于环境温度；静态角使用 `25/55/85` | 预热设备使用测试开始时估计或测得结温 |
-| `referenceTemperatureC` | `25.0` | 等于基础Rapp/Wiener/GMP/Doherty系数采集温度，不等于任意环境温度 |
+| `referenceTemperatureC` | `25.0` | 等于基础Rapp/Wiener/GMP/分段GMP/Doherty系数采集温度，不等于任意环境温度 |
 | `maximumJunctionTemperatureC` | 无器件资料时仿真起点 `150.0` | 使用数据手册额定结温并加入项目降额；该值是停止边界，不是温控器 |
 
 热源与效率参数建议如下：
@@ -2837,7 +2980,7 @@ MIMO互热参数 `thermalCouplingCPerW` 不属于 `ThermalConfig`，但同样需
 
 - **图A：`sampleRateHz`和 `thermalUpdateIntervalSamples`**共同决定一次热更新对应的真实时间。更新样点数不变时，采样率越高，物理更新时间越短；因此把同一配置直接搬到不同采样率会改变热过程。
 - **图B：`activePowerThresholdDb`**相对于当前波形峰值判定RF开启区。门限提高会把更多低包络样点当成空闲并使用 `idleDissipatedPowerW`；门限过低则可能把噪声底或数值残留当成RF开启。
-- **图C：`referenceTemperatureC`**移动所有温度电系数的零交点，但不改变热网络预测的真实结温。它应等于基础Rapp/Wiener/GMP/Doherty系数采集或拟合时的温度。
+- **图C：`referenceTemperatureC`**移动所有温度电系数的零交点，但不改变热网络预测的真实结温。它应等于基础Rapp/Wiener/GMP/分段GMP/Doherty系数采集或拟合时的温度。
 - **图D：`maximumJunctionTemperatureC`**只是仿真停止边界，不会剪切、压低或稳定其下的结温曲线。降低上限只会使同一发热轨迹更早报错，不能代替功率降额或温控模型。
 
 时间换算关系为：

@@ -13,7 +13,11 @@ trainingSignal = fbOut
 finalMetrics = resultAnalysis.Analyze(chOut)
 ```
 
-精确理想的I/Q级、0度公共移相、单位FB线性响应、无FB三阶/限幅和0 dB模拟drive现在使用独立数组旁路；非理想配置、随机噪声、热状态和闭环校准仍在每次调用中真实执行。旁路条件、状态边界和参考耗时见 [Performance.md](./Performance.md#6-channel理想级旁路)。
+精确理想的I/Q级、0度公共移相、单位FB线性响应、无FB三阶/限幅和0 dB模拟drive使用单位变换旁路；独立调用辅助函数时仍返回防御性副本，一次公开处理事务内部则允许复用已验证的临时数组，最终 `chOut`、`fbOut` 和用户输入始终内存独立。非理想配置、随机噪声、热状态和闭环校准仍在每次调用中真实执行。旁路条件、状态边界和参考耗时见 [Performance.md](./Performance.md#6-channel理想级旁路)。
+
+为了处理长帧，`Process`、`ProcessFloating`、`ProcessPaOutput`、`ProcessOutputPathsFloating`、`ProcessNormalizedOutputPaths` 和 `CalibratePaInput` 在公开入口只完整校验一次实时ChainMap与输入波形。嵌套级不再对相同数组反复扫描有限值，但PA返回值和公开输出边界仍强制检查；任何异常都通过 `finally` 恢复事务状态。定点功率闭环还会在单次校准内复用drive无关的合法DAC预设及其量化活动RMS，热稳态求解则在一个周期内复用已验证热常数和未合并区间。所有复用都在本次事务结束时失效，下一次调用仍读取外部mapping的新值。具体等价性边界与基准见 [Performance.md](./Performance.md#61-单次channel校验事务)。
+
+一个Channel实例含有随机数、PA记忆、热状态和校准事务，不支持并发调用，也不支持第三方PA回调重入同一实例的公开Channel方法。同一进程需要并行处理多条独立链路时，应为每个worker创建独立的Channel及PA实例；顺序调用同一实例仍按设计连续推进噪声与温度历史。
 
 ```mermaid
 flowchart LR

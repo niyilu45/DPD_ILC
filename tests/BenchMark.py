@@ -187,10 +187,12 @@ class BenchmarkConfig:
             "rapp",
             "wiener",
             "gmp",
+            "piecewise_gmp",
             "doherty",
         ):
             raise ValueError(
-                "paModelName must be 'rapp', 'wiener', 'gmp', or 'doherty'"
+                "paModelName must be 'rapp', 'wiener', 'gmp', "
+                "'piecewise_gmp', or 'doherty'"
             )
         if (
             not isinstance(self.seed, int)
@@ -297,10 +299,12 @@ class TwoToneBenchmarkConfig:
             "rapp",
             "wiener",
             "gmp",
+            "piecewise_gmp",
             "doherty",
         ):
             raise ValueError(
-                "paModelName must be 'rapp', 'wiener', 'gmp', or 'doherty'"
+                "paModelName must be 'rapp', 'wiener', 'gmp', "
+                "'piecewise_gmp', or 'doherty'"
             )
         if (
             not isinstance(self.numIterations, int)
@@ -568,15 +572,22 @@ class PaCharacterizationConfig:
         if (
             not self.paModelNames
             or any(
-                modelName not in ("rapp", "wiener", "gmp", "doherty")
+                modelName
+                not in (
+                    "rapp",
+                    "wiener",
+                    "gmp",
+                    "piecewise_gmp",
+                    "doherty",
+                )
                 for modelName in normalizedModelNames
             )
             or len(set(normalizedModelNames))
             != len(normalizedModelNames)
         ):
             raise ValueError(
-                "paModelNames must contain unique Rapp, Wiener, GMP, or "
-                "Doherty names"
+                "paModelNames must contain unique Rapp, Wiener, GMP, "
+                "piecewise GMP, or Doherty names"
             )
         for centerFrequencyHz in (
             self.frequencyCentersHz[0],
@@ -6731,7 +6742,13 @@ def ParseBenchmarkArguments() -> Union[
     argumentParser.add_argument(
         "--pa",
         dest="paModelName",
-        choices=("rapp", "wiener", "gmp", "doherty"),
+        choices=(
+            "rapp",
+            "wiener",
+            "gmp",
+            "piecewise_gmp",
+            "doherty",
+        ),
         default="wiener",
     )
     argumentParser.add_argument(

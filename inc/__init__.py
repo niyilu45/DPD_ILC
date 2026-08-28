@@ -15,6 +15,8 @@ from .lib.PaModel import (
     GMPPA,
     MimoPaModel,
     PaModel,
+    PiecewiseGMPConfig,
+    PiecewiseGMPPA,
     RappConfig,
     RappPA,
     WienerPA,
@@ -53,6 +55,7 @@ from .lib.DpdGmp import (
     CouplingAwareDpdGmpTrainingResult,
     DpdGmp,
     DpdGmpTrainingResult,
+    PiecewiseDpdGmp,
 )
 from .lib.DpdLms import DpdLms, DpdLmsTrainingResult
 from .utils.Draw import Draw

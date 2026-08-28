@@ -201,6 +201,7 @@ class Channel:
         ] = None
         self._activeRandomSeed: Optional[int] = None
         self._randomGenerator = np.random.default_rng()
+        self._trustedProcessingDepth = 0
         self.ValidateParameters()
         self.SynchronizeRandomGenerator(forceReset=True)
         if paModel is not None:
@@ -343,7 +344,7 @@ class Channel:
         previousSeed = self._activeRandomSeed
         self.parameters.maps[0].update(recognizedOverrides)
         try:
-            self.ValidateParameters()
+            self.ValidateParameters(forceValidation=True)
             self.SynchronizeRandomGenerator()
         except (TypeError, ValueError):
             self.parameters.maps[0].clear()
@@ -382,7 +383,7 @@ class Channel:
         ):
             self.ResetFeedbackIqCalibration()
 
-    def ValidateParameters(self) -> None:
+    def ValidateParameters(self, forceValidation: bool = False) -> None:
         """Validate phase, noise, physical scaling, seed, and interface width.
 
         Processing details:
@@ -390,11 +391,24 @@ class Channel:
             restrict phase to minus 90, zero, or plus 90 degrees, enforce
             mutual exclusion of the three noise controls, check all physical
             scalars for finite values and valid domains, then use
-            ``FixedPoint`` as the authoritative width validator.
+            ``FixedPoint`` as the authoritative width validator. Nested
+            processing stages may reuse the public entry's proof; explicit
+            transactional updates force a fresh validation before commit.
+
+        Args:
+            forceValidation: True when a state-changing API must validate even
+                if it is invoked from a processing callback.
 
         Returns:
             result: None. Invalid recognized settings raise an exception.
         """
+
+        if self._trustedProcessingDepth > 0 and not forceValidation:
+            # A public processing entry validates the live ChainMap once.
+            # Nested stages run synchronously on that accepted configuration;
+            # repeating this full cross-parameter validation at every stage
+            # only rescans the same values and FIR/coupling structures.
+            return
 
         for layerIndex, parameterLayer in enumerate(
             self.parameters.maps[:2]
@@ -1232,20 +1246,26 @@ class Channel:
         """
 
         self.ValidateParameters()
-        # Direct CalibratePaInput and PrepareThermalTest callers must receive
-        # the same pre-transaction reference-plane checks as Process callers.
-        self.ValidateThermalReferencePlanes()
-        powerCalibration = self.ConfigurePowerCalibration(outputPowerDbm)
-        # PowerCalibration owns the common thermal transaction so the same
-        # reference-temperature behavior also applies to direct calibrator use.
-        calibratedInput = powerCalibration.Calibrate(inputSignal)
-        scalarTarget, perChainTargets = self.ResolveCalibrationTargets(
-            outputPowerDbm
-        )
-        self._lastCalibrationOutputPowerDbm = (
-            scalarTarget if perChainTargets is None else perChainTargets
-        )
-        return calibratedInput
+        preparedInput = self.PrepareSignal(inputSignal, "inputSignal")
+        self._trustedProcessingDepth += 1
+        try:
+            # Direct CalibratePaInput and PrepareThermalTest callers must
+            # receive the same pre-transaction reference-plane checks as
+            # Process callers.
+            self.ValidateThermalReferencePlanes()
+            powerCalibration = self.ConfigurePowerCalibration(outputPowerDbm)
+            # PowerCalibration owns the common thermal transaction so the same
+            # reference-temperature behavior applies to direct calibrator use.
+            calibratedInput = powerCalibration.Calibrate(preparedInput)
+            scalarTarget, perChainTargets = self.ResolveCalibrationTargets(
+                outputPowerDbm
+            )
+            self._lastCalibrationOutputPowerDbm = (
+                scalarTarget if perChainTargets is None else perChainTargets
+            )
+            return calibratedInput
+        finally:
+            self._trustedProcessingDepth -= 1
 
     def PrepareThermalTest(
         self,
@@ -1561,7 +1581,7 @@ class Channel:
             )
         interfaceFormat = FixedPoint(self.width)
         normalizedInput = interfaceFormat.DecodeComplex(
-            self.ValidateSignal(inputSignal, "inputSignal")
+            self.PrepareSignal(inputSignal, "inputSignal")
         )
         drivenInput = self.ApplyCalibrationDrive(normalizedInput)
         transmitterOutput = self.ApplyTransmitterIqImbalance(drivenInput)
@@ -1980,6 +2000,41 @@ class Channel:
             )
         return complexSignal
 
+    def PrepareSignal(
+        self,
+        inputSignal: np.ndarray,
+        signalName: str,
+        forceValidation: bool = False,
+    ) -> np.ndarray:
+        """Prepare a waveform for one validated processing transaction.
+
+        Processing details:
+            Algorithm: Preserve the public ``ValidateSignal`` contract at an
+            outer entry or for an external PA callback. Nested synchronous
+            Channel stages reuse that finite-value proof and only retain the
+            constant-time shape checks, avoiding repeated full-array scans.
+
+        Args:
+            inputSignal: Public or normalized complex samples.
+            signalName: Human-readable name used in validation messages.
+            forceValidation: True for data returned by an external plant.
+
+        Returns:
+            result: Complex128 vector or matrix with unchanged shape.
+        """
+
+        complexSignal = np.asarray(inputSignal, dtype=np.complex128)
+        if complexSignal.ndim not in (1, 2):
+            raise ValueError(f"{signalName} must be a vector or matrix")
+        if complexSignal.size == 0:
+            raise ValueError(f"{signalName} cannot be empty")
+        if forceValidation or self._trustedProcessingDepth == 0:
+            if not np.all(np.isfinite(complexSignal)):
+                raise ValueError(
+                    f"{signalName} contains NaN or infinite values"
+                )
+        return complexSignal
+
     def ResolveCouplingPaths(
         self,
         parameterName: str,
@@ -2295,7 +2350,7 @@ class Channel:
             result: Same-shape waveform after additive complex coupling.
         """
 
-        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        complexInput = self.PrepareSignal(inputSignal, "inputSignal")
         inputWasVector = complexInput.ndim == 1
         inputMatrix = (
             complexInput.reshape(-1, 1)
@@ -2305,6 +2360,12 @@ class Channel:
         couplingPaths = self.ResolveCouplingPaths(
             parameterName, inputMatrix.shape[1]
         )
+        if not couplingPaths:
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
         outputMatrix = inputMatrix.copy()
         for couplingPath in couplingPaths:
             sourceChain = int(couplingPath["sourceChain"])
@@ -2391,7 +2452,7 @@ class Channel:
                 DC terms.
         """
 
-        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        complexInput = self.PrepareSignal(inputSignal, "inputSignal")
         directCoefficient, imageCoefficient = (
             self.ResolveIqImbalanceCoefficients(
                 gainImbalanceDb,
@@ -2440,7 +2501,11 @@ class Channel:
             # An enabled but ideal I/Q stage is physically an identity. Keep
             # the public method's independent-array behavior while avoiding a
             # conjugate array and three full-waveform arithmetic passes.
-            return complexInput.copy()
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
         inputWasVector = complexInput.ndim == 1
         inputMatrix = (
             complexInput.reshape(-1, 1)
@@ -2630,10 +2695,12 @@ class Channel:
 
         self.ValidateParameters()
         if not bool(self.parameters["txIqImbalanceEnabled"]):
-            return np.asarray(
-                self.ValidateSignal(inputSignal, "inputSignal"),
-                dtype=np.complex128,
-            ).copy()
+            complexInput = self.PrepareSignal(inputSignal, "inputSignal")
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
         return self.ApplyIqImbalanceStage(
             inputSignal,
             float(self.parameters["txIqGainImbalanceDb"]),
@@ -2790,7 +2857,7 @@ class Channel:
             raise RuntimeError(
                 "ResolveSnrNoiseRmsPerChain requires noiseSnrDb"
             )
-        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        complexInput = self.PrepareSignal(inputSignal, "inputSignal")
         activePowerDetector = PowerCalibration(
             parameters={
                 "activePowerThresholdDb": self.parameters[
@@ -2834,12 +2901,16 @@ class Channel:
         """
 
         self.ValidateParameters()
-        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        complexInput = self.PrepareSignal(inputSignal, "inputSignal")
         phaseRadians = np.deg2rad(
             float(cast(float, self.parameters["phaseDegrees"]))
         )
         if phaseRadians == 0.0:
-            return complexInput.copy()
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
         phaseFactor = np.exp(1j * phaseRadians)
         return np.asarray(
             complexInput * phaseFactor, dtype=np.complex128
@@ -2863,7 +2934,17 @@ class Channel:
             result: Normalized samples including the configured white noise.
         """
 
-        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        complexInput = self.PrepareSignal(inputSignal, "inputSignal")
+        if (
+            self.parameters["noiseSnrDb"] is None
+            and self.parameters["noiseAmpMv"] is None
+            and self.parameters["noisePwrDbm"] is None
+        ):
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
         self.SynchronizeRandomGenerator()
         noiseSnrDb = self.parameters["noiseSnrDb"]
         if noiseSnrDb is None:
@@ -2931,7 +3012,7 @@ class Channel:
             result: Feedback analog signal after linear path distortion.
         """
 
-        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        complexInput = self.PrepareSignal(inputSignal, "inputSignal")
         inputWasVector = complexInput.ndim == 1
         inputMatrix = (
             complexInput.reshape(-1, 1)
@@ -2949,7 +3030,11 @@ class Channel:
             and feedbackGainDb == 0.0
             and feedbackPhaseDegrees == 0.0
         ):
-            return complexInput.copy()
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
         filteredMatrix = np.empty_like(inputMatrix)
         for chainIndex in range(inputMatrix.shape[1]):
             filteredMatrix[:, chainIndex] = np.convolve(
@@ -2999,7 +3084,7 @@ class Channel:
         """
 
         self.ValidateParameters()
-        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        complexInput = self.PrepareSignal(inputSignal, "inputSignal")
         thirdOrderCoefficient = complex(
             self.parameters["fbThirdOrderCoefficient"]
         )
@@ -3008,7 +3093,11 @@ class Channel:
             thirdOrderCoefficient == 0.0 + 0.0j
             and clipAmplitudeValue is None
         ):
-            return complexInput.copy()
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
         nonlinearOutput = complexInput + (
             thirdOrderCoefficient
             * np.abs(complexInput) ** 2
@@ -3049,7 +3138,7 @@ class Channel:
         """
 
         self.ValidateParameters()
-        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        complexInput = self.PrepareSignal(inputSignal, "inputSignal")
         inputWasVector = complexInput.ndim == 1
         inputMatrix = (
             complexInput.reshape(-1, 1)
@@ -3057,7 +3146,6 @@ class Channel:
             else complexInput
         )
         sampleCount = inputMatrix.shape[0]
-        nominalPositions = np.arange(sampleCount, dtype=float)
         samplingOffsetRatio = (
             float(self.parameters["fbSamplingFrequencyOffsetPpm"])
             * 1.0e-6
@@ -3065,6 +3153,24 @@ class Channel:
         fractionalDelay = float(
             self.parameters["fbFractionalDelaySamples"]
         )
+        integerDelay = int(
+            self.parameters["fbIntegerDelaySamples"]
+        )
+        carrierFrequencyOffsetHz = float(
+            self.parameters["fbCarrierFrequencyOffsetHz"]
+        )
+        if (
+            samplingOffsetRatio == 0.0
+            and fractionalDelay == 0.0
+            and integerDelay == 0
+            and carrierFrequencyOffsetHz == 0.0
+        ):
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
+        nominalPositions = np.arange(sampleCount, dtype=float)
         sourcePositions = (
             nominalPositions * (1.0 + samplingOffsetRatio)
             - fractionalDelay
@@ -3092,9 +3198,6 @@ class Channel:
                         right=0.0,
                     )
                 )
-        integerDelay = int(
-            self.parameters["fbIntegerDelaySamples"]
-        )
         if integerDelay > 0:
             delayedMatrix = np.zeros_like(resampledMatrix)
             if integerDelay < sampleCount:
@@ -3103,9 +3206,6 @@ class Channel:
                 ]
         else:
             delayedMatrix = resampledMatrix
-        carrierFrequencyOffsetHz = float(
-            self.parameters["fbCarrierFrequencyOffsetHz"]
-        )
         if carrierFrequencyOffsetHz != 0.0:
             carrierPhasor = np.exp(
                 1j
@@ -3144,10 +3244,12 @@ class Channel:
 
         self.ValidateParameters()
         if not bool(self.parameters["fbIqImbalanceEnabled"]):
-            return np.asarray(
-                self.ValidateSignal(inputSignal, "inputSignal"),
-                dtype=np.complex128,
-            ).copy()
+            complexInput = self.PrepareSignal(inputSignal, "inputSignal")
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
         return self.ApplyIqImbalanceStage(
             inputSignal,
             float(self.parameters["fbIqGainImbalanceDb"]),
@@ -3183,10 +3285,14 @@ class Channel:
         """
 
         self.ValidateParameters()
-        complexInput = self.ValidateSignal(inputSignal, "inputSignal")
+        complexInput = self.PrepareSignal(inputSignal, "inputSignal")
         adcWidthValue = self.parameters["fbAdcWidth"]
         if adcWidthValue is None:
-            return complexInput.copy()
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
         adcWidth = int(adcWidthValue)
         fullScale = float(self.parameters["fbAdcFullScale"])
         codeScale = float(2 ** (adcWidth - 1))
@@ -3486,17 +3592,27 @@ class Channel:
             result: Public receiver waveform with matching shape and width.
         """
 
-        interfaceFormat = FixedPoint(self.width)
-        normalizedPaOutput = interfaceFormat.DecodeComplex(
-            self.ValidateSignal(paOutputSignal, "paOutputSignal")
+        self.ValidateParameters()
+        preparedPaOutput = self.PrepareSignal(
+            paOutputSignal, "paOutputSignal"
         )
-        coupledPaOutput = self.ApplyPostPaCoupling(
-            normalizedPaOutput
-        )
-        normalizedReceiverSignal = self.ApplyChannelEffects(
-            coupledPaOutput
-        )
-        return interfaceFormat.EncodeComplex(normalizedReceiverSignal)
+        self._trustedProcessingDepth += 1
+        try:
+            interfaceFormat = FixedPoint(self.width)
+            normalizedPaOutput = interfaceFormat.DecodeComplex(
+                preparedPaOutput
+            )
+            coupledPaOutput = self.ApplyPostPaCoupling(
+                normalizedPaOutput
+            )
+            normalizedReceiverSignal = self.ApplyChannelEffects(
+                coupledPaOutput
+            )
+            return interfaceFormat.EncodeComplex(
+                normalizedReceiverSignal
+            )
+        finally:
+            self._trustedProcessingDepth -= 1
 
     def ProcessBoundPaFloating(
         self, inputSignal: np.ndarray
@@ -3521,7 +3637,7 @@ class Channel:
             raise RuntimeError(
                 "Process requires a PA bound through paModel or SetPaModel"
             )
-        normalizedInput = self.ValidateSignal(
+        normalizedInput = self.PrepareSignal(
             inputSignal, "inputSignal"
         )
         floatingProcessor = getattr(
@@ -3539,8 +3655,10 @@ class Channel:
             normalizedPaOutput = paInterfaceFormat.DecodeComplex(
                 publicPaOutput
             )
-        normalizedOutput = self.ValidateSignal(
-            normalizedPaOutput, "paOutputSignal"
+        normalizedOutput = self.PrepareSignal(
+            normalizedPaOutput,
+            "paOutputSignal",
+            forceValidation=True,
         )
         if normalizedOutput.shape != normalizedInput.shape:
             raise ValueError(
@@ -3573,7 +3691,7 @@ class Channel:
                 "Process requires a PA bound through paModel or SetPaModel"
             )
         self.ValidateParameters()
-        normalizedInput = self.ValidateSignal(inputSignal, "inputSignal")
+        normalizedInput = self.PrepareSignal(inputSignal, "inputSignal")
         periodicProcessor = getattr(
             self.paModel, "ProcessThermalPeriodFloating", None
         )
@@ -3603,8 +3721,10 @@ class Channel:
                     "ProcessThermalPeriodFloating for Channel scheduling"
                 )
             return self.ProcessBoundPaFloating(normalizedInput)
-        normalizedOutput = self.ValidateSignal(
-            normalizedPaOutput, "paOutputSignal"
+        normalizedOutput = self.PrepareSignal(
+            normalizedPaOutput,
+            "paOutputSignal",
+            forceValidation=True,
         )
         if normalizedOutput.shape != normalizedInput.shape:
             raise ValueError(
@@ -3685,7 +3805,7 @@ class Channel:
                 drive stage and before transmitter I/Q impairment.
         """
 
-        normalizedInput = self.ValidateSignal(inputSignal, "inputSignal")
+        normalizedInput = self.PrepareSignal(inputSignal, "inputSignal")
         inputWasVector = normalizedInput.ndim == 1
         inputMatrix = (
             normalizedInput.reshape(-1, 1)
@@ -3705,7 +3825,11 @@ class Channel:
             chainCount,
         )
         if all(driveValue == 0.0 for driveValue in resolvedDriveDb):
-            return normalizedInput.copy()
+            return (
+                normalizedInput
+                if self._trustedProcessingDepth > 0
+                else normalizedInput.copy()
+            )
         with np.errstate(over="ignore", invalid="ignore"):
             driveScale = np.power(
                 10.0, np.asarray(resolvedDriveDb, dtype=float) / 20.0
@@ -3774,18 +3898,21 @@ class Channel:
 
         interfaceFormat = FixedPoint(self.width)
         normalizedInput = interfaceFormat.DecodeComplex(
-            self.ValidateSignal(inputSignal, "inputSignal")
+            self.PrepareSignal(inputSignal, "inputSignal")
         )
         drivenInput = self.ApplyCalibrationDrive(
             normalizedInput, driveDbPerChain
         )
         transmitterOutput = self.ApplyTransmitterIqImbalance(drivenInput)
         actualPaInput = self.ApplyPrePaCoupling(transmitterOutput)
-        self._lastTransmitterOutput = np.array(
+        transmitterSnapshot = np.array(
             transmitterOutput, dtype=np.complex128, copy=True
         )
-        self._lastActualPaInput = np.array(
-            actualPaInput, dtype=np.complex128, copy=True
+        self._lastTransmitterOutput = transmitterSnapshot
+        self._lastActualPaInput = (
+            transmitterSnapshot
+            if actualPaInput is transmitterOutput
+            else np.array(actualPaInput, dtype=np.complex128, copy=True)
         )
         normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
         return interfaceFormat.EncodeComplex(normalizedPaOutput)
@@ -3811,18 +3938,21 @@ class Channel:
 
         interfaceFormat = FixedPoint(self.width)
         normalizedInput = interfaceFormat.DecodeComplex(
-            self.ValidateSignal(inputSignal, "inputSignal")
+            self.PrepareSignal(inputSignal, "inputSignal")
         )
         drivenInput = self.ApplyCalibrationDrive(normalizedInput)
         transmitterOutput = self.ApplyTransmitterIqImbalance(
             drivenInput
         )
         actualPaInput = self.ApplyPrePaCoupling(transmitterOutput)
-        self._lastTransmitterOutput = np.array(
+        transmitterSnapshot = np.array(
             transmitterOutput, dtype=np.complex128, copy=True
         )
-        self._lastActualPaInput = np.array(
-            actualPaInput, dtype=np.complex128, copy=True
+        self._lastTransmitterOutput = transmitterSnapshot
+        self._lastActualPaInput = (
+            transmitterSnapshot
+            if actualPaInput is transmitterOutput
+            else np.array(actualPaInput, dtype=np.complex128, copy=True)
         )
         normalizedPaOutput = self.ProcessBoundPaFloating(actualPaInput)
         return interfaceFormat.EncodeComplex(normalizedPaOutput)
@@ -3847,7 +3977,7 @@ class Channel:
                 branch point before common phase and receiver impairments.
         """
 
-        normalizedInput = self.ValidateSignal(
+        normalizedInput = self.PrepareSignal(
             inputSignal, "inputSignal"
         )
         drivenInput = self.ApplyCalibrationDrive(normalizedInput)
@@ -3855,11 +3985,14 @@ class Channel:
             drivenInput
         )
         actualPaInput = self.ApplyPrePaCoupling(transmitterOutput)
-        self._lastTransmitterOutput = np.array(
+        transmitterSnapshot = np.array(
             transmitterOutput, dtype=np.complex128, copy=True
         )
-        self._lastActualPaInput = np.array(
-            actualPaInput, dtype=np.complex128, copy=True
+        self._lastTransmitterOutput = transmitterSnapshot
+        self._lastActualPaInput = (
+            transmitterSnapshot
+            if actualPaInput is transmitterOutput
+            else np.array(actualPaInput, dtype=np.complex128, copy=True)
         )
         normalizedPaOutput = self.ProcessBoundPaThermalPeriodFloating(
             actualPaInput
@@ -3884,8 +4017,27 @@ class Channel:
             result: Legacy single floating output selected by ``sampleMode``.
         """
 
-        coupledPaOutput = self.ProcessCoupledPaFloating(inputSignal)
-        return self.ApplyChannelEffects(coupledPaOutput)
+        self.ValidateParameters()
+        normalizedInput = self.PrepareSignal(inputSignal, "inputSignal")
+        normalizedInput = np.array(
+            normalizedInput, dtype=np.complex128, copy=True
+        )
+        self._trustedProcessingDepth += 1
+        try:
+            coupledPaOutput = self.ProcessCoupledPaFloating(
+                normalizedInput
+            )
+            receiverOutput = self.ApplyChannelEffects(coupledPaOutput)
+            receiverOutput = self.PrepareSignal(
+                receiverOutput,
+                "receiverOutput",
+                forceValidation=True,
+            )
+            return np.array(
+                receiverOutput, dtype=np.complex128, copy=True
+            )
+        finally:
+            self._trustedProcessingDepth -= 1
 
     def ProcessOutputPathsFloating(
         self, inputSignal: np.ndarray
@@ -3909,14 +4061,58 @@ class Channel:
                 feedback observation in feedback mode.
         """
 
-        coupledPaOutput = self.ProcessCoupledPaFloating(inputSignal)
-        channelOutput = self.ApplyForwardChannelEffects(coupledPaOutput)
-        if self.sampleMode == "forward":
-            return channelOutput, channelOutput.copy()
-        feedbackOutput = self.ApplyCompensatedFeedbackChannelEffects(
-            coupledPaOutput
-        )
-        return channelOutput, feedbackOutput
+        ownsPublicBoundary = self._trustedProcessingDepth == 0
+        self.ValidateParameters()
+        normalizedInput = self.PrepareSignal(inputSignal, "inputSignal")
+        if ownsPublicBoundary:
+            # The trusted identity path may otherwise carry the caller's array
+            # directly into a third-party PA callback. Own exactly one input
+            # snapshot at this floating public boundary so a mutating plant
+            # cannot alter caller memory.
+            normalizedInput = np.array(
+                normalizedInput, dtype=np.complex128, copy=True
+            )
+        self._trustedProcessingDepth += 1
+        try:
+            coupledPaOutput = self.ProcessCoupledPaFloating(normalizedInput)
+            channelOutput = self.ApplyForwardChannelEffects(coupledPaOutput)
+            if self.sampleMode == "forward":
+                if ownsPublicBoundary:
+                    channelOutput = self.PrepareSignal(
+                        channelOutput,
+                        "channelOutput",
+                        forceValidation=True,
+                    )
+                    publicChannelOutput = np.array(
+                        channelOutput, dtype=np.complex128, copy=True
+                    )
+                    return publicChannelOutput, publicChannelOutput.copy()
+                return channelOutput, channelOutput
+            feedbackOutput = self.ApplyCompensatedFeedbackChannelEffects(
+                coupledPaOutput
+            )
+            if ownsPublicBoundary:
+                channelOutput = self.PrepareSignal(
+                    channelOutput,
+                    "channelOutput",
+                    forceValidation=True,
+                )
+                feedbackOutput = self.PrepareSignal(
+                    feedbackOutput,
+                    "feedbackOutput",
+                    forceValidation=True,
+                )
+                return (
+                    np.array(
+                        channelOutput, dtype=np.complex128, copy=True
+                    ),
+                    np.array(
+                        feedbackOutput, dtype=np.complex128, copy=True
+                    ),
+                )
+            return channelOutput, feedbackOutput
+        finally:
+            self._trustedProcessingDepth -= 1
 
     def ProcessNormalizedOutputPaths(
         self, inputSignal: np.ndarray
@@ -3939,22 +4135,52 @@ class Channel:
             result: Normalized ``(chOut, fbOut)`` from one committed live period.
         """
 
+        ownsPublicBoundary = self._trustedProcessingDepth == 0
         self.ValidateParameters()
-        normalizedInput = self.ValidateSignal(inputSignal, "inputSignal")
-        usesSteadyStateThermalMode = (
-            self.IsThermalModelEnabled()
-            and str(self.parameters["thermalRunMode"]).strip().lower()
-            == "steady_state"
-        )
-        if not usesSteadyStateThermalMode:
-            return self.ProcessOutputPathsFloating(normalizedInput)
-        interfaceFormat = FixedPoint(self.width)
-        publicInput = interfaceFormat.EncodeComplex(normalizedInput)
-        publicChannelOutput, publicFeedbackOutput = self.Process(publicInput)
-        return (
-            interfaceFormat.DecodeComplex(publicChannelOutput),
-            interfaceFormat.DecodeComplex(publicFeedbackOutput),
-        )
+        normalizedInput = self.PrepareSignal(inputSignal, "inputSignal")
+        if ownsPublicBoundary:
+            normalizedInput = np.array(
+                normalizedInput, dtype=np.complex128, copy=True
+            )
+        self._trustedProcessingDepth += 1
+        try:
+            usesSteadyStateThermalMode = (
+                self.IsThermalModelEnabled()
+                and str(self.parameters["thermalRunMode"]).strip().lower()
+                == "steady_state"
+            )
+            if not usesSteadyStateThermalMode:
+                channelOutput, feedbackOutput = (
+                    self.ProcessOutputPathsFloating(normalizedInput)
+                )
+            else:
+                interfaceFormat = FixedPoint(self.width)
+                publicInput = interfaceFormat.EncodeComplex(normalizedInput)
+                publicChannelOutput, publicFeedbackOutput = self.Process(
+                    publicInput
+                )
+                channelOutput = interfaceFormat.DecodeComplex(
+                    publicChannelOutput
+                )
+                feedbackOutput = interfaceFormat.DecodeComplex(
+                    publicFeedbackOutput
+                )
+            channelOutput = self.PrepareSignal(
+                channelOutput,
+                "channelOutput",
+                forceValidation=True,
+            )
+            feedbackOutput = self.PrepareSignal(
+                feedbackOutput,
+                "feedbackOutput",
+                forceValidation=True,
+            )
+            return (
+                np.array(channelOutput, dtype=np.complex128, copy=True),
+                np.array(feedbackOutput, dtype=np.complex128, copy=True),
+            )
+        finally:
+            self._trustedProcessingDepth -= 1
 
     def Process(
         self,
@@ -3994,54 +4220,66 @@ class Channel:
         """
 
         self.ValidateParameters()
-        if (
-            self.sampleMode == "fb"
-            and str(self.parameters["fbIqCompensationMode"])
-            .strip()
-            .lower()
-            == "filter"
-        ):
-            # Fail before power calibration or a live PA/thermal evaluation so
-            # an absent or stale inverse cannot consume a transmission period.
-            self.RequireCurrentFeedbackIqCalibration()
-        # Reject cross-module reference-plane mismatches before a closed-loop
-        # calibration can commit a new target or analog drive.
-        self.ValidateThermalReferencePlanes()
-        processingInput = inputSignal
-        resolvedOutputPowerDbm = outputPowerDbm
-        usesSteadyStateThermalMode = (
-            self.IsThermalModelEnabled()
-            and str(self.parameters["thermalRunMode"]).strip().lower()
-            == "steady_state"
-        )
-        if resolvedOutputPowerDbm is None and usesSteadyStateThermalMode:
-            if self._lastCalibrationOutputPowerDbm is None:
-                raise ValueError(
-                    "the first steady-state thermal Channel.Process call "
-                    "requires outputPowerDbm so every steady-state period "
-                    "can repeat reference-temperature power calibration"
-                )
-            resolvedOutputPowerDbm = self._lastCalibrationOutputPowerDbm
-        if resolvedOutputPowerDbm is not None:
-            processingInput = self.CalibratePaInput(
-                inputSignal,
-                resolvedOutputPowerDbm,
+        validatedInput = self.PrepareSignal(inputSignal, "inputSignal")
+        self._trustedProcessingDepth += 1
+        try:
+            if (
+                self.sampleMode == "fb"
+                and str(self.parameters["fbIqCompensationMode"])
+                .strip()
+                .lower()
+                == "filter"
+            ):
+                # Fail before power calibration or a live PA/thermal
+                # evaluation so an absent or stale inverse cannot consume a
+                # transmission period.
+                self.RequireCurrentFeedbackIqCalibration()
+            # Reject cross-module reference-plane mismatches before a
+            # closed-loop calibration can commit a new target or analog drive.
+            self.ValidateThermalReferencePlanes()
+            processingInput = validatedInput
+            resolvedOutputPowerDbm = outputPowerDbm
+            usesSteadyStateThermalMode = (
+                self.IsThermalModelEnabled()
+                and str(self.parameters["thermalRunMode"]).strip().lower()
+                == "steady_state"
             )
-            # CalibratePaInput has already restored the PA's original thermal
-            # state. Re-evaluate the accepted drive once so this public call
-            # represents a real temperature-aware transmission rather than the
-            # cold calibration observation cached by PowerCalibration.
-        interfaceFormat = FixedPoint(self.width)
-        normalizedInput = interfaceFormat.DecodeComplex(
-            self.ValidateSignal(processingInput, "inputSignal")
-        )
-        normalizedChannelOutput, normalizedFeedbackOutput = (
-            self.ProcessOutputPathsFloating(normalizedInput)
-        )
-        return (
-            interfaceFormat.EncodeComplex(normalizedChannelOutput),
-            interfaceFormat.EncodeComplex(normalizedFeedbackOutput),
-        )
+            if (
+                resolvedOutputPowerDbm is None
+                and usesSteadyStateThermalMode
+            ):
+                if self._lastCalibrationOutputPowerDbm is None:
+                    raise ValueError(
+                        "the first steady-state thermal Channel.Process call "
+                        "requires outputPowerDbm so every steady-state period "
+                        "can repeat reference-temperature power calibration"
+                    )
+                resolvedOutputPowerDbm = self._lastCalibrationOutputPowerDbm
+            if resolvedOutputPowerDbm is not None:
+                processingInput = self.CalibratePaInput(
+                    validatedInput,
+                    resolvedOutputPowerDbm,
+                )
+                # CalibratePaInput has already restored the PA's original
+                # thermal state. Re-evaluate the accepted drive once so this
+                # public call represents one real temperature-aware period.
+            interfaceFormat = FixedPoint(self.width)
+            normalizedInput = interfaceFormat.DecodeComplex(processingInput)
+            normalizedChannelOutput, normalizedFeedbackOutput = (
+                self.ProcessOutputPathsFloating(normalizedInput)
+            )
+            publicChannelOutput = interfaceFormat.EncodeComplex(
+                normalizedChannelOutput
+            )
+            if self.sampleMode == "forward":
+                publicFeedbackOutput = publicChannelOutput.copy()
+            else:
+                publicFeedbackOutput = interfaceFormat.EncodeComplex(
+                    normalizedFeedbackOutput
+                )
+            return publicChannelOutput, publicFeedbackOutput
+        finally:
+            self._trustedProcessingDepth -= 1
 
     def SmallSignalGain(self) -> complex:
         """Return the deterministic direct small-signal sampling-path gain.

@@ -1,8 +1,8 @@
 """Power-amplifier behavioral models used by the DPD-ILC simulation.
 
 Callers construct ``PaModel`` with ``modelName="rapp"``, ``"wiener"``,
-``"gmp"``, or ``"doherty"`` and then call ``Process``. Four nonlinear model
-families are
+``"gmp"``, ``"piecewise_gmp"``, or ``"doherty"`` and then call ``Process``.
+Five nonlinear model families are
 provided internally:
 
 * ``RappPA`` applies the classic memoryless solid-state PA AM-AM curve and
@@ -11,6 +11,8 @@ provided internally:
   AM-AM characteristic and a saturating AM-PM characteristic.
 * ``GMPPA`` implements the generalized memory polynomial main, lagging,
   and leading cross terms described in the project theory document.
+* ``PiecewiseGMPPA`` blends sparse GMP coefficient sets over adjacent
+  envelope regions with compact, twice-continuously-differentiable gates.
 * ``DohertyPA`` combines independently configurable carrier and peaking
   behavioral branches with envelope-dependent peaking turn-on, branch delay,
   complex combining, and simplified load modulation.
@@ -305,6 +307,104 @@ class ThermalConfig:
             )
 
 
+@dataclass(frozen=True, eq=False)
+class _ThermalRuntime:
+    """Cache validated thermal constants for one waveform-period operation.
+
+    ``ThermalConfig`` is immutable at the public boundary, so a period and all
+    of its steady-state solver probes may safely share these normalized names,
+    derived scalars, and read-only branch arrays.  The cache is deliberately
+    local to one top-level operation; live ChainMap updates are therefore still
+    observed and validated by the next call.
+    """
+
+    config: ThermalConfig
+    modelName: str
+    efficiencyModelName: str
+    resistanceValues: np.ndarray
+    timeConstantValues: np.ndarray
+    sampleRateHz: float
+    thermalUpdateIntervalSamples: int
+    activeThresholdLinear: float
+    referencePowerW: float
+    efficiencyKneePowerW: float
+    minimumDrainEfficiency: float
+    peakDrainEfficiency: float
+    idleDissipatedPowerW: float
+    maximumJunctionTemperatureC: float
+
+    @classmethod
+    def FromValidatedConfig(
+        cls, config: ThermalConfig
+    ) -> "_ThermalRuntime":
+        """Build one operation-local cache from a validated configuration.
+
+        Processing details:
+            Algorithm: Normalize model names once, copy the selected thermal
+            branch vectors into read-only arrays, and precompute scalar unit
+            conversions reused by every interval in one waveform period.
+
+        Args:
+            config: Thermal configuration already validated at the public
+                operation boundary.
+
+        Returns:
+            result: Immutable operation-local thermal runtime constants.
+        """
+
+        modelName = config.modelName.strip().lower()
+        resistanceValues = np.array(
+            config.thermalResistancesCPerW, dtype=float, copy=True
+        )
+        timeConstantValues = np.array(
+            config.thermalTimeConstantsSec, dtype=float, copy=True
+        )
+        if modelName == "single_rc":
+            resistanceValues = resistanceValues[:1]
+            timeConstantValues = timeConstantValues[:1]
+        resistanceValues.setflags(write=False)
+        timeConstantValues.setflags(write=False)
+        return cls(
+            config=config,
+            modelName=modelName,
+            efficiencyModelName=(
+                config.efficiencyModelName.strip().lower()
+            ),
+            resistanceValues=resistanceValues,
+            timeConstantValues=timeConstantValues,
+            sampleRateHz=float(config.sampleRateHz),
+            thermalUpdateIntervalSamples=int(
+                config.thermalUpdateIntervalSamples
+            ),
+            activeThresholdLinear=(
+                10.0 ** (float(config.activePowerThresholdDb) / 10.0)
+            ),
+            referencePowerW=(
+                10.0
+                ** (
+                    (float(config.referenceOutputPowerDbm) - 30.0)
+                    / 10.0
+                )
+            ),
+            efficiencyKneePowerW=(
+                10.0
+                ** (
+                    (
+                        float(config.efficiencyKneeOutputPowerDbm)
+                        - 30.0
+                    )
+                    / 10.0
+                )
+            ),
+            minimumDrainEfficiency=float(config.minimumDrainEfficiency),
+            peakDrainEfficiency=float(config.peakDrainEfficiency),
+            idleDissipatedPowerW=float(config.idleDissipatedPowerW),
+            maximumJunctionTemperatureC=float(
+                config.maximumJunctionTemperatureC
+            ),
+        )
+
+
 class ThermalNetwork:
     """Maintain the causal thermal state of a static, single-RC, or Foster model."""
 
@@ -483,6 +583,38 @@ class ThermalNetwork:
             result: New branch-temperature-rise vector without side effects.
         """
 
+        thermalRuntime = _ThermalRuntime.FromValidatedConfig(self.config)
+        return self.CalculateAdvancedStateResolved(
+            startingTemperatureRisePerBranchC,
+            dissipatedPowerW,
+            durationSec,
+            thermalRuntime,
+        )
+
+    def CalculateAdvancedStateResolved(
+        self,
+        startingTemperatureRisePerBranchC: np.ndarray,
+        dissipatedPowerW: float,
+        durationSec: float,
+        thermalRuntime: _ThermalRuntime,
+    ) -> np.ndarray:
+        """Advance one state using operation-local thermal constants.
+
+        Processing details:
+            Algorithm: Retain the public state, power, and duration checks,
+            then apply the exact RC step with the already selected read-only
+            resistance and time-constant arrays.
+
+        Args:
+            startingTemperatureRisePerBranchC: Branch rises before the step.
+            dissipatedPowerW: Nonnegative mean heat power for the step.
+            durationSec: Nonnegative physical step duration in seconds.
+            thermalRuntime: Validated constants shared by the current period.
+
+        Returns:
+            result: Branch temperature rises after the requested step.
+        """
+
         startingState = np.asarray(
             startingTemperatureRisePerBranchC, dtype=float
         )
@@ -505,13 +637,14 @@ class ThermalNetwork:
             raise ValueError(
                 "thermal power and duration must be finite and nonnegative"
             )
-        if self.config.modelName.strip().lower() == "static":
+        if thermalRuntime.modelName == "static":
             return startingState.copy()
-        resistanceValues, timeConstantValues = self.ResolveBranches()
-        decayValues = np.exp(-resolvedDuration / timeConstantValues)
+        decayValues = np.exp(
+            -resolvedDuration / thermalRuntime.timeConstantValues
+        )
         return np.asarray(
             decayValues * startingState
-            + resistanceValues
+            + thermalRuntime.resistanceValues
             * resolvedPower
             * (1.0 - decayValues),
             dtype=float,
@@ -539,6 +672,35 @@ class ThermalNetwork:
             result: Branch rises at both the beginning and end of the cycle.
         """
 
+        thermalRuntime = _ThermalRuntime.FromValidatedConfig(self.config)
+        return self.CalculatePeriodicSteadyStateResolved(
+            dissipatedPowersW,
+            durationsSec,
+            thermalRuntime,
+        )
+
+    def CalculatePeriodicSteadyStateResolved(
+        self,
+        dissipatedPowersW: Sequence[float],
+        durationsSec: Sequence[float],
+        thermalRuntime: _ThermalRuntime,
+    ) -> np.ndarray:
+        """Solve one frozen heat schedule using cached branch constants.
+
+        Processing details:
+            Algorithm: Validate the complete power-duration schedule once,
+            compose every exact RC step with the same branch arrays, and solve
+            the repeating initial state using the full-period decay.
+
+        Args:
+            dissipatedPowersW: Consecutive nonnegative heat-power values.
+            durationsSec: Physical durations paired with the heat values.
+            thermalRuntime: Validated constants shared by the current solver.
+
+        Returns:
+            result: Branch rises that repeat at the period boundaries.
+        """
+
         powerValues = np.asarray(dissipatedPowersW, dtype=float)
         durationValues = np.asarray(durationsSec, dtype=float)
         if (
@@ -562,7 +724,7 @@ class ThermalNetwork:
                 "periodic powers must be nonnegative and durations must "
                 "define one positive finite period"
             )
-        if self.config.modelName.strip().lower() == "static":
+        if thermalRuntime.modelName == "static":
             return self.temperatureRisePerBranchC.copy()
         additiveState = np.zeros_like(
             self.temperatureRisePerBranchC, dtype=float
@@ -570,15 +732,15 @@ class ThermalNetwork:
         for dissipatedPowerW, durationSec in zip(
             powerValues, durationValues
         ):
-            additiveState = self.CalculateAdvancedState(
+            additiveState = self.CalculateAdvancedStateResolved(
                 additiveState,
                 float(dissipatedPowerW),
                 float(durationSec),
+                thermalRuntime,
             )
-        _, timeConstantValues = self.ResolveBranches()
         totalDurationSec = float(np.sum(durationValues))
         oneMinusCycleDecay = -np.expm1(
-            -totalDurationSec / timeConstantValues
+            -totalDurationSec / thermalRuntime.timeConstantValues
         )
         return np.asarray(
             additiveState / oneMinusCycleDecay, dtype=float
@@ -1025,6 +1187,525 @@ class GMPPA:
 
 
 @dataclass(frozen=True)
+class PiecewiseGMPConfig:
+    """Configure smooth envelope-region blending of multiple GMP models.
+
+    ``regionBoundaries`` contains the normalized input-envelope boundaries
+    between adjacent GMP regions. ``transitionWidths`` gives the complete
+    compact blending interval around each matching boundary. An explicit
+    ``regionConfigs`` tuple supplies one ``GMPConfig`` per region. When it is
+    omitted, three sparse built-in GMP regions provide modest changes in
+    static compression, AM-PM, and electrical memory without adding noise.
+    """
+
+    regionBoundaries: Tuple[float, ...] = (0.25, 0.60)
+    transitionWidths: Tuple[float, ...] = (0.12, 0.18)
+    regionConfigs: Optional[Tuple[GMPConfig, ...]] = None
+
+    def Validate(self) -> None:
+        """Validate region ordering, compact transitions, and GMP configs.
+
+        Processing details:
+            Algorithm: Require at least two amplitude regions, pair every
+            positive finite boundary with one positive finite transition
+            width, keep the first transition above zero, and validate one
+            optional GMP configuration per resulting region. Ordered gates may
+            overlap because hierarchical region weights remain nonnegative.
+
+        Returns:
+            result: None. Invalid region geometry or coefficients raise an
+                exception before the PA is constructed.
+        """
+
+        if not isinstance(self.regionBoundaries, tuple):
+            raise TypeError("regionBoundaries must be a tuple")
+        if not isinstance(self.transitionWidths, tuple):
+            raise TypeError("transitionWidths must be a tuple")
+        if len(self.regionBoundaries) == 0:
+            raise ValueError("regionBoundaries cannot be empty")
+        if len(self.transitionWidths) != len(self.regionBoundaries):
+            raise ValueError(
+                "transitionWidths must match regionBoundaries in length"
+            )
+        boundaries = []
+        widths = []
+        for boundaryIndex, (boundaryValue, widthValue) in enumerate(
+            zip(self.regionBoundaries, self.transitionWidths)
+        ):
+            if (
+                not isinstance(boundaryValue, (int, float))
+                or isinstance(boundaryValue, bool)
+                or not np.isfinite(boundaryValue)
+                or float(boundaryValue) <= 0.0
+            ):
+                raise ValueError(
+                    f"regionBoundaries[{boundaryIndex}] must be finite "
+                    "and positive"
+                )
+            if (
+                not isinstance(widthValue, (int, float))
+                or isinstance(widthValue, bool)
+                or not np.isfinite(widthValue)
+                or float(widthValue) <= 0.0
+            ):
+                raise ValueError(
+                    f"transitionWidths[{boundaryIndex}] must be finite "
+                    "and positive"
+                )
+            boundaries.append(float(boundaryValue))
+            widths.append(float(widthValue))
+        if any(
+            laterBoundary <= earlierBoundary
+            for earlierBoundary, laterBoundary in zip(
+                boundaries[:-1], boundaries[1:]
+            )
+        ):
+            raise ValueError("regionBoundaries must be strictly increasing")
+        if boundaries[0] - 0.5 * widths[0] <= 0.0:
+            raise ValueError(
+                "the first transition interval must start above zero"
+            )
+        if self.regionConfigs is None:
+            if len(boundaries) != 2:
+                raise ValueError(
+                    "built-in piecewise GMP requires exactly two region "
+                    "boundaries; supply regionConfigs for another count"
+                )
+            return
+        if not isinstance(self.regionConfigs, tuple):
+            raise TypeError("regionConfigs must be a tuple or None")
+        expectedRegionCount = len(boundaries) + 1
+        if len(self.regionConfigs) != expectedRegionCount:
+            raise ValueError(
+                "regionConfigs must contain exactly one GMPConfig per region"
+            )
+        for regionIndex, regionConfig in enumerate(self.regionConfigs):
+            if not isinstance(regionConfig, GMPConfig):
+                raise TypeError(
+                    f"regionConfigs[{regionIndex}] must be a GMPConfig"
+                )
+            regionConfig.Validate()
+
+
+class PiecewiseGMPPA:
+    """Blend adjacent sparse GMP models over smooth envelope regions."""
+
+    def __init__(
+        self,
+        config: PiecewiseGMPConfig = PiecewiseGMPConfig(),
+    ) -> None:
+        """Initialize explicit or deterministic built-in regional GMPs.
+
+        Processing details:
+            Algorithm: Validate compact transition geometry, use caller-owned
+            regional GMP configurations when supplied, or derive three sparse
+            defaults from one common GMP expansion. The built-in profiles
+            preserve each region's settled target while varying gain, AM-PM,
+            nonlinearity, and zero-sum memory residual strength so ordinary
+            GMP predistortion sees controlled structural model mismatch.
+
+        Args:
+            config: Piecewise transition and regional GMP configuration.
+
+        Returns:
+            result: None. The immutable configuration and regional models are
+                ready for deterministic processing.
+        """
+
+        config.Validate()
+        self.config = config
+        if config.regionConfigs is None:
+            nonlinearOrders = (1, 3, 5)
+            memoryDepth = 2
+            crossMemoryDepth = 1
+            baseMain, baseLagging, baseLeading = DefaultGmpCoefficients(
+                nonlinearOrders,
+                memoryDepth,
+                crossMemoryDepth,
+            )
+            regionProfiles = (
+                (1.025, -0.004, 0.78, 0.72),
+                (1.000, 0.018, 1.00, 1.00),
+                (0.955, 0.055, 1.04, 1.35),
+            )
+            regionConfigurations = []
+            for (
+                gainScale,
+                phaseRotationRadians,
+                nonlinearScale,
+                memoryScale,
+            ) in regionProfiles:
+                complexScale = gainScale * np.exp(
+                    1j * phaseRotationRadians
+                )
+                mainCoefficients: Dict[Tuple[int, int], complex] = {}
+                laggingCoefficients: Dict[
+                    Tuple[int, int, int], complex
+                ] = {}
+                leadingCoefficients: Dict[
+                    Tuple[int, int, int], complex
+                ] = {}
+                for nonlinearOrder in nonlinearOrders:
+                    orderScale = complexScale * (
+                        1.0 if nonlinearOrder == 1 else nonlinearScale
+                    )
+                    targetCoefficient = orderScale * (
+                        sum(
+                            coefficient
+                            for (
+                                order,
+                                _memoryIndex,
+                            ), coefficient in baseMain.items()
+                            if order == nonlinearOrder
+                        )
+                        + sum(
+                            coefficient
+                            for (
+                                order,
+                                _memoryIndex,
+                                _crossIndex,
+                            ), coefficient in baseLagging.items()
+                            if order == nonlinearOrder
+                        )
+                        + sum(
+                            coefficient
+                            for (
+                                order,
+                                _memoryIndex,
+                                _crossIndex,
+                            ), coefficient in baseLeading.items()
+                            if order == nonlinearOrder
+                        )
+                    )
+                    for (
+                        order,
+                        memoryIndex,
+                    ), coefficient in baseMain.items():
+                        if order != nonlinearOrder or memoryIndex == 0:
+                            continue
+                        mainCoefficients[(order, memoryIndex)] = (
+                            orderScale * memoryScale * coefficient
+                        )
+                    for coefficientKey, coefficient in baseLagging.items():
+                        if coefficientKey[0] != nonlinearOrder:
+                            continue
+                        laggingCoefficients[coefficientKey] = (
+                            orderScale * memoryScale * coefficient
+                        )
+                    for coefficientKey, coefficient in baseLeading.items():
+                        if coefficientKey[0] != nonlinearOrder:
+                            continue
+                        leadingCoefficients[coefficientKey] = (
+                            orderScale * memoryScale * coefficient
+                        )
+                    dynamicCoefficientSum = sum(
+                        coefficient
+                        for (order, memoryIndex), coefficient in (
+                            mainCoefficients.items()
+                        )
+                        if order == nonlinearOrder and memoryIndex > 0
+                    ) + sum(
+                        coefficient
+                        for (order, _, _), coefficient in (
+                            laggingCoefficients.items()
+                        )
+                        if order == nonlinearOrder
+                    ) + sum(
+                        coefficient
+                        for (order, _, _), coefficient in (
+                            leadingCoefficients.items()
+                        )
+                        if order == nonlinearOrder
+                    )
+                    mainCoefficients[(nonlinearOrder, 0)] = (
+                        targetCoefficient - dynamicCoefficientSum
+                    )
+                regionConfigurations.append(
+                    GMPConfig(
+                        nonlinearOrders=nonlinearOrders,
+                        memoryDepth=memoryDepth,
+                        crossMemoryDepth=crossMemoryDepth,
+                        mainCoefficients=mainCoefficients,
+                        laggingCoefficients=laggingCoefficients,
+                        leadingCoefficients=leadingCoefficients,
+                    )
+                )
+            resolvedRegionConfigs = tuple(regionConfigurations)
+        else:
+            resolvedRegionConfigs = config.regionConfigs
+        self.regionModels = tuple(
+            GMPPA(regionConfig) for regionConfig in resolvedRegionConfigs
+        )
+        mainCoefficientSets = tuple(
+            regionModel.mainCoefficients
+            for regionModel in self.regionModels
+        )
+        laggingCoefficientSets = tuple(
+            regionModel.laggingCoefficients
+            for regionModel in self.regionModels
+        )
+        leadingCoefficientSets = tuple(
+            regionModel.leadingCoefficients
+            for regionModel in self.regionModels
+        )
+        mainKeys = set().union(
+            *(coefficientSet.keys() for coefficientSet in mainCoefficientSets)
+        )
+        laggingKeys = set().union(
+            *(
+                coefficientSet.keys()
+                for coefficientSet in laggingCoefficientSets
+            )
+        )
+        leadingKeys = set().union(
+            *(
+                coefficientSet.keys()
+                for coefficientSet in leadingCoefficientSets
+            )
+        )
+        self._mainTerms = []
+        for coefficientKey in sorted(mainKeys):
+            coefficientValues = tuple(
+                coefficientSet.get(coefficientKey, 0.0 + 0.0j)
+                for coefficientSet in mainCoefficientSets
+            )
+            coefficientDifferences = tuple(
+                laterCoefficient - earlierCoefficient
+                for earlierCoefficient, laterCoefficient in zip(
+                    coefficientValues[:-1], coefficientValues[1:]
+                )
+            )
+            if coefficientValues[0] != 0.0 + 0.0j or any(
+                value != 0.0 + 0.0j
+                for value in coefficientDifferences
+            ):
+                self._mainTerms.append(
+                    (
+                        coefficientKey,
+                        coefficientValues[0],
+                        coefficientDifferences,
+                    )
+                )
+        self._laggingTerms = []
+        for coefficientKey in sorted(laggingKeys):
+            coefficientValues = tuple(
+                coefficientSet.get(coefficientKey, 0.0 + 0.0j)
+                for coefficientSet in laggingCoefficientSets
+            )
+            coefficientDifferences = tuple(
+                laterCoefficient - earlierCoefficient
+                for earlierCoefficient, laterCoefficient in zip(
+                    coefficientValues[:-1], coefficientValues[1:]
+                )
+            )
+            if coefficientValues[0] != 0.0 + 0.0j or any(
+                value != 0.0 + 0.0j
+                for value in coefficientDifferences
+            ):
+                self._laggingTerms.append(
+                    (
+                        coefficientKey,
+                        coefficientValues[0],
+                        coefficientDifferences,
+                    )
+                )
+        self._leadingTerms = []
+        for coefficientKey in sorted(leadingKeys):
+            coefficientValues = tuple(
+                coefficientSet.get(coefficientKey, 0.0 + 0.0j)
+                for coefficientSet in leadingCoefficientSets
+            )
+            coefficientDifferences = tuple(
+                laterCoefficient - earlierCoefficient
+                for earlierCoefficient, laterCoefficient in zip(
+                    coefficientValues[:-1], coefficientValues[1:]
+                )
+            )
+            if coefficientValues[0] != 0.0 + 0.0j or any(
+                value != 0.0 + 0.0j
+                for value in coefficientDifferences
+            ):
+                self._leadingTerms.append(
+                    (
+                        coefficientKey,
+                        coefficientValues[0],
+                        coefficientDifferences,
+                    )
+                )
+        requiredDelays = set()
+        requiredEnvelopePowers = set()
+        for (nonlinearOrder, memoryIndex), _, _ in self._mainTerms:
+            requiredDelays.add(memoryIndex)
+            requiredEnvelopePowers.add((memoryIndex, nonlinearOrder))
+        for (
+            nonlinearOrder,
+            memoryIndex,
+            crossIndex,
+        ), _, _ in self._laggingTerms:
+            requiredDelays.add(memoryIndex)
+            requiredDelays.add(memoryIndex + crossIndex)
+            requiredEnvelopePowers.add(
+                (memoryIndex + crossIndex, nonlinearOrder)
+            )
+        for (
+            nonlinearOrder,
+            memoryIndex,
+            crossIndex,
+        ), _, _ in self._leadingTerms:
+            requiredDelays.add(memoryIndex)
+            requiredDelays.add(memoryIndex + crossIndex)
+            requiredEnvelopePowers.add((memoryIndex, nonlinearOrder))
+        self._requiredDelays = tuple(sorted(requiredDelays))
+        self._requiredEnvelopePowers = tuple(
+            sorted(requiredEnvelopePowers)
+        )
+
+    def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Evaluate shared GMP bases with smoothly varying coefficients.
+
+        Processing details:
+            Algorithm: Convert each compact transition interval into a C2
+            smootherstep gate, cache every unique delayed signal and envelope
+            power needed by any region once, and evaluate each unioned GMP
+            basis with a coefficient equal to the first region plus gated
+            adjacent-region coefficient differences. Each successive gate is
+            multiplied by all earlier gates, yielding low/middle/high weights
+            ``1-S1``, ``S1*(1-S2)``, and ``S1*S2`` for the default model; the
+            weights remain nonnegative and sum to one even if gates overlap.
+
+        Args:
+            inputSignal: One-dimensional normalized complex baseband samples.
+
+        Returns:
+            result: Same-length deterministic complex piecewise-GMP output.
+        """
+
+        complexInput = AsComplexVector(inputSignal)
+        inputEnvelope = np.abs(complexInput)
+        transitionFunctions = []
+        for boundaryValue, widthValue in zip(
+            self.config.regionBoundaries,
+            self.config.transitionWidths,
+        ):
+            transitionStart = float(boundaryValue) - 0.5 * float(widthValue)
+            normalizedPosition = np.clip(
+                (inputEnvelope - transitionStart) / float(widthValue),
+                0.0,
+                1.0,
+            )
+            transitionFunctions.append(
+                normalizedPosition**3
+                * (
+                    10.0
+                    + normalizedPosition
+                    * (-15.0 + 6.0 * normalizedPosition)
+                )
+            )
+        regionActivationFunctions = []
+        cumulativeActivation = np.ones_like(inputEnvelope)
+        for transitionFunction in transitionFunctions:
+            cumulativeActivation = (
+                cumulativeActivation * transitionFunction
+            )
+            regionActivationFunctions.append(cumulativeActivation)
+
+        delayedSignals = {
+            sampleDelay: DelaySignal(complexInput, sampleDelay)
+            for sampleDelay in self._requiredDelays
+        }
+        envelopePowers = {
+            (sampleDelay, nonlinearOrder): (
+                np.abs(delayedSignals[sampleDelay])
+                ** (nonlinearOrder - 1)
+            )
+            for sampleDelay, nonlinearOrder in (
+                self._requiredEnvelopePowers
+            )
+        }
+        outputSignal = np.zeros_like(complexInput)
+
+        for (
+            (nonlinearOrder, memoryIndex),
+            initialCoefficient,
+            coefficientDifferences,
+        ) in self._mainTerms:
+            basisSignal = (
+                delayedSignals[memoryIndex]
+                * envelopePowers[(memoryIndex, nonlinearOrder)]
+            )
+            outputSignal += initialCoefficient * basisSignal
+            for coefficientDifference, regionActivation in zip(
+                coefficientDifferences,
+                regionActivationFunctions,
+            ):
+                if coefficientDifference != 0.0 + 0.0j:
+                    outputSignal += (
+                        coefficientDifference
+                        * regionActivation
+                        * basisSignal
+                    )
+
+        for (
+            (nonlinearOrder, memoryIndex, crossIndex),
+            initialCoefficient,
+            coefficientDifferences,
+        ) in self._laggingTerms:
+            basisSignal = (
+                delayedSignals[memoryIndex]
+                * envelopePowers[
+                    (memoryIndex + crossIndex, nonlinearOrder)
+                ]
+            )
+            outputSignal += initialCoefficient * basisSignal
+            for coefficientDifference, regionActivation in zip(
+                coefficientDifferences,
+                regionActivationFunctions,
+            ):
+                if coefficientDifference != 0.0 + 0.0j:
+                    outputSignal += (
+                        coefficientDifference
+                        * regionActivation
+                        * basisSignal
+                    )
+
+        for (
+            (nonlinearOrder, memoryIndex, crossIndex),
+            initialCoefficient,
+            coefficientDifferences,
+        ) in self._leadingTerms:
+            basisSignal = (
+                delayedSignals[memoryIndex + crossIndex]
+                * envelopePowers[(memoryIndex, nonlinearOrder)]
+            )
+            outputSignal += initialCoefficient * basisSignal
+            for coefficientDifference, regionActivation in zip(
+                coefficientDifferences,
+                regionActivationFunctions,
+            ):
+                if coefficientDifference != 0.0 + 0.0j:
+                    outputSignal += (
+                        coefficientDifference
+                        * regionActivation
+                        * basisSignal
+                    )
+        return outputSignal
+
+    def SmallSignalGain(self) -> complex:
+        """Return the first region's exact small-envelope gain.
+
+        Processing details:
+            Algorithm: The first compact transition begins above zero, so the
+            origin uses only region zero; return that GMP model's first-order
+            DC gain without evaluating any transition arrays.
+
+        Returns:
+            result: Complex small-signal gain of the lowest-amplitude region.
+        """
+
+        return self.regionModels[0].SmallSignalGain()
+
+
+@dataclass(frozen=True)
 class DohertyConfig:
     """Configure a behavioral carrier-plus-peaking Doherty architecture."""
 
@@ -1035,13 +1716,13 @@ class DohertyConfig:
     peakingWienerConfig: Optional[WienerConfig] = None
     peakingGmpConfig: Optional[GMPConfig] = None
     carrierInputGain: float = 1.0
-    peakingInputGain: float = 1.0
+    peakingInputGain: float = 0.85
     peakingTurnOnAmplitude: float = 0.45
-    peakingTransitionWidth: float = 0.15
+    peakingTransitionWidth: float = 0.50
     carrierCombineCoefficient: complex = 1.0 + 0.0j
-    peakingCombineCoefficient: complex = 0.50 + 0.0j
+    peakingCombineCoefficient: complex = 0.15 + 0.0j
     peakingDelaySamples: int = 0
-    loadModulationStrength: float = 0.10
+    loadModulationStrength: float = 0.02
 
     def Validate(self) -> None:
         """Validate both branch families and all Doherty physical controls.
@@ -1323,7 +2004,7 @@ class DohertyPA:
 
 
 class PaModel:
-    """Configure and operate one Rapp, Wiener, GMP, or Doherty PA model.
+    """Operate one Rapp, Wiener, GMP, piecewise-GMP, or Doherty PA model.
 
     The facade gives every caller the same object-oriented construction and
     processing interface while retaining the dedicated model implementations.
@@ -1339,6 +2020,7 @@ class PaModel:
         rappConfig: Optional[RappConfig] = None,
         wienerConfig: Optional[WienerConfig] = None,
         gmpConfig: Optional[GMPConfig] = None,
+        piecewiseGmpConfig: Optional[PiecewiseGMPConfig] = None,
         dohertyConfig: Optional[DohertyConfig] = None,
         thermalConfig: Optional[ThermalConfig] = None,
         parameters: Optional[Mapping[str, object]] = None,
@@ -1357,6 +2039,7 @@ class PaModel:
             rappConfig: Optional memoryless Rapp configuration.
             wienerConfig: Optional Wiener configuration; None selects built-in values.
             gmpConfig: Optional GMP configuration; None selects built-in values.
+            piecewiseGmpConfig: Optional smooth regional GMP configuration.
             dohertyConfig: Optional carrier/peaking Doherty configuration.
             thermalConfig: Optional self-heating and temperature-drift model.
             parameters: Optional external mapping layered ahead of the built-in defaults.
@@ -1375,6 +2058,7 @@ class PaModel:
                 "rappConfig": None,
                 "wienerConfig": None,
                 "gmpConfig": None,
+                "piecewiseGmpConfig": None,
                 "dohertyConfig": None,
                 "thermalConfig": None,
                 "width": 16,
@@ -1389,6 +2073,8 @@ class PaModel:
             directOverrides["wienerConfig"] = wienerConfig
         if gmpConfig is not None:
             directOverrides["gmpConfig"] = gmpConfig
+        if piecewiseGmpConfig is not None:
+            directOverrides["piecewiseGmpConfig"] = piecewiseGmpConfig
         if dohertyConfig is not None:
             directOverrides["dohertyConfig"] = dohertyConfig
         if thermalConfig is not None:
@@ -1429,6 +2115,7 @@ class PaModel:
                 Optional[RappConfig],
                 Optional[WienerConfig],
                 Optional[GMPConfig],
+                Optional[PiecewiseGMPConfig],
                 Optional[DohertyConfig],
             ]
         ] = None
@@ -1446,7 +2133,7 @@ class PaModel:
             result: str. The computed value described by the summary, with documented units, shape, and normalization.
         """
 
-        normalizedName, _, _, _, _ = self.ResolveConfiguration()
+        normalizedName, _, _, _, _, _ = self.ResolveConfiguration()
         return normalizedName
 
     modelName = ModelName
@@ -1683,6 +2370,7 @@ class PaModel:
         Optional[RappConfig],
         Optional[WienerConfig],
         Optional[GMPConfig],
+        Optional[PiecewiseGMPConfig],
         Optional[DohertyConfig],
     ]:
         """Validate and return the currently resolved PA configuration.
@@ -1691,17 +2379,25 @@ class PaModel:
             Algorithm: Resolve values according to state and ChainMap precedence, keeping caller-owned configuration behavior explicit.
 
         Returns:
-            result: Model name followed by optional Rapp, Wiener, GMP, and
-                Doherty configurations in deterministic order.
+            result: Model name followed by optional Rapp, Wiener, GMP,
+                piecewise-GMP, and Doherty configurations in deterministic
+                order.
         """
 
         rawModelName = self.parameters["modelName"]
         if not isinstance(rawModelName, str):
             raise TypeError("modelName must be a string")
         normalizedName = rawModelName.strip().lower()
-        if normalizedName not in ("rapp", "wiener", "gmp", "doherty"):
+        if normalizedName not in (
+            "rapp",
+            "wiener",
+            "gmp",
+            "piecewise_gmp",
+            "doherty",
+        ):
             raise ValueError(
-                "modelName must be 'rapp', 'wiener', 'gmp', or 'doherty'"
+                "modelName must be 'rapp', 'wiener', 'gmp', "
+                "'piecewise_gmp', or 'doherty'"
             )
 
         rawRappConfig = self.parameters["rappConfig"]
@@ -1719,6 +2415,13 @@ class PaModel:
             rawGmpConfig, GMPConfig
         ):
             raise TypeError("gmpConfig must be a GMPConfig or None")
+        rawPiecewiseGmpConfig = self.parameters["piecewiseGmpConfig"]
+        if rawPiecewiseGmpConfig is not None and not isinstance(
+            rawPiecewiseGmpConfig, PiecewiseGMPConfig
+        ):
+            raise TypeError(
+                "piecewiseGmpConfig must be a PiecewiseGMPConfig or None"
+            )
         rawDohertyConfig = self.parameters["dohertyConfig"]
         if rawDohertyConfig is not None and not isinstance(
             rawDohertyConfig, DohertyConfig
@@ -1733,6 +2436,7 @@ class PaModel:
             cast(Optional[RappConfig], rawRappConfig),
             cast(Optional[WienerConfig], rawWienerConfig),
             cast(Optional[GMPConfig], rawGmpConfig),
+            cast(Optional[PiecewiseGMPConfig], rawPiecewiseGmpConfig),
             cast(Optional[DohertyConfig], rawDohertyConfig),
         )
 
@@ -1754,6 +2458,7 @@ class PaModel:
             rappConfig,
             wienerConfig,
             gmpConfig,
+            piecewiseGmpConfig,
             dohertyConfig,
         ) = selectedConfiguration
         if normalizedName == "rapp":
@@ -1767,6 +2472,12 @@ class PaModel:
         elif normalizedName == "gmp":
             selectedModel = GMPPA(
                 GMPConfig() if gmpConfig is None else gmpConfig
+            )
+        elif normalizedName == "piecewise_gmp":
+            selectedModel = PiecewiseGMPPA(
+                PiecewiseGMPConfig()
+                if piecewiseGmpConfig is None
+                else piecewiseGmpConfig
             )
         else:
             selectedModel = DohertyPA(
@@ -2007,6 +2718,36 @@ class PaModel:
             or not thermalConfig.enabled
         ):
             return complexOutput
+        return self.ApplyTemperatureDriftResolved(
+            complexOutput,
+            junctionTemperatureC,
+            _ThermalRuntime.FromValidatedConfig(thermalConfig),
+        )
+
+    def ApplyTemperatureDriftResolved(
+        self,
+        baseOutput: np.ndarray,
+        junctionTemperatureC: float,
+        thermalRuntime: _ThermalRuntime,
+    ) -> np.ndarray:
+        """Apply drift with constants validated by the period operation.
+
+        Processing details:
+            Algorithm: Calculate temperature-relative gain, phase, saturation,
+            and nonlinear-envelope changes while reusing the validated thermal
+            configuration instead of resolving it for this interval.
+
+        Args:
+            baseOutput: Electrical-model samples before thermal drift.
+            junctionTemperatureC: Interval-start junction temperature in C.
+            thermalRuntime: Validated constants shared by the current period.
+
+        Returns:
+            result: Temperature-modified complex output samples.
+        """
+
+        thermalConfig = thermalRuntime.config
+        complexOutput = np.asarray(baseOutput, dtype=np.complex128)
         temperatureDeltaC = (
             float(junctionTemperatureC)
             - float(thermalConfig.referenceTemperatureC)
@@ -2071,14 +2812,39 @@ class PaModel:
         thermalConfig = self.ResolveThermalConfig()
         if thermalConfig is None:
             return 0.0
+        return self.EstimateDissipatedPowerWResolved(
+            outputSignal,
+            activeMask,
+            _ThermalRuntime.FromValidatedConfig(thermalConfig),
+        )
+
+    def EstimateDissipatedPowerWResolved(
+        self,
+        outputSignal: np.ndarray,
+        activeMask: Optional[np.ndarray],
+        thermalRuntime: _ThermalRuntime,
+    ) -> float:
+        """Estimate interval heat with validated period constants.
+
+        Processing details:
+            Algorithm: Map normalized output power into watts, apply the
+            selected constant or power-dependent drain efficiency, preserve
+            idle-sample heat, and average the unchanged sample-level schedule.
+
+        Args:
+            outputSignal: Temperature-modified PA output for one interval.
+            activeMask: Optional full-window-derived activity slice.
+            thermalRuntime: Validated constants shared by the current period.
+
+        Returns:
+            result: Mean dissipated heat power for the interval in watts.
+        """
+
         complexOutput = np.asarray(outputSignal, dtype=np.complex128)
         if complexOutput.ndim != 1 or complexOutput.size == 0:
             raise ValueError("outputSignal must be a nonempty complex vector")
         outputPowerNormalized = np.abs(complexOutput) ** 2
-        referencePowerW = 10.0 ** (
-            (float(thermalConfig.referenceOutputPowerDbm) - 30.0) / 10.0
-        )
-        outputPowerW = referencePowerW * outputPowerNormalized
+        outputPowerW = thermalRuntime.referencePowerW * outputPowerNormalized
         if activeMask is None:
             peakPower = float(np.max(outputPowerNormalized))
             if peakPower <= np.finfo(float).tiny:
@@ -2086,12 +2852,9 @@ class PaModel:
                     complexOutput.size, dtype=bool
                 )
             else:
-                activeThresholdLinear = 10.0 ** (
-                    float(thermalConfig.activePowerThresholdDb) / 10.0
-                )
                 resolvedActiveMask = (
                     outputPowerNormalized
-                    >= activeThresholdLinear * peakPower
+                    >= thermalRuntime.activeThresholdLinear * peakPower
                 )
         else:
             resolvedActiveMask = np.asarray(activeMask, dtype=bool)
@@ -2101,40 +2864,34 @@ class PaModel:
                 )
         efficiencyValues = np.full(
             outputPowerW.shape,
-            float(thermalConfig.minimumDrainEfficiency),
+            thermalRuntime.minimumDrainEfficiency,
             dtype=float,
         )
-        if thermalConfig.efficiencyModelName.strip().lower() == "constant":
-            efficiencyValues.fill(float(thermalConfig.peakDrainEfficiency))
+        if thermalRuntime.efficiencyModelName == "constant":
+            efficiencyValues.fill(thermalRuntime.peakDrainEfficiency)
         else:
-            kneePowerW = 10.0 ** (
-                (
-                    float(thermalConfig.efficiencyKneeOutputPowerDbm)
-                    - 30.0
-                )
-                / 10.0
-            )
             normalizedKneePower = outputPowerW / max(
-                kneePowerW, np.finfo(float).tiny
+                thermalRuntime.efficiencyKneePowerW,
+                np.finfo(float).tiny,
             )
             efficiencyValues = (
-                float(thermalConfig.minimumDrainEfficiency)
+                thermalRuntime.minimumDrainEfficiency
                 + (
-                    float(thermalConfig.peakDrainEfficiency)
-                    - float(thermalConfig.minimumDrainEfficiency)
+                    thermalRuntime.peakDrainEfficiency
+                    - thermalRuntime.minimumDrainEfficiency
                 )
                 * normalizedKneePower
                 / (1.0 + normalizedKneePower)
             )
         activeDissipation = (
-            float(thermalConfig.idleDissipatedPowerW)
+            thermalRuntime.idleDissipatedPowerW
             + outputPowerW
             * (1.0 / efficiencyValues - 1.0)
         )
         dissipatedPowerPerSample = np.where(
             resolvedActiveMask,
             activeDissipation,
-            float(thermalConfig.idleDissipatedPowerW),
+            thermalRuntime.idleDissipatedPowerW,
         )
         return float(np.mean(dissipatedPowerPerSample))
 
@@ -2182,6 +2939,36 @@ class PaModel:
         """
 
         thermalConfig = self.ResolveThermalConfig()
+        thermalRuntime = (
+            None
+            if thermalConfig is None
+            else _ThermalRuntime.FromValidatedConfig(thermalConfig)
+        )
+        return self.BuildThermalActiveMaskResolved(
+            inputSignal,
+            thermalRuntime,
+        )
+
+    def BuildThermalActiveMaskResolved(
+        self,
+        inputSignal: np.ndarray,
+        thermalRuntime: Optional[_ThermalRuntime],
+    ) -> np.ndarray:
+        """Classify activity using the period's cached threshold.
+
+        Processing details:
+            Algorithm: Validate the complete input vector, measure its peak
+            power once, and compare every sample with the already converted
+            peak-relative active threshold.
+
+        Args:
+            inputSignal: Complete normalized PA-input data window.
+            thermalRuntime: Validated constants, or None when heat is disabled.
+
+        Returns:
+            result: Boolean activity mask aligned with the input samples.
+        """
+
         complexInput = np.asarray(inputSignal, dtype=np.complex128)
         if (
             complexInput.ndim != 1
@@ -2189,15 +2976,13 @@ class PaModel:
             or not np.all(np.isfinite(complexInput))
         ):
             raise ValueError("inputSignal must be a nonempty finite vector")
-        if thermalConfig is None:
+        if thermalRuntime is None:
             return np.zeros(complexInput.size, dtype=bool)
         inputPower = np.abs(complexInput) ** 2
         peakPower = float(np.max(inputPower))
         if peakPower <= np.finfo(float).tiny:
             return np.zeros(complexInput.size, dtype=bool)
-        threshold = peakPower * 10.0 ** (
-            float(thermalConfig.activePowerThresholdDb) / 10.0
-        )
+        threshold = peakPower * thermalRuntime.activeThresholdLinear
         return np.asarray(inputPower >= threshold, dtype=bool)
 
     def BuildThermalIntervals(
@@ -2222,10 +3007,35 @@ class PaModel:
         thermalConfig = self.ResolveThermalConfig()
         if thermalConfig is None:
             raise RuntimeError("thermal model is not configured")
+        return self.BuildThermalIntervalsResolved(
+            activeMask,
+            _ThermalRuntime.FromValidatedConfig(thermalConfig),
+        )
+
+    def BuildThermalIntervalsResolved(
+        self,
+        activeMask: np.ndarray,
+        thermalRuntime: _ThermalRuntime,
+    ) -> Tuple[Tuple[int, int], ...]:
+        """Build unchanged interval boundaries from cached constants.
+
+        Processing details:
+            Algorithm: Preserve every configured update boundary and every
+            active-to-idle transition, sort their union, and return consecutive
+            half-open ranges without merging any thermal interval.
+
+        Args:
+            activeMask: Full-window boolean RF-activity classification.
+            thermalRuntime: Validated constants shared by the current period.
+
+        Returns:
+            result: Ordered half-open interval boundaries for the data window.
+        """
+
         resolvedMask = np.asarray(activeMask, dtype=bool)
         if resolvedMask.ndim != 1 or resolvedMask.size == 0:
             raise ValueError("activeMask must be a nonempty vector")
-        intervalLength = int(thermalConfig.thermalUpdateIntervalSamples)
+        intervalLength = thermalRuntime.thermalUpdateIntervalSamples
         regularBoundaries = range(
             intervalLength, resolvedMask.size, intervalLength
         )
@@ -2278,6 +3088,46 @@ class PaModel:
         thermalConfig = self.ResolveThermalConfig()
         if thermalConfig is None or self.thermalNetwork is None:
             raise RuntimeError("thermal model is not enabled")
+        return self.SimulateThermalPeriodResolved(
+            baseOutput,
+            activeMask,
+            startingTemperatureRisePerBranchC,
+            externalIdleDurationSec,
+            _ThermalRuntime.FromValidatedConfig(thermalConfig),
+        )
+
+    def SimulateThermalPeriodResolved(
+        self,
+        baseOutput: np.ndarray,
+        activeMask: np.ndarray,
+        startingTemperatureRisePerBranchC: np.ndarray,
+        externalIdleDurationSec: float,
+        thermalRuntime: _ThermalRuntime,
+        thermalIntervals: Optional[Tuple[Tuple[int, int], ...]] = None,
+    ) -> Dict[str, object]:
+        """Simulate a period with one validated configuration and schedule.
+
+        Processing details:
+            Algorithm: Validate period-level arrays and idle duration, then
+            process every original active or idle interval independently while
+            reusing config constants and optional prebuilt boundaries. Advance
+            only a local branch-state copy and append the unchanged outer-idle
+            step so solver probes remain transactional.
+
+        Args:
+            baseOutput: Full electrical-model output before thermal drift.
+            activeMask: Full-window boolean RF-activity classification.
+            startingTemperatureRisePerBranchC: Period-start branch state.
+            externalIdleDurationSec: Scheduled idle time after the data window.
+            thermalRuntime: Validated constants shared by the current period.
+            thermalIntervals: Optional prebuilt boundaries for the same mask.
+
+        Returns:
+            result: Output, heat schedule, states, energy, and temperature trace.
+        """
+
+        if self.thermalNetwork is None:
+            raise RuntimeError("thermal model is not enabled")
         complexBaseOutput = np.asarray(baseOutput, dtype=np.complex128)
         resolvedActiveMask = np.asarray(activeMask, dtype=bool)
         if (
@@ -2319,12 +3169,18 @@ class PaModel:
             )
         ]
         temperatureTraceRfActive = []
-        maximumTemperatureC = float(
-            thermalConfig.maximumJunctionTemperatureC
+        maximumTemperatureC = (
+            thermalRuntime.maximumJunctionTemperatureC
         )
-        for startIndex, stopIndex in self.BuildThermalIntervals(
-            resolvedActiveMask
-        ):
+        resolvedIntervals = (
+            self.BuildThermalIntervalsResolved(
+                resolvedActiveMask,
+                thermalRuntime,
+            )
+            if thermalIntervals is None
+            else thermalIntervals
+        )
+        for startIndex, stopIndex in resolvedIntervals:
             junctionTemperatureC = float(
                 self.thermalNetwork.ambientTemperatureC
                 + np.sum(branchState)
@@ -2335,23 +3191,29 @@ class PaModel:
                     "PA junction temperature exceeded "
                     "maximumJunctionTemperatureC"
                 )
-            outputSegment = self.ApplyTemperatureDrift(
+            outputSegment = self.ApplyTemperatureDriftResolved(
                 complexBaseOutput[startIndex:stopIndex],
                 junctionTemperatureC,
+                thermalRuntime,
             )
             outputSignal[startIndex:stopIndex] = outputSegment
             segmentMask = resolvedActiveMask[startIndex:stopIndex]
-            dissipatedPowerW = self.EstimateDissipatedPowerW(
-                outputSegment, segmentMask
+            dissipatedPowerW = self.EstimateDissipatedPowerWResolved(
+                outputSegment,
+                segmentMask,
+                thermalRuntime,
             )
             durationSec = (
                 (stopIndex - startIndex)
-                / float(thermalConfig.sampleRateHz)
+                / thermalRuntime.sampleRateHz
             )
-            branchState = self.thermalNetwork.CalculateAdvancedState(
-                branchState,
-                dissipatedPowerW,
-                durationSec,
+            branchState = (
+                self.thermalNetwork.CalculateAdvancedStateResolved(
+                    branchState,
+                    dissipatedPowerW,
+                    durationSec,
+                    thermalRuntime,
+                )
             )
             elapsedDataTimeSec += durationSec
             dataDissipatedEnergyJ += dissipatedPowerW * durationSec
@@ -2368,11 +3230,14 @@ class PaModel:
             temperatureTraceRfActive.append(bool(np.any(segmentMask)))
         dataEndingState = branchState.copy()
         if resolvedIdleDurationSec > 0.0:
-            idlePowerW = float(thermalConfig.idleDissipatedPowerW)
-            branchState = self.thermalNetwork.CalculateAdvancedState(
-                branchState,
-                idlePowerW,
-                resolvedIdleDurationSec,
+            idlePowerW = thermalRuntime.idleDissipatedPowerW
+            branchState = (
+                self.thermalNetwork.CalculateAdvancedStateResolved(
+                    branchState,
+                    idlePowerW,
+                    resolvedIdleDurationSec,
+                    thermalRuntime,
+                )
             )
             dissipatedPowersW.append(idlePowerW)
             durationsSec.append(resolvedIdleDurationSec)
@@ -2400,7 +3265,7 @@ class PaModel:
             "dataDissipatedEnergyJ": dataDissipatedEnergyJ,
             "periodDissipatedEnergyJ": (
                 dataDissipatedEnergyJ
-                + float(thermalConfig.idleDissipatedPowerW)
+                + thermalRuntime.idleDissipatedPowerW
                 * resolvedIdleDurationSec
             ),
             "temperatureTraceTimeSec": tuple(temperatureTraceTimeSec),
@@ -2487,12 +3352,20 @@ class PaModel:
             return np.asarray(
                 self.model.Process(complexInput), dtype=np.complex128
             )
+        thermalRuntime = _ThermalRuntime.FromValidatedConfig(thermalConfig)
         baseOutput = np.asarray(
             self.model.Process(complexInput), dtype=np.complex128
         )
-        activeMask = self.BuildThermalActiveMask(complexInput)
+        activeMask = self.BuildThermalActiveMaskResolved(
+            complexInput,
+            thermalRuntime,
+        )
+        thermalIntervals = self.BuildThermalIntervalsResolved(
+            activeMask,
+            thermalRuntime,
+        )
         signalDurationSec = (
-            complexInput.size / float(thermalConfig.sampleRateHz)
+            complexInput.size / thermalRuntime.sampleRateHz
         )
         periodDurationSec = signalDurationSec / float(thermalDutyCycle)
         externalIdleDurationSec = periodDurationSec - signalDurationSec
@@ -2505,32 +3378,42 @@ class PaModel:
         simulationResult: Dict[str, object]
         if (
             resolvedRunMode == "steady_state"
-            and thermalConfig.modelName.strip().lower() != "static"
+            and thermalRuntime.modelName != "static"
         ):
             candidateState = periodStartingState.copy()
             bestErrorC = float("inf")
             for iterationIndex in range(
                 1, maximumSteadyStateIterations + 1
             ):
-                trialResult = self.SimulateThermalPeriod(
+                trialResult = self.SimulateThermalPeriodResolved(
                     baseOutput,
                     activeMask,
                     candidateState,
                     externalIdleDurationSec,
+                    thermalRuntime,
+                    thermalIntervals,
                 )
-                solvedState = self.thermalNetwork.CalculatePeriodicSteadyState(
-                    cast(
-                        Sequence[float],
-                        trialResult["dissipatedPowersW"],
-                    ),
-                    cast(Sequence[float], trialResult["durationsSec"]),
+                solvedState = (
+                    self.thermalNetwork.CalculatePeriodicSteadyStateResolved(
+                        cast(
+                            Sequence[float],
+                            trialResult["dissipatedPowersW"],
+                        ),
+                        cast(
+                            Sequence[float],
+                            trialResult["durationsSec"],
+                        ),
+                        thermalRuntime,
+                    )
                 )
                 candidateState = solvedState
-                verificationResult = self.SimulateThermalPeriod(
+                verificationResult = self.SimulateThermalPeriodResolved(
                     baseOutput,
                     activeMask,
                     candidateState,
                     externalIdleDurationSec,
+                    thermalRuntime,
+                    thermalIntervals,
                 )
                 endingState = np.asarray(
                     verificationResult[
@@ -2566,11 +3449,13 @@ class PaModel:
                     f"allowed tolerance is {float(steadyStateToleranceC):.6g} C"
                 )
         else:
-            simulationResult = self.SimulateThermalPeriod(
+            simulationResult = self.SimulateThermalPeriodResolved(
                 baseOutput,
                 activeMask,
                 periodStartingState,
                 externalIdleDurationSec,
+                thermalRuntime,
+                thermalIntervals,
             )
             if resolvedRunMode == "steady_state":
                 steadyStateConverged = True

@@ -885,3 +885,253 @@ a^*x[n]-b\,x^*[n]
 ```
 
 $\mathbf{H}_{d}$ 描述直接 MIMO 通道，$\mathbf{H}_{i}$ 描述跨链共轭镜像。只有 $\mathbf{H}_{d}$ 非对角时，现有 `CouplingAwareDpdGmp` 的直接通道去嵌入适用；检测到显著 $\mathbf{H}_{i}$ 时，每路 PA 逆模型应改用 `AugmentedDpdGmp`，并在更强的跨链镜像场景中升级为联合 widely-linear MIMO GMP。测量与选择流程见 [ChannelAnalyse.md](./ChannelAnalyse.md)。
+
+## 17. 分段 GMP：平滑包络区域与系数正则
+
+### 17.1 为什么需要分段
+
+一个全局 GMP 必须用同一组多项式系数同时逼近小信号区、压缩过渡区和峰值区。
+当 Doherty、负载调制或包络跟踪 PA 呈现明显的幅度相关工作机制时，继续提高
+全局多项式阶数容易增加条件数和训练外振荡。分段 GMP 为不同瞬时包络区域
+分配独立的 GMP 系数，再在边界处平滑混合。
+
+这里的 low、middle、high 由归一化瞬时包络 $r[n]=|x[n]|$ 决定。它与整帧
+平均输出功率 dBm 不同；平均功率、温度或载频变化应作为另一层慢状态处理。
+
+[分段 GMP PA 模型](https://doi.org/10.1109/APMC.2015.7413559)使用阈值分解和
+区域 GMP 描述包络跟踪 PA；[分段 DPD 射频测量](https://doi.org/10.1109/ISWCS.2019.8877236)
+表明不同区域可以采用不同的模型复杂度；[Mixture of Experts](https://doi.org/10.1109/TMTT.2021.3098867)
+进一步表明，让相邻子模型通过软门控协作可以避免独立硬分区的固有缺点。
+
+### 17.2 $C^2$ 软门控
+
+设两个包络边界为 $b_1<b_2$，完整过渡宽度为 $\Delta_1,\Delta_2>0$。先定义
+
+```math
+z_i(r)
+=
+\mathrm{clip}
+\left(
+\frac{r-(b_i-\Delta_i/2)}{\Delta_i},
+0,
+1
+\right),
+```
+
+再使用五次 smootherstep
+
+```math
+S(z)=6z^5-15z^4+10z^3.
+```
+
+它在 $z=0$ 和 $z=1$ 处的一阶、二阶导数都为零。三个区域权重为
+
+```math
+w_L(r)=1-S(z_1),
+```
+
+```math
+w_M(r)=S(z_1)[1-S(z_2)],
+```
+
+```math
+w_H(r)=S(z_1)S(z_2).
+```
+
+因此
+
+```math
+w_q(r)\geq0,
+\qquad
+\sum_{q\in\{L,M,H\}}w_q(r)=1.
+```
+
+该分割即使在两个过渡区发生重叠时仍是单位分解。设普通 GMP 基向量为
+$\boldsymbol{\phi}[n]$，三个区域系数为 $\mathbf c_L,\mathbf c_M,\mathbf c_H$，
+则 `PiecewiseDpdGmp` 的输出为
+
+```math
+u[n]
+=
+\sum_{q\in\{L,M,H\}}
+w_q(r[n])
+\boldsymbol{\phi}^{T}[n]\mathbf c_q.
+```
+
+实现时普通 GMP 基函数只计算一次，再复制为三组加权列：
+
+```math
+\boldsymbol{\Phi}_{\mathrm{PW}}
+=
+\begin{bmatrix}
+\mathbf W_L\boldsymbol{\Phi} &
+\mathbf W_M\boldsymbol{\Phi} &
+\mathbf W_H\boldsymbol{\Phi}
+\end{bmatrix},
+```
+
+其中 $\mathbf W_q$ 是以全部 $w_q[n]$ 为对角元素的矩阵。训练和部署必须使用
+完全相同的边界、过渡宽度和权重公式。
+
+### 17.3 为什么不约束原始复系数单调或同号
+
+复数没有自然的大小顺序。分别要求实部和虚部单调，会把相位参考面的任意选择
+变成模型约束；参考面旋转后系数实部、虚部可以变号，而物理响应不变。GMP 的
+高阶、延迟和交叉记忆列还经常高度相关，多组系数可产生几乎相同的输出。阶数、
+列尺度、样本权重或岭系数变化，也会改变各项之间的抵消关系。
+
+因此
+
+```math
+\mathbf c_L\preceq\mathbf c_M\preceq\mathbf c_H
+```
+
+对复 GMP 没有稳定、与坐标无关的物理含义。低、中、高段相同位置的系数不必
+同号，也不应通过逐项投影强行同号。可插值的前提是三个区域使用相同基函数
+顺序、相同相位参考和相同全局列归一化，而不是系数单调。
+
+### 17.4 联合回归与相邻区域平滑正则
+
+把三个区域系数按 low、middle、high 拼成
+
+```math
+\mathbf c
+=
+\begin{bmatrix}
+\mathbf c_L^T &
+\mathbf c_M^T &
+\mathbf c_H^T
+\end{bmatrix}^{T}.
+```
+
+在普通带权岭目标上增加相邻区域一阶差分：
+
+```math
+J(\mathbf c)
+=
+\left\|
+\mathbf W^{1/2}
+(\mathbf d-\boldsymbol{\Phi}_{\mathrm{PW}}\mathbf c)
+\right\|_2^2
++
+\lambda
+\|\mathbf c-\mathbf c_0\|_2^2
++
+\lambda_s
+\left(
+\|\mathbf c_M-\mathbf c_L\|_2^2
++
+\|\mathbf c_H-\mathbf c_M\|_2^2
+\right).
+```
+
+令
+
+```math
+\mathbf D_1
+=
+\begin{bmatrix}
+-\mathbf I & \mathbf I & \mathbf 0\\
+\mathbf 0 & -\mathbf I & \mathbf I
+\end{bmatrix},
+```
+
+则平滑项为
+
+```math
+\lambda_s\|\mathbf D_1\mathbf c\|_2^2.
+```
+
+它在正规方程中增加半正定矩阵
+
+```math
+\lambda_s\mathbf D_1^H\mathbf D_1.
+```
+
+代码参数 `regionSmoothnessFactor` 控制该项强度，并按照数据法矩阵和列归一化
+尺度进行无量纲化。`regionSmoothnessFactor=0` 完全关闭区域差分正则；较大值
+让相邻区域更接近，但不会要求单个复系数沿区域方向单调。
+
+若以后扩展到四个以上包络锚点，还可以增加二阶差分
+
+```math
+\lambda_2
+\sum_q
+\left\|
+\mathbf c_{q+1}-2\mathbf c_q+\mathbf c_{q-1}
+\right\|_2^2,
+```
+
+以惩罚区域系数轨迹的曲率。先用一阶差分抑制跳变，再根据独立验证决定是否
+需要二阶差分；不能因为插值方便就默认把所有差异抹平。
+
+### 17.5 物理形状约束应放在哪里
+
+真正需要单调的是特定工作区中的整体响应，而不是多项式展开坐标。对长恒包络
+输入得到 PA 稳态响应 $y_{\mathrm{ss}}(r)$。若实测确认有效工作区没有 AM-AM
+折返，可在幅度网格上约束
+
+```math
+\frac{d|y_{\mathrm{ss}}(r)|}{dr}\geq\epsilon>0.
+```
+
+若器件在该区间只表现增益压缩，还可约束
+
+```math
+\frac{d}{dr}
+\left(
+\frac{|y_{\mathrm{ss}}(r)|}{r}
+\right)
+\leq0.
+```
+
+AM-PM 应先相位解缠，再限制连续性和最大斜率；真实器件的相位曲线可能改变
+方向，所以不能无测量依据强制单调。对 DPD 静态映射则应检查：
+
+- $|u_{\mathrm{ss}}(r)|$ 不折返；
+- 局部逆增益和相位斜率有界；
+- `maximumOutputMagnitude` 范围内没有大量削顶；
+- 两个软过渡区没有 EVM、ACLR 或峰值的局部尖峰。
+
+若确有已知单调实标量，可用 PCHIP、I-spline、单调 B 样条或采样不等式处理。
+[形状约束惩罚样条](https://doi.org/10.1016/j.csda.2011.04.018)说明了如何把
+单调/凸性施加在回归函数上；[样条插值 LUT DPD](https://arxiv.org/abs/1907.02350)
+则给出了样条响应控制点用于低复杂度 DPD 的实例。这些方法适合约束 AM-AM
+增益、相位残差或 DPD 输出包络，不应直接套到任意复 GMP 系数的正负号上。
+
+### 17.6 两种“插值”不能混淆
+
+瞬时包络分段的插值发生在每个样点：
+
+```math
+\mathbf c_{\mathrm{eff}}(r[n])
+=
+w_L(r[n])\mathbf c_L
++w_M(r[n])\mathbf c_M
++w_H(r[n])\mathbf c_H.
+```
+
+它由 $C^2$ 软门控完成。平均功率、温度或载频模型库的插值发生在帧或校准周期
+级别，是一个额外慢状态维度。[功率相关参数 PA 模型](https://arxiv.org/abs/1410.8119)
+表明慢变 PA 特性可随长期功率状态动态变化；[插值记忆多项式](https://doi.org/10.3390/app15189899)
+展示了在载频锚点之间插值系数的可行性，同时指出精度受锚点模型拟合误差与
+一致性限制。
+
+若工程需要慢状态插值，必须在所有锚点保持同一 GMP 结构、全局幅度/列尺度、
+相位参考和训练权重，再对系数施加平滑差分。对具有明确物理方向的实参数可加
+单调约束；对原始复系数只做平滑，不做逐项顺序约束。
+
+### 17.7 训练与验收流程
+
+1. 用同一参考面、幅度标定和全局列归一化采集训练数据。
+2. 根据包络直方图和 PA 压缩转折选择边界，保证每个区域有足够有效样本。
+3. 对边界、过渡宽度、`ridgeFactor` 和 `regionSmoothnessFactor` 做小规模网格
+   搜索；训练期间同时记录条件数和区域差分范数。
+4. 使用未参与训练的 Wi-Fi 帧选择超参数，联合比较 EVM、ACLR、标签 NMSE、
+   DPD 峰值和削顶率。
+5. 在相邻平均功率、温度和载频点复验，确认瞬时包络分段没有记住单一帧分布。
+6. 若训练 NMSE 改善但独立帧 EVM/ACLR 变差，提高区域或岭正则、扩大过渡宽度，
+   或减少高阶/记忆；不要用硬单调系数掩盖过拟合。
+
+最终验收对象是独立帧上的射频性能、边界连续性和响应可逆性。区域系数曲线只
+是诊断量，不能替代 AM-AM、AM-PM、EVM、ACLR 和输出峰值检查。
