@@ -914,6 +914,10 @@ def CheckDocumentationApiConsistency() -> None:
         "channelDly" in documentText
         for documentText in channelDelayDocuments
     )
+    assert all(
+        "channelFractionalDelayFilterOrder" in documentText
+        for documentText in channelDelayDocuments
+    )
     assert expectedSignatureText in readmeText
     assert (
         'piecewisePa = PaModel(\n'
@@ -8938,6 +8942,22 @@ def CheckFeedbackIqPhasePairCalibration() -> None:
         thermalPhasePairChannel.GetFeedbackIqCalibrationMetrics()
         == savedChannelMetrics
     )
+    thermalPhasePairChannel.UpdateParameters(
+        channelFractionalDelayFilterOrder=15
+    )
+    try:
+        thermalPhasePairChannel.GetFeedbackIqCalibrationMetrics()
+    except RuntimeError as error:
+        assert "valid feedback I/Q calibration" in str(error)
+    else:
+        raise AssertionError(
+            "changing the common delay filter order must invalidate "
+            "feedback I/Q calibration"
+        )
+    thermalPhasePairChannel.UpdateParameters(
+        fbIqCompensationMode="phase_pair"
+    )
+    thermalPhasePairChannel.Process(thermalInput)
     thermalPhasePairChannel.UpdateParameters(channelDly=0.25)
     try:
         thermalPhasePairChannel.GetFeedbackIqCalibrationMetrics()
@@ -11110,6 +11130,12 @@ def CheckChannelModel() -> None:
     # decomposition always uses floor so its fractional part stays in [0, 1).
     defaultDelayChannel = Channel(parameters={"width": 0})
     assert defaultDelayChannel.GetParameters()["channelDly"] == 0.0
+    assert (
+        defaultDelayChannel.GetParameters()[
+            "channelFractionalDelayFilterOrder"
+        ]
+        == 23
+    )
     defaultDelayOutput = defaultDelayChannel.ApplyChannelDelay(testSignal)
     assert np.array_equal(defaultDelayOutput, testSignal)
     assert not np.shares_memory(defaultDelayOutput, testSignal)
@@ -11130,14 +11156,18 @@ def CheckChannelModel() -> None:
         ) == expectedDelayParts
         assert 0.0 <= resolvedFractionalDelay < 1.0
 
-    # A 2.25-sample delay is the causal first-order fractional response
-    # [0.75, 0.25] after two leading zeros. Records keep their original
-    # length, discard shifted tail samples, and become zero when the integer
-    # delay lies beyond the complete capture.
+    # Order one preserves the legacy causal fractional response [0.75, 0.25]
+    # after two leading zeros. Records keep their original length, discard
+    # shifted tail samples, and become zero when an exact integer delay lies
+    # beyond the complete capture.
     delayImpulse = np.zeros(8, dtype=np.complex128)
     delayImpulse[0] = 1.0 + 0.0j
     fractionalDelayChannel = Channel(
-        parameters={"channelDly": 2.25, "width": 0}
+        parameters={
+            "channelDly": 2.25,
+            "channelFractionalDelayFilterOrder": 1,
+            "width": 0,
+        }
     )
     expectedFractionalDelay = np.zeros_like(delayImpulse)
     expectedFractionalDelay[2:4] = (0.75, 0.25)
@@ -11185,6 +11215,16 @@ def CheckChannelModel() -> None:
         beyondRecordChannel.ApplyChannelDelay(tailInput),
         np.zeros_like(tailInput),
     )
+    beyondFractionalRecordChannel = Channel(
+        parameters={
+            "channelDly": float(tailInput.size) + 0.25,
+            "width": 0,
+        }
+    )
+    assert np.array_equal(
+        beyondFractionalRecordChannel.ApplyChannelDelay(tailInput),
+        np.zeros_like(tailInput),
+    )
 
     # MIMO columns use the same delay without cross-chain leakage.
     mimoDelayInput = np.zeros((8, 2), dtype=np.complex128)
@@ -11201,6 +11241,90 @@ def CheckChannelModel() -> None:
     )
     assert actualMimoDelay.shape == mimoDelayInput.shape
     assert np.array_equal(actualMimoDelay, expectedMimoDelay)
+
+    # The default order-23 Lanczos kernel must approximate an independently
+    # generated continuous-time multitone much more accurately than the legacy
+    # two-tap path. Guard samples exclude the finite-record convolution edges.
+    delayAccuracySampleCount = 2048
+    delayAccuracyIndices = np.arange(
+        delayAccuracySampleCount, dtype=float
+    )
+    delayAccuracyFrequencies = np.linspace(
+        -0.24 * np.pi, 0.24 * np.pi, 33
+    )
+    delayAccuracyCoefficients = np.exp(
+        1j * np.arange(delayAccuracyFrequencies.size, dtype=float)
+    ) / np.sqrt(float(delayAccuracyFrequencies.size))
+    configuredFractionalDelay = 2.25
+    delayAccuracyInput = (
+        np.exp(
+            1j
+            * np.outer(
+                delayAccuracyIndices,
+                delayAccuracyFrequencies,
+            )
+        )
+        @ delayAccuracyCoefficients
+    )
+    idealDelayedSignal = (
+        np.exp(
+            1j
+            * np.outer(
+                delayAccuracyIndices - configuredFractionalDelay,
+                delayAccuracyFrequencies,
+            )
+        )
+        @ delayAccuracyCoefficients
+    )
+    delayEvmByOrder = {}
+    for filterOrder in (1, 7, 23):
+        filterChannel = Channel(
+            parameters={
+                "channelDly": configuredFractionalDelay,
+                "channelFractionalDelayFilterOrder": filterOrder,
+                "width": 0,
+            }
+        )
+        filteredSignal = filterChannel.ApplyChannelDelay(
+            delayAccuracyInput
+        )
+        delayGuard = 64
+        validIdealSignal = idealDelayedSignal[delayGuard:-delayGuard]
+        validFilteredSignal = filteredSignal[delayGuard:-delayGuard]
+        commonGain = (
+            np.vdot(validIdealSignal, validFilteredSignal)
+            / np.vdot(validIdealSignal, validIdealSignal)
+        )
+        delayEvmByOrder[filterOrder] = 20.0 * np.log10(
+            np.linalg.norm(
+                validFilteredSignal / commonGain - validIdealSignal
+            )
+            / np.linalg.norm(validIdealSignal)
+        )
+    assert delayEvmByOrder[23] < -68.0
+    assert delayEvmByOrder[7] < delayEvmByOrder[1] - 10.0
+    assert delayEvmByOrder[23] < delayEvmByOrder[7] - 15.0
+
+    # A common high-order delay applies independently to every MIMO column.
+    highOrderMimoInput = np.column_stack(
+        (delayAccuracyInput, -0.5j * delayAccuracyInput)
+    )
+    highOrderMimoChannel = Channel(
+        parameters={
+            "channelDly": configuredFractionalDelay,
+            "width": 0,
+        }
+    )
+    highOrderMimoOutput = highOrderMimoChannel.ApplyChannelDelay(
+        highOrderMimoInput
+    )
+    assert np.allclose(
+        highOrderMimoOutput[:, 1],
+        -0.5j * highOrderMimoOutput[:, 0],
+        rtol=0.0,
+        atol=1.0e-14,
+    )
+    assert np.all(highOrderMimoOutput[:2, :] == 0.0)
 
     # Forward-mode Process evaluates the PA once and exposes identical clean
     # channel and feedback captures after the common delay.
@@ -11229,6 +11353,7 @@ def CheckChannelModel() -> None:
         parameters={
             "sampleMode": "fb",
             "channelDly": 1.25,
+            "channelFractionalDelayFilterOrder": 1,
             "fbIntegerDelaySamples": 2,
             "fbFractionalDelaySamples": 0.25,
             "width": 0,
@@ -11256,6 +11381,7 @@ def CheckChannelModel() -> None:
         parameters={
             "sampleMode": "forward",
             "channelDly": 2.25,
+            "channelFractionalDelayFilterOrder": 1,
             "width": 16,
         }
     )
@@ -11277,6 +11403,24 @@ def CheckChannelModel() -> None:
     )
     assert np.array_equal(
         fixedDelayOutput.imag, np.rint(fixedDelayOutput.imag)
+    )
+
+    defaultFloatingDelay = Channel(
+        parameters={"channelDly": 2.25, "width": 0}
+    ).ApplyChannelDelay(delayImpulse)
+    defaultFixedDelayChannel = Channel(
+        parameters={"channelDly": 2.25, "width": 16}
+    )
+    defaultFixedDelayOutput = defaultFixedDelayChannel.ProcessPaOutput(
+        fixedDelayInput
+    )
+    assert np.array_equal(
+        defaultFixedDelayOutput,
+        fixedDelayFormat.EncodeComplex(defaultFloatingDelay),
+    )
+    assert GetFixedPointFormat(defaultFixedDelayOutput) == (
+        16,
+        defaultFixedDelayChannel.outputFullScaleAmplitude,
     )
 
     fixedDelayProcessChannel = Channel(
@@ -12183,6 +12327,12 @@ def CheckChannelModel() -> None:
         {"channelDly": np.inf},
         {"channelDly": True},
         {"channelDly": "2.25"},
+        {"channelFractionalDelayFilterOrder": 0},
+        {"channelFractionalDelayFilterOrder": 2},
+        {"channelFractionalDelayFilterOrder": 24},
+        {"channelFractionalDelayFilterOrder": True},
+        {"channelFractionalDelayFilterOrder": 23.0},
+        {"channelFractionalDelayFilterOrder": "23"},
         {"txIqGainImbalanceDb": np.inf},
         {"txIqPhaseImbalanceDegrees": "invalid"},
         {"txDcOffset": complex(np.nan, 0.0)},

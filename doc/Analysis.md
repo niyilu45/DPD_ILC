@@ -2511,7 +2511,7 @@ Analysis(
 
 `signalProcessingParameters` 是显式构造参数，其映射内容直接传给 `SigProc`。为兼容旧程序，`parameters={"signalProcessingParameters": {...}}` 仍然有效；新代码应优先使用显式参数，避免把同步配置误认为普通Analysis指标配置。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。任何层出现未知键时，代码会发出 `UserWarning`、忽略该键并继续；已识别键的类型、单位和物理范围仍严格校验。
 
-其中 `signalProcessingParameters={"interpolationHalfLength": L}` 控制EVM/SNR/ACLR公共同步路径的Lanczos重采样核。$L$ 是半支持长度，不是FIR阶数：非整数位置最多使用 $2L$ 个抽头，对应 $2L-1$ 阶，默认 `L=12` 即24抽头/23阶等效FIR。增大它不会提高 `EstimateTimingOffsets` 的三点相关峰精度，也不能恢复Channel低阶时延注入已经造成的幅度下垂；这些残差都会诚实地进入最终EVM。选阶时应分别验证“独立高精度真值+已知时延补偿”和“自动估计+补偿”，并同时检查绝对EVM预算及 $L\rightarrow2L$ 的收敛。完整方案与OSR2/OSR4实测基线见 [SigProc §7](./SigProc.md#7-重采样与分数时延补偿)。
+其中 `signalProcessingParameters={"interpolationHalfLength": L}` 控制EVM/SNR/ACLR公共同步路径的Lanczos重采样核。$L$ 是半支持长度，不是FIR阶数：非整数位置最多使用 $2L$ 个抽头，对应 $2L-1$ 阶，默认 `L=12` 即24抽头/23阶等效FIR。增大它不会提高 `EstimateTimingOffsets` 的三点相关峰精度，也不能恢复Channel生成端在低阶配置、真实硬件通道或有限记录边界中已经造成的幅频失真；这些残差都会诚实地进入最终EVM。Channel公共 `channelDly` 当前默认也是23阶Lanczos，但它与接收补偿端仍须分别选阶和验收。应分别验证“独立高精度真值+已知时延补偿”和“自动估计+补偿”，并同时检查绝对EVM预算及 $L\rightarrow2L$ 的收敛。完整方案与OSR2/OSR4实测基线见 [SigProc §7](./SigProc.md#7-重采样与分数时延补偿)。
 
 `width` 配置参考和测量波形的统一I/Q码宽。`width=0` 使用浮点旁路；默认 `width=16` 要求公开输入的 I、Q 分量是 `-32768…32767` 的整数码。Analysis在入口把Reference按 $q/2^{width-1}$ 解码，把待测输出按 $F_{out}q/2^{width-1}$ 解码，再完成时延、CFO、SFO、复增益、OFDM解调和指标计算。显式参考、发送辅助和盲分析三条路径都只解码一次，盲模式还会把位宽传给Parser重建参考。完整且数据互不混用的浮点/定点示例见11.7节。
 

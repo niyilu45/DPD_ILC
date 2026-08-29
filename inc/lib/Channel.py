@@ -94,6 +94,7 @@ class Channel:
                 "sampleMode": "forward",
                 "sampleRateHz": 1.0,
                 "channelDly": 0.0,
+                "channelFractionalDelayFilterOrder": 23,
                 "thermalRunMode": "steady_state",
                 "thermalDutyCycle": 1.0,
                 "thermalSteadyStateToleranceC": 1.0e-4,
@@ -385,6 +386,7 @@ class Channel:
         calibrationSensitiveNames = {
             "sampleRateHz",
             "channelDly",
+            "channelFractionalDelayFilterOrder",
             "phaseDegrees",
             "fbGainDb",
             "fbPhaseDegrees",
@@ -598,6 +600,20 @@ class Channel:
             raise ValueError(
                 "channelDly has an invalid value. Allowed range: finite "
                 "real number in [0, +inf) samples."
+            )
+        channelFractionalDelayFilterOrder = self.parameters[
+            "channelFractionalDelayFilterOrder"
+        ]
+        if (
+            not isinstance(channelFractionalDelayFilterOrder, int)
+            or isinstance(channelFractionalDelayFilterOrder, bool)
+            or channelFractionalDelayFilterOrder < 1
+            or channelFractionalDelayFilterOrder % 2 == 0
+        ):
+            raise ValueError(
+                "channelFractionalDelayFilterOrder has an invalid value. "
+                "Allowed values: 1 for legacy two-tap linear interpolation, "
+                "or an odd integer in [3, +inf) for Lanczos interpolation."
             )
 
         thermalRunMode = self.parameters["thermalRunMode"]
@@ -1808,6 +1824,7 @@ class Channel:
             id(self.paModel),
             float(self.parameters["sampleRateHz"]),
             float(self.parameters["channelDly"]),
+            int(self.parameters["channelFractionalDelayFilterOrder"]),
             float(self.parameters["phaseDegrees"]),
             float(self.parameters["fbGainDb"]),
             float(self.parameters["fbPhaseDegrees"]),
@@ -2935,7 +2952,7 @@ class Channel:
         )
 
     def ResolveChannelDelay(self) -> Tuple[int, float]:
-        """Split the configured common delay into causal sample parts.
+        """Split the configured common delay into integer and fractional parts.
 
         Processing details:
             Algorithm: Take the floor of the nonnegative floating
@@ -2959,15 +2976,17 @@ class Channel:
     def ApplyChannelDelay(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
-        """Apply the common causal integer and fractional channel delay.
+        """Apply the common integer and fractional channel delay.
 
         Processing details:
             Algorithm: Resolve ``channelDly = N + mu`` with integer ``N``
-            and ``0 <= mu < 1``. Approximate ``x[n-mu]`` independently on
-            every chain with the first-order causal fractional-delay FIR
-            ``(1-mu)*x[n] + mu*x[n-1]`` under zero initial conditions, then
-            prefix ``N`` zeros and truncate the same number of tail samples.
-            The public record length and SISO/MIMO orientation remain fixed.
+            and ``0 <= mu < 1``. Integer positions use an exact zero-prefix
+            shift. Noninteger positions use either the legacy order-one
+            linear FIR or a normalized, fixed-coefficient Lanczos FIR with
+            ``order + 1`` taps. Retain the fractional stage on the original
+            zero-extended record coordinates, then prefix ``N`` zeros and
+            truncate the shifted tail. The public record length and SISO/MIMO
+            orientation remain fixed.
 
         Args:
             inputSignal: PA output vector or samples-by-chains matrix before
@@ -2996,26 +3015,61 @@ class Channel:
             else complexInput
         )
         sampleCount = inputMatrix.shape[0]
+        delayedMatrix = np.zeros_like(inputMatrix)
         if fractionalDelaySamples == 0.0:
-            fractionalOutput = inputMatrix
-        else:
-            fractionalOutput = (
-                (1.0 - fractionalDelaySamples) * inputMatrix
-            )
-            if sampleCount > 1:
-                fractionalOutput[1:, :] += (
-                    fractionalDelaySamples * inputMatrix[:-1, :]
-                )
-        if integerDelaySamples == 0:
-            delayedMatrix = fractionalOutput
-        else:
-            delayedMatrix = np.zeros_like(inputMatrix)
             if integerDelaySamples < sampleCount:
-                delayedMatrix[integerDelaySamples:, :] = (
-                    fractionalOutput[
-                        : sampleCount - integerDelaySamples, :
-                    ]
+                delayedMatrix[integerDelaySamples:, :] = inputMatrix[
+                    : sampleCount - integerDelaySamples, :
+                ]
+        elif integerDelaySamples < sampleCount:
+            filterOrder = int(
+                self.parameters["channelFractionalDelayFilterOrder"]
+            )
+            if filterOrder == 1:
+                minimumLag = 0
+                fractionalTaps = np.asarray(
+                    (
+                        1.0 - fractionalDelaySamples,
+                        fractionalDelaySamples,
+                    ),
+                    dtype=float,
                 )
+            else:
+                halfLength = (filterOrder + 1) // 2
+                lagIndices = np.arange(
+                    -halfLength + 1,
+                    halfLength + 1,
+                    dtype=int,
+                )
+                tapDistances = (
+                    lagIndices.astype(float) - fractionalDelaySamples
+                )
+                fractionalTaps = (
+                    np.sinc(tapDistances)
+                    * np.sinc(tapDistances / float(halfLength))
+                )
+                tapSum = float(np.sum(fractionalTaps))
+                if abs(tapSum) <= np.finfo(float).eps:
+                    raise RuntimeError(
+                        "channel fractional-delay FIR normalization is "
+                        "numerically singular"
+                    )
+                fractionalTaps /= tapSum
+                minimumLag = int(lagIndices[0])
+
+            copyCount = sampleCount - integerDelaySamples
+            fullStart = -minimumLag
+            for chainIndex in range(inputMatrix.shape[1]):
+                fullConvolution = np.convolve(
+                    inputMatrix[:, chainIndex],
+                    fractionalTaps,
+                    mode="full",
+                )
+                delayedMatrix[
+                    integerDelaySamples:, chainIndex
+                ] = fullConvolution[
+                    fullStart : fullStart + copyCount
+                ]
         return (
             np.asarray(delayedMatrix[:, 0], dtype=np.complex128)
             if inputWasVector

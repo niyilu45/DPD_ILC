@@ -1553,11 +1553,12 @@ Channel参数按物理模块分类如下，避免把真实Tx失真和FB观测误
 | `sampleMode` | `"forward"` | 公开 `Process` 始终返回 `(chOut, fbOut)`；`forward` 令第二项成为第一项的数值相同副本并绕过FB链，`fb` 令第二项经过完整反馈链。兼容单输出接口仍按该值选路。 |
 | `sampleRateHz` | `1.0` | CFO、SFO、时延和物理时间换算所用采样率。 |
 | `channelDly` | `0.0` | PA后耦合之后、forward/fb分路之前的公共传播时延，单位sample；必须为非负有限实数。 |
+| `channelFractionalDelayFilterOrder` | `23` | 公共分数时延滤波器阶数；`1`保留旧两抽头线性插值，奇数 `3, 5, ...` 使用 `order+1` 抽头的归一化Lanczos核。整数 `channelDly` 精确旁路该滤波器。 |
 | `phaseDegrees` | `0` | PA后的公共固定移相，仅允许 `-90`、`0`、`90` 度。 |
 | `width` | `16` | 公开I/Q位宽；`0`为浮点，正值为整数码。 |
 | `outputFullScaleAmplitude` | `2.0` | 固定点 `chOut`/`fbOut` 正满码代表的I或Q物理分量幅度；默认提供6.02 dB输出观测余量，输入DAC仍为1.0。 |
 
-`channelDly=D_total` 分解为 `D=floor(D_total)` 与 `mu=D_total-D`。整数部分在同长记录前补 `D` 个零并截去尾部，分数部分使用两抽头一阶Farrow/线性插值 `y[n]=(1-mu)x[n]+mu*x[n-1]`；物理时间为 `D_total/sampleRateHz`。理想传播频响 `exp(-j*omega*D_total)` 只改变相位，当前有限阶近似在非整数时延下会有高频幅度下垂，适合过采样基带。示例：
+`channelDly=D_total` 分解为 `D=floor(D_total)` 与 `mu=D_total-D`。`mu=0` 时直接执行精确整数移位。`mu!=0` 时先在原记录坐标上执行分数时延FIR，再前补 `D` 个零并截去同长尾部。默认阶数 `P=23` 对应 `L=(P+1)/2=12`、24抽头归一化Lanczos核，其lag支撑为 `[-11, 12]`；因此离线计算会读取当前位置之后最多11个输入样点。记录外部按0处理，滤波器只对整组抽头归一化一次，不会在边界按剩余抽头重新归一化。名义物理时间仍为 `D_total/sampleRateHz`。示例：
 
 ```python
 channel = Channel(
@@ -1566,6 +1567,7 @@ channel = Channel(
         "sampleMode": "fb",
         "sampleRateHz": 160.0e6,
         "channelDly": 3.25,  # 20.3125 ns common delay
+        "channelFractionalDelayFilterOrder": 23,
         "fbIntegerDelaySamples": 12,
         "fbFractionalDelaySamples": 0.18,
     },
@@ -1573,16 +1575,16 @@ channel = Channel(
 chOut, fbOut = channel.Process(rawSignal, outputPowerDbm=20.0)
 ```
 
-两路都包含 `3.25 sample` 公共时延；fb模式的第二路还叠加FB专用时延。`channelDly` 是非负物理传播时延，`fbFractionalDelaySamples` 则是可带符号的接收采样偏差。两级串联时名义group delay相加，但两次一阶插值的频响相乘，卷积后的波形一般不等价于把总小数部分只插值一次。forward模式仍直接复制延迟后的 `chOut`，所以两项完全相同。功率闭环测量公共时延之前的干净PA输出，不会把同长零边界造成的表观记录功率变化反馈到PA drive。
+两路都包含 `3.25 sample` 公共时延；fb模式的第二路还叠加FB专用时延。`channelDly` 是非负物理传播时延，默认由可配的高阶Lanczos核生成；`fbFractionalDelaySamples` 则是可带符号的接收采样偏差，目前仍使用一阶线性插值。两级串联时名义group delay相加，但实际频响为两级频响相乘，不等价于把总小数部分只插值一次。forward模式仍直接复制延迟后的 `chOut`，所以两项完全相同。功率闭环测量公共时延之前的干净PA输出，不会把同长零边界造成的表观记录功率变化反馈到PA drive。
 
 生成端和补偿端的“阶数”不是同一个参数：
 
 | 位置 | 当前选择量 | 实际规模 | 能解决的问题 |
 | --- | --- | ---: | --- |
-| Channel公共 `channelDly` | 固定一阶Farrow，当前不可配置 | 2 taps | 生成整数加分数传播时延；非整数时会有带内幅度下垂 |
-| SigProc接收补偿 | `interpolationHalfLength=L`，默认12 | $2L$ taps，默认24 taps/23阶等效FIR | 更准确地重采样已收到的波形；不能恢复Channel生成端已经引入的幅度失真 |
+| Channel公共 `channelDly` | `channelFractionalDelayFilterOrder=P`，默认23 | `P+1` taps，默认24 taps；`P=1`为两抽头旧模式 | 生成整数加分数传播时延；阶数决定注入端带内近似误差、前视和边界guard |
+| SigProc接收补偿 | `interpolationHalfLength=L`，默认12 | $2L$ taps，默认24 taps/23阶等效FIR | 更准确地重采样已收到的波形；不能恢复注入端、硬件通道或边界已经造成的幅频失真 |
 
-接收端选阶应先用独立高精度时延真值做“已知时延补偿”，再用完整自动估计做第二条路径；同时要求插值残差满足绝对EVM预算，并且 $L\rightarrow2L$ 后最差结果变化小于项目门限。普通筛选可留10 dB余量；若要求插值使最终EVM恶化不超过0.1 dB，应留约17 dB。当前EHT基线在4倍采样时默认 `L=12` 的已知时延最差EVM约 -69.2 dB，但自动路径在部分相位只有约 -51.3 dB，主要限制来自三点相关峰估计，继续增加抽头无效。完整公式、实测表、guard计算和故障判据见 [Channel §1.1](doc/Channel.md#11-chout前向仪表采样与公共传播时延) 与 [SigProc §7](doc/SigProc.md#7-重采样与分数时延补偿)。
+注入端与接收端必须分开验收：先用独立长sinc、零扩展FFT或硬件时延作真值，在已知时延下分别扫描Channel的 `P` 和接收端的 `L`，再开启自动估计。对每一端都应同时要求绝对EVM余量和阶数加倍收敛；已知时延通过而自动路径停在平台时，限制来自时延估计而不是补偿滤波器阶数。普通筛选可留10 dB余量；若要求该模块使最终EVM恶化不超过0.1 dB，应留约17 dB。默认23阶Channel需在评价区前后至少保留其真实支撑要求的guard；流式实现还需缓存跨块历史及11个前视样点，或显式增加11点流水延迟使其因果化。完整公式、guard计算和故障判据见 [Channel §1.1](doc/Channel.md#11-chout前向仪表采样与公共传播时延) 与 [SigProc §7](doc/SigProc.md#7-重采样与分数时延补偿)。
 
 #### Channel周期热调度参数
 
@@ -1773,7 +1775,7 @@ channel = Channel(
 | FB I/Q | `fbIqImbalanceEnabled=True`，双FIR均 `None`，`0.3 dB`、`2 degree` | 平坦回退时使用相同镜像公式，但只污染fb观测；forward结果不变。False时标量、FIR和DC整级旁路。 |
 | Tx/FB频选I/Q | 80 MHz采样率下，中度起点使用直接FIR `(0.997+0j, 0.003+0j)`、镜像FIR `(0.019+0j, -0.009+0j)` | 中心约 -40 dBc、两侧带边约 -31 dBc；非None序列是完整有效响应，真实工程应由扫频或宽带辨识得到，并按占用带宽最差IRR选择阶数。 |
 | FB I/Q补偿 | 先 `phase_pair`，再 `filter`；平坦误差从 `L=1`、`1e-6` 开始，3-tap频选误差可从 `L=7` 开始 | 相位对分离 $h_d*u$ 与 $h_i*u^*$ 并拟合广义线性逆FIR；实时filter只需单状态。深陷波或非最小相位只能用有限长因果FIR近似，必须用验证NMSE和带边IRR定阶。 |
-| 公共传播时延 | `channelDly=0.0` 为理想基线；功能验证可用 `3.25 sample` | PA后耦合之后共同延迟chOut/fbOut；整数部分前补零/尾截断，非整数部分的两抽头近似会有高频下垂。物理秒数为 `channelDly/sampleRateHz`，不进入PA功率闭环。 |
+| 公共传播时延 | `channelDly=0.0` 为理想基线；功能验证可用 `3.25 sample` | PA后耦合之后共同延迟chOut/fbOut；默认 `channelFractionalDelayFilterOrder=23` 先执行24抽头归一化Lanczos分数滤波，再对整数部分前补零/尾截断。阶数 `1` 才是旧两抽头模式。物理秒数为 `channelDly/sampleRateHz`，不进入PA功率闭环。 |
 | 通道耦合 | `-30 dB` | 电压泄漏为 `10^(-30/20)=3.16%`；PA前耦合还会进入非线性。 |
 | FB CFO | `500 Hz`功能验证、`5 kHz`压力测试 | 累计相位为 `2π·CFO·观测时间`；帧越长旋转越明显。 |
 | FB SFO | `5 ppm`功能验证、`50 ppm`压力测试 | 经过N点累计漂移约 `N·ppm·1e-6` 个样点。 |
