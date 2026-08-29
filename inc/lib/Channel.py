@@ -2,11 +2,12 @@
 
 The channel can apply flat or frequency-selective widely-linear transmitter and
 feedback I/Q imbalance, causal complex coupling paths before a multi-chain PA
-bank, and coupling after its nonlinear outputs. One PA evaluation always
-produces a forward channel observation. Forward sampling copies it into the
-feedback return, while feedback sampling additionally evaluates the embedded
-receiver. Public fixed-point boundaries use raw integer I/Q codes while every
-physical operation remains floating point.
+bank, coupling after its nonlinear outputs, and one common propagation delay.
+One PA evaluation always produces a forward channel observation. Forward
+sampling copies it into the feedback return, while feedback sampling
+additionally evaluates the embedded receiver. Public fixed-point boundaries
+use raw integer I/Q codes while every physical operation remains floating
+point.
 """
 
 from collections import ChainMap
@@ -92,6 +93,7 @@ class Channel:
             {
                 "sampleMode": "forward",
                 "sampleRateHz": 1.0,
+                "channalDly": 0.0,
                 "thermalRunMode": "steady_state",
                 "thermalDutyCycle": 1.0,
                 "thermalSteadyStateToleranceC": 1.0e-4,
@@ -382,6 +384,7 @@ class Channel:
             raise
         calibrationSensitiveNames = {
             "sampleRateHz",
+            "channalDly",
             "phaseDegrees",
             "fbGainDb",
             "fbPhaseDegrees",
@@ -584,6 +587,17 @@ class Channel:
             raise ValueError(
                 "sampleRateHz has an invalid value. Allowed range: "
                 "finite real number in (0, +inf) Hz."
+            )
+        channelDelaySamples = self.parameters["channalDly"]
+        if (
+            not isinstance(channelDelaySamples, (int, float))
+            or isinstance(channelDelaySamples, bool)
+            or not np.isfinite(channelDelaySamples)
+            or float(channelDelaySamples) < 0.0
+        ):
+            raise ValueError(
+                "channalDly has an invalid value. Allowed range: finite "
+                "real number in [0, +inf) samples."
             )
 
         thermalRunMode = self.parameters["thermalRunMode"]
@@ -1793,6 +1807,7 @@ class Channel:
         return (
             id(self.paModel),
             float(self.parameters["sampleRateHz"]),
+            float(self.parameters["channalDly"]),
             float(self.parameters["phaseDegrees"]),
             float(self.parameters["fbGainDb"]),
             float(self.parameters["fbPhaseDegrees"]),
@@ -2919,6 +2934,94 @@ class Channel:
             for signalRms in signalRmsPerChain
         )
 
+    def ResolveChannelDelay(self) -> Tuple[int, float]:
+        """Split the configured common delay into causal sample parts.
+
+        Processing details:
+            Algorithm: Take the floor of the nonnegative floating
+            ``channalDly`` value as the exact whole-sample shift and retain
+            the remainder in ``[0, 1)`` as the fractional-sample delay. Their
+            sum always reconstructs the configured total delay.
+
+        Returns:
+            result: Integer delay followed by fractional delay, both in
+                complex-sample periods.
+        """
+
+        self.ValidateParameters()
+        totalDelaySamples = float(self.parameters["channalDly"])
+        integerDelaySamples = int(np.floor(totalDelaySamples))
+        fractionalDelaySamples = (
+            totalDelaySamples - float(integerDelaySamples)
+        )
+        return integerDelaySamples, float(fractionalDelaySamples)
+
+    def ApplyChannelDelay(
+        self, inputSignal: np.ndarray
+    ) -> np.ndarray:
+        """Apply the common causal integer and fractional channel delay.
+
+        Processing details:
+            Algorithm: Resolve ``channalDly = N + mu`` with integer ``N``
+            and ``0 <= mu < 1``. Approximate ``x[n-mu]`` independently on
+            every chain with the first-order causal fractional-delay FIR
+            ``(1-mu)*x[n] + mu*x[n-1]`` under zero initial conditions, then
+            prefix ``N`` zeros and truncate the same number of tail samples.
+            The public record length and SISO/MIMO orientation remain fixed.
+
+        Args:
+            inputSignal: PA output vector or samples-by-chains matrix before
+                receiver-path propagation delay.
+
+        Returns:
+            result: Same-shape complex waveform delayed by ``channalDly``
+                sample periods.
+        """
+
+        self.ValidateParameters()
+        complexInput = self.PrepareSignal(inputSignal, "inputSignal")
+        integerDelaySamples, fractionalDelaySamples = (
+            self.ResolveChannelDelay()
+        )
+        if integerDelaySamples == 0 and fractionalDelaySamples == 0.0:
+            return (
+                complexInput
+                if self._trustedProcessingDepth > 0
+                else complexInput.copy()
+            )
+        inputWasVector = complexInput.ndim == 1
+        inputMatrix = (
+            complexInput.reshape(-1, 1)
+            if inputWasVector
+            else complexInput
+        )
+        sampleCount = inputMatrix.shape[0]
+        if fractionalDelaySamples == 0.0:
+            fractionalOutput = inputMatrix
+        else:
+            fractionalOutput = (
+                (1.0 - fractionalDelaySamples) * inputMatrix
+            )
+            if sampleCount > 1:
+                fractionalOutput[1:, :] += (
+                    fractionalDelaySamples * inputMatrix[:-1, :]
+                )
+        if integerDelaySamples == 0:
+            delayedMatrix = fractionalOutput
+        else:
+            delayedMatrix = np.zeros_like(inputMatrix)
+            if integerDelaySamples < sampleCount:
+                delayedMatrix[integerDelaySamples:, :] = (
+                    fractionalOutput[
+                        : sampleCount - integerDelaySamples, :
+                    ]
+                )
+        return (
+            np.asarray(delayedMatrix[:, 0], dtype=np.complex128)
+            if inputWasVector
+            else np.asarray(delayedMatrix, dtype=np.complex128)
+        )
+
     def ApplyPhaseRotation(
         self, inputSignal: np.ndarray
     ) -> np.ndarray:
@@ -3520,9 +3623,10 @@ class Channel:
         """Create the forward channel observation used for final RF metrics.
 
         Processing details:
-            Algorithm: Apply the common PA-to-receiver phase rotation and the
-            configured measurement noise without applying any embedded-
-            feedback FIR, nonlinearity, oscillator, I/Q, or ADC impairment.
+            Algorithm: Apply the common ``channalDly`` propagation delay,
+            PA-to-receiver phase rotation, and configured measurement noise
+            without applying any embedded-feedback FIR, nonlinearity,
+            oscillator, I/Q, or ADC impairment.
 
         Args:
             paOutputSignal: Normalized PA output after post-PA coupling.
@@ -3533,7 +3637,8 @@ class Channel:
         """
 
         self.ValidateParameters()
-        phaseRotatedSignal = self.ApplyPhaseRotation(paOutputSignal)
+        delayedSignal = self.ApplyChannelDelay(paOutputSignal)
+        phaseRotatedSignal = self.ApplyPhaseRotation(delayedSignal)
         return self.AddNoise(phaseRotatedSignal)
 
     def ApplyFeedbackChannelEffects(
@@ -3566,12 +3671,13 @@ class Channel:
         """Evaluate one measured phase-switch state before FB I/Q error.
 
         Processing details:
-            Algorithm: Apply the existing common ``phaseDegrees`` rotation and
-            every feedback impairment up to the I/Q-converter input, multiply
-            by the supplied measured complex response of the additional phase
-            switch, then execute feedback I/Q/DC, noise, and ADC stages. This
-            explicit reference plane makes unequal measured switch magnitudes
-            separable even when an earlier feedback amplifier is nonlinear.
+            Algorithm: Apply the common ``channalDly`` propagation delay and
+            ``phaseDegrees`` rotation, then every feedback impairment up to
+            the I/Q-converter input. Multiply by the supplied measured complex
+            response of the additional phase switch, then execute feedback
+            I/Q/DC, noise, and ADC stages. This explicit reference plane makes
+            unequal measured switch magnitudes separable even when an earlier
+            feedback amplifier is nonlinear.
 
         Args:
             paOutputSignal: Normalized PA output after post-PA coupling.
@@ -3596,7 +3702,8 @@ class Channel:
             raise ValueError(
                 "phaseResponse must be one finite nonzero complex scalar"
             )
-        phaseRotatedSignal = self.ApplyPhaseRotation(paOutputSignal)
+        delayedSignal = self.ApplyChannelDelay(paOutputSignal)
+        phaseRotatedSignal = self.ApplyPhaseRotation(delayedSignal)
         preIqFeedbackSignal = self.ApplyFeedbackPreIqImpairments(
             phaseRotatedSignal
         )
@@ -3618,10 +3725,11 @@ class Channel:
         Processing details:
             Algorithm: Decode public integer I/Q codes with the bound PA's
             output scale, apply configured post-PA inter-chain coupling,
-            execute the selected forward or feedback sampling path in
-            normalized floating units, and encode the receiver signal with
-            the Channel output scale. Equal defaults preserve the ordinary
-            same-format path while allowing an explicitly wider PA capture.
+            apply the common propagation delay, execute the selected forward
+            or feedback sampling path in normalized floating units, and
+            encode the receiver signal with the Channel output scale. Equal
+            defaults preserve the ordinary same-format path while allowing an
+            explicitly wider PA capture.
 
         Args:
             paOutputSignal: Public PA output vector or matrix.
@@ -4113,11 +4221,12 @@ class Channel:
 
         Processing details:
             Algorithm: Run the transmitter, coupled PA bank, and thermal
-            period exactly once, then evaluate the forward measurement path.
-            In forward mode return an independent copy of that same waveform
-            as ``fbOut``. In feedback mode additionally evaluate the complete
-            embedded receiver, with an independent noise realization, while
-            retaining the common PA memory and temperature state.
+            period exactly once, then apply the common propagation delay in
+            both observation paths. In forward mode return an independent
+            copy of ``chOut`` as ``fbOut``. In feedback mode additionally
+            evaluate the complete embedded receiver, with an independent
+            noise realization, while retaining the common PA memory and
+            temperature state.
 
         Args:
             inputSignal: Normalized digital Tx input vector or matrix.
@@ -4276,9 +4385,11 @@ class Channel:
             reference-temperature calibration; the first such call therefore
             requires an explicit target. The accepted waveform is then
             evaluated on the periodic steady-state temperature curve exactly
-            once. Forward mode copies ``chOut`` into ``fbOut``; feedback mode
-            evaluates the embedded receiver for ``fbOut``. DPD/ILC uses the
-            selected ``fbOut`` observation and final RF metrics use ``chOut``.
+            once. Both observations include the common ``channalDly`` after
+            PA output coupling. Forward mode copies ``chOut`` into ``fbOut``;
+            feedback mode evaluates the embedded receiver for ``fbOut`` and
+            may add its own ``fb...DelaySamples``. DPD/ILC uses the selected
+            ``fbOut`` observation and final RF metrics use ``chOut``.
 
         Args:
             inputSignal: Public digital Tx vector or samples-by-chains matrix.

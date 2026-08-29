@@ -11017,6 +11017,208 @@ def CheckChannelModel() -> None:
         testSignal,
     )
 
+    # The common propagation delay defaults to an identity operation while
+    # retaining the standalone helper's defensive-copy contract. Delay
+    # decomposition always uses floor so its fractional part stays in [0, 1).
+    defaultDelayChannel = Channel(parameters={"width": 0})
+    assert defaultDelayChannel.GetParameters()["channalDly"] == 0.0
+    defaultDelayOutput = defaultDelayChannel.ApplyChannelDelay(testSignal)
+    assert np.array_equal(defaultDelayOutput, testSignal)
+    assert not np.shares_memory(defaultDelayOutput, testSignal)
+    for configuredDelay, expectedDelayParts in (
+        (0, (0, 0.0)),
+        (3, (3, 0.0)),
+        (2.25, (2, 0.25)),
+    ):
+        delayResolver = Channel(
+            parameters={"channalDly": configuredDelay, "width": 0}
+        )
+        resolvedIntegerDelay, resolvedFractionalDelay = (
+            delayResolver.ResolveChannelDelay()
+        )
+        assert (
+            resolvedIntegerDelay,
+            resolvedFractionalDelay,
+        ) == expectedDelayParts
+        assert 0.0 <= resolvedFractionalDelay < 1.0
+
+    # A 2.25-sample delay is the causal first-order fractional response
+    # [0.75, 0.25] after two leading zeros. Records keep their original
+    # length, discard shifted tail samples, and become zero when the integer
+    # delay lies beyond the complete capture.
+    delayImpulse = np.zeros(8, dtype=np.complex128)
+    delayImpulse[0] = 1.0 + 0.0j
+    fractionalDelayChannel = Channel(
+        parameters={"channalDly": 2.25, "width": 0}
+    )
+    expectedFractionalDelay = np.zeros_like(delayImpulse)
+    expectedFractionalDelay[2:4] = (0.75, 0.25)
+    actualFractionalDelay = fractionalDelayChannel.ApplyChannelDelay(
+        delayImpulse
+    )
+    assert actualFractionalDelay.shape == delayImpulse.shape
+    assert np.array_equal(
+        actualFractionalDelay, expectedFractionalDelay
+    )
+    assert np.array_equal(
+        fractionalDelayChannel.ProcessPaOutput(delayImpulse),
+        expectedFractionalDelay,
+    )
+
+    tailInput = np.asarray(
+        (
+            1.0 + 0.5j,
+            2.0 + 1.0j,
+            3.0 + 1.5j,
+            4.0 + 2.0j,
+            5.0 + 2.5j,
+        ),
+        dtype=np.complex128,
+    )
+    integerDelayChannel = Channel(
+        parameters={"channalDly": 2.0, "width": 0}
+    )
+    expectedTailTruncation = np.zeros_like(tailInput)
+    expectedTailTruncation[2:] = tailInput[:-2]
+    actualTailTruncation = integerDelayChannel.ApplyChannelDelay(
+        tailInput
+    )
+    assert actualTailTruncation.shape == tailInput.shape
+    assert np.array_equal(
+        actualTailTruncation, expectedTailTruncation
+    )
+    beyondRecordChannel = Channel(
+        parameters={
+            "channalDly": float(tailInput.size + 1),
+            "width": 0,
+        }
+    )
+    assert np.array_equal(
+        beyondRecordChannel.ApplyChannelDelay(tailInput),
+        np.zeros_like(tailInput),
+    )
+
+    # MIMO columns use the same delay without cross-chain leakage.
+    mimoDelayInput = np.zeros((8, 2), dtype=np.complex128)
+    mimoDelayInput[0, 0] = 1.0 + 0.0j
+    mimoDelayInput[1, 1] = 2.0 - 1.0j
+    expectedMimoDelay = np.zeros_like(mimoDelayInput)
+    expectedMimoDelay[2:4, 0] = (0.75, 0.25)
+    expectedMimoDelay[3:5, 1] = (
+        1.5 - 0.75j,
+        0.5 - 0.25j,
+    )
+    actualMimoDelay = fractionalDelayChannel.ApplyChannelDelay(
+        mimoDelayInput
+    )
+    assert actualMimoDelay.shape == mimoDelayInput.shape
+    assert np.array_equal(actualMimoDelay, expectedMimoDelay)
+
+    # Forward-mode Process evaluates the PA once and exposes identical clean
+    # channel and feedback captures after the common delay.
+    forwardDelayProcessChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=0),
+        parameters={
+            "sampleMode": "forward",
+            "channalDly": 2.25,
+            "width": 0,
+        },
+    )
+    forwardDelayOutput, forwardDelayFeedbackOutput = (
+        forwardDelayProcessChannel.Process(delayImpulse)
+    )
+    assert np.array_equal(
+        forwardDelayFeedbackOutput, forwardDelayOutput
+    )
+    assert not np.shares_memory(
+        forwardDelayFeedbackOutput, forwardDelayOutput
+    )
+
+    # In feedback mode the ordinary receiver timing error follows the common
+    # delay. chOut therefore has only [0.75, 0.25], whereas a further 2.25
+    # samples in FB produces the cascaded three-tap fractional response.
+    stackedDelayChannel = Channel(
+        parameters={
+            "sampleMode": "fb",
+            "channalDly": 1.25,
+            "fbIntegerDelaySamples": 2,
+            "fbFractionalDelaySamples": 0.25,
+            "width": 0,
+        }
+    )
+    expectedCommonDelay = np.zeros_like(delayImpulse)
+    expectedCommonDelay[1:3] = (0.75, 0.25)
+    expectedStackedFeedbackDelay = np.zeros_like(delayImpulse)
+    expectedStackedFeedbackDelay[3:6] = (0.5625, 0.375, 0.0625)
+    stackedChannelOutput = stackedDelayChannel.ApplyForwardChannelEffects(
+        delayImpulse
+    )
+    stackedFeedbackOutput = stackedDelayChannel.ProcessPaOutput(
+        delayImpulse
+    )
+    assert np.array_equal(stackedChannelOutput, expectedCommonDelay)
+    assert np.array_equal(
+        stackedFeedbackOutput, expectedStackedFeedbackDelay
+    )
+
+    # Width-16 ProcessPaOutput retains public integer I/Q codes, and the
+    # ordinary PA-backed Process contract still makes forward fbOut identical
+    # to chOut after applying the configured common delay.
+    fixedDelayChannel = Channel(
+        parameters={
+            "sampleMode": "forward",
+            "channalDly": 2.25,
+            "width": 16,
+        }
+    )
+    fixedDelayFormat = FixedPoint(
+        16, fixedDelayChannel.outputFullScaleAmplitude
+    )
+    fixedDelayInput = fixedDelayFormat.EncodeComplex(delayImpulse)
+    fixedExpectedDelay = fixedDelayFormat.EncodeComplex(
+        expectedFractionalDelay
+    )
+    fixedDelayOutput = fixedDelayChannel.ProcessPaOutput(fixedDelayInput)
+    assert np.array_equal(fixedDelayOutput, fixedExpectedDelay)
+    assert GetFixedPointFormat(fixedDelayOutput) == (
+        16,
+        fixedDelayChannel.outputFullScaleAmplitude,
+    )
+    assert np.array_equal(
+        fixedDelayOutput.real, np.rint(fixedDelayOutput.real)
+    )
+    assert np.array_equal(
+        fixedDelayOutput.imag, np.rint(fixedDelayOutput.imag)
+    )
+
+    fixedDelayProcessChannel = Channel(
+        paModel=PaModel(modelName="wiener", width=16),
+        parameters={
+            "sampleMode": "forward",
+            "channalDly": 2.25,
+            "width": 16,
+        },
+    )
+    fixedProcessInput = FixedPoint(16).EncodeComplex(0.25 * delayImpulse)
+    fixedProcessOutput, fixedProcessFeedbackOutput = (
+        fixedDelayProcessChannel.Process(fixedProcessInput)
+    )
+    assert np.array_equal(fixedProcessFeedbackOutput, fixedProcessOutput)
+    for fixedPublicOutput in (
+        fixedProcessOutput,
+        fixedProcessFeedbackOutput,
+    ):
+        assert GetFixedPointFormat(fixedPublicOutput) == (
+            16,
+            fixedDelayProcessChannel.outputFullScaleAmplitude,
+        )
+        assert np.array_equal(
+            fixedPublicOutput.real, np.rint(fixedPublicOutput.real)
+        )
+        assert np.array_equal(
+            fixedPublicOutput.imag, np.rint(fixedPublicOutput.imag)
+        )
+
     # Tx I/Q imbalance is a physical forward-path impairment before the PA,
     # while feedback I/Q imbalance is an observation-only receiver defect.
     txPaModel = PaModel(modelName="wiener", width=0)
@@ -11888,6 +12090,11 @@ def CheckChannelModel() -> None:
             "noiseSnrDb": 30.0,
         },
         {"noiseSnrDb": np.nan},
+        {"channalDly": -0.25},
+        {"channalDly": np.nan},
+        {"channalDly": np.inf},
+        {"channalDly": True},
+        {"channalDly": "2.25"},
         {"txIqGainImbalanceDb": np.inf},
         {"txIqPhaseImbalanceDegrees": "invalid"},
         {"txDcOffset": complex(np.nan, 0.0)},
@@ -14003,6 +14210,7 @@ def CheckPerformanceOptimizationEquivalence() -> None:
     # Every standalone identity helper preserves its historical defensive-copy
     # contract even though the same stages alias intermediates inside Process.
     identityHelperOutputs = (
+        acceleratedChannel.ApplyChannelDelay(channelInput),
         acceleratedChannel.ApplyMimoCoupling(
             channelInput, "prePaCouplingPaths"
         ),
