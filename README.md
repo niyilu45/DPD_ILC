@@ -1575,6 +1575,15 @@ chOut, fbOut = channel.Process(rawSignal, outputPowerDbm=20.0)
 
 两路都包含 `3.25 sample` 公共时延；fb模式的第二路还叠加FB专用时延。`channelDly` 是非负物理传播时延，`fbFractionalDelaySamples` 则是可带符号的接收采样偏差。两级串联时名义group delay相加，但两次一阶插值的频响相乘，卷积后的波形一般不等价于把总小数部分只插值一次。forward模式仍直接复制延迟后的 `chOut`，所以两项完全相同。功率闭环测量公共时延之前的干净PA输出，不会把同长零边界造成的表观记录功率变化反馈到PA drive。
 
+生成端和补偿端的“阶数”不是同一个参数：
+
+| 位置 | 当前选择量 | 实际规模 | 能解决的问题 |
+| --- | --- | ---: | --- |
+| Channel公共 `channelDly` | 固定一阶Farrow，当前不可配置 | 2 taps | 生成整数加分数传播时延；非整数时会有带内幅度下垂 |
+| SigProc接收补偿 | `interpolationHalfLength=L`，默认12 | $2L$ taps，默认24 taps/23阶等效FIR | 更准确地重采样已收到的波形；不能恢复Channel生成端已经引入的幅度失真 |
+
+接收端选阶应先用独立高精度时延真值做“已知时延补偿”，再用完整自动估计做第二条路径；同时要求插值残差满足绝对EVM预算，并且 $L\rightarrow2L$ 后最差结果变化小于项目门限。普通筛选可留10 dB余量；若要求插值使最终EVM恶化不超过0.1 dB，应留约17 dB。当前EHT基线在4倍采样时默认 `L=12` 的已知时延最差EVM约 -69.2 dB，但自动路径在部分相位只有约 -51.3 dB，主要限制来自三点相关峰估计，继续增加抽头无效。完整公式、实测表、guard计算和故障判据见 [Channel §1.1](doc/Channel.md#11-chout前向仪表采样与公共传播时延) 与 [SigProc §7](doc/SigProc.md#7-重采样与分数时延补偿)。
+
 #### Channel周期热调度参数
 
 | 参数 | 默认值 | 说明 |
@@ -1834,7 +1843,7 @@ measurementChOut, filteredFbOut = channel.Process(
 | `maxSamplingFrequencyOffsetPpm` | `200.0` | 采样频偏估计绝对值上限。 |
 | `timingWindowCount` | `9` | CFO 和时变时延估计使用的窗口数。 |
 | `timingWindowLength` | `2048` | 每个局部估计窗口的目标样点数。 |
-| `interpolationHalfLength` | `12` | Lanczos-sinc 插值核的单侧支持长度。 |
+| `interpolationHalfLength` | `12` | Lanczos-sinc半支持长度 $L$，最小2；非整数位置最多使用 $2L$ 个抽头，默认即24抽头/23阶等效FIR。它只控制重采样核，不提高分数时延估计精度。 |
 
 | 方法 | 参数 | 返回值或作用 |
 | --- | --- | --- |
@@ -1848,6 +1857,8 @@ measurementChOut, filteredFbOut = channel.Process(
 | `UpdateParameters(**parameterOverrides)` | 支持的任意配置 | 事务式更新最高优先级参数层。 |
 
 `SignalProcessingResult` 包含 `processedSignal`、`integerDelaySamples`、`fractionalDelaySamples`、`carrierFrequencyOffsetHz`、`samplingFrequencyOffsetPpm` 和 `complexGain`。
+
+判断接收阶数是否足够时，不能用同一个插值器同时生成和补偿测试时延。应采用独立长sinc、充分零扩展FFT或硬件时延作为真值，分别记录已知时延EVM和自动估计EVM，并在固定同一组时延估计的条件下比较 $L$ 与 $2L$。默认 `L=12` 不等于12阶；完整的10 dB/17 dB误差预算、OSR2/OSR4候选表和“阶数不足/估计偏差/边界截断”的区分方法见 [SigProc §7](doc/SigProc.md#7-重采样与分数时延补偿)。
 
 同文件的 `FeedbackIqCalibration(parameters=None, width=None, **parameterOverrides)` 独立处理0°/90°反馈I/Q标定：
 

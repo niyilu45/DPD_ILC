@@ -121,6 +121,56 @@ e^{-j\omega D}
 
 它在DC处增益为1，但当 $\mu\neq0$ 时会在高频产生幅度下垂；这是两抽头线性插值的数值近似，不应误解成真实传播损耗。该实现适合占用带宽远低于Nyquist的过采样复基带。带边精度要求更高时，应扩展为更高阶分数时延滤波器，而不是用额外 `fb...` 时延抵消。
 
+#### 1.1.1 分数时延的阶数、抽头数与当前精度边界
+
+“阶数”必须连同算法一起说明，不能只给一个没有上下文的数字：
+
+| 方法 | 用户真正选择的量 | 有效计算规模 | 主要特点 |
+|---|---|---:|---|
+| 当前线性Farrow | 多项式阶数 $P=1$ | $P+1=2$ taps | 最快，但不是全通，会产生明显带内下垂 |
+| Lagrange/Farrow | 多项式阶数 $P$、每支路FIR长度 | 通常随 $P$ 线性增加 | 适合流式实现，但必须同时验收带边误差与系数峰值 |
+| Thiran/all-pass | IIR阶数 $N$ | $N$ 个状态级 | 幅度严格全通，需检查相位误差、稳定性和跨帧状态 |
+| Lanczos/windowed-sinc | 半支持长度 $L$ | 非整数位置使用 $2L$ taps | 离线带限仿真精度高，边界需要guard，计算量约正比于 $2L$ |
+| 零扩展FFT相位斜坡 | FFT长度与零扩展长度 | $O(N\log N)$ | 周期块上接近理想；不零扩展会把物理时延错误地变成循环移位 |
+
+当前 `Channel.ApplyChannelDelay` 固定使用第一行，即一阶、两抽头；目前没有可配置的Channel时延阶数参数。接收端即使采用很高阶插值，也只能更准确地撤销时移，不能恢复两抽头生成侧已经造成的频率选择性幅度失真。若 `channelDly` 要表示“只有传播时间、没有额外频响”的物理通道，必须先把生成侧升级为近全通或高精度带限时延，不能只增大接收端阶数。
+
+上表中的对称windowed-sinc/Lanczos会同时访问目标位置两侧的样点，适合离线仿真，但不是零延迟的因果实时结构。部署到流式接收机时，必须增加至少覆盖前视支持长度的基础整数流水延迟，并通常把它单独记在接收机group delay参考面；只有调用方明确把 `channelDly` 重新定义成“端到端观测总时延”时才能合并进去，而且不能在同步端再加一次。Lagrange/Farrow和Thiran更容易做成因果状态机，但仍需把其固定group delay与分数部分分别记账。
+
+两抽头分数部分的幅度平方为：
+
+```math
+\left|H_1(e^{j\omega})\right|^2
+=1-4\mu(1-\mu)\sin^2\!\left(\frac{\omega}{2}\right).
+```
+
+令 $K=F_s/B_{\mathrm{occ}}$ 为采样率相对于双边占用带宽的倍数，则占用带边近似为 $\Omega_B=\pi/K$。最敏感的半样点 $\mu=0.5$ 在本工程无PA、无噪声EHT基准中的结果如下。EVM已经经过 `Analysis` 的时延与公共复增益补偿，因此不是“忘记同步”造成的：
+
+| $K=F_s/B_{\mathrm{occ}}$ | 半样点带边幅度 | 同步后EVM |
+|---:|---:|---:|
+| 2 | -3.010 dB | 约 -21.1 dB |
+| 3 | -1.249 dB | 约 -28.4 dB |
+| 4 | -0.688 dB | 约 -33.5 dB |
+| 8 | -0.169 dB | 约 -45.1 dB |
+
+因此阶数不能按“时延小于一个sample所以两抽头足够”来选，而应由最小过采样率、最大占用带宽、系统最好EVM以及允许的测量退化共同决定。普通筛选可先让分数时延自身的最坏EVM低于待测系统目标10 dB；若要求它使最终EVM恶化不超过0.1 dB，则需要约16.3 dB余量，工程上取17 dB。例如要严格评价约 -50 dB的PA/DPD，纯时延模块自身应达到约 -67 dB或更好。完整的误差预算、阶数扫描和接收端充分性判据见 [SigProc §7](./SigProc.md#7-重采样与分数时延补偿)。
+
+#### 1.1.2 有限记录边界不能用提高阶数掩盖
+
+插值阶数只控制带内逼近误差，不解决有限capture的样点缺失。当前公共时延保持输出长度不变，前端补零并裁掉尾部；Wi-Fi数据字段位于生成记录末尾时，哪怕纯整数时延也会使最后一个OFDM符号缺样。验证阶数时必须在需要的前后方向保留至少
+
+```math
+N_{\mathrm{guard}}
+\geq
+|D_{\mathrm{int}}|
++L_{\mathrm{inject}}
++L_{\mathrm{receive}}
++\left\lceil N\frac{|\epsilon_{\mathrm{ppm}}|}{10^6}\right\rceil
++N_{\mathrm{margin}}
+```
+
+个保护样点，其中 $L_{\mathrm{inject}}$ 和 $L_{\mathrm{receive}}$ 分别是生成端与接收端核的单侧支持，最后一项之前的取整量覆盖长度为 $N$ 的记录中最大SFO漂移。当前两抽头生成端只有一个历史样点支持，但用独立长sinc制作验证真值时必须使用它的真实支持长度。流式实现应保留前一块的延迟线状态；周期稳态发送应让上一周期尾部成为下一周期的真实历史，而不是每次 `Process` 都重新假设零初态。若没有这些边界处理，测得的EVM同时包含“插值阶数误差”和“capture被截断误差”，无法据此判断阶数是否足够。
+
 前向模式以高性能VSA作为相对可信的黄金参考。设公共相位为 $\phi_c$，仪表噪声为 $w(n)$：
 
 ```math
@@ -1413,7 +1463,7 @@ Channel(
 |---|---:|---|---|
 | `sampleMode` | `"forward"` | 无 | 公开 `Process` 始终返回 `(chOut, fbOut)`；`forward` 令第二项成为第一项的数值相同副本并绕过FB链，`fb` 令第二项经过完整反馈链。兼容单输出接口仍按该值选路 |
 | `sampleRateHz` | `1.0` | sample/s | CFO、SFO、分数时延和热时间换算使用的真实采样率 |
-| `channelDly` | `0.0` | sample | PA后耦合之后、forward/fb分路之前的公共传播时延；必须是非负有限实数。整数部分前补零/尾截断，分数部分使用两抽头线性插值 |
+| `channelDly` | `0.0` | sample | PA后耦合之后、forward/fb分路之前的公共传播时延；必须是非负有限实数。整数部分前补零/尾截断，分数部分固定使用一阶两抽头线性插值；阶数含义、精度边界与选型见§1.1 |
 | `phaseDegrees` | `0` | degree | PA输出后的公共移相，仅允许 `-90`、`0`、`90` |
 | `width` | `16` | bit/I或Q | `0`为浮点；正整数为公开边界有符号I/Q码位宽 |
 | `outputFullScaleAmplitude` | `2.0` | normalized component | 固定点 `chOut`/`fbOut` 正满码代表的I或Q分量幅度；默认相对单位幅度提供6.02 dB观测余量，输入DAC标尺仍为1.0 |
@@ -2121,7 +2171,7 @@ stressFeedbackParameters = {
 | `ApplyPrePaCoupling(inputSignal)` | PA前矩阵 | 生成每个PA真正看到的耦合激励 |
 | `ApplyPostPaCoupling(paOutputSignal)` | 各PA自身输出矩阵 | 在采样前混合PA非线性输出 |
 | `ResolveChannelDelay()` | 无 | 将非负 `channelDly` 分解为 `D=floor(channelDly)` 与 `mu=channelDly-D` |
-| `ApplyChannelDelay(inputSignal)` | PA后耦合波形 | 逐链执行两抽头一阶Farrow分数时延和整数前补零/尾截断，保持输入形状与记录长度 |
+| `ApplyChannelDelay(inputSignal)` | PA后耦合波形 | 逐链执行固定一阶、两抽头Farrow分数时延和整数前补零/尾截断，保持输入形状与记录长度；当前没有公开阶数参数，精度边界见§1.1 |
 | `HasPrePaCoupling()` | 无 | 判断自动联合功率校准是否需要启用 |
 | `ProcessBoundPaFloating(inputSignal)` | 实际PA激励 | 只运行绑定PA，不加耦合或采样影响 |
 | `ResolveCalibrationDriveDbPerChain(driveDbPerChain, chainCount)` | 逐链drive与链数 | 校验并返回与物理链顺序一致的有限dB元组 |

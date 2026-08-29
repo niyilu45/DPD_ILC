@@ -266,7 +266,7 @@ y_{\mathrm{long},3}[n]
 | `Channel.ValidateSignal`, `Channel.PrepareSignal` | N/E | 前者保留独立公开校验契约；后者在一次已验证Channel事务中保留常数时间形状检查并复用有限值证明，对外部PA返回值和最终公开输出仍强制重新扫描，避免嵌套理想级反复遍历整段波形 | Channel §1、§6、Performance §6.1 |
 | `Channel.ResolveNoiseRmsVolts`, `Channel.ResolveNoiseRmsNormalized` | P/N | 把毫伏或dBm噪声换成复包络总RMS电压，再按PA满量程dBm映射到内部归一化单位 | Channel §3.2–§3.3、§3.5 |
 | `Channel.ResolveSnrNoiseRmsPerChain` | P/N | 按逐链有效突发信号RMS与 `10^{-SNR/20}` 计算复噪声总RMS，排除补零和长占空比静默 | Channel §3.4 |
-| `Channel.ResolveChannelDelay`, `Channel.ApplyChannelDelay` | P/N/E | 前者把非负sample参数 `channelDly` 分解为 `D=floor(channelDly)` 与 `mu=channelDly-D`；后者在PA后耦合、forward/fb分路之前逐链执行两抽头一阶Farrow `(1-mu)x[n]+mu*x[n-1]` 和整数前补零/尾截断，保持记录长度。理想传播只产生线性相位，有限阶近似允许高频下垂；物理时间为 `channelDly/sampleRateHz` | Channel §1.1、§5–§6 |
+| `Channel.ResolveChannelDelay`, `Channel.ApplyChannelDelay` | P/N/E | 前者把非负sample参数 `channelDly` 分解为 `D=floor(channelDly)` 与 `mu=channelDly-D`；后者在PA后耦合、forward/fb分路之前逐链执行固定一阶、两抽头Farrow `(1-mu)x[n]+mu*x[n-1]` 和整数前补零/尾截断，保持记录长度。理想传播只产生线性相位，当前低阶近似会产生不可由接收重采样恢复的高频下垂；阶数、guard和误差预算见§1.1；物理时间为 `channelDly/sampleRateHz` | Channel §1.1、§5–§6 |
 | `Channel.ApplyPhaseRotation` | P/N | 计算PA输出乘以单位复指数，当前相位仅为-90、0或+90度；0度时返回独立副本 | Channel §2，Performance §6 |
 | `Channel.AddNoise` | P/N | 在毫伏、绝对dBm或有效突发SNR三种互斥控制中选择一种，生成I/Q各占总方差一半的圆对称复白高斯噪声并叠加到旋转后波形 | Channel §3.1–§3.5 |
 | `Channel.ResolveFeedbackFirTaps`, `Channel.ApplyFeedbackLinearResponse` | P/N | 将可选反馈FIR规范为非空有限复抽头，并按每链执行因果卷积、反馈电压增益和附加相位；单抽头1、0 dB和0度时返回独立副本 | Channel §1.2、§4.1，Performance §6 |
@@ -427,7 +427,7 @@ y_{\mathrm{long},3}[n]
 | `PowerCalibration.CalibrateFixedColumn`, `PowerCalibration.CalibrateWaveformToOutputPower`, `PowerCalibration.CalibrateWaveformToOutputPowers` | P/N/E | 兼容性底层接口：不经过PA闭环，直接消除任意初始RMS归一化并重建目标dBm波形；定点模式通过量化后RMS搜索补偿取整并维持公开整数I/Q码接口，不应用于真实PA工作点设定 | SigProc §13.2–§13.4 |
 | `PowerCalibration.ScaleSignalToOutputPower`, `PowerCalibration.ScaleSignalToOutputPowers` | P/E | 按有效区RMS施加逐链常数增益，把物理电压波形标定到目标dBm且不把补零或长静默计入平均 | SigProc §13.4 |
 | `SignalProcessingResult.ToDict`, `SignalOverlapResult.ToDict` | E | 只序列化估计标量或重叠坐标，不重新计算同步与相关 | SigProc §9 |
-| `SigProc.__init__`, `SigProc.ValidateSignal`, `SigProc.GetParameters`, `SigProc.UpdateParameters`, `SigProc.ValidateParameters` | E | 保存参考、解析ChainMap、警告并忽略未知键、检查已识别配置的单位和有限性 | SigProc §9–§10 |
+| `SigProc.__init__`, `SigProc.ValidateSignal`, `SigProc.GetParameters`, `SigProc.UpdateParameters`, `SigProc.ValidateParameters` | E | 保存参考、解析ChainMap、警告并忽略未知键、检查已识别配置的单位和有限性；`interpolationHalfLength=L>=2` 表示Lanczos半支持长度，非整数位置最多使用 `2L` 抽头而非“L阶” | SigProc §7、§9–§10 |
 | `SigProc.ResolveMaximumIntegerDelay` | N/E | 把自动/外部时延边界转换为有限相关搜索半径 | SigProc §3、§12 |
 | `SigProc.CalculateRangeEnergies` | N | 条件良好时使用累计差并估计消减上界；仅对可疑半开区间用成对二叉树累加互不重叠的非负局部功率和，避免强突发后小噪声窗口发生灾难性消减 | SigProc §3.3，Performance §3.1–§3.2 |
 | `SigProc.EstimateSignalOverlap` | P/N | 对可能裁剪、补零或不等长的发送与接收波形搜索有符号时延；三段FFT批量生成完整/正探针/负探针相关，分层区间树生成逐候选能量，Cauchy-Schwarz约束抑制零窗舍入伪峰，并保持分数、重叠长度和最早测量起点的并列次序 | SigProc §3.3，Performance §3.2 |
@@ -436,8 +436,8 @@ y_{\mathrm{long},3}[n]
 | `SigProc.EstimateCarrierFrequencyOffset` | P/N | 分块复增益相位随时间的斜率估计 CFO | SigProc §4.1 |
 | `SigProc.CompensateCarrierFrequencyOffset` | P/N | 乘 $e^{-j2\pi\hat f n/f_s}$ 撤销载波相位斜率；频偏严格为0 Hz时直接返回独立副本 | SigProc §4.2，Performance §3.4 |
 | `SigProc.RefineCorrelationPeak` | N | 对相关峰邻点做抛物线插值得到亚采样峰位置 | SigProc §5 |
-| `SigProc.EstimateTimingOffsets` | P/N | 多窗口局部相关位置的截距给分数时延、斜率给 SFO | SigProc §5–§6 |
-| `SigProc.InterpolateSignal` | N/P | 加窗 sinc/Lanczos 重采样，实现分数时延和采样率校正 | SigProc §7 |
+| `SigProc.EstimateTimingOffsets` | P/N | 多窗口三点抛物线细化的局部相关位置以截距给分数时延、斜率给SFO；插值半支持长度不改变该估计器精度 | SigProc §5–§7 |
+| `SigProc.InterpolateSignal` | N/P | 非整数位置用归一化Lanczos核的 `2L` 候选抽头重采样，实现分数时延和采样率校正；整数位置精确索引旁路；选阶按独立真值、绝对EVM预算和 `L→2L` 收敛联合验收 | SigProc §7 |
 | `SigProc.EstimateComplexGain` | N/P | 最小二乘正交投影得到公共复增益 | SigProc §8、Analysis §3 |
 | `SigProc.ResolveEstimationSlice` | E | 把数据字段或调用方切片限制到有效参考范围 | SigProc §9、Analysis §4.4 |
 | `SigProc.Process` | E/P | 按整数时延→CFO→分数时延/SFO→重采样→复增益的顺序执行 | SigProc §2 |
