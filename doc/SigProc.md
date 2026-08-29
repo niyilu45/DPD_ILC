@@ -537,6 +537,251 @@ sigProc = SigProc(
 - 路径A已经通过后仍靠增加 $L$ 修复相关峰估计偏差或Channel两抽头幅度下垂；
 - 只看到 $L$ 与 $2L$ 已收敛，却不检查两者是否都满足绝对EVM预算。
 
+### 7.8 可直接复制到其他工程的独立补偿函数
+
+下面的函数只依赖NumPy，不依赖本工程的 `SigProc`、`Analysis` 或Wi-Fi类。它接受一维复IQ，或形状为“样点数×通道数”的二维数组。符号约定与本工程一致：若接收信号满足 $r[n]\approx s(n-d)$，正的 `delayToRemoveSamples=d` 表示接收信号比参考晚到，补偿输出读取 $r(n+d)$。参数也可以包含整数部分，例如传入 `3.25` 会一次撤销3.25 sample总时延；整数采样位置自动走精确索引。
+
+```python
+import numpy as np
+
+
+def CompensateFractionalDelay(
+    inputSignal,
+    delayToRemoveSamples,
+    *,
+    firOrder=23,
+    chunkLength=32768,
+):
+    """Remove a known sample delay from SISO or samples-by-channels IQ.
+
+    If ``inputSignal[n] ~= reference(n - d)``, pass
+    ``delayToRemoveSamples=d``.  ``firOrder=1`` selects two-tap linear
+    interpolation.  Odd orders 3, 5, ... select a normalized Lanczos
+    kernel with ``firOrder + 1`` taps.  The returned record has the same
+    length as the input; callers must discard boundary samples.
+    """
+
+    if (
+        isinstance(firOrder, (bool, np.bool_))
+        or not isinstance(firOrder, (int, np.integer))
+        or firOrder < 1
+        or firOrder % 2 == 0
+    ):
+        raise ValueError("firOrder must be 1 or an odd integer >= 3")
+    firOrder = int(firOrder)
+    if (
+        isinstance(chunkLength, (bool, np.bool_))
+        or not isinstance(chunkLength, (int, np.integer))
+        or chunkLength < 1
+    ):
+        raise ValueError("chunkLength must be a positive integer")
+    chunkLength = int(chunkLength)
+    delayArray = np.asarray(delayToRemoveSamples)
+    if (
+        delayArray.ndim != 0
+        or not np.issubdtype(delayArray.dtype, np.number)
+        or np.issubdtype(delayArray.dtype, np.bool_)
+        or np.iscomplexobj(delayArray)
+    ):
+        raise ValueError(
+            "delayToRemoveSamples must be a finite real scalar"
+        )
+    delayValue = float(delayArray)
+    if not np.isfinite(delayValue):
+        raise ValueError("delayToRemoveSamples must be a finite real scalar")
+
+    inputArray = np.asarray(inputSignal, dtype=np.complex128)
+    inputWasVector = inputArray.ndim == 1
+    if inputWasVector:
+        inputMatrix = inputArray[:, None]
+    elif inputArray.ndim == 2:
+        inputMatrix = inputArray
+    else:
+        raise ValueError(
+            "inputSignal must have shape (samples,) or (samples, channels)"
+        )
+    if inputMatrix.shape[0] == 0:
+        raise ValueError("inputSignal cannot be empty")
+    if not np.all(np.isfinite(inputMatrix)):
+        raise ValueError("inputSignal contains NaN or infinite values")
+
+    sampleCount, channelCount = inputMatrix.shape
+    samplePositions = (
+        np.arange(sampleCount, dtype=float)
+        + delayValue
+    )
+    roundedPositions = np.rint(samplePositions).astype(np.int64)
+    outputMatrix = np.zeros(
+        (sampleCount, channelCount), dtype=np.complex128
+    )
+
+    # Preserve integer-delay paths exactly; no interpolation noise is added.
+    if np.all(np.abs(samplePositions - roundedPositions) < 1.0e-12):
+        validMask = (
+            (roundedPositions >= 0)
+            & (roundedPositions < sampleCount)
+        )
+        outputMatrix[validMask] = inputMatrix[
+            roundedPositions[validMask]
+        ]
+        return outputMatrix[:, 0] if inputWasVector else outputMatrix
+
+    if firOrder == 1:
+        # First-order/two-tap linear interpolation.
+        leftIndices = np.floor(samplePositions).astype(np.int64)
+        fractions = samplePositions - leftIndices
+        for sourceIndices, weights in (
+            (leftIndices, 1.0 - fractions),
+            (leftIndices + 1, fractions),
+        ):
+            validMask = (
+                (sourceIndices >= 0)
+                & (sourceIndices < sampleCount)
+            )
+            outputMatrix[validMask] += (
+                inputMatrix[sourceIndices[validMask]]
+                * weights[validMask, None]
+            )
+        return outputMatrix[:, 0] if inputWasVector else outputMatrix
+
+    # P=firOrder is odd, so L=(P+1)/2 and the kernel has 2L=P+1 taps.
+    halfLength = (firOrder + 1) // 2
+    tapOffsets = np.arange(-halfLength + 1, halfLength + 1)
+    for startIndex in range(0, sampleCount, chunkLength):
+        stopIndex = min(startIndex + chunkLength, sampleCount)
+        positions = samplePositions[startIndex:stopIndex]
+        centerIndices = np.floor(positions).astype(np.int64)
+        sourceIndices = centerIndices[:, None] + tapOffsets[None, :]
+        distances = positions[:, None] - sourceIndices
+        weights = (
+            np.sinc(distances)
+            * np.sinc(distances / float(halfLength))
+        )
+        validMask = (
+            (sourceIndices >= 0)
+            & (sourceIndices < sampleCount)
+            & (np.abs(distances) < halfLength)
+        )
+        weights *= validMask
+        weightSums = np.sum(weights, axis=1)
+        safeWeightSums = np.where(
+            np.abs(weightSums) > np.finfo(float).eps,
+            weightSums,
+            1.0,
+        )
+        clippedIndices = np.clip(sourceIndices, 0, sampleCount - 1)
+        sourceValues = inputMatrix[clippedIndices]
+        outputMatrix[startIndex:stopIndex] = np.sum(
+            sourceValues * weights[:, :, None], axis=1
+        ) / safeWeightSums[:, None]
+
+    return outputMatrix[:, 0] if inputWasVector else outputMatrix
+```
+
+`firOrder` 在这段独立代码中的含义始终是“抽头数减1”。一阶特例使用线性插值；三阶及以上的奇数阶使用Lanczos，因此比较一阶和高阶时同时改变了算法族。常用调用如下：
+
+| 调用 | 算法 | 抽头数 | 对应本工程的 $L$ | 典型用途 |
+|---|---|---:|---:|---|
+| `firOrder=1` | 线性 | 2 | 不适用 | 快速功能验证，不适合低EVM带边测量 |
+| `firOrder=3` | Lanczos | 4 | 2 | 很低成本的粗补偿 |
+| `firOrder=7` | Lanczos | 8 | 4 | 4倍采样、约 -40 dB级目标的起点 |
+| `firOrder=15` | Lanczos | 16 | 8 | 4倍采样普通 -50 dB级筛选的起点 |
+| `firOrder=23` | Lanczos | 24 | 12 | 本工程默认；4倍采样严格 -50 dB级验收起点 |
+| `firOrder=47` | Lanczos | 48 | 24 | 2倍采样严格 -50 dB级验收起点 |
+
+```python
+estimatedDelay = 0.25
+
+alignedLinear = CompensateFractionalDelay(
+    receivedIq, estimatedDelay, firOrder=1
+)
+alignedOrder3 = CompensateFractionalDelay(
+    receivedIq, estimatedDelay, firOrder=3
+)
+alignedOrder7 = CompensateFractionalDelay(
+    receivedIq, estimatedDelay, firOrder=7
+)
+alignedOrder15 = CompensateFractionalDelay(
+    receivedIq, estimatedDelay, firOrder=15
+)
+alignedOrder23 = CompensateFractionalDelay(
+    receivedIq, estimatedDelay, firOrder=23
+)
+alignedOrder47 = CompensateFractionalDelay(
+    receivedIq, estimatedDelay, firOrder=47
+)
+```
+
+下面是可以在复制函数后直接运行的独立数值自检。真值用解析多音的连续时间表达式生成，没有使用被测Lanczos核，因此不会形成“同算法自证”。正常情况下，阶数增加时打印的EVM应整体变得更负；具体数值会随测试带宽改变。
+
+```python
+def CalculateEvmDb(referenceSignal, measuredSignal):
+    complexGain = (
+        np.vdot(referenceSignal, measuredSignal)
+        / np.vdot(referenceSignal, referenceSignal)
+    )
+    normalizedSignal = measuredSignal / complexGain
+    return 20.0 * np.log10(
+        np.linalg.norm(normalizedSignal - referenceSignal)
+        / np.linalg.norm(referenceSignal)
+    )
+
+
+rng = np.random.default_rng(7)
+sampleCount = 4096
+sampleIndices = np.arange(sampleCount, dtype=float)
+delayToRemove = 0.25
+angularFrequencies = np.linspace(-0.24 * np.pi, 0.24 * np.pi, 97)
+toneCoefficients = (
+    rng.standard_normal(angularFrequencies.size)
+    + 1j * rng.standard_normal(angularFrequencies.size)
+) / np.sqrt(2.0 * angularFrequencies.size)
+
+referenceIq = (
+    np.exp(1j * np.outer(sampleIndices, angularFrequencies))
+    @ toneCoefficients
+)
+receivedIq = (
+    np.exp(
+        1j
+        * np.outer(
+            sampleIndices - delayToRemove,
+            angularFrequencies,
+        )
+    )
+    @ toneCoefficients
+)
+
+for firOrder in (1, 3, 7, 15, 23, 47):
+    alignedIq = CompensateFractionalDelay(
+        receivedIq,
+        delayToRemove,
+        firOrder=firOrder,
+    )
+    halfLength = 1 if firOrder == 1 else (firOrder + 1) // 2
+    guard = int(np.ceil(abs(delayToRemove))) + halfLength
+    validSlice = slice(guard, -guard)
+    print(
+        f"order={firOrder:2d}, taps={firOrder + 1:2d}, "
+        f"EVM={CalculateEvmDb(referenceIq[validSlice], alignedIq[validSlice]):.2f} dB"
+    )
+```
+
+在当前NumPy环境中，上述1/3/7/15/23/47阶依次约得到 -35.8/-40.2/-51.5/-63.9/-70.3/-81.7 dB；它只用于确认符号、边界和阶数趋势，不能替代§7.3针对实际波形的正式验收。
+
+该函数只负责补偿调用方已经估计出的时延，不负责估计时延，也不补偿CFO或SFO。它为了便于独立复制而保持输入长度不变，记录边界只能得到不完整插值支持；评价EVM时应保留guard，并对阶数 $P>1$ 至少丢弃
+
+```python
+halfLength = (firOrder + 1) // 2
+guard = int(np.ceil(abs(estimatedDelay))) + halfLength
+referenceValid = referenceIq[guard:-guard]
+alignedValid = alignedOrder23[guard:-guard]
+```
+
+如果捕获记录本身已经裁掉延迟后的尾部，滤波器无法凭空恢复缺失样点，必须延长capture或保存跨块状态。对称Lanczos核会读取目标位置两侧的样点；实时因果移植必须增加缓存和固定流水延迟，并把这段实现延迟单独记账。多条接收链具有不同路径时延时应逐链调用，不能给所有列复用一个时延标量；改成定点后还必须重新验证系数量化、累加位宽、舍入和饱和。
+
+要用同一函数生成正时延，符号应反过来传 `-delaySamples`；但验证补偿阶数时仍应使用独立高精度注入器，不能让该函数同时生成和补偿测试真值。需要低阶实时硬件结构时，可把直接Lagrange多项式展开为Farrow支路；那是另一种滤波器族，不能把其阶数与这里的Lanczos阶数直接等同。
+
 ---
 
 ## 8. 公共复增益估计与补偿

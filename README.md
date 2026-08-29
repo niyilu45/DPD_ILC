@@ -1858,7 +1858,7 @@ measurementChOut, filteredFbOut = channel.Process(
 
 `SignalProcessingResult` 包含 `processedSignal`、`integerDelaySamples`、`fractionalDelaySamples`、`carrierFrequencyOffsetHz`、`samplingFrequencyOffsetPpm` 和 `complexGain`。
 
-判断接收阶数是否足够时，不能用同一个插值器同时生成和补偿测试时延。应采用独立长sinc、充分零扩展FFT或硬件时延作为真值，分别记录已知时延EVM和自动估计EVM，并在固定同一组时延估计的条件下比较 $L$ 与 $2L$。默认 `L=12` 不等于12阶；完整的10 dB/17 dB误差预算、OSR2/OSR4候选表和“阶数不足/估计偏差/边界截断”的区分方法见 [SigProc §7](doc/SigProc.md#7-重采样与分数时延补偿)。
+判断接收阶数是否足够时，不能用同一个插值器同时生成和补偿测试时延。应采用独立长sinc、充分零扩展FFT或硬件时延作为真值，分别记录已知时延EVM和自动估计EVM，并在固定同一组时延估计的条件下比较 $L$ 与 $2L$。默认 `L=12` 不等于12阶；完整的10 dB/17 dB误差预算、OSR2/OSR4候选表和“阶数不足/估计偏差/边界截断”的区分方法见 [SigProc §7](doc/SigProc.md#7-重采样与分数时延补偿)，可直接复制到其他工程的一阶及3/7/15/23/47阶NumPy补偿函数见 [SigProc §7.8](doc/SigProc.md#78-可直接复制到其他工程的独立补偿函数)。
 
 同文件的 `FeedbackIqCalibration(parameters=None, width=None, **parameterOverrides)` 独立处理0°/90°反馈I/Q标定：
 
