@@ -1072,8 +1072,9 @@ flowchart TD
 - `CalculateEvmAlignedMse` 使用与 EVM 完全相同的同步、去 CP、FFT、空间解映射和数据音调选择；其结果严格等于 RMS EVM 的平方。
 - `Analysis.PrintConvergence` 和 `Analysis.SaveConvergence` 逐轮呈现 Raw MSE/NMSE、LC-MSE/NMSE、EVM-MSE/EVM dB、模拟输出功率、公共复增益幅相和输入峰值。
 - MIMO 输入按列分别同步；`Analysis.DemodulatePreparedWifiData` 将帧处理委托给 `FrameProcess`，由后者在 FFT 后撤销每链 CSD 相位和空间映射矩阵。MIMO明细同样以普通字典保存逐 PA 输出功率/SNR/ACLR 与逐空间流 EVM，`PrintMimo` 和 `Save` 分别打印并写入 JSON/CSV。
-- 当前版本的功率-EVM扫描采用闭环输入功率校准：每个求值器作为完整“DPD+PA”被反复运行，输入驱动由 `PowerCalibration` 隐式调整，直到实测PA输出落入横轴目标容限；不对方法输出做PA后重标定。因此曲线EVM对应真实压缩工作点。
-- 主程序的逐点ILC求值由 `EvaluateIlcPowerPoint` 完成：每个功率点都用对应参考构造独立 `Analysis`，在全部历史的前向 `chOut` 中按严格Wi-Fi EVM选择最佳轮，再把该轮输入重放到PA。反馈域LC-NMSE仍用于学习和算法内部候选诊断，但不再替代主路EVM决定功率曲线的报告样点。
+- 当前版本的功率-EVM扫描采用闭环输入功率校准：每个求值器作为完整“DPD+PA”被反复运行，输入驱动由 `PowerCalibration` 隐式调整，直到实测PA输出落入横轴目标容限；不对方法输出做PA后重标定。因此曲线EVM对应真实压缩工作点。定点扫描使用 `BuildPowerSweepEvaluator` 转发plant的隐藏drive协议，并把收敛drive保存在各求值器本地；共享PA原先提交的drive不会被baseline、DPD或ILC扫描覆盖。
+- 部署DPD作为 `inputTransform` 传入helper后，每次闭环试探都固定先执行DPD、再执行PA显式drive测量。主程序的逐点ILC则通过 `CalibrationDrivePaView` 让探针、全部迭代、前向EVM选轮和最终重放都运行在同一个非提交显式drive；反馈域LC-NMSE仍用于学习和算法内部候选诊断，但不再替代主路EVM决定功率曲线的报告样点。
+- 旧式 `lambda pointReference, outputPowerDbm: paModel.Process(pointReference)` 继续作为纯数字兼容路径，适合浮点plant或明确只允许DAC码变化的第三方回调。普通lambda不暴露成对drive/热事务协议，不应用于内置 `width=16` PA、DPD或ILC的物理功率扫描。
 - 固定 `noiseAmpMv`、固定 `noisePwrDbm` 或固定满量程定点量化会形成绝对噪声地板。DPD压低PA失真后，低功率点可能先被该地板限制，最终EVM排序因而真实反转；这不是PA或DPD模型必然出错。研究PA/DPD本征曲线时使用 `width=0` 并关闭绝对噪声，或用固定相对 `noiseSnrDb`；评估传导系统时则应保留实际噪声和量化地板。
 
 ### `inc/utils/Draw.py`
@@ -2025,12 +2026,14 @@ assert resultAnalysis.width == 16
 | `DemodulateWifiData(measuredSignal)` | 待测输出 | 返回 VHT/HE/EHT 数据子载波星座。 |
 | `AnalyzeIlcHistory(ilcHistory)` | SISO原生ILC历史 | 逐轮计算输出功率/SNR/EVM/ACLR，并返回EVM最佳轮及完整 `ILCPerformanceIteration` 历史。 |
 | `AnalyzeMimoIlcHistory(chainHistories)` | 每条PA链的原生ILC历史 | 按轮组合MIMO矩阵、执行空间流性能分析并返回EVM最佳轮。 |
+| `BuildPowerSweepEvaluator(paModel, inputTransform=None, calibrationProcessor=None)` | drive-aware plant、可选DPD变换、可选完整方法试探回调 | 返回 `AnalyzePowerEvmCurve` 使用的二参数求值器；转发定点drive/热事务协议，且把接受drive保存在求值器本地。 |
+| `CalibrationDrivePaView(paModel, driveDbPerChain)` | drive-aware plant、逐链显式drive | 返回不调用共享plant提交接口的固定工作点视图，供逐点ILC完整流程使用。 |
 | `Print(stageMetrics=None)` | 可选指标映射 | 打印指标表；省略时使用最近一次 `AnalyzeStages` 的结果。 |
 | `PrintMimo(stageMimoMetrics=None)` | 可选详细指标映射 | 打印逐 PA 输出功率/SNR/ACLR 与逐空间流 EVM。 |
 | `PrintConvergence(ilcHistory, historyName="ILC convergence")` | Analysis生成的性能历史、可选标题 | 逐轮打印 Raw MSE、LC-MSE、输出功率、SNR、EVM、ACLR、复增益幅相和输入峰值。 |
 | `Save(outputDirectory, runMetadata, stageMetrics=None)` | 输出路径、元数据、可选指标映射 | 写入 `metrics.json` 和 `metrics.csv`，并附带可用的各阶段同步估计。 |
 | `SaveConvergence(ilcHistory, outputDirectory)` | Analysis生成的性能历史、输出路径 | 写入包含三级MSE、输出功率、SNR、EVM、ACLR和线性项诊断的 `ilc_convergence.csv`。 |
-| `AnalyzePowerEvmCurve(outputPowerDbmValues, methodEvaluators)` | 递增输出dBm点、`{方法名: 求值器}` 映射 | 按输出回退驱动PA，把每种方法标定到相同输出功率后计算EVM。 |
+| `AnalyzePowerEvmCurve(outputPowerDbmValues, methodEvaluators)` | 递增输出dBm点、`{方法名: 求值器}` 映射 | 按输出回退驱动PA，把每种方法标定到相同输出功率后计算EVM；有成对drive协议时使用隐藏模拟drive，无协议旧回调保留纯数字路径。 |
 | `SavePowerEvmCurveData(outputDirectory, powerEvmCurve=None, fileStem=None)` | 输出路径、可选曲线、文件名前缀 | `fileStem=None` 时读取实例解析后的 `powerEvmFileStem`，并只写入 CSV 和 JSON。 |
 
 最小Mask测量与画图示例：
@@ -2559,6 +2562,7 @@ wifiGenerator = WaveGenWifi(
         "numDataSymbols": 10,
         "sampleRateHz": 80.0e6,
         "seed": 21,
+        "width": 16,
     }
 )
 waveform = wifiGenerator.Generate()
@@ -2619,20 +2623,19 @@ print(stageMetrics["Frequency-domain ILC"])
 
 ### 示例十：程序化保存功率-EVM 数据并单独绘图
 
-以下代码接续示例七中的 `resultAnalysis` 和 `paModel`。`Analysis` 负责扫描及保存数值数据，`Draw` 只消费 `PowerEvmCurve` 并生成 PNG：
+以下代码接续示例九中的16位 `resultAnalysis` 和 `paModel`。`Analysis` 负责扫描及保存数值数据，`Draw` 只消费 `PowerEvmCurve` 并生成 PNG：
 
 ```python
 from pathlib import Path
 
+from inc.lib.Analysis import BuildPowerSweepEvaluator
 from inc.utils.Draw import Draw
 
 outputDirectory = Path("results/programmatic_curve")
 powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
     outputPowerDbmValues=(10.0, 15.0, 20.0, 23.0, 25.0),
     methodEvaluators={
-        "PA baseline": lambda pointReference, outputPowerDbm: paModel.Process(
-            pointReference
-        ),
+        "PA baseline": BuildPowerSweepEvaluator(paModel),
     },
 )
 powerCsvPath, powerJsonPath = resultAnalysis.SavePowerEvmCurveData(
@@ -2653,6 +2656,8 @@ powerFigurePath = resultDraw.SavePowerEvmCurve(
     outputDirectory,
 )
 ```
+
+`BuildPowerSweepEvaluator` 让每个16位功率点使用独立的本地隐藏模拟drive；闭环试探调用PA的非提交接口，扫描前 `paModel` 已提交的工作点在扫描后保持不变。部署DPD可通过 `inputTransform=` 传入，helper保证每次候选都先做DPD变换再试探PA。逐点ILC还应通过 `calibrationProcessor=` 和 `CalibrationDrivePaView` 运行完整训练流程，不能只在最终输出上补一次drive。旧式二参数lambda仍可运行，但只表示纯数字缩放兼容路径。
 
 ### 示例十一：运行全部 ILC 与部署模型
 

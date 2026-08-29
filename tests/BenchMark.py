@@ -45,7 +45,13 @@ def GetProjectRoot() -> Path:
 if str(GetProjectRoot()) not in sys.path:
     sys.path.insert(0, str(GetProjectRoot()))
 
-from inc.lib.Analysis import Analysis, ILCAnalysisResult, SignalMetrics
+from inc.lib.Analysis import (
+    Analysis,
+    BuildPowerSweepEvaluator,
+    CalibrationDrivePaView,
+    ILCAnalysisResult,
+    SignalMetrics,
+)
 from inc.lib.Channel import Channel
 from inc.lib.ChannelAnalyse import (
     ChannelAnalyse,
@@ -5223,6 +5229,90 @@ def RunIlcCurvePoint(
     return paModel.Process(analysisResult.bestInputSignal)
 
 
+def BuildIlcCurveEvaluator(
+    paModel: Any,
+    waveform: WifiWaveform,
+    width: int,
+    maximumOutputPowerDbm: float,
+    methodName: str,
+    methodFunction: Optional[Callable[..., ILCResult]],
+    methodConfigSource: Any,
+) -> Callable[[np.ndarray, float], np.ndarray]:
+    """Build one noncommitting hidden-drive ILC sweep evaluator.
+
+    Processing details:
+        Algorithm: Resolve a fixed configuration or a reference-dependent
+        configuration factory for every trial, expose the PA through
+        ``CalibrationDrivePaView``, and run the complete ILC point pipeline at
+        the outer calibrator's explicit drive without changing shared PA state.
+
+    Args:
+        paModel: Drive-aware PA used by the benchmark method.
+        waveform: Wi-Fi metadata shared by all curve points.
+        width: Public I/Q component width.
+        maximumOutputPowerDbm: Rated normalized full-scale output power.
+        methodName: Human-readable ILC algorithm name.
+        methodFunction: Selected ILC callable or None for frequency-domain ILC.
+        methodConfigSource: ILCConfig or callable mapping a point reference to
+            an ILCConfig.
+
+    Returns:
+        result: Drive-aware evaluator accepted by AnalyzePowerEvmCurve.
+    """
+
+    if not isinstance(methodConfigSource, ILCConfig) and not callable(
+        methodConfigSource
+    ):
+        raise TypeError(
+            "methodConfigSource must be ILCConfig or callable"
+        )
+
+    def EvaluateAtDrive(
+        pointReference: np.ndarray,
+        driveDbPerChain: Sequence[float],
+    ) -> np.ndarray:
+        """Run the complete selected ILC method at one explicit drive.
+
+        Processing details:
+            Algorithm: Resolve the current configuration, create a public-only
+            noncommitting PA view at the requested drive, and delegate strict
+            EVM-best candidate selection to ``RunIlcCurvePoint``.
+
+        Args:
+            pointReference: Public reference waveform for one sweep trial.
+            driveDbPerChain: Trial post-decode analog drive per PA chain.
+
+        Returns:
+            result: Public best-ILC PA output for this trial drive.
+        """
+
+        methodConfig = (
+            methodConfigSource
+            if isinstance(methodConfigSource, ILCConfig)
+            else methodConfigSource(pointReference)
+        )
+        if not isinstance(methodConfig, ILCConfig):
+            raise TypeError(
+                "methodConfigSource must return an ILCConfig"
+            )
+        return RunIlcCurvePoint(
+            pointReference,
+            0.0,
+            CalibrationDrivePaView(paModel, driveDbPerChain),
+            waveform,
+            width,
+            maximumOutputPowerDbm,
+            methodName,
+            methodFunction,
+            methodConfig,
+        )
+
+    return BuildPowerSweepEvaluator(
+        paModel,
+        calibrationProcessor=EvaluateAtDrive,
+    )
+
+
 def RunTwoToneIlcBenchmark(
     config: Optional[TwoToneBenchmarkConfig] = None,
 ) -> List[TwoToneBenchmarkRow]:
@@ -5671,9 +5761,7 @@ def RunAllIlcBenchmark(
 
     baselineMetrics = trainingAnalysis.Analyze(baselineOutput)
     powerEvaluators = {
-        "PA baseline": lambda pointReference, _: paModel.Process(
-            pointReference
-        )
+        "PA baseline": BuildPowerSweepEvaluator(paModel)
     }
     rows: List[BenchmarkRow] = []
     AddRow(
@@ -5775,22 +5863,14 @@ def RunAllIlcBenchmark(
             methodMetrics,
             baselineMetrics,
         )
-        powerEvaluators[methodName] = (
-            lambda pointReference,
-            pointDrive,
-            selectedName=methodName,
-            selectedFunction=methodFunction,
-            selectedConfig=methodConfig: RunIlcCurvePoint(
-                pointReference,
-                pointDrive,
-                paModel,
-                trainingWaveform,
-                config.width,
-                config.maximumOutputPowerDbm,
-                selectedName,
-                selectedFunction,
-                selectedConfig,
-            )
+        powerEvaluators[methodName] = BuildIlcCurveEvaluator(
+            paModel,
+            trainingWaveform,
+            config.width,
+            config.maximumOutputPowerDbm,
+            methodName,
+            methodFunction,
+            methodConfig,
         )
 
     if frequencyResult is None or frequencyAnalysisResult is None:
@@ -5856,28 +5936,24 @@ def RunAllIlcBenchmark(
         constrainedMetrics,
         baselineMetrics,
     )
-    powerEvaluators["Constrained CFR-ILC"] = (
-        lambda pointReference, pointDrive: RunIlcCurvePoint(
-            pointReference,
-            pointDrive,
-            paModel,
-            trainingWaveform,
-            config.width,
-            config.maximumOutputPowerDbm,
-            "Frequency-domain ILC",
-            None,
-            ILCConfig(
-                numIterations=config.numIterations,
-                learningRate=0.12,
-                maxAmplitude=1.05
-                * np.max(
-                    np.abs(
-                        interfaceFormat.DecodeComplex(pointReference)
-                    )
-                ),
-                randomSeed=config.seed + 7,
+    powerEvaluators["Constrained CFR-ILC"] = BuildIlcCurveEvaluator(
+        paModel,
+        trainingWaveform,
+        config.width,
+        config.maximumOutputPowerDbm,
+        "Frequency-domain ILC",
+        None,
+        lambda pointReference: ILCConfig(
+            numIterations=config.numIterations,
+            learningRate=0.12,
+            maxAmplitude=1.05
+            * np.max(
+                np.abs(
+                    interfaceFormat.DecodeComplex(pointReference)
+                )
             ),
-        )
+            randomSeed=config.seed + 7,
+        ),
     )
 
     # The noise scenario compares an ordinary single-capture frequency-domain
@@ -5959,47 +6035,39 @@ def RunAllIlcBenchmark(
         noiseAwareMetrics,
         noisyBaselineMetrics,
     )
-    powerEvaluators["Naive noisy-feedback ILC"] = (
-        lambda pointReference, pointDrive: RunIlcCurvePoint(
-            pointReference,
-            pointDrive,
-            paModel,
-            trainingWaveform,
-            config.width,
-            config.maximumOutputPowerDbm,
-            "Frequency-domain ILC",
-            None,
-            ILCConfig(
-                numIterations=config.numIterations,
-                learningRate=0.15,
-                regularization=1e-3,
-                maxAmplitude=maxAmplitude,
-                feedbackSnrDb=32.0,
-                feedbackAverages=1,
-                randomSeed=config.seed + 18,
-            ),
-        )
+    powerEvaluators["Naive noisy-feedback ILC"] = BuildIlcCurveEvaluator(
+        paModel,
+        trainingWaveform,
+        config.width,
+        config.maximumOutputPowerDbm,
+        "Frequency-domain ILC",
+        None,
+        ILCConfig(
+            numIterations=config.numIterations,
+            learningRate=0.15,
+            regularization=1e-3,
+            maxAmplitude=maxAmplitude,
+            feedbackSnrDb=32.0,
+            feedbackAverages=1,
+            randomSeed=config.seed + 18,
+        ),
     )
-    powerEvaluators["Noise-aware ILC"] = (
-        lambda pointReference, pointDrive: RunIlcCurvePoint(
-            pointReference,
-            pointDrive,
-            paModel,
-            trainingWaveform,
-            config.width,
-            config.maximumOutputPowerDbm,
-            "Frequency-domain ILC",
-            None,
-            ILCConfig(
-                numIterations=config.numIterations,
-                learningRate=0.10,
-                regularization=1e-2,
-                maxAmplitude=maxAmplitude,
-                feedbackSnrDb=32.0,
-                feedbackAverages=4,
-                randomSeed=config.seed + 8,
-            ),
-        )
+    powerEvaluators["Noise-aware ILC"] = BuildIlcCurveEvaluator(
+        paModel,
+        trainingWaveform,
+        config.width,
+        config.maximumOutputPowerDbm,
+        "Frequency-domain ILC",
+        None,
+        ILCConfig(
+            numIterations=config.numIterations,
+            learningRate=0.10,
+            regularization=1e-2,
+            maxAmplitude=maxAmplitude,
+            feedbackSnrDb=32.0,
+            feedbackAverages=4,
+            randomSeed=config.seed + 8,
+        ),
     )
 
     # The IQ scenario compares an ordinary frequency-domain update against the
@@ -6078,12 +6146,10 @@ def RunAllIlcBenchmark(
         iqBaselineMetrics,
     )
     powerEvaluators["IQ-imbalance baseline"] = (
-        lambda pointReference, _: iqPaModel.Process(pointReference)
+        BuildPowerSweepEvaluator(iqPaModel)
     )
     powerEvaluators["Frequency-domain ILC on IQ plant"] = (
-        lambda pointReference, pointDrive: RunIlcCurvePoint(
-            pointReference,
-            pointDrive,
+        BuildIlcCurveEvaluator(
             iqPaModel,
             trainingWaveform,
             config.width,
@@ -6098,23 +6164,19 @@ def RunAllIlcBenchmark(
             ),
         )
     )
-    powerEvaluators["Augmented IQ ILC"] = (
-        lambda pointReference, pointDrive: RunIlcCurvePoint(
-            pointReference,
-            pointDrive,
-            iqPaModel,
-            trainingWaveform,
-            config.width,
-            config.maximumOutputPowerDbm,
-            "Augmented IQ ILC",
-            RunAugmentedIqIlc,
-            ILCConfig(
-                numIterations=config.numIterations,
-                learningRate=0.18,
-                maxAmplitude=maxAmplitude,
-                randomSeed=config.seed + 9,
-            ),
-        )
+    powerEvaluators["Augmented IQ ILC"] = BuildIlcCurveEvaluator(
+        iqPaModel,
+        trainingWaveform,
+        config.width,
+        config.maximumOutputPowerDbm,
+        "Augmented IQ ILC",
+        RunAugmentedIqIlc,
+        ILCConfig(
+            numIterations=config.numIterations,
+            learningRate=0.18,
+            maxAmplitude=maxAmplitude,
+            randomSeed=config.seed + 9,
+        ),
     )
 
     # Fit every deployable model to the same converged ILC labels, then test
@@ -6207,10 +6269,10 @@ def RunAllIlcBenchmark(
             methodMetrics,
             validationBaselineMetrics,
         )
-        powerEvaluators[methodName] = (
+        powerEvaluators[methodName] = BuildPowerSweepEvaluator(
+            paModel,
             lambda pointReference,
-            _,
-            selectedPredistorter=predistorter: paModel.Process(
+            selectedPredistorter=predistorter: (
                 interfaceFormat.EncodeComplex(
                     LimitAmplitude(
                         selectedPredistorter.Process(
@@ -6221,7 +6283,7 @@ def RunAllIlcBenchmark(
                         maxAmplitude,
                     )
                 )
-            )
+            ),
         )
     metadata: Mapping[str, object] = {
         "frameFormat": trainingWaveform.frameFormat,

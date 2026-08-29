@@ -1528,7 +1528,9 @@ A_{i,\mathrm{target}}
 10^{(p_i-p_{\max})/20}.
 ```
 
-浮点模式把每轮试探输入直接送入方法求值器。定点模式先按输入DAC标尺1.0生成保留数字余量的合法整数I/Q码，再把闭环剩余功率差保存在解码后的隐藏post-DAC模拟驱动中；PA输出使用相同位宽但独立的plant `outputFullScaleAmplitude` 解码后测功率，量化和削顶由此真实影响闭环与EVM。多个目标功率点的公开码可以完全相同，物理工作点由不同的 `analogDriveDbPerChain` 区分。收敛驱动会提交到plant；ILC的 `NormalizedPaAdapter` 对Channel先使用 `ProcessNormalizedOutputPaths` 保持稳态热公共校准语义，对普通PA则调用 `ProcessOutputPathsFloating` 应用该驱动。公开 `ProcessFloating` 也应用隐藏驱动，适合校准后的单输出浮点重放；Channel在自己已经施加drive的内部参考面优先调用 `ProcessRawFloating`，避免重复增益。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
+浮点模式把每轮试探输入直接送入方法求值器。定点模式先按输入DAC标尺1.0生成保留数字余量的合法整数I/Q码，再把闭环剩余功率差保存在解码后的隐藏post-DAC模拟驱动中；PA输出使用相同位宽但独立的plant `outputFullScaleAmplitude` 解码后测功率，量化和削顶由此真实影响闭环与EVM。多个目标功率点的公开码可以完全相同，物理工作点由不同的 `analogDriveDbPerChain` 区分。
+
+直接把PA对象交给普通 `PowerCalibration` 时，收敛drive会调用plant的 `SetCalibrationDriveDb`，供后续 `Process` 或 `ProcessFloating` 重放同一工作点。功率扫描采用另一种状态语义：`BuildPowerSweepEvaluator` 把已接受drive保存在当前evaluator自己的闭包中，后续用plant的非提交 `ProcessCalibrationDrive` 重放，不调用共享plant的drive提交接口。这样baseline、DPD和ILC即使共用同一个PA对象，也不会彼此覆盖已提交工作点。物理目标RMS电压 $V_i$ 仍单独保存在曲线结果中用于端口功率审计。
 
 `outputPowerDbmValues` 必须有限且严格递增，每一点都不得超过 `maximumOutputPowerDbm`。结果对象保留的 `driveScaleValues` 只是由额定极限计算的名义初始试探比例，不是闭环最终隐藏预设；`targetOutputRmsValues` 用于审计50 Ω物理输出标定。
 
@@ -1539,6 +1541,26 @@ A_{i,\mathrm{target}}
 主程序的逐点ILC求值还多一层候选选择。`EvaluateIlcPowerPoint` 为当前功率参考建立独立 `Analysis`，运行SISO或MIMO频域ILC，对每轮前向 `chOut` 只调用功率曲线所需的 `CalculateEvm`，以严格Wi-Fi EVM最小值选择对应输入，然后把该输入重放到PA。反馈域 `linearCompensatedNmseDb` 仍用于学习和算法内部诊断，但不能决定最终功率-EVM报告样点；FB链非理想会使LC-NMSE最佳轮与主路EVM最佳轮不同。
 
 这条曲线接口只消费EVM，因此每个方法/功率点不再附带运行输出功率报告、SNR、IRR和ACLR计算。功率闭环自己的有效区功率测量仍必须保留，EVM的同步和星座定义也没有简化；省略的只是曲线结果不使用的指标。
+
+#### 8.3.1 定点evaluator、DPD和ILC怎样保留模拟drive
+
+推荐由 `BuildPowerSweepEvaluator(paModel, inputTransform=None, calibrationProcessor=None)` 构造求值器。它转发plant的位宽、输出scaled full-scale、成对隐藏drive协议和成对热事务协议，同时把每个方法的已接受drive保存在本地。三条路径的顺序如下：
+
+1. **PA baseline**：候选公开码先进入plant的 `ProcessCalibrationDrive(input, drive)`；收敛时只更新evaluator本地drive，plant原来的已提交drive不变。
+2. **部署型DPD**：`inputTransform` 在每一次普通求值和每一次显式drive试探中都先执行；顺序固定为“候选参考 → DPD变换 → PA显式drive试探”。不能只在最终报告时做DPD、却让闭环用未预失真的PA估计drive。
+3. **逐点ILC**：`calibrationProcessor` 接收已经完成可选DPD变换的候选输入和当前显式drive。Benchmark用 `CalibrationDrivePaView(paModel, driveDbPerChain)` 把同一drive包装成ILC可调用的完整plant，然后运行探针、全部迭代、前向EVM选轮和最终重放。整个ILC流程都位于该显式drive，而不是只给最终输出补一次增益。
+
+`CalibrationDrivePaView.Process` 始终调用底层plant的非提交试探接口；MIMO逐链入口 `ProcessChain` 则对选中链应用同一显式drive后调用drive-free链内核。它们都不会调用 `SetCalibrationDriveDb`。外层扫描结束后，共享PA在进入扫描前已经提交的drive仍保持原值；各方法也各自持有自己的本地drive，因此求值顺序不会污染结果。
+
+旧式二参数回调仍然兼容，例如：
+
+```python
+legacyEvaluator = lambda pointReference, outputPowerDbm: paModel.Process(
+    pointReference
+)
+```
+
+但普通lambda没有 `ProcessCalibrationDrive` / `SetCalibrationDriveDb` 属性，也无法自动转发热事务，所以它只能走纯数字输入缩放兼容路径。该写法适合 `width=0` 或明确只允许数字码变化的第三方设备；对内置 `width=16` PA、DPD或ILC扫描应使用 `BuildPowerSweepEvaluator`，否则不同功率点可能复用错误的模拟工作点，或在数字码到轨后把可达功率误报为不可达。
 
 ```mermaid
 flowchart LR
@@ -1841,6 +1863,8 @@ ILC 每轮收敛结果另外输出：
 | 最近/分阶段同步结果 | `GetLastSignalProcessingResult` / `GetStageSignalProcessingResults` |
 | 全部链同步结果 | `GetLastSignalProcessingResults` |
 | 逐 PA/逐流指标 | `GetLastMimoMetrics` / `GetStageMimoMetrics` / `PrintMimo` |
+| 构造保留定点隐藏drive的扫描求值器 | `BuildPowerSweepEvaluator` |
+| 构造不提交drive的固定工作点plant视图 | `CalibrationDrivePaView` |
 | 功率扫描 | `Analysis.AnalyzePowerEvmCurve` |
 | 曲线数据保存 | `Analysis.SavePowerEvmCurveData` |
 | 曲线绘图 | `Draw.SavePowerEvmCurve` |
@@ -2500,9 +2524,7 @@ Analysis(
 ```python
 from pathlib import Path
 
-import numpy as np
-
-from inc.lib.Analysis import Analysis
+from inc.lib.Analysis import Analysis, BuildPowerSweepEvaluator
 from inc.lib.PaModel import PaModel
 from inc.lib.WaveGenWifi import WaveGenWifi
 from inc.utils.Draw import Draw
@@ -2515,48 +2537,33 @@ wifiWaveform = WaveGenWifi(
         "mcs": 5,
         "numDataSymbols": 8,
         "sampleRateHz": 80.0e6,
-        "width": 0,
+        "width": 16,
     }
 ).Generate()
 wienerPa = PaModel(
-    parameters={"modelName": "wiener", "width": 0}
+    parameters={"modelName": "wiener", "width": 16}
 )
 gmpPa = PaModel(
-    parameters={"modelName": "gmp", "width": 0}
+    parameters={"modelName": "gmp", "width": 16}
 )
 resultAnalysis = Analysis(
     wifiWaveform.samples,
     wifiWaveform,
     parameters={
         "maximumOutputPowerDbm": 25.0,
-        "width": 0,
+        "width": 16,
+        "outputFullScaleAmplitude": (
+            wienerPa.outputFullScaleAmplitude
+        ),
     },
 )
-
-
-def EvaluateWiener(
-    pointReference: np.ndarray,
-    outputPowerDbm: float,
-) -> np.ndarray:
-    # PowerCalibration controls the requested power outside this evaluator.
-    del outputPowerDbm
-    return wienerPa.Process(pointReference)
-
-
-def EvaluateGmp(
-    pointReference: np.ndarray,
-    outputPowerDbm: float,
-) -> np.ndarray:
-    # PowerCalibration controls the requested power outside this evaluator.
-    del outputPowerDbm
-    return gmpPa.Process(pointReference)
 
 
 powerEvmCurve = resultAnalysis.AnalyzePowerEvmCurve(
     outputPowerDbmValues=(10.0, 15.0, 18.0, 20.0),
     methodEvaluators={
-        "Wiener PA": EvaluateWiener,
-        "GMP PA": EvaluateGmp,
+        "Wiener PA": BuildPowerSweepEvaluator(wienerPa),
+        "GMP PA": BuildPowerSweepEvaluator(gmpPa),
     },
 )
 outputDirectory = Path("results") / "standalone_power_evm"
@@ -2570,7 +2577,7 @@ Draw().SavePowerEvmCurve(
 )
 ```
 
-`AnalyzePowerEvmCurve` 会在每个功率点独立闭环调整被测对象输入，直到实测PA输出功率进入容限；评估器不应在PA输出端追加归一化增益。若某个模型在定点幅度范围内无法达到指定功率，该点应失败并提示工作点不可达，而不是放宽校准误差。
+`AnalyzePowerEvmCurve` 会在每个功率点独立闭环调整被测对象输入，直到实测PA输出功率进入容限；评估器不应在PA输出端追加归一化增益。这里的 `BuildPowerSweepEvaluator` 让16位公开码保留数字余量，把功率差放入本地隐藏模拟drive，并用非提交试探接口重放，因此扫描Wiener时不会改变GMP PA的状态，反之亦然。若某个模型在完整显式drive范围内仍无法达到指定功率，该点应失败并提示工作点不可达，而不是放宽校准误差。
 
 ---
 

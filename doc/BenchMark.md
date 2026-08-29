@@ -402,6 +402,10 @@ e_i^{(k)}
 
 隐藏输入预设按有界dB修正或括区后二分更新，直到绝对误差进入容限。PA输出不施加后置常数增益，所以EVM、SNR和ACLR均来自实际工作点。
 
+固定点F类场景不再用普通lambda包住PA。PA baseline和固定部署模型由 `BuildPowerSweepEvaluator` 构造：前者直接把候选公开码送入PA显式drive试探，后者先执行 `inputTransform` 的DPD变换，再用同一个候选drive试探PA。收敛drive保存在各evaluator自己的闭包里，不调用共享PA的 `SetCalibrationDriveDb`，因此方法运行顺序不会覆盖PA进入扫描前的已提交工作点，也不会让一个方法的最后功率点污染下一个方法。
+
+波形ILC由 `BuildIlcCurveEvaluator` 提供 `calibrationProcessor`。外层功率闭环给出候选参考和显式drive后，处理器创建 `CalibrationDrivePaView`，让低功率探针、全部ILC迭代、每轮反馈测量、严格前向EVM选轮和最终重放都经过相同的非提交drive。drive不是只在ILC完成后附加到结果上；它是本次完整被测流程的一部分。
+
 ### 10.2 结果预期
 
 - PA baseline的EVM随驱动功率升高而恶化；
@@ -1270,15 +1274,19 @@ i=0,1,\ldots,N-1.
 
 | evaluator类别 | 每个功率点做什么 | 是否重新训练 |
 |---|---|---|
-| PA和IQ baseline | 缩放参考后直接过plant | 否 |
-| 波形ILC方法 | 为当前缩放参考重新运行ILC | 是 |
-| ILC标签部署模型 | 使用标称工作点已经拟合的模型处理当前参考 | 否 |
+| PA和IQ baseline | `BuildPowerSweepEvaluator` 在本地显式drive上非提交试探plant | 否 |
+| 波形ILC方法 | `CalibrationDrivePaView` 固定当前显式drive，重新运行探针、全部迭代、选轮和重放 | 是 |
+| ILC标签部署模型 | 先用标称点模型变换当前参考，再在同一显式drive上试探PA | 否 |
 
 这一区别非常重要。波形ILC表示“每个功率点单独标定的最佳能力”；部署模型表示“一个标称功率模型跨功率使用的能力”。两类曲线回答的问题不同。
 
 ### 20.3 为什么必须重新绑定EVM-MSE
 
-`RunIlcCurvePoint` 为当前缩放参考创建新的 `Analysis`。ILC仍只产生原生MSE与输出历史；运行结束后，Benchmark保留每轮原生MSE、同步估计和候选输入，只把 `outputSignal` 替换为当前有效突发目标dBm版本，再交给 `AnalyzeIlcHistory` 按严格EVM选择最佳轮。这样不会把EVM计算嵌回 `ILCConfig`，也不会让不同占空比或公共输出增益影响功率点比较。
+`BuildIlcCurveEvaluator` 为外层每一次候选drive调用完整的 `RunIlcCurvePoint`，而不是先在共享PA当前状态上训练、最后再缩放输出。它先构造 `CalibrationDrivePaView(paModel, driveDbPerChain)`；该view的 `Process` 始终走底层PA的非提交 `ProcessCalibrationDrive`。因此低功率响应探针、ILC每一轮plant调用、反馈同步与更新、前向 `chOut` 候选以及最终最佳输入重放都处于同一个显式drive。
+
+`RunIlcCurvePoint` 为当前候选参考创建新的 `Analysis`。ILC仍只产生原生MSE与输出历史；`AnalyzeIlcHistory` 在相同drive得到的逐轮前向输出中按严格EVM选择最佳输入，最后由同一个view重放。这样不会把EVM计算嵌回 `ILCConfig`，也不会把PA后缩放误当成功率闭环。外层候选drive未收敛时，完整流程会在下一个drive重新运行。
+
+`BuildPowerSweepEvaluator` 接受drive时只更新evaluator本地状态，不提交共享PA；不同ILC方法因此可以安全共用一个确定性PA对象。普通二参数lambda仍被 `AnalyzePowerEvmCurve` 接受，但它没有成对隐藏drive协议，只走纯数字缩放兼容路径，不是16位F类benchmark的推荐实现。
 
 ### 20.4 功率曲线验收
 
@@ -1286,6 +1294,9 @@ i=0,1,\ldots,N-1.
 - `driveScaleValues` 必须与相对额定极限的输出回退换算一致；
 - `targetOutputRmsValues` 必须与目标输出 dBm 和端口电阻换算结果一致；
 - 每个evaluator送入Analysis前的有效突发功率必须与当前横轴dBm一致；
+- 定点evaluator必须为每个功率点调用并接受独立隐藏drive，且扫描前后共享PA的已提交drive保持不变；
+- 部署DPD的每次闭环候选必须先执行DPD变换再进入PA显式drive试探；
+- 波形ILC的探针、全部迭代和最终重放必须使用当前候选的同一个 `CalibrationDrivePaView`；
 - 每个方法必须在全部功率点都有EVM dB和EVM百分比；
 - EVM百分比必须为正且有限；
 - EVM dB与EVM百分比必须满足幅度比换算；

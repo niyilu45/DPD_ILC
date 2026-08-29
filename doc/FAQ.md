@@ -3342,8 +3342,49 @@ x-S(fbOut_k),
 
 但工程中还存在两个会制造假反转的软件参考面问题，本轮已明确处理：
 
-1. 定点 `PowerCalibration` 为了保留数字余量，可以让不同功率点使用相同公开DAC码，实际功率差保存在解码后的隐藏post-DAC `analogDriveDbPerChain`。`NormalizedPaAdapter` 对普通PA通过 `ProcessOutputPathsFloating` 在浮点ILC内部继续应用该已提交驱动；对稳态热Channel则先调用 `ProcessNormalizedOutputPaths`，按公共语义为每个候选复校目标功率。校准后的单输出重放也可以直接调用公开 `ProcessFloating`，它会保留当前最近一次成功校准提交的drive；扫描1、10和20 dBm时应在每点校准后立即重放，或为各点使用独立PA对象。只有 `ProcessRawFloating` 是明确的drive-free参考面，供已经施加物理drive的Channel内部使用。
+1. 定点 `PowerCalibration` 为了保留数字余量，可以让不同功率点使用相同公开DAC码，实际功率差保存在解码后的隐藏post-DAC `analogDriveDbPerChain`。直接校准一个PA对象时，公开 `Process` / `ProcessFloating` 会应用最近一次成功提交的drive；只有 `ProcessRawFloating` 是明确的drive-free参考面。多方法功率扫描则应使用 `BuildPowerSweepEvaluator`：它把接受drive留在各evaluator本地，并通过非提交 `ProcessCalibrationDrive` 重放，不覆盖共享PA状态。
 2. `ILCResult.learnedInput` 由训练用 `fbOut` 的LC-NMSE选择，不保证是前向主路EVM最佳轮。主程序的 `EvaluateIlcPowerPoint` 现在为每个功率点对全部历史 `chOut` 调用 `CalculateEvm`，按严格Wi-Fi EVM最小值选择对应输入，再重放到PA生成曲线样点。
+
+### 为什么16位功率扫描要用 `BuildPowerSweepEvaluator`，不能继续包普通lambda？
+
+普通二参数lambda只保留“输入波形、目标dBm → 输出波形”的调用外形，Python无法从它自动找到背后PA的 `ProcessCalibrationDrive`、`SetCalibrationDriveDb` 和热事务接口。`AnalyzePowerEvmCurve` 因而只能让 `PowerCalibration` 改变公开数字码。浮点模式下这仍是兼容且合理的路径；16位模式下，数字码需要保留DAC余量，几个目标功率点甚至可以具有相同公开码。若丢掉解码后的模拟drive，高功率点会在码轨附近错误显示不可达，或多个点实际落在同一物理工作点。
+
+推荐写法如下：
+
+```python
+from inc.lib.Analysis import Analysis, BuildPowerSweepEvaluator
+from inc.lib.PaModel import PaModel
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+
+waveform = WaveGenWifi(
+    frameFormat="EHT",
+    bandwidthMhz=20,
+    mcs=5,
+    numDataSymbols=2,
+    sampleRateHz=80.0e6,
+    width=16,
+).Generate()
+paModel = PaModel(modelName="gmp", width=16)
+resultAnalysis = Analysis(
+    waveform.samples,
+    waveform,
+    width=16,
+    outputFullScaleAmplitude=paModel.outputFullScaleAmplitude,
+)
+curve = resultAnalysis.AnalyzePowerEvmCurve(
+    (1.0, 16.0, 20.0),
+    {"PA baseline": BuildPowerSweepEvaluator(paModel)},
+)
+```
+
+helper有三项关键保证：
+
+1. 每个闭环候选都用PA的非提交显式drive接口测量，接受值只写入该evaluator自己的闭包；扫描前共享PA已经提交的drive在扫描后保持不变。
+2. 部署DPD放在 `inputTransform=` 后，普通求值和校准试探都先执行DPD变换，再进入PA显式drive；闭环测到的是完整“DPD+PA”，不是裸PA。
+3. 逐点ILC放在 `calibrationProcessor=` 后，用 `CalibrationDrivePaView(paModel, driveDbPerChain)` 运行低功率探针、全部迭代、反馈更新、前向EVM选轮和最终重放。整个流程共享当前候选drive，不是在结果端追加缩放。
+
+旧lambda仍可用于 `width=0`、旧仪表适配器或刻意研究纯数字驱动的场景；“兼容可调用”不等于“适合定点物理功率扫描”。
 
 诊断顺序如下：
 

@@ -221,6 +221,409 @@ class PowerEvmCurve:
         }
 
 
+class CalibrationDrivePaView:
+    """Expose a PA at one noncommitting post-decode analog drive."""
+
+    def __init__(
+        self,
+        paModel: Any,
+        driveDbPerChain: Sequence[float],
+    ) -> None:
+        """Bind one plant and validate the explicit trial drive.
+
+        Processing details:
+            Algorithm: Resolve the plant's public width, output scale, chain
+            count, and noncommitting calibration method, then retain a finite
+            chain-ordered drive tuple without calling its stateful commit API.
+
+        Args:
+            paModel: Drive-aware SISO or MIMO PA-compatible plant.
+            driveDbPerChain: Explicit post-decode drive for every PA chain.
+
+        Returns:
+            result: None. A fixed-drive public plant view is initialized.
+        """
+
+        protocolOwner = getattr(paModel, "__self__", None)
+        if protocolOwner is None:
+            protocolOwner = paModel
+        calibrationProcessMethod = getattr(
+            protocolOwner, "ProcessCalibrationDrive", None
+        )
+        if not callable(calibrationProcessMethod):
+            raise TypeError(
+                "paModel must expose ProcessCalibrationDrive"
+            )
+        driveTuple = tuple(float(value) for value in driveDbPerChain)
+        if not driveTuple or not np.all(np.isfinite(driveTuple)):
+            raise ValueError(
+                "driveDbPerChain must contain finite drive values"
+            )
+        width = int(getattr(protocolOwner, "width", 0))
+        outputFullScaleAmplitude = float(
+            getattr(protocolOwner, "outputFullScaleAmplitude", 1.0)
+        )
+        FixedPoint(width, outputFullScaleAmplitude)
+        numTransmitChains = int(
+            getattr(protocolOwner, "numTransmitChains", len(driveTuple))
+        )
+        if numTransmitChains <= 0 or len(driveTuple) != numTransmitChains:
+            raise ValueError(
+                "driveDbPerChain must contain one value per transmit chain"
+            )
+        self.paModel = protocolOwner
+        self.driveDbPerChain = driveTuple
+        self.width = width
+        self.outputFullScaleAmplitude = outputFullScaleAmplitude
+        self.numTransmitChains = numTransmitChains
+        self._calibrationProcessMethod = calibrationProcessMethod
+
+    def Process(self, inputSignal: np.ndarray) -> np.ndarray:
+        """Process a public waveform at the fixed noncommitting drive.
+
+        Processing details:
+            Algorithm: Delegate the complete public-boundary waveform to the
+            underlying plant's explicit-drive calibration method and never
+            call its stateful drive commit method.
+
+        Args:
+            inputSignal: Public floating samples or fixed-point I/Q codes.
+
+        Returns:
+            result: Public plant output at ``driveDbPerChain``.
+        """
+
+        return self._calibrationProcessMethod(
+            inputSignal, self.driveDbPerChain
+        )
+
+    def ProcessChain(
+        self,
+        inputSignal: np.ndarray,
+        chainIndex: int,
+    ) -> np.ndarray:
+        """Process one MIMO PA chain at its selected explicit drive.
+
+        Processing details:
+            Algorithm: Decode the selected public input vector, apply only
+            that chain's fixed analog drive, evaluate the parent's drive-free
+            chain kernel, and encode with the common public output scale. This
+            lets independent per-chain ILC use the same noncommitting drive as
+            matrix evaluation.
+
+        Args:
+            inputSignal: Public one-dimensional waveform for one PA chain.
+            chainIndex: Zero-based physical transmit-chain index.
+
+        Returns:
+            result: Public selected-chain PA output at the explicit drive.
+        """
+
+        if not isinstance(chainIndex, int) or isinstance(chainIndex, bool):
+            raise TypeError("chainIndex must be an integer")
+        if chainIndex < 0 or chainIndex >= self.numTransmitChains:
+            raise IndexError("chainIndex is outside the configured chain range")
+        rawChainProcessor = getattr(
+            self.paModel, "ProcessChainRawFloating", None
+        )
+        if not callable(rawChainProcessor):
+            if self.numTransmitChains == 1 and chainIndex == 0:
+                return self.Process(inputSignal)
+            raise TypeError(
+                "a MIMO calibration-drive view requires "
+                "ProcessChainRawFloating"
+            )
+        inputFormat = FixedPoint(self.width)
+        outputFormat = FixedPoint(
+            self.width, self.outputFullScaleAmplitude
+        )
+        floatingInput = inputFormat.DecodeComplex(inputSignal)
+        if (
+            floatingInput.ndim != 1
+            or floatingInput.size == 0
+            or not np.all(np.isfinite(floatingInput))
+        ):
+            raise ValueError(
+                "inputSignal must be a finite nonempty vector"
+            )
+        driveScale = np.power(
+            10.0, self.driveDbPerChain[chainIndex] / 20.0
+        )
+        floatingOutput = rawChainProcessor(
+            driveScale * floatingInput, chainIndex
+        )
+        return outputFormat.EncodeComplex(floatingOutput)
+
+
+def BuildPowerSweepEvaluator(
+    paModel: Any,
+    inputTransform: Optional[
+        Callable[[np.ndarray], np.ndarray]
+    ] = None,
+    calibrationProcessor: Optional[
+        Callable[[np.ndarray, Sequence[float]], np.ndarray]
+    ] = None,
+) -> Callable[[np.ndarray, float], np.ndarray]:
+    """Build a power-sweep evaluator that preserves plant calibration APIs.
+
+    A plain ``lambda`` around ``paModel.Process`` hides the optional paired
+    ``ProcessCalibrationDrive``/``SetCalibrationDriveDb`` protocol from
+    ``PowerCalibration``. That is harmless in floating point, but forces a
+    fixed-point sweep to vary only its public DAC codes and can make high
+    output-power points unreachable. This helper applies an optional DPD
+    input transform while forwarding the plant's width, output scale, analog
+    drive, and thermal-transaction protocols. Accepted drive values remain
+    local to this evaluator: normal evaluation replays the plant's
+    noncommitting trial method, so scanning one method cannot overwrite the
+    shared PA's previously committed operating point or contaminate another
+    method.
+
+    Args:
+        paModel: PA, Channel, wrapper, or compatible callable plant.
+        inputTransform: Optional public-boundary transform applied before
+            every normal and explicit-drive plant evaluation. It is suitable
+            for a fitted DPD whose output is encoded in the plant input
+            format. None selects the identity transform.
+        calibrationProcessor: Optional complete method-pipeline evaluator for
+            one transformed input and explicit drive. None delegates directly
+            to the plant. Supplying this callback lets an iterative method run
+            against ``CalibrationDrivePaView`` without committing shared PA
+            state.
+
+    Returns:
+        result: Two-argument evaluator accepted by
+            ``Analysis.AnalyzePowerEvmCurve``. Optional plant protocols are
+            attached only when the underlying plant exposes complete pairs.
+    """
+
+    processMethod = getattr(paModel, "Process", None)
+    if processMethod is None and callable(paModel):
+        processMethod = paModel
+    if not callable(processMethod):
+        raise TypeError(
+            "paModel must expose Process(inputSignal) or be callable"
+        )
+    if inputTransform is not None and not callable(inputTransform):
+        raise TypeError("inputTransform must be callable or None")
+    if calibrationProcessor is not None and not callable(
+        calibrationProcessor
+    ):
+        raise TypeError("calibrationProcessor must be callable or None")
+
+    protocolOwner = getattr(paModel, "__self__", None)
+    if protocolOwner is None:
+        protocolOwner = paModel
+    width = int(getattr(protocolOwner, "width", 0))
+    outputFullScaleAmplitude = float(
+        getattr(protocolOwner, "outputFullScaleAmplitude", 1.0)
+    )
+    FixedPoint(width, outputFullScaleAmplitude)
+
+    def Transform(inputSignal: np.ndarray) -> np.ndarray:
+        """Apply and validate the optional public-boundary transformation.
+
+        Processing details:
+            Algorithm: Use the identity mapping when no transform was
+            supplied, otherwise call the transform once, validate through a
+            complex view, and reject empty or nonfinite output. Preserve an
+            existing complex ndarray so fixed-point format metadata survives
+            into third-party calibration callbacks.
+
+        Args:
+            inputSignal: Public PA-input waveform for one calibration trial.
+
+        Returns:
+            result: Finite transformed waveform accepted by the plant.
+        """
+
+        transformedSignal = (
+            inputSignal
+            if inputTransform is None
+            else inputTransform(inputSignal)
+        )
+        complexSignal = np.asarray(
+            transformedSignal, dtype=np.complex128
+        )
+        if complexSignal.size == 0 or not np.all(
+            np.isfinite(complexSignal)
+        ):
+            raise ValueError(
+                "power-sweep input transform must return finite samples"
+            )
+        # Public fixed-point signals are ndarray subclasses carrying width and
+        # full-scale metadata. Preserve an already-complex ndarray exactly;
+        # converting it with np.asarray would silently strip that metadata
+        # before a third-party calibration callback receives the trial.
+        if (
+            isinstance(transformedSignal, np.ndarray)
+            and transformedSignal.dtype == np.complex128
+        ):
+            return transformedSignal
+        return complexSignal
+
+    def Evaluate(
+        inputSignal: np.ndarray,
+        outputPowerDbm: float,
+    ) -> np.ndarray:
+        """Evaluate the transformed input at the committed analog drive.
+
+        Processing details:
+            Algorithm: Retain the curve callback's two-argument signature,
+            transform the public input, and invoke the plant's normal process
+            method. The outer power calibration owns the requested dBm value.
+
+        Args:
+            inputSignal: Public waveform calibrated for one curve point.
+            outputPowerDbm: Requested dBm retained by the callback contract.
+
+        Returns:
+            result: Public plant output at its currently committed drive.
+        """
+
+        del outputPowerDbm
+        return processMethod(Transform(inputSignal))
+
+    setattr(Evaluate, "width", width)
+    setattr(
+        Evaluate,
+        "outputFullScaleAmplitude",
+        outputFullScaleAmplitude,
+    )
+
+    calibrationProcessMethod = getattr(
+        protocolOwner, "ProcessCalibrationDrive", None
+    )
+    calibrationCommitMethod = getattr(
+        protocolOwner, "SetCalibrationDriveDb", None
+    )
+    if callable(calibrationProcessMethod) != callable(
+        calibrationCommitMethod
+    ):
+        raise TypeError(
+            "a power-sweep plant must expose both "
+            "ProcessCalibrationDrive and SetCalibrationDriveDb, or neither"
+        )
+    resolvedCalibrationProcessor = (
+        calibrationProcessMethod
+        if calibrationProcessor is None
+        else calibrationProcessor
+    )
+    if callable(resolvedCalibrationProcessor):
+        committedDriveDbPerChain: Optional[Tuple[float, ...]] = None
+
+        def EvaluateCalibrationDrive(
+            inputSignal: np.ndarray,
+            driveDbPerChain: Sequence[float],
+        ) -> np.ndarray:
+            """Evaluate one transformed input with an explicit trial drive.
+
+            Processing details:
+                Algorithm: Apply the identical public input transform used by
+                normal evaluation and forward the noncommitting analog-drive
+                candidate to the underlying plant calibration protocol.
+
+            Args:
+                inputSignal: Legal public waveform for the current trial.
+                driveDbPerChain: Candidate post-decode drive per PA chain.
+
+            Returns:
+                result: Public plant output for the explicit drive candidate.
+            """
+
+            return resolvedCalibrationProcessor(
+                Transform(inputSignal), driveDbPerChain
+            )
+
+        def CommitCalibrationDrive(
+            driveDbPerChain: Sequence[float],
+        ) -> None:
+            """Store one accepted drive without mutating the shared plant.
+
+            Processing details:
+                Algorithm: Convert the accepted chain-ordered drive to a
+                finite immutable tuple and retain it inside this evaluator.
+                Later normal calls replay the plant's noncommitting trial
+                method at this drive, leaving the underlying PA state intact.
+
+            Args:
+                driveDbPerChain: Accepted post-decode drive per PA chain.
+
+            Returns:
+                result: None. Evaluator-local state is updated atomically.
+            """
+
+            nonlocal committedDriveDbPerChain
+            driveTuple = tuple(float(value) for value in driveDbPerChain)
+            if not driveTuple or not np.all(np.isfinite(driveTuple)):
+                raise ValueError(
+                    "driveDbPerChain must contain finite drive values"
+                )
+            committedDriveDbPerChain = driveTuple
+
+        def EvaluateCommittedDrive(
+            inputSignal: np.ndarray,
+            outputPowerDbm: float,
+        ) -> np.ndarray:
+            """Replay the transformed method at its evaluator-local drive.
+
+            Processing details:
+                Algorithm: Use the ordinary plant path until this evaluator
+                has accepted a power point, then call the noncommitting trial
+                path with the locally stored drive. The descriptive target
+                argument does not alter the accepted physical operating point.
+
+            Args:
+                inputSignal: Public waveform evaluated after calibration.
+                outputPowerDbm: Requested dBm retained by the curve contract.
+
+            Returns:
+                result: Public plant output at the evaluator-local drive.
+            """
+
+            del outputPowerDbm
+            if committedDriveDbPerChain is None:
+                return processMethod(Transform(inputSignal))
+            return resolvedCalibrationProcessor(
+                Transform(inputSignal), committedDriveDbPerChain
+            )
+
+        Evaluate = EvaluateCommittedDrive
+        setattr(Evaluate, "width", width)
+        setattr(
+            Evaluate,
+            "outputFullScaleAmplitude",
+            outputFullScaleAmplitude,
+        )
+
+        setattr(
+            Evaluate,
+            "ProcessCalibrationDrive",
+            EvaluateCalibrationDrive,
+        )
+        setattr(
+            Evaluate,
+            "SetCalibrationDriveDb",
+            CommitCalibrationDrive,
+        )
+
+    thermalSuspendMethod = getattr(
+        protocolOwner, "SuspendThermalModel", None
+    )
+    thermalRestoreMethod = getattr(
+        protocolOwner, "RestoreThermalModel", None
+    )
+    if callable(thermalSuspendMethod) != callable(thermalRestoreMethod):
+        raise TypeError(
+            "a power-sweep plant must expose both SuspendThermalModel and "
+            "RestoreThermalModel, or neither"
+        )
+    if callable(thermalSuspendMethod):
+        setattr(Evaluate, "SuspendThermalModel", thermalSuspendMethod)
+        setattr(Evaluate, "RestoreThermalModel", thermalRestoreMethod)
+
+    return Evaluate
+
+
 @dataclass(frozen=True)
 class ILCPerformanceIteration:
     """Combine native ILC diagnostics with independently analyzed RF metrics."""
@@ -3431,7 +3834,10 @@ class Analysis:
                 powers in dBm, no greater than ``maximumOutputPowerDbm``.
             methodEvaluators: Mapping from display name to a callable that
                 accepts the trial reference and target output dBm, and returns
-                the corresponding measured PA output waveform.
+                the corresponding measured PA output waveform. Fixed-point
+                evaluators built with ``BuildPowerSweepEvaluator`` retain the
+                plant's paired hidden-drive calibration protocol so every
+                power point closes on its own measured PA output.
 
         Returns:
             result: Power-EVM curve containing output powers, nominal initial
@@ -3511,10 +3917,64 @@ class Analysis:
             calibrationEvaluator = lambda trialInput: methodEvaluator(
                 trialInput, currentOutputPowerDbm[0]
             )
-            calibrationEvaluator.width = self.width
-            calibrationEvaluator.outputFullScaleAmplitude = (
-                self.outputFullScaleAmplitude
+            protocolOwner = getattr(
+                methodEvaluator, "__self__", None
             )
+            if protocolOwner is None:
+                protocolOwner = methodEvaluator
+            calibrationEvaluator.width = int(
+                getattr(protocolOwner, "width", self.width)
+            )
+            calibrationEvaluator.outputFullScaleAmplitude = (
+                float(
+                    getattr(
+                        protocolOwner,
+                        "outputFullScaleAmplitude",
+                        self.outputFullScaleAmplitude,
+                    )
+                )
+            )
+            calibrationProcessMethod = getattr(
+                protocolOwner, "ProcessCalibrationDrive", None
+            )
+            calibrationCommitMethod = getattr(
+                protocolOwner, "SetCalibrationDriveDb", None
+            )
+            if callable(calibrationProcessMethod) != callable(
+                calibrationCommitMethod
+            ):
+                raise TypeError(
+                    "a power-sweep evaluator must expose both "
+                    "ProcessCalibrationDrive and SetCalibrationDriveDb, "
+                    "or neither"
+                )
+            if callable(calibrationProcessMethod):
+                calibrationEvaluator.ProcessCalibrationDrive = (
+                    calibrationProcessMethod
+                )
+                calibrationEvaluator.SetCalibrationDriveDb = (
+                    calibrationCommitMethod
+                )
+            thermalSuspendMethod = getattr(
+                protocolOwner, "SuspendThermalModel", None
+            )
+            thermalRestoreMethod = getattr(
+                protocolOwner, "RestoreThermalModel", None
+            )
+            if callable(thermalSuspendMethod) != callable(
+                thermalRestoreMethod
+            ):
+                raise TypeError(
+                    "a power-sweep evaluator must expose both "
+                    "SuspendThermalModel and RestoreThermalModel, or neither"
+                )
+            if callable(thermalSuspendMethod):
+                calibrationEvaluator.SuspendThermalModel = (
+                    thermalSuspendMethod
+                )
+                calibrationEvaluator.RestoreThermalModel = (
+                    thermalRestoreMethod
+                )
             powerCalibration.SetPaModel(calibrationEvaluator)
             for outputPowerDbm in powerDbmArray:
                 currentOutputPowerDbm[0] = float(outputPowerDbm)

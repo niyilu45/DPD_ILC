@@ -2,15 +2,20 @@
 
 import argparse
 from pathlib import Path
-from typing import Mapping, Union
+from typing import Any, Mapping
 
 import numpy as np
 
-from inc.lib.Analysis import Analysis
+from inc.lib.Analysis import (
+    Analysis,
+    BuildPowerSweepEvaluator,
+    CalibrationDrivePaView,
+)
 from inc.lib.DpdIlc import (
     FitGmpPredistorter,
     FitMimoGmpPredistorter,
     ILCConfig,
+    LimitAmplitude,
     RunFrequencyDomainIlc,
     RunMimoFrequencyDomainIlc,
 )
@@ -129,7 +134,7 @@ def ParseOptionalDbmSequence(rawValue: str) -> tuple:
 
 def EvaluateIlcPowerPoint(
     pointReference: np.ndarray,
-    paModel: Union[PaModel, MimoPaModel],
+    paModel: Any,
     waveform: WifiWaveform,
     ilcConfig: ILCConfig,
     analysisParameters: Mapping[str, object],
@@ -185,8 +190,10 @@ def EvaluateIlcPowerPoint(
             selectedIterationIndex
         ].inputSignal
     else:
-        if not isinstance(paModel, MimoPaModel):
-            raise TypeError("MIMO Wi-Fi requires a MimoPaModel")
+        if not hasattr(paModel, "numTransmitChains"):
+            raise TypeError(
+                "MIMO Wi-Fi requires a multi-chain PA-compatible plant"
+            )
         pointIlcResult = RunMimoFrequencyDomainIlc(
             pointReference,
             paModel,
@@ -790,15 +797,10 @@ def Main() -> int:
             crossMemoryDepth=2,
             ridgeFactor=1e-6,
         )
-    floatingDeployedDpdInput = gmpPredistorter.Process(
-        floatingReferenceSignal
+    floatingDeployedDpdInput = LimitAmplitude(
+        gmpPredistorter.Process(floatingReferenceSignal),
+        arguments.maxAmplitude,
     )
-    deployedMagnitude = np.abs(floatingDeployedDpdInput)
-    overLimit = deployedMagnitude > arguments.maxAmplitude
-    if np.any(overLimit):
-        floatingDeployedDpdInput[overLimit] *= (
-            arguments.maxAmplitude / deployedMagnitude[overLimit]
-        )
     rawDeployedDpdInput = interfaceFormat.EncodeComplex(
         floatingDeployedDpdInput
     )
@@ -961,37 +963,33 @@ def Main() -> int:
             arguments.powerPointCount,
         )
         methodEvaluators = {
-            "PA baseline": lambda pointReference, _: paModel.Process(
-                pointReference
-            ),
-            "Fitted GMP DPD": lambda pointReference, _: paModel.Process(
-                interfaceFormat.EncodeComplex(
-                    gmpPredistorter.Process(
-                        interfaceFormat.DecodeComplex(pointReference)
+            "PA baseline": BuildPowerSweepEvaluator(paModel),
+            "Fitted GMP DPD": BuildPowerSweepEvaluator(
+                paModel,
+                lambda pointReference: interfaceFormat.EncodeComplex(
+                    LimitAmplitude(
+                        gmpPredistorter.Process(
+                            interfaceFormat.DecodeComplex(pointReference)
+                        ),
+                        arguments.maxAmplitude,
                     )
-                )
+                ),
             ),
         }
-        if waveform.numTransmitAntennas == 1:
-            methodEvaluators["Frequency-domain ILC"] = (
-                lambda pointReference, _: EvaluateIlcPowerPoint(
-                    pointReference,
-                    paModel,
-                    waveform,
-                    ilcConfig,
-                    analysisOverrides,
-                )
+        methodEvaluators["Frequency-domain ILC"] = (
+            BuildPowerSweepEvaluator(
+                paModel,
+                calibrationProcessor=lambda pointReference, driveDb: (
+                    EvaluateIlcPowerPoint(
+                        pointReference,
+                        CalibrationDrivePaView(paModel, driveDb),
+                        waveform,
+                        ilcConfig,
+                        analysisOverrides,
+                    )
+                ),
             )
-        else:
-            methodEvaluators["Frequency-domain ILC"] = (
-                lambda pointReference, _: EvaluateIlcPowerPoint(
-                    pointReference,
-                    paModel,
-                    waveform,
-                    ilcConfig,
-                    analysisOverrides,
-                )
-            )
+        )
         resultAnalysis.AnalyzePowerEvmCurve(
             outputPowerDbmValues, methodEvaluators
         )

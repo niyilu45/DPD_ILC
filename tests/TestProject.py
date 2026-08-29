@@ -34,7 +34,12 @@ def GetProjectRoot() -> Path:
 if str(GetProjectRoot()) not in sys.path:
     sys.path.insert(0, str(GetProjectRoot()))
 
-from inc.lib.Analysis import Analysis, AveragePeriodogram
+from inc.lib.Analysis import (
+    Analysis,
+    AveragePeriodogram,
+    BuildPowerSweepEvaluator,
+    CalibrationDrivePaView,
+)
 from inc.lib.Channel import Channel
 from inc.lib.ChannelAnalyse import ChannelAnalyse
 from inc.lib.DpdGmp import (
@@ -2636,6 +2641,354 @@ def CheckPowerEvmCurve() -> None:
     assert np.isclose(
         powerCalibration.RmsToDbm(calibratedRms),
         20.0,
+    )
+
+    # Fixed-point sweeps must keep one legal public DAC waveform while
+    # selecting a separate hidden post-DAC drive at every power point. Compare
+    # the curve helper against independently calibrated PA instances so a
+    # stale drive from the preceding point cannot satisfy this regression.
+    fixedCurveWaveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=3,
+        numDataSymbols=1,
+        oversampling=2,
+        seed=344,
+        width=16,
+    ).Generate()
+    fixedCurvePaModel = PaModel(modelName="wiener", width=16)
+    fixedCurveTrialDriveDbValues = []
+    fixedCurveTrialOutputs = []
+    fixedCurveCommittedDriveDbValues = []
+    fixedCurveTrialCountsAtCommit = []
+    fixedCurveCommittedOutputs = []
+
+    def EvaluateFixedCurve(
+        inputSignal: np.ndarray,
+        outputPowerDbm: float,
+    ) -> np.ndarray:
+        """Retain the established two-argument curve callback contract.
+
+        Processing details:
+            Algorithm: Ignore the descriptive target argument and process the
+            public waveform with the hidden drive most recently committed by
+            the curve's closed-loop calibration adapter.
+
+        Args:
+            inputSignal: Public 16-bit waveform evaluated at one curve point.
+            outputPowerDbm: Requested curve power retained for compatibility.
+
+        Returns:
+            result: Fixed-point Wiener PA output at the committed drive.
+        """
+
+        _ = outputPowerDbm
+        return fixedCurvePaModel.Process(inputSignal)
+
+    def EvaluateFixedCurveCalibrationDrive(
+        inputSignal: np.ndarray,
+        driveDbPerChain: Sequence[float],
+    ) -> np.ndarray:
+        """Record every noncommitting hidden-drive calibration trial.
+
+        Processing details:
+            Algorithm: Forward the public waveform and candidate post-DAC
+            drive to the PA's paired calibration method, then retain both the
+            drive and returned observation for commit-time verification.
+
+        Args:
+            inputSignal: Legal public 16-bit waveform for the current trial.
+            driveDbPerChain: Candidate analog drive for the single PA chain.
+
+        Returns:
+            result: Fixed-point PA observation for this candidate drive.
+        """
+
+        driveTuple = tuple(float(value) for value in driveDbPerChain)
+        paOutput = fixedCurvePaModel.ProcessCalibrationDrive(
+            inputSignal,
+            driveTuple,
+        )
+        fixedCurveTrialDriveDbValues.append(driveTuple[0])
+        fixedCurveTrialOutputs.append(paOutput.copy())
+        return paOutput
+
+    def CommitFixedCurveCalibrationDrive(
+        driveDbPerChain: Sequence[float],
+    ) -> None:
+        """Commit and snapshot exactly one accepted drive per power point.
+
+        Processing details:
+            Algorithm: Require the committed drive to equal the latest trial,
+            forward it to the PA, and retain the accepted observation and
+            cumulative trial count without replaying or changing model state.
+
+        Args:
+            driveDbPerChain: Accepted analog drive for the single PA chain.
+
+        Returns:
+            result: None. Recorder state identifies every independent point.
+        """
+
+        driveTuple = tuple(float(value) for value in driveDbPerChain)
+        assert fixedCurveTrialDriveDbValues
+        assert np.isclose(
+            driveTuple[0],
+            fixedCurveTrialDriveDbValues[-1],
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+        fixedCurvePaModel.SetCalibrationDriveDb(driveTuple)
+        fixedCurveCommittedDriveDbValues.append(driveTuple[0])
+        fixedCurveTrialCountsAtCommit.append(
+            len(fixedCurveTrialDriveDbValues)
+        )
+        fixedCurveCommittedOutputs.append(
+            fixedCurveTrialOutputs[-1].copy()
+        )
+
+    setattr(EvaluateFixedCurve, "width", 16)
+    setattr(
+        EvaluateFixedCurve,
+        "outputFullScaleAmplitude",
+        fixedCurvePaModel.outputFullScaleAmplitude,
+    )
+    setattr(
+        EvaluateFixedCurve,
+        "ProcessCalibrationDrive",
+        EvaluateFixedCurveCalibrationDrive,
+    )
+    setattr(
+        EvaluateFixedCurve,
+        "SetCalibrationDriveDb",
+        CommitFixedCurveCalibrationDrive,
+    )
+    fixedCurvePowerDbmValues = (8.0, 14.0, 20.0)
+    fixedCurveAnalysis = Analysis(
+        fixedCurveWaveform.samples,
+        fixedCurveWaveform,
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "width": 16,
+            "outputFullScaleAmplitude": (
+                fixedCurvePaModel.outputFullScaleAmplitude
+            ),
+        },
+    )
+    fixedHelperPaModel = PaModel(modelName="wiener", width=16)
+    fixedHelperInputTransformCount = [0]
+
+    def CopyFixedHelperInput(inputSignal: np.ndarray) -> np.ndarray:
+        """Exercise the production sweep transform without changing samples.
+
+        Processing details:
+            Algorithm: Count each invocation and return an independent copy so
+            both ordinary and explicit-drive helper paths use the configured
+            transform before entering the PA.
+
+        Args:
+            inputSignal: Public fixed-point waveform for one sweep trial.
+
+        Returns:
+            result: Unchanged copied waveform in the same public format.
+        """
+
+        fixedHelperInputTransformCount[0] += 1
+        return np.asarray(inputSignal, dtype=np.complex128).copy()
+
+    fixedHelperProbe = fixedCurveWaveform.samples[:256]
+    fixedHelperOutputBeforeSweep = fixedHelperPaModel.Process(
+        fixedHelperProbe
+    )
+    fixedHelperEvaluator = BuildPowerSweepEvaluator(
+        fixedHelperPaModel,
+        CopyFixedHelperInput,
+    )
+    fixedPipelinePaModel = PaModel(modelName="wiener", width=16)
+    fixedPipelineTrialCount = [0]
+    fixedPipelineProbe = fixedCurveWaveform.samples[:256]
+    fixedPipelineOutputBeforeSweep = fixedPipelinePaModel.Process(
+        fixedPipelineProbe
+    )
+
+    def EvaluateFixedPipelineAtDrive(
+        inputSignal: np.ndarray,
+        driveDbPerChain: Sequence[float],
+    ) -> np.ndarray:
+        """Evaluate a complete custom sweep pipeline at its trial drive.
+
+        Processing details:
+            Algorithm: Count the invocation, bind a noncommitting fixed-drive
+            PA view, and execute the public pipeline through that view. This
+            is the lightweight equivalent of the production ILC callback.
+
+        Args:
+            inputSignal: Public fixed-point waveform for one sweep trial.
+            driveDbPerChain: Candidate post-decode drive for the PA chain.
+
+        Returns:
+            result: Public PA output produced at the explicit trial drive.
+        """
+
+        fixedPipelineTrialCount[0] += 1
+        assert GetFixedPointFormat(inputSignal) == (16, 1.0)
+        return CalibrationDrivePaView(
+            fixedPipelinePaModel,
+            driveDbPerChain,
+        ).Process(inputSignal)
+
+    fixedPipelineEvaluator = BuildPowerSweepEvaluator(
+        fixedPipelinePaModel,
+        calibrationProcessor=EvaluateFixedPipelineAtDrive,
+    )
+    fixedCurve = fixedCurveAnalysis.AnalyzePowerEvmCurve(
+        fixedCurvePowerDbmValues,
+        {
+            "Fixed hidden-drive": EvaluateFixedCurve,
+            "Factory hidden-drive": fixedHelperEvaluator,
+            "Factory complete pipeline": fixedPipelineEvaluator,
+        },
+    )
+    assert len(fixedCurveCommittedDriveDbValues) == len(
+        fixedCurvePowerDbmValues
+    )
+    assert len(fixedCurveCommittedOutputs) == len(
+        fixedCurvePowerDbmValues
+    )
+    assert np.all(
+        np.diff(np.r_[0, fixedCurveTrialCountsAtCommit]) > 0
+    )
+    assert np.all(np.diff(fixedCurveCommittedDriveDbValues) > 0.0)
+
+    curvePowerMeter = PowerCalibration(
+        parameters={
+            "maximumOutputPowerDbm": 25.0,
+            "width": 16,
+        },
+    )
+    fixedCurveOutputFormat = FixedPoint(
+        16,
+        fixedCurvePaModel.outputFullScaleAmplitude,
+    )
+    fixedCurveMeasuredPowerDbmValues = []
+    for committedOutput in fixedCurveCommittedOutputs:
+        decodedOutput = fixedCurveOutputFormat.DecodeComplex(
+            committedOutput
+        )
+        activeRms = curvePowerMeter.CalculateActiveRmsPerChain(
+            decodedOutput
+        )[0]
+        fixedCurveMeasuredPowerDbmValues.append(
+            curvePowerMeter.NormalizedRmsToOutputPowerDbm(activeRms)
+        )
+    assert np.allclose(
+        fixedCurveMeasuredPowerDbmValues,
+        fixedCurvePowerDbmValues,
+        rtol=0.0,
+        atol=0.25,
+    )
+
+    directDriveDbValues = []
+    directEvmDbValues = []
+    directEvmPercentValues = []
+    for targetPowerDbm in fixedCurvePowerDbmValues:
+        directPaModel = PaModel(modelName="wiener", width=16)
+        directCalibration = PowerCalibration(
+            paModel=directPaModel,
+            parameters={
+                "maximumOutputPowerDbm": 25.0,
+                "outputPowerDbm": targetPowerDbm,
+                "width": 16,
+            },
+        )
+        directReference = directCalibration.Calibrate(
+            fixedCurveWaveform.samples
+        )
+        directMetrics = directCalibration.GetLastCalibrationMetrics()
+        assert abs(
+            directMetrics["measuredOutputPowerDbmPerChain"][0]
+            - targetPowerDbm
+        ) <= 0.25
+        directDriveDbValues.append(
+            directMetrics["analogDriveDbPerChain"][0]
+        )
+        directAnalysis = Analysis(
+            directReference,
+            fixedCurveWaveform,
+            parameters={
+                "maximumOutputPowerDbm": 25.0,
+                "width": 16,
+                "outputFullScaleAmplitude": (
+                    directPaModel.outputFullScaleAmplitude
+                ),
+            },
+        )
+        directEvmDb, directEvmPercent = directAnalysis.CalculateEvm(
+            directCalibration.GetLastPaOutput()
+        )
+        directEvmDbValues.append(directEvmDb)
+        directEvmPercentValues.append(directEvmPercent)
+    assert np.allclose(
+        fixedCurveCommittedDriveDbValues,
+        directDriveDbValues,
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+    assert np.allclose(
+        fixedCurve.evmDbByMethod["Fixed hidden-drive"],
+        directEvmDbValues,
+        rtol=0.0,
+        atol=0.02,
+    )
+    assert np.allclose(
+        fixedCurve.evmPercentByMethod["Fixed hidden-drive"],
+        directEvmPercentValues,
+        rtol=0.0,
+        atol=0.002,
+    )
+    assert np.allclose(
+        fixedCurve.evmDbByMethod["Factory hidden-drive"],
+        directEvmDbValues,
+        rtol=0.0,
+        atol=0.02,
+    )
+    assert np.allclose(
+        fixedCurve.evmPercentByMethod["Factory hidden-drive"],
+        directEvmPercentValues,
+        rtol=0.0,
+        atol=0.002,
+    )
+    assert np.allclose(
+        fixedCurve.evmDbByMethod["Factory complete pipeline"],
+        directEvmDbValues,
+        rtol=0.0,
+        atol=0.02,
+    )
+    assert np.allclose(
+        fixedCurve.evmPercentByMethod["Factory complete pipeline"],
+        directEvmPercentValues,
+        rtol=0.0,
+        atol=0.002,
+    )
+    assert fixedHelperInputTransformCount[0] > len(
+        fixedCurvePowerDbmValues
+    )
+    assert fixedPipelineTrialCount[0] > len(
+        fixedCurvePowerDbmValues
+    )
+    fixedHelperOutputAfterSweep = fixedHelperPaModel.Process(
+        fixedHelperProbe
+    )
+    assert np.array_equal(
+        fixedHelperOutputAfterSweep,
+        fixedHelperOutputBeforeSweep,
+    )
+    fixedPipelineOutputAfterSweep = fixedPipelinePaModel.Process(
+        fixedPipelineProbe
+    )
+    assert np.array_equal(
+        fixedPipelineOutputAfterSweep,
+        fixedPipelineOutputBeforeSweep,
     )
 
     # Power calibration must ignore leading/trailing padding and a long

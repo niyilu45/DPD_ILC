@@ -458,6 +458,8 @@ y_{\mathrm{long},3}[n]
 
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
+| `CalibrationDrivePaView.__init__`, `CalibrationDrivePaView.Process`, `CalibrationDrivePaView.ProcessChain` | P/E | 验证逐链显式post-DAC drive并构造不提交状态的plant视图；SISO/矩阵处理委托底层 `ProcessCalibrationDrive`，MIMO逐链处理在解码后施加对应drive并调用drive-free链内核，供完整ILC试探使用且不调用共享plant的提交接口 | Analysis §8.3.1 |
+| `Analysis.BuildPowerSweepEvaluator`, `Analysis.Transform`, `Analysis.Evaluate`, `Analysis.EvaluateCalibrationDrive`, `Analysis.CommitCalibrationDrive`, `Analysis.EvaluateCommittedDrive` | P/E | 构造保留位宽、输出标尺、成对drive和热事务协议的功率扫描求值器；可选DPD变换先于每次PA试探，可选完整方法处理器接收同一显式drive，接受值只保存在evaluator闭包并通过非提交试探重放，避免多方法共享PA状态互相污染 | Analysis §8.3.1、§11.11 |
 | `Analysis.Analyze`, `Analysis.GetLastMimoMetrics` | E | 直接返回普通指标字典，调用方使用固定键读取模拟输出功率、SNR、EVM、ACLR和MIMO明细 | Analysis §3.1、§10 |
 | `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把曲线或逐轮记录转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann窗、50%重叠的Welch PSD平均；先按原顺序累计未移位功率，最后只执行一次固定频率bin移位 | Analysis §6.2，Performance §4.2 |
@@ -485,7 +487,7 @@ y_{\mathrm{long},3}[n]
 | `Analysis.CalculateIntermodulationOrder`, `Analysis.CalculateIm3`, `Analysis.CalculateIm5`, `Analysis.CalculateIm7` | P/E | 选择3、5或7阶互调，接受元数据或原始NumPy/list输入，返回上下侧物理频率、同侧基波归一化dBc、绝对互调dBFS及同一次分析的 `outputPowerDbm`；非法阶次或缺失原始样值物理频率直接拒绝 | TwoToneAnalysis §4–§5、§8.1–§8.2 |
 | `Analysis.AnalyzeIlcHistory` | P/E | 在ILC返回后逐轮分析已保存的SISO对齐输出，复制反馈同步估计，并在Analysis中按严格EVM在线维护最佳实测轮；直接复用该轮已算指标且只保留最佳输入/输出副本，不做第二次最佳轮分析 | DpdIlc §7、Analysis §5.10，Performance §4.3 |
 | `Analysis.AnalyzeMimoIlcHistory` | P/E | 按轮组合各PA链输出，以完整MIMO空间解映射统一计算性能并在Analysis中选择最佳轮 | Analysis §9 |
-| `Analysis.AnalyzePowerEvmCurve` | P/E | 把每个方法求值器视为完整“DPD+PA”被测对象，在共同目标dBm点反复更新输入并重新运行方法，直到PA实测有效突发输出进入容限；不对方法输出做后级缩放，只调用EVM路径而不附带计算SNR/IRR/ACLR。主程序ILC求值器另按每点chOut严格EVM选轮；绝对噪声和满量程量化地板仍如实进入传导曲线 | Analysis §8，Performance §4.3 |
+| `Analysis.AnalyzePowerEvmCurve` | P/E | 把每个方法求值器视为完整“DPD+PA”被测对象，在共同目标dBm点反复更新输入并重新运行方法，直到PA实测有效突发输出进入容限；自动转交求值器公开的成对drive/热事务协议，helper构造的定点路径使用evaluator本地模拟drive，旧式无协议回调保留纯数字兼容路径。不对方法输出做后级缩放，只调用EVM路径而不附带计算SNR/IRR/ACLR；主程序ILC求值器另按每点chOut严格EVM选轮 | Analysis §8、Performance §4.3 |
 | `Analysis.SavePowerEvmCurveData`, `Analysis.Print`, `Analysis.PrintMimo`, `Analysis.Save`, `Analysis.SaveConvergence`, `Analysis.PrintConvergence` | E | 展示/序列化既有结果，不改变物理指标 | Analysis §10–§11 |
 
 ## 9. `Draw.py`：图形函数
