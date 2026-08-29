@@ -826,8 +826,9 @@ def CheckDocumentationApiConsistency() -> None:
         ``Analysis`` constructor parameter order with its documented
         signature, require synchronization examples to use the explicit
         ``signalProcessingParameters`` argument, require the piecewise-GMP PA
-        example to use the common ``parameters`` mapping, and retain one
-        documented compatibility note for the legacy nested mapping form.
+        example to use the common ``parameters`` mapping, retain one
+        documented compatibility note for the legacy nested mapping form,
+        and reject the obsolete misspelling of the Channel delay parameter.
 
     Returns:
         result: None. A stale example or signature fails with its document
@@ -894,6 +895,25 @@ def CheckDocumentationApiConsistency() -> None:
     paModelDocumentText = (
         projectRoot / "doc" / "PaModel.md"
     ).read_text(encoding="utf-8")
+    channelDocumentText = (
+        projectRoot / "doc" / "Channel.md"
+    ).read_text(encoding="utf-8")
+    functionPrinciplesText = (
+        projectRoot / "doc" / "FunctionPrinciples.md"
+    ).read_text(encoding="utf-8")
+    channelDelayDocuments = (
+        readmeText,
+        channelDocumentText,
+        functionPrinciplesText,
+    )
+    assert all(
+        "channalDly" not in documentText
+        for documentText in channelDelayDocuments
+    )
+    assert all(
+        "channelDly" in documentText
+        for documentText in channelDelayDocuments
+    )
     assert expectedSignatureText in readmeText
     assert (
         'piecewisePa = PaModel(\n'
@@ -6737,6 +6757,52 @@ def CheckUnknownConfigurationWarnings() -> None:
             "Channel.UpdateParameters must reject unknown names"
         )
 
+    # The corrected public key is unique. Every old-spelling entry path must
+    # fail loudly and rank channelDly first so a stale configuration cannot
+    # silently fall back to the zero-delay default.
+    obsoleteDelayName = "channalDly"
+    obsoleteDelayConstructors = (
+        lambda: Channel(
+            parameters={obsoleteDelayName: 2.25, "width": 0}
+        ),
+        lambda: Channel(width=0, **{obsoleteDelayName: 2.25}),
+    )
+    for obsoleteDelayConstructor in obsoleteDelayConstructors:
+        try:
+            obsoleteDelayConstructor()
+        except TypeError as error:
+            errorText = str(error)
+            assert obsoleteDelayName in errorText
+            rankedDelayNames = (
+                errorText.split(f"{obsoleteDelayName}: ", 1)[1]
+                .splitlines()[0]
+                .split(", ")
+            )
+            assert rankedDelayNames[0] == "channelDly"
+        else:
+            raise AssertionError(
+                "Channel must reject the obsolete delay spelling"
+            )
+
+    renamedDelayChannel = Channel(
+        parameters={"channelDly": 1.25, "width": 0}
+    )
+    renamedDelayParameters = renamedDelayChannel.GetParameters()
+    assert "channelDly" in renamedDelayParameters
+    assert obsoleteDelayName not in renamedDelayParameters
+    try:
+        renamedDelayChannel.UpdateParameters(
+            **{obsoleteDelayName: 2.25}
+        )
+    except TypeError as error:
+        assert obsoleteDelayName in str(error)
+        assert f"{obsoleteDelayName}: channelDly" in str(error)
+    else:
+        raise AssertionError(
+            "Channel.UpdateParameters must reject the obsolete delay spelling"
+        )
+    assert renamedDelayChannel.GetParameters()["channelDly"] == 1.25
+
     liveChannelParameters = {"width": 0}
     liveStrictChannel = Channel(parameters=liveChannelParameters)
     liveChannelParameters["lateUnknownChannelSetting"] = 3
@@ -6747,6 +6813,19 @@ def CheckUnknownConfigurationWarnings() -> None:
     else:
         raise AssertionError(
             "Channel must reject unknown names added to a live mapping"
+        )
+
+    liveDelayParameters = {"width": 0, "channelDly": 1.25}
+    liveDelayChannel = Channel(parameters=liveDelayParameters)
+    liveDelayParameters[obsoleteDelayName] = 2.25
+    try:
+        liveDelayChannel.GetParameters()
+    except TypeError as error:
+        assert obsoleteDelayName in str(error)
+        assert f"{obsoleteDelayName}: channelDly" in str(error)
+    else:
+        raise AssertionError(
+            "Channel must reject a live obsolete delay spelling"
         )
 
     with warnings.catch_warnings():
@@ -8859,6 +8938,15 @@ def CheckFeedbackIqPhasePairCalibration() -> None:
         thermalPhasePairChannel.GetFeedbackIqCalibrationMetrics()
         == savedChannelMetrics
     )
+    thermalPhasePairChannel.UpdateParameters(channelDly=0.25)
+    try:
+        thermalPhasePairChannel.GetFeedbackIqCalibrationMetrics()
+    except RuntimeError as error:
+        assert "valid feedback I/Q calibration" in str(error)
+    else:
+        raise AssertionError(
+            "changing channelDly must invalidate feedback I/Q calibration"
+        )
     uncalibratedFilterChannel = Channel(
         paModel=PaModel(modelName="wiener", width=0),
         parameters={
@@ -11021,7 +11109,7 @@ def CheckChannelModel() -> None:
     # retaining the standalone helper's defensive-copy contract. Delay
     # decomposition always uses floor so its fractional part stays in [0, 1).
     defaultDelayChannel = Channel(parameters={"width": 0})
-    assert defaultDelayChannel.GetParameters()["channalDly"] == 0.0
+    assert defaultDelayChannel.GetParameters()["channelDly"] == 0.0
     defaultDelayOutput = defaultDelayChannel.ApplyChannelDelay(testSignal)
     assert np.array_equal(defaultDelayOutput, testSignal)
     assert not np.shares_memory(defaultDelayOutput, testSignal)
@@ -11031,7 +11119,7 @@ def CheckChannelModel() -> None:
         (2.25, (2, 0.25)),
     ):
         delayResolver = Channel(
-            parameters={"channalDly": configuredDelay, "width": 0}
+            parameters={"channelDly": configuredDelay, "width": 0}
         )
         resolvedIntegerDelay, resolvedFractionalDelay = (
             delayResolver.ResolveChannelDelay()
@@ -11049,7 +11137,7 @@ def CheckChannelModel() -> None:
     delayImpulse = np.zeros(8, dtype=np.complex128)
     delayImpulse[0] = 1.0 + 0.0j
     fractionalDelayChannel = Channel(
-        parameters={"channalDly": 2.25, "width": 0}
+        parameters={"channelDly": 2.25, "width": 0}
     )
     expectedFractionalDelay = np.zeros_like(delayImpulse)
     expectedFractionalDelay[2:4] = (0.75, 0.25)
@@ -11076,7 +11164,7 @@ def CheckChannelModel() -> None:
         dtype=np.complex128,
     )
     integerDelayChannel = Channel(
-        parameters={"channalDly": 2.0, "width": 0}
+        parameters={"channelDly": 2.0, "width": 0}
     )
     expectedTailTruncation = np.zeros_like(tailInput)
     expectedTailTruncation[2:] = tailInput[:-2]
@@ -11089,7 +11177,7 @@ def CheckChannelModel() -> None:
     )
     beyondRecordChannel = Channel(
         parameters={
-            "channalDly": float(tailInput.size + 1),
+            "channelDly": float(tailInput.size + 1),
             "width": 0,
         }
     )
@@ -11120,7 +11208,7 @@ def CheckChannelModel() -> None:
         paModel=PaModel(modelName="wiener", width=0),
         parameters={
             "sampleMode": "forward",
-            "channalDly": 2.25,
+            "channelDly": 2.25,
             "width": 0,
         },
     )
@@ -11140,7 +11228,7 @@ def CheckChannelModel() -> None:
     stackedDelayChannel = Channel(
         parameters={
             "sampleMode": "fb",
-            "channalDly": 1.25,
+            "channelDly": 1.25,
             "fbIntegerDelaySamples": 2,
             "fbFractionalDelaySamples": 0.25,
             "width": 0,
@@ -11167,7 +11255,7 @@ def CheckChannelModel() -> None:
     fixedDelayChannel = Channel(
         parameters={
             "sampleMode": "forward",
-            "channalDly": 2.25,
+            "channelDly": 2.25,
             "width": 16,
         }
     )
@@ -11195,7 +11283,7 @@ def CheckChannelModel() -> None:
         paModel=PaModel(modelName="wiener", width=16),
         parameters={
             "sampleMode": "forward",
-            "channalDly": 2.25,
+            "channelDly": 2.25,
             "width": 16,
         },
     )
@@ -12090,11 +12178,11 @@ def CheckChannelModel() -> None:
             "noiseSnrDb": 30.0,
         },
         {"noiseSnrDb": np.nan},
-        {"channalDly": -0.25},
-        {"channalDly": np.nan},
-        {"channalDly": np.inf},
-        {"channalDly": True},
-        {"channalDly": "2.25"},
+        {"channelDly": -0.25},
+        {"channelDly": np.nan},
+        {"channelDly": np.inf},
+        {"channelDly": True},
+        {"channelDly": "2.25"},
         {"txIqGainImbalanceDb": np.inf},
         {"txIqPhaseImbalanceDegrees": "invalid"},
         {"txDcOffset": complex(np.nan, 0.0)},

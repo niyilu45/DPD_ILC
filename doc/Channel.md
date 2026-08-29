@@ -2,7 +2,7 @@
 
 ## 1. 模块边界
 
-`inc/lib/Channel.py` 描述PA前多通道耦合、独立非线性PA、PA后耦合、公共传播时延、外部仪表采样和板载反馈接收机。公开入口 `Channel.Process(...)` 固定返回二元组 `chOut, fbOut`：`chOut` 始终是前向主路测量；`sampleMode="forward"` 时 `fbOut` 是 `chOut` 的数值相同副本，`sampleMode="fb"` 时 `fbOut` 才是经过完整反馈接收链的DPD/ILC训练观测。两种模式都只运行一次PA、使用同一段记忆状态和同一个热周期，并在PA后耦合之后共享同一个 `channalDly`。参数名的拼写是公开兼容接口的一部分，必须写成 `channalDly`，不能改写为 `channelDelay`。
+`inc/lib/Channel.py` 描述PA前多通道耦合、独立非线性PA、PA后耦合、公共传播时延、外部仪表采样和板载反馈接收机。公开入口 `Channel.Process(...)` 固定返回二元组 `chOut, fbOut`：`chOut` 始终是前向主路测量；`sampleMode="forward"` 时 `fbOut` 是 `chOut` 的数值相同副本，`sampleMode="fb"` 时 `fbOut` 才是经过完整反馈接收链的DPD/ILC训练观测。两种模式都只运行一次PA、使用同一段记忆状态和同一个热周期，并在PA后耦合之后共享同一个 `channelDly`。
 
 公开构造签名为
 `Channel(paModel=None, parameters=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。固定点输入DAC标尺保持1.0；固定点 `chOut`/`fbOut` 的 `outputFullScaleAmplitude` 默认2.0，提供6.02 dB分量观测余量。两者位宽相同但幅度标尺可以不同。
@@ -44,7 +44,7 @@ flowchart LR
     restoreThermal --> thermalPeriod["正式热周期<br/>稳态固定点或瞬态推进"]
     thermalPeriod --> livePaOutput["数据窗PA输出<br/>窗后自动空闲只更新温度"]
     livePaOutput --> postCoupling["PA后耦合 Hpost(z)"]
-    postCoupling --> commonDelay["公共传播时延<br/>channalDly"]
+    postCoupling --> commonDelay["公共传播时延<br/>channelDly"]
     commonDelay --> forwardPhase["主路公共固定相位"]
     forwardPhase --> instrument["前向仪表采样<br/>跳过fb专用非理想"]
     instrument --> forwardNoise["AddNoise"]
@@ -69,20 +69,20 @@ flowchart LR
 图示说明：
 
 - `txIqImbalanceEnabled=True` 时，Tx直接/镜像FIR或其增益/相位回退系数以及 `txDcOffset` 位于PA之前，属于真实发射链路；无论选择forward还是fb，它们都会改变PA激励和空口输出。设为 `False` 时，标量、FIR和DC即使非理想也被整级旁路。
-- `chOut` 用校准仪表直接观测PA主路输出。公共 `channalDly` 在forward/fb分路之前生效；所有 `fb...` 参数都不会进入 `chOut` 分支，因此不会把板载反馈接收机失真混入最终EVM、SNR、ACLR、IRR和功率，但Tx I/Q不平衡与公共传播时延仍然存在。
+- `chOut` 用校准仪表直接观测PA主路输出。公共 `channelDly` 在forward/fb分路之前生效；所有 `fb...` 参数都不会进入 `chOut` 分支，因此不会把板载反馈接收机失真混入最终EVM、SNR、ACLR、IRR和功率，但Tx I/Q不平衡与公共传播时延仍然存在。
 - `sampleMode="forward"` 时，`fbOut` 是已经加入公共时延、公共相位和前向噪声后的 `chOut` 数值副本；它不会重新产生噪声，也不会执行任何 `fb...` 模块，所以两项仍逐样点完全相同。`sampleMode="fb"` 时，第二项先包含同一个公共时延，再通过板载反馈接收链并叠加FB专用时延。`fbIqCompensationMode="none"` 保留历史单路原始采样；`"phase_pair"` 在I/Q变频器输入处依次应用两个实测相位响应并返回分离后的直接项，同时缓存逆FIR；`"filter"` 只采第一状态并应用当前缓存。三种模式都不会改变 `chOut`。
 - `prePaCouplingPaths` 在Tx I/Q调制器之后、PA非线性之前，把其他通道的延迟复泄漏叠加到每个PA输入；`postPaCouplingPaths` 在非线性之后混合各PA输出。两者都与forward/fb选择无关。
 - `Channel.Process(rawSignal, outputPowerDbm=...)` 是推荐入口。用户只提供任意初始幅度的原始波形和参考温度目标PA输出功率；Channel内部的 `PowerCalibration.Calibrate` 通过Channel热事务代理保存并暂停实际PA热状态，调整逐链总drive并反复观测参考温度的干净PA输出。正位宽模式不会用超量程数字码模拟更大驱动，而是在合法公开码解码后施加隐藏模拟drive。收敛后在 `finally` 中恢复原热状态，再用同一公开波形和已提交drive执行一次真实PA/热周期。随后始终生成 `chOut`，并按 `sampleMode` 复制它或产生完整 `fbOut`；因此校准试探不发热，而两项返回波形都对应同一次温漂历史。
 - 启用热模型且使用默认 `thermalRunMode="steady_state"` 时，每次 `Channel.Process` 都重做参考温度功率校准。首次必须显式给出 `outputPowerDbm`；成功后的后续调用可省略，Channel会复用最近成功目标并仍执行校准。未启用热模型或显式选择 `"transient"` 时，`Channel.Process(rawSignal)` 才是无功率校准的单周期PA→采样路径。
 - `Channel.ProcessPaOutput` 接收各PA已经产生但尚未经过输出耦合的矩阵，不再次运行PA，依次执行PA后耦合和 `sampleMode` 所选的兼容单输出采样路径。
 - 功率闭环由Channel私有持有的 `PowerCalibration` 完成。Channel的 `SuspendThermalModel` 与 `RestoreThermalModel` 只把统一事务代理到实际绑定PA；普通用户不需要构造、配置或调用校准器，也不需要手工开关温度。
-- 必须区分两种“校准”：PA功率设定闭环 `PowerCalibration` 仍观察PA后耦合、`channalDly` 和所有接收非理想之前的干净物理PA输出，`outputPowerDbm` 绝不是延迟后 `chOut` 或原始 `fbOut` 的表观功率；DPD/ILC校准或训练则使用 `fbOut` 做同步、MSE和系数更新。最终RF验收只把同一轮的 `chOut` 交给 `Analysis`。
+- 必须区分两种“校准”：PA功率设定闭环 `PowerCalibration` 仍观察PA后耦合、`channelDly` 和所有接收非理想之前的干净物理PA输出，`outputPowerDbm` 绝不是延迟后 `chOut` 或原始 `fbOut` 的表观功率；DPD/ILC校准或训练则使用 `fbOut` 做同步、MSE和系数更新。最终RF验收只把同一轮的 `chOut` 交给 `Analysis`。
 - `maximumOutputPowerDbm` 是内置PA的额定输出上限和归一化功率参考，不是任意可移动的显示标尺。内置plant应覆盖不超过该上限的目标；默认 `25 dBm` 上限下，`20 dBm` 必须是可达工作点。
 - DPD/ILC把整个Channel作为plant时，内部适配器固定选择二元组第二项 `fbOut` 训练，并保留同一轮的 `chOut` 用于最终评价。需要板载反馈链时必须显式设置 `sampleMode="fb"`；`forward` 模式则明确表示用前向主路的相同副本训练。
 
 ### 1.1 `chOut`前向仪表采样与公共传播时延
 
-用户指定拼写的 `channalDly` 是PA后耦合节点到两个接收分支的公共传播时延，单位为复基带sample，默认 `0.0`，只接受非负有限实数。以下用 $D_{\mathrm{total}}$ 表示该参数值，代码把它分解为：
+`channelDly` 是PA后耦合节点到两个接收分支的公共传播时延，单位为复基带sample，默认 `0.0`，只接受非负有限实数。以下用 $D_{\mathrm{total}}$ 表示该参数值，代码把它分解为：
 
 ```math
 D=\left\lfloor D_{\mathrm{total}}\right\rfloor,
@@ -108,7 +108,7 @@ y_d[n]
 \frac{D_{\mathrm{total}}}{f_s}.
 ```
 
-这里 $f_s$ 就是正文参数 `sampleRateHz`，因此代码量对应 `channalDly/sampleRateHz` 秒。
+这里 $f_s$ 就是正文参数 `sampleRateHz`，因此代码量对应 `channelDly/sampleRateHz` 秒。
 
 理想物理传播只有相位斜率，频响为 $H_{\mathrm{ideal}}(e^{j\omega})=\exp[-j\omega D_{\mathrm{total}}]$。当前有限阶近似为：
 
@@ -129,7 +129,7 @@ chOut(n)
 y_d(n)\exp(j\phi_c)+w(n).
 ```
 
-`fb...` 配置不会进入该公式；`channalDly` 不是FB专用参数，所以会进入该公式。即使兼容参数 `sampleMode="fb"`，公开 `Process` 返回的第一个数组仍遵循这个主路方程。同长零边界意味着有限记录开头出现延迟空白、尾部被截断；测量EVM、IRR或频响时应保留足够保护样点，并让同步搜索窗口覆盖总时延。
+`fb...` 配置不会进入该公式；`channelDly` 不是FB专用参数，所以会进入该公式。即使兼容参数 `sampleMode="fb"`，公开 `Process` 返回的第一个数组仍遵循这个主路方程。同长零边界意味着有限记录开头出现延迟空白、尾部被截断；测量EVM、IRR或频响时应保留足够保护样点，并让同步搜索窗口覆盖总时延。
 
 ### 1.2 `fbOut`训练观测
 
@@ -145,7 +145,7 @@ fbOut(n)=chOut(n).
 
 ```text
 PA output
-  -> common channalDly
+  -> common channelDly
   -> common phase
   -> feedback gain/phase and FIR
   -> third-order receiver distortion and envelope clipping
@@ -787,7 +787,7 @@ r_y
 4. 把每路原始波形归一化到有效区单位RMS，并用目标相对额定上限的功率回退作为总drive初值。
 5. 浮点模式直接把总drive乘入公开波形；定点模式生成带数字余量的合法整数码，并按量化后的真实RMS计算隐藏模拟drive。
 6. 公开波形进入Channel后先解码，再经过逐链模拟drive、Tx I/Q不平衡和DC、PA前耦合，最后进入各路非线性PA。
-7. 仅在每个PA自身输出、PA后耦合之前测量有效区功率；公共 `channalDly`、公共移相、forward/fb接收链和白噪声都不进入校准误差。
+7. 仅在每个PA自身输出、PA后耦合之前测量有效区功率；公共 `channelDly`、公共移相、forward/fb接收链和白噪声都不进入校准误差。
 8. 未包围目标时使用有界dB比例更新，形成上下界后使用二分；存在PA前耦合且启用联合校准时使用有限差分Jacobian更新所有链。
 9. 全部链进入 `calibrationToleranceDb` 后才原子提交逐链模拟drive，并缓存公开输入、干净PA输出和成功metrics。
 10. `finally` 恢复校准前的完整热状态，再用已接受的公开输入与drive正式处理一次；这一次会推进温度并生成 `chOut`。`sampleMode="forward"` 直接复制该结果为 `fbOut`，`"fb"` 才从同一PA后节点执行带独立噪声的完整反馈链。若校准期间活动配置已经关闭温度，恢复不会复活旧启用快照。
@@ -1058,7 +1058,7 @@ A\frac{v_{\mathrm{nl}}(n)}
 
 ### 4.3 时延、CFO和SFO
 
-本节参数描述公共 `channalDly` 之后的FB接收机专用同步误差，不应重复填写PA输出到两路采样器共有的传播时间。分数时延与采样频偏使用保持长度的插值模型。正的 `fbFractionalDelaySamples=d` 取源位置 $n-d$；采样偏差为 $\epsilon_{\mathrm{sfo}}=\mathrm{ppm}\times10^{-6}$：
+本节参数描述公共 `channelDly` 之后的FB接收机专用同步误差，不应重复填写PA输出到两路采样器共有的传播时间。分数时延与采样频偏使用保持长度的插值模型。正的 `fbFractionalDelaySamples=d` 取源位置 $n-d$；采样偏差为 $\epsilon_{\mathrm{sfo}}=\mathrm{ppm}\times10^{-6}$：
 
 ```math
 v_{\mathrm{sfo}}(n)
@@ -1081,9 +1081,9 @@ j2\pi\frac{\Delta f}{f_s}n
 \right).
 ```
 
-超出原采样记录的插值位置补零。`sampleRateHz` 决定CFO相位斜率的物理尺度。忽略各FIR群时延时，fb模式的名义显式group delay为 `channalDly + fbIntegerDelaySamples + fbFractionalDelaySamples`，而 `chOut` 只包含第一项；forward模式的 `fbOut` 是 `chOut` 副本，因此不会再叠加后两项。
+超出原采样记录的插值位置补零。`sampleRateHz` 决定CFO相位斜率的物理尺度。忽略各FIR群时延时，fb模式的名义显式group delay为 `channelDly + fbIntegerDelaySamples + fbFractionalDelaySamples`，而 `chOut` 只包含第一项；forward模式的 `fbOut` 是 `chOut` 副本，因此不会再叠加后两项。
 
-两个分数时延参数的物理含义和数值约束不同：`channalDly` 是非负传播时延，先按 $D+\mu$ 形成因果两抽头FIR；`fbFractionalDelaySamples` 是范围 `[-0.5,0.5)` 的可带符号接收采样偏差，正值采样较晚、负值可表示采样较早。fb模式下两个stage串联，所以名义group delay可以相加，但波形通常不能先把两个小数相加、再只插值一次。若两级分数插值的频响分别为 $H_1$ 和 $H_2$，真实组合为 $H_1H_2$；两个一阶stage卷积后一般成为更长的等效响应，并不等于一个以总小数部分构造的两抽头响应。测试或同步可报告总时延，复现波形时仍应保留两个参考面和两次插值顺序。
+两个分数时延参数的物理含义和数值约束不同：`channelDly` 是非负传播时延，先按 $D+\mu$ 形成因果两抽头FIR；`fbFractionalDelaySamples` 是范围 `[-0.5,0.5)` 的可带符号接收采样偏差，正值采样较晚、负值可表示采样较早。fb模式下两个stage串联，所以名义group delay可以相加，但波形通常不能先把两个小数相加、再只插值一次。若两级分数插值的频响分别为 $H_1$ 和 $H_2$，真实组合为 $H_1H_2$；两个一阶stage卷积后一般成为更长的等效响应，并不等于一个以总小数部分构造的两抽头响应。测试或同步可报告总时延，复现波形时仍应保留两个参考面和两次插值顺序。
 
 ### 4.4 Tx与FB频率选择性I/Q不平衡及直流偏置
 
@@ -1260,7 +1260,7 @@ flowchart LR
     pre --> pa["逐路PA电模型"]
     pa --> thermal["周期热调度<br/>thermalRunMode / thermalDutyCycle"]
     thermal --> post["PA后耦合<br/>postPaCouplingPaths"]
-    post --> commonDelay["公共传播时延<br/>channalDly"]
+    post --> commonDelay["公共传播时延<br/>channelDly"]
     commonDelay --> forwardPhase["主路公共移相<br/>phaseDegrees"]
     forwardPhase --> forwardNoise["前向仪表与互斥噪声配置"]
     forwardNoise --> channelOutput["chOut<br/>最终RF指标"]
@@ -1283,9 +1283,9 @@ flowchart LR
 
 图示说明：
 
-- 主信号从左向右依次经过公开边界解码、已提交的逐链模拟drive、Tx I/Q调制器、PA前耦合、逐路PA、PA后耦合、公共 `channalDly` 和公共固定移相。功率闭环负责寻找并提交drive，不是一个PA输出后的缩放模块；其干净PA输出参考面不包含PA后耦合或公共传播时延。
+- 主信号从左向右依次经过公开边界解码、已提交的逐链模拟drive、Tx I/Q调制器、PA前耦合、逐路PA、PA后耦合、公共 `channelDly` 和公共固定移相。功率闭环负责寻找并提交drive，不是一个PA输出后的缩放模块；其干净PA输出参考面不包含PA后耦合或公共传播时延。
 - Tx I/Q位于PA之前，因此启用时forward与fb都包含它；FB I/Q位于采样分支内部，启用时只改变fb观测。两个enabled开关分别旁路自己的完整标量/FIR/DC模块，互不联动。
-- 公开 `Process` 总是先构造 `chOut`，它在公共传播时延与公共移相后进入仪表前向支路，不经过任何 `fb...` 参数。`sampleMode="forward"` 把这个结果直接复制为 `fbOut`；`sampleMode="fb"` 让第二项共享 `channalDly` 后，再经过反馈增益/FIR、非线性/限幅、FB专用时延/CFO/SFO、I/Q不平衡/DC和反馈ADC。
+- 公开 `Process` 总是先构造 `chOut`，它在公共传播时延与公共移相后进入仪表前向支路，不经过任何 `fb...` 参数。`sampleMode="forward"` 把这个结果直接复制为 `fbOut`；`sampleMode="fb"` 让第二项共享 `channelDly` 后，再经过反馈增益/FIR、非线性/限幅、FB专用时延/CFO/SFO、I/Q不平衡/DC和反馈ADC。
 - `sampleMode` 不改变 `Process` 的二元组顺序，但决定第二项是前向副本还是板载反馈观测；兼容单输出接口仍返回对应选路。
 - 三种白噪声配置描述接收或采样噪声，而不是PA本身的非线性。`forward` 模式只生成一次前向噪声并复制结果；`fb` 模式在前向和反馈路径分别生成独立噪声实现。
 - `width` 只定义公开输入输出的整数码位宽；图中模拟drive及所有物理模块仍在内部浮点域计算。
@@ -1307,7 +1307,7 @@ flowchart TB
         fbNonlinear["FB非线性与ADC参数"] --> fbNonlinearObs["fb压缩、削顶与量化台阶"]
     end
     subgraph measurement["测量与求解模块"]
-        commonDelay["channalDly"] --> delayObs["chOut与fbOut共同平移<br/>分数近似带边轻微下垂"]
+        commonDelay["channelDly"] --> delayObs["chOut与fbOut共同平移<br/>分数近似带边轻微下垂"]
         noise["接收噪声参数"] --> noiseObs["噪声底、SNR与EVM地板"]
         calibration["功率检测与校准参数"] --> calibrationObs["目标dBm、收敛速度与稳态误差"]
         interface["采样率与width"] --> interfaceObs["物理单位换算与公开码值"]
@@ -1320,7 +1320,7 @@ flowchart TB
 |---|---|---|
 | A | `sourceChain`、`destinationChain`、`gainDb`、`firTaps` | 耦合方向、耦合幅度、带内纹波和陷波 |
 | B | 耦合路径 `phaseDegrees`、`integerDelaySamples`、`fractionalDelaySamples` | 中心相位和随频率变化的相位斜率 |
-| B-common | `channalDly` 与 `sampleRateHz` | 两路共同横向平移；物理时间为 `channalDly/sampleRateHz`，非整数值还会出现两抽头近似的带边下垂 |
+| B-common | `channelDly` 与 `sampleRateHz` | 两路共同横向平移；物理时间为 `channelDly/sampleRateHz`，非整数值还会出现两抽头近似的带边下垂 |
 | C-Tx | `txIqImbalanceEnabled`、Tx标量、直接/镜像FIR、`txDcOffset` | True时产生PA前幅相衰落、频选镜像与DC并同时影响forward、fb和PA非线性；False时整级旁路 |
 | C-FB | `fbIqImbalanceEnabled`、FB标量、直接/镜像FIR、`fbDcOffset` | True时只在fb观测端产生幅相衰落、频选共轭镜像和中心偏移；False时整级旁路 |
 | D | `fbThirdOrderCoefficient`、`fbClipAmplitude`、`fbAdcWidth`、`fbAdcFullScale` | AM/AM 弯曲、硬限幅和量化台阶 |
@@ -1342,7 +1342,7 @@ flowchart TB
 | `firTaps` | 决定频率选择性、记忆长度、纹波和可能的陷波 | 不能只用一个中心增益概括 |
 | `sourceChain` / `destinationChain` | 改变泄漏的方向和 MIMO 拓扑 | 它们不表示耦合强度 |
 | 公共 `phaseDegrees` | 所选观测信号整体旋转 `-90`、`0` 或 `90` 度 | 不改变功率、噪声或非线性 |
-| `channalDly` | `chOut` 与 `fbOut` 共同增加传播时延；非整数值的高频近似下垂增大 | 不是FB专用时延，也不进入PA功率校准参考面 |
+| `channelDly` | `chOut` 与 `fbOut` 共同增加传播时延；非整数值的高频近似下垂增大 | 不是FB专用时延，也不进入PA功率校准参考面 |
 | `txIqImbalanceEnabled` | True执行Tx实际双FIR/DC，False让输入原样进入PA前耦合 | 不会关闭FB I/Q、耦合或PA |
 | `txIqGainImbalanceDb` | PA前I/Q两轴尺度差增大，Tx镜像和PA级联互调增强 | 开关为False时该值被保留但不生效 |
 | `txIqPhaseImbalanceDegrees` | PA前正交误差增大，Tx镜像增强 | 不是公共相位旋转 |
@@ -1413,7 +1413,7 @@ Channel(
 |---|---:|---|---|
 | `sampleMode` | `"forward"` | 无 | 公开 `Process` 始终返回 `(chOut, fbOut)`；`forward` 令第二项成为第一项的数值相同副本并绕过FB链，`fb` 令第二项经过完整反馈链。兼容单输出接口仍按该值选路 |
 | `sampleRateHz` | `1.0` | sample/s | CFO、SFO、分数时延和热时间换算使用的真实采样率 |
-| `channalDly` | `0.0` | sample | PA后耦合之后、forward/fb分路之前的公共传播时延；必须是非负有限实数。整数部分前补零/尾截断，分数部分使用两抽头线性插值；公开拼写固定为 `channalDly` |
+| `channelDly` | `0.0` | sample | PA后耦合之后、forward/fb分路之前的公共传播时延；必须是非负有限实数。整数部分前补零/尾截断，分数部分使用两抽头线性插值 |
 | `phaseDegrees` | `0` | degree | PA输出后的公共移相，仅允许 `-90`、`0`、`90` |
 | `width` | `16` | bit/I或Q | `0`为浮点；正整数为公开边界有符号I/Q码位宽 |
 | `outputFullScaleAmplitude` | `2.0` | normalized component | 固定点 `chOut`/`fbOut` 正满码代表的I或Q分量幅度；默认相对单位幅度提供6.02 dB观测余量，输入DAC标尺仍为1.0 |
@@ -2020,7 +2020,7 @@ except RuntimeError as error:
 idealChannelParameters = {
     "sampleMode": "forward",
     "sampleRateHz": 80.0e6,
-    "channalDly": 0.0,
+    "channelDly": 0.0,
     "txIqImbalanceEnabled": True,
     "txIqGainImbalanceDb": 0.0,
     "txIqPhaseImbalanceDegrees": 0.0,
@@ -2032,7 +2032,7 @@ idealChannelParameters = {
 typicalFeedbackParameters = {
     "sampleMode": "fb",
     "sampleRateHz": 80.0e6,
-    "channalDly": 3.25,
+    "channelDly": 3.25,
     "txIqImbalanceEnabled": True,
     "txIqGainImbalanceDb": 0.3,
     "txIqPhaseImbalanceDegrees": 2.0,
@@ -2055,7 +2055,7 @@ typicalFeedbackParameters = {
 stressFeedbackParameters = {
     "sampleMode": "fb",
     "sampleRateHz": 80.0e6,
-    "channalDly": 15.5,
+    "channelDly": 15.5,
     "txIqImbalanceEnabled": True,
     "txIqGainImbalanceDb": 1.0,
     "txIqPhaseImbalanceDegrees": 5.0,
@@ -2090,7 +2090,7 @@ stressFeedbackParameters = {
 | 方法 | 参数 | 返回值或作用 |
 |---|---|---|
 | `OutputFullScaleAmplitude` / `outputFullScaleAmplitude` | 无 | 返回固定点 `chOut`/`fbOut` 的scaled full-scale分量标尺；默认2.0，供PowerCalibration发现，并随FixedPointArray自动传给Analysis或用于显式接线 |
-| `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 返回 `(chOut, fbOut)`；默认稳态热模式每次都校准后只提交一个稳态周期。两路都含公共 `channalDly`；`forward` 复制第一项，`fb` 再执行完整反馈链；首次必须给目标，后续 `None` 复用最近成功目标 |
+| `Process(inputSignal, outputPowerDbm=None)` | 原始公开波形；可选共同目标dBm或逐链序列 | 返回 `(chOut, fbOut)`；默认稳态热模式每次都校准后只提交一个稳态周期。两路都含公共 `channelDly`；`forward` 复制第一项，`fb` 再执行完整反馈链；首次必须给目标，后续 `None` 复用最近成功目标 |
 | `ProcessOutputPathsFloating(inputSignal)` | 内部归一化浮点波形 | 从一次PA/热周期返回浮点 `(chOut, fbOut)`；两路在PA后耦合之后包含同一个公共时延，`sampleMode` 决定第二项是前向副本还是继续叠加反馈观测链，供ILC适配器使用 |
 | `ProcessFloating(inputSignal)` | 内部归一化浮点波形 | 兼容单输出入口，按 `sampleMode` 返回一路；新代码不应用它代替双输出接口 |
 | `CalibratePaInput(inputSignal, outputPowerDbm)` | 原始波形、目标功率 | 高级诊断入口；调用内部 `PowerCalibration.Calibrate` 的统一热事务与闭环，返回定点解码与模拟drive之前的公开收敛波形，但不执行正式热态发射 |
@@ -2108,7 +2108,7 @@ stressFeedbackParameters = {
 | `GetThermalMetrics()` | 无 | 返回占空比、周期时间、首/数据尾/周期尾温度、轨迹、耗散功率、稳态收敛和输出功率诊断 |
 | `SuspendThermalModel()` | 无 | 校准器使用的内部代理；要求绑定PA的暂停/恢复接口成对出现，返回PA热快照或在PA无热协议时返回 `None` |
 | `RestoreThermalModel(thermalSnapshot)` | 由暂停代理返回的不透明快照 | 校准器在 `finally` 中使用的内部代理；活动配置已关闭温度时保持关闭，不恢复旧启用状态 |
-| `ProcessPaOutput(paOutputSignal)` | 已有各PA自身输出 | 兼容单输出入口；不运行PA或功率闭环，执行PA后耦合、公共 `channalDly` 及 `sampleMode` 所选采样路径 |
+| `ProcessPaOutput(paOutputSignal)` | 已有各PA自身输出 | 兼容单输出入口；不运行PA或功率闭环，执行PA后耦合、公共 `channelDly` 及 `sampleMode` 所选采样路径 |
 | `FormatUnknownParameterError(ownerName, unknownNames, supportedNames)` | 配置上下文、错误名称、全部合法名称 | 对每个错误名称按相关度降序列出全部合法名称并生成严格模式异常文本 |
 | `ResolveCouplingPaths(parameterName, chainCount=None)` | 路径参数名、可选链数 | 拒绝未知子键并规范、校验耦合路径 |
 | `ApplyCouplingPath(sourceSignal, couplingPath)` | 单路源信号、规范路径 | 应用FIR、整数/分数时延、增益与相位 |
@@ -2120,7 +2120,7 @@ stressFeedbackParameters = {
 | `TransmitterIqFilterTaps()` / `FeedbackIqFilterTaps()` | 无 | 返回Tx或FB当前实际生效的直接/镜像FIR防御性副本，包括None回退和disabled理想响应 |
 | `ApplyPrePaCoupling(inputSignal)` | PA前矩阵 | 生成每个PA真正看到的耦合激励 |
 | `ApplyPostPaCoupling(paOutputSignal)` | 各PA自身输出矩阵 | 在采样前混合PA非线性输出 |
-| `ResolveChannelDelay()` | 无 | 将非负 `channalDly` 分解为 `D=floor(channalDly)` 与 `mu=channalDly-D` |
+| `ResolveChannelDelay()` | 无 | 将非负 `channelDly` 分解为 `D=floor(channelDly)` 与 `mu=channelDly-D` |
 | `ApplyChannelDelay(inputSignal)` | PA后耦合波形 | 逐链执行两抽头一阶Farrow分数时延和整数前补零/尾截断，保持输入形状与记录长度 |
 | `HasPrePaCoupling()` | 无 | 判断自动联合功率校准是否需要启用 |
 | `ProcessBoundPaFloating(inputSignal)` | 实际PA激励 | 只运行绑定PA，不加耦合或采样影响 |
@@ -2271,7 +2271,7 @@ channel = Channel(
     parameters={
         "sampleMode": "fb",
         "sampleRateHz": 160.0e6,
-        "channalDly": 3.25,
+        "channelDly": 3.25,
         "fbGainDb": -6.0,
         "fbPhaseDegrees": 18.0,
         "fbFirTaps": (
@@ -2300,7 +2300,7 @@ chOut, fbOut = channel.Process(paInputSignal)
 # Use fbOut for DPD training and chOut for final Analysis.
 ```
 
-这里 `channalDly=3.25` 在160 MS/s下表示20.3125 ns公共传播：两个输出都包含它。`fbOut` 还额外包含 `12.18 sample` 的FB专用时延；同步器因而会观察到约 `15.43 sample` 的显式总时延，FIR群时延另计。`chOut` 用于最终EVM、SNR、ACLR、IRR和功率判断；显式 `sampleMode="fb"` 后得到的 `fbOut` 用于训练或验证反馈校准。不能只用未经校准的 `fbOut` 同时训练和评价DPD，否则容易得到“板载反馈EVM很好但主路仪表EVM变差”的虚假结论。
+这里 `channelDly=3.25` 在160 MS/s下表示20.3125 ns公共传播：两个输出都包含它。`fbOut` 还额外包含 `12.18 sample` 的FB专用时延；同步器因而会观察到约 `15.43 sample` 的显式总时延，FIR群时延另计。`chOut` 用于最终EVM、SNR、ACLR、IRR和功率判断；显式 `sampleMode="fb"` 后得到的 `fbOut` 用于训练或验证反馈校准。不能只用未经校准的 `fbOut` 同时训练和评价DPD，否则容易得到“板载反馈EVM很好但主路仪表EVM变差”的虚假结论。
 
 公开双输出调用也读取 `sampleMode`。若切回forward模式，第二项会同步变为第一项的数值副本；兼容单输出调用则继续只返回所选一路：
 
@@ -2311,7 +2311,7 @@ forwardCaptureFromSameObject = channel.ProcessPaOutput(
 )
 ```
 
-forward模式会完整跳过所有 `fb...` 非理想，但公共 `channalDly`、`phaseDegrees` 和三种互斥噪声控制仍然生效。对公开 `Process` 而言，这些公共效果只计算一次，随后复制，所以 `np.array_equal(chOut, fbOut)` 为True。
+forward模式会完整跳过所有 `fb...` 非理想，但公共 `channelDly`、`phaseDegrees` 和三种互斥噪声控制仍然生效。对公开 `Process` 而言，这些公共效果只计算一次，随后复制，所以 `np.array_equal(chOut, fbOut)` 为True。
 
 ### 7.4 用户只提供原始波形与目标输出功率
 
@@ -2997,7 +2997,7 @@ measurementChOut, filteredFbOut = channel.Process(
 
 示例中的 `outputPowerDbm=20.0` 仍由 `PowerCalibration` 在参考温度、PA后耦合前的干净PA输出面闭环测量。它既不读取 `phaseZeroCapture`，也不把 `separatedFbOut` 的表观RMS当成发射功率。相位对与filter只服务于DPD反馈训练；`calibrationChOut` 和 `measurementChOut` 始终是最终Analysis参考面。
 
-以下操作会使filter失效，必须重新运行 `phase_pair`：替换PA；修改公共 `channalDly`、公共相位、FB普通FIR/增益/时频偏、FB I/Q标量/直接FIR/镜像FIR/DC、相位响应、补偿滤波长度/正则化、FB非线性/限幅、ADC或Channel `width`。`filter` 若发现活动映射被外部直接改动，也会先清除旧缓存再报错，不会继续使用错误参考面的抽头。只有 `fbIqCompensationMode` 可以在标定后从 `phase_pair` 改为 `filter` 而保留缓存。
+以下操作会使filter失效，必须重新运行 `phase_pair`：替换PA；修改公共 `channelDly`、公共相位、FB普通FIR/增益/时频偏、FB I/Q标量/直接FIR/镜像FIR/DC、相位响应、补偿滤波长度/正则化、FB非线性/限幅、ADC或Channel `width`。`filter` 若发现活动映射被外部直接改动，也会先清除旧缓存再报错，不会继续使用错误参考面的抽头。只有 `fbIqCompensationMode` 可以在标定后从 `phase_pair` 改为 `filter` 而保留缓存。
 
 ## 8. `SmallestSISO.py`中的设置
 

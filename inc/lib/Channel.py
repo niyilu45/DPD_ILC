@@ -93,7 +93,7 @@ class Channel:
             {
                 "sampleMode": "forward",
                 "sampleRateHz": 1.0,
-                "channalDly": 0.0,
+                "channelDly": 0.0,
                 "thermalRunMode": "steady_state",
                 "thermalDutyCycle": 1.0,
                 "thermalSteadyStateToleranceC": 1.0e-4,
@@ -384,7 +384,7 @@ class Channel:
             raise
         calibrationSensitiveNames = {
             "sampleRateHz",
-            "channalDly",
+            "channelDly",
             "phaseDegrees",
             "fbGainDb",
             "fbPhaseDegrees",
@@ -588,7 +588,7 @@ class Channel:
                 "sampleRateHz has an invalid value. Allowed range: "
                 "finite real number in (0, +inf) Hz."
             )
-        channelDelaySamples = self.parameters["channalDly"]
+        channelDelaySamples = self.parameters["channelDly"]
         if (
             not isinstance(channelDelaySamples, (int, float))
             or isinstance(channelDelaySamples, bool)
@@ -596,7 +596,7 @@ class Channel:
             or float(channelDelaySamples) < 0.0
         ):
             raise ValueError(
-                "channalDly has an invalid value. Allowed range: finite "
+                "channelDly has an invalid value. Allowed range: finite "
                 "real number in [0, +inf) samples."
             )
 
@@ -1807,7 +1807,7 @@ class Channel:
         return (
             id(self.paModel),
             float(self.parameters["sampleRateHz"]),
-            float(self.parameters["channalDly"]),
+            float(self.parameters["channelDly"]),
             float(self.parameters["phaseDegrees"]),
             float(self.parameters["fbGainDb"]),
             float(self.parameters["fbPhaseDegrees"]),
@@ -2939,7 +2939,7 @@ class Channel:
 
         Processing details:
             Algorithm: Take the floor of the nonnegative floating
-            ``channalDly`` value as the exact whole-sample shift and retain
+            ``channelDly`` value as the exact whole-sample shift and retain
             the remainder in ``[0, 1)`` as the fractional-sample delay. Their
             sum always reconstructs the configured total delay.
 
@@ -2949,7 +2949,7 @@ class Channel:
         """
 
         self.ValidateParameters()
-        totalDelaySamples = float(self.parameters["channalDly"])
+        totalDelaySamples = float(self.parameters["channelDly"])
         integerDelaySamples = int(np.floor(totalDelaySamples))
         fractionalDelaySamples = (
             totalDelaySamples - float(integerDelaySamples)
@@ -2962,7 +2962,7 @@ class Channel:
         """Apply the common causal integer and fractional channel delay.
 
         Processing details:
-            Algorithm: Resolve ``channalDly = N + mu`` with integer ``N``
+            Algorithm: Resolve ``channelDly = N + mu`` with integer ``N``
             and ``0 <= mu < 1``. Approximate ``x[n-mu]`` independently on
             every chain with the first-order causal fractional-delay FIR
             ``(1-mu)*x[n] + mu*x[n-1]`` under zero initial conditions, then
@@ -2974,7 +2974,7 @@ class Channel:
                 receiver-path propagation delay.
 
         Returns:
-            result: Same-shape complex waveform delayed by ``channalDly``
+            result: Same-shape complex waveform delayed by ``channelDly``
                 sample periods.
         """
 
@@ -3623,7 +3623,7 @@ class Channel:
         """Create the forward channel observation used for final RF metrics.
 
         Processing details:
-            Algorithm: Apply the common ``channalDly`` propagation delay,
+            Algorithm: Apply the common ``channelDly`` propagation delay,
             PA-to-receiver phase rotation, and configured measurement noise
             without applying any embedded-feedback FIR, nonlinearity,
             oscillator, I/Q, or ADC impairment.
@@ -3671,7 +3671,7 @@ class Channel:
         """Evaluate one measured phase-switch state before FB I/Q error.
 
         Processing details:
-            Algorithm: Apply the common ``channalDly`` propagation delay and
+            Algorithm: Apply the common ``channelDly`` propagation delay and
             ``phaseDegrees`` rotation, then every feedback impairment up to
             the I/Q-converter input. Multiply by the supplied measured complex
             response of the additional phase switch, then execute feedback
@@ -4385,7 +4385,7 @@ class Channel:
             reference-temperature calibration; the first such call therefore
             requires an explicit target. The accepted waveform is then
             evaluated on the periodic steady-state temperature curve exactly
-            once. Both observations include the common ``channalDly`` after
+            once. Both observations include the common ``channelDly`` after
             PA output coupling. Forward mode copies ``chOut`` into ``fbOut``;
             feedback mode evaluates the embedded receiver for ``fbOut`` and
             may add its own ``fb...DelaySamples``. DPD/ILC uses the selected
