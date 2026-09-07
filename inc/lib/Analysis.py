@@ -480,7 +480,6 @@ def BuildPowerSweepEvaluator(
             result: Public plant output at its currently committed drive.
         """
 
-        del outputPowerDbm
         return processMethod(Transform(inputSignal))
 
     setattr(Evaluate, "width", width)
@@ -580,7 +579,6 @@ def BuildPowerSweepEvaluator(
                 result: Public plant output at the evaluator-local drive.
             """
 
-            del outputPowerDbm
             if committedDriveDbPerChain is None:
                 return processMethod(Transform(inputSignal))
             return resolvedCalibrationProcessor(

@@ -1373,7 +1373,6 @@ def RunPointIlc(
 ):
     """Run point-specific ILC with a matching EVM objective."""
 
-    del outputPowerDbm
     pointAnalysis = Analysis(
         pointReference,
         waveform,
@@ -1627,9 +1626,6 @@ def BuildUpdate(
 ):
     """Return one additive waveform update."""
 
-    del inputSignal
-    del measuredOutput
-    del iteration
     return 0.08 * errorSignal
 ```
 
