@@ -78,11 +78,11 @@ flowchart LR
 | 函数/方法 | 类型 | 原理或职责 | 对应章节 |
 |---|---|---|---|
 | `WaveGenWifi.NormalizeFrameFormat` | E | 把 11ac/11ax/11be 别名规范为 VHT/HE/EHT，不改变波形 | WaveGenWifi §8.1 |
-| `WaveGenWifi.__init__`, `WaveGenWifi.GetParameters`, `WaveGenWifi.UpdateParameters`, `WaveGenWifi.Validate` | E | ChainMap 配置、未知键警告后忽略、已识别值合法域校验；保证后续公式输入有效 | WaveGenWifi §12–14 |
+| `WaveGenWifi.__init__`, `WaveGenWifi.GetParameters`, `WaveGenWifi.UpdateParameters`, `WaveGenWifi.Validate` | E | ChainMap 配置、未知键警告后忽略、已识别值合法域校验；320 MHz仅允许EHT/11be，保证后续公式输入有效 | WaveGenWifi §12–14 |
 | `WaveGenWifi.Width`, `WaveGenWifi.FrameFormat`, `WaveGenWifi.BandwidthMhz`, `WaveGenWifi.Mcs`, `WaveGenWifi.NumDataSymbols`, `WaveGenWifi.GuardIntervalUs`, `WaveGenWifi.SampleRateHz`, `WaveGenWifi.Oversampling`, `WaveGenWifi.Seed`, `WaveGenWifi.NumTransmitAntennas`, `WaveGenWifi.NumSpatialStreams`, `WaveGenWifi.SpatialMapping`, `WaveGenWifi.SpatialMappingMatrix`, `WaveGenWifi.CyclicShiftEnabled` | E | 返回已验证配置；采样率由 `sampleRateHz` 直接决定，旧 `oversampling` 只在未配置采样率时用于兼容推导，位宽定义输出接口量化 | WaveGenWifi §12、FixedPoint §2 |
 | `WaveGenWifi.ResolveMcsTable`, `WaveGenWifi.GetMcsInfo` | P/E | 在方法内部构造不可变 MCS 表并返回调制阶数、名义码率和每音调比特数，不保留模块级查表变量 | WaveGenWifi §5 |
 | `WaveGenWifi.Generate`, `WaveGenWifi.GenerateWifiWaveform` | P/E | 组装完整 VHT/HE/EHT 复基带帧、归一化浮点待输出波形、量化公开样值并保存解调元数据 | WaveGenWifi §2、§8、§10、FixedPoint §6 |
-| `WaveGenWifi.ActiveTones`, `WaveGenWifi.PilotTones` | P | 依据 FFT 网格选择活动、数据和导频子载波 | WaveGenWifi §4 |
+| `WaveGenWifi.ActiveTones`, `WaveGenWifi.PilotTones` | P | 依据 FFT 网格选择活动、数据和导频子载波；EHT 320 MHz由四个996-tone块组成，包含3920个数据音调和64个工程导频 | WaveGenWifi §4 |
 | `WaveGenWifi.GrayToBinary`, `WaveGenWifi.QamModulate` | P/N | Gray 标号转自然坐标，构造单位平均功率 BPSK/QAM | WaveGenWifi §6 |
 | `WaveGenWifi.PilotSequence` | P/N | 生成可复现 BPSK 导频符号；用于相位/信道参考，本仿真不执行接收端导频跟踪 | WaveGenWifi §4、§11 |
 | `WaveGenWifi.OfdmSymbol` | P/N | 子载波映射、IFFT、能量归一化和循环前缀 | WaveGenWifi §3、§7 |
@@ -113,14 +113,14 @@ flowchart LR
 | `ParseWifi.IntegerToBits`, `ParseWifi.BitsToInteger` | N | 在固定宽度整数与MSB优先比特序列之间无损转换 | ParseWifi §3 |
 | `ParseWifi.CalculateDescriptorCrc` | N | 按CRC-16-CCITT多项式验证描述字段的时序、采样率和内容 | ParseWifi §3.3 |
 | `ParseWifi.CachedDescriptorLdpcPhysicalLayout`, `ParseWifi.DescriptorLdpcPhysicalLayout` | P/N | 在两个52音调描述符号中各放置七个已知BPSK导频，并把LDPC码字偶/奇位分散到不同符号；前者只缓存不可变布局字节，后者每次返回以这些字节为底层所有者的新只读NumPy视图，外部不能污染缓存 | ParseWifi §3.4，Performance §7.2 |
-| `ParseWifi.DecodeWifiDescriptorPayload`, `ParseWifi.BuildDecodedDescriptorParameters` | E/N | 恢复55 bit新版载荷并统一校验格式、带宽、MCS、GI、空间流、映射和10 bit随机种子 | ParseWifi §3.2、§5.3 |
-| `ParseWifi.BuildWifiDescriptorBits`, `ParseWifi.DecodeWifiDescriptorBits` | E/N | 打包新版LDPC描述或自动分派新版LDPC/旧版CRC硬判决恢复 | ParseWifi §3 |
+| `ParseWifi.DecodeWifiDescriptorPayload`, `ParseWifi.BuildDecodedDescriptorParameters` | E/N | 恢复55 bit载荷并统一校验格式、带宽、MCS、GI、空间流、映射和10 bit随机种子；版本3严格限定EHT加带宽码0，表示320 MHz | ParseWifi §3.2、§5.3 |
+| `ParseWifi.BuildWifiDescriptorBits`, `ParseWifi.DecodeWifiDescriptorBits` | E/N | 打包版本2（20至160 MHz）或版本3（EHT 320 MHz）LDPC描述，自动分派LDPC/历史版本1 CRC硬判决恢复，保持载荷和物理字段长度不变 | ParseWifi §3 |
 | `ParseWifi.DecodeLegacyWifiDescriptorBits` | E/N | 保留对历史32 bit seed、CRC-16顺序描述波形的接收兼容 | ParseWifi §3.5 |
 | `ParseWifi.DecodeWifiDescriptorLdpcValues` | N | 从104个均衡后软BPSK值中去导频、撤销跨符号交织、LDPC译码并恢复10 bit seed载荷 | ParseWifi §5.3 |
 | `ParseWifi.DecodeWifiDescriptorBitsWithCorrection` | N | 用magic/版本/保留位先验、软判决可靠度和CRC综合值执行有限meet-in-the-middle位翻转搜索；仍要求完整CRC与字段语义合法 | ParseWifi §5.3 |
 | `ParseWifi.BuildWifiDescriptorField` | P/N | 把104个描述比特映射到两个重复发送的52音调BPSK传统OFDM符号 | ParseWifi §4 |
 | `ParseWifi.__init__`, `ParseWifi.GetParameters`, `ParseWifi.UpdateParameters`, `ParseWifi.ValidateParameters` | E | 在类内建立ChainMap默认参数，警告并忽略未知键，再验证接收时钟、搜索范围和自定义空间映射 | ParseWifi §7 |
-| `ParseWifi.ResolveSampleRates` | E | 使用显式接收时钟，或产生按顺序尝试的常见复基带采样率 | ParseWifi §5.2 |
+| `ParseWifi.ResolveSampleRates` | E | 使用显式接收时钟，或产生按顺序尝试的常见复基带采样率，默认包含EHT 320 MHz的1.28 GHz采样率 | ParseWifi §5.2 |
 | `ParseWifi.ValidateReceivedSignal` | E/N | 自动从NumPy数组或 `WifiWaveform.samples` 取样，并检查SISO向量或samples×chains矩阵的形状与有限性 | ParseWifi §5.1 |
 | `ParseWifi.ScoreDescriptorCandidate` | P/N | 重生成LDPC或历史CRC有效候选的完整确定性帧，以逐链归一化相关和捕获长度一致性排除错误随机种子或错误帧长 | ParseWifi §5.3 |
 | `ParseWifi.DecodeDescriptorAt` | P/N | 对候选时刻去CP和FFT；新版路径逐符号导频均衡后调用FEC软译码，历史路径保留magic公共增益和CRC有限软纠错 | ParseWifi §5.3 |
@@ -480,7 +480,7 @@ y_{\mathrm{long},3}[n]
 | `Analysis.IntegrateAclr` | P/N | 等宽主/邻道 PSD 积分并取较差邻道 | Analysis §6.1、§6.3 |
 | `Analysis.CalculatePreparedAclrDetails` | P/N | 对每条物理链只计算一次数据字段Welch PSD，由同一组频谱同时积分逐链ACLR并在功率域求和后积分汇总ACLR | Analysis §6、§9.3，Performance §4.2 |
 | `Analysis.CalculateAclr`, `Analysis.CalculatePreparedAclr`, `Analysis.CalculatePreparedAclrPerChain` | P/N | 数据字段Welch PSD的汇总/逐链ACLR，并统一复用 `CalculatePreparedAclrDetails` 的频谱实现 | Analysis §6、§9.3，Performance §4.2 |
-| `Analysis.ResolveWifiSpectralMaskTemplate` | P/E | 在函数内部按VHT/HE/EHT及20/40/80/160 MHz选择对称相对发射Mask折点，额外允许查询EHT 320 MHz模板；返回0/-20/-28/-40 dBr、100 kHz RBW、格式相关VBW及包含一个RBW边界护带的最低采样率，不引入模块级配置变量 | Analysis §16.1–§16.3、§16.7 |
+| `Analysis.ResolveWifiSpectralMaskTemplate` | P/E | 在函数内部按VHT/HE/EHT及20/40/80/160 MHz、EHT 320 MHz选择对称相对发射Mask折点；返回0/-20/-28/-40 dBr、100 kHz RBW、格式相关VBW及包含一个RBW边界护带的最低采样率，不引入模块级配置变量 | Analysis §16.1–§16.3、§16.7 |
 | `Analysis.CalculatePreparedWifiSpectralMask` | P/N | 接受调用方显式准备且已匹配Analysis参考网格的信号，不执行同步；按Wi-Fi数据字段或NumPy活动区门控，每条传导链独立计算Hann-Welch频谱，以FFT bin频率区间和居中100 kHz矩形RBW窗口的重叠比例作为线性功率权重，边缘bin允许分数权重并使等效RBW在浮点容差内等于100 kHz；RBW卷积在 `fftshift` 频谱两端按离散时间频谱周期回绕，不用零填充，因而靠近正负奈奎斯特接缝的完整窗口不会丢功率。随后按每链带内峰值归一化dBr并计算limit-minus-measurement Margin。返回的总PASS仅表示relative dBr预检，`assessmentType` 固定为 `relativeDbrPrecheck`，`certificationResult` 固定为 `None` | Analysis §16.1、§16.4–§16.8 |
 | `Analysis.MeasureWifiSpectralMask` | E/P | 对原始公开capture只执行定点接口解码、整数重叠定位和Data字段门控，再委托频谱内核；不进入EVM所用的CFO、分数时延、SFO、复增益补偿或插值重采样链，并与普通 `Analyze` 分离；继承相同的relative预检而非认证结果语义 | Analysis §16.1、§16.5–§16.8 |
 | `Analysis.Analyze`, `Analysis.AnalyzeStages` | E | 让输出功率/SNR/EVM/ACLR共用一次同步结果并保存阶段映射；MIMO汇总/逐流EVM共享一次测量解调，汇总/逐链ACLR共享每链一次PSD | Analysis §1、§3.1，Performance §4 |

@@ -654,6 +654,8 @@ Save convergence histories and power-EVM data
 
 文档中的实测表格只能和“本文参考值”复现结果比较；使用默认值时，结果不同是正常现象。
 
+EHT/11be还支持320 MHz。Wi-Fi、`--dpd-gmp` 和 `--channel-analyse` 入口在未指定 `--sample-rate-hz` 时均按带宽乘以 `--oversampling` 推导采样率；默认4倍采样使320 MHz对应1.28 GHz。DPD-GMP入口会转发 `--format`、`--bandwidth` 和 `--mcs`，例如 `--dpd-gmp --format 11be --bandwidth 320 --mcs 13`；VHT/HE仍不允许320 MHz。上述默认20 MHz参考结果不随新增带宽支持而改变。
+
 ### 14.2 配置验证规则
 
 `BenchmarkConfig.Validate` 在构造任何波形前检查：

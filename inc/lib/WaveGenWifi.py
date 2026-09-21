@@ -5,7 +5,8 @@ sample rate, MCS, guard interval, and packet length, and then call ``Generate``.
 The class creates a single-user full-band complex baseband packet with the
 appropriate VHT, HE-SU, or EHT field order, OFDM numerology, and MCS table.
 Standard names such as ``11ac`` are accepted as aliases of PHY names such as
-``VHT``.
+``VHT``. VHT and HE support 20 through 160 MHz; EHT additionally supports
+full-band 320 MHz with a 4096-bin base FFT and four 996-tone blocks.
 
 DPD characterization only requires statistically representative coded
 symbols. Therefore, this module creates randomized post-FEC stimulus bits
@@ -496,7 +497,11 @@ class WaveGenWifi:
         normalizedFormat = NormalizeFrameFormat(
             cast(str, self.parameters["frameFormat"])
         )
-        supportedBandwidths = (20, 40, 80, 160)
+        supportedBandwidths = (
+            (20, 40, 80, 160, 320)
+            if normalizedFormat == "EHT"
+            else (20, 40, 80, 160)
+        )
         guardIntervalsByFormat: Mapping[
             str, Tuple[float, ...]
         ] = MappingProxyType(
@@ -511,7 +516,10 @@ class WaveGenWifi:
         ):
             raise TypeError("bandwidthMhz must be an integer")
         if self.bandwidthMhz not in supportedBandwidths:
-            raise ValueError("bandwidthMhz must be one of 20, 40, 80, 160")
+            raise ValueError(
+                f"{normalizedFormat} bandwidthMhz must be one of "
+                + ", ".join(str(value) for value in supportedBandwidths)
+            )
         selectedMcsTable = self.ResolveMcsTable(normalizedFormat)
         if not isinstance(self.mcs, int) or isinstance(self.mcs, bool):
             raise TypeError("mcs must be an integer")
@@ -693,7 +701,9 @@ def ActiveTones(
     """Return centered active-subcarrier indices for one Wi-Fi PHY format.
 
     Processing details:
-        Algorithm: Carry out the described operation using validated inputs, explicit array-shape handling, and deterministic project conventions.
+        Algorithm: Build the centered allocation for the selected format.
+        Replicate the 80 MHz tone plan at 1024-bin spacing for HE/EHT 160 MHz
+        and EHT-only 320 MHz, retaining each block's nulls and guard tones.
 
     Args:
         bandwidthMhz: Configured Wi-Fi channel bandwidth in megahertz.
@@ -708,10 +718,12 @@ def ActiveTones(
         {20: 56, 40: 114, 80: 242, 160: 484}
     )
     heEhtActiveToneCount: Mapping[int, int] = MappingProxyType(
-        {20: 242, 40: 484, 80: 996, 160: 1992}
+        {20: 242, 40: 484, 80: 996, 160: 1992, 320: 3984}
     )
     if bandwidthMhz not in heEhtActiveToneCount:
-        raise ValueError("bandwidthMhz must be one of 20, 40, 80, 160")
+        raise ValueError("bandwidthMhz must be one of 20, 40, 80, 160, 320")
+    if bandwidthMhz == 320 and normalizedFormat != "EHT":
+        raise ValueError("320 MHz bandwidth requires EHT/11be")
 
     if normalizedFormat == "VHT":
         if bandwidthMhz == 20:
@@ -736,10 +748,17 @@ def ActiveTones(
         toneIndices = np.r_[np.arange(-500, -2), np.arange(3, 501)]
         expectedToneCount = heEhtActiveToneCount[bandwidthMhz]
     else:
-        # A full-band 160 MHz allocation consists of two 996-tone RUs whose
-        # centers are separated by 1024 HE/EHT subcarrier spacings.
+        # Full-band 160/320 MHz allocations contain two/four 996-tone
+        # blocks at 1024-bin spacing. Preserve each 80 MHz block's DC nulls
+        # and guard tones instead of filling the gaps with active carriers.
         ru996Tones = np.r_[np.arange(-500, -2), np.arange(3, 501)]
-        toneIndices = np.r_[ru996Tones - 512, ru996Tones + 512]
+        blockCount = bandwidthMhz // 80
+        blockOffsets = (
+            2 * np.arange(blockCount) - (blockCount - 1)
+        ) * 512
+        toneIndices = np.concatenate(
+            [ru996Tones + offset for offset in blockOffsets]
+        )
         expectedToneCount = heEhtActiveToneCount[bandwidthMhz]
 
     if toneIndices.size != expectedToneCount:
@@ -755,7 +774,10 @@ def PilotTones(
     """Build a format-specific symmetric full-band Wi-Fi pilot pattern.
 
     Processing details:
-        Algorithm: Generate deterministic complex-baseband data from validated settings while preserving sample-rate and energy conventions.
+        Algorithm: Use the existing format-specific pilot locations, copying
+        the simplified symmetric 80 MHz pattern into two or four blocks for
+        HE/EHT 160 MHz and EHT-only 320 MHz. Keep the existing lower-bandwidth
+        stimulus unchanged; this is not a bit-exact standard pilot sequence.
 
     Args:
         activeTones: Centered indices of all active allocation subcarriers.
@@ -767,6 +789,10 @@ def PilotTones(
     """
 
     normalizedFormat = NormalizeFrameFormat(frameFormat)
+    if bandwidthMhz not in (20, 40, 80, 160, 320):
+        raise ValueError("bandwidthMhz must be one of 20, 40, 80, 160, 320")
+    if bandwidthMhz == 320 and normalizedFormat != "EHT":
+        raise ValueError("320 MHz bandwidth requires EHT/11be")
     if normalizedFormat == "VHT":
         if bandwidthMhz == 20:
             pilotTones = np.array([-21, -7, 7, 21], dtype=np.int32)
@@ -823,14 +849,21 @@ def PilotTones(
             dtype=np.int32,
         )
 
-    if bandwidthMhz == 160:
+    if bandwidthMhz in (160, 320):
         localActiveTones = ActiveTones(80, normalizedFormat)
         localPilotTones = PilotTones(
             localActiveTones, 80, normalizedFormat
         )
-        return np.r_[localPilotTones - 512, localPilotTones + 512].astype(
-            np.int32
-        )
+        blockCount = bandwidthMhz // 80
+        blockOffsets = (
+            2 * np.arange(blockCount) - (blockCount - 1)
+        ) * 512
+        pilotTones = np.concatenate(
+            [localPilotTones + offset for offset in blockOffsets]
+        ).astype(np.int32)
+        if not np.all(np.isin(pilotTones, activeTones)):
+            raise RuntimeError("internal HE/EHT pilot-tone construction error")
+        return pilotTones
 
     # For the 996-tone RU, select eight negative-frequency pilot locations
     # and mirror them. This preserves symmetry, edge clearance, and the EHT
@@ -1294,13 +1327,13 @@ def GenerateWifiWaveform(config: WaveGenWifi) -> WifiWaveform:
         {20: 64, 40: 128, 80: 256, 160: 512}
     )
     heEhtBaseFftLength: Mapping[int, int] = MappingProxyType(
-        {20: 256, 40: 512, 80: 1024, 160: 2048}
+        {20: 256, 40: 512, 80: 1024, 160: 2048, 320: 4096}
     )
     vhtPilotToneCount: Mapping[int, int] = MappingProxyType(
         {20: 4, 40: 6, 80: 8, 160: 16}
     )
     heEhtPilotToneCount: Mapping[int, int] = MappingProxyType(
-        {20: 8, 40: 16, 80: 16, 160: 32}
+        {20: 8, 40: 16, 80: 16, 160: 32, 320: 64}
     )
     if normalizedFormat == "VHT":
         baseFftLength = vhtBaseFftLength[config.bandwidthMhz]

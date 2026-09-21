@@ -97,6 +97,7 @@ from inc.lib.PaModel import (
 from inc.lib.ParseWifi import (
     BuildWifiDescriptorBits,
     DecodeWifiDescriptorBits,
+    DecodeWifiDescriptorPayload,
     DescriptorLdpcPhysicalLayout,
     ParseWifi,
 )
@@ -106,12 +107,14 @@ from inc.utils.SigProc import (
     SigProc,
 )
 from inc.lib.WaveGenWifi import (
+    ActiveTones,
     NormalizeFrameFormat,
+    PilotTones,
     WaveGenWifi,
 )
 from inc.lib.WaveGenTwoTone import WaveGenTwoTone
 from inc.lib.TwoToneAnalysis import TwoToneAnalysis
-from main import EvaluateIlcPowerPoint
+from main import EvaluateIlcPowerPoint, Main
 
 
 def CheckMcsTables() -> None:
@@ -1304,6 +1307,7 @@ def CheckWifiBandwidths() -> None:
             40: (512, 468, 16),
             80: (1024, 980, 16),
             160: (2048, 1960, 32),
+            320: (4096, 3920, 64),
         },
     }
     for frameFormat, expectedValues in expectedValuesByFormat.items():
@@ -1323,6 +1327,206 @@ def CheckWifiBandwidths() -> None:
             assert waveform.fftLength == baseFftLength
             assert waveform.dataSubcarriers.size == dataToneCount
             assert waveform.pilotSubcarriers.size == pilotToneCount
+
+
+def CheckEht320Waveform() -> None:
+    """Verify 320 MHz EHT generation, descriptor compatibility, and analysis.
+
+    Processing details:
+        Algorithm: Exercise aliases and CLI parsing, enforce the EHT-only
+        bandwidth restriction, round-trip the extended descriptor while
+        retaining legacy bytes, compare floating and fixed-point 4096-QAM,
+        invert oversampled MIMO mapping, and select the spectral mask from a
+        receive-only packet without supplying its format or sample rate.
+
+    Returns:
+        result: None. Assertions expose wideband generation and receive-path
+            regressions without running a PA or iterative DPD calibration.
+    """
+
+    from tests.BenchMark import DpdGmpBenchmarkConfig, ParseBenchmarkArguments
+
+    activeTones = ActiveTones(320, "11BE")
+    pilotTones = PilotTones(activeTones, 320, "802.11be")
+    assert activeTones.size == np.unique(activeTones).size == 3984
+    assert pilotTones.size == np.unique(pilotTones).size == 64
+    assert activeTones[0] == -2036
+    assert activeTones[-1] == 2036
+    assert np.array_equal(activeTones, -activeTones[::-1])
+    assert np.all(np.isin(pilotTones, activeTones))
+    assert not np.any(np.isin((-1536, -512, 0, 512, 1536), activeTones))
+
+    for invalidFormat in ("VHT", "HE", "11ac", "11ax"):
+        for invalidOperation in (
+            lambda: WaveGenWifi(frameFormat=invalidFormat, bandwidthMhz=320),
+            lambda: ActiveTones(320, invalidFormat),
+            lambda: PilotTones(activeTones, 320, invalidFormat),
+        ):
+            try:
+                invalidOperation()
+            except ValueError as error:
+                assert "320" in str(error) or "bandwidthMhz" in str(error)
+            else:
+                raise AssertionError("320 MHz must require EHT/11be")
+
+    with patch.object(
+        sys, "argv", ["main.py", "--format", "11BE", "--bandwidth", "320"]
+    ), patch(
+        "main.WaveGenWifi", side_effect=RuntimeError("CLI generation reached")
+    ) as generatorConstructor:
+        try:
+            Main()
+        except RuntimeError as error:
+            assert str(error) == "CLI generation reached"
+        else:
+            raise AssertionError("CLI did not reach waveform generation")
+        cliParameters = generatorConstructor.call_args.kwargs["parameters"]
+        assert cliParameters["frameFormat"] == "EHT"
+        assert cliParameters["bandwidthMhz"] == 320
+
+    DpdGmpBenchmarkConfig(
+        frameFormat="11BE", bandwidthMhz=320, sampleRateHz=1280.0e6
+    ).Validate()
+    try:
+        DpdGmpBenchmarkConfig(
+            frameFormat="HE", bandwidthMhz=320, sampleRateHz=1280.0e6
+        ).Validate()
+    except ValueError as error:
+        assert "bandwidthMhz" in str(error)
+    else:
+        raise AssertionError("benchmark accepted HE with 320 MHz bandwidth")
+    with patch.object(
+        sys, "argv", [
+            "BenchMark.py", "--dpd-gmp", "--format", "11BE",
+            "--bandwidth", "320", "--sample-rate-hz", "1280000000",
+        ]
+    ):
+        benchmarkConfig = ParseBenchmarkArguments()
+    assert isinstance(benchmarkConfig, DpdGmpBenchmarkConfig)
+    assert NormalizeFrameFormat(benchmarkConfig.frameFormat) == "EHT"
+    assert benchmarkConfig.bandwidthMhz == 320
+    assert benchmarkConfig.sampleRateHz == 1280.0e6
+
+    for modeFlag in ("--dpd-gmp", "--channel-analyse"):
+        with patch.object(
+            sys, "argv", [
+                "BenchMark.py", modeFlag, "--format", "11BE",
+                "--bandwidth", "320", "--mcs", "13",
+            ]
+        ):
+            widebandConfig = ParseBenchmarkArguments()
+        assert widebandConfig.bandwidthMhz == 320
+        assert widebandConfig.sampleRateHz == 1280.0e6
+        assert widebandConfig.mcs == 13
+
+    legacyDescriptor = BuildWifiDescriptorBits(
+        "EHT", 160, 13, 2, 0.8, 101, 1, 1, "direct", True
+    )
+    assert np.packbits(legacyDescriptor).tobytes().hex() == (
+        "4770484bf4d52fabc0029dc86d"
+    )
+    descriptorBits = BuildWifiDescriptorBits(
+        "EHT", 320, 13, 2, 0.8, 101, 1, 1, "direct", True
+    )
+    decodedDescriptor = DecodeWifiDescriptorBits(descriptorBits)
+    assert decodedDescriptor["frameFormat"] == "EHT"
+    assert decodedDescriptor["bandwidthMhz"] == 320
+    assert decodedDescriptor["mcs"] == 13
+    assert decodedDescriptor["seed"] == 101
+    _, _, physicalPositions, codewordOrder = DescriptorLdpcPhysicalLayout()
+    codeword = np.empty(90, dtype=np.uint8)
+    codeword[codewordOrder] = descriptorBits[physicalPositions]
+    payload = DecodeDescriptorLdpc(1.0 - 2.0 * codeword.astype(float))
+    assert np.array_equal(payload[12:18], (1, 1, 1, 0, 0, 0))
+    for fieldSlice, invalidCode in (
+        (slice(14, 16), (0, 0)),
+        (slice(14, 16), (0, 1)),
+        (slice(16, 18), (0, 1)),
+        (slice(16, 18), (1, 0)),
+        (slice(16, 18), (1, 1)),
+    ):
+        invalidPayload = payload.copy()
+        invalidPayload[fieldSlice] = invalidCode
+        try:
+            DecodeWifiDescriptorPayload(invalidPayload)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid version-three descriptor accepted")
+
+    floatingWaveform = None
+    for interfaceWidth, formatAlias in ((0, "11BE"), (16, "802.11be")):
+        waveform = WaveGenWifi(
+            parameters={
+                "frameFormat": formatAlias,
+                "bandwidthMhz": 320,
+                "mcs": 13,
+                "numDataSymbols": 2,
+                "oversampling": 2,
+                "seed": 101,
+                "width": interfaceWidth,
+            }
+        ).Generate()
+        assert waveform.frameFormat == "EHT"
+        assert waveform.sampleRateHz == 640.0e6
+        assert waveform.fftLength == 8192
+        assert waveform.cpLength == 512
+        analysis = Analysis(waveform.samples, waveform, width=interfaceWidth)
+        evmDb, _ = analysis.CalculateEvm(waveform.samples)
+        assert evmDb < (-250.0 if interfaceWidth == 0 else -65.0)
+        if interfaceWidth == 0:
+            floatingWaveform = waveform
+        else:
+            assert floatingWaveform is not None
+            scale = (
+                waveform.normalizationScale
+                / floatingWaveform.normalizationScale
+            )
+            fixedSamples = FixedPoint(16).DecodeComplex(waveform.samples)
+            assert np.max(
+                np.abs(fixedSamples - scale * floatingWaveform.samples)
+            ) < 2.2e-5
+        receiveCapture = np.r_[np.zeros(19), waveform.samples, np.zeros(7)]
+        parsedFrame = ParseWifi(
+            parameters={"sampleRateHz": 640.0e6, "width": interfaceWidth}
+        ).Parse(receiveCapture)
+        assert parsedFrame.packetStartSample == 19
+        assert parsedFrame.detectedParameters["bandwidthMhz"] == 320
+        assert parsedFrame.detectedParameters["mcs"] == 13
+        assert parsedFrame.detectedParameters["seed"] == 101
+
+    mimoWaveform = WaveGenWifi(
+        frameFormat="EHT", bandwidthMhz=320, mcs=3, numDataSymbols=1,
+        oversampling=2, numTransmitAntennas=2, numSpatialStreams=2,
+        spatialMapping="dft", width=0,
+    ).Generate()
+    assert mimoWaveform.fftLength == 8192
+    assert mimoWaveform.samples.shape[1] == 2
+    mimoAnalysis = Analysis(mimoWaveform.samples, mimoWaveform, width=0)
+    assert np.allclose(
+        mimoAnalysis.DemodulatePreparedWifiData(mimoWaveform.samples),
+        mimoWaveform.referenceDataSymbols,
+        atol=1.0e-11,
+    )
+
+    maskWaveform = WaveGenWifi(
+        frameFormat="11be", bandwidthMhz=320, mcs=0, numDataSymbols=2,
+        oversampling=4, width=0,
+    ).Generate()
+    blindAnalysis = Analysis(
+        maskWaveform.samples,
+        parameters={"width": 0, "maxSegmentLength": 16384},
+    )
+    parsedMaskFrame = blindAnalysis.GetParsedWifiFrame()
+    assert parsedMaskFrame is not None
+    assert parsedMaskFrame.detectedParameters["sampleRateHz"] == 1280.0e6
+    assert parsedMaskFrame.detectedParameters["bandwidthMhz"] == 320
+    maskResult = blindAnalysis.MeasureWifiSpectralMask()
+    assert maskResult["frameFormat"] == "EHT"
+    assert maskResult["bandwidthMhz"] == 320
+    assert "320" in maskResult["templateName"]
+    assert np.isfinite(maskResult["minimumMarginDb"])
+    assert np.isfinite(maskResult["maximumViolationDb"])
 
 
 def CheckWifiFixedPointHeadroom() -> None:
@@ -15082,6 +15286,7 @@ def RunTests() -> None:
     CheckChannelModel()
     CheckWifiFormats()
     CheckWifiBandwidths()
+    CheckEht320Waveform()
     CheckWifiFixedPointHeadroom()
     CheckWifiSpectralMaskAnalysis()
     CheckSampleRateConfiguration()

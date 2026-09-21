@@ -242,13 +242,15 @@ def DescriptorLdpcPhysicalLayout(
 def DecodeWifiDescriptorPayload(
     payloadBits: np.ndarray,
 ) -> Dict[str, object]:
-    """Decode and validate the 55-bit version-two descriptor payload.
+    """Decode and validate a 55-bit LDPC-protected descriptor payload.
 
     Processing details:
-        Algorithm: Slice the fixed-width PHY fields, require the version-two
-        magic and version values, and apply the same format, MCS, guard
-        interval, spatial, and stream-count semantic checks used by the legacy
-        receiver. The random seed occupies ten bits.
+        Algorithm: Slice the fixed-width PHY fields, require the shared magic
+        and a supported LDPC descriptor version, and apply format, bandwidth,
+        MCS, guard interval, spatial, and stream-count semantic checks. Version
+        two retains the original 20 through 160 MHz encoding; version three
+        reserves the EHT format and bandwidth code zero for 320 MHz without
+        changing the payload size or the ten-bit random seed.
 
     Args:
         payloadBits: Corrected systematic LDPC payload of exactly 55 bits.
@@ -270,7 +272,7 @@ def DecodeWifiDescriptorPayload(
         bitCursor += bitWidth
     if fieldValues[0] != 0xD5B:
         raise ValueError("Wi-Fi descriptor magic word is invalid")
-    if fieldValues[1] != 2:
+    if fieldValues[1] not in (2, 3):
         raise ValueError("Wi-Fi descriptor version is unsupported")
     return BuildDecodedDescriptorParameters(fieldValues)
 
@@ -283,8 +285,9 @@ def BuildDecodedDescriptorParameters(
     Processing details:
         Algorithm: Map compact enum fields to public names and reject illegal
         MCS, guard interval, antenna, stream, or spatial-mapping combinations.
-        This shared semantic layer keeps version-one CRC and version-two LDPC
-        decoding behavior identical after error correction.
+        Versions one and two retain the original bandwidth code meanings.
+        Version three requires EHT and bandwidth code zero, representing the
+        320 MHz extension within the unchanged two-bit bandwidth field.
 
     Args:
         fieldValues: Twelve decoded integer fields in transmitter order.
@@ -314,6 +317,18 @@ def BuildDecodedDescriptorParameters(
     if fieldValues[5] not in guardIntervals:
         raise ValueError("Wi-Fi descriptor guard interval code is invalid")
     frameFormat = formats[fieldValues[2]]
+    descriptorVersion = fieldValues[1]
+    if descriptorVersion not in (1, 2, 3):
+        raise ValueError("Wi-Fi descriptor version is unsupported")
+    if descriptorVersion == 3:
+        if frameFormat != "EHT" or fieldValues[3] != 0:
+            raise ValueError(
+                "version-three Wi-Fi descriptors require EHT and "
+                "bandwidth code zero for 320 MHz"
+            )
+        bandwidthMhz = 320
+    else:
+        bandwidthMhz = bandwidths[fieldValues[3]]
     guardIntervalUs = guardIntervals[fieldValues[5]]
     mcs = fieldValues[4]
     numDataSymbols = fieldValues[6]
@@ -347,7 +362,7 @@ def BuildDecodedDescriptorParameters(
         )
     return {
         "frameFormat": frameFormat,
-        "bandwidthMhz": bandwidths[fieldValues[3]],
+        "bandwidthMhz": bandwidthMhz,
         "mcs": mcs,
         "guardIntervalUs": guardIntervalUs,
         "numDataSymbols": numDataSymbols,
@@ -374,14 +389,17 @@ def BuildWifiDescriptorBits(
     """Pack one Wi-Fi simulation configuration into 104 protected bits.
 
     Processing details:
-        Algorithm: Encode a version-two 55-bit payload with a ten-bit seed,
-        apply the systematic rate-55/90 LDPC code, interleave even and odd
+        Algorithm: Encode a 55-bit payload with a ten-bit seed, keeping the
+        version-two layout unchanged for 20 through 160 MHz and using version
+        three with EHT and bandwidth code zero for 320 MHz. Apply the
+        systematic rate-55/90 LDPC code, interleave even and odd
         codeword positions across two symbols, and insert fourteen distributed
         BPSK pilots for independent per-symbol complex-gain estimation.
 
     Args:
         frameFormat: Canonical VHT, HE, or EHT PHY name.
-        bandwidthMhz: Nominal channel bandwidth in megahertz.
+        bandwidthMhz: Nominal channel bandwidth in megahertz. The 320 MHz
+            bandwidth is available only for EHT.
         mcs: Modulation-and-coding-scheme index.
         numDataSymbols: Number of payload OFDM symbols.
         guardIntervalUs: Payload guard interval in microseconds.
@@ -400,7 +418,7 @@ def BuildWifiDescriptorBits(
         {"VHT": 0, "HE": 1, "EHT": 2}
     )
     bandwidthCodes: Mapping[int, int] = MappingProxyType(
-        {20: 0, 40: 1, 80: 2, 160: 3}
+        {20: 0, 40: 1, 80: 2, 160: 3, 320: 0}
     )
     guardIntervalCodes: Mapping[float, int] = MappingProxyType(
         {0.4: 0, 0.8: 1, 1.6: 2, 3.2: 3}
@@ -413,7 +431,9 @@ def BuildWifiDescriptorBits(
     if normalizedFormat not in formatCodes:
         raise ValueError("frameFormat must be VHT, HE, or EHT")
     if bandwidthMhz not in bandwidthCodes:
-        raise ValueError("bandwidthMhz must be 20, 40, 80, or 160")
+        raise ValueError("bandwidthMhz must be 20, 40, 80, 160, or 320")
+    if bandwidthMhz == 320 and normalizedFormat != "EHT":
+        raise ValueError("320 MHz bandwidth requires EHT")
     if guardIntervalUs not in guardIntervalCodes:
         raise ValueError("unsupported descriptor guardIntervalUs")
     if normalizedMapping not in mappingCodes:
@@ -423,7 +443,7 @@ def BuildWifiDescriptorBits(
 
     fieldValues: Tuple[Tuple[int, int], ...] = (
         (0xD5B, 12),
-        (2, 2),
+        (3 if bandwidthMhz == 320 else 2, 2),
         (formatCodes[normalizedFormat], 2),
         (bandwidthCodes[bandwidthMhz], 2),
         (int(mcs), 4),
@@ -501,7 +521,7 @@ def DecodeLegacyWifiDescriptorBits(
 def DecodeWifiDescriptorLdpcValues(
     normalizedDescriptorValues: np.ndarray,
 ) -> Dict[str, object]:
-    """Decode normalized version-two descriptor symbols with LDPC.
+    """Decode normalized version-two or version-three symbols with LDPC.
 
     Processing details:
         Algorithm: Remove the fourteen known pilot positions, invert the
@@ -541,7 +561,7 @@ def DecodeWifiDescriptorLdpcValues(
 
 
 def DecodeWifiDescriptorBits(descriptorBits: np.ndarray) -> Dict[str, object]:
-    """Decode version-two LDPC or legacy version-one descriptor bits.
+    """Decode LDPC-protected or legacy version-one descriptor bits.
 
     Processing details:
         Algorithm: Interpret hard values first as the new pilot-interleaved
@@ -869,9 +889,9 @@ def BuildWifiDescriptorField(
     if (
         not isinstance(subchannelCount, int)
         or isinstance(subchannelCount, bool)
-        or subchannelCount not in (1, 2, 4, 8)
+        or subchannelCount not in (1, 2, 4, 8, 16)
     ):
-        raise ValueError("subchannelCount must be 1, 2, 4, or 8")
+        raise ValueError("subchannelCount must be 1, 2, 4, 8, or 16")
     descriptorBits = BuildWifiDescriptorBits(
         frameFormat,
         bandwidthMhz,
@@ -943,6 +963,7 @@ class ParseWifi:
                     160.0e6,
                     320.0e6,
                     640.0e6,
+                    1280.0e6,
                 ),
                 "maximumPacketOffsetSamples": 2000,
                 "minimumParseConfidence": 0.80,
@@ -1280,8 +1301,11 @@ class ParseWifi:
         Processing details:
             Algorithm: Remove each legacy cyclic prefix, FFT two signaling
             symbols from the first receive chain, recover one repeated copy per
-            20 MHz subchannel, and first try the version-two distributed pilots
+            20 MHz subchannel, and first try the LDPC distributed pilots
             with independent per-symbol gain estimates and soft LDPC decoding.
+            Reuse each distinct subchannel center once and score repeated
+            decoded configurations once within this candidate to avoid
+            duplicate wideband work.
             Fall back to version-one magic-word gain estimation and bounded
             CRC correction for previously generated waveforms.
 
@@ -1339,9 +1363,13 @@ class ParseWifi:
         expectedMagicSymbols = (
             1.0 - 2.0 * expectedMagicBits.astype(float)
         ).astype(np.complex128)
+        evaluatedSubchannelCenters = set()
+        ldpcFullPacketScores: Dict[
+            Tuple[Tuple[str, object], ...], float
+        ] = {}
         localTones = np.r_[np.arange(-26, 0), np.arange(1, 27)]
         maximumSubchannels = max(1, legacyFftLength // 64)
-        for subchannelCount in (1, 2, 4, 8):
+        for subchannelCount in (1, 2, 4, 8, 16):
             if subchannelCount > maximumSubchannels:
                 continue
             subchannelCenters = (
@@ -1349,6 +1377,9 @@ class ParseWifi:
                 - (subchannelCount - 1) / 2.0
             ) * 64
             for subchannelCenter in subchannelCenters.astype(int):
+                if subchannelCenter in evaluatedSubchannelCenters:
+                    continue
+                evaluatedSubchannelCenters.add(subchannelCenter)
                 toneIndices = subchannelCenter + localTones
                 if np.any(np.abs(toneIndices) > legacyFftLength // 2):
                     continue
@@ -1359,7 +1390,7 @@ class ParseWifi:
                     ]
                 )
 
-                # Version two distributes seven known pilots over each OFDM
+                # The LDPC layout distributes seven known pilots per OFDM
                 # symbol. Separate gain estimates prevent PA memory or burst
                 # distortion in one symbol from rotating the other symbol.
                 (
@@ -1451,14 +1482,21 @@ class ParseWifi:
                         if ldpcParameters is not None:
                             ldpcCandidateScore = ldpcCorrelation
                             if evaluateCorrectionCandidates:
-                                fullPacketScore = (
-                                    self.ScoreDescriptorCandidate(
-                                        ldpcParameters,
-                                        receivedSignal,
-                                        packetStartSample,
-                                        sampleRateHz,
-                                    )
+                                ldpcParameterKey = tuple(
+                                    ldpcParameters.items()
                                 )
+                                if ldpcParameterKey not in ldpcFullPacketScores:
+                                    ldpcFullPacketScores[ldpcParameterKey] = (
+                                        self.ScoreDescriptorCandidate(
+                                            ldpcParameters,
+                                            receivedSignal,
+                                            packetStartSample,
+                                            sampleRateHz,
+                                        )
+                                    )
+                                fullPacketScore = ldpcFullPacketScores[
+                                    ldpcParameterKey
+                                ]
                                 if np.isfinite(fullPacketScore):
                                     ldpcCandidateScore = min(
                                         ldpcCandidateScore,

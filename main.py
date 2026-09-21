@@ -265,9 +265,9 @@ def Main() -> int:
         "--bandwidth",
         dest="bandwidthMhz",
         type=int,
-        choices=(20, 40, 80, 160),
+        choices=(20, 40, 80, 160, 320),
         default=None,
-        help="Wi-Fi channel bandwidth in MHz (default: 80)",
+        help="Wi-Fi channel bandwidth in MHz; 320 requires EHT/11be (default: 80)",
     )
     argumentParser.add_argument(
         "--mcs",

@@ -2939,7 +2939,7 @@ VHT模板返回 `resolutionBandwidthHz=100000` 和 `videoBandwidthHz=30000`；HE
 
 EHT 20 MHz的第二折点按IEEE 802.11be-2024与Rohde & Schwarz《IEEE 802.11be Technology Introduction》Version 01.00表值采用10.5 MHz；HE 20 MHz仍按IEEE 802.11ax资料采用10.25 MHz。其余20/40/80/160 MHz折点看起来大体继承HE形状，但实现保留独立EHT表，避免把两个版本的20 MHz第二折点误合并。
 
-320 MHz需要特别区分两层能力：`ResolveWifiSpectralMaskTemplate("EHT", 320)` 已能返回折点，但当前 `WaveGenWifi` 和 `ParseWifi` 的带宽集合仍只有20/40/80/160 MHz。因此320 MHz只能用于调用方自行提供元数据与满足采样覆盖的外部波形，不能由当前工程生成，也不能从当前工程描述字段盲解析。
+EHT 320 MHz已贯通 `WaveGenWifi` 生成、`ParseWifi` 工程描述解析与相对Mask模板选择。发送 `WifiWaveform` 辅助时直接使用元数据，盲模式从EHT 320 MHz专用的版本3描述恢复带宽；两条路径都会选取本表的320 MHz模板。完整Mask仍要求实际复采样率至少为960.1 MHz，生成器默认4倍采样为1.28 GHz。320 MHz是信道带宽，不能与80 MHz信道常用的320 MHz采样率混为一谈；这条工程描述解析路径也不代表可以解析任意商用802.11be抓包。
 
 ### 16.3 dB域分段插值
 
@@ -3288,7 +3288,7 @@ f_{s,\min}
 \frac{f_s}{2}-\frac{B_{\mathrm{eq}}}{2}\geq D.
 ```
 
-建议使用至少4倍带宽的采样率。`WaveGenWifi` 未显式指定 `sampleRateHz` 时的兼容默认 `oversampling=4` 满足20/40/80/160 MHz模板覆盖。采样率不足时函数报错，不会只测到一部分Mask却返回假PASS。
+建议使用至少4倍带宽的采样率。`WaveGenWifi` 未显式指定 `sampleRateHz` 时的兼容默认 `oversampling=4` 满足20/40/80/160 MHz及EHT 320 MHz模板覆盖。采样率不足时函数报错，不会只测到一部分Mask却返回假PASS。
 
 ### 16.8 当前实现边界与认证限制
 
@@ -3297,7 +3297,7 @@ f_{s,\min}
 3. **这是传导复基带工程预筛查。** 代码不模拟天线、连接器、RF滤波器、频谱仪检波模式、监管频段绝对杂散限制或测量不确定度，结果不能作为IEEE或监管认证报告。
 4. **逐链而非空口合成。** MIMO每列独立判定，适合每个Tx端口的conducted测量；它不预测天线方向图中相干叠加后的EIRP频谱。
 5. **当前不支持puncturing和80+80 Mask。** 打孔Mask取决于被打孔20 MHz子信道的位置、数量与PPDU结构，不能用一个连续满带宽模板替代。80+80还需要两个80 MHz分段中心频率及重叠组合规则。缺少这些元数据时程序不应猜测。
-6. **320 MHz只有模板。** 当前生成器、描述字段和盲解析器尚未支持EHT 320 MHz；外部波形至少需要960.1 MHz复采样率，实际还要通过等效RBW边界检查。
+6. **320 MHz仅支持连续满带宽EHT。** 生成器、版本3工程描述和Parser已支持该配置；至少需要960.1 MHz复采样率才能覆盖完整Mask，实际还要通过等效RBW边界检查。默认1.28 GHz覆盖该范围，但随机训练序列和矩形OFDM拼接仍不保证发射认证合格。
 7. **WaveGenWifi本轮不增加WOLA。** `WaveGenWifi` 是可复现的基带/DPD刺激源，当前没有为了Mask认证新增逐OFDM符号WOLA或发射机重构滤波；真实发射机的符号窗、DAC、模拟滤波和突发成形都会改变带外谱。因此生成成功不代表必然通过Mask，理想生成波形也没有义务在所有估计设置下自动通过发射认证Mask。
 8. **比较必须固定估计设置。** 帧长度、`maxSegmentLength`、采样率、活动区、功率工作点和链路噪声都会改变频谱估计方差。比较PA或DPD方案时应固定这些条件，同时报告 `equivalentResolutionBandwidthHz` 和最小Margin。
 

@@ -1146,7 +1146,7 @@ flowchart LR
 | `11ax`、`802.11ax` | `HE` | `HE` |
 | `11be`、`802.11be` | `EHT` | `EHT` |
 
-- 带宽：20、40、80、160 MHz。
+- 带宽：VHT/11ac和HE/11ax支持20、40、80、160 MHz；EHT/11be额外支持320 MHz。默认配置仍为EHT 80 MHz。
 - VHT MCS：0–9，即 BPSK、QPSK、16/64/256-QAM 及对应码率。
 - EHT MCS：0–13，即 BPSK、QPSK、16/64/256/1024/4096-QAM 及对应码率。
 - HE MCS：0–11，即 BPSK、QPSK、16/64/256/1024-QAM 及对应码率。
@@ -1154,7 +1154,7 @@ flowchart LR
 - EHT 字段：L-STF、L-LTF、L-SIG、RL-SIG、U-SIG、EHT-SIG、EHT-STF、EHT-LTF、EHT-Data。
 - HE-SU 字段：L-STF、L-LTF、L-SIG、RL-SIG、HE-SIG-A、HE-STF、HE-LTF、HE-Data。
 - VHT 数据子载波间隔为 312.5 kHz；20/40/80/160 MHz 分别使用 64/128/256/512 点基础 FFT，数据音调数为 52/108/234/468。
-- HE/EHT 数据子载波间隔为 78.125 kHz；全带宽 RU 分别采用 242、484、996 和 2×996 tones。
+- HE/EHT 数据子载波间隔为 78.125 kHz；20/40/80/160 MHz满带宽分别采用242、484、996和2×996个活动音调；EHT 320 MHz采用4×996个活动音调，基础FFT为4096，含3920个数据音调和64个导频。
 - VHT 数据 GI 支持 0.4、0.8 μs；HE/EHT 支持 0.8、1.6、3.2 μs。
 - VHT/HE/EHT 支持 1–8 条空间流和发射链，且 `numSpatialStreams <= numTransmitAntennas`。
 - 每条空间流具有独立 QAM 与导频；支持 direct、DFT 和 Python API 自定义正交空间映射、每链 CSD 以及随空间维度增加的正交 LTF 训练。
@@ -1178,7 +1178,9 @@ flowchart LR
 | 12 | 4096-QAM | 3/4 | 仅 EHT |
 | 13 | 4096-QAM | 5/6 | 仅 EHT |
 
-波形用于 PA/DPD 激励与指标评估，载荷采用随机 post-FEC 比特。MIMO 的空间维度、正交映射、CSD 和多 LTF 结构可用于多链 PA/DPD 研究；它不包含可用于协议一致性测试的完整 LDPC 编解码、MAC/A-MPDU 组帧、标准 P 矩阵逐元素复刻或 SIG 字段逐比特编码。
+EHT 320 MHz的OFDM规模参数可对照 [MathWorks `wlanEHTOFDMInfo` 的CBW320示例](https://www.mathworks.com/help/wlan/ref/wlanehtofdminfo.html)。在默认4倍过采样下，320 MHz信道使用1.28 GHz复采样率和16384点实际FFT；80 MHz信道默认使用320 MHz复采样率，带宽与采样率不能混用。
+
+波形用于 PA/DPD 激励与指标评估，载荷采用随机 post-FEC 比特。MIMO 的空间维度、正交映射、CSD 和多 LTF 结构可用于多链 PA/DPD 研究；它不包含可用于协议一致性测试的完整 LDPC 编解码、MAC/A-MPDU 组帧、标准 P 矩阵逐元素复刻或 SIG 字段逐比特编码。训练字段及导频仍采用工程简化序列；320 MHz是连续满带宽单用户激励，不增加puncturing、多用户OFDMA/RU调度或非连续80+80 MHz支持。
 
 ## 参数参考
 
@@ -1190,7 +1192,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | `-h`, `--help` | 开关 | — | 显示完整命令行帮助。 |
 | `--format` | `VHT/11ac`、`HE/11ax`、`EHT/11be`，也接受 `802.11ac/ax/be` | `EHT` | 输入不区分大小写并规范化为 VHT、HE 或 EHT。 |
-| `--bandwidth` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
+| `--bandwidth` | `20`、`40`、`80`、`160`、`320` | `80` | 信道带宽，单位 MHz；320仅支持EHT/11be。 |
 | `--mcs` | VHT：`0–9`；HE：`0–11`；EHT：`0–13` | `9` | 调制编码方案索引；默认值对三种格式都有效。 |
 | `--pa` | `rapp`、`wiener`、`gmp`、`piecewise_gmp`、`doherty` | `wiener` | 非线性 PA 模型；分段GMP按瞬时包络平滑混合低/中/高区域，Doherty使用载波与峰值双支路默认配置。 |
 | `--tx-antennas` | `1–8` | `1` | VHT/HE/EHT 物理发射链及独立 PA 数量。 |
@@ -1233,7 +1235,7 @@ flowchart LR
 | `parameters` | `Mapping` | `None` | 调用方只传需要修改的键；缺少的键由 `WaveGenWifi` 构造函数内部的不可变默认参数补齐。 |
 | `width` | 非负整数 | `16` | 每个I或Q分量的对外位宽；`0`为浮点旁路，正数返回有符号整数码并在内部按 `2^(width-1)` 缩放。 |
 | `frameFormat` | `"VHT"/"11ac"`、`"HE"/"11ax"`、`"EHT"/"11be"`，并接受带 `802.` 前缀的名称 | `"EHT"` | 不区分大小写；生成后规范化为 VHT、HE 或 EHT。 |
-| `bandwidthMhz` | `20`、`40`、`80`、`160` | `80` | 信道带宽，单位 MHz。 |
+| `bandwidthMhz` | `20`、`40`、`80`、`160`、`320` | `80` | 信道带宽，单位 MHz；320仅支持EHT/11be。 |
 | `mcs` | VHT：`0–9`；HE：`0–11`；EHT：`0–13` | `9` | MCS 索引；默认值对三种格式都有效。 |
 | `numDataSymbols` | 1至4095 | `20` | 数据OFDM符号数；上限由接收解析描述字段的12位计数决定。 |
 | `guardIntervalUs` | VHT：`0.4/0.8`；HE/EHT：`0.8/1.6/3.2` | `0.8` | 数据 GI，单位 μs。 |
@@ -1266,6 +1268,29 @@ assert waveform.oversampling == 2.5
 ```
 
 采样率与带宽的比值可以是非整数，但采样率必须让有效OFDM符号、GI和传统前导时长得到整数采样点。若未提供 `sampleRateHz`，旧 `oversampling` 参数仍可兼容现有调用。
+
+用 `parameters` 生成320 MHz 802.11be波形：
+
+```python
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+wifiWaveform = WaveGenWifi(parameters={
+    "frameFormat": "11be",
+    "bandwidthMhz": 320,
+    "mcs": 13,
+    "numDataSymbols": 20,
+    "guardIntervalUs": 0.8,
+    "sampleRateHz": 1.28e9,
+    "width": 0,
+}).Generate()
+
+assert wifiWaveform.frameFormat == "EHT"
+assert wifiWaveform.fftLength == 16384
+assert wifiWaveform.dataSubcarriers.size == 3920
+assert wifiWaveform.pilotSubcarriers.size == 64
+```
+
+省略 `sampleRateHz` 时，默认 `oversampling=4` 也得到1.28 GHz。`width=0`输出浮点复包络；定点工程可改为16。相同符号数与链数下，320 MHz波形的样本数约为80 MHz的4倍。
 
 ### `PowerCalibration` 参数与方法（位于 `inc/utils/SigProc.py`）
 
@@ -1907,7 +1932,7 @@ measurementChOut, filteredFbOut = channel.Process(
 | 配置参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `sampleRateHz` | `None` | 显式接收采样率；`None`时自动尝试候选采样率。 |
-| `sampleRateCandidatesHz` | 20至640 MHz常见速率 | 自动解析时按顺序尝试的复基带采样率。 |
+| `sampleRateCandidatesHz` | 20、40、80、160、320、640、1280 MHz | 自动解析时按顺序尝试的复基带采样率；包含EHT 320 MHz默认4倍采样。 |
 | `maximumPacketOffsetSamples` | `2000` | 捕获开头允许的最大前置样点数；不限制发送侧裁剪位置。 |
 | `minimumParseConfidence` | `0.80` | 新版描述导频、历史magic或发送接收互相关的最低置信度。 |
 | `referenceSearchSamples` | `4096` | 发送辅助归一化互相关使用的参考样点数。 |
@@ -2057,7 +2082,7 @@ assert resultAnalysis.width == 16
 | `AnalyzeTwoTone(measuredSignal, waveform=None, ...)` | PA输出和 `TwoToneWaveform`或NumPy/list | 一次返回双音基波、IM3/IM5/IM7的上下侧dBc、每阶较差侧、综合最差互调和模拟PA输出参考面 `outputPowerDbm` 字典；功率先按接收样值位宽解码并排除长静默，原始样值必须提供 `sampleRateHz` 与 `toneFrequenciesHz`。 |
 | `CalculateIm3/CalculateIm5/CalculateIm7(measuredSignal, waveform=None, ...)` | PA输出和 `TwoToneWaveform`或NumPy/list | 分别返回该阶上下侧频率、dBc、绝对dBFS、较差侧和同一次分析得到的 `outputPowerDbm`；支持与 `AnalyzeTwoTone` 相同的原始样值参数。 |
 | `CalculateAclr(measuredSignal)` | 待测输出 | 返回 `(aclrLowerDb, aclrUpperDb, aclrWorstDb)`。 |
-| `ResolveWifiSpectralMaskTemplate(frameFormat, bandwidthMhz)` | 制式名称和标称MHz带宽 | 静态解析VHT/HE/EHT相对Mask；返回正频率四个折点、`(0, -20, -28, -40)` dBr限值、RBW/VBW元数据和包含100 kHz边界护带的最低采样率。EHT可解析320 MHz模板，但当前波形生成和盲解析仍不支持320 MHz。 |
+| `ResolveWifiSpectralMaskTemplate(frameFormat, bandwidthMhz)` | 制式名称和标称MHz带宽 | 静态解析VHT/HE/EHT相对Mask；返回正频率四个折点、`(0, -20, -28, -40)` dBr限值、RBW/VBW元数据和包含100 kHz边界护带的最低采样率。EHT 320 MHz已支持生成、工程描述盲解析及自动模板选择；完整Mask采样率至少为960.1 MHz。 |
 | `CalculatePreparedWifiSpectralMask(preparedSignal)` | 调用方显式准备、且已经与本Analysis参考网格对齐的信号 | 不再做任何同步；按FFT bin代表的频率区间与居中100 kHz矩形RBW窗口的重叠比例加权线性功率，边缘bin允许分数权重，使等效RBW在浮点容差内等于100 kHz，再逐链计算dBr、Margin和relative预检PASS。该高级入口不会撤销调用方此前对样值做过的处理。 |
 | `MeasureWifiSpectralMask(measuredSignal=None)` | 可选原始待测Wi-Fi capture | 推荐公开入口；只做接口解码、整数重叠定位和Data字段门控，不做CFO/分数时延/SFO/复增益补偿或插值重采样。发送辅助和盲模式可省略输入，显式Reference模式必须传入。结果以 `assessmentType="relativeDbrPrecheck"`、`certificationResult=None` 明确不提供认证结论。 |
 | `DemodulateWifiData(measuredSignal)` | 待测输出 | 返回 VHT/HE/EHT 数据子载波星座。 |
@@ -2254,7 +2279,7 @@ x[n]-\frac{\bar y_k[n]}{\hat g_k}.
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `frameFormat` | `"EHT"` | `VHT/11ac`、`HE/11ax` 或 `EHT/11be` 及其 `802.` 别名。 |
-| `bandwidthMhz` | `20` | 20、40、80 或 160 MHz。 |
+| `bandwidthMhz` | `20` | 20、40、80、160 MHz；EHT/11be还支持320 MHz。 |
 | `mcs` | `7` | VHT 0–9，HE 0–11，EHT 0–13。 |
 | `numDataSymbols` | `10` | 数据 OFDM 符号数。 |
 | `sampleRateHz` | `None` | 用户指定采样率；`None` 时由兼容 `oversampling` 推导。benchmark要求实际采样率不低于3倍带宽。 |
@@ -2408,6 +2433,14 @@ python main.py --format 11ac --bandwidth 80 --mcs 9 --guard-interval 0.4 --pa wi
 ```powershell
 python main.py --format EHT --bandwidth 160 --sample-rate-hz 640000000 --mcs 13 --pa gmp --symbols 20
 ```
+
+320 MHz的802.11be配置使用1.28 GHz复采样率；以下示例跳过额外的功率扫描以减少首次运行时间：
+
+```bash
+python main.py --format 11be --bandwidth 320 --sample-rate-hz 1280000000 --mcs 13 --pa gmp --symbols 20 --skip-power-evm-curve
+```
+
+`tests/BenchMark.py` 的 `--bandwidth 320` 与 `DpdGmpBenchmarkConfig` 的 `bandwidthMhz=320` 同样要求EHT/11be；默认基准带宽保持不变。
 
 ### 示例四：指定功率范围、带噪反馈并保存波形
 
@@ -3190,4 +3223,4 @@ python tests\BenchMark.py --dpd-lms
 python tests\BenchMark.py --channel-analyse
 ```
 
-验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、四种带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善、多方法功率-EVM和双音IMD输出、Rapp/Wiener/GMP/Doherty的频响/间隔记忆/动态迟滞/多输出功率图表、分段GMP PA的边界连续性与AM-AM不折返、PiecewiseDpdGmp独立帧拟合与区域平滑正则、DpdGmp基础补偿/结构扩展/峰值加权/正则化/多功率训练、DpdLms逐样点系数更新/帧提交/样点提交/漂移跟踪，以及PA前后MIMO通道平坦度、耦合参数、群时延、条件数和测量驱动耦合感知DPD的目标指标回归。
+验证内容包括 11ac/VHT、11ax/HE、11be/EHT 名称等效性、三套字段结构和 MCS 映射、20/40/80/160 MHz及EHT 320 MHz带宽、格式专用 GI、理想链路 EVM、Raw/LC/EVM-MSE 数学关系、双音IM3/IM5/IM7频率与定点边界、每轮 CSV/PNG、两类 PA 的 ILC 改善、多方法功率-EVM和双音IMD输出、Rapp/Wiener/GMP/Doherty的频响/间隔记忆/动态迟滞/多输出功率图表、分段GMP PA的边界连续性与AM-AM不折返、PiecewiseDpdGmp独立帧拟合与区域平滑正则、DpdGmp基础补偿/结构扩展/峰值加权/正则化/多功率训练、DpdLms逐样点系数更新/帧提交/样点提交/漂移跟踪，以及PA前后MIMO通道平坦度、耦合参数、群时延、条件数和测量驱动耦合感知DPD的目标指标回归。

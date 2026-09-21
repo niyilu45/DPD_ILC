@@ -917,7 +917,7 @@ class DpdGmpBenchmarkConfig:
         if (
             not isinstance(self.bandwidthMhz, int)
             or isinstance(self.bandwidthMhz, bool)
-            or self.bandwidthMhz not in (20, 40, 80, 160)
+            or self.bandwidthMhz not in (20, 40, 80, 160, 320)
             or not isinstance(self.sampleRateHz, (int, float))
             or isinstance(self.sampleRateHz, bool)
             or not np.isfinite(self.sampleRateHz)
@@ -6820,7 +6820,8 @@ def ParseBenchmarkArguments() -> Union[
         dest="bandwidthMhz",
         type=int,
         default=20,
-        choices=(20, 40, 80, 160),
+        choices=(20, 40, 80, 160, 320),
+        help="Wi-Fi channel bandwidth in MHz; 320 requires EHT/11be",
     )
     argumentParser.add_argument("--mcs", type=int, default=7)
     argumentParser.add_argument(
@@ -7001,7 +7002,7 @@ def ParseBenchmarkArguments() -> Union[
             frameFormat=arguments.frameFormat,
             bandwidthMhz=arguments.bandwidthMhz,
             sampleRateHz=(
-                80.0e6
+                arguments.bandwidthMhz * 1.0e6 * arguments.oversampling
                 if arguments.sampleRateHz is None
                 else arguments.sampleRateHz
             ),
@@ -7053,8 +7054,11 @@ def ParseBenchmarkArguments() -> Union[
             else arguments.outputDirectory
         )
         dpdGmpConfig = DpdGmpBenchmarkConfig(
+            frameFormat=arguments.frameFormat,
+            bandwidthMhz=arguments.bandwidthMhz,
+            mcs=arguments.mcs,
             sampleRateHz=(
-                80.0e6
+                arguments.bandwidthMhz * 1.0e6 * arguments.oversampling
                 if arguments.sampleRateHz is None
                 else arguments.sampleRateHz
             ),

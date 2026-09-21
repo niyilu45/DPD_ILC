@@ -119,14 +119,14 @@ C(d)
 
 ### 3.2 55 bit有效载荷
 
-新版描述版本为2。有效载荷由55 bit组成，其中seed由原来的32 bit缩减为10 bit，取值范围为0至1023。
+LDPC描述使用版本2或版本3，有效载荷仍由55 bit组成，其中seed由历史CRC格式的32 bit缩减为10 bit，取值范围为0至1023。20/40/80/160 MHz继续使用版本2，已有波形的描述比特保持不变；仅EHT 320 MHz使用版本3的保留组合，不增加字段长度。
 
 | 字段 | 位数 | 含义 |
 |---|---:|---|
 | magic word | 12 | 固定同步字 `0xD5B` |
-| version | 2 | 新版LDPC描述固定为2 |
+| version | 2 | 20/40/80/160 MHz为2；EHT 320 MHz为3 |
 | frame format | 2 | VHT、HE或EHT |
-| bandwidth | 2 | 20、40、80或160 MHz |
+| bandwidth | 2 | 版本2的码值0/1/2/3对应20/40/80/160 MHz；版本3仅允许EHT且码值0，表示320 MHz |
 | MCS | 4 | MCS 0至13 |
 | guard interval | 2 | 0.4、0.8、1.6或3.2 us |
 | data symbol count | 12 | 数据OFDM符号数 |
@@ -136,6 +136,10 @@ C(d)
 | CSD enabled | 1 | 是否启用循环移位 |
 | random seed | 10 | 波形确定性重生成种子，范围0至1023 |
 | 合计 | 55 | LDPC系统信息位 |
+
+版本3必须同时满足 `frame format=2`（EHT）和 `bandwidth=0`；解析器拒绝版本3的其他格式/带宽码组合，避免把非法描述解释成有效帧。这样仍保留55 bit载荷、90 bit LDPC码字、104 bit物理描述字段和10 bit随机种子。版本1的历史CRC描述继续走原兼容路径。以上版本均是本工程可复现波形的描述协议，不是802.11be标准U-SIG比特布局。
+
+EHT 320 MHz在16个20 MHz子带上重复工程描述，Parser结合重复副本恢复参数，再以4096点基础FFT、3984个活动音调、3920个数据音调和64个导频重新生成参考。默认4倍采样对应1.28 GHz实际采样率及16384点实际FFT；格式别名 `11be` 最终规范化为 `EHT`。
 
 ### 3.3 90 bit短码LDPC
 
@@ -434,6 +438,8 @@ L_i^{(0)}
 
 其中 $\mathbf{x}_{c,m}$ 是由候选格式、MCS、符号数和随机种子重生成的发送帧，$\mathbf{y}_{m}$ 是接收端仍然可用的重叠样值。二者不要求总长度相等；相关只使用公共有效区间，并用“实际参与相关的样点数/候选帧样点数”的平方根降低不完整候选的评分。逐链相关幅度平均后，Parser选择整帧一致性最高的候选。错误随机种子即使形成一个校验有效码字，也无法同时匹配随机载荷，因此会被排除。采样率低于候选带宽或空间结构不一致时仍直接判为无效。
 
+320 MHz包含更多描述重复副本，为避免重复计算，`DecodeDescriptorAt` 在1/2/4/8/16个20 MHz子带的组合搜索中，对相同频率中心只解调一次，并保留首次出现的搜索顺序。同一输入capture、包起点和采样率候选下，如果多个副本解出相同参数，完整参考的重生成与相关评分也只进行一次。这些复用仅在本次候选调用内有效，不跨capture、时延或采样率缓存，也不缩小包起点搜索范围；新的输入或新的候选仍重新验证。
+
 第 $s$ 个描述符号的导频相关置信度为：
 
 ```math
@@ -621,7 +627,7 @@ Parser通过运行时数据类型自动分派。
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `sampleRateHz` | `None` | 已知接收采样率；`None`表示自动尝试候选值 |
-| `sampleRateCandidatesHz` | 20、40、80、160、320、640 MHz | 自动采样率候选 |
+| `sampleRateCandidatesHz` | 20、40、80、160、320、640、1280 MHz | 自动采样率候选，包含EHT 320 MHz的默认4倍采样率 |
 | `maximumPacketOffsetSamples` | `2000` | 接收捕获前允许搜索的最大前置样点数；不限制发送侧裁剪位置 |
 | `minimumParseConfidence` | `0.80` | 新版描述导频、历史magic或发送接收相关的最低置信度 |
 | `referenceSearchSamples` | `4096` | 发送辅助互相关使用的最大参考样点数 |
@@ -749,6 +755,29 @@ metrics = resultAnalysis.Analyze(receivedSignal)
 
 ### 8.5 独立使用ParseWifi
 
+对于本工程生成的320 MHz 802.11be波形，可以先直接验证无失真的生成与盲解析链路：
+
+```python
+from inc.lib.ParseWifi import ParseWifi
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+wifiWaveform = WaveGenWifi(parameters={
+    "frameFormat": "11be",
+    "bandwidthMhz": 320,
+    "mcs": 13,
+    "numDataSymbols": 2,
+    "width": 0,
+}).Generate()
+
+parser = ParseWifi(parameters={"sampleRateHz": 1.28e9, "width": 0})
+parsedFrame = parser.Parse(wifiWaveform.samples)
+assert parsedFrame.waveform.frameFormat == "EHT"
+assert parsedFrame.waveform.bandwidthHz == 320.0e6
+assert parsedFrame.waveform.fftLength == 16384
+```
+
+已知采样率时建议显式提供，以减少候选搜索。省略它时默认候选列表也包含1.28 GHz；其他合法自定义采样率应显式传入或添加到 `sampleRateCandidatesHz`。仍然可以使用以下通用入口解析包含时延或链路失真的采集记录：
+
 ```python
 from inc.lib.ParseWifi import ParseWifi
 
@@ -820,7 +849,7 @@ NumPy发送样值虽然有助于同步，但不能唯一确定任意自定义空
 ### 11.1 当前支持
 
 - 本工程 `WaveGenWifi` 生成的VHT、HE和EHT帧；
-- 20、40、80和160 MHz；
+- VHT/HE的20、40、80和160 MHz，以及EHT的20、40、80、160和320 MHz；
 - 各格式支持的全部MCS；
 - SISO和最多八条物理链；
 - direct和DFT空间映射；

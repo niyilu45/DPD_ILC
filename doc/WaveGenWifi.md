@@ -136,6 +136,9 @@ HE/EHT 的基础 FFT 和音调规划为：
 | 40 MHz | 512 | 484 | 16 | 468 |
 | 80 MHz | 1024 | 996 | 16 | 980 |
 | 160 MHz | 2048 | 1992 | 32 | 1960 |
+| 320 MHz（仅 EHT/11be） | 4096 | 3984 | 64 | 3920 |
+
+VHT/11ac和HE/11ax的带宽上限保持160 MHz；320 MHz只接受EHT、11be或802.11be。EHT 320 MHz采用四个996-tone块，基础FFT、活动/数据/导频音调数量可对照 [MathWorks `wlanEHTOFDMInfo` 的CBW320示例](https://www.mathworks.com/help/wlan/ref/wlanehtofdminfo.html)。本工程使用这些OFDM规模参数，但训练字段、工程描述字段和导频序列仍遵循本文说明的简化实现。
 
 例如 80 MHz 时：
 
@@ -171,6 +174,8 @@ L_{\mathrm{effective}}
 子载波间隔仍保持VHT的312.5 kHz或HE/EHT的78.125 kHz。例如20 MHz EHT可以直接设置50 MHz采样率，此时有效过采样比为2.5，FFT长度为640；20 MHz VHT可以设置30 MHz采样率，此时有效过采样比为1.5，FFT长度为96。
 
 旧参数 `oversampling` 只用于兼容：当 `sampleRateHz=None` 时，程序按 `带宽×oversampling` 推导采样率。一旦用户提供 `sampleRateHz`，它就是权威采样时钟，`oversampling` 属性仅作为实际 `sampleRateHz/带宽` 的派生元数据。
+
+对320 MHz EHT，基础FFT为4096；采用默认 `oversampling=4` 且不覆盖 `sampleRateHz` 时，复基带采样率为1.28 GHz，实际FFT为16384，0.8 µs GI为1024点。`bandwidthMhz=320` 表示信道带宽，而 `sampleRateHz=320e6` 表示采样时钟：后者用于320 MHz波形时只有1倍采样，虽然可以生成和解调，却不足以覆盖两侧邻道或完整Mask。完整320 MHz相对Mask至少要求960.1 MHz采样率，实际宜使用1.28 GHz；默认80 MHz配置仍为320 MHz采样率，不能据此称为320 MHz信道。
 
 ---
 
@@ -229,13 +234,23 @@ HE/EHT 的满带宽活动索引为：
 \{k+512\mid k\in\mathcal{K}_{80}\}.
 ```
 
+- 320 MHz（仅 EHT）：
+
+```math
+\mathcal{K}_{320}
+=\bigcup_{c\in\{-1536,-512,512,1536\}}
+\{k+c\mid k\in\mathcal{K}_{80}\}.
+```
+
+四个80 MHz块中心分别位于复基带的-120、-40、40、120 MHz；活动子载波集合包含3984个唯一索引，范围为-2036至2036，并保留每个块的空音调。过采样只扩大IFFT网格，不会增加活动音调数，也不会改变78.125 kHz子载波间隔。
+
 上式中，花括号表示实际启用的离散子载波编号集合，并集符号“∪”表示把两组活动子载波合并。例如，20 MHz 的第一组从 -122 逐个增加到 -2，第二组从 2 逐个增加到 122；编号 -1、0 和 1 不在活动集合中。160 MHz 则把两个 996-tone 的 80 MHz 图样分别向左和向右平移 512 个子载波，因此两个图样的中心相隔 1024 个子载波。
 
-VHT 使用较粗的 312.5 kHz 网格，20/40/80 MHz 分别形成 56/114/242 个活动音调；160 MHz 由两个 80 MHz 图样平移得到，共 484 个活动音调。代码为 VHT 使用 4/6/8/16 个导频，为 HE/EHT 使用 8/16/16/32 个导频。
+VHT 使用较粗的 312.5 kHz 网格，20/40/80 MHz 分别形成 56/114/242 个活动音调；160 MHz 由两个 80 MHz 图样平移得到，共 484 个活动音调。代码为 VHT 使用 4/6/8/16 个导频，为 HE/EHT 的20/40/80/160 MHz使用 8/16/16/32 个导频，EHT 320 MHz使用64个导频。
 
 导频是接收端已知的 BPSK 符号，真实系统用它们跟踪残余相位和频率漂移。本仿真把导频作为宽带激励的一部分，但 EVM 当前只在数据子载波上计算。
 
-> **导频实现边界**：VHT 使用格式专用的对称导频位置；当前 HE/EHT 80 MHz 导频由程序对称选点，160 MHz 由两个 80 MHz 图样平移得到。所有格式都满足数量、对称性和边缘留量要求，适合 PA 激励，但本工程不宣称复现标准的逐符号导频极性序列。
+> **导频实现边界**：VHT 使用格式专用的对称导频位置；当前 HE/EHT 80 MHz 导频由程序对称选点，160 MHz 由两个80 MHz图样平移得到，EHT 320 MHz由四个80 MHz图样平移得到。所有格式都满足数量、对称性和边缘留量要求，适合 PA 激励，但本工程不宣称复现标准的逐符号导频极性序列或全部标准导频位置。
 
 ---
 
@@ -463,6 +478,8 @@ flowchart LR
 `TrainingField` 用 64 点传统 OFDM 基准，在每个 20 MHz 子信道放置 52 个 BPSK 音调；多带宽时按 bonded 20 MHz 分段扩展。传统符号的有效时长约为 3.2 µs，CP 为 0.8 µs，合计 4 µs。
 
 为了支持只输入接收波形的Analysis路径，`BuildWifiDescriptorField` 在VHT-SIG-A、HE-SIG-A或U-SIG位置写入两个52音调BPSK符号。描述内容包括格式、带宽、MCS、GI、数据符号数、空间维度、映射方式和10 bit随机种子；55 bit有效载荷编码为90 bit短块LDPC码字，再与14个已知导频共同填满104个音调。Parser还保留历史32 bit seed加CRC-16描述的只读兼容。发送字段布局和接收推导见 [ParseWifi.md](./ParseWifi.md)。
+
+20/40/80/160 MHz继续写入版本2描述，EHT 320 MHz写入版本3且使用EHT格式码2与带宽码0的专用组合。版本3在16个20 MHz子带重复发送，保持55 bit载荷、90 bit LDPC码字和104 bit物理描述长度不变；没有占用额外seed位或改变旧版本2波形。
 
 VHT 中，L-STF/L-LTF/L-SIG 分别占 8/8/4 µs，VHT-SIG-A 占 8 µs，VHT-STF 和 VHT-SIG-B 各占 4 µs；每个 VHT-LTF 占 4 µs，字段总时长随空间流所需的 LTF 符号数增长。
 
@@ -768,7 +785,7 @@ e^{(k)}
 | `WaveGenWifi` 参数 | 物理作用 | 常见观察 |
 |---|---|---|
 | `frameFormat` | 选择 VHT/HE/EHT 的字段、FFT、GI 和 MCS 上限 | `11ac/11ax/11be` 会分别归一化为 VHT/HE/EHT |
-| `bandwidthMhz` | 改变活动音调规划和基础OFDM参数 | 同带宽下 HE/EHT 的有效符号时长为VHT的四倍 |
+| `bandwidthMhz` | 改变活动音调规划和基础OFDM参数 | VHT/HE支持20/40/80/160 MHz；EHT额外支持320 MHz，默认仍为80 MHz |
 | `mcs` | 改变星座密度与名义编码率 | 高阶 QAM 的 EVM 容限更严格 |
 | `numDataSymbols` | 1至4095 | 改变数据观测长度；更长帧更容易包含罕见高峰，PSD也更稳定，上限由12位接收解析描述决定 |
 | `guardIntervalUs` | 改变 CP 和 LTF 模式 | GI 越长，抗长多径能力越强，效率越低 |
@@ -827,6 +844,36 @@ updatedWaveform = wifiGenerator.Generate()
 
 `WaveGenWifi` 在构造函数内部建立“构造函数直接覆盖 → 外部映射 → 类内只读默认值”的 `ChainMap`。调用方不需要导入默认参数表，也不需要显式创建 `ChainMap`。`UpdateParameters(...)` 可写入最高优先级层，`GetParameters()` 可取得当前解析结果的字典快照。无法识别的键会产生 `UserWarning` 并被忽略；其余已识别配置继续生效，已识别但取值非法的配置仍会报错。
 
+320 MHz、802.11be/EHT、4096-QAM的可复制配置如下。默认4倍采样保留带外观测范围；示例采用浮点输出，使用定点链路时可把 `width` 改为16并按 [FixedPoint.md](./FixedPoint.md) 的规则处理码值：
+
+```python
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+wifiWaveform = WaveGenWifi(parameters={
+    "frameFormat": "11be",
+    "bandwidthMhz": 320,
+    "mcs": 13,
+    "numDataSymbols": 20,
+    "guardIntervalUs": 0.8,
+    "width": 0,
+}).Generate()
+
+assert wifiWaveform.frameFormat == "EHT"
+assert wifiWaveform.bandwidthHz == 320.0e6
+assert wifiWaveform.sampleRateHz == 1.28e9
+assert wifiWaveform.fftLength == 16384
+assert wifiWaveform.dataSubcarriers.size == 3920
+assert wifiWaveform.pilotSubcarriers.size == 64
+```
+
+如需显式控制采样时钟，在同一 `parameters` 字典中添加 `"sampleRateHz": 1.28e9`。命令行入口使用相同的格式和带宽验证：
+
+```bash
+python main.py --format 11be --bandwidth 320 --mcs 13 --sample-rate-hz 1280000000 --symbols 20 --skip-power-evm-curve
+```
+
+320 MHz在相同符号数、空间流数和过采样比下，样本数约为80 MHz的4倍；需要保留足够内存和处理时间。`--format 11ax --bandwidth 320` 或 `--format 11ac --bandwidth 320` 会拒绝，不会静默改成EHT。
+
 构造函数还支持 `width`。下面两个实例分别产生浮点接口波形和默认16位整数码接口波形；两者的 `samples` 都是 `numpy.complex128`：
 
 ```python
@@ -854,7 +901,7 @@ assert fixedWaveform.samples.real.min() >= -32768
 1. 波形适合 PA、DPD、ILC、EVM 和频谱再生研究，不是标准一致性向量。
 2. 未实现完整 MAC 帧、SERVICE/TAIL/PAD、加扰、LDPC/BCC、交织和译码。
 3. 前导字段强调字段顺序、持续时间和宽带激励，不是标准逐比特/逐采样训练序列。
-4. 当前系统实现单用户、满带宽、最多 8 条空间流的 MIMO 激励；不实现多用户 RU 调度、MAC 调度或 OTA 信道矩阵。
+4. 当前系统实现单用户、连续满带宽、最多 8 条空间流的 MIMO 激励，包括EHT 320 MHz；不实现多用户OFDMA/RU调度、puncturing、非连续80+80 MHz、MAC调度或OTA信道矩阵。
 5. 空间映射和 LTF 具有正确的矩阵维度与正交结构，但训练序列/SIG 不是标准逐比特一致性向量。
 6. 不包含无线多径、相位噪声或天线耦合；时延、CFO、SFO 和复增益由分析端工具补偿，而非波形生成器主动注入。
 7. EVM 分析从时域参考重新解调并撤销 CSD/空间映射，因此发送和测量波形需要保持可同步关系。
