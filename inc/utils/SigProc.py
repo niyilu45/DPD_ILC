@@ -2766,6 +2766,8 @@ class SignalProcessingResult:
     carrierFrequencyOffsetHz: float
     samplingFrequencyOffsetPpm: float
     complexGain: complex
+    validSampleMask: Optional[np.ndarray] = None
+    capturedSampleMask: Optional[np.ndarray] = None
 
     def ToDict(self) -> Dict[str, float]:
         """Return synchronization estimates in a serialization-ready form.
@@ -2776,7 +2778,7 @@ class SignalProcessingResult:
 
         Returns:
             result: Dictionary containing scalar impairment estimates. The
-                processed sample array is intentionally excluded.
+                processed samples and coverage masks are intentionally excluded.
         """
 
         return {
@@ -3455,7 +3457,11 @@ class SigProc:
         automaticMaximum = max(32, self.referenceSignal.size // 4)
         return min(4096, automaticMaximum, self.referenceSignal.size - 1)
 
-    def EstimateIntegerDelay(self, measuredSignal: np.ndarray) -> int:
+    def EstimateIntegerDelay(
+        self,
+        measuredSignal: np.ndarray,
+        preferFullOverlap: bool = False,
+    ) -> int:
         """Estimate the signed integer delay of measurement versus reference.
 
         A positive result means that the measured waveform occurs later and
@@ -3465,10 +3471,15 @@ class SigProc:
         Processing details:
             Algorithm: Compute linear cross-correlation with an FFT, restrict
             the lag search, normalize every candidate by overlap energy, and
-            select the maximum normalized magnitude.
+            select the maximum normalized magnitude. Optional full-overlap
+            preference resolves repeated captures in favor of a complete
+            reference only when its correlation remains statistically close
+            to the best candidate.
 
         Args:
             measuredSignal: Finite measured complex waveform.
+            preferFullOverlap: Prefer a near-best full-reference overlap and,
+                without an explicit delay limit, search the entire capture.
 
         Returns:
             result: Signed integer delay in nominal samples.
@@ -3486,14 +3497,22 @@ class SigProc:
             * np.fft.fft(np.conj(self.referenceSignal[::-1]), fftLength)
         )[:fullLength]
         lags = np.arange(fullLength, dtype=int) - (referenceLength - 1)
-        maximumDelay = self.ResolveMaximumIntegerDelay()
         minimumOverlap = max(16, min(referenceLength, measuredLength) // 4)
         # Only lags inside the configured search radius can win. Resolve all
         # overlap boundaries as NumPy vectors so long reference records do not
         # execute thousands of scalar Python iterations. ``np.argmax`` keeps
         # the former first-maximum tie rule because candidate lags remain in
         # ascending order.
-        candidateMask = np.abs(lags) <= maximumDelay
+        configuredMaximum = self.parameters["maxIntegerDelaySamples"]
+        if preferFullOverlap and configuredMaximum is None:
+            candidateMask = np.ones(lags.size, dtype=bool)
+        else:
+            maximumDelay = (
+                int(configuredMaximum)
+                if preferFullOverlap and configuredMaximum is not None
+                else self.ResolveMaximumIntegerDelay()
+            )
+            candidateMask = np.abs(lags) <= maximumDelay
         candidateLags = lags[candidateMask]
         correlationIndices = np.flatnonzero(candidateMask)
         referenceStarts = np.maximum(0, -candidateLags)
@@ -3509,8 +3528,9 @@ class SigProc:
         correlationIndices = correlationIndices[validMask]
         referenceStarts = referenceStarts[validMask]
         referenceStops = referenceStops[validMask]
+        overlapLengths = overlapLengths[validMask]
         measuredStarts = referenceStarts + candidateLags
-        measuredStops = measuredStarts + overlapLengths[validMask]
+        measuredStops = measuredStarts + overlapLengths
         referenceEnergies = self.CalculateRangeEnergies(
             np.abs(self.referenceSignal) ** 2,
             referenceStarts,
@@ -3527,13 +3547,42 @@ class SigProc:
                 np.finfo(float).tiny,
             )
         )
-        candidateScores = (
-            np.abs(correlation[correlationIndices]) / normalizations
-        )
+        candidateMagnitudes = np.abs(correlation[correlationIndices])
+        if preferFullOverlap:
+            # An unrestricted capture search includes all-zero padding. FFT
+            # roundoff there must not be promoted by a near-zero denominator.
+            candidateMagnitudes = np.minimum(
+                candidateMagnitudes,
+                np.sqrt(np.maximum(referenceEnergies * measuredEnergies, 0.0)),
+            )
+        candidateScores = candidateMagnitudes / normalizations
         bestIndex = int(np.argmax(candidateScores))
         bestScore = float(candidateScores[bestIndex])
         if not np.isfinite(bestScore):
             raise RuntimeError("unable to estimate integer delay")
+        if preferFullOverlap:
+            # Repeated packets may yield indistinguishable correlations for
+            # a clipped packet and a complete later packet. Exact ties favor
+            # more actual samples; noisy near-ties may favor full coverage
+            # only within a conservative correlation-uncertainty allowance.
+            tiedIndices = np.flatnonzero(candidateScores >= bestScore - 1.0e-12)
+            bestIndex = int(tiedIndices[np.argmax(overlapLengths[tiedIndices])])
+            correlationUncertainty = (
+                3.0
+                * max(0.0, 1.0 - min(bestScore, 1.0) ** 2)
+                * np.sqrt(
+                    1.0 / float(overlapLengths[bestIndex])
+                    + 1.0 / float(referenceLength)
+                )
+            )
+            scoreTolerance = min(0.01, max(1.0e-6, correlationUncertainty))
+            fullIndices = np.flatnonzero(
+                (overlapLengths == referenceLength)
+                & np.isfinite(candidateScores)
+                & (candidateScores >= bestScore - scoreTolerance)
+            )
+            if fullIndices.size:
+                bestIndex = int(fullIndices[np.argmax(candidateScores[fullIndices])])
         return int(candidateLags[bestIndex])
 
     def ExtractIntegerAligned(
@@ -3574,6 +3623,7 @@ class SigProc:
     def EstimateCarrierFrequencyOffset(
         self,
         integerAlignedSignal: np.ndarray,
+        validSampleMask: Optional[np.ndarray] = None,
     ) -> float:
         """Estimate data-aided carrier-frequency offset from block gains.
 
@@ -3588,6 +3638,8 @@ class SigProc:
         Args:
             integerAlignedSignal: Reference-length measurement after coarse
                 integer-delay alignment.
+            validSampleMask: Optional reference-grid mask identifying actual
+                received samples rather than alignment padding.
 
         Returns:
             result: Estimated carrier-frequency offset in hertz.
@@ -3601,20 +3653,33 @@ class SigProc:
                 "integerAlignedSignal must match the reference length"
             )
         signalLength = self.referenceSignal.size
+        if validSampleMask is None:
+            firstValidSample = 0
+            lastValidSample = signalLength
+        else:
+            coverageMask = np.asarray(validSampleMask, dtype=bool)
+            if coverageMask.shape != self.referenceSignal.shape:
+                raise ValueError("validSampleMask must match the reference shape")
+            validIndices = np.flatnonzero(coverageMask)
+            if validIndices.size == 0:
+                return 0.0
+            firstValidSample = int(validIndices[0])
+            lastValidSample = int(validIndices[-1]) + 1
+        coveredLength = lastValidSample - firstValidSample
         requestedWindowLength = int(self.parameters["timingWindowLength"])
         windowLength = min(
             requestedWindowLength,
-            max(64, signalLength // 12),
+            max(64, coveredLength // 12),
         )
-        if windowLength >= signalLength:
-            windowLength = max(16, signalLength // 3)
+        if windowLength >= coveredLength:
+            windowLength = max(16, coveredLength // 3)
         halfWindow = windowLength // 2
         centerCount = min(
             max(int(self.parameters["timingWindowCount"]), 5),
-            max(5, signalLength // max(windowLength, 1)),
+            max(5, coveredLength // max(windowLength, 1)),
         )
-        firstCenter = halfWindow
-        lastCenter = signalLength - halfWindow - 1
+        firstCenter = firstValidSample + halfWindow
+        lastCenter = lastValidSample - halfWindow - 1
         if lastCenter <= firstCenter:
             return 0.0
         centerIndices = np.linspace(
@@ -3626,6 +3691,10 @@ class SigProc:
         for centerIndex in centerIndices:
             startIndex = int(centerIndex) - halfWindow
             stopIndex = startIndex + windowLength
+            if validSampleMask is not None and not np.all(
+                coverageMask[startIndex:stopIndex]
+            ):
+                continue
             referenceWindow = self.referenceSignal[startIndex:stopIndex]
             measuredWindow = complexAligned[startIndex:stopIndex]
             referenceEnergy = float(
@@ -3766,13 +3835,16 @@ class SigProc:
             frequencyCorrectedSignal, "frequencyCorrectedSignal"
         )
         referenceLength = self.referenceSignal.size
+        overlapStart = max(0, -integerDelaySamples)
+        overlapStop = min(referenceLength, complexMeasured.size - integerDelaySamples)
+        overlapLength = max(0, overlapStop - overlapStart)
         requestedWindowLength = int(self.parameters["timingWindowLength"])
-        windowLength = min(requestedWindowLength, max(32, referenceLength // 4))
-        if windowLength >= referenceLength:
-            windowLength = max(16, referenceLength // 2)
+        windowLength = min(requestedWindowLength, max(32, overlapLength // 4))
+        if windowLength >= overlapLength:
+            windowLength = max(16, overlapLength // 2)
         windowCount = min(
             int(self.parameters["timingWindowCount"]),
-            max(3, referenceLength // max(windowLength, 1)),
+            max(3, overlapLength // max(windowLength, 1)),
         )
         maximumSamplingOffsetPpm = float(
             self.parameters["maxSamplingFrequencyOffsetPpm"]
@@ -3782,8 +3854,8 @@ class SigProc:
         )
         localSearchRadius = max(2, int(np.ceil(maximumDriftSamples)) + 2)
         halfWindow = windowLength // 2
-        firstCenter = halfWindow + localSearchRadius
-        lastCenter = referenceLength - halfWindow - localSearchRadius - 1
+        firstCenter = overlapStart + halfWindow + localSearchRadius
+        lastCenter = overlapStop - halfWindow - localSearchRadius - 1
         if lastCenter <= firstCenter:
             return integerDelaySamples, 0.0, 0.0
         centerIndices = np.linspace(
@@ -3801,10 +3873,9 @@ class SigProc:
             referenceWindow = self.referenceSignal[
                 referenceStart:referenceStop
             ]
-            referenceEnergy = max(
-                float(np.vdot(referenceWindow, referenceWindow).real),
-                np.finfo(float).tiny,
-            )
+            referenceEnergy = float(np.vdot(referenceWindow, referenceWindow).real)
+            if referenceEnergy <= np.finfo(float).tiny:
+                continue
             lagValues = np.arange(
                 -localSearchRadius,
                 localSearchRadius + 1,
@@ -3819,19 +3890,21 @@ class SigProc:
                 if measuredStart < 0 or measuredStop > complexMeasured.size:
                     continue
                 measuredWindow = complexMeasured[measuredStart:measuredStop]
-                measuredEnergy = max(
-                    float(np.vdot(measuredWindow, measuredWindow).real),
-                    np.finfo(float).tiny,
-                )
+                measuredEnergy = float(np.vdot(measuredWindow, measuredWindow).real)
+                if measuredEnergy <= np.finfo(float).tiny:
+                    continue
                 lagScores[lagIndex] = abs(
                     np.vdot(referenceWindow, measuredWindow)
-                ) / np.sqrt(referenceEnergy * measuredEnergy)
+                ) / (np.sqrt(referenceEnergy) * np.sqrt(measuredEnergy))
 
             peakIndex = int(np.argmax(lagScores))
             if not np.isfinite(lagScores[peakIndex]):
                 continue
             fractionalPeak = 0.0
-            if 0 < peakIndex < lagScores.size - 1:
+            if (
+                0 < peakIndex < lagScores.size - 1
+                and np.all(np.isfinite(lagScores[peakIndex - 1:peakIndex + 2]))
+            ):
                 fractionalPeak = self.RefineCorrelationPeak(
                     float(lagScores[peakIndex - 1]),
                     float(lagScores[peakIndex]),
@@ -4032,6 +4105,7 @@ class SigProc:
         self,
         measuredSignal: np.ndarray,
         estimationSlice: Optional[slice] = None,
+        preferFullOverlap: bool = False,
     ) -> SignalProcessingResult:
         """Estimate and compensate all enabled signal impairments.
 
@@ -4048,6 +4122,8 @@ class SigProc:
                 final extraction.
             estimationSlice: Optional reference-grid region used to estimate
                 complex gain, normally the Wi-Fi data field.
+            preferFullOverlap: Prefer a complete reference among comparably
+                correlated repetitions when estimating the integer delay.
 
         Returns:
             result: ``SignalProcessingResult`` containing the compensated
@@ -4062,19 +4138,31 @@ class SigProc:
             self.parameters["enableIntegerDelayCompensation"]
         )
         integerDelaySamples = (
-            self.EstimateIntegerDelay(complexMeasured)
+            self.EstimateIntegerDelay(
+                complexMeasured, preferFullOverlap=preferFullOverlap
+            )
             if enableIntegerDelay
             else 0
         )
         integerAlignedSignal = self.ExtractIntegerAligned(
             complexMeasured, integerDelaySamples
         )
+        referenceIndices = np.arange(
+            self.referenceSignal.size, dtype=float
+        )
+        coarseSourcePositions = referenceIndices + float(integerDelaySamples)
+        coarseValidMask = (
+            (coarseSourcePositions >= 0.0)
+            & (coarseSourcePositions <= complexMeasured.size - 1)
+        )
 
         enableCarrierFrequencyOffset = bool(
             self.parameters["enableCarrierFrequencyOffsetCompensation"]
         )
         carrierFrequencyOffsetHz = (
-            self.EstimateCarrierFrequencyOffset(integerAlignedSignal)
+            self.EstimateCarrierFrequencyOffset(
+                integerAlignedSignal, validSampleMask=coarseValidMask
+            )
             if enableCarrierFrequencyOffset
             else 0.0
         )
@@ -4092,11 +4180,13 @@ class SigProc:
             frequencyCorrectedSignal, integerDelaySamples
         )
         coarseGain = self.EstimateComplexGain(
-            self.referenceSignal, coarseAlignedSignal
+            self.referenceSignal[coarseValidMask],
+            coarseAlignedSignal[coarseValidMask],
         )
-        coarseError = coarseAlignedSignal - coarseGain * self.referenceSignal
+        coarsePrediction = coarseGain * self.referenceSignal[coarseValidMask]
+        coarseError = coarseAlignedSignal[coarseValidMask] - coarsePrediction
         coarseErrorRatio = np.sum(np.abs(coarseError) ** 2) / max(
-            np.sum(np.abs(coarseGain * self.referenceSignal) ** 2),
+            np.sum(np.abs(coarsePrediction) ** 2),
             np.finfo(float).tiny,
         )
         coarseAlignmentIsExact = coarseErrorRatio < 1.0e-24
@@ -4123,9 +4213,6 @@ class SigProc:
             fractionalDelaySamples = 0.0
             samplingFrequencyOffsetPpm = 0.0
 
-        referenceIndices = np.arange(
-            self.referenceSignal.size, dtype=float
-        )
         sourcePositions = (
             float(integerDelaySamples)
             + float(fractionalDelaySamples)
@@ -4135,17 +4222,50 @@ class SigProc:
         alignedSignal = self.InterpolateSignal(
             frequencyCorrectedSignal, sourcePositions
         )
+        # A received sample represents its half-open sampling cell. This
+        # preserves endpoint coverage under sub-half-sample timing estimates
+        # without treating a genuinely missing integer sample as captured.
+        capturedSampleMask = (
+            (sourcePositions >= -0.5 - 1.0e-9)
+            & (sourcePositions < frequencyCorrectedSignal.size - 0.5 + 1.0e-9)
+        )
+        integerPositionMask = (
+            np.abs(sourcePositions - np.rint(sourcePositions)) < 1.0e-12
+        )
+        interpolationHalfLength = int(self.parameters["interpolationHalfLength"])
+        sourceCenters = np.floor(sourcePositions).astype(np.int64)
+        # At an exact integer position, only the central sinc tap is nonzero.
+        # Fractional positions require the complete nonzero Lanczos support;
+        # normalization of a truncated edge kernel cannot create real samples.
+        fullInterpolationSupport = (
+            (sourceCenters - interpolationHalfLength + 1 >= 0)
+            & (
+                sourceCenters + interpolationHalfLength
+                < frequencyCorrectedSignal.size
+            )
+        )
+        validSampleMask = capturedSampleMask & (
+            integerPositionMask | fullInterpolationSupport
+        )
+        if not np.any(validSampleMask):
+            raise ValueError("measurement contains no valid aligned samples")
 
         gainSlice = self.ResolveEstimationSlice(
             estimationSlice, self.referenceSignal.size
         )
+        gainSampleMask = np.zeros(self.referenceSignal.size, dtype=bool)
+        gainSampleMask[gainSlice] = validSampleMask[gainSlice]
+        if not np.any(gainSampleMask):
+            # A header-only capture can still be synchronized. The analysis
+            # layer will report that no complete data symbol is available.
+            gainSampleMask = validSampleMask
         enableComplexGain = bool(
             self.parameters["enableComplexGainCompensation"]
         )
         if enableComplexGain:
             complexGain = self.EstimateComplexGain(
-                self.referenceSignal[gainSlice],
-                alignedSignal[gainSlice],
+                self.referenceSignal[gainSampleMask],
+                alignedSignal[gainSampleMask],
             )
             if abs(complexGain) <= np.finfo(float).tiny:
                 raise ValueError("estimated complex gain is numerically zero")
@@ -4161,5 +4281,7 @@ class SigProc:
             carrierFrequencyOffsetHz=float(carrierFrequencyOffsetHz),
             samplingFrequencyOffsetPpm=float(samplingFrequencyOffsetPpm),
             complexGain=complex(complexGain),
+            validSampleMask=validSampleMask,
+            capturedSampleMask=capturedSampleMask,
         )
         return self.lastResult

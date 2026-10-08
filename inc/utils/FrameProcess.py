@@ -287,6 +287,7 @@ class FrameProcess:
         self,
         preparedSignal: np.ndarray,
         maximumSymbolCount: Optional[int] = None,
+        symbolIndices: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Demodulate data tones and recover transmitted spatial streams.
 
@@ -300,6 +301,8 @@ class FrameProcess:
             preparedSignal: Synchronized signal on the reference sample grid.
             maximumSymbolCount: Optional positive limit for debugging or
                 partial-frame analysis; ``None`` processes every data symbol.
+            symbolIndices: Optional one-dimensional integer indices selecting
+                fully captured data symbols before maximumSymbolCount applies.
 
         Returns:
             result: SISO matrix shaped symbols by data tones, or MIMO tensor
@@ -310,6 +313,17 @@ class FrameProcess:
         symbolStarts = np.asarray(
             self.waveform.dataSymbolStarts, dtype=int
         ).reshape(-1)
+        if symbolIndices is not None:
+            indexArray = np.asarray(symbolIndices)
+            if (
+                indexArray.ndim != 1
+                or indexArray.size == 0
+                or not np.issubdtype(indexArray.dtype, np.integer)
+                or np.any(indexArray < 0)
+                or np.any(indexArray >= symbolStarts.size)
+            ):
+                raise ValueError("symbolIndices must contain valid data-symbol indices")
+            symbolStarts = symbolStarts[indexArray]
         if maximumSymbolCount is not None:
             if (
                 not isinstance(maximumSymbolCount, int)

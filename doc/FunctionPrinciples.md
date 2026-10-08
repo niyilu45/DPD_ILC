@@ -431,16 +431,16 @@ y_{\mathrm{long},3}[n]
 | `SigProc.ResolveMaximumIntegerDelay` | N/E | 把自动/外部时延边界转换为有限相关搜索半径 | SigProc §3、§12 |
 | `SigProc.CalculateRangeEnergies` | N | 条件良好时使用累计差并估计消减上界；仅对可疑半开区间用成对二叉树累加互不重叠的非负局部功率和，避免强突发后小噪声窗口发生灾难性消减 | SigProc §3.3，Performance §3.1–§3.2 |
 | `SigProc.EstimateSignalOverlap` | P/N | 对可能裁剪、补零或不等长的发送与接收波形搜索有符号时延；三段FFT批量生成完整/正探针/负探针相关，分层区间树生成逐候选能量，Cauchy-Schwarz约束抑制零窗舍入伪峰，并保持分数、重叠长度和最早测量起点的并列次序 | SigProc §3.3，Performance §3.2 |
-| `SigProc.EstimateIntegerDelay` | P/N | FFT互相关后向量化生成搜索半径内全部重叠边界，并用分层区间树计算能量；`argmax`在升序lag上保持原来的第一个并列峰语义 | SigProc §3，Performance §3.1 |
+| `SigProc.EstimateIntegerDelay` | P/N | FFT互相关后向量化生成重叠边界，并用分层区间树计算能量；通常保留首个并列峰语义，`preferFullOverlap=True` 则在相关近似相等时优先完整参考覆盖，无显式搜索上限时搜索整个capture | SigProc §3、§8，Performance §3.1 |
 | `SigProc.ExtractIntegerAligned` | N | 按估计时延提取重叠样点并对缺失位置补零 | SigProc §3 |
-| `SigProc.EstimateCarrierFrequencyOffset` | P/N | 分块复增益相位随时间的斜率估计 CFO | SigProc §4.1 |
+| `SigProc.EstimateCarrierFrequencyOffset` | P/N | 分块复增益相位随时间的斜率估计 CFO；可选 `validSampleMask` 限制窗口在实际接收覆盖区，避免缺帧补零污染 | SigProc §4.1、§8 |
 | `SigProc.CompensateCarrierFrequencyOffset` | P/N | 乘 $e^{-j2\pi\hat f n/f_s}$ 撤销载波相位斜率；频偏严格为0 Hz时直接返回独立副本 | SigProc §4.2，Performance §3.4 |
 | `SigProc.RefineCorrelationPeak` | N | 对相关峰邻点做抛物线插值得到亚采样峰位置 | SigProc §5 |
 | `SigProc.EstimateTimingOffsets` | P/N | 多窗口三点抛物线细化的局部相关位置以截距给分数时延、斜率给SFO；插值半支持长度不改变该估计器精度 | SigProc §5–§7 |
 | `SigProc.InterpolateSignal` | N/P | 非整数位置用归一化Lanczos核的 `2L` 候选抽头重采样，实现分数时延和采样率校正；整数位置精确索引旁路；选阶按独立真值、绝对EVM预算和 `L→2L` 收敛联合验收 | SigProc §7 |
 | `SigProc.EstimateComplexGain` | N/P | 最小二乘正交投影得到公共复增益 | SigProc §8、Analysis §3 |
 | `SigProc.ResolveEstimationSlice` | E | 把数据字段或调用方切片限制到有效参考范围 | SigProc §9、Analysis §4.4 |
-| `SigProc.Process` | E/P | 按整数时延→CFO→分数时延/SFO→重采样→复增益的顺序执行 | SigProc §2 |
+| `SigProc.Process` | E/P | 按整数时延→CFO→分数时延/SFO→重采样→复增益的顺序执行；返回真实采样中心与完整插值支持两种覆盖掩码，精确对齐判断和增益拟合排除缺失补零 | SigProc §2、§8 |
 
 ## 7. `FrameProcess.py` 与 `WifiMetadata.py`：帧处理和共享数据
 
@@ -451,7 +451,7 @@ y_{\mathrm{long},3}[n]
 | `FrameProcess.BuildCsdPhaseMatrix` | P/N | 按 $\exp(-j2\pi k\Delta f\tau_m)$ 构造逐音调逐链 CSD 相位矩阵 | FrameProcess §2 |
 | `FrameProcess.__init__`, `FrameProcess.ValidateMetadata` | E | 保存并验证独立 `WifiWaveform` 数据契约 | FrameProcess §1、§5 |
 | `FrameProcess.ValidatePreparedSignal` | E | 检查校正后信号形状、链数和有限性 | FrameProcess §5–§7 |
-| `FrameProcess.DemodulatePreparedWifiData` | P/N | 去 CP、单位化 FFT、选择数据音调、撤销 CSD 和空间映射 | FrameProcess §3–§4 |
+| `FrameProcess.DemodulatePreparedWifiData` | P/N | 按可选 `symbolIndices` 选择完整接收的数据符号，再去 CP、单位化 FFT、选择数据音调、撤销 CSD 和空间映射 | FrameProcess §3–§4 |
 
 ## 8. `Analysis.py`：指标与每轮 MSE 函数
 
@@ -467,7 +467,8 @@ y_{\mathrm{long},3}[n]
 | `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考，Reference为`None`时复用`WifiWaveform.samples`；发送辅助直接相关并截取公共区间，可从兼容 `parseParameters` 转交采样率/带宽但不调用Parser；仅盲模式调用ParseWifi；分别建立输入标尺1和兼容默认1的待测输出scaled full-scale格式；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§3.1、§11、ParseWifi §8 |
 | `Analysis.ResolveMeasuredOutputFormat` | E/N | 保持显式待测输出标尺最高优先级；未显式配置时读取FixedPointArray格式元数据并按对应FS解码，裸数组保留FS1兼容行为 | Analysis §1、§3.1、§11；FixedPoint §7 |
 | `Analysis.GetParsedWifiFrame`, `Analysis.GetAnalysisMode`, `Analysis.Width`, `Analysis.OutputFullScaleAmplitude`, `Analysis.GetSignalOverlapResult` | E | 返回盲模式解析结果、三态路径名、位宽、待测输出标尺或发送辅助重叠坐标；未产生对应结果时返回 `None` | Analysis §1、§3.1、§11、ParseWifi §8、SigProc §3.3、FixedPoint §7 |
-| `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc` | Analysis §2、§9 |
+| `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc`；短捕获在未显式限制整数时延搜索范围时搜索整个参考；通过弱引用把真实捕获/插值有效掩码绑定到返回数组，不把补零视为接收样本 | Analysis §2、§9 |
+| `Analysis.ResolveEvmSymbolIndices`, `Analysis.DemodulatePreparedEvmData` | P/N | `needFullFrameEn=True` 要求所有链真实接收范围覆盖完整参考帧；默认False只要求至少一个完整FFT窗口；以所有链有效插值支持的交集筛选数据符号，对测量与参考使用完全相同的FFT窗口，不包含缺失符号或边缘补零 | Analysis §5 |
 | `Analysis.GetLastSignalProcessingResult`, `Analysis.GetLastSignalProcessingResults`, `Analysis.GetLastMimoMetrics`, `Analysis.GetStageSignalProcessingResults`, `Analysis.GetStageMimoMetrics` | E | 返回缓存的不可变结果，不重新估计 | Analysis §9–§10 |
 | `Analysis.ValidatePreparedSignal` | E | 确保 prepared 数据与参考网格形状和有限性一致 | Analysis §2 |
 | `Analysis.CalculateOutputPower` | P/N | 先按待测输出scaled full-scale解码，恢复同步后、公共复增益补偿前的幅度，以解码后单位RMS对应额定dBm标定每链功率，并在线性功率域汇总MIMO端口 | Analysis §3.1、§9.4 |

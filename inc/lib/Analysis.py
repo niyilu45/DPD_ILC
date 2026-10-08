@@ -6,6 +6,7 @@ from collections import ChainMap
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
+from weakref import ReferenceType, ref
 from typing import (
     Any,
     Callable,
@@ -770,6 +771,7 @@ class Analysis:
         channelBandwidthHz: Optional[float] = None,
         width: Optional[int] = None,
         outputFullScaleAmplitude: Optional[float] = None,
+        needFullFrameEn: Optional[bool] = None,
         **parameterOverrides: object,
     ) -> None:
         """Initialize one of the three independent analysis contexts.
@@ -816,6 +818,9 @@ class Analysis:
                 of one. Project ``FixedPointArray`` inputs supply this scale
                 automatically unless explicitly overridden. Plain ndarrays
                 retain the 1.0 compatibility default.
+            needFullFrameEn: Require a complete captured Wi-Fi frame for EVM
+                when True. None resolves the parameters mapping or the False
+                default, which evaluates only fully captured data FFT windows.
             parameterOverrides: Highest-priority keyword values applied to the local ChainMap layer.
 
         Returns:
@@ -839,6 +844,7 @@ class Analysis:
                 "assistedMinimumCorrelation": 0.12,
                 "width": 16,
                 "outputFullScaleAmplitude": 1.0,
+                "needFullFrameEn": False,
             }
         )
         if parameters is not None and not isinstance(parameters, Mapping):
@@ -877,6 +883,8 @@ class Analysis:
             recognizedOverrides["outputFullScaleAmplitude"] = (
                 outputFullScaleAmplitude
             )
+        if needFullFrameEn is not None:
+            recognizedOverrides["needFullFrameEn"] = needFullFrameEn
         self.parameters: ChainMap[str, object] = ChainMap(
             recognizedOverrides,
             externalParameters,
@@ -1073,11 +1081,16 @@ class Analysis:
                     referenceSignal
                 )
             )
-            self.parsedWifiFrame = ParseWifi(
-                parameters=parseConfiguration
-            ).Parse(
-                parseInput,
-            )
+            frameParser = ParseWifi(parameters=parseConfiguration)
+            try:
+                self.parsedWifiFrame = frameParser.Parse(parseInput)
+            except ValueError as parseError:
+                if self.parameters["needFullFrameEn"]:
+                    raise ValueError(
+                        "没有检测到完整wifi帧：无法同步/解析，"
+                        "无法判断帧头、帧尾完整性；" + str(parseError)
+                    ) from parseError
+                raise
             selectedReference = self.parsedWifiFrame.referenceSignal
             selectedWaveform = self.parsedWifiFrame.waveform
             self.defaultMeasuredSignal = blindOutputFormat.QuantizeCodes(
@@ -1139,6 +1152,9 @@ class Analysis:
         ] = tuple()
         self.lastMimoMetrics: Optional[MimoSignalMetrics] = None
         self.powerEvmCurve: Optional[PowerEvmCurve] = None
+        self.preparedSignalCoverage: list[
+            Tuple[ReferenceType, np.ndarray, np.ndarray]
+        ] = []
 
     def GetParsedWifiFrame(self) -> Optional[ParsedWifiFrame]:
         """Return blind-mode parser output retained by the constructor.
@@ -1304,6 +1320,13 @@ class Analysis:
             self.width,
             self.parameters["outputFullScaleAmplitude"],
         )
+        if not isinstance(self.parameters["needFullFrameEn"], bool):
+            raise TypeError("needFullFrameEn must be a bool")
+        if self.parameters["needFullFrameEn"] and self.waveform is None:
+            raise ValueError(
+                "needFullFrameEn=True requires WifiWaveform metadata; "
+                "raw NumPy transmit-assisted mode cannot verify a complete frame"
+            )
         maxSegmentLength = self.parameters["maxSegmentLength"]
         if (
             not isinstance(maxSegmentLength, int)
@@ -1525,22 +1548,77 @@ class Analysis:
         )
         processingResults = []
         processedColumns = []
+        # A partial capture can begin beyond the ordinary synchronization
+        # radius. Honor explicit user limits, but search the full reference
+        # by default when a shorter capture is supplied.
+        resolvedProcessingParameters = dict(signalProcessingParameters or {})
+        if (
+            measuredMatrix.shape[0] < referenceMatrix.shape[0]
+            and not self.parameters["needFullFrameEn"]
+            and resolvedProcessingParameters.get("maxIntegerDelaySamples")
+            is None
+        ):
+            resolvedProcessingParameters["maxIntegerDelaySamples"] = (
+                referenceMatrix.shape[0] - 1
+            )
         for chainIndex in range(referenceMatrix.shape[1]):
             signalProcessor = SigProc(
                 referenceMatrix[:, chainIndex],
                 self.sampleRateHz,
-                parameters=signalProcessingParameters,
+                parameters=resolvedProcessingParameters,
             )
-            processingResult = signalProcessor.Process(
-                measuredMatrix[:, chainIndex],
-                estimationSlice=dataSlice,
-            )
+            try:
+                processingResult = signalProcessor.Process(
+                    measuredMatrix[:, chainIndex],
+                    estimationSlice=dataSlice,
+                    preferFullOverlap=bool(self.parameters["needFullFrameEn"]),
+                )
+            except (ValueError, RuntimeError) as synchronizationError:
+                if self.parameters["needFullFrameEn"]:
+                    raise ValueError(
+                        "没有检测到完整wifi帧：无法同步/解析，"
+                        "无法判断帧头、帧尾完整性；" + str(synchronizationError)
+                    ) from synchronizationError
+                raise
             processingResults.append(processingResult)
             processedColumns.append(processingResult.processedSignal)
         self.lastSignalProcessingResults = tuple(processingResults)
         self.lastSignalProcessingResult = processingResults[0]
         processedMatrix = np.column_stack(processedColumns)
-        return processedMatrix[:, 0] if inputWasVector else processedMatrix
+        preparedSignal = (
+            processedMatrix[:, 0] if inputWasVector else processedMatrix
+        )
+        evmValidMasks = []
+        for result in processingResults:
+            chainValidMask = result.validSampleMask.copy()
+            validIndices = np.flatnonzero(chainValidMask)
+            # Preserve finite-record interpolation at a captured reference
+            # endpoint. A truncated edge inside the reference still requires
+            # the entire interpolation support and never receives this waiver.
+            if validIndices.size:
+                if result.capturedSampleMask[0]:
+                    chainValidMask[:validIndices[0]] = (
+                        result.capturedSampleMask[:validIndices[0]]
+                    )
+                if result.capturedSampleMask[-1]:
+                    chainValidMask[validIndices[-1] + 1:] = (
+                        result.capturedSampleMask[validIndices[-1] + 1:]
+                    )
+            evmValidMasks.append(chainValidMask)
+        validSampleMask = np.logical_and.reduce(evmValidMasks)
+        capturedSampleMask = np.logical_and.reduce(
+            [result.capturedSampleMask for result in processingResults]
+        )
+        # Bind coverage to each live returned array, not merely the latest
+        # call. Preparing another capture must not change an older EVM input.
+        self.preparedSignalCoverage = [
+            record for record in self.preparedSignalCoverage
+            if record[0]() is not None
+        ]
+        self.preparedSignalCoverage.append(
+            (ref(preparedSignal), validSampleMask, capturedSampleMask)
+        )
+        return preparedSignal
 
     def GetLastSignalProcessingResult(
         self,
@@ -1828,6 +1906,98 @@ class Analysis:
             complexMeasured
         )
 
+    def ResolveEvmSymbolIndices(self, preparedSignal: np.ndarray) -> np.ndarray:
+        """Select complete received FFT windows without counting padding.
+
+        Processing details:
+            Algorithm: Recover coverage bound to this exact prepared array,
+            enforce optional whole-frame capture, and intersect interpolation
+            support across all chains. Count unavailable samples in each data
+            FFT window using a cumulative sum. Externally prepared full-length
+            arrays have caller-declared complete coverage.
+
+        Args:
+            preparedSignal: The original array returned by PrepareMeasuredSignal,
+                or an externally prepared complete reference-grid signal.
+
+        Returns:
+            result: Nonempty integer indices into waveform.dataSymbolStarts.
+        """
+
+        self.ValidateParameters()
+        self.ValidatePreparedSignal(preparedSignal)
+        if self.waveform is None:
+            raise ValueError("Wi-Fi EVM symbol selection requires WifiWaveform metadata")
+        validSampleMask = np.ones(self.referenceSignal.shape[0], dtype=bool)
+        capturedSampleMask = validSampleMask
+        for signalReference, validMask, capturedMask in self.preparedSignalCoverage:
+            if signalReference() is preparedSignal:
+                validSampleMask = validMask
+                capturedSampleMask = capturedMask
+                break
+        if self.parameters["needFullFrameEn"] and not np.all(capturedSampleMask):
+            missingHead = not capturedSampleMask[0]
+            missingTail = not capturedSampleMask[-1]
+            if missingHead and missingTail:
+                missingDescription = "帧头和帧尾均不完整"
+            elif missingHead:
+                missingDescription = "帧头不完整"
+            elif missingTail:
+                missingDescription = "帧尾不完整"
+            else:
+                missingDescription = "帧内采样不完整"
+            raise ValueError(
+                "没有检测到完整wifi帧：" + missingDescription + "；"
+                "needFullFrameEn=True requires at least one complete Wi-Fi frame; "
+                "the received capture does not cover the complete reference frame"
+            )
+        usefulStarts = (
+            np.asarray(self.waveform.dataSymbolStarts, dtype=int)
+            + self.waveform.cpLength
+        )
+        usefulStops = usefulStarts + self.waveform.fftLength
+        missingCounts = np.concatenate(
+            (np.zeros(1, dtype=np.int64), np.cumsum(~validSampleMask))
+        )
+        selectedIndices = np.flatnonzero(
+            missingCounts[usefulStops] == missingCounts[usefulStarts]
+        )
+        if selectedIndices.size == 0:
+            raise ValueError(
+                "没有检测到完整的 Wi-Fi 数据符号，无法计算 EVM；"
+                "EVM requires at least one complete Wi-Fi data-symbol FFT window "
+                "within the received capture"
+            )
+        return selectedIndices
+
+    def DemodulatePreparedEvmData(
+        self, preparedSignal: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Demodulate matching measured and reference symbols for partial EVM.
+
+        Processing details:
+            Algorithm: Resolve capture-valid symbol indices once, then apply
+            identical FFT, tone selection, CSD removal, and spatial demapping
+            to both signals using FrameProcess.
+
+        Args:
+            preparedSignal: Original compensated array with tracked coverage.
+
+        Returns:
+            result: Measured and reference data-symbol arrays on the same grid.
+        """
+
+        symbolIndices = self.ResolveEvmSymbolIndices(preparedSignal)
+        frameProcessor = cast(FrameProcess, self.frameProcessor)
+        return (
+            frameProcessor.DemodulatePreparedWifiData(
+                preparedSignal, symbolIndices=symbolIndices
+            ),
+            frameProcessor.DemodulatePreparedWifiData(
+                self.referenceSignal, symbolIndices=symbolIndices
+            ),
+        )
+
     def CalculateEvm(self, measuredSignal: np.ndarray) -> Tuple[float, float]:
         """Calculate RMS EVM in dB and percent on Wi-Fi data subcarriers.
 
@@ -1896,9 +2066,8 @@ class Analysis:
                     np.finfo(float).tiny,
                 )
             )
-        measuredSymbols = self.DemodulatePreparedWifiData(preparedSignal)
-        referenceSymbols = self.DemodulatePreparedWifiData(
-            self.referenceSignal
+        measuredSymbols, referenceSymbols = self.DemodulatePreparedEvmData(
+            preparedSignal
         )
         symbolError = measuredSymbols.reshape(-1) - referenceSymbols.reshape(-1)
         return float(
@@ -2243,9 +2412,8 @@ class Analysis:
                 )
                 evmPercentValues.append(float(100.0 * evmRatio))
             return tuple(evmDbValues), tuple(evmPercentValues)
-        measuredSymbols = self.DemodulatePreparedWifiData(preparedSignal)
-        referenceSymbols = self.DemodulatePreparedWifiData(
-            self.referenceSignal
+        measuredSymbols, referenceSymbols = self.DemodulatePreparedEvmData(
+            preparedSignal
         )
         if referenceSymbols.ndim == 2:
             referenceSymbols = referenceSymbols[:, :, np.newaxis]
@@ -3086,11 +3254,8 @@ class Analysis:
             # aggregate and per-spatial-stream EVM. Rebuild both grids on the
             # next public call so direct edits to the public reference or its
             # Wi-Fi metadata cannot leave a stale cross-call cache.
-            measuredSymbols = self.DemodulatePreparedWifiData(
+            measuredSymbols, referenceSymbols = self.DemodulatePreparedEvmData(
                 complexMeasured
-            )
-            referenceSymbols = self.DemodulatePreparedWifiData(
-                self.referenceSignal
             )
             symbolError = measuredSymbols - referenceSymbols
             evmAlignedMse = float(

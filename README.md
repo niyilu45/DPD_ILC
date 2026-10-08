@@ -16,7 +16,7 @@
 - [Wi-Fi 帧接收处理原理](doc/FrameProcess.md)：循环前缀删除、FFT、CSD 撤销和空间流解映射。
 - [仅接收Wi-Fi帧解析原理与用法](doc/ParseWifi.md)：10 bit seed、短块LDPC、历史CRC兼容、包起点、可选发送辅助、NumPy/WifiWaveform统一接口和完整示例。
 - [Wi-Fi 元数据契约](doc/WifiMetadata.md)：`MCSInfo` 与 `WifiWaveform` 的字段、数组形状和模块边界。
-- [结果计算物理原理与推导](doc/Analysis.md)：同步后SNR/EVM/IRR/ACLR、原始capture的VHT/HE/EHT相对发射频谱Mask、Welch PSD和功率-EVM曲线。
+- [结果计算物理原理与推导](doc/Analysis.md)：同步后SNR/EVM/IRR/ACLR、部分帧EVM与完整帧检查、原始capture的VHT/HE/EHT相对发射频谱Mask、Welch PSD和功率-EVM曲线。
 - [双音IM分析与ILC比较](doc/TwoToneAnalysis.md)：精确频率投影、IM3/IM5/IM7专用接口、dBc与绝对dBFS、逐轮选择和全方法Benchmark。
 - [定点接口原理与用法](doc/FixedPoint.md)：浮点旁路、公开整数码、内部缩放、舍入、饱和，以及 WaveGenWifi、PaModel、Analysis 的统一数据边界。
 - [Analysis、Channel与PaModel性能优化说明](doc/Performance.md)：同步向量化、稳定区间能量、MIMO调用内中间量复用、不可变协议布局缓存、GMP延迟复用、Channel单次校验事务、定点校准预设复用、热周期局部常数、参考耗时和安全使用边界。
@@ -1992,7 +1992,7 @@ print(assistedMetrics["evmDb"])
 ### `Analysis` 参数与方法
 
 当前构造函数签名为
-`Analysis(referenceSignal=None, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。
+`Analysis(referenceSignal=None, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, outputFullScaleAmplitude=None, needFullFrameEn=None, **parameterOverrides)`。
 显式参考方式使用 `Analysis(referenceSignal, waveform, ...)`；若 `WifiWaveform` 已包含原始发送样值，也可以使用 `Analysis(None, waveform, ...)` 或 `Analysis(waveform=waveform, ...)`，内部自动把 `waveform.samples` 作为Reference。发送辅助方式使用 `Analysis(receivedSignal, transmittedSignal=txSignal, ...)`；盲分析方式使用 `Analysis(receivedSignal, ...)`。接收输入和发送输入都可以是NumPy数组或 `WifiWaveform`；MIMO采用 `samples × transmitChains`。发送辅助模式只做类型适配、公共区间搜索与同步，不调用Parser。
 
 `referenceSignal=None` 只在同时提供 `waveform` 的显式参考模式下表示“复用 `waveform.samples`”。发送辅助和盲分析模式的第一个参数代表接收波形；该接收波形不能为 `None`。
@@ -2002,6 +2002,7 @@ print(assistedMetrics["evmDb"])
 | `parameters` | `None` | 外部 `Mapping` 覆盖层；未提供的键使用 `Analysis` 构造函数内部默认值。 |
 | `width` | `16` | 参考和接收波形的I/Q接口位宽；`0`为浮点，正数输入整数码，解码后用 `complex128` 浮点值做同步和指标计算。 |
 | `outputFullScaleAmplitude` | `1.0` | 待测固定点接收波形的scaled full-scale分量标尺；显式配置优先。工程 `FixedPointArray` 自动携带实际FS，裸外部仪表和旧ndarray兼容回退1.0。 |
+| `needFullFrameEn` | `False` | EVM默认只比较真实接收范围内完整的Data FFT窗口，至少保留一个；`True`要求真实覆盖完整Wi-Fi帧，否则报错。纯NumPy发送辅助没有帧元数据，`True`明确拒绝，`False`仍计算公共区间波形域EVM。 |
 | `maxSegmentLength` | `16384` | Welch PSD 的最大分段长度，必须是不小于 16 的整数。 |
 | `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
 | `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
@@ -2018,6 +2019,27 @@ print(assistedMetrics["evmDb"])
 | `assistedMaximumOffsetSamples` | `2000` | 发送辅助相关允许搜索的接收端最大前置偏移样点数。 |
 | `assistedReferenceSearchSamples` | `32768` | 每个候选偏移最多参与归一化相关的样点数。 |
 | `assistedMinimumCorrelation` | `0.12` | 发送辅助公共区间的最低归一化相关幅度。 |
+
+`needFullFrameEn` 支持直接参数和 `parameters` 两种配置；签名中的 `None` 表示采用配置映射或内部默认 `False`，显式布尔参数优先。已知Reference或发送 `WifiWaveform` 时，缺帧头、缺帧尾的接收片段可以用现存完整Data FFT窗口计算EVM；盲分析即使设为 `False` 也必须保留足够帧头以恢复本工程描述字段，只支持可解析帧头下的尾截断。对齐补零不算真实采集，不能让不完整帧通过 `True` 检查。要求完整帧但接收记录未满足时，`ValueError` 的报错文本明确包含“没有检测到完整wifi帧”，并按可确认的真实接收范围指出“帧头不完整”“帧尾不完整”或“帧头和帧尾均不完整”。盲解析无法可靠定位时提示“无法同步/解析，无法判断帧头、帧尾完整性”，不猜测缺失位置。
+
+```python
+partialAnalysis = Analysis(
+    waveform=wifiWaveform,
+    parameters={"width": 0, "needFullFrameEn": False},
+)
+evmDb, evmPercent = partialAnalysis.CalculateEvm(receivedPartial)
+
+strictAnalysis = Analysis(
+    waveform=wifiWaveform,
+    width=0,
+    needFullFrameEn=True,
+)
+evmDb, evmPercent = strictAnalysis.CalculateEvm(receivedComplete)
+```
+
+部分帧保证只适用于EVM及同路径MSE和逐空间流EVM；功率、SNR、IRR、ACLR及Mask仍有各自的数据范围和统计要求。完整三模式对照、可运行的截断示例与同步边界说明见 [Analysis部分帧EVM](doc/Analysis.md#14-needfullframeen部分帧evm与完整帧检查)。
+
+调用 `CalculatePreparedEvm` 等高级接口时，应直接传入 `PrepareMeasuredSignal` 返回的原数组，保留与该数组身份绑定的真实采样覆盖；不要先 `.copy()` 或重建数组。外部提供的等长prepared数组按调用方已保证完整、已对齐来处理，不会仅凭数组值反推原始采集范围。
 
 发送辅助模式推荐直接使用 `sampleRateHz=` 和
 `channelBandwidthHz=`。已有程序若把采样率放在 `parseParameters` 中，

@@ -874,6 +874,7 @@ def CheckDocumentationApiConsistency() -> None:
         "channelBandwidthHz",
         "width",
         "outputFullScaleAmplitude",
+        "needFullFrameEn",
         "parameterOverrides",
     )
     actualAnalysisParameters = tuple(
@@ -886,7 +887,8 @@ def CheckDocumentationApiConsistency() -> None:
         "parseParameters=None, transmittedSignal=None, "
         "signalProcessingParameters=None, sampleRateHz=None, "
         "channelBandwidthHz=None, width=None, "
-        "outputFullScaleAmplitude=None, **parameterOverrides)"
+        "outputFullScaleAmplitude=None, needFullFrameEn=None, "
+        "**parameterOverrides)"
     )
     readmeText = (projectRoot / "README.md").read_text(encoding="utf-8")
     analysisDocumentText = (
@@ -6467,7 +6469,7 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         frameFormat="EHT",
         bandwidthMhz=40,
         mcs=5,
-        numDataSymbols=1,
+        numDataSymbols=2,
         sampleRateHz=160.0e6,
         seed=514,
         width=0,
@@ -6663,6 +6665,309 @@ def CheckReceiveOnlyWifiAnalysis() -> None:
         raise AssertionError(
             "reference-aided Analysis must require a measured signal"
         )
+
+
+def CheckPartialFrameEvm() -> None:
+    """Verify optional complete-frame enforcement and capture-valid EVM.
+
+    Processing details:
+        Algorithm: Crop deterministic Wi-Fi captures at their head, tail,
+        and data-symbol boundaries, require relaxed EVM to use only complete
+        FFT windows, and reject incomplete records in strict mode. Repeat the
+        checks across assisted, blind, fixed-point, and MIMO paths, validate
+        live configuration precedence, and preserve prepared-record coverage
+        when another measurement is processed by the same analysis object.
+
+    Returns:
+        result: None. Assertions expose zero-padding bias, stale coverage,
+            inconsistent EVM objectives, and missing complete-frame checks.
+    """
+
+    waveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=7,
+        numDataSymbols=6,
+        sampleRateHz=80.0e6,
+        seed=521,
+        width=0,
+    ).Generate()
+    symbolStarts = np.asarray(waveform.dataSymbolStarts, dtype=int)
+    usefulStarts = symbolStarts + waveform.cpLength
+    usefulStops = usefulStarts + waveform.fftLength
+    captureRanges = (
+        (0, waveform.samples.shape[0], np.arange(6)),
+        (0, waveform.samples.shape[0] - 1, np.arange(5)),
+        (0, int(usefulStarts[-1] + waveform.fftLength // 2), np.arange(5)),
+        (int(usefulStarts[0] + 17), waveform.samples.shape[0], np.arange(1, 6)),
+        (int(usefulStarts[1]), int(usefulStops[4]), np.arange(1, 5)),
+        (int(usefulStarts[2]), int(usefulStops[2]), np.array([2])),
+    )
+    relaxedAnalysis = Analysis(waveform=waveform, width=0)
+    assert relaxedAnalysis.GetParameters()["needFullFrameEn"] is False
+    for captureStart, captureStop, expectedSymbols in captureRanges:
+        capturedSignal = waveform.samples[captureStart:captureStop]
+        preparedSignal = relaxedAnalysis.PrepareMeasuredSignal(capturedSignal)
+        assert np.array_equal(
+            relaxedAnalysis.ResolveEvmSymbolIndices(preparedSignal),
+            expectedSymbols,
+        )
+        evmDb, evmPercent = relaxedAnalysis.CalculatePreparedEvm(preparedSignal)
+        assert evmPercent < 1.0e-8, (captureStart, captureStop, evmDb)
+        metrics = relaxedAnalysis.Analyze(capturedSignal)
+        assert metrics["evmPercent"] < 1.0e-8
+        assert relaxedAnalysis.CalculateEvmAlignedMse(capturedSignal) < 1.0e-20
+
+    # Retaining an earlier prepared capture must retain its own symbol mask.
+    retainedPartial = relaxedAnalysis.PrepareMeasuredSignal(
+        waveform.samples[usefulStarts[1]:usefulStops[4]]
+    )
+    relaxedAnalysis.PrepareMeasuredSignal(waveform.samples)
+    assert np.array_equal(
+        relaxedAnalysis.ResolveEvmSymbolIndices(retainedPartial),
+        np.arange(1, 5),
+    )
+    assert relaxedAnalysis.CalculatePreparedEvm(retainedPartial)[1] < 1.0e-8
+
+    incompleteSymbolCaptures = (
+        waveform.samples[:usefulStarts[0]],
+        waveform.samples[usefulStarts[2] + 1:usefulStops[2]],
+    )
+    for incompleteCapture in incompleteSymbolCaptures:
+        try:
+            relaxedAnalysis.CalculateEvm(incompleteCapture)
+        except ValueError as error:
+            assert "complete" in str(error) and "FFT" in str(error)
+            assert "没有检测到完整的 Wi-Fi 数据符号" in str(error)
+        else:
+            raise AssertionError("EVM requires at least one complete FFT window")
+
+    strictAnalysis = Analysis(
+        waveform=waveform,
+        width=0,
+        needFullFrameEn=True,
+    )
+    paddedFullCapture = np.r_[
+        np.zeros(17, dtype=np.complex128),
+        waveform.samples,
+        np.zeros(11, dtype=np.complex128),
+    ]
+    for fullCapture in (waveform.samples, paddedFullCapture):
+        assert strictAnalysis.CalculateEvm(fullCapture)[1] < 1.0e-8
+    # A partial first period must not hide a complete later Wi-Fi frame.
+    repeatedCapture = np.concatenate((waveform.samples[100:], waveform.samples))
+    repeatRandomGenerator = np.random.default_rng(523)
+    noiseUnitPower = (
+        repeatRandomGenerator.standard_normal(repeatedCapture.shape)
+        + 1j * repeatRandomGenerator.standard_normal(repeatedCapture.shape)
+    ) / np.sqrt(2.0)
+    repeatSignalRms = np.sqrt(np.mean(np.abs(repeatedCapture) ** 2))
+    for noiseRatio in (0.0, 0.01):
+        repeatMeasurement = (
+            repeatedCapture + noiseRatio * repeatSignalRms * noiseUnitPower
+        )
+        explicitRepeatMetrics = strictAnalysis.Analyze(repeatMeasurement)
+        assistedRepeatAnalysis = Analysis(
+            repeatMeasurement,
+            transmittedSignal=waveform,
+            needFullFrameEn=True,
+            width=0,
+        )
+        assistedRepeatMetrics = assistedRepeatAnalysis.Analyze()
+        blindRepeatAnalysis = Analysis(
+            repeatMeasurement,
+            parseParameters={
+                "sampleRateHz": waveform.sampleRateHz,
+                "maximumPacketOffsetSamples": waveform.samples.shape[0] - 100,
+            },
+            needFullFrameEn=True,
+            width=0,
+        )
+        blindRepeatMetrics = blindRepeatAnalysis.Analyze()
+        maximumEvmPercent = 2.0 if noiseRatio else 1.0e-8
+        for repeatMetrics in (
+            explicitRepeatMetrics,
+            assistedRepeatMetrics,
+            blindRepeatMetrics,
+        ):
+            assert repeatMetrics["evmPercent"] < maximumEvmPercent
+    for partialCapture, expectedIncompleteField in (
+        (waveform.samples[1:], "帧头不完整"),
+        (waveform.samples[:-1], "帧尾不完整"),
+        (waveform.samples[symbolStarts[0]:], "帧头不完整"),
+        (waveform.samples[17:-19], "帧头和帧尾均不完整"),
+    ):
+        try:
+            strictAnalysis.Analyze(partialCapture)
+        except ValueError as error:
+            assert "complete Wi-Fi frame" in str(error)
+            assert "没有检测到完整wifi帧" in str(error)
+            assert expectedIncompleteField in str(error)
+        else:
+            raise AssertionError("strict EVM must reject every incomplete frame")
+    relaxedAnalysis.UpdateParameters(needFullFrameEn=True)
+    try:
+        relaxedAnalysis.CalculatePreparedEvm(retainedPartial)
+    except ValueError as error:
+        assert "没有检测到完整wifi帧" in str(error)
+    else:
+        raise AssertionError("retained prepared coverage must enforce strict mode")
+    relaxedAnalysis.UpdateParameters(needFullFrameEn=False)
+
+    liveParameters = {"needFullFrameEn": False}
+    liveAnalysis = Analysis(waveform=waveform, parameters=liveParameters, width=0)
+    overriddenAnalysis = Analysis(
+        waveform=waveform,
+        parameters=liveParameters,
+        width=0,
+        needFullFrameEn=False,
+    )
+    liveParameters["needFullFrameEn"] = True
+    assert liveAnalysis.GetParameters()["needFullFrameEn"] is True
+    assert overriddenAnalysis.GetParameters()["needFullFrameEn"] is False
+    try:
+        liveAnalysis.CalculateEvm(waveform.samples[:-1])
+    except ValueError as error:
+        assert "needFullFrameEn=True" in str(error)
+        assert "没有检测到完整wifi帧" in str(error)
+    else:
+        raise AssertionError("live complete-frame settings must be revalidated")
+    assert overriddenAnalysis.CalculateEvm(waveform.samples[:-1])[1] < 1.0e-8
+    liveParameters["needFullFrameEn"] = False
+    assert liveAnalysis.CalculateEvm(waveform.samples[:-1])[1] < 1.0e-8
+    for invalidValue in (0, 1, "False"):
+        try:
+            Analysis(waveform=waveform, width=0, needFullFrameEn=invalidValue)
+        except TypeError as error:
+            assert "needFullFrameEn" in str(error)
+        else:
+            raise AssertionError("needFullFrameEn must accept only booleans")
+
+    middleCapture = waveform.samples[usefulStarts[1]:usefulStops[4]]
+    assistedAnalysis = Analysis(
+        middleCapture,
+        transmittedSignal=waveform,
+        parameters={"assistedMaximumOffsetSamples": waveform.samples.shape[0]},
+        width=0,
+    )
+    assert assistedAnalysis.Analyze()["evmPercent"] < 1.0e-8
+    rawAssistedAnalysis = Analysis(
+        middleCapture,
+        transmittedSignal=waveform.samples,
+        parameters={"assistedMaximumOffsetSamples": waveform.samples.shape[0]},
+        width=0,
+    )
+    assert rawAssistedAnalysis.Analyze()["evmPercent"] < 1.0e-8
+    try:
+        Analysis(
+            waveform.samples,
+            transmittedSignal=waveform.samples,
+            width=0,
+            needFullFrameEn=True,
+        )
+    except ValueError as error:
+        assert "WifiWaveform metadata" in str(error)
+    else:
+        raise AssertionError("raw references cannot verify Wi-Fi frame completeness")
+
+    blindAnalysis = Analysis(
+        waveform.samples[:-1],
+        parseParameters={
+            "sampleRateHz": waveform.sampleRateHz,
+            "maximumPacketOffsetSamples": 0,
+        },
+        width=0,
+    )
+    assert blindAnalysis.GetParsedWifiFrame() is not None
+    assert blindAnalysis.Analyze()["evmPercent"] < 1.0e-8
+    blindAnalysis.UpdateParameters(needFullFrameEn=True)
+    try:
+        blindAnalysis.Analyze()
+    except ValueError as error:
+        assert "complete Wi-Fi frame" in str(error)
+        assert "没有检测到完整wifi帧" in str(error)
+    else:
+        raise AssertionError("blind parsing must not pad away strict length errors")
+    try:
+        Analysis(
+            middleCapture,
+            parseParameters={
+                "sampleRateHz": waveform.sampleRateHz,
+                "maximumPacketOffsetSamples": 0,
+            },
+            needFullFrameEn=True,
+            width=0,
+        )
+    except ValueError as error:
+        assert "没有检测到完整wifi帧" in str(error)
+    else:
+        raise AssertionError("strict blind mode must explain an undecodable header")
+
+    for interfaceWidth, antennaCount in ((16, 1), (0, 2), (16, 2)):
+        formatWaveform = WaveGenWifi(
+            frameFormat="HE",
+            bandwidthMhz=20,
+            mcs=7,
+            numDataSymbols=4,
+            sampleRateHz=80.0e6,
+            seed=522,
+            numTransmitAntennas=antennaCount,
+            numSpatialStreams=antennaCount,
+            spatialMapping="dft",
+            width=interfaceWidth,
+        ).Generate()
+        formatAnalysis = Analysis(waveform=formatWaveform, width=interfaceWidth)
+        formatStart = formatWaveform.dataSymbolStarts[1] + formatWaveform.cpLength
+        formatStop = (
+            formatWaveform.dataSymbolStarts[2]
+            + formatWaveform.cpLength
+            + formatWaveform.fftLength
+        )
+        formatCapture = formatWaveform.samples[formatStart:formatStop]
+        formatMetrics = formatAnalysis.Analyze(formatCapture)
+        assert formatMetrics["evmPercent"] < 1.0e-8
+        assert formatAnalysis.CalculateEvmAlignedMse(formatCapture) < 1.0e-20
+        if antennaCount > 1:
+            mimoMetrics = formatAnalysis.GetLastMimoMetrics()
+            assert mimoMetrics is not None
+            assert max(mimoMetrics["evmPercentPerSpatialStream"]) < 1.0e-8
+
+    # Check the nonzero objective against a manually selected OFDM grid.
+    deterministicProcessing = {
+        "enableFractionalDelayCompensation": False,
+        "enableCarrierFrequencyOffsetCompensation": False,
+        "enableSamplingFrequencyOffsetCompensation": False,
+    }
+    impairedAnalysis = Analysis(
+        waveform=waveform,
+        signalProcessingParameters=deterministicProcessing,
+        width=0,
+    )
+    impairedCapture = np.asarray(middleCapture).copy()
+    impairedCapture += 0.021 * np.conjugate(impairedCapture)
+    preparedImpaired = impairedAnalysis.PrepareMeasuredSignal(impairedCapture)
+    allReferenceSymbols = impairedAnalysis.frameProcessor.DemodulatePreparedWifiData(
+        impairedAnalysis.referenceSignal
+    )
+    allMeasuredSymbols = impairedAnalysis.frameProcessor.DemodulatePreparedWifiData(
+        preparedImpaired
+    )
+    selectedReference = allReferenceSymbols[1:5]
+    selectedMeasured = allMeasuredSymbols[1:5]
+    expectedMse = float(
+        np.sum(np.abs(selectedMeasured - selectedReference) ** 2)
+        / np.sum(np.abs(selectedReference) ** 2)
+    )
+    assert expectedMse > 1.0e-6
+    measuredMse = impairedAnalysis.CalculateEvmAlignedMse(impairedCapture)
+    impairedMetrics = impairedAnalysis.Analyze(impairedCapture)
+    assert np.isclose(measuredMse, expectedMse, rtol=1.0e-12, atol=1.0e-15)
+    assert np.isclose(
+        impairedMetrics["evmDb"],
+        10.0 * np.log10(expectedMse),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
 
 
 def CheckMseEvmConvergence() -> None:
@@ -15306,6 +15611,7 @@ def RunTests() -> None:
     CheckIlcImprovement()
     CheckIlcFeedbackSynchronization()
     CheckReceiveOnlyWifiAnalysis()
+    CheckPartialFrameEvm()
     CheckMseEvmConvergence()
     CheckTwoToneAnalogPowerReporting()
     CheckTwoToneIlcAnalysis()

@@ -811,6 +811,10 @@ z[n]=\frac{z_0[n]}{\hat g}.
 
 `Analysis` 默认把 Wi-Fi 数据字段作为复增益估计区间，使性能评价关注非线性形状误差，而不是测试链路的固定幅相标定差。
 
+部分捕获时，复增益拟合只使用估计区间与真实有效接收样本的交集，不能让同步补零参与分母而低估增益。`SignalProcessingResult.capturedSampleMask` 标记重采样中心是否落在实际接收记录的采样单元范围 $[-0.5, N-0.5)$ 内，供完整帧检查；`validSampleMask` 进一步排除插值核缺少真实输入支撑的边缘样本，供增益估计和部分帧 EVM 使用。整数位置不需要额外插值护带；非整数位置要求 Lanczos 核的非零支撑完整。`Analysis` 对参考帧本身已被采集覆盖的首尾保留原有有限记录端点插值，对参考帧内部的截断边缘不做此放宽。若捕获只有帧头而没有有效数据区，增益估计可退回有效接收区，但 EVM 仍会因缺少完整数据 FFT 窗口而明确报错。这两个数组不写入 `ToDict()` 的标量日志。
+
+`SigProc.Process(..., preferFullOverlap=True)` 与 `EstimateIntegerDelay(..., preferFullOverlap=True)` 用于完整帧优先同步，默认 `False` 保留通常的相关峰选择。启用后，若没有显式整数时延搜索上限，则搜索整个接收记录；相同得分优先更长重叠，并允许噪声导致的小幅相关不确定度，以便从“残帧+完整帧”中选择完整帧。容差按相关得分和重叠长度估计，最低 $10^{-6}$、最高0.01；完整候选仍必须接近最优相关峰，不能通过填零强行补成完整帧。`Analysis` 在 `needFullFrameEn=True` 时启用此选项。
+
 ---
 
 ## 9. 类结构和结果
@@ -821,8 +825,8 @@ classDiagram
         +Process(measuredSignal, estimationSlice)
         +CalculateRangeEnergies(powerValues, rangeStarts, rangeStops)
         +EstimateSignalOverlap(measuredSignal, referenceSignal, ...)
-        +EstimateIntegerDelay(measuredSignal)
-        +EstimateCarrierFrequencyOffset(integerAlignedSignal)
+        +EstimateIntegerDelay(measuredSignal, preferFullOverlap)
+        +EstimateCarrierFrequencyOffset(integerAlignedSignal, validSampleMask)
         +EstimateTimingOffsets(frequencyCorrectedSignal, integerDelaySamples)
         +InterpolateSignal(inputSignal, samplePositions)
         +EstimateComplexGain(referenceSignal, measuredSignal)

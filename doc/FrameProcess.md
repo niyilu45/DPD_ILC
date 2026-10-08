@@ -107,7 +107,7 @@ classDiagram
     class FrameProcess {
         +ValidateMetadata()
         +ValidatePreparedSignal(preparedSignal)
-        +DemodulatePreparedWifiData(preparedSignal, maximumSymbolCount)
+        +DemodulatePreparedWifiData(preparedSignal, maximumSymbolCount, symbolIndices)
     }
     class BuildCsdPhaseMatrix {
         +subcarrierIndices
@@ -137,5 +137,5 @@ spatialStreamSymbols = frameProcessor.DemodulatePreparedWifiData(
 
 1. 本模块撤销已知发送端 CSD 和空间映射，不估计未知 OTA MIMO 信道。
 2. 不执行导频相位跟踪、相位噪声估计或信道均衡。
-3. `maximumSymbolCount` 只用于局部调试；正式 EVM 应处理全部数据符号。
+3. `maximumSymbolCount` 限制选中符号的数量，主要用于局部调试。`symbolIndices` 可显式选择数据符号索引（先选择索引，再应用数量限制）。`Analysis` 的部分帧 EVM 会用实际捕获与插值支持范围筛选完整 FFT 窗口，对参考和接收使用同一组索引；不能把缺失处的补零当成有效符号。`needFullFrameEn=True` 另行要求完整帧真实存在，详见 [Analysis](Analysis.md)。
 4. 输入不足一个完整有效 OFDM 符号时会拒绝处理，而不是静默补零。

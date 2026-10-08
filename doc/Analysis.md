@@ -201,7 +201,7 @@ import numpy as np
 from inc.lib.Analysis import Analysis
 
 
-# Load one complete receive capture, including the project signaling field.
+# Load a receive capture containing the project signaling field.
 receivedSignal = np.load(
     Path("captures") / "ehtReceiveCapture.npy"
 )
@@ -235,7 +235,7 @@ print(f"EVM: {metrics['evmPercent']:.3f} %")
 - 包前可以带有零样值、静默区或采集时延，默认最多搜索2000个前置样点，由 `maximumPacketOffsetSamples` 控制；
 - 提供发送波形时，发送和接收长度可以不同。发送端前后补零、只把完整有效帧送入PA、或接收捕获更短都不会触发长度错误，`SigProc.EstimateSignalOverlap` 会在公共有效区间内完成对齐，不会调用Parser。
 
-这里的“不要求等长”不等于“任意缺失样点都能恢复”。若裁剪只移除完整Wi-Fi帧外的补零，指标不受影响；若裁剪切入帧内OFDM符号，缺失信息会在同步到参考网格时保留为缺失误差，因此EVM会合理变差。
+这里的“不要求等长”不等于“任意缺失样点都能恢复”。`needFullFrameEn=False` 时，EVM只统计真实接收范围内完整的Data符号FFT窗口，裁剪切断的窗口不参与计算；至少要保留一个有效窗口。盲分析还必须保留足够帧头供Parser恢复描述字段，不能靠这一开关解析没有帧头的未知数据片段。完整帧检查及其他指标的边界见1.4节。
 
 下面是一个不依赖外部采集文件、可以在本工程中直接运行的完整示例。虽然代码用PA模型产生接收波形，但送给Analysis的仍然只有 `receivedSignal`，没有提供发送参考：
 
@@ -297,6 +297,80 @@ if mimoMetrics is not None:
 ```
 
 上述“仅接收波形”方式适用于由本工程 `WaveGenWifi` 生成且保留项目描述字段的波形。对于不含该描述字段的商业仪器抓包，应额外提供发送样值或完整接收配置；Parser不能仅凭任意未知波形无条件恢复随机载荷对应的理想星座。
+
+### 1.4 `needFullFrameEn`：部分帧EVM与完整帧检查
+
+`needFullFrameEn` 的实际默认值为 `False`。它既可以通过 `parameters={"needFullFrameEn": True}` 配置，也可以使用显式构造参数 `needFullFrameEn=True`；显式非 `None` 值优先。签名中的 `needFullFrameEn=None` 表示继续读取 `parameters` 和内部默认值，并不表示第三种测量模式。配置值必须是布尔值。
+
+要求完整帧但接收记录不满足时，抛出的 `ValueError` 文本明确包含“没有检测到完整wifi帧”，便于调用方和使用者识别完整性失败。可可靠定位帧边界时，错误进一步区分“没有检测到完整wifi帧：帧头不完整”“没有检测到完整wifi帧：帧尾不完整”或“没有检测到完整wifi帧：帧头和帧尾均不完整”。盲解析没有可靠帧定位时，提示“无法同步/解析，无法判断帧头、帧尾完整性”，不会把同步或描述字段译码失败直接解释成缺帧头。这类错误与部分帧模式下“没有完整Data FFT窗口”以及普通数据类型错误分别处理。
+
+| 分析路径 | `False`：允许部分帧 | `True`：要求完整帧 |
+| --- | --- | --- |
+| 显式Reference和 `WifiWaveform` 元数据 | 通过已知参考定位接收片段，只比较实际收到的完整Data FFT窗口；可以缺帧头或帧尾 | 接收记录必须真实覆盖所定位Wi-Fi帧的全部字段，否则抛出 `ValueError` |
+| 发送辅助，`transmittedSignal` 为 `WifiWaveform` | 使用已知发送样值与元数据定位、选取完整窗口，不调用Parser | 利用元数据和接收覆盖范围检查完整帧，否则抛出 `ValueError` |
+| 发送辅助，`transmittedSignal` 为纯NumPy数组 | 保持公共区间上的波形域EVM，即归一化时域误差；不是Wi-Fi数据子载波EVM | 无帧边界元数据，无法证实完整Wi-Fi帧，明确抛出 `ValueError`；改传 `WifiWaveform` |
+| 盲分析 | 必须仍可解析本工程帧头描述字段；允许帧尾截断，并只测剩余完整Data FFT窗口 | 成功解析后还要确认所定位帧全部字段均在真实接收记录内，否则抛出 `ValueError` |
+
+有元数据时，“允许部分帧”至少要求一个完整的Data符号FFT窗口。只有帧头、只剩半个Data FFT窗口，或者各MIMO链没有共同可用的完整窗口，都不能给出有效的Wi-Fi子载波EVM。这里的窗口指去CP之后的有效FFT样点；单独缺少不用来FFT的CP样点，不等于有效窗口残缺。`True` 的要求更严格，帧头和CP也必须属于真实采集的完整帧。
+
+判断使用同步映射后的原始接收范围，不能用对齐数组的长度代替。`SigProc` 为保持参考网格仍可能在记录边界补零，但这些补零不会被当成实测样点加入EVM，也不能让不完整帧通过 `True` 检查。参考和测量必须选择相同的Data符号索引，MIMO各链也使用共同有效窗口，避免错配参考或将缺失片段当成失真。截取后仍应保留同步搜索和插值所需的保护样点；该开关不修复接收机同步失败或已产生的边界插值失真。
+
+采样范围按每个样点代表的半开采样单元计算，即原始记录的中心坐标范围为 $[-0.5, N-0.5)$，避免完整帧因小于半个样点的同步估计偏差而被误报为缺头/缺尾。实际少一个样点仍会被识别。对于参考帧本来的首尾边界，保留既有有限记录插值方式；对于截断发生在参考帧内部的边界，必须有完整插值核支撑，否则相邻FFT窗口不用于EVM。前者保证完整单符号帧不会仅因端点插值而丢掉唯一符号，但不代表端点插值误差被消除。
+
+连续记录可能先出现残帧、随后才出现完整帧。严格模式在没有显式 `maxIntegerDelaySamples` 限制时搜索整个接收记录，在相关得分足够接近时优先选择完整参考覆盖的候选，而不是固定使用第一个残帧。用户显式同步搜索范围仍受尊重。盲分析的帧头解析仍受 `parseParameters["maximumPacketOffsetSamples"]` 限制（默认2000样点）；完整帧位置超过该范围时，应增大该值，或传入已知的 `WifiWaveform`。盲解析需要逐位置验证描述字段，扩大范围会增加耗时；本开关不会默认将盲解析范围扩展到无限长记录。
+
+`CalculatePreparedEvm`、`CalculatePreparedEvmAlignedMse` 和 `CalculatePreparedEvmPerSpatialStream` 属于已同步高级接口。若信号来自当前Analysis的 `PrepareMeasuredSignal`，必须直接传其返回的原数组；采样覆盖与数组身份绑定，即使之后准备了另一个capture，原数组仍保留自己的覆盖信息。先 `.copy()`、重建数组或传入其他对象会失去这一绑定。兼容已有外部接收处理流程时，外部等长prepared数组被视为调用方已保证完整且位于参考网格上，Analysis无法仅凭数值分辨其中的零是实测静默还是人工补零。需要检查真实采集完整性时，应使用 `CalculateEvm(rawCapture)` 或 `Analyze(rawCapture)`。
+
+下面的浮点示例保留帧头和前3个Data符号，再截断第4个符号；默认EVM只使用前3个完整窗口。示例用无失真的发送副本表示接收记录，实际使用时换成相同区间的实测接收样值。
+
+```python
+import numpy as np
+
+from inc.lib.Analysis import Analysis
+from inc.lib.WaveGenWifi import WaveGenWifi
+
+
+wifiWaveform = WaveGenWifi(parameters={
+    "frameFormat": "EHT",
+    "bandwidthMhz": 20,
+    "sampleRateHz": 80.0e6,
+    "numDataSymbols": 6,
+    "width": 0,
+}).Generate()
+captureStop = (
+    int(wifiWaveform.dataSymbolStarts[3])
+    + wifiWaveform.cpLength
+    + wifiWaveform.fftLength // 2
+)
+receivedPartial = np.asarray(wifiWaveform.samples[:captureStop]).copy()
+
+partialAnalysis = Analysis(
+    waveform=wifiWaveform,
+    parameters={"width": 0, "needFullFrameEn": False},
+)
+evmDb, evmPercent = partialAnalysis.CalculateEvm(receivedPartial)
+print(evmDb, evmPercent)
+
+fullFrameAnalysis = Analysis(
+    waveform=wifiWaveform,
+    width=0,
+    needFullFrameEn=True,
+)
+try:
+    fullFrameAnalysis.CalculateEvm(receivedPartial)
+except ValueError as error:
+    print(error)
+
+# A complete capture satisfies the strict frame requirement.
+fullEvmDb, fullEvmPercent = fullFrameAnalysis.CalculateEvm(
+    wifiWaveform.samples
+)
+print(fullEvmDb, fullEvmPercent)
+```
+
+盲分析同一条尾截断记录时，可使用 `Analysis(receivedPartial, width=0, needFullFrameEn=False, parseParameters={"sampleRateHz": wifiWaveform.sampleRateHz}).Analyze()`；成功的前提仍是帧头描述字段可解码。若只采到了帧中间的数据，提供发送 `WifiWaveform` 作为 `transmittedSignal`，或者采用显式Reference模式。
+
+本开关保证的是EVM及其同路径归一化MSE、逐空间流EVM对部分帧的选择逻辑。它不把一小段采集变成整帧性能估计，也不保证部分帧的模拟功率、SNR、IRR、ACLR或Mask等于完整帧结果；这些指标保留各自的数据范围和统计要求。仅测部分帧EVM时优先使用 `CalculateEvm`。若调用 `Analyze()`，返回的其他指标需按各自条件判断；短记录还会增加EVM统计波动，比较算法时应保持相同符号范围和足够的样本量。
 
 ---
 
@@ -1831,7 +1905,7 @@ ILC 每轮收敛结果另外输出：
 `Analysis` 是独立的测量与结果统计类，不要求使用任何ILC算法。只要能够得到参考波形和待测波形，或者接收波形包含本工程可解析的Wi-Fi描述字段，就可以直接计算指标。下面所有示例都不导入 `DpdIlc`；表中的逐轮历史接口只是兼容迭代算法输出的可选扩展，不是使用Analysis的前提。
 
 公开构造签名为
-`Analysis(referenceSignal=None, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, outputFullScaleAmplitude=None, **parameterOverrides)`。其中 `outputFullScaleAmplitude` 只描述待测输出码；工程 `FixedPointArray` 自动提供实际标尺，显式值优先，裸ndarray兼容回退1.0；Reference/DAC码仍使用标尺1.0。
+`Analysis(referenceSignal=None, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, outputFullScaleAmplitude=None, needFullFrameEn=None, **parameterOverrides)`。其中 `outputFullScaleAmplitude` 只描述待测输出码；工程 `FixedPointArray` 自动提供实际标尺，显式值优先，裸ndarray兼容回退1.0；Reference/DAC码仍使用标尺1.0。`needFullFrameEn` 的实际默认值为 `False`，完整帧与部分帧EVM的定义见1.4节。
 
 | 计算步骤 | 方法 |
 |---|---|
@@ -2505,11 +2579,14 @@ Analysis(
     channelBandwidthHz=None,
     width=None,
     outputFullScaleAmplitude=None,
+    needFullFrameEn=None,
     **parameterOverrides,
 )
 ```
 
 `signalProcessingParameters` 是显式构造参数，其映射内容直接传给 `SigProc`。为兼容旧程序，`parameters={"signalProcessingParameters": {...}}` 仍然有效；新代码应优先使用显式参数，避免把同步配置误认为普通Analysis指标配置。外部修改对应覆盖字典后，下一次信号处理、指标计算、曲线数据保存或绘图会使用新值；`UpdateParameters(...)` 可设置最高优先级覆盖，`GetParameters()` 用于取得当前配置快照。任何层出现未知键时，代码会发出 `UserWarning`、忽略该键并继续；已识别键的类型、单位和物理范围仍严格校验。
+
+`needFullFrameEn` 也参加相同的配置优先级解析。`parameters={"needFullFrameEn": True}` 要求完整帧；再显式传 `needFullFrameEn=False` 会覆盖这个映射。省略或显式传 `None` 则继续使用映射，没有映射值时回退 `False`。它是Analysis的EVM策略，不是Parser参数，不应放入 `parseParameters`。
 
 其中 `signalProcessingParameters={"interpolationHalfLength": L}` 控制EVM/SNR/ACLR公共同步路径的Lanczos重采样核。$L$ 是半支持长度，不是FIR阶数：非整数位置最多使用 $2L$ 个抽头，对应 $2L-1$ 阶，默认 `L=12` 即24抽头/23阶等效FIR。增大它不会提高 `EstimateTimingOffsets` 的三点相关峰精度，也不能恢复Channel生成端在低阶配置、真实硬件通道或有限记录边界中已经造成的幅频失真；这些残差都会诚实地进入最终EVM。Channel公共 `channelDly` 当前默认也是23阶Lanczos，但它与接收补偿端仍须分别选阶和验收。应分别验证“独立高精度真值+已知时延补偿”和“自动估计+补偿”，并同时检查绝对EVM预算及 $L\rightarrow2L$ 的收敛。完整方案与OSR2/OSR4实测基线见 [SigProc §7](./SigProc.md#7-重采样与分数时延补偿)。
 
