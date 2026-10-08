@@ -6911,17 +6911,14 @@ def CheckPartialFrameEvm() -> None:
         width=0,
     )
     assert rawAssistedAnalysis.Analyze()["evmPercent"] < 1.0e-8
-    try:
-        Analysis(
-            waveform.samples,
-            transmittedSignal=waveform.samples,
-            width=0,
-            needFullFrameEn=True,
-        )
-    except ValueError as error:
-        assert "WifiWaveform metadata" in str(error)
-    else:
-        raise AssertionError("raw references cannot verify Wi-Fi frame completeness")
+    strictRawAnalysis = Analysis(
+        waveform.samples,
+        transmittedSignal=waveform.samples,
+        sampleRateHz=waveform.sampleRateHz,
+        width=0,
+        needFullFrameEn=True,
+    )
+    assert strictRawAnalysis.Analyze()["evmPercent"] < 1.0e-8
 
     blindAnalysis = Analysis(
         waveform.samples[:-1],
@@ -7023,6 +7020,303 @@ def CheckPartialFrameEvm() -> None:
         rtol=1.0e-12,
         atol=1.0e-12,
     )
+
+
+def CheckNumpyAssistedFullFrame() -> None:
+    """Verify strict frame checks with transmit sample arrays only.
+
+    Processing details:
+        Algorithm: Parse only the known transmit samples when strict checks
+        are requested, preserve their actual data values, and validate capture
+        boundaries across floating, fixed-point, MIMO, and EHT 320 MHz inputs.
+        Exercise live upgrades, parser caching, transmit padding, and explicit
+        diagnostics for transmit references without a complete frame.
+
+    Returns:
+        result: None. Assertions expose missing metadata recovery, regenerated
+            reference substitution, stale raw overlap, and incorrect scaling.
+    """
+
+    waveform = WaveGenWifi(
+        frameFormat="EHT",
+        bandwidthMhz=20,
+        mcs=7,
+        numDataSymbols=4,
+        sampleRateHz=80.0e6,
+        seed=524,
+        width=0,
+    ).Generate()
+    parserParameters = {
+        "sampleRateHz": waveform.sampleRateHz,
+        "maximumPacketOffsetSamples": 0,
+    }
+    transmitSamples = np.asarray(waveform.samples).copy()
+    dataStart = int(waveform.dataSymbolStarts[0])
+    transmitSamples[dataStart:] += 0.031 * np.conjugate(
+        transmitSamples[dataStart:]
+    )
+    with patch.object(ParseWifi, "Parse", side_effect=AssertionError(
+        "relaxed raw-assisted analysis must not invoke ParseWifi"
+    )):
+        rawAnalysis = Analysis(
+            transmitSamples[19:-23],
+            transmittedSignal=transmitSamples,
+            sampleRateHz=waveform.sampleRateHz,
+            width=0,
+        )
+        assert rawAnalysis.GetParsedWifiFrame() is None
+        assert rawAnalysis.waveform is None
+        assert rawAnalysis.Analyze()["evmPercent"] < 1.0e-8
+
+    originalParse = ParseWifi.Parse
+    automaticAnalysis = Analysis(
+        transmitSamples,
+        transmittedSignal=transmitSamples,
+        needFullFrameEn=True,
+        width=0,
+    )
+    assert automaticAnalysis.sampleRateHz == waveform.sampleRateHz
+    assert automaticAnalysis.Analyze()["evmPercent"] < 1.0e-8
+    with patch.object(ParseWifi, "Parse", autospec=True,
+                      side_effect=originalParse) as parseSpy:
+        strictAnalysis = Analysis(
+            transmitSamples,
+            transmittedSignal=transmitSamples,
+            parseParameters=parserParameters,
+            needFullFrameEn=True,
+            width=0,
+        )
+        assert strictAnalysis.GetAnalysisMode() == "transmitAssisted"
+        assert strictAnalysis.GetParsedWifiFrame() is None
+        assert strictAnalysis.parsedTransmitFrame is not None
+        assert np.array_equal(strictAnalysis.referenceSignal, transmitSamples)
+        assert strictAnalysis.Analyze()["evmPercent"] < 1.0e-8
+        assert strictAnalysis.CalculateEvm(transmitSamples)[1] < 1.0e-8
+        strictAnalysis.UpdateParameters(needFullFrameEn=False)
+        assert strictAnalysis.waveform is not None
+        assert strictAnalysis.CalculateEvm(transmitSamples[:-1])[1] < 1.0e-8
+        strictAnalysis.UpdateParameters(needFullFrameEn=True)
+        assert strictAnalysis.Analyze()["evmPercent"] < 1.0e-8
+        assert parseSpy.call_count == 1
+        assert np.array_equal(parseSpy.call_args.args[1], transmitSamples)
+
+    for partialCapture, missingField in (
+        (transmitSamples[1:], "incomplete frame header"),
+        (transmitSamples[:-1], "incomplete frame tail"),
+        (transmitSamples[19:-23], "incomplete frame header and tail"),
+    ):
+        try:
+            Analysis(
+                partialCapture,
+                transmittedSignal=transmitSamples,
+                parseParameters=parserParameters,
+                needFullFrameEn=True,
+                width=0,
+            ).Analyze()
+        except ValueError as error:
+            assert "No complete Wi-Fi frame detected" in str(error)
+            assert missingField in str(error)
+        else:
+            raise AssertionError("raw transmit metadata must preserve RX coverage")
+
+    for useLiveMapping in (False, True):
+        liveParameters = {"needFullFrameEn": False}
+        initialCapture = (
+            transmitSamples[17:-19] if useLiveMapping else transmitSamples[:-1]
+        )
+        expectedIncompleteField = (
+            "incomplete frame header and tail"
+            if useLiveMapping else "incomplete frame tail"
+        )
+        with patch.object(ParseWifi, "Parse", autospec=True,
+                          side_effect=originalParse) as parseSpy:
+            upgradedAnalysis = Analysis(
+                initialCapture,
+                transmittedSignal=transmitSamples,
+                parameters=liveParameters,
+                sampleRateHz=waveform.sampleRateHz,
+                width=0,
+            )
+            stalePreparedSignal = upgradedAnalysis.PrepareMeasuredSignal(initialCapture)
+            assert upgradedAnalysis.Analyze()["evmPercent"] < 1.0e-8
+            assert parseSpy.call_count == 0
+            if useLiveMapping:
+                liveParameters["needFullFrameEn"] = True
+            else:
+                upgradedAnalysis.UpdateParameters(needFullFrameEn=True)
+            try:
+                upgradedAnalysis.Analyze()
+            except ValueError as error:
+                assert expectedIncompleteField in str(error)
+            else:
+                raise AssertionError("upgrades must retain the original RX tail")
+            try:
+                upgradedAnalysis.CalculatePreparedEvm(stalePreparedSignal)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("metadata upgrades must reject stale raw records")
+            assert upgradedAnalysis.CalculateEvm(transmitSamples)[1] < 1.0e-8
+            assert parseSpy.call_count == 1
+
+    for incompleteTransmit, expectedDetail in (
+        (transmitSamples[:-1], "incomplete frame tail"),
+        (transmitSamples[dataStart:],
+         "frame header/tail completeness cannot be determined"),
+    ):
+        try:
+            Analysis(
+                transmitSamples,
+                transmittedSignal=incompleteTransmit,
+                parseParameters=parserParameters,
+                needFullFrameEn=True,
+                width=0,
+            ).Analyze()
+        except ValueError as error:
+            assert "transmit reference" in str(error).lower()
+            assert expectedDetail in str(error)
+        else:
+            raise AssertionError("strict mode needs a complete transmit reference")
+
+    failedUpgrade = Analysis(
+        transmitSamples[:-1],
+        transmittedSignal=transmitSamples,
+        sampleRateHz=waveform.sampleRateHz,
+        width=0,
+    )
+    retainedRawReference = failedUpgrade.referenceSignal.copy()
+    retainedRawCapture = failedUpgrade.defaultMeasuredSignal.copy()
+    try:
+        failedUpgrade.UpdateParameters(
+            needFullFrameEn=True, loadResistanceOhm=-1.0,
+        )
+    except ValueError:
+        assert failedUpgrade.GetParameters()["needFullFrameEn"] is False
+        assert failedUpgrade.waveform is None
+        assert failedUpgrade.parsedTransmitFrame is None
+        assert np.array_equal(failedUpgrade.referenceSignal, retainedRawReference)
+        assert np.array_equal(failedUpgrade.defaultMeasuredSignal, retainedRawCapture)
+        assert failedUpgrade.Analyze()["evmPercent"] < 1.0e-8
+    else:
+        raise AssertionError("a failed metadata upgrade must restore the raw context")
+
+    precedenceAnalysis = Analysis(
+        transmitSamples,
+        transmittedSignal=transmitSamples,
+        parseParameters={"sampleRateHz": 60.0e6},
+        sampleRateHz=waveform.sampleRateHz,
+        needFullFrameEn=True,
+        width=0,
+    )
+    assert precedenceAnalysis.sampleRateHz == waveform.sampleRateHz
+    assert precedenceAnalysis.Analyze()["evmPercent"] < 1.0e-8
+
+    leadingPadding = np.zeros(29, dtype=np.complex128)
+    paddedTransmit = np.concatenate((
+        leadingPadding, transmitSamples, transmitSamples,
+        np.zeros(13, dtype=np.complex128),
+    ))
+    repeatedReceive = np.concatenate((transmitSamples[101:], transmitSamples))
+    paddedAnalysis = Analysis(
+        repeatedReceive,
+        transmittedSignal=paddedTransmit,
+        parseParameters={
+            "sampleRateHz": waveform.sampleRateHz,
+            "maximumPacketOffsetSamples": leadingPadding.size,
+        },
+        needFullFrameEn=True,
+        width=0,
+    )
+    assert paddedAnalysis.parsedTransmitFrame.packetStartSample == 29
+    assert np.array_equal(paddedAnalysis.referenceSignal, transmitSamples)
+    assert paddedAnalysis.Analyze()["evmPercent"] < 1.0e-8
+    tailThenFullTransmit = np.concatenate((transmitSamples[101:], transmitSamples))
+    laterFrameStart = transmitSamples.shape[0] - 101
+    laterTransmitAnalysis = Analysis(
+        transmitSamples,
+        transmittedSignal=tailThenFullTransmit,
+        parseParameters={
+            "sampleRateHz": waveform.sampleRateHz,
+            "maximumPacketOffsetSamples": laterFrameStart,
+        },
+        needFullFrameEn=True,
+        width=0,
+    )
+    assert laterTransmitAnalysis.parsedTransmitFrame.packetStartSample == laterFrameStart
+    assert np.array_equal(laterTransmitAnalysis.referenceSignal, transmitSamples)
+    assert laterTransmitAnalysis.Analyze()["evmPercent"] < 1.0e-8
+
+    for interfaceWidth, antennaCount, bandwidthMhz in (
+        (16, 1, 20), (0, 2, 20), (16, 2, 20), (0, 1, 320),
+    ):
+        formatWaveform = WaveGenWifi(
+            frameFormat="EHT",
+            bandwidthMhz=bandwidthMhz,
+            mcs=7,
+            numDataSymbols=2,
+            sampleRateHz=bandwidthMhz * 4.0e6,
+            seed=525,
+            numTransmitAntennas=antennaCount,
+            numSpatialStreams=antennaCount,
+            spatialMapping="dft",
+            width=interfaceWidth,
+        ).Generate()
+        formatAnalysis = Analysis(
+            formatWaveform.samples,
+            transmittedSignal=formatWaveform.samples,
+            parseParameters={
+                "sampleRateHz": formatWaveform.sampleRateHz,
+                "maximumPacketOffsetSamples": 0,
+            },
+            needFullFrameEn=True,
+            width=interfaceWidth,
+        )
+        assert formatAnalysis.Analyze()["evmPercent"] < 1.0e-8
+        assert formatAnalysis.waveform.bandwidthHz == bandwidthMhz * 1.0e6
+        assert formatAnalysis.waveform.numTransmitAntennas == antennaCount
+        if interfaceWidth:
+            physicalTransmit = FixedPoint(interfaceWidth).DecodeComplex(
+                formatWaveform.samples
+            )
+            scaledOutput = FixedPoint(interfaceWidth, 4.0).EncodeComplex(
+                2.0 * physicalTransmit
+            )
+            scaledAnalysis = Analysis(
+                scaledOutput,
+                transmittedSignal=formatWaveform.samples,
+                parseParameters={"sampleRateHz": formatWaveform.sampleRateHz},
+                needFullFrameEn=False,
+                width=interfaceWidth,
+            )
+            scaledAnalysis.UpdateParameters(needFullFrameEn=True)
+            expectedMetrics = Analysis(
+                waveform=formatWaveform, width=interfaceWidth,
+                needFullFrameEn=True,
+            ).Analyze(scaledOutput)
+            actualMetrics = scaledAnalysis.Analyze()
+            for metricName in ("evmDb", "evmPercent", "outputPowerDbm"):
+                assert np.isclose(actualMetrics[metricName],
+                                  expectedMetrics[metricName], atol=1.0e-10)
+
+    customMatrix = np.array([[1.0, 1j], [1j, 1.0]]) / np.sqrt(2.0)
+    customWaveform = WaveGenWifi(
+        frameFormat="HE", bandwidthMhz=20, numDataSymbols=2,
+        sampleRateHz=80.0e6, seed=526, width=0,
+        numTransmitAntennas=2, numSpatialStreams=2,
+        spatialMapping="custom", spatialMappingMatrix=customMatrix,
+    ).Generate()
+    customAnalysis = Analysis(
+        customWaveform.samples,
+        transmittedSignal=customWaveform.samples,
+        parseParameters={
+            "sampleRateHz": customWaveform.sampleRateHz,
+            "spatialMappingMatrix": customMatrix,
+        },
+        needFullFrameEn=True,
+        width=0,
+    )
+    assert customAnalysis.Analyze()["evmPercent"] < 1.0e-8
+    assert np.allclose(customAnalysis.waveform.spatialMappingMatrix, customMatrix)
 
 
 def CheckMseEvmConvergence() -> None:
@@ -15668,6 +15962,7 @@ def RunTests() -> None:
     CheckIlcFeedbackSynchronization()
     CheckReceiveOnlyWifiAnalysis()
     CheckPartialFrameEvm()
+    CheckNumpyAssistedFullFrame()
     CheckMseEvmConvergence()
     CheckTwoToneAnalogPowerReporting()
     CheckTwoToneIlcAnalysis()

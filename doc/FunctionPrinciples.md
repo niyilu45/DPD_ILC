@@ -464,8 +464,9 @@ y_{\mathrm{long},3}[n]
 | `Analysis.Analyze`, `Analysis.GetLastMimoMetrics` | E | 直接返回普通指标字典，调用方使用固定键读取模拟输出功率、SNR、EVM、ACLR和MIMO明细 | Analysis §3.1、§10 |
 | `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把曲线或逐轮记录转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
 | `Analysis.AveragePeriodogram` | N/P | Hann窗、50%重叠的Welch PSD平均；先按原顺序累计未移位功率，最后只执行一次固定频率bin移位 | Analysis §6.2，Performance §4.2 |
-| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考，Reference为`None`时复用`WifiWaveform.samples`；发送辅助直接相关并截取公共区间，可从兼容 `parseParameters` 转交采样率/带宽但不调用Parser；仅盲模式调用ParseWifi；分别建立输入标尺1和兼容默认1的待测输出scaled full-scale格式；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§3.1、§11、ParseWifi §8 |
+| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考，Reference为`None`时复用`WifiWaveform.samples`；默认NumPy发送辅助相关截取公共区间，严格模式自动从完整发送数组恢复元数据且保留真实发送参考和原始接收范围；支持后续启用检查时升级并缓存上下文；盲模式才从接收解析并重生成参考；分别建立输入标尺1和兼容默认1的待测输出scaled full-scale格式；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§3.1、§11、ParseWifi §8 |
 | `Analysis.ResolveMeasuredOutputFormat` | E/N | 保持显式待测输出标尺最高优先级；未显式配置时读取FixedPointArray格式元数据并按对应FS解码，裸数组保留FS1兼容行为 | Analysis §1、§3.1、§11；FixedPoint §7 |
+| `Analysis.ParseAssistedTransmitFrame` | E/N | 严格NumPy发送辅助从保存的发送数组恢复帧元数据，统一Analysis采样率/位宽与Parser配置；验证原始发送帧样值完整，拒绝用重生成数据填补缺失参考；先构建候选上下文，成功验证后才原子升级并清理旧测量缓存 | Analysis §1.2、§1.4；ParseWifi §8.2 |
 | `Analysis.GetParsedWifiFrame`, `Analysis.GetAnalysisMode`, `Analysis.Width`, `Analysis.OutputFullScaleAmplitude`, `Analysis.GetSignalOverlapResult` | E | 返回盲模式解析结果、三态路径名、位宽、待测输出标尺或发送辅助重叠坐标；未产生对应结果时返回 `None` | Analysis §1、§3.1、§11、ParseWifi §8、SigProc §3.3、FixedPoint §7 |
 | `Analysis.PrepareMeasuredSignal` | E/P | 对每条物理链调用完整 `SigProc`；短捕获在未显式限制整数时延搜索范围时搜索整个参考；通过弱引用把真实捕获/插值有效掩码绑定到返回数组，不把补零视为接收样本 | Analysis §2、§9 |
 | `Analysis.ResolveEvmSymbolIndices`, `Analysis.DemodulatePreparedEvmData` | P/N | `needFullFrameEn=True` 要求所有链真实接收范围覆盖完整参考帧；默认False只要求至少一个完整FFT窗口；以所有链有效插值支持的交集筛选数据符号，对测量与参考使用完全相同的FFT窗口，不包含缺失符号或边缘补零 | Analysis §5 |

@@ -737,9 +737,9 @@ class Analysis:
 
     Explicit-reference mode receives ideal samples plus ``WifiWaveform``
     metadata. Transmit-assisted mode receives a measured waveform plus known
-    transmitted samples and directly correlates their common interval without
-    parsing a descriptor. Blind mode receives no transmitted reference, so
-    only that mode invokes ``ParseWifi`` to restore metadata and ideal samples.
+    transmitted samples. Raw arrays use direct overlap analysis by default;
+    full-frame enforcement first parses the transmit reference for metadata.
+    Blind mode parses the receive capture to restore metadata and ideal samples.
 
     Example:
         ``resultAnalysis = Analysis(referenceSignal, waveform)``
@@ -780,8 +780,9 @@ class Analysis:
             Algorithm: Select explicit-reference mode when ``waveform`` is
             supplied, use ``waveform.samples`` when that mode receives a
             ``None`` reference, select direct waveform-overlap mode when
-            ``transmittedSignal`` is supplied, and use blind descriptor
-            parsing only when neither is supplied. Analysis defaults remain
+            ``transmittedSignal`` is supplied, parse raw transmit metadata
+            when complete-frame enforcement requires it, and use blind receive
+            parsing when neither is supplied. Analysis defaults remain
             inside this constructor and are resolved through ChainMap.
 
         Args:
@@ -795,12 +796,13 @@ class Analysis:
             parseParameters: Optional ``ParseWifi`` parameter mapping. Blind
                 mode forwards the complete mapping to ``ParseWifi``.
                 Transmit-assisted mode accepts ``sampleRateHz`` and
-                ``channelBandwidthHz`` as compatibility aliases without
-                invoking the parser.
+                ``channelBandwidthHz`` as compatibility aliases. Raw-array
+                complete-frame analysis also forwards the parser settings
+                when decoding the transmit reference, excluding bandwidth.
             transmittedSignal: Optional known transmit input selecting direct
                 assisted mode. Either a metadata-rich ``WifiWaveform`` or a
-                NumPy waveform containing samples only is accepted without
-                invoking ``ParseWifi``.
+                NumPy waveform containing samples only is accepted. Raw arrays
+                are parsed on demand when needFullFrameEn becomes True.
             signalProcessingParameters: Optional explicit ``SigProc``
                 configuration mapping. This named argument is preferred over
                 nesting the same key inside ``parameters``; the nested form
@@ -899,6 +901,12 @@ class Analysis:
         )
 
         self.parsedWifiFrame: Optional[ParsedWifiFrame] = None
+        self.parsedTransmitFrame: Optional[ParsedWifiFrame] = None
+        self.numpyTransmitSamples: Optional[np.ndarray] = None
+        self.numpyMeasuredSamples: Optional[np.ndarray] = None
+        self.assistedParseParameters: Mapping[str, object] = dict(
+            parseParameters or {}
+        )
         self.signalOverlapResult: Optional[SignalOverlapResult] = None
         self.defaultMeasuredSignal: Optional[np.ndarray] = None
         self.analysisMode = "explicitReference"
@@ -929,9 +937,9 @@ class Analysis:
             if parseParameters is not None:
                 # Older callers often placed the known receiver clock in the
                 # parser mapping before the assisted path existed. Preserve
-                # that useful configuration without parsing the known
-                # transmit waveform. Explicit Analysis settings retain higher
-                # priority, and parser-only keys are warned about and ignored.
+                # that useful configuration. Explicit Analysis settings retain
+                # higher priority. Full parser settings are retained separately
+                # for an on-demand raw-reference metadata upgrade.
                 assistedParameterNames: Mapping[str, object] = (
                     MappingProxyType(
                         {
@@ -942,7 +950,16 @@ class Analysis:
                 )
                 assistedCompatibilityParameters = (
                     FilterRecognizedParameters(
-                        parseParameters,
+                        (
+                            {
+                                key: value
+                                for key, value in parseParameters.items()
+                                if key in assistedParameterNames
+                            }
+                            if not isinstance(transmittedSignal, WifiWaveform)
+                            and self.parameters["needFullFrameEn"]
+                            else parseParameters
+                        ),
                         assistedParameterNames,
                         "Analysis transmit-assisted parseParameters",
                     )
@@ -1022,6 +1039,8 @@ class Analysis:
                 floatingTransmitArray = (
                     self.interfaceFormat.DecodeComplex(transmitArray)
                 )
+                self.numpyTransmitSamples = transmitArray.copy()
+                self.numpyMeasuredSamples = measuredArray.copy()
                 self.signalOverlapResult = SigProc.EstimateSignalOverlap(
                     floatingMeasuredArray,
                     floatingTransmitArray,
@@ -1162,8 +1181,8 @@ class Analysis:
 
         Processing details:
             Algorithm: Return ``None`` for explicit-reference and
-            transmit-assisted modes because neither invokes ``ParseWifi``;
-            otherwise return the blind-mode immutable parser result.
+            transmit-assisted modes; transmit-side parsing is stored separately
+            in parsedTransmitFrame. Otherwise return the blind receive result.
 
         Returns:
             result: Parsed frame only when blind analysis was selected.
@@ -1306,6 +1325,46 @@ class Analysis:
             self.parameters.maps[0].update(previousOverrides)
             raise
 
+    def ParseAssistedTransmitFrame(self) -> ParsedWifiFrame:
+        """Recover Wi-Fi metadata from a complete raw transmit reference.
+
+        Processing details:
+            Algorithm: Parse the saved transmit samples without supplying a
+            second reference to ParseWifi, preserve its actual captured packet
+            samples, and reject a truncated reference rather than filling it
+            with regenerated payload. Build a candidate without mutating the
+            analysis context so failed parameter updates remain transactional.
+
+        Returns:
+            result: Transmit-side parser record with one complete actual frame.
+        """
+
+        if self.numpyTransmitSamples is None:
+            raise ValueError(
+                "complete-frame analysis requires a decodable transmit reference"
+            )
+        parseConfiguration = dict(self.assistedParseParameters)
+        parseConfiguration.pop("channelBandwidthHz", None)
+        parseConfiguration["width"] = self.width
+        if self.parameters["sampleRateHz"] is not None:
+            parseConfiguration["sampleRateHz"] = self.parameters["sampleRateHz"]
+        frameParser = ParseWifi(parameters=parseConfiguration)
+        try:
+            parsedTransmit = frameParser.Parse(self.numpyTransmitSamples)
+        except ValueError as parseError:
+            raise ValueError(
+                "No complete Wi-Fi frame detected in transmittedSignal: "
+                "unable to parse the transmit reference; frame header/tail "
+                "completeness cannot be determined; " + str(parseError)
+            ) from parseError
+        if parsedTransmit.receivedSignal.shape != parsedTransmit.waveform.samples.shape:
+            raise ValueError(
+                "No complete Wi-Fi frame detected in transmittedSignal: "
+                "incomplete frame tail in the transmit reference after the "
+                "decoded frame start"
+            )
+        return parsedTransmit
+
     def ValidateParameters(self) -> None:
         """Validate the currently resolved ChainMap analysis settings.
 
@@ -1323,11 +1382,6 @@ class Analysis:
         )
         if not isinstance(self.parameters["needFullFrameEn"], bool):
             raise TypeError("needFullFrameEn must be a bool")
-        if self.parameters["needFullFrameEn"] and self.waveform is None:
-            raise ValueError(
-                "needFullFrameEn=True requires WifiWaveform metadata; "
-                "raw NumPy transmit-assisted mode cannot verify a complete frame"
-            )
         maxSegmentLength = self.parameters["maxSegmentLength"]
         if (
             not isinstance(maxSegmentLength, int)
@@ -1360,9 +1414,18 @@ class Analysis:
             raise TypeError(
                 "signalProcessingParameters must be a mapping or None"
             )
+        parsedTransmitCandidate: Optional[ParsedWifiFrame] = None
+        validationWaveform = self.waveform
+        validationReference = self.referenceSignal
+        if self.parameters["needFullFrameEn"] and validationWaveform is None:
+            parsedTransmitCandidate = self.ParseAssistedTransmitFrame()
+            validationWaveform = parsedTransmitCandidate.waveform
+            validationReference = self.interfaceFormat.DecodeComplex(
+                parsedTransmitCandidate.receivedSignal
+            )
         resolvedSampleRate = (
-            self.waveform.sampleRateHz
-            if self.waveform is not None
+            validationWaveform.sampleRateHz
+            if validationWaveform is not None
             else (
                 1.0
                 if self.parameters["sampleRateHz"] is None
@@ -1379,8 +1442,8 @@ class Analysis:
                 "sampleRateHz must be finite and positive when supplied"
             )
         resolvedBandwidth = (
-            self.waveform.bandwidthHz
-            if self.waveform is not None
+            validationWaveform.bandwidthHz
+            if validationWaveform is not None
             else self.parameters["channelBandwidthHz"]
         )
         if (
@@ -1480,9 +1543,9 @@ class Analysis:
         # Constructing one temporary processor per conducted chain validates
         # nested settings without duplicating synchronization constraints.
         referenceMatrix = (
-            self.referenceSignal.reshape(-1, 1)
-            if self.referenceSignal.ndim == 1
-            else self.referenceSignal
+            validationReference.reshape(-1, 1)
+            if validationReference.ndim == 1
+            else validationReference
         )
         for chainIndex in range(referenceMatrix.shape[1]):
             SigProc(
@@ -1490,6 +1553,34 @@ class Analysis:
                 float(resolvedSampleRate),
                 parameters=signalProcessingParameters,
             )
+        if parsedTransmitCandidate is not None:
+            candidateProcessor = FrameProcess(cast(WifiWaveform, validationWaveform))
+            originalMeasured = cast(np.ndarray, self.numpyMeasuredSamples)
+            candidateOverlap = SigProc.EstimateSignalOverlap(
+                self.ResolveMeasuredOutputFormat(originalMeasured).DecodeComplex(
+                    originalMeasured
+                ),
+                validationReference,
+                maximumOffsetSamples,
+                referenceSearchSamples,
+                minimumCorrelation,
+            )
+            # Commit only after parsing and every validation succeed. Keep the
+            # original capture, including missing boundaries and later frames.
+            self.parsedTransmitFrame = parsedTransmitCandidate
+            self.referenceSignal = validationReference
+            self.waveform = validationWaveform
+            self.frameProcessor = candidateProcessor
+            self.defaultMeasuredSignal = originalMeasured.copy()
+            self.signalOverlapResult = candidateOverlap
+            self.lastSignalProcessingResult = None
+            self.lastSignalProcessingResults = tuple()
+            self.lastMimoMetrics = None
+            self.preparedSignalCoverage = []
+            self.stageMetrics = {}
+            self.stageSignalProcessingResults = {}
+            self.stageMimoMetrics = {}
+            self.powerEvmCurve = None
         self.sampleRateHz = float(resolvedSampleRate)
         self.channelBandwidthHz = (
             None
@@ -2053,6 +2144,8 @@ class Analysis:
             result: Dimensionless EVM-aligned normalized MSE.
         """
 
+        if self.parameters["needFullFrameEn"] and self.waveform is None:
+            self.ValidateParameters()
         if self.frameProcessor is None:
             complexMeasured = self.ValidatePreparedSignal(preparedSignal)
             waveformError = (
@@ -2129,6 +2222,8 @@ class Analysis:
                 numbers.
         """
 
+        if self.parameters["needFullFrameEn"] and self.waveform is None:
+            self.ValidateParameters()
         selectedSignal = measuredSignal
         if selectedSignal is None:
             if self.defaultMeasuredSignal is None:
@@ -2378,6 +2473,8 @@ class Analysis:
             result: Tuple of stream EVM-dB tuple and EVM-percent tuple.
         """
 
+        if self.parameters["needFullFrameEn"] and self.waveform is None:
+            self.ValidateParameters()
         if self.frameProcessor is None:
             complexMeasured = self.ValidatePreparedSignal(preparedSignal)
             referenceMatrix = (
@@ -3129,6 +3226,8 @@ class Analysis:
             result: Detailed relative dBr mask measurement dictionary.
         """
 
+        if self.parameters["needFullFrameEn"] and self.waveform is None:
+            self.ValidateParameters()
         selectedSignal = measuredSignal
         if selectedSignal is None:
             if self.defaultMeasuredSignal is None:
@@ -3229,6 +3328,8 @@ class Analysis:
                 IRR, and ACLR values.
         """
 
+        if self.parameters["needFullFrameEn"] and self.waveform is None:
+            self.ValidateParameters()
         selectedSignal = measuredSignal
         if selectedSignal is None:
             if self.defaultMeasuredSignal is None:

@@ -25,7 +25,7 @@ resultAnalysis = Analysis(
 metrics = resultAnalysis.Analyze()
 ```
 
-这条路径不调用 `ParseWifi`。Analysis直接把发送样值作为参考，由 `SigProc.EstimateSignalOverlap` 搜索公共区间。
+这条路径始终直接把真实发送样值作为参考。默认 `needFullFrameEn=False` 的NumPy输入由 `SigProc.EstimateSignalOverlap` 搜索公共区间，不调用 `ParseWifi`；启用 `needFullFrameEn=True` 时，Analysis自动从发送数组中的完整工程Wi-Fi帧恢复元数据，再检查原始接收capture是否完整。发送输入为 `WifiWaveform` 时则直接复用对象元数据。
 
 3. 仅接收帧盲分析路径：
 
@@ -34,7 +34,7 @@ resultAnalysis = Analysis(receivedSignal)
 metrics = resultAnalysis.Analyze()
 ```
 
-只有第三种路径在Analysis内部调用 `ParseWifi.Parse`。Parser恢复参考波形、FFT长度、GI、数据字段位置、活动音调、MCS、空间映射和CSD等信息，然后仍然调用原来的 `SigProc`、`FrameProcess` 和指标计算函数。也就是说，ParseWifi的职责严格限制为“没有任何发送参考时恢复参考信息”；SNR、EVM和ACLR公式没有在Parser中实现。
+第三种路径在Analysis内部从接收帧调用 `ParseWifi.Parse`，恢复参考波形、FFT长度、GI、数据字段位置、活动音调、MCS、空间映射和CSD等信息。严格的NumPy发送辅助也调用Parser，但输入是发送参考，恢复元数据后仍以真实发送样值进行测量，不用重生成参考替换它。两者都继续复用 `SigProc`、`FrameProcess` 和指标计算函数；SNR、EVM和ACLR公式没有在Parser中实现。
 
 ---
 
@@ -42,7 +42,7 @@ metrics = resultAnalysis.Analyze()
 
 `ParseWifi.Parse` 的 `receivedSignal` 和可选的 `transmittedSignal` 都可以是 `numpy.ndarray` 或 `WifiWaveform`。调用方始终使用同一个函数和同一组参数名，Parser根据数据类型自动选择内部路径。
 
-> 本节描述的是调用方显式创建 `ParseWifi` 并直接调用 `ParseWifi.Parse(...)` 时的兼容能力，不是 `Analysis` 的发送辅助实现。`Analysis(receivedSignal, transmittedSignal=...)` 始终绕过本节三条Parser分支。
+> 本节描述的是调用方显式创建 `ParseWifi` 并直接调用 `ParseWifi.Parse(...)` 时的兼容能力。默认Analysis发送辅助不经过Parser；严格NumPy发送辅助只使用Parser恢复发送参考的完整帧上下文，接收完整性检查与指标计算仍由Analysis执行，不调用这里的双输入发送辅助解析流程。
 
 | 模式 | `transmittedSignal` | 元数据来源 | 参考样值来源 | 适用场景 |
 |---|---|---|---|---|
@@ -515,7 +515,7 @@ referenceWaveform = WaveGenWifi(
 
 ## 6. 提供可选发送波形时
 
-本章仅说明调用方直接使用 `ParseWifi.Parse(receivedSignal, transmittedSignal=...)` 的历史兼容接口。新的 `Analysis` 发送辅助模式不会执行本章流程；其公共区间估计已下沉到 `SigProc.EstimateSignalOverlap`。
+本章仅说明调用方直接使用 `ParseWifi.Parse(receivedSignal, transmittedSignal=...)` 的历史兼容接口。Analysis发送辅助不执行本章的双输入解析流程；其公共区间估计由 `SigProc.EstimateSignalOverlap` 完成。需要完整帧检查的NumPy辅助使用单输入解析恢复发送参考元数据，保留接收原始capture供后续覆盖检查。
 
 ### 6.1 NumPy发送波形
 
@@ -698,7 +698,7 @@ metrics = resultAnalysis.Analyze()
 
 `transmitSamples` 可以是一维SISO数组，也可以是 `samples × chains` 的MIMO矩阵。
 
-这里Analysis不会调用 `ParseWifi.Parse`。它直接搜索两路波形公共区间，因此发送样值可以被裁剪、前后补零，也不要求包含Descriptor。纯NumPy输入没有帧元数据，结果采用波形域EVM/SNR；需要ACLR时同时传入 `sampleRateHz` 和 `channelBandwidthHz`。
+这里采用默认 `needFullFrameEn=False`，Analysis不会调用 `ParseWifi.Parse`。它直接搜索两路波形公共区间，因此发送样值可以被裁剪、前后补零，也不要求包含Descriptor。尚无帧元数据时，结果采用波形域EVM/SNR；需要ACLR时同时传入 `sampleRateHz` 和 `channelBandwidthHz`。
 
 已有程序如果通过 `parseParameters` 提供接收机采样率，也不需要修改调用结构：
 
@@ -714,9 +714,29 @@ resultAnalysis = Analysis(
 metrics = resultAnalysis.Analyze()
 ```
 
-此处 `parseParameters` 只是采样率/带宽的兼容入口，Analysis仍然不调用
-`ParseWifi.Parse`。Parser专用的其他键会警告后忽略；显式
+此处 `parseParameters` 只是采样率/带宽的兼容入口，默认路径仍然不调用
+`ParseWifi.Parse`。Parser专用的其他键在该路径会警告后不参与计算；显式
 `sampleRateHz=` 和 `channelBandwidthHz=` 具有更高优先级。
+
+若要验证接收记录至少包含完整一帧，可以继续只传samples，直接开启严格模式：
+
+```python
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=transmitSamples,
+    width=0,
+    sampleRateHz=320.0e6,
+    needFullFrameEn=True,
+    parseParameters={"maximumPacketOffsetSamples": 8192},
+)
+metrics = resultAnalysis.Analyze()
+```
+
+这里的 `width=0` 适用于浮点样值，整数码应改为实际位宽。Analysis自动解析发送参考中的工程描述字段，验证发送参考确实包含完整帧，再保留该帧的原始发送样值作为参考，不用Parser重生成的理想帧替换发送失真或DPD输出。接收记录不会先裁为公共区间，所以仍能报告缺头、缺尾或两者缺失。元数据恢复后EVM采用Wi-Fi数据子载波定义。
+
+严格分支把Parser专用配置用于发送解析；`channelBandwidthHz` 是Analysis兼容项，不转交Parser；显式Analysis采样率优先，Parser位宽与Analysis一致。自定义空间映射应通过 `parseParameters["spatialMappingMatrix"]` 提供。发送数组缺少可解码工程描述字段或本身没有完整帧时，会明确报发送参考错误；无法从任意未知片段凭空恢复帧边界。
+
+原始NumPy辅助实例后续通过 `UpdateParameters(needFullFrameEn=True)` 开启检查，会在参数验证时升级并保存发送元数据；直接修改活动映射时，则在下一次分析验证时升级。重复分析不反复解析。成功升级后再设 `False` 只放松接收完整性，仍计算完整Data FFT窗口的Wi-Fi EVM；若要恢复无元数据的波形域EVM，应新建实例。`GetAnalysisMode()` 始终返回 `"transmitAssisted"`，`GetParsedWifiFrame()` 仍返回 `None`，不会把发送解析伪装成盲接收解析。完整错误分类与采集范围判断见 [Analysis §1.4](./Analysis.md#14-needfullframeen部分帧evm与完整帧检查)。
 
 ### 8.3 Analysis的WifiWaveform发送对象辅助
 

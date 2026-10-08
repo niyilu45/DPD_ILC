@@ -321,7 +321,7 @@ flowchart TD
 4. `Channel.Process` 固定返回 `(chOut, fbOut)`。PA后耦合之后先对两路共同应用 `channelDly`；`chOut` 随后进入跳过全部 `fb...` 参数的VSA前向主路。默认 `sampleMode="forward"` 时，`fbOut` 是包含相同公共时延的 `chOut` 数值副本且完全不执行FB专用链。显式选择 `sampleMode="fb"` 时，两路共享一次PA记忆、热周期和公共时延，第二路再叠加FB专用时延及其他接收非理想。反馈I/Q补偿可保留单状态raw观测，也可在I/Q mixer之前对PA输出的低功率观测支路做0°/90°两状态采样，分离镜像并缓存逆FIR；后续 `filter` 模式只需第一状态。该相位旋转不作用于PA输入，也不是ADC后的数字旋转，`chOut`始终不变。
 5. 长帧处理在一次公开Channel事务内只完整校验实时配置和输入一次，理想级可复用临时数组，但PA返回值和公开输出仍重新检查，`chOut`、`fbOut` 与输入不共享可写内存。定点功率闭环只在本次校准内复用drive无关的合法DAC预设；热稳态只在本周期内复用不可变热常数与原始区间。下一次调用仍读取ChainMap新值，不缓存噪声、PA输出或温度结果。同一Channel实例含有RNG、PA记忆、温度和校准状态，不支持并发或第三方PA回调重入；并行任务应各自创建实例。完整基准和验收边界见 [Performance.md](doc/Performance.md)。
 6. `DpdIlc` 在学习期间不计算EVM、SNR或ACLR；它固定用二元组第二项 `fbOut` 做同步、MSE和更新，同时把同轮 `chOut` 保存到历史，供 `Analysis.AnalyzeIlcHistory` 计算最终参考面的RF指标。因此需要板载反馈链训练的Channel必须显式配置 `sampleMode="fb"`；`forward` 模式表示用前向主路的相同副本训练。现有 `RunMimoFrequencyDomainIlc` 是逐PA独立算法，只适用于关闭或忽略跨通道耦合；启用PA前/后耦合后的联合补偿需要完整矩阵频响或Jacobian的MIMO ILC，文档不会把逐链结果误写成联合补偿结果。
-7. `Analysis` 使用三条互相独立的路径。显式参考模式直接保存 `referenceSignal` 与 `WifiWaveform`；发送波形辅助模式对NumPy数组或 `WifiWaveform.samples` 做互相关，直接截取公共区间，绝不解析Descriptor、恢复seed或重新生成参考；只有盲分析模式才调用 `ParseWifi` 恢复包起点、格式、MCS、FFT/GI、空间结构和参考样值。三条路径之后共用 `SigProc`；具备Wi-Fi元数据时再用 `FrameProcess` 计算严格子载波EVM。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
+7. `Analysis` 使用三条路径。显式参考模式直接保存 `referenceSignal` 与 `WifiWaveform`；发送波形辅助直接使用实际发送样值，纯NumPy输入默认只搜索公共区间，设置 `needFullFrameEn=True` 后自动从发送数组恢复帧元数据并检查接收完整性，无需改传对象；盲分析则由 `ParseWifi` 从接收波形恢复包起点、格式、MCS、FFT/GI、空间结构和重生成参考。三条路径之后共用 `SigProc`；具备Wi-Fi元数据时再用 `FrameProcess` 计算严格子载波EVM。MIMO时每条物理链分别同步，ACLR汇总各链PSD，EVM按空间流统计。
 8. `Analysis.PrintConvergence` 在控制台逐轮显示 Raw MSE、去公共复增益后的 LC-MSE 和严格的 EVM 对齐 MSE；`Analysis.SaveConvergence` 保存相同数据。`Draw.SaveConvergenceCurve` 把三种归一化指标绘制在同一张收敛图中，`Draw.SavePowerEvmCurve` 则单独绘制多方法功率-EVM 图。
 
 图中从“生成独立验证 VHT/HE/EHT 帧”开始的支路专门验证部署模型的泛化能力；它使用相同格式配置和不同随机种子的载荷，不与 ILC 训练帧重复。
@@ -1007,7 +1007,9 @@ flowchart TD
     aided["显式参考路径<br/>Analysis(referenceSignal, waveform)"] --> context["Analysis上下文"]
     receiveOnly["盲分析路径<br/>Analysis(receivedInput)"] --> parser["ParseWifi.Parse"]
     transmitted["发送辅助路径<br/>Analysis(receivedInput, transmittedSignal=tx)"] --> overlap["SigProc.EstimateSignalOverlap"]
-    overlap --> directReference["直接使用发送样值作为Reference<br/>不解析Descriptor"]
+    overlap --> directReference["直接使用发送样值作为Reference"]
+    transmitted --> txMetadata["NumPy + needFullFrameEn=True<br/>解析发送帧元数据"]
+    txMetadata --> context
     directReference --> context
     parser --> parsed["ParsedWifiFrame<br/>参考 + 元数据 + 对齐接收包"]
     parsed --> context
@@ -1065,7 +1067,7 @@ flowchart TD
 **图示说明：**
 
 - 原有显式参考路径保持不变：构造时保存参考信号和 `WifiWaveform`，待测输出传给 `Analyze(measuredSignal)`。
-- 传入 `transmittedSignal` 时进入发送辅助路径。发送和接收都可为NumPy数组或 `WifiWaveform`；内部直接取得样值、搜索公共重叠区并将发送样值作为Reference，不调用 `ParseWifi`，也不恢复Descriptor、seed、MCS或GI。发送波形可以被裁剪或前后补零。
+- 传入 `transmittedSignal` 时进入发送辅助路径。发送和接收都可为NumPy数组或 `WifiWaveform`；内部始终用真实发送样值作为Reference。默认纯NumPy路径只搜索公共重叠区，不解析Descriptor，允许发送片段和前后补零。设置 `needFullFrameEn=True` 后自动解析发送数组中的完整工程Wi-Fi帧，保留原始接收capture检查缺头/缺尾，并计算Wi-Fi子载波EVM；提供 `WifiWaveform` 时直接复用元数据。
 - 仅当既没有 `waveform`、也没有 `transmittedSignal` 时进入盲分析路径，第一个输入作为接收帧交给 `ParseWifi`，恢复上下文后允许零参数 `Analyze()`。
 - `AnalyzeIlcHistory` 在ILC完成后读取每轮保存的真实输入和PA输出，用普通 `Analyze` 逐轮计算模拟输出功率、SNR、EVM和ACLR；`AnalyzeMimoIlcHistory` 先按轮组合各PA链，再使用完整空间流接收结构分析。主程序和 `SmallestSISO.py` 不再替换或缩放每轮PA输出，因此功率、压缩和EVM变化保持物理一致。两者都在Analysis层按严格EVM返回最佳轮。
 - 每次 `Analyze` 只调用一次 `SigProc.Process`，整数/分数时延、CFO、SFO 和公共复增益补偿后的同一份信号被三个指标复用。
@@ -1954,7 +1956,7 @@ measurementChOut, filteredFbOut = channel.Process(
 
 当接收数组是 `PaModel.Process(...)` 的直接输出时，Parser会分别用每个描述OFDM符号的已知导频估计复增益，撤销跨符号交织，再对90 bit短块LDPC码字执行软输入归一化min-sum译码。因此典型20 dBm输出下的Rapp、Wiener、GMP、分段GMP和Doherty输出可以直接使用 `Analysis(paOutput).Analyze()`；工程公开固定点数组携带位宽与FS1/FS2/FS4元数据，Analysis会自动按PA输出标尺解码。显式 `outputFullScaleAmplitude=paModel.outputFullScaleAmplitude` 仍可用于固定参考面并具有最高优先级。Parser仍可读取旧版magic加CRC描述。若PA已进入严重饱和、描述字段相关度低于门限，任何无参考解析都不能可靠恢复随机种子；此时应使用 `Analysis(paOutput, transmittedSignal=transmitSamples)`，其中 `transmitSamples` 可以是原始NumPy发送数组或 `WifiWaveform`。`np.asarray`、保存为普通 `.npy` 后重载或 `.tolist()` 会丢失数组元数据；这类裸整数码仍兼容默认FS1，分析内置PA/Channel的FS2输出时必须显式传标尺，否则模拟功率会低6.02 dB。
 
-后一种发送辅助调用不会把 `transmitSamples` 交给Parser。Analysis直接对发送与接收样值做互相关并将公共区间作为Reference，因此Descriptor、seed、MCS、GI和重生成步骤全部被绕过。
+后一种默认 `needFullFrameEn=False` 的发送辅助调用不会把 `transmitSamples` 交给Parser，而是直接对发送与接收样值做互相关并将公共区间作为Reference。若要求完整帧，只需添加 `needFullFrameEn=True`；Analysis会从发送数组恢复元数据，仍以真实发送样值作为误差参考，不依赖失真接收端的描述字段译码。
 
 ```python
 from inc.lib.Analysis import Analysis
@@ -1993,7 +1995,7 @@ print(assistedMetrics["evmDb"])
 
 当前构造函数签名为
 `Analysis(referenceSignal=None, waveform=None, parameters=None, parseParameters=None, transmittedSignal=None, signalProcessingParameters=None, sampleRateHz=None, channelBandwidthHz=None, width=None, outputFullScaleAmplitude=None, needFullFrameEn=None, **parameterOverrides)`。
-显式参考方式使用 `Analysis(referenceSignal, waveform, ...)`；若 `WifiWaveform` 已包含原始发送样值，也可以使用 `Analysis(None, waveform, ...)` 或 `Analysis(waveform=waveform, ...)`，内部自动把 `waveform.samples` 作为Reference。发送辅助方式使用 `Analysis(receivedSignal, transmittedSignal=txSignal, ...)`；盲分析方式使用 `Analysis(receivedSignal, ...)`。接收输入和发送输入都可以是NumPy数组或 `WifiWaveform`；MIMO采用 `samples × transmitChains`。发送辅助模式只做类型适配、公共区间搜索与同步，不调用Parser。
+显式参考方式使用 `Analysis(referenceSignal, waveform, ...)`；若 `WifiWaveform` 已包含原始发送样值，也可以使用 `Analysis(None, waveform, ...)` 或 `Analysis(waveform=waveform, ...)`，内部自动把 `waveform.samples` 作为Reference。发送辅助方式使用 `Analysis(receivedSignal, transmittedSignal=txSignal, ...)`；盲分析方式使用 `Analysis(receivedSignal, ...)`。接收输入和发送输入都可以是NumPy数组或 `WifiWaveform`；MIMO采用 `samples × transmitChains`。发送辅助默认只做公共区间搜索与同步；纯NumPy输入启用完整帧检查后会自动解析发送元数据，无需调用方传对象。
 
 `referenceSignal=None` 只在同时提供 `waveform` 的显式参考模式下表示“复用 `waveform.samples`”。发送辅助和盲分析模式的第一个参数代表接收波形；该接收波形不能为 `None`。
 
@@ -2002,7 +2004,7 @@ print(assistedMetrics["evmDb"])
 | `parameters` | `None` | 外部 `Mapping` 覆盖层；未提供的键使用 `Analysis` 构造函数内部默认值。 |
 | `width` | `16` | 参考和接收波形的I/Q接口位宽；`0`为浮点，正数输入整数码，解码后用 `complex128` 浮点值做同步和指标计算。 |
 | `outputFullScaleAmplitude` | `1.0` | 待测固定点接收波形的scaled full-scale分量标尺；显式配置优先。工程 `FixedPointArray` 自动携带实际FS，裸外部仪表和旧ndarray兼容回退1.0。 |
-| `needFullFrameEn` | `False` | EVM默认只比较真实接收范围内完整的Data FFT窗口，至少保留一个；`True`要求真实覆盖完整Wi-Fi帧，否则报错。纯NumPy发送辅助没有帧元数据，`True`明确拒绝，`False`仍计算公共区间波形域EVM。 |
+| `needFullFrameEn` | `False` | 有元数据时默认只比较真实接收范围内完整的Data FFT窗口，至少保留一个；`True`要求真实覆盖完整Wi-Fi帧。纯NumPy发送辅助默认计算公共区间波形域EVM，首次启用 `True` 会自动从发送数组恢复帧元数据，转为Wi-Fi子载波EVM并检查完整帧。 |
 | `maxSegmentLength` | `16384` | Welch PSD 的最大分段长度，必须是不小于 16 的整数。 |
 | `minimumAclrOversampling` | `3.0` | ACLR 所需最低过采样倍率，不允许小于 3。 |
 | `powerEvmFileStem` | `"power_evm_curve"` | 功率–EVM 的 CSV、JSON 默认文件名前缀。 |
@@ -2011,10 +2013,10 @@ print(assistedMetrics["evmDb"])
 | `activePowerThresholdDb` | `-60.0` | 输出功率有效区检测的逐链峰值相对门限；必须为负数。 |
 | `activeGapToleranceSamples` | `16` | 有效区掩码中允许闭合的短低幅间隙；长静默按占空比关断排除。 |
 | `signalProcessingParameters` | `None` | 显式构造参数；作为普通覆盖字典传给 `SigProc`，`None` 使用其内部默认值。旧版 `parameters={"signalProcessingParameters": {...}}` 写法仍兼容。 |
-| `parseParameters` | `None` | 盲分析路径把完整映射传给 `ParseWifi`；发送辅助路径为兼容旧调用接受其中的 `sampleRateHz` 和 `channelBandwidthHz`，但仍不调用Parser。其他Parser专用键警告后忽略。 |
-| `transmittedSignal` | `None` | 可选发送NumPy数组或 `WifiWaveform`；一旦提供就直接作为Reference并彻底绕过 `ParseWifi`。 |
-| `sampleRateHz` | `None` | 纯NumPy发送辅助模式的可选物理采样率；未提供时使用归一化采样率1，补偿仍有效，但CFO数值不具有实际Hz单位。相对发射频谱Mask必须使用实际采样率。 |
-| `channelBandwidthHz` | `None` | 纯NumPy发送辅助模式的可选信道带宽；与实际 `sampleRateHz` 同时提供后才计算ACLR，否则三个ACLR键返回 `NaN`；无 `WifiWaveform` 元数据时也是选择Mask带宽的必需项。 |
+| `parseParameters` | `None` | 盲分析用于接收解析；严格NumPy发送辅助用于发送解析，并统一采用Analysis位宽/显式采样率，兼容的 `channelBandwidthHz` 不传给Parser；默认未解析的发送辅助只使用采样率/带宽，其他Parser键警告后不参与计算。 |
+| `transmittedSignal` | `None` | 可选发送NumPy数组或 `WifiWaveform`，始终以真实发送样值为Reference；纯NumPy输入要求完整帧时自动恢复发送元数据，发送参考须包含完整且可解码的工程Wi-Fi帧。 |
+| `sampleRateHz` | `None` | 纯NumPy发送辅助的可选物理采样率，也用于严格模式发送解析。无元数据且未提供时使用归一化采样率1，CFO数值不具有实际Hz单位；解析成功后可从帧上下文获得实际采样率。相对发射频谱Mask必须使用实际采样率。 |
+| `channelBandwidthHz` | `None` | 无元数据NumPy发送辅助的可选信道带宽；该路径与实际 `sampleRateHz` 同时提供后才计算ACLR，否则三个ACLR键返回 `NaN`，也用于选择Mask带宽。成功恢复帧元数据后使用其带宽。 |
 | `wifiMaskFrameFormat` | `None` | 只用于没有 `WifiWaveform` 元数据的Mask回退路径；接受VHT/11ac、HE/11ax或EHT/11be。代码不会根据NumPy频谱猜测格式。 |
 | `assistedMaximumOffsetSamples` | `2000` | 发送辅助相关允许搜索的接收端最大前置偏移样点数。 |
 | `assistedReferenceSearchSamples` | `32768` | 每个候选偏移最多参与归一化相关的样点数。 |
@@ -2037,6 +2039,21 @@ strictAnalysis = Analysis(
 evmDb, evmPercent = strictAnalysis.CalculateEvm(receivedComplete)
 ```
 
+无需传 `WifiWaveform`，只传 `.samples` 也支持完整帧检查：
+
+```python
+arrayAnalysis = Analysis(
+    receivedComplete,
+    transmittedSignal=wifiWaveform.samples,
+    width=0,
+    sampleRateHz=wifiWaveform.sampleRateHz,
+    needFullFrameEn=True,
+)
+metrics = arrayAnalysis.Analyze()
+```
+
+以上 `width=0` 用于浮点样值，整数码应改为对应位宽。解析只从发送数组恢复边界和解调元数据，不用重生成样值替换真实发送参考。发送参考无法解析或本身不完整时，会明确报告发送参考错误。自定义MIMO映射通过 `parseParameters={"spatialMappingMatrix": spatialMappingMatrix}` 提供。之后通过 `UpdateParameters` 从 `False` 切换到 `True`，会在参数验证时恢复并缓存元数据；直接修改活动映射则在下次分析验证时执行。成功恢复后再设为 `False` 仅放松接收完整性检查，继续使用Wi-Fi子载波EVM。需回到无元数据的波形域EVM时新建Analysis。
+
 部分帧保证只适用于EVM及同路径MSE和逐空间流EVM；功率、SNR、IRR、ACLR及Mask仍有各自的数据范围和统计要求。完整三模式对照、可运行的截断示例与同步边界说明见 [Analysis部分帧EVM](doc/Analysis.md#14-needfullframeen部分帧evm与完整帧检查)。
 
 调用 `CalculatePreparedEvm` 等高级接口时，应直接传入 `PrepareMeasuredSignal` 返回的原数组，保留与该数组身份绑定的真实采样覆盖；不要先 `.copy()` 或重建数组。外部提供的等长prepared数组按调用方已保证完整、已对齐来处理，不会仅凭数组值反推原始采集范围。
@@ -2057,7 +2074,7 @@ resultAnalysis = Analysis(
 metrics = resultAnalysis.Analyze()
 ```
 
-该写法只转交两个物理频率参数，不会解析Descriptor，也不会恢复seed。
+该默认 `needFullFrameEn=False` 写法只转交两个物理频率参数，不会解析Descriptor，也不会恢复seed。
 如果同时给出 `sampleRateHz=` 或 `parameters["sampleRateHz"]`，显式
 Analysis配置优先于兼容值。
 
@@ -2858,7 +2875,7 @@ receiveObjectAnalysis = Analysis(receivedWifiWaveform)
 receiveObjectMetrics = receiveObjectAnalysis.Analyze()
 ```
 
-Analysis会在内部自动提取NumPy样值或 `WifiWaveform.samples`，无需外部指定类型。只有第一段完全盲分析示例调用Parser；两个带 `transmittedSignal` 的示例均绕过Parser。完整盲解析原理和独立 `ParseWifi` 用法见[ParseWifi说明文档](doc/ParseWifi.md)，发送辅助的公共区间原理见[SigProc说明文档](doc/SigProc.md)。
+Analysis会在内部自动提取NumPy样值或 `WifiWaveform.samples`，无需外部指定类型。上述两个带 `transmittedSignal` 的默认示例均绕过Parser；若给NumPy辅助示例添加 `needFullFrameEn=True`，则会从发送数组恢复元数据并检查接收完整帧。`GetParsedWifiFrame()` 仍仅返回盲接收解析结果，发送辅助路径返回 `None`。完整盲解析原理和独立 `ParseWifi` 用法见[ParseWifi说明文档](doc/ParseWifi.md)，发送辅助的公共区间原理见[SigProc说明文档](doc/SigProc.md)。
 
 默认在 `results/` 生成：
 
