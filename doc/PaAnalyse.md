@@ -38,6 +38,8 @@ j2\pi f_2\frac{n}{f_s}+j\phi_2
 
 ## 2. 小信号频率响应
 
+<!-- doc-check: Small-signal frequency response -->
+
 ### 2.1 扫描方法
 
 频响测试把输入RMS设为0.05，使Doherty峰值支路保持关闭，并尽量让所有模型工作在线性小信号区。对每个中心频率 $f_c$，产生间隔固定为 $\Delta f_{\mathrm{FR}}$ 的两个音调：
@@ -132,6 +134,8 @@ G_{\mathrm{ripple}}
 
 ### 2.4 小信号频响测试后的DPD建议
 
+<!-- doc-check: DPD recommendations after small-signal response tests -->
+
 频响测试首先决定DPD是否需要独立线性均衡器，以及线性均衡器应与非线性模型串联还是联合辨识。默认结果对应以下初始设计：
 
 | PA | 测试结论 | 针对性DPD结构与初始参数 | 训练和验收建议 |
@@ -146,6 +150,8 @@ G_{\mathrm{ripple}}
 ---
 
 ## 3. 双音间隔扫描与频谱记忆效应
+
+<!-- doc-check: Two-tone spacing sweep -->
 
 ### 3.1 为什么改变音调间隔
 
@@ -263,6 +269,8 @@ A_{\mathrm{IM3}}(\Delta f)
 
 ### 3.4 双音间隔测试后的DPD建议
 
+<!-- doc-check: DPD recommendations after two-tone spacing tests -->
+
 间隔扫描决定是否需要GMP交叉记忆项，以及记忆深度是否必须覆盖更快的包络变化。默认20 dBm结果给出：
 
 | PA | 测试结论 | 针对性DPD结构与初始参数 | 训练和验收建议 |
@@ -277,6 +285,8 @@ A_{\mathrm{IM3}}(\Delta f)
 ---
 
 ## 4. 动态AM-AM/AM-PM迟滞
+
+<!-- doc-check: Dynamic AM-AM/AM-PM hysteresis -->
 
 仅看IM3仍可能遗漏时域记忆。默认在4 MHz双音间隔处，把实际PA输入与输出解码到内部浮点域，并定义瞬时复增益：
 
@@ -346,6 +356,8 @@ H_{\phi}
 
 ### 4.1 动态迟滞测试后的DPD建议
 
+<!-- doc-check: DPD recommendations after dynamic hysteresis tests -->
+
 频谱间隔变化描述“输出频谱是否依赖包络速度”，动态迟滞进一步回答“同一瞬时幅度是否因为上升或下降历史而需要不同逆响应”。因此两者应分别指导DPD：
 
 | PA | 测试结论 | 针对性DPD结构与初始参数 | 训练和验收建议 |
@@ -369,6 +381,8 @@ H_{\phi}
 
 ### 5.1 标称非线性测试后的DPD建议
 
+<!-- doc-check: DPD recommendations after nominal nonlinearity tests -->
+
 20 dBm标称点用于决定非线性阶数、是否需要分段模型，以及该工作点是否已经深到不适合直接求逆。
 
 | PA | 测试结论 | 针对性DPD结构与初始参数 | 训练和验收建议 |
@@ -383,6 +397,8 @@ H_{\phi}
 ---
 
 ## 6. 输出功率扫描
+
+<!-- doc-check: Output-power sweep -->
 
 单一20 dBm工作点不能代表完整AM-AM/AM-PM与互调特性。功率扫描固定双音间隔为4 MHz，依次把每个PA闭环到
 
@@ -408,6 +424,8 @@ P_{\mathrm{target}}
 **图4说明：**左上为IM3，右上为IM5和IM7；下方为动态AM-AM和AM-PM迟滞。Rapp的互调随压缩增强，但AM-PM始终为0；Wiener到25 dBm才越过-30 dBc IM3门限；GMP的IM3从10至25 dBm单调接近基波，长包络支路使动态AM-AM仅由0.013 dB增至0.074 dB，而动态AM-PM由0.109度增至2.946度，呈现相位主导的功率相关记忆；Doherty在Peaking开启后形成独立而平滑的功率轨迹，其IM3在23至25 dBm轻微回落，IM5和IM7也呈现不同的阶次趋势，因此不能强制单调。Rapp在当前扫描中的AM-AM“迟滞”仍接近0，符合无记忆方程。
 
 ### 6.1 输出功率测试后的DPD建议
+
+<!-- doc-check: DPD recommendations after output-power tests -->
 
 功率扫描用于决定单一系数集是否足够、系数锚点放在哪里，以及最大部署功率是否已经越过稳定可逆区。
 
@@ -541,6 +559,8 @@ for recommendation in result.recommendations:
 
 ## 11. 测试结果
 
+<!-- doc-check: Test results -->
+
 以下结果由默认配置生成。所有非线性指标均在20 dBm目标下测量；各间隔点实际功率误差均不超过0.25 dB。
 
 | PA模型 | 平均小信号增益(dB) | 增益起伏(dB) | 群时延(ns) | 相位曲率(度) | IM3间隔变化(dB) | 最大IM3不对称(dB) | 动态AM-AM迟滞(dB) | 动态AM-PM迟滞(度) |
@@ -591,6 +611,8 @@ for recommendation in result.recommendations:
 ---
 
 ## 12. PA特性分析后的DPD-GMP改进与实测对比
+
+<!-- doc-check: PA-analysis-driven DPD-GMP improvements and measurements -->
 
 前面的PA分析不能停留在“建议增加阶数”这一层。`RunPaCharacterizationBenchmark` 默认继续调用 `RunDpdGmpBenchmark`，对默认GMP PA执行一条可复现的闭环：
 

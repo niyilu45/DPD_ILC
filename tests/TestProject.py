@@ -288,6 +288,59 @@ def CheckFunctionStyle() -> None:
             )
 
 
+def CheckEnglishOnlyCode() -> None:
+    """Reject non-ASCII text in Python files and executable examples.
+
+    Processing details:
+        Algorithm: Inspect root scripts plus all production, test, and
+        documentation Python files, then inspect each fenced Python example.
+        Check raw source text so comments are covered, and decoded AST string
+        constants so Unicode escapes cannot bypass the English-only rule.
+
+    Returns:
+        result: None. Violations report the file or example and line number.
+    """
+
+    projectRoot = GetProjectRoot()
+    sourceFiles = list(sorted(projectRoot.glob("*.py")))
+    for directoryName in ("inc", "tests", "doc"):
+        sourceFiles.extend(sorted((projectRoot / directoryName).rglob("*.py")))
+    codeUnits = [
+        (str(sourcePath), sourcePath.read_text(encoding="utf-8"))
+        for sourcePath in sourceFiles
+    ]
+    documentPaths = [projectRoot / "README.md"]
+    documentPaths.extend(sorted((projectRoot / "doc").rglob("*.md")))
+    pythonBlockPattern = re.compile(
+        r"^[ \t]*```(?:python|python3|py)[ \t]*\r?\n(.*?)^[ \t]*```",
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    for documentPath in documentPaths:
+        markdownText = documentPath.read_text(encoding="utf-8")
+        for blockIndex, pythonBlock in enumerate(
+            pythonBlockPattern.findall(markdownText), start=1,
+        ):
+            codeUnits.append(
+                (f"{documentPath}#python-block-{blockIndex}", pythonBlock)
+            )
+    for codeLocation, sourceText in codeUnits:
+        for lineNumber, sourceLine in enumerate(sourceText.splitlines(), start=1):
+            assert sourceLine.isascii(), (
+                "Python code must contain only English ASCII text: "
+                f"{codeLocation}:{lineNumber}"
+            )
+        syntaxTree = ast.parse(sourceText, filename=codeLocation)
+        for syntaxNode in ast.walk(syntaxTree):
+            if isinstance(syntaxNode, ast.Constant) and isinstance(
+                syntaxNode.value, str,
+            ):
+                assert syntaxNode.value.isascii(), (
+                    "Decoded Python strings must contain only English ASCII "
+                    "text; Unicode escapes cannot bypass this rule: "
+                    f"{codeLocation}:{syntaxNode.lineno}"
+                )
+
+
 def CheckNoGlobalDataVariables() -> None:
     """Reject module-level data assignments in every project Python file.
 
@@ -549,40 +602,40 @@ def CheckBenchmarkSeparation() -> None:
         )
 
     requiredDocumentSections = (
-        "A类：基础对照场景",
-        "B类：标称波形更新律场景",
-        "C类：约束与噪声鲁棒性场景",
-        "D类：IQ失衡增广场景",
-        "E类：ILC标签部署泛化场景",
-        "F类：功率-EVM扫描场景",
-        "BenchMark.py函数级结构与完整执行时序",
-        "结果文件字段与审计方法",
-        "公平性、可复现性和统计限制",
-        "分层验收清单",
-        "五种baseline的对比",
-        "同场景方法优缺点对比",
-        "C类同场景对比结论",
-        "D类同场景选择结论",
-        "同场景部署模型优缺点对比",
-        "功率维度的优缺点对比",
-        "G类：双音IM3/IM5/IM7场景",
-        "H类：Rapp/Wiener/GMP/Doherty PA双音特性",
-        "逐PA、逐测试DPD优化建议",
+        "A: Baseline scenarios",
+        "B: Nominal waveform update scenarios",
+        "C: Constraint and noise robustness scenarios",
+        "D: Augmented IQ imbalance scenarios",
+        "E: ILC-label deployment generalization scenarios",
+        "F: Power-EVM sweep scenarios",
+        "BenchMark.py function structure and execution order",
+        "Result fields and audit methods",
+        "Fairness, reproducibility, and statistical limitations",
+        "Layered acceptance checklist",
+        "Five-baseline comparison",
+        "Same-scenario method tradeoffs",
+        "C: Same-scenario comparison conclusions",
+        "D: Same-scenario selection conclusions",
+        "Same-scenario deployment-model tradeoffs",
+        "Power-dependent tradeoffs",
+        "G: Two-tone IM3/IM5/IM7 scenarios",
+        "H: Rapp/Wiener/GMP/Doherty two-tone PA characterization",
+        "Per-PA and per-test DPD recommendations",
     )
     for sectionTitle in requiredDocumentSections:
         assert sectionTitle in benchmarkDocument, (
             f"missing classified benchmark documentation: {sectionTitle}"
         )
     assert (
-        "I类：PA分析驱动的DPD-GMP分阶段性能测试"
+        "I: PA-analysis-driven staged DPD-GMP performance tests"
         in benchmarkDocument
     )
     assert (
-        "J类：通道测量与耦合感知 DPD-GMP"
+        "J: Channel measurement and coupling-aware DPD-GMP"
         in benchmarkDocument
     )
     assert (
-        "L类：DPD-LMS逐样点更新与漂移跟踪"
+        "L: Sample-by-sample DPD-LMS updates and drift tracking"
         in benchmarkDocument
     )
 
@@ -1071,7 +1124,7 @@ def CheckDocumentationApiConsistency() -> None:
             FitMimoGmpPredistorter
         ).parameters
     )
-    assert "该接口不包含 `chunkSize`" in readmeText
+    assert "This interface does not accept `chunkSize`" in readmeText
     assert "signalProcessingParameters=None," in analysisDocumentText
     assert (
         'parameters={"signalProcessingParameters": {...}}'
@@ -6738,7 +6791,7 @@ def CheckPartialFrameEvm() -> None:
             relaxedAnalysis.CalculateEvm(incompleteCapture)
         except ValueError as error:
             assert "complete" in str(error) and "FFT" in str(error)
-            assert "没有检测到完整的 Wi-Fi 数据符号" in str(error)
+            assert "No complete Wi-Fi data symbol detected" in str(error)
         else:
             raise AssertionError("EVM requires at least one complete FFT window")
 
@@ -6792,16 +6845,16 @@ def CheckPartialFrameEvm() -> None:
         ):
             assert repeatMetrics["evmPercent"] < maximumEvmPercent
     for partialCapture, expectedIncompleteField in (
-        (waveform.samples[1:], "帧头不完整"),
-        (waveform.samples[:-1], "帧尾不完整"),
-        (waveform.samples[symbolStarts[0]:], "帧头不完整"),
-        (waveform.samples[17:-19], "帧头和帧尾均不完整"),
+        (waveform.samples[1:], "incomplete frame header"),
+        (waveform.samples[:-1], "incomplete frame tail"),
+        (waveform.samples[symbolStarts[0]:], "incomplete frame header"),
+        (waveform.samples[17:-19], "incomplete frame header and tail"),
     ):
         try:
             strictAnalysis.Analyze(partialCapture)
         except ValueError as error:
             assert "complete Wi-Fi frame" in str(error)
-            assert "没有检测到完整wifi帧" in str(error)
+            assert "No complete Wi-Fi frame detected" in str(error)
             assert expectedIncompleteField in str(error)
         else:
             raise AssertionError("strict EVM must reject every incomplete frame")
@@ -6809,7 +6862,7 @@ def CheckPartialFrameEvm() -> None:
     try:
         relaxedAnalysis.CalculatePreparedEvm(retainedPartial)
     except ValueError as error:
-        assert "没有检测到完整wifi帧" in str(error)
+        assert "No complete Wi-Fi frame detected" in str(error)
     else:
         raise AssertionError("retained prepared coverage must enforce strict mode")
     relaxedAnalysis.UpdateParameters(needFullFrameEn=False)
@@ -6829,7 +6882,7 @@ def CheckPartialFrameEvm() -> None:
         liveAnalysis.CalculateEvm(waveform.samples[:-1])
     except ValueError as error:
         assert "needFullFrameEn=True" in str(error)
-        assert "没有检测到完整wifi帧" in str(error)
+        assert "No complete Wi-Fi frame detected" in str(error)
     else:
         raise AssertionError("live complete-frame settings must be revalidated")
     assert overriddenAnalysis.CalculateEvm(waveform.samples[:-1])[1] < 1.0e-8
@@ -6885,7 +6938,7 @@ def CheckPartialFrameEvm() -> None:
         blindAnalysis.Analyze()
     except ValueError as error:
         assert "complete Wi-Fi frame" in str(error)
-        assert "没有检测到完整wifi帧" in str(error)
+        assert "No complete Wi-Fi frame detected" in str(error)
     else:
         raise AssertionError("blind parsing must not pad away strict length errors")
     try:
@@ -6899,7 +6952,9 @@ def CheckPartialFrameEvm() -> None:
             width=0,
         )
     except ValueError as error:
-        assert "没有检测到完整wifi帧" in str(error)
+        assert "No complete Wi-Fi frame detected" in str(error)
+        assert "synchronization/parsing failed" in str(error)
+        assert "frame header/tail completeness cannot be determined" in str(error)
     else:
         raise AssertionError("strict blind mode must explain an undecodable header")
 
@@ -13773,17 +13828,17 @@ def CheckPaCharacterizationBenchmark() -> None:
         GetProjectRoot() / "doc" / "PaAnalyse.md"
     ).read_text(encoding="utf-8")
     for requiredText in (
-        "小信号频率响应",
-        "双音间隔扫描",
-        "动态AM-AM/AM-PM迟滞",
-        "输出功率扫描",
-        "小信号频响测试后的DPD建议",
-        "双音间隔测试后的DPD建议",
-        "动态迟滞测试后的DPD建议",
-        "标称非线性测试后的DPD建议",
-        "输出功率测试后的DPD建议",
+        "Small-signal frequency response",
+        "Two-tone spacing sweep",
+        "Dynamic AM-AM/AM-PM hysteresis",
+        "Output-power sweep",
+        "DPD recommendations after small-signal response tests",
+        "DPD recommendations after two-tone spacing tests",
+        "DPD recommendations after dynamic hysteresis tests",
+        "DPD recommendations after nominal nonlinearity tests",
+        "DPD recommendations after output-power tests",
         "pa_dpd_recommendations.csv",
-        "测试结果",
+        "Test results",
         "pa_frequency_response.png",
         "pa_memory_effect.png",
         "pa_nonlinearity_comparison.png",
@@ -14067,9 +14122,9 @@ def CheckDpdLmsModelAndBenchmark() -> None:
         ).exists()
 
     for documentName, requiredText in (
-        ("DPD-LMS.md", "逐样点更新"),
+        ("DPD-LMS.md", "Sample-by-sample updates"),
         ("DpdLms.md", "SmallestLMS.py"),
-        ("BenchMark.md", "DPD-LMS逐样点"),
+        ("BenchMark.md", "Sample-by-sample DPD-LMS updates"),
     ):
         documentText = (
             GetProjectRoot() / "doc" / documentName
@@ -14401,9 +14456,9 @@ def CheckDpdGmpModelAndBenchmark() -> None:
     )
 
     for documentName, requiredText in (
-        ("DPD-GMP.md", "加权岭回归"),
-        ("DpdGmp.md", "多功率联合训练"),
-        ("PaAnalyse.md", "PA特性分析后的DPD-GMP改进与实测对比"),
+        ("DPD-GMP.md", "Weighted ridge regression"),
+        ("DpdGmp.md", "Joint multi-power training"),
+        ("PaAnalyse.md", "PA-analysis-driven DPD-GMP improvements and measurements"),
     ):
         documentText = (
             GetProjectRoot() / "doc" / documentName
@@ -14601,11 +14656,11 @@ def CheckChannelAnalysisAndCoupledDpd() -> None:
         GetProjectRoot() / "doc" / "ChannelAnalyse.md"
     ).read_text(encoding="utf-8")
     for requiredText in (
-        "平坦度",
-        "耦合参数",
-        "群时延",
+        "Flatness",
+        "Coupling parameters",
+        "Group delay",
         "CouplingAwareDpdGmp",
-        "修改前后性能比较",
+        "Before/after performance comparison",
         "channel_analysis.png",
     ):
         assert requiredText in channelDocument
@@ -15569,6 +15624,7 @@ def RunTests() -> None:
     CheckMcsTables()
     CheckFrameFormatAliases()
     CheckFunctionStyle()
+    CheckEnglishOnlyCode()
     CheckPerformanceOptimizationEquivalence()
     CheckNoGlobalDataVariables()
     CheckModuleResponsibilityBoundaries()

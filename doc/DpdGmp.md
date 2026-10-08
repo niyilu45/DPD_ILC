@@ -266,6 +266,8 @@ print(metrics)
 
 ## 6. 多功率联合训练
 
+<!-- doc-check: Joint multi-power training -->
+
 假设已经分别获得 10、12、14 dBm 的理想参考和 ILC 标签：
 
 ```python

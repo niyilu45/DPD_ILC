@@ -103,6 +103,8 @@ EVM dB 定义为：
 
 ## 5. A类：基础对照场景
 
+<!-- doc-check: A: Baseline scenarios -->
+
 ### 5.1 场景构造
 
 训练帧使用 `outputPowerDbm=20` 和 `maximumOutputPowerDbm=25`。5 dB回退对应的0.5623只作为闭环第一次驱动预设。`PowerCalibration` 把原始Wi-Fi波形送入Wiener PA，测量实际有效突发输出功率并在内部更新预设，直到误差进入容限。前后补零和长占空比静默不进入RMS，短暂OFDM过零仍保留。基线输出不做PA后幅度重标定，因此它代表真实20 dBm压缩工作点。
@@ -119,6 +121,8 @@ EVM dB 定义为：
 基线必须表现出非零 EVM 和有限 ACLR，否则 PA 工作点过于线性，无法有效区分 ILC 方法。
 
 ### 5.4 五种baseline的对比
+
+<!-- doc-check: Five-baseline comparison -->
 
 | baseline | 物理差异 | SNR (dB) | EVM (%) | Worst ACLR (dB) | 对比用途 |
 |---|---|---:|---:|---:|---|
@@ -137,6 +141,8 @@ PA baseline 的 7.292% EVM 足以观察迭代改善；27.333 dB ACLR 说明 20 d
 ---
 
 ## 6. B类：标称波形更新律场景
+
+<!-- doc-check: B: Nominal waveform update scenarios -->
 
 ### 6.1 场景构造
 
@@ -197,6 +203,8 @@ PA baseline 的 7.292% EVM 足以观察迭代改善；27.333 dB ACLR 说明 20 d
 
 ### 6.7 同场景方法优缺点对比
 
+<!-- doc-check: Same-scenario method tradeoffs -->
+
 | 方法 | 主要优势 | 主要缺点 | 本场景证据 | 更适合的条件 |
 |---|---|---|---|---|
 | Scalar P ILC | 结构最简单、每轮成本低 | 不能显式补偿公共相位和频率选择性记忆 | EVM降至6.432%，六种方法中改善较小 | PA近似无记忆、需要快速初始验证 |
@@ -211,6 +219,8 @@ PA baseline 的 7.292% EVM 足以观察迭代改善；27.333 dB ACLR 说明 20 d
 ---
 
 ## 7. C类：约束与噪声鲁棒性场景
+
+<!-- doc-check: C: Constraint and noise robustness scenarios -->
 
 ### 7.1 C1：峰值约束
 
@@ -277,6 +287,8 @@ PA baseline 的 7.292% EVM 足以观察迭代改善；27.333 dB ACLR 说明 20 d
 
 ## 8. D类：IQ失衡增广场景
 
+<!-- doc-check: D: Augmented IQ imbalance scenarios -->
+
 ### 8.1 场景构造
 
 基础 Wiener PA 外包一层 `IQImbalancePA`，使输出同时包含原信号分量和共轭镜像分量。普通解析复多项式不能完整表达共轭支路，因此使用同时依赖输入及输入共轭的增广 ILC。
@@ -314,6 +326,8 @@ IQ 失衡使 EVM 从标称 baseline 的 7.292% 恶化到 8.488%。普通频域 I
 ---
 
 ## 9. E类：ILC标签部署泛化场景
+
+<!-- doc-check: E: ILC-label deployment generalization scenarios -->
 
 ### 9.1 场景构造
 
@@ -359,6 +373,8 @@ IQ 失衡使 EVM 从标称 baseline 的 7.292% 恶化到 8.488%。普通频域 I
 
 ### 9.6 同场景部署模型优缺点对比
 
+<!-- doc-check: Same-scenario deployment-model tradeoffs -->
+
 | 方法 | 主要优势 | 主要缺点 | 当前验证帧结论 |
 |---|---|---|---|
 | MP | 系数少、实现成熟 | 缺少交叉记忆项 | 6.681%，性能与复杂度均衡 |
@@ -372,6 +388,8 @@ IQ 失衡使 EVM 从标称 baseline 的 7.292% 恶化到 8.488%。普通频域 I
 ---
 
 ## 10. F类：功率-EVM扫描场景
+
+<!-- doc-check: F: Power-EVM sweep scenarios -->
 
 ### 10.1 场景构造
 
@@ -445,6 +463,8 @@ PA baseline 从 0.738% 恶化到 19.833%，说明扫描从 15 dB 回退区一直
 
 ### 10.5 功率维度的优缺点对比
 
+<!-- doc-check: Power-dependent tradeoffs -->
+
 | 方法组 | 低功率端表现 | 高功率端表现 | 优点 | 缺点 |
 |---|---|---|---|---|
 | PA baseline | 0.738% | 19.833% | 提供真实未补偿趋势 | 到额定极限后快速恶化 |
@@ -514,6 +534,8 @@ benchmarkRows = RunAllIlcBenchmark(benchmarkConfig)
 ---
 
 ## 13. BenchMark.py函数级结构与完整执行时序
+
+<!-- doc-check: BenchMark.py function structure and execution order -->
 
 ### 13.1 为什么benchmark必须独立于DpdIlc.py
 
@@ -1039,6 +1061,8 @@ Naive方法只改变反馈是否含噪，因而接近“没有鲁棒化措施”
 
 ### 17.7 C类同场景对比结论
 
+<!-- doc-check: C: Same-scenario comparison conclusions -->
+
 #### C1峰值约束对比
 
 | 方法 | EVM (%) | 最大峰值或约束 | 优点 | 缺点 |
@@ -1146,6 +1170,8 @@ flowchart LR
 - 当前ACLR窗口主要观察邻道总功率，不等价于镜像抑制度。
 
 ### 18.6 D类同场景选择结论
+
+<!-- doc-check: D: Same-scenario selection conclusions -->
 
 | 选择 | 何时使用 | 代价与风险 |
 |---|---|---|
@@ -1353,6 +1379,8 @@ Directional Gauss-Newton每轮还需要有限差分的额外PA调用，频域ILC
 
 ## 21. 结果文件字段与审计方法
 
+<!-- doc-check: Result fields and audit methods -->
+
 ### 21.1 all_ilc_metrics.csv
 
 参考运行固定产生22行：
@@ -1453,6 +1481,8 @@ JSON顶层包括：
 
 ## 22. 公平性、可复现性和统计限制
 
+<!-- doc-check: Fairness, reproducibility, and statistical limitations -->
+
 ### 22.1 已控制的公平性条件
 
 - 同类标称算法使用同一训练帧；
@@ -1501,6 +1531,8 @@ JSON顶层包括：
 ---
 
 ## 23. 分层验收清单
+
+<!-- doc-check: Layered acceptance checklist -->
 
 ### 23.1 运行前
 
@@ -1681,6 +1713,8 @@ MIMO场景的baseline必须使用相同空间映射、相同每链功率和相�
 
 ## 28. G类：双音IM3/IM5/IM7场景
 
+<!-- doc-check: G: Two-tone IM3/IM5/IM7 scenarios -->
+
 ### 28.1 为什么单独分类
 
 G类不构造Wi-Fi帧，也不使用EVM、MCS、GI或Descriptor。它回答：
@@ -1854,6 +1888,8 @@ rows = RunTwoToneIlcBenchmark(
 
 ## 29. H类：Rapp/Wiener/GMP/Doherty PA双音特性
 
+<!-- doc-check: H: Rapp/Wiener/GMP/Doherty two-tone PA characterization -->
+
 ### 29.1 分类目的
 
 H类不运行ILC，专门回答PA本身的三个问题：
@@ -1875,6 +1911,8 @@ H类不运行ILC，专门回答PA本身的三个问题：
 频响分支故意不做逐频点功率闭环，否则输入缩放会掩盖真实增益起伏。记忆和功率分支则在每个点重新闭环PA输入，使横向比较对应共同实测输出功率；PA输出不会被后级乘常数。
 
 ### 29.3 执行流程
+
+<!-- doc-check: Per-PA and per-test DPD recommendations -->
 
 ```mermaid
 flowchart TD
@@ -1945,6 +1983,8 @@ python tests/BenchMark.py --pa-analyse --sample-rate-hz 200000000 --tone-samples
 ---
 
 ## 30. I类：PA分析驱动的DPD-GMP分阶段性能测试
+
+<!-- doc-check: I: PA-analysis-driven staged DPD-GMP performance tests -->
 
 ### 30.1 分类目的
 
@@ -2058,6 +2098,8 @@ python tests/BenchMark.py --dpd-gmp --seed 321 --validation-seed 987
 完整原理和改进解释见 [DPD-GMP.md](./DPD-GMP.md) 与 [PaAnalyse.md第12节](./PaAnalyse.md#12-pa特性分析后的dpd-gmp改进与实测对比)。
 
 ## 31. J类：通道测量与耦合感知 DPD-GMP
+
+<!-- doc-check: J: Channel measurement and coupling-aware DPD-GMP -->
 
 ### 31.1 分类目的
 
@@ -2248,6 +2290,8 @@ python tests/BenchMark.py --channel-analyse
 - [ ] 文档明确区分理想数值残差与真实测量上限。
 
 ## 33. L类：DPD-LMS逐样点更新与漂移跟踪
+
+<!-- doc-check: L: Sample-by-sample DPD-LMS updates and drift tracking -->
 
 ### 33.1 分类目的
 

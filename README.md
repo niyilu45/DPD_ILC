@@ -80,7 +80,7 @@ doc/ParseWifi.md        接收帧解析物理原理、参数、限制和完整�
 doc/Performance.md      Analysis、SigProc、PaModel、Channel、FEC与ParseWifi性能优化和验收方法
 ```
 
-所有代码注释与文档字符串均为英文；除 Python 协议强制要求的 `__init__` 等双下划线方法外，所有函数（包括内部辅助函数）都使用大驼峰命名。变量和对外对象属性使用小驼峰命名；属性底层访问器使用大驼峰函数名，并通过小驼峰属性别名保持调用接口一致。
+工程源代码、测试代码和文档中的可执行代码示例只能使用英文，禁止中文，包括注释、文档字符串、报错消息、日志和测试断言字符串；不能用 Unicode 转义把中文隐藏在代码中。回归检查覆盖全部 Python 文件和文档中的 Python 示例，要求代码文本为 ASCII。中文说明文档正文不受此限制。除 Python 协议强制要求的 `__init__` 等双下划线方法外，所有函数（包括内部辅助函数）都使用大驼峰命名。变量和对外对象属性使用小驼峰命名；属性底层访问器使用大驼峰函数名，并通过小驼峰属性别名保持调用接口一致。
 
 工程源代码、测试和文档中的Python示例均禁止使用 `del` 语法。为保持回调接口而保留的未使用参数无需显式处理。
 
@@ -2020,7 +2020,7 @@ print(assistedMetrics["evmDb"])
 | `assistedReferenceSearchSamples` | `32768` | 每个候选偏移最多参与归一化相关的样点数。 |
 | `assistedMinimumCorrelation` | `0.12` | 发送辅助公共区间的最低归一化相关幅度。 |
 
-`needFullFrameEn` 支持直接参数和 `parameters` 两种配置；签名中的 `None` 表示采用配置映射或内部默认 `False`，显式布尔参数优先。已知Reference或发送 `WifiWaveform` 时，缺帧头、缺帧尾的接收片段可以用现存完整Data FFT窗口计算EVM；盲分析即使设为 `False` 也必须保留足够帧头以恢复本工程描述字段，只支持可解析帧头下的尾截断。对齐补零不算真实采集，不能让不完整帧通过 `True` 检查。要求完整帧但接收记录未满足时，`ValueError` 的报错文本明确包含“没有检测到完整wifi帧”，并按可确认的真实接收范围指出“帧头不完整”“帧尾不完整”或“帧头和帧尾均不完整”。盲解析无法可靠定位时提示“无法同步/解析，无法判断帧头、帧尾完整性”，不猜测缺失位置。
+`needFullFrameEn` 支持直接参数和 `parameters` 两种配置；签名中的 `None` 表示采用配置映射或内部默认 `False`，显式布尔参数优先。已知Reference或发送 `WifiWaveform` 时，缺帧头、缺帧尾的接收片段可以用现存完整Data FFT窗口计算EVM；盲分析即使设为 `False` 也必须保留足够帧头以恢复本工程描述字段，只支持可解析帧头下的尾截断。对齐补零不算真实采集，不能让不完整帧通过 `True` 检查。要求完整帧但接收记录未满足时，`ValueError` 的英文报错以 `No complete Wi-Fi frame detected` 开头，并按可确认的真实接收范围指出 `incomplete frame header`（帧头不完整）、`incomplete frame tail`（帧尾不完整）或 `incomplete frame header and tail`（两者均不完整）。盲解析无法可靠定位时提示 `synchronization/parsing failed; frame header/tail completeness cannot be determined`，不猜测缺失位置。
 
 ```python
 partialAnalysis = Analysis(
@@ -2141,7 +2141,7 @@ resultAnalysis = Analysis(wifiWaveform.samples, wifiWaveform, width=0)
 maskResult = resultAnalysis.MeasureWifiSpectralMask(wifiWaveform.samples)
 
 print(maskResult["assessmentType"], maskResult["passed"])
-print(maskResult["certificationResult"])  # None：不是认证结论
+print(maskResult["certificationResult"])  # None: not a certification result.
 print(maskResult["minimumMarginDb"], maskResult["worstFrequencyHz"])
 
 frequencyMhz = np.asarray(maskResult["frequencyBinsHz"]) / 1.0e6
@@ -2291,7 +2291,7 @@ x[n]-\frac{\bar y_k[n]}{\hat g_k}.
 | --- | --- |
 | `FitGmpPredistorter` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`、`crossMemoryDepth=2`、`ridgeFactor=1e-6`、`chunkSize=8192`。 |
 | `RunMimoFrequencyDomainIlc` | 接收矩阵与 `MimoPaModel`，其余参数同 `RunFrequencyDomainIlc`；逐 PA 返回独立历史。 |
-| `FitMimoGmpPredistorter` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`、`crossMemoryDepth=2`、`ridgeFactor=1e-6`；逐列拟合并返回 `MimoGmpPredistorter`。该接口不包含 `chunkSize`。 |
+| `FitMimoGmpPredistorter` | `nonlinearOrders=(1,3,5,7)`、`memoryDepth=3`、`crossMemoryDepth=2`、`ridgeFactor=1e-6`；逐列拟合并返回 `MimoGmpPredistorter`。该接口不包含 `chunkSize`（This interface does not accept `chunkSize`）。 |
 | `FitVolterraPredistorter` | `memoryDepth=3`、`ridgeFactor=1e-6`。 |
 | `FitLutPredistorter` | `binCount=64`、`ridgeFactor=1e-8`。 |
 | `FitNeuralPredistorter` | `memoryDepth=4`、`hiddenUnitCount=32`、`ridgeFactor=1e-5`、`randomSeed=71`。 |

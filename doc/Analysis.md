@@ -302,7 +302,13 @@ if mimoMetrics is not None:
 
 `needFullFrameEn` 的实际默认值为 `False`。它既可以通过 `parameters={"needFullFrameEn": True}` 配置，也可以使用显式构造参数 `needFullFrameEn=True`；显式非 `None` 值优先。签名中的 `needFullFrameEn=None` 表示继续读取 `parameters` 和内部默认值，并不表示第三种测量模式。配置值必须是布尔值。
 
-要求完整帧但接收记录不满足时，抛出的 `ValueError` 文本明确包含“没有检测到完整wifi帧”，便于调用方和使用者识别完整性失败。可可靠定位帧边界时，错误进一步区分“没有检测到完整wifi帧：帧头不完整”“没有检测到完整wifi帧：帧尾不完整”或“没有检测到完整wifi帧：帧头和帧尾均不完整”。盲解析没有可靠帧定位时，提示“无法同步/解析，无法判断帧头、帧尾完整性”，不会把同步或描述字段译码失败直接解释成缺帧头。这类错误与部分帧模式下“没有完整Data FFT窗口”以及普通数据类型错误分别处理。
+要求完整帧但接收记录不满足时，抛出的 `ValueError` 文本以 `No complete Wi-Fi frame detected` 开头，便于调用方和使用者识别完整性失败。按照工程英文代码规范，实际报错仅使用英文，可可靠定位帧边界时分别提示：
+
+- `No complete Wi-Fi frame detected: incomplete frame header`：帧头不完整。
+- `No complete Wi-Fi frame detected: incomplete frame tail`：帧尾不完整。
+- `No complete Wi-Fi frame detected: incomplete frame header and tail`：帧头和帧尾均不完整。
+
+盲解析没有可靠帧定位时，提示 `No complete Wi-Fi frame detected: synchronization/parsing failed; frame header/tail completeness cannot be determined`，并保留原始异常原因，不会把同步或描述字段译码失败直接解释成缺帧头。这类错误与部分帧模式下的 `No complete Wi-Fi data symbol detected`（没有完整Data FFT窗口）以及普通数据类型错误分别处理。
 
 | 分析路径 | `False`：允许部分帧 | `True`：要求完整帧 |
 | --- | --- | --- |

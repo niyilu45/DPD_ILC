@@ -1087,8 +1087,9 @@ class Analysis:
             except ValueError as parseError:
                 if self.parameters["needFullFrameEn"]:
                     raise ValueError(
-                        "没有检测到完整wifi帧：无法同步/解析，"
-                        "无法判断帧头、帧尾完整性；" + str(parseError)
+                        "No complete Wi-Fi frame detected: synchronization/parsing "
+                        "failed; frame header/tail completeness cannot be determined; "
+                        + str(parseError)
                     ) from parseError
                 raise
             selectedReference = self.parsedWifiFrame.referenceSignal
@@ -1576,8 +1577,9 @@ class Analysis:
             except (ValueError, RuntimeError) as synchronizationError:
                 if self.parameters["needFullFrameEn"]:
                     raise ValueError(
-                        "没有检测到完整wifi帧：无法同步/解析，"
-                        "无法判断帧头、帧尾完整性；" + str(synchronizationError)
+                        "No complete Wi-Fi frame detected: synchronization/parsing "
+                        "failed; frame header/tail completeness cannot be determined; "
+                        + str(synchronizationError)
                     ) from synchronizationError
                 raise
             processingResults.append(processingResult)
@@ -1939,15 +1941,15 @@ class Analysis:
             missingHead = not capturedSampleMask[0]
             missingTail = not capturedSampleMask[-1]
             if missingHead and missingTail:
-                missingDescription = "帧头和帧尾均不完整"
+                missingDescription = "incomplete frame header and tail"
             elif missingHead:
-                missingDescription = "帧头不完整"
+                missingDescription = "incomplete frame header"
             elif missingTail:
-                missingDescription = "帧尾不完整"
+                missingDescription = "incomplete frame tail"
             else:
-                missingDescription = "帧内采样不完整"
+                missingDescription = "missing samples inside frame"
             raise ValueError(
-                "没有检测到完整wifi帧：" + missingDescription + "；"
+                "No complete Wi-Fi frame detected: " + missingDescription + "; "
                 "needFullFrameEn=True requires at least one complete Wi-Fi frame; "
                 "the received capture does not cover the complete reference frame"
             )
@@ -1964,7 +1966,7 @@ class Analysis:
         )
         if selectedIndices.size == 0:
             raise ValueError(
-                "没有检测到完整的 Wi-Fi 数据符号，无法计算 EVM；"
+                "No complete Wi-Fi data symbol detected; "
                 "EVM requires at least one complete Wi-Fi data-symbol FFT window "
                 "within the received capture"
             )

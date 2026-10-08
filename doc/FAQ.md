@@ -3407,7 +3407,7 @@ channelParameters = {
     "noiseSnrDb": None,
 }
 
-# 若要保持各功率点相同的相对接收SNR：
+# Keep the same relative receive SNR at every power point.
 relativeNoiseParameters = {
     **channelParameters,
     "noiseSnrDb": 45.0,

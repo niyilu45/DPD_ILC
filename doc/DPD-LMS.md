@@ -14,6 +14,8 @@
 
 ## 1. 逐样点DPD-LMS解决什么问题
 
+<!-- doc-check: Sample-by-sample updates -->
+
 批量岭回归收集一整批参考和标签后求解一次：
 
 ```math
