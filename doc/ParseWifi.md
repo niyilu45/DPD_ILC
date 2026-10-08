@@ -465,6 +465,10 @@ L_i^{(0)}
 
 CP会使相邻少量采样偏移仍可能得到可判决的FFT结果。Parser找到第一个LDPC有效或历史CRC有效候选后，不立即返回，而是在一个传统CP范围内重新搜索，并选择导频或magic相关值最大的采样位置。
 
+细化仍按原顺序访问配置范围内的每个采样偏移，不使用稀疏搜索或提前结束。为减少重复FEC计算，`FindDescriptor` 维护已经通过描述校验、格式位置、天线数和采样率检查的最佳置信度，并把它作为 `DecodeDescriptorAt(..., minimumCandidateConfidence=...)` 的下界。每个副本先计算与原算法相同的导频相关或历史magic相关，只有低于这个有效最佳值、因此不可能成为最终优胜者的副本，才跳过后续LDPC/CRC译码。相同得分仍然参与，搜索顺序和等分时的选择不变；最佳值只在候选验证成功后提高，不能由一个高相关但无效的描述字段抬高。
+
+这个下界仅在本次细化内有效，不跨capture缓存，也不放宽 `minimumParseConfidence`。`DecodeDescriptorAt` 独立调用的默认下界为0，保留原阈值；最终优胜包起点仍执行原来的完整参考重生成与一致性验证。导频位置、期望符号及其能量在一次候选调用内复用，不改变相关置信度的定义。
+
 这一步避免把真实包起点前一个采样误判为包起点。
 
 对于本工程生成的PA输出，典型的仅接收调用为：
@@ -490,7 +494,7 @@ resultAnalysis = Analysis(
 metrics = resultAnalysis.Analyze()
 ```
 
-`transmittedSignal` 也可以直接使用 `transmitWaveform.samples`。这条Analysis辅助路径不进入Parser，不读取发送Descriptor，而是用发送/接收互相关找到公共区间并直接把发送样值作为参考。
+`transmittedSignal` 也可以直接使用 `transmitWaveform.samples`。默认 `needFullFrameEn=False` 时，这条Analysis辅助路径不进入Parser，不读取发送Descriptor，而是用发送/接收互相关找到公共区间并直接把发送样值作为参考。严格完整帧模式的发送解析见 §8.2。
 
 ### 5.5 参考重生成
 
@@ -733,6 +737,8 @@ metrics = resultAnalysis.Analyze()
 ```
 
 这里的 `width=0` 适用于浮点样值，整数码应改为实际位宽。Analysis自动解析发送参考中的工程描述字段，验证发送参考确实包含完整帧，再保留该帧的原始发送样值作为参考，不用Parser重生成的理想帧替换发送失真或DPD输出。接收记录不会先裁为公共区间，所以仍能报告缺头、缺尾或两者缺失。元数据恢复后EVM采用Wi-Fi数据子载波定义。
+
+构造时直接启用严格模式，会先解析发送参考，再仅针对解析得到的最终真实发送帧估计一次发送/接收公共区间；不再预先对原始数组做一次随后被丢弃的重叠搜索。接收capture依旧完整保留，后续同步、完整帧覆盖判断及错误分类没有省略。默认非严格路径仍直接做一次原始发送/接收重叠搜索，不额外解析Descriptor。
 
 严格分支把Parser专用配置用于发送解析；`channelBandwidthHz` 是Analysis兼容项，不转交Parser；显式Analysis采样率优先，Parser位宽与Analysis一致。自定义空间映射应通过 `parseParameters["spatialMappingMatrix"]` 提供。发送数组缺少可解码工程描述字段或本身没有完整帧时，会明确报发送参考错误；无法从任意未知片段凭空恢复帧边界。
 

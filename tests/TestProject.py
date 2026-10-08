@@ -15156,6 +15156,688 @@ def FindLegacyActiveSampleMask(
     return activeMask[:, 0] if inputWasVector else activeMask
 
 
+def CheckDescriptorRefinementPruning() -> None:
+    """Preserve descriptor refinement results while skipping losing decodes.
+
+    Processing details:
+        Algorithm: Compare refinement against an oracle that always uses the
+        original zero confidence floor. Exercise padded and noisy floating
+        and fixed-point VHT/HE/EHT captures, then count LDPC decoder calls on a
+        wideband frame. Check equal-score acceptance and invalid floor inputs
+        independently without relying on machine-specific timing limits.
+
+    Returns:
+        result: None. Assertions protect packet positions, confidence,
+            metadata, sample values, and the exact pruning boundary.
+    """
+
+    from inc.lib.ParseWifi import DecodeWifiDescriptorLdpcValues
+
+    originalDecode = ParseWifi.DecodeDescriptorAt
+
+    def DecodeWithoutConfidenceFloor(
+        parser: ParseWifi,
+        receivedSignal: np.ndarray,
+        packetStartSample: int,
+        sampleRateHz: float,
+        descriptorOffsetSymbols: int,
+        evaluateCorrectionCandidates: bool = True,
+        minimumCandidateConfidence: float = 0.0,
+    ) -> tuple[dict[str, object], float]:
+        """Run the same candidate decoder with refinement pruning disabled.
+
+        Processing details:
+            Algorithm: Retain the caller's packet location, sample rate, and
+            final-validation flag, but replace the optional floor with zero
+            to reproduce the original exhaustive error-correction work.
+
+        Args:
+            parser: Independent parser instance for the oracle measurement.
+            receivedSignal: Floating receive samples used by the parser.
+            packetStartSample: Candidate packet-start index.
+            sampleRateHz: Candidate receiver clock in hertz.
+            descriptorOffsetSymbols: Format-dependent descriptor location.
+            evaluateCorrectionCandidates: Original full-packet scoring flag.
+            minimumCandidateConfidence: Deliberately ignored pruning bound.
+
+        Returns:
+            result: Protected descriptor parameters and their confidence.
+        """
+
+        return originalDecode(
+            parser,
+            receivedSignal,
+            packetStartSample,
+            sampleRateHz,
+            descriptorOffsetSymbols,
+            evaluateCorrectionCandidates,
+            0.0,
+        )
+
+    cases = (
+        ("VHT", 20, 0), ("VHT", 20, 16),
+        ("HE", 20, 0), ("HE", 20, 16),
+        ("EHT", 20, 0), ("EHT", 20, 16),
+        ("EHT", 320, 0),
+    )
+    for caseIndex, (frameFormat, bandwidthMhz, interfaceWidth) in enumerate(cases):
+        waveform = WaveGenWifi(
+            frameFormat=frameFormat,
+            bandwidthMhz=bandwidthMhz,
+            sampleRateHz=bandwidthMhz * 4.0e6,
+            numDataSymbols=2,
+            seed=734 + caseIndex,
+            width=interfaceWidth,
+        ).Generate()
+        interfaceFormat = FixedPoint(interfaceWidth)
+        physicalSamples = interfaceFormat.DecodeComplex(waveform.samples)
+        leadingSamples = 3 + caseIndex
+        if bandwidthMhz == 20:
+            randomGenerator = np.random.default_rng(834 + caseIndex)
+            physicalSamples = physicalSamples + 0.002 * (
+                randomGenerator.normal(size=physicalSamples.shape)
+                + 1j * randomGenerator.normal(size=physicalSamples.shape)
+            )
+        capture = interfaceFormat.EncodeComplex(np.concatenate((
+            np.zeros(leadingSamples, dtype=np.complex128), physicalSamples,
+        )))
+        parseParameters = {
+            "sampleRateHz": waveform.sampleRateHz,
+            "width": interfaceWidth,
+            "maximumPacketOffsetSamples": leadingSamples + 32,
+        }
+        with patch(
+            "inc.lib.ParseWifi.DecodeWifiDescriptorLdpcValues",
+            wraps=DecodeWifiDescriptorLdpcValues,
+        ) as optimizedDecoder:
+            optimized = ParseWifi(parameters=parseParameters).Parse(capture)
+        with patch.object(
+            ParseWifi, "DecodeDescriptorAt", DecodeWithoutConfidenceFloor,
+        ), patch(
+            "inc.lib.ParseWifi.DecodeWifiDescriptorLdpcValues",
+            wraps=DecodeWifiDescriptorLdpcValues,
+        ) as exhaustiveDecoder:
+            exhaustive = ParseWifi(parameters=parseParameters).Parse(capture)
+        assert optimized.packetStartSample == exhaustive.packetStartSample
+        assert optimized.parseConfidence == exhaustive.parseConfidence
+        assert optimized.detectedParameters == exhaustive.detectedParameters
+        assert np.array_equal(optimized.receivedSignal, exhaustive.receivedSignal)
+        assert np.array_equal(optimized.referenceSignal, exhaustive.referenceSignal)
+        assert optimizedDecoder.call_count <= exhaustiveDecoder.call_count
+        if bandwidthMhz == 320:
+            assert optimizedDecoder.call_count < exhaustiveDecoder.call_count
+
+        floatingCapture = interfaceFormat.DecodeComplex(capture)
+        parser = ParseWifi(parameters=parseParameters)
+        descriptorOffset = 5 if frameFormat == "VHT" else 6
+        expectedParameters, expectedConfidence = parser.DecodeDescriptorAt(
+            floatingCapture, optimized.packetStartSample,
+            waveform.sampleRateHz, descriptorOffset, False,
+        )
+        equalParameters, equalConfidence = parser.DecodeDescriptorAt(
+            floatingCapture, optimized.packetStartSample,
+            waveform.sampleRateHz, descriptorOffset, False,
+            expectedConfidence,
+        )
+        assert equalParameters == expectedParameters
+        assert equalConfidence == expectedConfidence
+        try:
+            parser.DecodeDescriptorAt(
+                floatingCapture, optimized.packetStartSample,
+                waveform.sampleRateHz, descriptorOffset, False,
+                float(np.nextafter(expectedConfidence, np.inf)),
+            )
+        except ValueError as error:
+            assert "no LDPC-valid or legacy CRC-valid" in str(error)
+        else:
+            raise AssertionError("a strictly higher floor must reject every copy")
+
+    for invalidFloor in (-1.0, float("nan"), float("inf"), True, "0.8", None):
+        try:
+            parser.DecodeDescriptorAt(
+                floatingCapture, optimized.packetStartSample,
+                waveform.sampleRateHz, descriptorOffset, False, invalidFloor,
+            )
+        except ValueError as error:
+            assert "minimumCandidateConfidence" in str(error)
+        else:
+            raise AssertionError("invalid candidate confidence floors must fail")
+
+
+def CheckBatchedWifiDemodulation() -> None:
+    """Compare bounded OFDM batches with the original per-symbol receiver.
+
+    Processing details:
+        Algorithm: Recover floating and decoded fixed-point SISO/MIMO frames
+        with an independent per-symbol FFT oracle. Exercise reordered,
+        repeated, limited, and noncontiguous inputs, and inspect transform
+        calls to prove bounded working batches without timing assertions.
+
+    Returns:
+        result: None. Assertions protect symbol values, ordering, and errors.
+    """
+
+    from inc.utils.FrameProcess import BuildCsdPhaseMatrix, FrameProcess
+
+    def LegacyDemodulation(
+        processor: FrameProcess,
+        preparedSignal: np.ndarray,
+        selectedIndices: np.ndarray,
+    ) -> np.ndarray:
+        """Recover selected symbols through the original scalar FFT loop.
+
+        Processing details:
+            Algorithm: Slice each useful symbol independently, transform its
+            sample axis, select tones, undo CSD, and invert spatial mapping.
+
+        Args:
+            processor: Validated frame metadata and receiver context.
+            preparedSignal: Floating samples on the complete frame grid.
+            selectedIndices: Ordered symbol indices after any count limit.
+
+        Returns:
+            result: Recovered SISO matrix or MIMO spatial-stream tensor.
+        """
+
+        waveform = processor.waveform
+        csdPhase = BuildCsdPhaseMatrix(
+            waveform.dataSubcarriers,
+            waveform.sampleRateHz / waveform.fftLength,
+            waveform.cyclicShiftsSeconds,
+        )
+        recoveredSymbols = []
+        for symbolIndex in selectedIndices:
+            usefulStart = (
+                int(waveform.dataSymbolStarts[symbolIndex])
+                + waveform.cpLength
+            )
+            usefulSamples = preparedSignal[
+                usefulStart:usefulStart + waveform.fftLength
+            ]
+            usefulMatrix = (
+                usefulSamples.reshape(-1, 1)
+                if usefulSamples.ndim == 1
+                else usefulSamples
+            )
+            frequencyGrid = np.fft.fft(usefulMatrix, axis=0) / np.sqrt(
+                waveform.fftLength
+            )
+            antennaData = frequencyGrid[
+                np.mod(waveform.dataSubcarriers, waveform.fftLength)
+            ]
+            recoveredSymbols.append(
+                (antennaData * np.conj(csdPhase))
+                @ np.conj(waveform.spatialMappingMatrix)
+            )
+        recoveredArray = np.asarray(recoveredSymbols)
+        return (
+            recoveredArray[:, :, 0]
+            if waveform.numTransmitAntennas == 1
+            else recoveredArray
+        )
+
+    randomGenerator = np.random.default_rng(20261008)
+    customMapping, _ = np.linalg.qr(
+        randomGenerator.normal(size=(4, 3))
+        + 1j * randomGenerator.normal(size=(4, 3))
+    )
+    originalFft = np.fft.fft
+    for frameFormat, bandwidthMhz, antennaCount, streamCount, width in (
+        ("VHT", 20, 1, 1, 0),
+        ("HE", 80, 4, 3, 16),
+        ("EHT", 320, 1, 1, 0),
+    ):
+        waveform = WaveGenWifi(
+            frameFormat=frameFormat,
+            bandwidthMhz=bandwidthMhz,
+            numDataSymbols=40,
+            oversampling=4,
+            numTransmitAntennas=antennaCount,
+            numSpatialStreams=streamCount,
+            spatialMapping="custom" if antennaCount > 1 else "direct",
+            spatialMappingMatrix=customMapping if antennaCount > 1 else None,
+            width=width,
+        ).Generate()
+        decodedSignal = FixedPoint(width).DecodeComplex(waveform.samples)
+        backingShape = (2 * decodedSignal.shape[0],) + decodedSignal.shape[1:]
+        backingSignal = np.empty(backingShape, dtype=np.complex128)
+        backingSignal[::2] = decodedSignal * (0.81 + 0.12j)
+        preparedSignal = backingSignal[::2]
+        originalSignal = preparedSignal.copy()
+        processor = FrameProcess(waveform)
+        batchSymbolCount = max(1, 131072 // (waveform.fftLength * antennaCount))
+        for symbolIndices, maximumSymbolCount in (
+            (None, None),
+            (None, 3),
+            (np.arange(39, -1, -1), None),
+            (np.tile(np.array([39, 0, 3, 3, 1]), 8), None),
+            (np.array([4, 1, 3, 2]), 2),
+            (np.arange(0, 40, 2), 200),
+        ):
+            selectedIndices = (
+                np.arange(40) if symbolIndices is None else symbolIndices
+            )
+            if maximumSymbolCount is not None:
+                selectedIndices = selectedIndices[:maximumSymbolCount]
+            expected = LegacyDemodulation(
+                processor, preparedSignal, selectedIndices
+            )
+            with patch("numpy.fft.fft", wraps=originalFft) as trackedFft:
+                actual = processor.DemodulatePreparedWifiData(
+                    preparedSignal,
+                    maximumSymbolCount=maximumSymbolCount,
+                    symbolIndices=symbolIndices,
+                )
+            np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)
+            expectedCallCount = (
+                selectedIndices.size + batchSymbolCount - 1
+            ) // batchSymbolCount
+            assert trackedFft.call_count == expectedCallCount
+            for fftCall in trackedFft.call_args_list:
+                fftInput = fftCall.args[0]
+                assert fftCall.kwargs["axis"] == 1
+                assert fftInput.shape[1:] == (waveform.fftLength, antennaCount)
+                assert fftInput.size <= max(
+                    131072, waveform.fftLength * antennaCount
+                )
+                if symbolIndices is None:
+                    assert np.shares_memory(fftInput, preparedSignal)
+        np.testing.assert_array_equal(preparedSignal, originalSignal)
+        for symbolIndices in (
+            np.array([], dtype=int),
+            np.array([40]),
+            np.array([-1]),
+            np.array([1.0]),
+            np.array([[1]]),
+        ):
+            try:
+                processor.DemodulatePreparedWifiData(
+                    preparedSignal, symbolIndices=symbolIndices
+                )
+            except ValueError as error:
+                assert str(error) == "symbolIndices must contain valid data-symbol indices"
+            else:
+                raise AssertionError("Invalid symbol indices must be rejected")
+        for maximumSymbolCount in (0, True, np.int64(2)):
+            try:
+                processor.DemodulatePreparedWifiData(
+                    preparedSignal, maximumSymbolCount=maximumSymbolCount
+                )
+            except ValueError as error:
+                assert str(error) == "maximumSymbolCount must be a positive integer or None"
+            else:
+                raise AssertionError("Invalid symbol limits must be rejected")
+        try:
+            processor.DemodulatePreparedWifiData(preparedSignal[:-1])
+        except ValueError as error:
+            assert str(error) == "preparedSignal shape must match waveform.samples"
+        else:
+            raise AssertionError("Short prepared arrays must be rejected")
+
+    # A single unusually long symbol must still be processed in one batch.
+    largeWaveform = replace(
+        waveform,
+        samples=np.ones(262144, dtype=np.complex128),
+        fftLength=262144,
+        cpLength=0,
+        dataSymbolStarts=np.array([0]),
+        dataSubcarriers=np.array([-1, 1]),
+    )
+    largeProcessor = FrameProcess(largeWaveform)
+    expected = LegacyDemodulation(
+        largeProcessor, largeWaveform.samples, np.array([0])
+    )
+    with patch("numpy.fft.fft", wraps=originalFft) as trackedFft:
+        actual = largeProcessor.DemodulatePreparedWifiData(largeWaveform.samples)
+    np.testing.assert_array_equal(actual, expected)
+    assert trackedFft.call_count == 1
+    assert trackedFft.call_args.args[0].shape == (1, 262144, 1)
+
+
+def CheckBoundedIntegerDelayFft() -> None:
+    """Verify reduced delay-search FFTs against the full linear transform.
+
+    Processing details:
+        Algorithm: Force the same normalization and selection rules through
+        the legacy full FFT and compare signed delays for asymmetric records,
+        partial or repeated frames, explicit bounds, and periodic ties. Count
+        transform sizes to verify acceleration without wall-clock thresholds.
+
+    Returns:
+        result: None. Assertions protect lag, search-range, and tie semantics.
+    """
+
+    randomGenerator = np.random.default_rng(20261008)
+    referenceSignal = (
+        randomGenerator.normal(size=5000)
+        + 1j * randomGenerator.normal(size=5000)
+    )
+    measuredGain = 0.63 * np.exp(0.37j)
+    cases = [
+        (referenceSignal, measuredGain * referenceSignal, 64, False, 0),
+        (referenceSignal, measuredGain * referenceSignal, None, False, 0),
+        (referenceSignal, measuredGain * referenceSignal, 0, False, 0),
+        (
+            referenceSignal,
+            np.r_[np.zeros(31), measuredGain * referenceSignal, np.zeros(19)],
+            64,
+            False,
+            31,
+        ),
+        (referenceSignal, measuredGain * referenceSignal[27:], 64, False, -27),
+        (
+            referenceSignal,
+            measuredGain * referenceSignal[27:-53],
+            64,
+            True,
+            -27,
+        ),
+        (
+            referenceSignal,
+            np.r_[
+                measuredGain * referenceSignal[700:],
+                np.zeros(33),
+                measuredGain * referenceSignal,
+                np.zeros(17),
+            ],
+            None,
+            True,
+            4333,
+        ),
+        (
+            referenceSignal,
+            np.r_[np.zeros(6000), measuredGain * referenceSignal],
+            7000,
+            True,
+            6000,
+        ),
+        (
+            referenceSignal,
+            np.r_[np.zeros(6000), measuredGain * referenceSignal],
+            7000,
+            False,
+            None,
+        ),
+    ]
+    for referenceLength, measuredLength in (
+        (2049, 33), (31, 2070), (4095, 2101), (2101, 4095), (5000, 4973)
+    ):
+        asymmetricReference = (
+            randomGenerator.normal(size=referenceLength)
+            + 1j * randomGenerator.normal(size=referenceLength)
+        )
+        asymmetricMeasured = (
+            randomGenerator.normal(size=measuredLength)
+            + 1j * randomGenerator.normal(size=measuredLength)
+        )
+        for maximumDelay in (0, 64, 7000):
+            for preferFullOverlap in (False, True):
+                cases.append((
+                    asymmetricReference,
+                    asymmetricMeasured,
+                    maximumDelay,
+                    preferFullOverlap,
+                    None,
+                ))
+    periodicReference = np.resize(referenceSignal[:16], 5000)
+    for tiedReference in (periodicReference, np.ones(5000, dtype=complex)):
+        for preferFullOverlap in (False, True):
+            cases.append((
+                tiedReference,
+                measuredGain * tiedReference,
+                64,
+                preferFullOverlap,
+                None,
+            ))
+    highDynamicReference = referenceSignal.copy()
+    highDynamicReference[2500:] *= 1.0e-10
+    cases.append((
+        highDynamicReference,
+        np.r_[np.zeros(23), measuredGain * highDynamicReference],
+        64,
+        True,
+        23,
+    ))
+    originalFft = np.fft.fft
+    for (
+        testedReference,
+        testedMeasured,
+        maximumDelay,
+        preferFullOverlap,
+        expectedDelay,
+    ) in cases:
+        signalProcessor = SigProc(
+            testedReference,
+            40.0e6,
+            parameters={"maxIntegerDelaySamples": maximumDelay},
+        )
+        fullLength = testedReference.size + testedMeasured.size - 1
+        fullFftLength = 1 << int(np.ceil(np.log2(max(fullLength, 2))))
+
+        def ForceFullFft(inputSignal: np.ndarray, fftLength: int) -> np.ndarray:
+            """Replace any reduced FFT with the original linear FFT length.
+
+            Processing details:
+                Algorithm: Ignore the requested reduced length and use the
+                full zero-padded convolution length captured for this case.
+
+            Args:
+                inputSignal: Measured or reversed-reference FFT operand.
+                fftLength: Requested production transform size.
+
+            Returns:
+                result: Original full-length complex Fourier transform.
+            """
+
+            return originalFft(inputSignal, fullFftLength)
+
+        reducedDelay = signalProcessor.EstimateIntegerDelay(
+            testedMeasured, preferFullOverlap=preferFullOverlap
+        )
+        with patch.object(np.fft, "fft", new=ForceFullFft):
+            fullDelay = signalProcessor.EstimateIntegerDelay(
+                testedMeasured, preferFullOverlap=preferFullOverlap
+            )
+        assert reducedDelay == fullDelay, (
+            testedReference.size, testedMeasured.size, maximumDelay,
+            preferFullOverlap, reducedDelay, fullDelay,
+        )
+        if expectedDelay is not None:
+            assert reducedDelay == expectedDelay
+
+    transformLengths = []
+
+    def RecordFft(inputSignal: np.ndarray, fftLength: int) -> np.ndarray:
+        """Record actual FFT sizes without changing transform results.
+
+        Processing details:
+            Algorithm: Save the requested zero-padding length then delegate
+            to NumPy's unpatched implementation for structural assertions.
+
+        Args:
+            inputSignal: Measured or reversed-reference FFT operand.
+            fftLength: Requested production transform size.
+
+        Returns:
+            result: Unmodified complex Fourier transform.
+        """
+
+        transformLengths.append(fftLength)
+        return originalFft(inputSignal, fftLength)
+
+    boundedProcessor = SigProc(
+        referenceSignal, 40.0e6,
+        parameters={"maxIntegerDelaySamples": 64},
+    )
+    with patch.object(np.fft, "fft", new=RecordFft):
+        assert boundedProcessor.EstimateIntegerDelay(referenceSignal) == 0
+    assert transformLengths == [8192, 8192]
+    transformLengths.clear()
+    fullProcessor = SigProc(referenceSignal, 40.0e6)
+    with patch.object(np.fft, "fft", new=RecordFft):
+        assert fullProcessor.EstimateIntegerDelay(
+            referenceSignal, preferFullOverlap=True
+        ) == 0
+    assert transformLengths == [16384, 16384]
+    transformLengths.clear()
+    tieProcessor = SigProc(
+        periodicReference, 40.0e6,
+        parameters={"maxIntegerDelaySamples": 64},
+    )
+    with patch.object(np.fft, "fft", new=RecordFft):
+        tieProcessor.EstimateIntegerDelay(periodicReference)
+    assert transformLengths == [8192, 8192, 16384, 16384]
+
+
+def CheckBatchedAnalysisMetrics() -> None:
+    """Verify accelerated PSD, IRR, and strict sample construction.
+
+    Processing details:
+        Algorithm: Compare bounded PSD batches and sufficient-statistic IRR
+        against the original segment loop and two-column matrix formulas.
+        Include strided arrays, ill-conditioned references, scale changes,
+        mutable input reuse, and the strict constructor's overlap call count.
+
+    Returns:
+        result: None. Numerical and structural assertions detect regressions.
+    """
+
+    randomGenerator = np.random.default_rng(20261008)
+    for sampleCount, maximumSegment in (
+        (16, 16384), (19, 16), (1025, 256), (50000, 4096), (200000, 16384),
+    ):
+        storage = (
+            randomGenerator.normal(size=2 * sampleCount)
+            + 1j * randomGenerator.normal(size=2 * sampleCount)
+        )
+        inputSignal = storage[::2]
+        originalSignal = inputSignal.copy()
+        segmentLength = 1 << int(np.floor(np.log2(
+            min(maximumSegment, sampleCount)
+        )))
+        segmentStep = segmentLength // 2
+        analysisWindow = np.hanning(segmentLength)
+        windowPower = np.sum(analysisWindow ** 2)
+        expectedPsd = np.zeros(segmentLength)
+        segmentCount = 0
+        for startIndex in range(0, sampleCount - segmentLength + 1, segmentStep):
+            signalSpectrum = np.fft.fft(
+                inputSignal[startIndex:startIndex + segmentLength] * analysisWindow
+            )
+            expectedPsd += np.abs(signalSpectrum) ** 2 / windowPower
+            segmentCount += 1
+        expectedPsd = np.fft.fftshift(expectedPsd / segmentCount)
+        with patch.object(np.fft, "fft", wraps=np.fft.fft) as fftSpy:
+            actualBins, actualPsd = AveragePeriodogram(
+                inputSignal, 80.0e6, maximumSegment
+            )
+            batchSize = max(1, 131072 // segmentLength)
+            assert fftSpy.call_count == (segmentCount + batchSize - 1) // batchSize
+            for fftCall in fftSpy.call_args_list:
+                assert fftCall.args[0].size <= max(131072, segmentLength)
+        assert np.array_equal(actualPsd, expectedPsd)
+        assert np.array_equal(actualBins, np.fft.fftshift(
+            np.fft.fftfreq(segmentLength, d=1.0 / 80.0e6)
+        ))
+        assert np.array_equal(inputSignal, originalSignal)
+
+    referenceBase = (
+        randomGenerator.normal(size=(513, 2))
+        + 1j * randomGenerator.normal(size=(513, 2))
+    )
+    analyzer = Analysis(
+        referenceBase, transmittedSignal=referenceBase, width=0
+    )
+    referenceCases = (
+        referenceBase,
+        referenceBase * 1.0e-6,
+        referenceBase * 1.0e6,
+        referenceBase.real.astype(np.complex128),
+        referenceBase.real + 1.0e-6j * referenceBase.imag,
+        np.full_like(referenceBase, 0.3 + 0.7j),
+        np.zeros_like(referenceBase),
+    )
+    for referenceSignal in referenceCases:
+        analyzer.referenceSignal = referenceSignal.copy()
+        measuredSignal = (
+            (0.87 + 0.13j) * referenceSignal
+            + (0.017 - 0.009j) * np.conj(referenceSignal)
+            + 0.001 * referenceBase
+        )
+        measuredCopy = measuredSignal.copy()
+        with patch.object(np.linalg, "cond", wraps=np.linalg.cond) as conditionSpy:
+            measurement = analyzer.MeasurePreparedIrr(measuredSignal)
+            if referenceSignal is referenceCases[0]:
+                assert conditionSpy.call_count == 0
+        expectedDirectPower = 0.0
+        expectedImagePower = 0.0
+        expectedResidualPower = 0.0
+        expectedMeasuredPower = 0.0
+        for chainIndex in range(2):
+            referenceColumn = referenceSignal[:, chainIndex]
+            measuredColumn = measuredSignal[:, chainIndex]
+            regressionMatrix = np.column_stack(
+                (referenceColumn, np.conj(referenceColumn))
+            )
+            normalMatrix = regressionMatrix.conj().T @ regressionMatrix
+            diagonalScale = max(
+                float(np.mean(np.real(np.diag(normalMatrix)))),
+                np.finfo(float).tiny,
+            )
+            coefficients = np.linalg.solve(
+                normalMatrix + 1.0e-12 * diagonalScale * np.eye(2),
+                regressionMatrix.conj().T @ measuredColumn,
+            )
+            fittedSignal = regressionMatrix @ coefficients
+            expectedDirectPower += float(abs(coefficients[0]) ** 2)
+            expectedImagePower += float(abs(coefficients[1]) ** 2)
+            expectedResidualPower += float(np.sum(abs(measuredColumn - fittedSignal) ** 2))
+            expectedMeasuredPower += float(np.sum(abs(measuredColumn) ** 2))
+            for coefficientIndex, prefix in ((0, "direct"), (1, "image")):
+                actualCoefficient = (
+                    measurement[prefix + "CoefficientRealPerChain"][chainIndex]
+                    + 1j * measurement[prefix + "CoefficientImagPerChain"][chainIndex]
+                )
+                assert np.allclose(actualCoefficient, coefficients[coefficientIndex],
+                                   rtol=1.0e-10, atol=1.0e-12, equal_nan=True)
+            assert np.allclose(
+                measurement["regressionConditionNumberPerChain"][chainIndex],
+                np.linalg.cond(regressionMatrix), rtol=1.0e-10, atol=1.0e-12,
+            )
+        assert np.isclose(measurement["desiredCoefficientPower"], expectedDirectPower,
+                          rtol=1.0e-10, atol=1.0e-20, equal_nan=True)
+        assert np.isclose(measurement["imageCoefficientPower"], expectedImagePower,
+                          rtol=1.0e-10, atol=1.0e-20, equal_nan=True)
+        assert np.isclose(
+            measurement["residualPowerRatio"],
+            expectedResidualPower / max(expectedMeasuredPower, np.finfo(float).tiny),
+            rtol=1.0e-10, atol=1.0e-20, equal_nan=True,
+        )
+        assert np.array_equal(measuredSignal, measuredCopy)
+    # Public arrays remain live; no previously fitted result is reused.
+    analyzer.referenceSignal = referenceBase.copy()
+    firstIrr = analyzer.MeasurePreparedIrr(referenceBase)["irrDb"]
+    analyzer.referenceSignal += 0.1 * np.conj(analyzer.referenceSignal)
+    changedIrr = analyzer.MeasurePreparedIrr(referenceBase)["irrDb"]
+    assert changedIrr > firstIrr + 20.0
+
+    waveform = WaveGenWifi(
+        frameFormat="EHT", bandwidthMhz=20, numDataSymbols=2,
+        sampleRateHz=80.0e6, seed=112, width=16,
+    ).Generate()
+    originalOverlap = SigProc.EstimateSignalOverlap
+    with patch.object(SigProc, "EstimateSignalOverlap", wraps=originalOverlap) as overlapSpy:
+        strictAnalysis = Analysis(
+            waveform.samples, transmittedSignal=waveform.samples,
+            needFullFrameEn=True, width=16,
+            parseParameters={"sampleRateHz": waveform.sampleRateHz,
+                             "maximumPacketOffsetSamples": 0},
+        )
+        assert overlapSpy.call_count == 1
+        assert strictAnalysis.GetSignalOverlapResult() is not None
+        assert strictAnalysis.Analyze()["evmPercent"] < 1.0e-8
+
+
 def CheckPerformanceOptimizationEquivalence() -> None:
     """Verify accelerated hot paths without fragile wall-clock assertions.
 
@@ -15919,6 +16601,10 @@ def RunTests() -> None:
     CheckFrameFormatAliases()
     CheckFunctionStyle()
     CheckEnglishOnlyCode()
+    CheckDescriptorRefinementPruning()
+    CheckBatchedWifiDemodulation()
+    CheckBoundedIntegerDelayFft()
+    CheckBatchedAnalysisMetrics()
     CheckPerformanceOptimizationEquivalence()
     CheckNoGlobalDataVariables()
     CheckModuleResponsibilityBoundaries()

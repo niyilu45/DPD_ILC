@@ -1295,6 +1295,7 @@ class ParseWifi:
         sampleRateHz: float,
         descriptorOffsetSymbols: int,
         evaluateCorrectionCandidates: bool = True,
+        minimumCandidateConfidence: float = 0.0,
     ) -> Tuple[Dict[str, object], float]:
         """Decode one descriptor at a proposed packet start and sample rate.
 
@@ -1307,7 +1308,9 @@ class ParseWifi:
             decoded configurations once within this candidate to avoid
             duplicate wideband work.
             Fall back to version-one magic-word gain estimation and bounded
-            CRC correction for previously generated waveforms.
+            CRC correction for previously generated waveforms. A validated
+            confidence floor can skip decoding copies whose pilot or magic
+            score cannot reach an already accepted refinement candidate.
 
         Args:
             receivedSignal: Validated receive vector or matrix.
@@ -1316,11 +1319,27 @@ class ParseWifi:
             descriptorOffsetSymbols: Five for VHT or six for HE/EHT.
             evaluateCorrectionCandidates: Whether valid protected candidates
                 are checked with full-packet correlation.
+            minimumCandidateConfidence: Finite nonnegative lower bound for
+                candidate pilot or magic scores. Equal scores remain eligible;
+                the default leaves the configured parser threshold unchanged.
 
         Returns:
             result: Pair containing decoded parameters and correlation score.
         """
 
+        if (
+            not isinstance(minimumCandidateConfidence, (int, float))
+            or isinstance(minimumCandidateConfidence, bool)
+            or not np.isfinite(minimumCandidateConfidence)
+            or minimumCandidateConfidence < 0.0
+        ):
+            raise ValueError(
+                "minimumCandidateConfidence must be finite and nonnegative"
+            )
+        confidenceThreshold = max(
+            float(self.parameters["minimumParseConfidence"]),
+            float(minimumCandidateConfidence),
+        )
         legacyFftLengthFloat = 3.2e-6 * sampleRateHz
         if not np.isclose(
             legacyFftLengthFloat,
@@ -1367,6 +1386,25 @@ class ParseWifi:
         ldpcFullPacketScores: Dict[
             Tuple[Tuple[str, object], ...], float
         ] = {}
+        pilotPositions, pilotBits, _, _ = DescriptorLdpcPhysicalLayout()
+        symbolPilotLayouts = []
+        for symbolIndex in range(2):
+            symbolStart = 52 * symbolIndex
+            symbolStop = symbolStart + 52
+            symbolPilotMask = (
+                (pilotPositions >= symbolStart)
+                & (pilotPositions < symbolStop)
+            )
+            symbolPilotPositions = pilotPositions[symbolPilotMask]
+            expectedPilotSymbols = (
+                1.0 - 2.0 * pilotBits[symbolPilotMask].astype(float)
+            ).astype(np.complex128)
+            expectedPilotEnergy = float(
+                np.vdot(expectedPilotSymbols, expectedPilotSymbols).real
+            )
+            symbolPilotLayouts.append(
+                (symbolPilotPositions, expectedPilotSymbols, expectedPilotEnergy)
+            )
         localTones = np.r_[np.arange(-26, 0), np.arange(1, 27)]
         maximumSubchannels = max(1, legacyFftLength // 64)
         for subchannelCount in (1, 2, 4, 8, 16):
@@ -1393,12 +1431,6 @@ class ParseWifi:
                 # The LDPC layout distributes seven known pilots per OFDM
                 # symbol. Separate gain estimates prevent PA memory or burst
                 # distortion in one symbol from rotating the other symbol.
-                (
-                    pilotPositions,
-                    pilotBits,
-                    _,
-                    _,
-                ) = DescriptorLdpcPhysicalLayout()
                 ldpcNormalizedValues = np.zeros(
                     104,
                     dtype=np.complex128,
@@ -1408,29 +1440,16 @@ class ParseWifi:
                 for symbolIndex in range(2):
                     symbolStart = 52 * symbolIndex
                     symbolStop = symbolStart + 52
-                    symbolPilotMask = (
-                        (pilotPositions >= symbolStart)
-                        & (pilotPositions < symbolStop)
-                    )
-                    symbolPilotPositions = pilotPositions[
-                        symbolPilotMask
-                    ]
-                    expectedPilotSymbols = (
-                        1.0
-                        - 2.0
-                        * pilotBits[symbolPilotMask].astype(float)
-                    ).astype(np.complex128)
+                    (
+                        symbolPilotPositions,
+                        expectedPilotSymbols,
+                        expectedPilotEnergy,
+                    ) = symbolPilotLayouts[symbolIndex]
                     receivedPilots = receivedValues[
                         symbolPilotPositions
                     ]
                     pilotEnergy = float(
                         np.vdot(receivedPilots, receivedPilots).real
-                    )
-                    expectedPilotEnergy = float(
-                        np.vdot(
-                            expectedPilotSymbols,
-                            expectedPilotSymbols,
-                        ).real
                     )
                     if (
                         pilotEnergy <= np.finfo(float).tiny
@@ -1468,9 +1487,7 @@ class ParseWifi:
                     ldpcCorrelation = float(
                         np.mean(pilotCorrelations)
                     )
-                    if ldpcCorrelation >= float(
-                        self.parameters["minimumParseConfidence"]
-                    ):
+                    if ldpcCorrelation >= confidenceThreshold:
                         try:
                             ldpcParameters = (
                                 DecodeWifiDescriptorLdpcValues(
@@ -1534,9 +1551,7 @@ class ParseWifi:
                         * magicEnergy
                     )
                 )
-                if correlation < float(
-                    self.parameters["minimumParseConfidence"]
-                ):
+                if correlation < confidenceThreshold:
                     continue
                 try:
                     descriptorParameters = (
@@ -1582,7 +1597,9 @@ class ParseWifi:
             leading-offset range. For each receiver-clock candidate, try the
             VHT and HE/EHT signaling positions and accept only protected
             descriptors whose format-dependent offset, antenna count, and
-            confidence agree.
+            confidence agree. Refinement still visits every configured start,
+            but omits error-correction work below the best already validated
+            pilot or magic score, preserving equal-score candidates and order.
 
         Args:
             receivedSignal: Validated receive waveform.
@@ -1675,6 +1692,7 @@ class ParseWifi:
                         packetStartSample + legacyCpLength,
                     )
                     refinedCandidates = []
+                    bestRefinementConfidence = confidence
                     for refinedStart in range(
                         refinementStart, refinementStop + 1
                     ):
@@ -1686,6 +1704,7 @@ class ParseWifi:
                                     sampleRateHz,
                                     descriptorOffsetSymbols,
                                     False,
+                                    bestRefinementConfidence,
                                 )
                             )
                         except ValueError:
@@ -1721,6 +1740,10 @@ class ParseWifi:
                                 refinedStart,
                                 refinedParameters,
                             )
+                        )
+                        bestRefinementConfidence = max(
+                            bestRefinementConfidence,
+                            refinedConfidence,
                         )
                     if not refinedCandidates:
                         continue

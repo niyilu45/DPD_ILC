@@ -60,6 +60,59 @@ GMP本身占长帧普通调用的大部分时间，所以端到端增益小于�
 
 ---
 
+### 2.1 长帧Analysis与samples完整帧检查优化
+
+以下为后续一次独立优化的前后对照，基线为提交 `b03baad`，不要与上面的更早历史数字混用。环境为Windows、Python 3.9.6、NumPy 1.22.0；EHT、MCS 7、seed 524、4倍采样，MIMO使用2×2 DFT映射。测量信号在解码后添加固定复增益、三阶非线性和共轭项，定点场景再编码为16位；默认同步全部开启。表中只统计预热后5次 `Analyze()` 的中位数，不含生成波形和构造分析器。
+
+| 场景 | 样点数×链数 | 优化前 | 优化后 | 加速比 |
+|---|---:|---:|---:|---:|
+| 20 MHz，20 symbols，浮点 | 26,048×1 | 26.8 ms | 22.0 ms | 1.22× |
+| 80 MHz，100 symbols，浮点 | 452,352×1 | 452.0 ms | 320.5 ms | 1.41× |
+| 80 MHz，100 symbols，16位 | 452,352×1 | 456.3 ms | 346.4 ms | 1.32× |
+| 80 MHz，20 symbols，2×2、16位 | 108,544×2 | 224.3 ms | 179.7 ms | 1.25× |
+| 320 MHz，20 symbols，浮点 | 416,768×1 | 374.6 ms | 297.5 ms | 1.26× |
+| samples严格模式，20 MHz、20 symbols、16位 | 26,048×1 | 28.6 ms | 27.6 ms | 1.04× |
+
+前5行使用 `Analysis(waveform=waveform, width=width)`；最后一行使用纯发送/接收samples和 `needFullFrameEn=True`。严格模式默认搜索整个capture，不能为了速度把完整帧搜索缩小，因此单次分析收益较小。各场景EVM、SNR、功率和ACLR与基线一致；IRR差异小于 $10^{-10}$ dB，属于累加次序导致的浮点舍入。
+
+首次构造另测：EHT 320 MHz、20 symbols、416768点、16位，纯samples、`needFullFrameEn=True`、自动采样率、默认2000点包起始搜索，3次构造中位数由 **22.35 s降至2.50 s（约8.9×）**。此计时包括发送参考解析、参考恢复和重叠定位，不包括波形生成及后续 `Analyze()`；优化前后恢复的帧起点均为0。该显著收益主要来自Descriptor候选剪枝，不代表每次 `Analyze()` 都能加速8.9倍。
+
+可复制下面的示例复测80 MHz长帧；改 `width=16` 可测定点，修改生成参数可测不同带宽和链数：
+
+```python
+from time import perf_counter
+import numpy as np
+from inc.lib.Analysis import Analysis
+from inc.lib.WaveGenWifi import WaveGenWifi
+from inc.utils.FixedPoint import FixedPoint
+
+width = 0
+waveform = WaveGenWifi(
+    frameFormat="EHT", bandwidthMhz=80, mcs=7,
+    numDataSymbols=100, sampleRateHz=320.0e6,
+    spatialMapping="dft", seed=524, width=width,
+).Generate()
+interfaceFormat = FixedPoint(width)
+transmitSamples = interfaceFormat.DecodeComplex(waveform.samples)
+receiveSamples = interfaceFormat.EncodeComplex(
+    0.87 * np.exp(0.15j) * (
+        transmitSamples
+        + 0.025 * transmitSamples * np.abs(transmitSamples) ** 2
+        + 0.007 * np.conj(transmitSamples)
+    )
+)
+startTime = perf_counter()
+analyzer = Analysis(waveform=waveform, width=width)
+print("Construction ms:", 1000.0 * (perf_counter() - startTime))
+analyzer.Analyze(receiveSamples)
+elapsedSeconds = []
+for repeatIndex in range(5):
+    startTime = perf_counter()
+    metrics = analyzer.Analyze(receiveSamples)
+    elapsedSeconds.append(perf_counter() - startTime)
+print("Analyze median ms:", 1000.0 * np.median(elapsedSeconds))
+```
+
 ## 3. `SigProc`同步路径
 
 ### 3.1 整数时延搜索向量化
@@ -84,6 +137,14 @@ E_x[a,b)
 这里的每个 $S_q$ 只对该树节点内部的非负样点功率做成对累加，不通过两个很大的全局累计值相减。因此正常波形保留快速向量路径；强突发后面只有极低噪声时，可疑尾部窗口自动回退到稳定路径，不会因灾难性消减而被错误压低。
 
 互相关本身仍由FFT卷积得到。候选lag保持升序，最终使用 `numpy.argmax`；当多个分数完全相同时，它返回第一个最大值，因此保留原实现“最先出现者胜出”的并列语义。
+
+现在还会按实际候选区间缩短FFT，**没有缩短参考信号，也没有减少候选lag**。设参考长度为 $N_x$、测量长度为 $N_y$，保留候选为 $[l_{min},l_{max}]$。反转共轭参考的卷积中，目标索引为 $k=N_x-1+l$。选取2的幂次FFT长度满足：
+
+```math
+L \geq \max(N_x,N_y,N_x+l_{max},N_y-l_{min})
+```
+
+则所有目标索引都满足 $k<L$ 且 $k+L\geq N_x+N_y-1$，不会有循环卷积混叠进入目标区间。5000点、±64点搜索时，FFT由16384缩短为8192；严格模式无显式上限时仍用全长FFT。若缩短FFT后出现 $10^{-12}$ 相对/绝对量级的近似并列最大值，会重算原全长FFT，以保留旧的浮点并列选择行为。
 
 ### 3.2 不等长发送辅助的三段FFT
 
@@ -180,6 +241,34 @@ flowchart TD
 `AnalyzeIlcHistory()`仍逐轮完整分析以形成每轮MSE、EVM、SNR和ACLR记录，但在循环中同步维护严格EVM最优候选。最终直接复用该轮已经得到的指标，不再对最佳输出额外执行第二次完整 `Analyze()`；同时只复制当前最佳输入和输出，不再保存一份额外的全历史波形副本。
 
 ---
+
+### 4.4 有界批量FFT
+
+`FrameProcess.DemodulatePreparedWifiData()`将多个OFDM符号的FFT合并为批量调用。连续符号通过原数组视图去CP；任意顺序、重复或跳跃的 `symbolIndices` 使用有界索引采样。子载波索引、CSD共轭和空间映射共轭每次解调只计算一次；不跨调用保存，因此修改公开参考或元数据不会使用旧结果。
+
+`AveragePeriodogram()`用只读滑动窗口视图组织50%重叠的Hann分段，在批量FFT之后仍严格按旧的分段顺序累加功率。窗长、窗功率归一化、未满一段的尾部丢弃策略和最终 `fftshift` 均不变。
+
+两个批量路径都以131072个复数输入点作为每批预算，至少处理一个完整符号/分段；不会一次展开整个长capture。若用户本身配置的单个FFT超过预算，则以一个FFT为最小工作单元。预算是输入点数，不是整个程序峰值内存上限；输出网格、频谱和计算临时数组仍需额外内存。
+
+### 4.5 IRR充分统计量与病态回退
+
+IRR的模型仍为 $y=ax+b x^*$。对 $X=[x,x^*]$，无需在常规Wi-Fi路径上显式构造 $N\times2$ 矩阵，只需累加：
+
+```math
+E=\sum_n |x_n|^2,\qquad P=\sum_n x_n^2,
+\qquad
+X^H X=\begin{bmatrix}E&P^*\\P&E\end{bmatrix},
+\qquad
+X^H y=\begin{bmatrix}\sum_n x_n^*y_n\\\sum_n x_n y_n\end{bmatrix}.
+```
+
+保留相同的 $10^{-12}$ 相对岭项和2×2求解。条件数可从Gram矩阵特征值计算：
+
+```math
+\kappa(X)=\sqrt{\frac{E+|P|}{E-|P|}}.
+```
+
+若 $E-|P|\leq10^{-8}E$，差值会受到浮点消减影响，因此完整回退原矩阵构造、正规方程与SVD条件数路径。纯实数、近恒定相位及其他病态参考不会为了提速而使用不稳定的近似条件数。残差仍从实际拟合样值直接求和，不用两个大能量相减。
 
 ## 5. `PaModel`的GMP路径
 
@@ -319,6 +408,14 @@ normalized min-sum的每条校验边需要“除去本边后的最小输入幅�
 
 ---
 
+### 7.3 完整帧解析的精确候选剪枝
+
+Descriptor首次通过校验后，Parser仍遍历原来的一个legacy CP范围来精修帧起点。不同起点和子信道的导频/魔数相关得分可以在纠错前得到；若得分**严格小于已通过校验的最优候选得分**，该候选不可能成为原搜索中的胜者，无需再执行昂贵的LDPC/CRC纠错。相等得分仍参与，遍历顺序、帧格式/链数检查及胜者的整包验证不变。这是精确淘汰，不是降低置信度要求或只检测一部分帧头。
+
+`DecodeDescriptorAt(..., minimumCandidateConfidence=0.0)`默认行为不变；精修内部传入当前最优得分。同时，每次候选解码只构造一次固定导频布局与期望导频能量，复用于各子信道。
+
+纯NumPy `needFullFrameEn=True` 的构造直接恢复发送帧元数据，再针对最终发送帧参考计算一次重叠。原来先做一次原始samples重叠、升级后再做一次的重复搜索已删除。默认False的原始samples公共区间逻辑不变；False→True的后续参数升级仍保留验证与失败回滚。
+
 ## 8. 缓存、状态与ChainMap规则
 
 为了避免“加速后结果没有跟着输入变化”的错误，本工程明确不跨调用缓存：
@@ -371,7 +468,21 @@ resultAnalysis = Analysis(
 metrics = resultAnalysis.Analyze()
 ```
 
-这两种模式都避免恢复Descriptor和seed。只有确实没有发送参考时，才使用 `Analysis(receivedSignal)`的盲解析路径。
+上面默认 `needFullFrameEn=False` 的两种模式都避免恢复Descriptor和seed。只有确实没有发送参考时，才使用 `Analysis(receivedSignal)`的盲解析路径。注意 `Analysis(wifiWaveform)` 的第一个位置参数属于接收输入，也会走盲解析；已有元数据且要显式参考模式时，请使用 `Analysis(waveform=wifiWaveform)`。
+
+只传samples并要求完整帧仍然受支持：
+
+```python
+resultAnalysis = Analysis(
+    receivedSignal,
+    transmittedSignal=transmittedSamples,
+    needFullFrameEn=True,
+    width=16,
+)
+metrics = resultAnalysis.Analyze()
+```
+
+这种模式在首次构造/首次升级时自动解析发送参考，随后复用帧上下文；不必每轮重建对象。已知采样率时可显式给出 `sampleRateHz` 减少候选试探。只有确实知道帧从第0点开始，才能设置 `parseParameters={"maximumPacketOffsetSamples": 0}`；不能为了测速对含前导补零或其他偏移的真实记录强设0。
 
 ### 9.3 关闭补偿前必须确认测量条件
 

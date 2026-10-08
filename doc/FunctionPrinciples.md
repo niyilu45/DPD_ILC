@@ -123,8 +123,8 @@ flowchart LR
 | `ParseWifi.ResolveSampleRates` | E | 使用显式接收时钟，或产生按顺序尝试的常见复基带采样率，默认包含EHT 320 MHz的1.28 GHz采样率 | ParseWifi §5.2 |
 | `ParseWifi.ValidateReceivedSignal` | E/N | 自动从NumPy数组或 `WifiWaveform.samples` 取样，并检查SISO向量或samples×chains矩阵的形状与有限性 | ParseWifi §5.1 |
 | `ParseWifi.ScoreDescriptorCandidate` | P/N | 重生成LDPC或历史CRC有效候选的完整确定性帧，以逐链归一化相关和捕获长度一致性排除错误随机种子或错误帧长 | ParseWifi §5.3 |
-| `ParseWifi.DecodeDescriptorAt` | P/N | 对候选时刻去CP和FFT；新版路径逐符号导频均衡后调用FEC软译码，历史路径保留magic公共增益和CRC有限软纠错 | ParseWifi §5.3 |
-| `ParseWifi.FindDescriptor` | P/N | 联合搜索采样率、包起点和VHT/HE/EHT描述字段位置，并用相关峰细化边界 | ParseWifi §5.4 |
+| `ParseWifi.DecodeDescriptorAt` | P/N | 对候选时刻去CP和FFT，复用本次候选的导频布局；新版路径逐符号导频均衡后调用FEC软译码，历史路径保留magic公共增益和CRC有限软纠错；可用已验证候选的置信度下界跳过不可能胜出的译码，等分仍保留 | ParseWifi §5.3–§5.4 |
+| `ParseWifi.FindDescriptor` | P/N | 联合搜索采样率、包起点和VHT/HE/EHT描述字段位置，并用相关峰细化边界；细化仍访问全部配置偏移，仅在FEC前跳过低于已验证最佳导频或magic置信度的副本，不改变等分顺序与最终完整参考校验 | ParseWifi §5.4 |
 | `ParseWifi.EstimatePacketStartFromReference` | P/N | 兼容接口：调用不等长重叠估计后，只返回接收包起点和置信度 | ParseWifi §6.1 |
 | `ParseWifi.EstimateSignalOverlap` | P/N | 对发送端外部补零进行能量裁边，枚举允许发送或接收裁剪的有符号时延，并在逐链公共区间上计算能量归一化相关；发送与接收总长度不要求相等 | ParseWifi §6.1 |
 | `ParseWifi.BuildDetectedParameters` | E | 可选输入为 `WifiWaveform` 时直接读取中性元数据并转换为统一解析结果 | ParseWifi §6.2 |
@@ -431,7 +431,7 @@ y_{\mathrm{long},3}[n]
 | `SigProc.ResolveMaximumIntegerDelay` | N/E | 把自动/外部时延边界转换为有限相关搜索半径 | SigProc §3、§12 |
 | `SigProc.CalculateRangeEnergies` | N | 条件良好时使用累计差并估计消减上界；仅对可疑半开区间用成对二叉树累加互不重叠的非负局部功率和，避免强突发后小噪声窗口发生灾难性消减 | SigProc §3.3，Performance §3.1–§3.2 |
 | `SigProc.EstimateSignalOverlap` | P/N | 对可能裁剪、补零或不等长的发送与接收波形搜索有符号时延；三段FFT批量生成完整/正探针/负探针相关，分层区间树生成逐候选能量，Cauchy-Schwarz约束抑制零窗舍入伪峰，并保持分数、重叠长度和最早测量起点的并列次序 | SigProc §3.3，Performance §3.2 |
-| `SigProc.EstimateIntegerDelay` | P/N | FFT互相关后向量化生成重叠边界，并用分层区间树计算能量；通常保留首个并列峰语义，`preferFullOverlap=True` 则在相关近似相等时优先完整参考覆盖，无显式搜索上限时搜索整个capture | SigProc §3、§8，Performance §3.1 |
+| `SigProc.EstimateIntegerDelay` | P/N | 先生成限定lag的有效重叠范围，再以保证该范围无循环混叠的最短二次幂FFT求相关；稳定区间能量归一化不变，数值近似并列峰回退全长FFT以保留原选择语义；`preferFullOverlap=True` 在相关近似相等时优先完整参考覆盖，无显式搜索上限时仍以全长FFT搜索整个capture | SigProc §3、§8，Performance §3.1 |
 | `SigProc.ExtractIntegerAligned` | N | 按估计时延提取重叠样点并对缺失位置补零 | SigProc §3 |
 | `SigProc.EstimateCarrierFrequencyOffset` | P/N | 分块复增益相位随时间的斜率估计 CFO；可选 `validSampleMask` 限制窗口在实际接收覆盖区，避免缺帧补零污染 | SigProc §4.1、§8 |
 | `SigProc.CompensateCarrierFrequencyOffset` | P/N | 乘 $e^{-j2\pi\hat f n/f_s}$ 撤销载波相位斜率；频偏严格为0 Hz时直接返回独立副本 | SigProc §4.2，Performance §3.4 |
@@ -451,7 +451,7 @@ y_{\mathrm{long},3}[n]
 | `FrameProcess.BuildCsdPhaseMatrix` | P/N | 按 $\exp(-j2\pi k\Delta f\tau_m)$ 构造逐音调逐链 CSD 相位矩阵 | FrameProcess §2 |
 | `FrameProcess.__init__`, `FrameProcess.ValidateMetadata` | E | 保存并验证独立 `WifiWaveform` 数据契约 | FrameProcess §1、§5 |
 | `FrameProcess.ValidatePreparedSignal` | E | 检查校正后信号形状、链数和有限性 | FrameProcess §5–§7 |
-| `FrameProcess.DemodulatePreparedWifiData` | P/N | 按可选 `symbolIndices` 选择完整接收的数据符号，再去 CP、单位化 FFT、选择数据音调、撤销 CSD 和空间映射 | FrameProcess §3–§4 |
+| `FrameProcess.DemodulatePreparedWifiData` | P/N | 按可选 `symbolIndices` 保留完整接收符号的顺序及重复项，以有界批次去CP、单位化FFT、选数据音调并撤销CSD与空间映射；连续符号用缓冲视图，不规则选择用有界索引副本，本次调用复用音调和逆映射因子 | FrameProcess §3–§4，Performance §4 |
 
 ## 8. `Analysis.py`：指标与每轮 MSE 函数
 
@@ -463,8 +463,8 @@ y_{\mathrm{long},3}[n]
 | `Analysis.BuildPowerSweepEvaluator`, `Analysis.Transform`, `Analysis.Evaluate`, `Analysis.EvaluateCalibrationDrive`, `Analysis.CommitCalibrationDrive`, `Analysis.EvaluateCommittedDrive` | P/E | 构造保留位宽、输出标尺、成对drive和热事务协议的功率扫描求值器；可选DPD变换先于每次PA试探，可选完整方法处理器接收同一显式drive，接受值只保存在evaluator闭包并通过非提交试探重放，避免多方法共享PA状态互相污染 | Analysis §8.3.1、§11.11 |
 | `Analysis.Analyze`, `Analysis.GetLastMimoMetrics` | E | 直接返回普通指标字典，调用方使用固定键读取模拟输出功率、SNR、EVM、ACLR和MIMO明细 | Analysis §3.1、§10 |
 | `PowerEvmCurve.ToDict`, `ILCPerformanceIteration.ToDict` | E | 把曲线或逐轮记录转为 JSON/CSV 类型，不改变数值 | Analysis §10 |
-| `Analysis.AveragePeriodogram` | N/P | Hann窗、50%重叠的Welch PSD平均；先按原顺序累计未移位功率，最后只执行一次固定频率bin移位 | Analysis §6.2，Performance §4.2 |
-| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考，Reference为`None`时复用`WifiWaveform.samples`；默认NumPy发送辅助相关截取公共区间，严格模式自动从完整发送数组恢复元数据且保留真实发送参考和原始接收范围；支持后续启用检查时升级并缓存上下文；盲模式才从接收解析并重生成参考；分别建立输入标尺1和兼容默认1的待测输出scaled full-scale格式；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§3.1、§11、ParseWifi §8 |
+| `Analysis.AveragePeriodogram` | N/P | Hann窗、50%重叠的Welch PSD平均；以重叠窗口视图和有界批次执行FFT，按原逐段顺序累计未移位功率，最后只执行一次固定频率bin移位；窗、归一化和不足一段的尾部策略不变 | Analysis §6.2，Performance §4.2 |
+| `Analysis.__init__`, `Analysis.GetParameters`, `Analysis.UpdateParameters`, `Analysis.ValidateParameters` | E | 显式参考直接使用参考，Reference为`None`时复用`WifiWaveform.samples`；默认NumPy发送辅助相关截取公共区间，严格模式先从完整发送数组恢复元数据，仅对最终真实发送参考估计一次公共区间并保留原始接收范围；支持后续启用检查时升级并缓存上下文；盲模式才从接收解析并重生成参考；分别建立输入标尺1和兼容默认1的待测输出scaled full-scale格式；未知键警告后忽略，已识别指标/同步参数继续校验 | Analysis §1–§3.1、§11、ParseWifi §8 |
 | `Analysis.ResolveMeasuredOutputFormat` | E/N | 保持显式待测输出标尺最高优先级；未显式配置时读取FixedPointArray格式元数据并按对应FS解码，裸数组保留FS1兼容行为 | Analysis §1、§3.1、§11；FixedPoint §7 |
 | `Analysis.ParseAssistedTransmitFrame` | E/N | 严格NumPy发送辅助从保存的发送数组恢复帧元数据，统一Analysis采样率/位宽与Parser配置；验证原始发送帧样值完整，拒绝用重生成数据填补缺失参考；先构建候选上下文，成功验证后才原子升级并清理旧测量缓存 | Analysis §1.2、§1.4；ParseWifi §8.2 |
 | `Analysis.GetParsedWifiFrame`, `Analysis.GetAnalysisMode`, `Analysis.Width`, `Analysis.OutputFullScaleAmplitude`, `Analysis.GetSignalOverlapResult` | E | 返回盲模式解析结果、三态路径名、位宽、待测输出标尺或发送辅助重叠坐标；未产生对应结果时返回 `None` | Analysis §1、§3.1、§11、ParseWifi §8、SigProc §3.3、FixedPoint §7 |
@@ -600,7 +600,7 @@ y_{\mathrm{long},3}[n]
 | `DpdGmp.BuildBasisChunk` | P/N | 按活动 main、lagging 和 leading 规格构造直接 GMP 基矩阵；子类通过覆盖此入口复用同一个归一化岭回归求解器。 | DPD-GMP §16 |
 | `AugmentedDpdGmp.RebuildStructure`, `AugmentedDpdGmp.BuildBasisChunk` | P/N/E | 联合编号直接 GMP 基与其共轭副本；共轭支路保留阶数、信号时延和包络交叉时延，用于表达 IQ 镜像及其非线性记忆。 | DPD-GMP §16 |
 | `AugmentedDpdGmp.GetDirectCoefficients`, `AugmentedDpdGmp.GetImageCoefficients` | E | 分别返回直接支路与镜像支路系数副本，便于诊断而不允许外部静默修改模型。 | DpdGmp §17 |
-| `Analysis.MeasureIrr`, `Analysis.MeasurePreparedIrr`, `Analysis.CalculateIrr`, `Analysis.CalculatePreparedIrr` | P/N | 在统一同步和公共复增益补偿后联合拟合直接项与共轭项，以镜像功率/期望功率计算总 `irrDb` 和逐链 `irrDb`；单位为 dBc，越负越好。完整测量字典同时给出系数、镜像幅度比、残差与条件数，微小岭项保护数值求解。 | Analysis §15 |
+| `Analysis.MeasureIrr`, `Analysis.MeasurePreparedIrr`, `Analysis.CalculateIrr`, `Analysis.CalculatePreparedIrr` | P/N | 在统一同步和公共复增益补偿后，用能量与复内积直接构造2×2正规方程拟合直接项和共轭项，普通参考以Gram特征值求条件数，近奇异参考回退原矩阵求解与SVD；微小岭项及残差定义不变。镜像功率/期望功率给出总及逐链 `irrDb`，单位dBc、越负越好，保留系数、镜像幅度比、残差与条件数诊断 | Analysis §15，Performance §4 |
 | `Draw.CreateIqGmpComparisonFigure`, `Draw.SaveIqGmpComparison` | E | 绘制并保存普通 GMP 与增广 GMP 的同功率 EVM、IRR 双面板曲线，不重新训练模型或计算指标。 | ChannelAnalyse §16 |
 
 ## 17. DPD-LMS逐样点更新函数索引

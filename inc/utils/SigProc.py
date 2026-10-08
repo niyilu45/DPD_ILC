@@ -3469,9 +3469,10 @@ class SigProc:
         ``n``.
 
         Processing details:
-            Algorithm: Compute linear cross-correlation with an FFT, restrict
-            the lag search, normalize every candidate by overlap energy, and
-            select the maximum normalized magnitude. Optional full-overlap
+            Algorithm: Compute alias-free cross-correlation only over the
+            searched lag range with a reduced FFT, normalize every candidate
+            by overlap energy, and select the maximum normalized magnitude.
+            Optional full-overlap
             preference resolves repeated captures in favor of a complete
             reference only when its correlation remains statistically close
             to the best candidate.
@@ -3491,12 +3492,7 @@ class SigProc:
         referenceLength = self.referenceSignal.size
         measuredLength = complexMeasured.size
         fullLength = referenceLength + measuredLength - 1
-        fftLength = 1 << int(np.ceil(np.log2(max(fullLength, 2))))
-        correlation = np.fft.ifft(
-            np.fft.fft(complexMeasured, fftLength)
-            * np.fft.fft(np.conj(self.referenceSignal[::-1]), fftLength)
-        )[:fullLength]
-        lags = np.arange(fullLength, dtype=int) - (referenceLength - 1)
+        fullFftLength = 1 << int(np.ceil(np.log2(max(fullLength, 2))))
         minimumOverlap = max(16, min(referenceLength, measuredLength) // 4)
         # Only lags inside the configured search radius can win. Resolve all
         # overlap boundaries as NumPy vectors so long reference records do not
@@ -3504,17 +3500,18 @@ class SigProc:
         # the former first-maximum tie rule because candidate lags remain in
         # ascending order.
         configuredMaximum = self.parameters["maxIntegerDelaySamples"]
-        if preferFullOverlap and configuredMaximum is None:
-            candidateMask = np.ones(lags.size, dtype=bool)
-        else:
+        searchFullCapture = preferFullOverlap and configuredMaximum is None
+        minimumLag = -(referenceLength - 1)
+        maximumLag = measuredLength - 1
+        if not searchFullCapture:
             maximumDelay = (
                 int(configuredMaximum)
                 if preferFullOverlap and configuredMaximum is not None
                 else self.ResolveMaximumIntegerDelay()
             )
-            candidateMask = np.abs(lags) <= maximumDelay
-        candidateLags = lags[candidateMask]
-        correlationIndices = np.flatnonzero(candidateMask)
+            minimumLag = max(minimumLag, -maximumDelay)
+            maximumLag = min(maximumLag, maximumDelay)
+        candidateLags = np.arange(minimumLag, maximumLag + 1, dtype=int)
         referenceStarts = np.maximum(0, -candidateLags)
         referenceStops = np.minimum(
             referenceLength,
@@ -3525,10 +3522,31 @@ class SigProc:
         if not np.any(validMask):
             raise RuntimeError("unable to estimate integer delay")
         candidateLags = candidateLags[validMask]
-        correlationIndices = correlationIndices[validMask]
+        correlationIndices = candidateLags + referenceLength - 1
         referenceStarts = referenceStarts[validMask]
         referenceStops = referenceStops[validMask]
         overlapLengths = overlapLengths[validMask]
+        # For convolution index k = referenceLength - 1 + lag, these bounds
+        # ensure k < fftLength and k + fftLength >= fullLength. Consequently
+        # no wrapped convolution term can enter any searched lag even when
+        # the unused ends of the full linear correlation would wrap. Both
+        # inputs still fit without truncation. Unrestricted complete-frame
+        # searches retain the historical full-length transform.
+        minimumFftLength = (
+            fullLength
+            if searchFullCapture
+            else max(
+                referenceLength,
+                measuredLength,
+                referenceLength + int(candidateLags[-1]),
+                measuredLength - int(candidateLags[0]),
+            )
+        )
+        fftLength = 1 << int(np.ceil(np.log2(max(minimumFftLength, 2))))
+        correlation = np.fft.ifft(
+            np.fft.fft(complexMeasured, fftLength)
+            * np.fft.fft(np.conj(self.referenceSignal[::-1]), fftLength)
+        )
         measuredStarts = referenceStarts + candidateLags
         measuredStops = measuredStarts + overlapLengths
         referenceEnergies = self.CalculateRangeEnergies(
@@ -3558,6 +3576,29 @@ class SigProc:
         candidateScores = candidateMagnitudes / normalizations
         bestIndex = int(np.argmax(candidateScores))
         bestScore = float(candidateScores[bestIndex])
+        if fftLength < fullFftLength and np.count_nonzero(
+            candidateScores >= bestScore - 1.0e-12 * max(1.0, abs(bestScore))
+        ) > 1:
+            # Perfect periodic records can have several equal maxima. Small
+            # FFT roundoff changes must not change the legacy first-maximum
+            # rule, so ambiguous numerical ties use the original transform.
+            correlation = np.fft.ifft(
+                np.fft.fft(complexMeasured, fullFftLength)
+                * np.fft.fft(
+                    np.conj(self.referenceSignal[::-1]), fullFftLength
+                )
+            )
+            candidateMagnitudes = np.abs(correlation[correlationIndices])
+            if preferFullOverlap:
+                candidateMagnitudes = np.minimum(
+                    candidateMagnitudes,
+                    np.sqrt(
+                        np.maximum(referenceEnergies * measuredEnergies, 0.0)
+                    ),
+                )
+            candidateScores = candidateMagnitudes / normalizations
+            bestIndex = int(np.argmax(candidateScores))
+            bestScore = float(candidateScores[bestIndex])
         if not np.isfinite(bestScore):
             raise RuntimeError("unable to estimate integer delay")
         if preferFullOverlap:

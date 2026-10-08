@@ -292,10 +292,15 @@ class FrameProcess:
         """Demodulate data tones and recover transmitted spatial streams.
 
         Processing details:
-            Algorithm: For every requested data symbol, remove the cyclic
-            prefix, apply a unitary FFT, select data subcarriers, multiply by
-            the conjugate CSD phase, and right-multiply by the conjugate
-            orthonormal spatial-mapping matrix.
+            Algorithm: Gather requested data symbols in bounded batches,
+            remove the cyclic prefix, apply unitary FFTs along the sample
+            axis, select data subcarriers, remove CSD, and invert the
+            orthonormal spatial mapping. Each batch holds at most 131072
+            complex input points across all antennas, or one symbol when
+            that symbol alone exceeds the bound. Consecutive symbols use
+            buffer views; irregular selections use bounded indexed copies.
+            Tone indices and inverse CSD/mapping factors are shared within
+            this call, while caller symbol order and duplicates are preserved.
 
         Args:
             preparedSignal: Synchronized signal on the reference sample grid.
@@ -334,42 +339,67 @@ class FrameProcess:
                     "maximumSymbolCount must be a positive integer or None"
                 )
             symbolStarts = symbolStarts[:maximumSymbolCount]
-        demodulatedSymbols = []
         csdPhaseMatrix = BuildCsdPhaseMatrix(
             self.waveform.dataSubcarriers,
             self.waveform.sampleRateHz / self.waveform.fftLength,
             self.waveform.cyclicShiftsSeconds,
         )
-        for symbolStart in symbolStarts:
-            usefulStart = int(symbolStart) + self.waveform.cpLength
-            usefulStop = usefulStart + self.waveform.fftLength
-            if usefulStop > complexPrepared.shape[0]:
-                raise ValueError(
-                    "preparedSignal is shorter than the Wi-Fi data field"
-                )
-            usefulSamples = complexPrepared[usefulStart:usefulStop]
-            usefulMatrix = (
-                usefulSamples.reshape(-1, 1)
-                if usefulSamples.ndim == 1
-                else usefulSamples
+        fftLength = self.waveform.fftLength
+        usefulStarts = symbolStarts + self.waveform.cpLength
+        if np.any(usefulStarts + fftLength > complexPrepared.shape[0]):
+            raise ValueError(
+                "preparedSignal is shorter than the Wi-Fi data field"
             )
-            frequencyGrid = np.fft.fft(usefulMatrix, axis=0) / np.sqrt(
-                self.waveform.fftLength
-            )
-            antennaData = frequencyGrid[
-                np.mod(
-                    self.waveform.dataSubcarriers,
-                    self.waveform.fftLength,
-                )
-            ]
+        dataToneIndices = np.mod(self.waveform.dataSubcarriers, fftLength)
+        inverseCsdPhase = np.conj(csdPhaseMatrix)
+        inverseSpatialMapping = np.conj(self.waveform.spatialMappingMatrix)
+        fftScale = np.sqrt(fftLength)
+        preparedMatrix = (
+            complexPrepared.reshape(-1, 1)
+            if complexPrepared.ndim == 1
+            else complexPrepared
+        )
+        batchSymbolCount = max(
+            1, 131072 // (fftLength * self.waveform.numTransmitAntennas)
+        )
+        symbolLength = fftLength + self.waveform.cpLength
+        sampleOffsets = np.arange(fftLength)
+        demodulatedArray = np.empty(
+            (
+                symbolStarts.size,
+                np.asarray(dataToneIndices).size,
+                self.waveform.numSpatialStreams,
+            ),
+            dtype=np.complex128,
+        )
+        for batchStart in range(0, symbolStarts.size, batchSymbolCount):
+            batchStop = min(batchStart + batchSymbolCount, symbolStarts.size)
+            batchStarts = usefulStarts[batchStart:batchStop]
+            if np.all(np.diff(batchStarts) == symbolLength):
+                # Consecutive OFDM symbols share a strided view of the
+                # original buffer, so their useful samples need no copy.
+                batchField = preparedMatrix[
+                    int(batchStarts[0]) - self.waveform.cpLength:
+                    int(batchStarts[-1]) + fftLength
+                ]
+                usefulSamples = batchField.reshape(
+                    batchStop - batchStart,
+                    symbolLength,
+                    self.waveform.numTransmitAntennas,
+                )[:, self.waveform.cpLength:, :]
+            else:
+                sampleIndices = batchStarts[:, None] + sampleOffsets[None, :]
+                usefulSamples = preparedMatrix[sampleIndices]
+            frequencyGrid = np.fft.fft(usefulSamples, axis=1)
+            frequencyGrid /= fftScale
+            antennaData = frequencyGrid[:, dataToneIndices, :]
             # The transmit mapping is y = s Q^T D_csd. Because Q has
             # orthonormal columns and D_csd is unitary, conjugating both terms
             # in reverse order gives the corresponding left inverse.
-            spatialStreams = (
-                antennaData * np.conj(csdPhaseMatrix)
-            ) @ np.conj(self.waveform.spatialMappingMatrix)
-            demodulatedSymbols.append(spatialStreams)
-        demodulatedArray = np.asarray(demodulatedSymbols)
+            antennaData *= inverseCsdPhase
+            demodulatedArray[batchStart:batchStop] = (
+                antennaData @ inverseSpatialMapping
+            )
         if self.waveform.numTransmitAntennas == 1:
             return demodulatedArray[:, :, 0]
         return demodulatedArray

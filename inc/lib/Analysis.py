@@ -687,7 +687,10 @@ def AveragePeriodogram(
     """Estimate a low-variance PSD using overlapping Hann-windowed segments.
 
     Processing details:
-        Algorithm: Perform the numerical calculation with explicit power, shape, and normalization handling for comparable results.
+        Algorithm: Batch overlapping Hann-windowed FFTs within a bounded
+        workspace, accumulate segment powers in their original order, and
+        shift bins only after averaging. The window, overlap, normalization,
+        and incomplete-tail policy remain unchanged.
 
     Args:
         inputSignal: One-dimensional complex baseband samples supplied to the operation.
@@ -708,17 +711,21 @@ def AveragePeriodogram(
     analysisWindow = np.hanning(segmentLength)
     windowPower = max(np.sum(analysisWindow**2), np.finfo(float).tiny)
     accumulatedPsd = np.zeros(segmentLength, dtype=float)
-    segmentCount = 0
-
-    for startIndex in range(
-        0, complexInput.size - segmentLength + 1, segmentStep
-    ):
-        signalSegment = complexInput[startIndex : startIndex + segmentLength]
-        signalSpectrum = np.fft.fft(
-            signalSegment * analysisWindow
+    segmentView = np.lib.stride_tricks.sliding_window_view(
+        complexInput, segmentLength
+    )[::segmentStep]
+    segmentCount = segmentView.shape[0]
+    batchSize = max(1, 131072 // segmentLength)
+    for startIndex in range(0, segmentCount, batchSize):
+        batchSegments = segmentView[startIndex:startIndex + batchSize]
+        batchSpectra = np.fft.fft(
+            batchSegments * analysisWindow, axis=1
         )
-        accumulatedPsd += np.abs(signalSpectrum) ** 2 / windowPower
-        segmentCount += 1
+        batchPowers = np.abs(batchSpectra) ** 2 / windowPower
+        # Retain segment-by-segment addition, including across batches, so
+        # batching does not change the floating-point PSD reduction order.
+        for segmentPower in batchPowers:
+            accumulatedPsd += segmentPower
 
     if segmentCount == 0:
         raise RuntimeError("unable to create a PSD segment")
@@ -1041,32 +1048,40 @@ class Analysis:
                 )
                 self.numpyTransmitSamples = transmitArray.copy()
                 self.numpyMeasuredSamples = measuredArray.copy()
-                self.signalOverlapResult = SigProc.EstimateSignalOverlap(
-                    floatingMeasuredArray,
-                    floatingTransmitArray,
-                    self.parameters[
-                        "assistedMaximumOffsetSamples"
-                    ],
-                    self.parameters[
-                        "assistedReferenceSearchSamples"
-                    ],
-                    self.parameters[
-                        "assistedMinimumCorrelation"
-                    ],
-                )
-                receivedStart = (
-                    self.signalOverlapResult.receivedStartSample
-                )
-                referenceStart = (
-                    self.signalOverlapResult.referenceStartSample
-                )
-                overlapStop = self.signalOverlapResult.overlapLength
-                self.defaultMeasuredSignal = measuredArray[
-                    receivedStart:receivedStart + overlapStop
-                ].copy()
-                selectedReference = transmitArray[
-                    referenceStart:referenceStart + overlapStop
-                ].copy()
+                if self.parameters["needFullFrameEn"]:
+                    # Strict validation parses the transmit frame and computes
+                    # overlap against that final reference below. A preliminary
+                    # raw overlap would be discarded, wasting a second FFT
+                    # search and potentially rejecting useful padded captures.
+                    self.defaultMeasuredSignal = measuredArray.copy()
+                    selectedReference = transmitArray.copy()
+                else:
+                    self.signalOverlapResult = SigProc.EstimateSignalOverlap(
+                        floatingMeasuredArray,
+                        floatingTransmitArray,
+                        self.parameters[
+                            "assistedMaximumOffsetSamples"
+                        ],
+                        self.parameters[
+                            "assistedReferenceSearchSamples"
+                        ],
+                        self.parameters[
+                            "assistedMinimumCorrelation"
+                        ],
+                    )
+                    receivedStart = (
+                        self.signalOverlapResult.receivedStartSample
+                    )
+                    referenceStart = (
+                        self.signalOverlapResult.referenceStartSample
+                    )
+                    overlapStop = self.signalOverlapResult.overlapLength
+                    self.defaultMeasuredSignal = measuredArray[
+                        receivedStart:receivedStart + overlapStop
+                    ].copy()
+                    selectedReference = transmitArray[
+                        referenceStart:referenceStart + overlapStop
+                    ].copy()
                 selectedWaveform = None
         else:
             self.analysisMode = "blind"
@@ -2286,9 +2301,12 @@ class Analysis:
             ``|b|^2`` as image-path power, calculate aggregate and per-chain
             image-to-desired dBc values, retain complex coefficient
             components, and quantify the unexplained residual and regression
-            conditioning. A tiny scale-relative ridge protects the solve
-            without materially biasing ordinary circular Wi-Fi or nonzero
-            complex-tone signals.
+            conditioning. Accumulate the two-column model's sufficient
+            statistics without allocating a samples-by-two matrix. Obtain
+            its condition number from the two Gram eigenvalues, retaining
+            direct SVD for nearly singular references. A tiny scale-relative
+            ridge protects the solve without materially biasing ordinary
+            circular Wi-Fi or nonzero complex-tone signals.
 
         Args:
             preparedSignal: Signal returned by ``PrepareMeasuredSignal``.
@@ -2326,12 +2344,34 @@ class Analysis:
         for chainIndex in range(referenceMatrix.shape[1]):
             referenceData = referenceMatrix[dataSlice, chainIndex].reshape(-1)
             measuredData = measuredMatrix[dataSlice, chainIndex].reshape(-1)
-            regressionMatrix = np.column_stack(
-                (referenceData, np.conj(referenceData))
+            referenceEnergy = float(np.vdot(referenceData, referenceData).real)
+            referencePseudoEnergy = np.dot(referenceData, referenceData)
+            pseudoEnergyMagnitude = float(abs(referencePseudoEnergy))
+            minimumEigenvalue = referenceEnergy - pseudoEnergyMagnitude
+            normalMatrix = np.array(
+                [
+                    [referenceEnergy, np.conj(referencePseudoEnergy)],
+                    [referencePseudoEnergy, referenceEnergy],
+                ],
+                dtype=np.complex128,
             )
-            normalMatrix = (
-                regressionMatrix.conj().T @ regressionMatrix
+            rightHandSide = np.array(
+                [
+                    np.vdot(referenceData, measuredData),
+                    np.dot(referenceData, measuredData),
+                ],
+                dtype=np.complex128,
             )
+            regressionMatrix = None
+            if minimumEigenvalue <= 1.0e-8 * referenceEnergy:
+                # Preserve the original accumulation and solve for strongly
+                # noncircular references, whose fitted coefficients are
+                # sensitive even to roundoff in the normal equations.
+                regressionMatrix = np.column_stack(
+                    (referenceData, np.conj(referenceData))
+                )
+                normalMatrix = regressionMatrix.conj().T @ regressionMatrix
+                rightHandSide = regressionMatrix.conj().T @ measuredData
             diagonalScale = max(
                 float(np.mean(np.real(np.diag(normalMatrix)))),
                 numericFloor,
@@ -2343,13 +2383,18 @@ class Analysis:
             )
             coefficients = np.linalg.solve(
                 regularizedMatrix,
-                regressionMatrix.conj().T @ measuredData,
+                rightHandSide,
             )
             directCoefficient = complex(coefficients[0])
             imageCoefficient = complex(coefficients[1])
             chainDirectPower = float(np.abs(directCoefficient) ** 2)
             chainImagePower = float(np.abs(imageCoefficient) ** 2)
-            fittedSignal = regressionMatrix @ coefficients
+            fittedSignal = (
+                directCoefficient * referenceData
+                + imageCoefficient * np.conj(referenceData)
+                if regressionMatrix is None
+                else regressionMatrix @ coefficients
+            )
             directPower += chainDirectPower
             imagePower += chainImagePower
             residualPower += float(
@@ -2367,9 +2412,17 @@ class Analysis:
             )
             directCoefficients.append(directCoefficient)
             imageCoefficients.append(imageCoefficient)
-            conditionNumbers.append(
-                float(np.linalg.cond(regressionMatrix))
-            )
+            if regressionMatrix is None:
+                conditionNumber = np.sqrt(
+                    (referenceEnergy + pseudoEnergyMagnitude)
+                    / minimumEigenvalue
+                )
+            else:
+                # Subtracting almost equal Gram eigenvalues loses relative
+                # precision. Preserve direct-SVD diagnostics for real-only,
+                # constant-phase, zero, and otherwise degenerate references.
+                conditionNumber = np.linalg.cond(regressionMatrix)
+            conditionNumbers.append(float(conditionNumber))
         aggregateIrrDb = float(
             10.0
             * np.log10(
